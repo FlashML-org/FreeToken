@@ -3,17 +3,18 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import threading
 from types import ModuleType
 from typing import Any, List
 
 import torch
 from freetoken.message import TokenizeMsg
+from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
 
-#: Reasoning-effort values accepted by the DeepSeek-V4 encoder. Anything else
-#: (notably OpenAI's default ``"medium"``) makes ``encoding_dsv4.render_message``
-#: raise an assertion, so unsupported values are normalized to ``None``.
-VALID_REASONING_EFFORTS = ("max", "high")
+from .effort import EffortProfile, probe_effort_profile, quantize_effort
+
+logger = init_logger(__name__)
 
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
@@ -36,46 +37,99 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
     return mode
 
 
-def normalize_reasoning_effort(value: Any | None) -> str | None:
-    """Drop reasoning-effort values the dsv4 encoder cannot accept (-> ``None``)."""
-    return value if value in VALID_REASONING_EFFORTS else None
+_EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
+        self._effort_profile: EffortProfile | None = None
+        self._effort_lock = threading.Lock()
+        self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
         results: List[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
-            if isinstance(msg.text, list):
-                chat_template_kwargs = msg.chat_template_kwargs or {}
-                if self._dsv4_encoder is not None:
-                    prompt = _apply_dsv4_chat_encoder(
-                        self._dsv4_encoder,
-                        msg.text,
-                        msg.tools,
-                        chat_template_kwargs,
-                    )
-                else:
-                    if msg.tools is not None:
-                        chat_template_kwargs = {**chat_template_kwargs, "tools": msg.tools}
-                    prompt = self.tokenizer.apply_chat_template(
-                        msg.text,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        **chat_template_kwargs,
-                    )
-                    assert isinstance(prompt, str)
-            else:
-                prompt = msg.text
+            prompt = self.render_prompt(msg)
             input_ids: torch.Tensor = (  # type: ignore
                 self.tokenizer.encode(prompt, return_tensors="pt")
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
+
+    def render_prompt(self, msg: TokenizeMsg) -> str:
+        """The template/encoder half of ``tokenize``, exposed so the frontend can
+        validate a request before committing an SSE stream. Sanitizes
+        ``reasoning_effort`` first: every render path (worker, frontend
+        validation, count_tokens) must quantize identically."""
+        if not isinstance(msg.text, list):
+            return msg.text
+        return self._render(
+            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+        )
+
+    def _render(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any],
+    ) -> str:
+        """Raw render, no effort sanitation — the probe needs unsupported values
+        to actually reach the template so rejection is observable."""
+        if self._dsv4_encoder is not None:
+            return _apply_dsv4_chat_encoder(
+                self._dsv4_encoder, messages, tools, chat_template_kwargs
+            )
+        if tools is not None:
+            chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+        assert isinstance(prompt, str)
+        return prompt
+
+    def effort_profile(self) -> EffortProfile:
+        """The checkpoint's effort vocabulary, probed on first use and cached
+        for the process lifetime."""
+        with self._effort_lock:
+            if self._effort_profile is None:
+                self._effort_profile = probe_effort_profile(
+                    lambda kwargs, tools: self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
+                )
+                logger.info(
+                    "reasoning-effort profile: supported=%s default=%s",
+                    sorted(self._effort_profile.supported) or "(none)",
+                    self._effort_profile.default,
+                )
+            return self._effort_profile
+
+    def _sanitize_effort(self, chat_template_kwargs: dict[str, Any]) -> dict[str, Any]:
+        if "reasoning_effort" not in chat_template_kwargs:
+            return chat_template_kwargs
+        raw = chat_template_kwargs.get("reasoning_effort")
+        mapped = quantize_effort(raw, self.effort_profile())
+        if mapped == raw:
+            return chat_template_kwargs
+        # raw is client-controlled and may be unhashable (a JSON list/dict).
+        key = (raw if isinstance(raw, str) else repr(raw), mapped)
+        if key not in self._logged_effort_maps:
+            self._logged_effort_maps.add(key)
+            logger.info(
+                "reasoning_effort %r is not supported by this checkpoint; using %s",
+                raw,
+                mapped if mapped is not None else "the template default",
+            )
+        sanitized = dict(chat_template_kwargs)
+        if mapped is None:
+            del sanitized["reasoning_effort"]
+        else:
+            sanitized["reasoning_effort"] = mapped
+        return sanitized
 
 
 def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:
@@ -110,10 +164,12 @@ def _apply_dsv4_chat_encoder(
     if tools:
         _attach_tools_to_dsv4_messages(rendered_messages, tools)
 
+    # No effort filtering here: the caller sanitized already, and the probe
+    # needs raw values to reach the encoder's own validation.
     return encoder.encode_messages(
         rendered_messages,
         thinking_mode=resolve_thinking_mode(chat_template_kwargs, tools),
-        reasoning_effort=normalize_reasoning_effort(chat_template_kwargs.get("reasoning_effort")),
+        reasoning_effort=chat_template_kwargs.get("reasoning_effort"),
     )
 
 

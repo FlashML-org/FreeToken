@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -10,6 +11,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
+
+#: The wire superset plus "off", DeepSeek's disable synonym that
+#: effort_toggle_kwargs has always honored.
+_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
+
+
+def _thinking_type(req: Any) -> str | None:
+    """The DeepSeek-wire thinking toggle, or None for absent/foreign shapes
+    (which stay ignored, as extra="allow" ignored them before the field existed)."""
+    if isinstance(req.thinking, dict):
+        value = req.thinking.get("type")
+        if value in ("enabled", "disabled"):
+            return value
+    return None
 
 from .api_models import (
     ChatCompletionRequest,
@@ -31,6 +47,7 @@ from .generation import (
     ToolCallStart,
     generate_events,
     generate_full,
+    prerender_error,
     render_messages,
     resolve_sampling,
     submit_generation,
@@ -46,8 +63,14 @@ def chat_request_to_genspec(
     from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
-    if req.reasoning_effort:
-        ctk = effort_toggle_kwargs(reasoning_parser, req.reasoning_effort, ctk)
+    thinking_type = _thinking_type(req)
+    if req.reasoning_effort or thinking_type:
+        ctk = effort_toggle_kwargs(
+            reasoning_parser,
+            req.reasoning_effort,
+            ctk,
+            thinking_type=thinking_type,
+        )
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -115,11 +138,14 @@ def register_openai_routes(
         state = get_state()
         model_id = _served_model_name(state)
         ctx = _model_context_length(state)
+        efforts, default_effort = await _effort_fields(state)
         return ModelList(data=[ModelCard(
             id=model_id,
             root=state.config.model_path,
             max_model_len=ctx,
             context_length=ctx,
+            supported_reasoning_efforts=efforts,
+            default_reasoning_effort=default_effort,
         )])
 
 
@@ -140,6 +166,22 @@ async def handle_chat_completion(
         )
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
+    # Case/whitespace and the "off" disable synonym stay accepted here because
+    # effort_toggle_kwargs normalizes and honors them downstream.
+    effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None
+    if effort and effort not in _ACCEPTED_EFFORTS:
+        return create_error_response(
+            f"reasoning_effort must be one of {', '.join(_ACCEPTED_EFFORTS)}; "
+            f"got {req.reasoning_effort!r}",
+            param="reasoning_effort",
+        )
+    if isinstance(req.thinking, dict):
+        thinking_type = req.thinking.get("type")
+        if thinking_type is not None and thinking_type not in ("enabled", "disabled"):
+            return create_error_response(
+                f"thinking.type must be 'enabled' or 'disabled'; got {thinking_type!r}",
+                param="thinking",
+            )
 
     try:
         spec = chat_request_to_genspec(
@@ -147,6 +189,14 @@ async def handle_chat_completion(
         )
     except ValueError as exc:
         return create_error_response(str(exc))
+
+    if req.stream:
+        # Non-stream requests already surface render failures as a clean 400
+        # through GenerationError; only the stream path needs the pre-check.
+        err = await prerender_error(spec, state)
+        if err is not None:
+            return create_error_response(str(err), code=err.code)
+
     uid = await submit_generation(spec, state)
 
     if req.stream:
@@ -608,6 +658,24 @@ def _is_token_prompt(prompt: Any) -> bool:
             or all(isinstance(item, list) and all(isinstance(token, int) for token in item) for item in prompt)
         )
     )
+
+
+async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
+    """The checkpoint's probed effort vocabulary for /v1/models, or (None, None)
+    when there is no frontend tokenizer, it fails to build, or the model has no
+    effort knob — a metadata route must never 500 over this."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None, None
+    try:
+        manager = await asyncio.to_thread(build)
+        profile = await asyncio.to_thread(manager.effort_profile)
+    except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
+        return None, None
+    if not profile.consumes_effort:
+        return None, None
+    ordered = sorted(profile.supported, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
+    return ordered, profile.default
 
 
 def _served_model_name(state: Any) -> str:

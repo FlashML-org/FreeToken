@@ -75,19 +75,27 @@ def effort_toggle_kwargs(
     reasoning_parser: str | None,
     effort: str | None,
     chat_template_kwargs: dict | None,
+    thinking_type: str | None = None,
 ) -> dict:
     """Fold a protocol-level reasoning-effort request into the template kwargs.
     An explicit thinking-related key wins wholesale; unrelated extras ride along.
     Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
-    effort enables it, forwarded for templates that grade it (gpt-oss)."""
+    effort enables it, forwarded for templates that grade it (quantized against
+    the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
+    DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides
+    the on/off direction outright, "disabled" winning over any effort."""
     ctk = dict(chat_template_kwargs or {})
     if any(key in ctk for key in _THINKING_KWARG_KEYS):
         return ctk
     if isinstance(effort, str):
         effort = effort.strip().lower()
     disabled = effort in _DISABLE_EFFORTS
+    if thinking_type == "disabled":
+        disabled = True
+    elif thinking_type == "enabled":
+        disabled = False
     mapped = dict(think_toggle_kwargs(reasoning_parser, not disabled))
-    if effort and not disabled:
+    if effort and not disabled and effort not in _DISABLE_EFFORTS:
         mapped.setdefault("reasoning_effort", effort)
     mapped.update(ctk)
     return mapped

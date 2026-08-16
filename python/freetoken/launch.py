@@ -724,9 +724,12 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     ``freetoken-launch.settings.yaml`` for this invocation only, so the user's
     ``settings.yaml`` is never read or written. The llm-deepseek adapter (route
     ``deepseek-official``) is used rather than a custom llm-pi-ai provider: it
-    replays tool-call arguments and assistant content verbatim, which prefix
-    caching depends on. The dummy DEEPSEEK_API_KEY satisfies dsh's non-empty
-    key requirement; FreeToken itself is unauthenticated."""
+    replays tool-call arguments byte-verbatim and reasoning as
+    ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
+    values and key order — drift that survives render canonicalization, cuts
+    the prefix cache, and shows the model a rewrite of its own output. The
+    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement; FreeToken
+    itself is unauthenticated."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -766,8 +769,8 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
         patch = [{"id": "settings", "config": {"path": str(settings_path)}}]
         _write_text_with_backup(patch_path, yaml.safe_dump(patch, sort_keys=False))
 
-    # The `dsh web` alias rejects launcher flags like --patch; use the explicit
-    # --profile form and normalize a leading alias or --profile from extra args.
+    # The explicit --profile form (equivalent to the `web` alias) lets the
+    # normalization below swap the profile from extra args.
     profile, app_args = "web", list(ctx.extra_args)
     if app_args and app_args[0] == "web":
         app_args = app_args[1:]

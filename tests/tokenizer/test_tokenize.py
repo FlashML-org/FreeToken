@@ -179,3 +179,116 @@ def test_dsv4_arguments_str_normalization():
     for bad in ("[1,2]", "5", "true", '"x"', "not json", [1, 2], 5):
         with pytest.raises(ValueError):
             _dsv4_arguments_str(bad)
+
+
+class Qwen38LikeTokenizer:
+    """Fake whose template grades effort like Qwen3.8: validates the vocabulary
+    whenever thinking is not explicitly off, distinct preamble per gear."""
+
+    def __init__(self) -> None:
+        self.chat_template_kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.chat_template_kwargs = kwargs
+        if kwargs.get("enable_thinking") is not False:
+            effort = kwargs.get("reasoning_effort", "xhigh")
+            if effort not in ("xhigh", "medium", "low"):
+                raise ValueError(f"Unexpected reasoning effort {effort}")
+            return f"prompt effort={effort}"
+        return "prompt effort=off"
+
+    def encode(self, prompt, return_tensors=None):
+        return torch.tensor([[7, 8]], dtype=torch.long)
+
+
+def test_tokenize_quantizes_foreign_effort_onto_the_template_vocabulary():
+    """DeepSeek-dialect "high" must reach a Qwen3.8-style template as its
+    nearest supported gear, not raw (raw would raise_exception)."""
+    tokenizer = Qwen38LikeTokenizer()
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "high"},
+    )
+
+    manager.tokenize([msg])
+
+    assert tokenizer.chat_template_kwargs["reasoning_effort"] == "xhigh"
+    assert tokenizer.chat_template_kwargs["enable_thinking"] is True
+    # the caller's kwargs stay untouched
+    assert msg.chat_template_kwargs["reasoning_effort"] == "high"
+
+
+def test_tokenize_drops_effort_for_templates_that_ignore_it():
+    tokenizer = FakeTokenizer()  # renders the same prompt regardless of kwargs
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"reasoning_effort": "high"},
+    )
+
+    manager.tokenize([msg])
+
+    assert "reasoning_effort" not in tokenizer.chat_template_kwargs
+
+
+def test_tokenize_drops_far_effort_for_the_dsv4_encoder(tmp_path):
+    """An OpenAI-dialect "medium" has no nearby dsv4 gear, so nothing is sent
+    and the encoder default ("low") applies -- never a silent escalation to
+    the absolute-maximum "high" prompt."""
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding_dsv4.py").write_text(
+        """
+SEEN = []
+
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    effort = reasoning_effort or "low"
+    assert effort in ("low", "high", "max"), f"Invalid reasoning effort: {effort}"
+    SEEN.append(reasoning_effort)
+    return f"dsv4 prompt effort={effort}"
+""".lstrip()
+    )
+    tokenizer = FakeDsv4Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"reasoning_effort": "medium"},
+    )
+
+    manager.tokenize([msg])
+
+    assert tokenizer.prompt == "dsv4 prompt effort=low"
+
+
+def test_tokenize_survives_an_unhashable_effort():
+    tokenizer = Qwen38LikeTokenizer()
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"reasoning_effort": ["high"]},  # legal JSON on the wire
+    )
+
+    manager.tokenize([msg])
+
+    assert "reasoning_effort" not in tokenizer.chat_template_kwargs
+
+
+def test_effort_profile_is_probed_once_and_cached():
+    tokenizer = Qwen38LikeTokenizer()
+    manager = TokenizeManager(tokenizer)
+
+    first = manager.effort_profile()
+    second = manager.effort_profile()
+
+    assert first is second
+    assert first.supported == frozenset({"xhigh", "medium", "low"})
+    assert first.default == "xhigh"

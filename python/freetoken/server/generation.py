@@ -307,6 +307,36 @@ async def count_prompt_tokens(
     return int(input_ids.numel())
 
 
+async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
+    """Render ``spec``'s prompt frontend-side, returning the failure a streaming
+    adapter should surface as an HTTP 400 *before* committing an SSE stream —
+    once headers go out, a template rejection can only ride in-stream, where
+    some agents show nothing but "empty response". Render only; the worker
+    still renders and encodes authoritatively. Best-effort: a state without a
+    frontend tokenizer, or one that fails to *initialize*, skips validation
+    rather than blocking the generation path.
+    """
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None
+    msg = TokenizeMsg(
+        uid=0,
+        text=spec.messages,
+        sampling_params=SamplingParams(),
+        chat_template_kwargs=spec.chat_template_kwargs,
+        tools=spec.template_tools,
+    )
+    try:
+        manager = await asyncio.to_thread(build)
+    except Exception:  # noqa: BLE001 -- server fault, not this request's problem
+        return None
+    try:
+        await asyncio.to_thread(manager.render_prompt, msg)
+    except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
+        return GenerationError(f"could not encode request: {exc}")
+    return None
+
+
 def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     """Build a reasoning parser for this generation, or None if the server has no
     reasoning parser configured. ``force_reasoning`` matches the encode-side

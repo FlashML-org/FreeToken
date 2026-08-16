@@ -78,6 +78,11 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
+    # foreign shape stays ignored (extra="allow" swallowed it before this field
+    # existed) instead of becoming a bare 422 at the route boundary; the handler
+    # reads the dict form and 400s only on an unknown "type" value.
+    thinking: Any | None = None
     ignore_eos: bool = False
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
@@ -133,6 +138,10 @@ class ModelCard(BaseModel):
     # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.
     max_model_len: int | None = None
     context_length: int | None = None
+    # The checkpoint's probed effort vocabulary (freetoken.tokenizer.effort); None
+    # (not []) when the model has no effort knob or the probe could not run.
+    supported_reasoning_efforts: list[str] | None = None
+    default_reasoning_effort: str | None = None
 
 
 class ModelList(BaseModel):
