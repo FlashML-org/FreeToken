@@ -158,10 +158,10 @@ def test_convert_system_role_message_and_unknown_block():
     assert spec.messages[2]["content"] == "hi"
 
 
-def test_convert_thinking_toggle_routes_through_family_mapping():
-    """A hardcoded {"enable_thinking": bool} is inert for M3, whose template
-    reads thinking_mode -- the toggle must go through the same model_meta
-    mapping as the chat-completions gears."""
+def test_convert_thinking_toggle_broadcasts_every_spelling():
+    """The toggle is broadcast in every spelling templates read (enable_thinking
+    bool + M3's thinking_mode); each template picks the knob it knows and Jinja
+    ignores the rest, so the kwargs are family-independent."""
     def _req(ttype):
         return AnthropicMessagesRequest.model_validate(
             {
@@ -171,18 +171,13 @@ def test_convert_thinking_toggle_routes_through_family_mapping():
             }
         )
 
-    spec = A.convert_anthropic_to_genspec(_req("enabled"), {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {"thinking_mode": "enabled"}
-    spec = A.convert_anthropic_to_genspec(_req("disabled"), {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {"thinking_mode": "disabled"}
-    # enable_thinking families keep their key; no parser keeps the generic key
-    spec = A.convert_anthropic_to_genspec(_req("enabled"), {}, reasoning_parser="qwen3")
-    assert spec.chat_template_kwargs == {"enable_thinking": True}
-    spec = A.convert_anthropic_to_genspec(_req("disabled"), {})
-    assert spec.chat_template_kwargs == {"enable_thinking": False}
-    # a family without the requested direction sets nothing (minimax has no off)
-    spec = A.convert_anthropic_to_genspec(_req("disabled"), {}, reasoning_parser="minimax")
-    assert spec.chat_template_kwargs == {}
+    on = {"enable_thinking": True, "thinking_mode": "enabled"}
+    off = {"enable_thinking": False, "thinking_mode": "disabled"}
+    for parser in ("minimax_m3", "qwen3", "minimax", None):
+        spec = A.convert_anthropic_to_genspec(_req("enabled"), {}, reasoning_parser=parser)
+        assert spec.chat_template_kwargs == on, parser
+        spec = A.convert_anthropic_to_genspec(_req("disabled"), {}, reasoning_parser=parser)
+        assert spec.chat_template_kwargs == off, parser
 
 
 def test_convert_thinking_only_assistant_message_keeps_empty_content():
@@ -598,11 +593,11 @@ def test_convert_native_thinking_toggle():
     on = A.convert_anthropic_to_genspec(
         AnthropicMessagesRequest.model_validate({**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}), {}
     )
-    assert on.chat_template_kwargs == {"enable_thinking": True}
+    assert on.chat_template_kwargs == {"enable_thinking": True, "thinking_mode": "enabled"}
     off = A.convert_anthropic_to_genspec(
         AnthropicMessagesRequest.model_validate({**base, "thinking": {"type": "disabled"}}), {}
     )
-    assert off.chat_template_kwargs == {"enable_thinking": False}
+    assert off.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
     absent = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(base), {})
     assert absent.chat_template_kwargs == {}
 

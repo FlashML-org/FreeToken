@@ -12,7 +12,13 @@ from freetoken.message import TokenizeMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
 
-from .effort import EffortProfile, probe_effort_profile, quantize_effort
+from .effort import (
+    EffortProfile,
+    ThinkingProfile,
+    probe_effort_profile,
+    probe_thinking_profile,
+    quantize_effort,
+)
 
 logger = init_logger(__name__)
 
@@ -45,6 +51,7 @@ class TokenizeManager:
         self.tokenizer = tokenizer
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
+        self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
@@ -98,15 +105,28 @@ class TokenizeManager:
         for the process lifetime."""
         with self._effort_lock:
             if self._effort_profile is None:
-                self._effort_profile = probe_effort_profile(
-                    lambda kwargs, tools: self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
-                )
+                self._effort_profile = probe_effort_profile(self._probe_render)
                 logger.info(
                     "reasoning-effort profile: supported=%s default=%s",
                     sorted(self._effort_profile.supported) or "(none)",
                     self._effort_profile.default,
                 )
             return self._effort_profile
+
+    def thinking_profile(self) -> ThinkingProfile:
+        """The checkpoint's thinking controls (toggle behavior + effort
+        vocabulary), probed on first use and cached for the process lifetime.
+        Feeds the /v1/cache/status gear derivation."""
+        efforts = self.effort_profile()
+        with self._effort_lock:
+            if self._thinking_profile is None:
+                self._thinking_profile = probe_thinking_profile(self._probe_render, efforts)
+            return self._thinking_profile
+
+    def _probe_render(
+        self, kwargs: dict[str, Any], tools: list[dict[str, Any]] | None
+    ) -> str:
+        return self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
 
     def _sanitize_effort(self, chat_template_kwargs: dict[str, Any]) -> dict[str, Any]:
         if "reasoning_effort" not in chat_template_kwargs:

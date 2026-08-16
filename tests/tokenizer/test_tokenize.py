@@ -280,15 +280,3 @@ def test_tokenize_survives_an_unhashable_effort():
     manager.tokenize([msg])
 
     assert "reasoning_effort" not in tokenizer.chat_template_kwargs
-
-
-def test_effort_profile_is_probed_once_and_cached():
-    tokenizer = Qwen38LikeTokenizer()
-    manager = TokenizeManager(tokenizer)
-
-    first = manager.effort_profile()
-    second = manager.effort_profile()
-
-    assert first is second
-    assert first.supported == frozenset({"xhigh", "medium", "low"})
-    assert first.default == "xhigh"

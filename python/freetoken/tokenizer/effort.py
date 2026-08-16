@@ -30,6 +30,20 @@ EFFORT_SCALE: dict[str, float] = {
 KNOWN_REASONING_EFFORTS = tuple(EFFORT_SCALE)
 
 
+#: OpenAI's effort triple -- the common-denominator vocabulary offered for a
+#: template that grades effort without validating it (nothing observable
+#: narrows its gears, so offer what every dialect understands).
+OPENAI_EFFORT_TRIPLE = ("low", "medium", "high")
+
+#: Protocol-level thinking toggles, broadcast in every spelling the ecosystem's
+#: templates read (``enable_thinking`` bool: qwen/glm/gemma/dsv4;
+#: ``thinking_mode`` string: minimax-m3). Jinja ignores undeclared variables,
+#: so a template simply picks the knob it knows -- no per-family routing needed.
+THINKING_OFF_KWARGS = {"enable_thinking": False, "thinking_mode": "disabled"}
+THINKING_ON_KWARGS = {"enable_thinking": True, "thinking_mode": "enabled"}
+THINKING_ADAPTIVE_KWARGS = {"thinking_mode": "adaptive"}
+
+
 @dataclass(frozen=True)
 class EffortProfile:
     """What one checkpoint's template/encoder accepts, learned by probing it.
@@ -37,12 +51,31 @@ class EffortProfile:
     ``default`` is the supported name whose rendering is byte-identical to
     passing no effort at all. ``consumes_effort`` False means no probe round
     ever changed its output or raised -- the template ignores the knob, so
-    requests should not carry it.
+    requests should not carry it. ``validates`` True means the probe observed a
+    rejection: only then is ``supported`` a real vocabulary rather than "this
+    template interpolates anything".
     """
 
     supported: frozenset[str]
     default: str | None
     consumes_effort: bool
+    validates: bool = False
+
+
+@dataclass(frozen=True)
+class ThinkingProfile:
+    """A checkpoint's thinking controls, learned by probing its template.
+
+    ``toggleable``: the off/on broadcasts render differently. ``has_adaptive``:
+    thinking_mode "adaptive" is a third distinct state (minimax-m3).
+    ``default_state``: which state the bare render matches ("on" when not
+    toggleable or unmatched).
+    """
+
+    efforts: EffortProfile
+    toggleable: bool
+    has_adaptive: bool
+    default_state: str  # "on" | "off" | "adaptive"
 
 
 #: A gear farther than this on the scale misrepresents the request; drop the
@@ -144,7 +177,48 @@ def probe_effort_profile(
         defaults = [name for name in supported if matches_baseline[name]]
         if defaults:
             default = max(defaults, key=lambda name: EFFORT_SCALE[name])
-    return EffortProfile(supported=supported, default=default, consumes_effort=consumes)
+    return EffortProfile(
+        supported=supported,
+        default=default,
+        consumes_effort=consumes,
+        validates=bool(rejected),
+    )
+
+
+def probe_thinking_profile(
+    render: Callable[[dict[str, Any], list[dict[str, Any]] | None], Any],
+    efforts: EffortProfile,
+) -> ThinkingProfile:
+    """Learn a checkpoint's thinking-toggle behavior by rendering the broadcast
+    kwargs through its template. Same contract as ``probe_effort_profile``; a
+    template that rejects any toggle probe is treated as not toggleable."""
+    try:
+        baseline = render({}, None)
+        off = render(dict(THINKING_OFF_KWARGS), None)
+        on = render(dict(THINKING_ON_KWARGS), None)
+    except Exception:  # noqa: BLE001 -- can't observe the toggle; assume none
+        return ThinkingProfile(efforts=efforts, toggleable=False, has_adaptive=False, default_state="on")
+    toggleable = _renderings_differ(off, on)
+    has_adaptive = False
+    adaptive = None
+    if toggleable:
+        try:
+            adaptive = render(dict(THINKING_ADAPTIVE_KWARGS), None)
+            has_adaptive = _renderings_differ(adaptive, off) and _renderings_differ(adaptive, on)
+        except Exception:  # noqa: BLE001 -- adaptive is not a state this template knows
+            has_adaptive = False
+    default_state = "on"
+    if toggleable:
+        if not _renderings_differ(baseline, off):
+            default_state = "off"
+        elif has_adaptive and not _renderings_differ(baseline, adaptive):
+            default_state = "adaptive"
+    return ThinkingProfile(
+        efforts=efforts,
+        toggleable=toggleable,
+        has_adaptive=has_adaptive,
+        default_state=default_state,
+    )
 
 
 def _renderings_differ(a: Any, b: Any) -> bool:

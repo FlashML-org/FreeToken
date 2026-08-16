@@ -13,20 +13,6 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
-#: The wire superset plus "off", DeepSeek's disable synonym that
-#: effort_toggle_kwargs has always honored.
-_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
-
-
-def _thinking_type(req: Any) -> str | None:
-    """The DeepSeek-wire thinking toggle, or None for absent/foreign shapes
-    (which stay ignored, as extra="allow" ignored them before the field existed)."""
-    if isinstance(req.thinking, dict):
-        value = req.thinking.get("type")
-        if value in ("enabled", "disabled"):
-            return value
-    return None
-
 from .api_models import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -53,11 +39,25 @@ from .generation import (
     submit_generation,
 )
 
+#: The wire superset plus "off", DeepSeek's disable synonym that
+#: effort_toggle_kwargs has always honored.
+_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
+
+
+def _thinking_type(req: Any) -> str | None:
+    """The DeepSeek-wire thinking toggle, or None for absent/foreign shapes
+    (which stay ignored, as extra="allow" ignored them before the field existed)."""
+    if isinstance(req.thinking, dict):
+        value = req.thinking.get("type")
+        if value in ("enabled", "disabled"):
+            return value
+    return None
+
+
 
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
-    reasoning_parser: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -65,12 +65,7 @@ def chat_request_to_genspec(
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(
-            reasoning_parser,
-            req.reasoning_effort,
-            ctk,
-            thinking_type=thinking_type,
-        )
+        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -184,9 +179,7 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(
-            req, model_sampling, reasoning_parser=getattr(state.config, "reasoning_parser", None)
-        )
+        spec = chat_request_to_genspec(req, model_sampling)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -243,9 +236,7 @@ async def stream_chat_completion_chunks(
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
-        spec = chat_request_to_genspec(
-            req, {}, reasoning_parser=getattr(state.config, "reasoning_parser", None)
-        )
+        spec = chat_request_to_genspec(req, {})
     yield _sse(
         _chat_chunk(
             req,

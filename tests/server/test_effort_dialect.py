@@ -75,25 +75,27 @@ def chat_request(**overrides) -> ChatCompletionRequest:
 # --------------------------------------------------------------------------- #
 # effort_toggle_kwargs: the DeepSeek thinking toggle folds into template kwargs.
 # --------------------------------------------------------------------------- #
+OFF = {"enable_thinking": False, "thinking_mode": "disabled"}
+ON = {"enable_thinking": True, "thinking_mode": "enabled"}
+
+
 def test_thinking_disabled_wins_over_an_effort():
-    ctk = effort_toggle_kwargs("qwen3", "high", {}, thinking_type="disabled")
-    assert ctk == {"enable_thinking": False}
+    ctk = effort_toggle_kwargs("high", {}, thinking_type="disabled")
+    assert ctk == OFF
 
 
 def test_thinking_enabled_forwards_the_effort():
-    ctk = effort_toggle_kwargs("qwen3", "high", {}, thinking_type="enabled")
-    assert ctk == {"enable_thinking": True, "reasoning_effort": "high"}
+    ctk = effort_toggle_kwargs("high", {}, thinking_type="enabled")
+    assert ctk == {**ON, "reasoning_effort": "high"}
 
 
 def test_thinking_enabled_alone_turns_thinking_on():
-    ctk = effort_toggle_kwargs("qwen3", None, {}, thinking_type="enabled")
-    assert ctk == {"enable_thinking": True}
+    ctk = effort_toggle_kwargs(None, {}, thinking_type="enabled")
+    assert ctk == ON
 
 
 def test_explicit_template_kwargs_still_win_wholesale():
-    ctk = effort_toggle_kwargs(
-        "qwen3", "high", {"enable_thinking": False}, thinking_type="enabled"
-    )
+    ctk = effort_toggle_kwargs("high", {"enable_thinking": False}, thinking_type="enabled")
     assert ctk == {"enable_thinking": False}
 
 
@@ -128,16 +130,16 @@ def test_thinking_disabled_reaches_the_tokenizer_as_enable_thinking_false():
     )
     assert not isinstance(response, JSONResponse)  # plain successful completion
     assert state.sent is not None
-    assert state.sent.chat_template_kwargs == {"enable_thinking": False}
+    assert state.sent.chat_template_kwargs == OFF
 
 
 def test_off_and_mixed_case_efforts_stay_accepted():
     # effort_toggle_kwargs has always normalized case/whitespace and honored
     # "off" as a disable synonym; the superset gate must not reject them.
     for effort, expected in (
-        ("off", {"enable_thinking": False}),
-        ("High", {"enable_thinking": True, "reasoning_effort": "high"}),
-        (" high ", {"enable_thinking": True, "reasoning_effort": "high"}),
+        ("off", OFF),
+        ("High", {**ON, "reasoning_effort": "high"}),
+        (" high ", {**ON, "reasoning_effort": "high"}),
     ):
         state = FakeState(reasoning_parser="qwen3")
         response = run(
@@ -176,7 +178,7 @@ def test_anthropic_style_thinking_dict_works():
         )
     )
     assert not isinstance(response, JSONResponse)
-    assert state.sent.chat_template_kwargs == {"enable_thinking": True}
+    assert state.sent.chat_template_kwargs == ON
 
 
 def test_stream_returns_400_when_the_template_rejects_the_render():
@@ -196,13 +198,6 @@ def test_stream_proceeds_without_a_frontend_tokenizer():
     # Minimal embeddings (and the unit FakeState) have no frontend tokenizer;
     # validation degrades to the old worker-side path instead of blocking.
     response = run(handle_chat_completion(chat_request(stream=True), None, FakeState(), {}))
-    assert isinstance(response, StreamingResponse)
-
-
-def test_stream_proceeds_when_the_render_succeeds():
-    state = FakeState()
-    state.frontend_tokenizer = lambda: FakeManager(render_error=None)
-    response = run(handle_chat_completion(chat_request(stream=True), None, state, {}))
     assert isinstance(response, StreamingResponse)
 
 

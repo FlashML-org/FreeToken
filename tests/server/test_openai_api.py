@@ -163,7 +163,9 @@ def test_chat_request_reasoning_replay_field_aliases():
 
 def test_chat_reasoning_effort_enables_thinking():
     spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
-    assert spec.chat_template_kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    }
 
     # an explicit thinking-related chat_template_kwargs key wins over the mapping
     spec = chat_request_to_genspec(
@@ -175,7 +177,9 @@ def test_chat_reasoning_effort_enables_thinking():
     spec = chat_request_to_genspec(
         chat_request(reasoning_effort="none", chat_template_kwargs={"custom_var": 1}), {}
     )
-    assert spec.chat_template_kwargs == {"enable_thinking": False, "custom_var": 1}
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1
+    }
 
     # absent effort -> kwargs pass through untouched
     assert chat_request_to_genspec(chat_request(), {}).chat_template_kwargs == {}
@@ -184,25 +188,23 @@ def test_chat_reasoning_effort_enables_thinking():
 def test_chat_reasoning_effort_none_disables_thinking():
     # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
     spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
-    assert spec.chat_template_kwargs == {"enable_thinking": False}
+    assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
 
 
-def test_chat_reasoning_effort_routes_through_family_mapping():
-    """The toggle goes through model_meta's per-family mapping -- for M3 that is
-    thinking_mode, not the (inert) enable_thinking key."""
+def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
+    """The toggle is broadcast in every spelling templates read (enable_thinking
+    bool + M3's thinking_mode); each template picks the knob it knows and Jinja
+    ignores the rest, so no per-family routing exists."""
     on = chat_request(reasoning_effort="high")
-    spec = chat_request_to_genspec(on, {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {"thinking_mode": "enabled", "reasoning_effort": "high"}
+    spec = chat_request_to_genspec(on, {})
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    }
 
     off = chat_request(reasoning_effort="none")
-    spec = chat_request_to_genspec(off, {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {"thinking_mode": "disabled"}
+    spec = chat_request_to_genspec(off, {})
+    assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
 
-    # gpt-oss: the template grades effort and has no off gear
-    spec = chat_request_to_genspec(on, {}, reasoning_parser="gpt_oss")
-    assert spec.chat_template_kwargs == {"reasoning_effort": "high"}
-    spec = chat_request_to_genspec(off, {}, reasoning_parser="gpt_oss")
-    assert spec.chat_template_kwargs == {}
 
 
 def test_glm_reasoning_parser_honors_disabled_thinking_with_tools():
@@ -211,11 +213,11 @@ def test_glm_reasoning_parser_honors_disabled_thinking_with_tools():
     from freetoken.server.generation import _make_reasoning_parser
 
     state = FakeState([], reasoning_parser="glm")
-    off = chat_request_to_genspec(chat_request(reasoning_effort="none"), {}, reasoning_parser="glm")
+    off = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
     parser = _make_reasoning_parser(off, state)
     assert parser is not None and parser.detector.force_reasoning is False
 
-    on = chat_request_to_genspec(chat_request(), {}, reasoning_parser="glm")
+    on = chat_request_to_genspec(chat_request(), {})
     parser = _make_reasoning_parser(on, state)
     assert parser is not None and parser.detector.force_reasoning is True
 

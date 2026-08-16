@@ -178,6 +178,8 @@ class FrontendManager:
     # the generation path. The lock dedupes concurrent first builds.
     _frontend_tokenizer: Any = None
     _frontend_tokenizer_lock: Any = field(default_factory=threading.Lock)
+    # One-shot guard for warm_frontend_tokenizer(); benign if two polls race it.
+    _frontend_warm_started: bool = False
 
     def __post_init__(self) -> None:
         if self.stats is None:
@@ -193,6 +195,22 @@ class FrontendManager:
 
                 self._frontend_tokenizer = TokenizeManager(load_tokenizer(self.config.model_path))
             return self._frontend_tokenizer
+
+    def warm_frontend_tokenizer(self) -> None:
+        """Build the frontend tokenizer and probe its thinking profile off-thread,
+        once — /v1/cache/status polls call this so the gear picker self-populates
+        without ever blocking the event loop on a tokenizer load."""
+        if self._frontend_warm_started:
+            return
+        self._frontend_warm_started = True
+
+        def _warm() -> None:
+            try:
+                self.frontend_tokenizer().thinking_profile()
+            except Exception:  # noqa: BLE001 -- warmup only; real faults surface on use
+                pass
+
+        threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
 
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
@@ -651,6 +669,27 @@ def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -
         }
 
 
+def _reasoning_geometry(state: Any) -> dict | None:
+    """The ``geometry.reasoning`` block, from the frontend tokenizer's probed
+    thinking profile. Peeks rather than builds: a cold tokenizer only kicks the
+    warmup thread (the profile itself is a handful of microsecond renders once
+    the tokenizer exists, safe to run inline)."""
+    manager = getattr(state, "_frontend_tokenizer", None)
+    if manager is None:
+        state.warm_frontend_tokenizer()
+        return None
+    from .model_meta import derive_think_gears
+
+    derived = derive_think_gears(
+        manager.thinking_profile(),
+        parser_configured=bool(getattr(state.config, "reasoning_parser", None)),
+    )
+    if derived is None:
+        return None
+    gears, default, kwargs = derived
+    return {"gears": list(gears), "default": default, "kwargs": kwargs}
+
+
 def cache_geometry(state: Any) -> dict:
     """Current cache geometry for the desktop cache panel. Each pool size resolves
     most-recent-truth first: the last rebuild's result, else the running UserReply snapshot
@@ -705,24 +744,13 @@ def cache_geometry(state: Any) -> dict:
         }
     except Exception:
         unit_bytes = {"kv_per_token": 0, "moe_per_expert": 0, "mamba_per_slot": 0, "swa_per_token": 0}
-    # Model-family thinking control: the gears a client can offer and the chat_template_kwargs
-    # each selects, so the desktop can render a think/effort control (and the shell its /think)
-    # and send the right kwargs on /v1/chat/completions. None when the model has no controllable
-    # thinking (or a dummy/absent config).
-    from .model_meta import think_chat_template_kwargs, think_spec
-
+    # Thinking control: the gears a client can offer and the chat_template_kwargs
+    # each selects, derived from the checkpoint's own probed template (no
+    # per-family registry). None until the frontend tokenizer is warm — the
+    # first status poll kicks the warmup thread and later polls see the gears,
+    # so the picker self-populates without ever blocking this route.
     try:
-        r_parser = getattr(config, "reasoning_parser", None)
-        r_gears, r_default = think_spec(r_parser)
-        reasoning = (
-            {
-                "gears": list(r_gears),
-                "default": r_default,
-                "kwargs": {g: think_chat_template_kwargs(r_parser, g) for g in r_gears},
-            }
-            if r_gears
-            else None
-        )
+        reasoning = _reasoning_geometry(state)
     except Exception:
         reasoning = None
     geo = {

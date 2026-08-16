@@ -234,7 +234,7 @@ def convert_responses_to_genspec(
 
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
     if req.reasoning:
-        ctk = effort_toggle_kwargs(reasoning_parser, req.reasoning.get("effort"), ctk)
+        ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
 
     return GenSpec(
         messages=render_messages(messages),

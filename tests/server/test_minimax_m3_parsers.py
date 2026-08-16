@@ -590,8 +590,17 @@ def test_detect_and_parse_multiple_wrappers_and_inter_block_text():
     "gear,mode", [("off", "disabled"), ("adaptive", "adaptive"), ("on", "enabled")]
 )
 def test_think_gears(gear, mode):
-    from freetoken.server.model_meta import think_chat_template_kwargs, think_spec
+    """M3's three thinking states are discovered from its template behavior
+    (thinking_mode disabled/adaptive/enabled, template default adaptive)."""
+    from freetoken.server.model_meta import derive_think_gears
+    from freetoken.tokenizer.effort import EffortProfile, probe_thinking_profile
 
-    gears, default = think_spec("minimax_m3")
+    def m3_render(kwargs, tools):
+        # The template reads thinking_mode only; adaptive is its own default.
+        return f"m3|{kwargs.get('thinking_mode', 'adaptive')}"
+
+    no_efforts = EffortProfile(supported=frozenset(), default=None, consumes_effort=False)
+    profile = probe_thinking_profile(m3_render, no_efforts)
+    gears, default, kwargs = derive_think_gears(profile, parser_configured=True)
     assert gears == ("off", "adaptive", "on") and default == "adaptive"
-    assert think_chat_template_kwargs("minimax_m3", gear) == {"thinking_mode": mode}
+    assert kwargs[gear]["thinking_mode"] == mode

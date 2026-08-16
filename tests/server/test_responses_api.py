@@ -865,7 +865,9 @@ def test_convert_reasoning_field_enables_thinking():
         {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}
     )
     spec = RP.convert_responses_to_genspec(req, {})
-    assert spec.chat_template_kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    }
 
     # an explicit thinking-related chat_template_kwargs key wins over the mapping
     req2 = ResponsesRequest.model_validate(
@@ -881,7 +883,7 @@ def test_convert_reasoning_field_enables_thinking():
          "chat_template_kwargs": {"custom_var": 1}}
     )
     assert RP.convert_responses_to_genspec(req3, {}).chat_template_kwargs == {
-        "enable_thinking": False, "custom_var": 1,
+        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1,
     }
 
     # absent reasoning -> no kwargs
@@ -895,25 +897,25 @@ def test_convert_reasoning_effort_none_disables_thinking():
         {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
     )
     assert RP.convert_responses_to_genspec(req, {}).chat_template_kwargs == {
-        "enable_thinking": False
+        "enable_thinking": False, "thinking_mode": "disabled"
     }
 
 
-def test_convert_reasoning_toggle_routes_through_family_mapping():
-    """The toggle goes through model_meta's per-family mapping -- for M3 that is
-    thinking_mode, not the (inert) enable_thinking key."""
+def test_convert_reasoning_toggle_broadcasts_every_spelling():
+    """The toggle is broadcast in every spelling templates read; a template
+    picks the knob it knows (M3: thinking_mode) and ignores the rest, so the
+    kwargs are family-independent."""
     req = ResponsesRequest.model_validate(
         {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}
     )
-    spec = RP.convert_responses_to_genspec(req, {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {
-        "thinking_mode": "enabled", "reasoning_effort": "high",
-    }
+    on = {"enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"}
     off = ResponsesRequest.model_validate(
         {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
     )
-    spec = RP.convert_responses_to_genspec(off, {}, reasoning_parser="minimax_m3")
-    assert spec.chat_template_kwargs == {"thinking_mode": "disabled"}
-    # gpt-oss: the template grades effort and has no off gear
-    spec = RP.convert_responses_to_genspec(req, {}, reasoning_parser="gpt_oss")
-    assert spec.chat_template_kwargs == {"reasoning_effort": "high"}
+    for parser in ("minimax_m3", "gpt_oss", None):
+        spec = RP.convert_responses_to_genspec(req, {}, reasoning_parser=parser)
+        assert spec.chat_template_kwargs == on, parser
+        spec = RP.convert_responses_to_genspec(off, {}, reasoning_parser=parser)
+        assert spec.chat_template_kwargs == {
+            "enable_thinking": False, "thinking_mode": "disabled"
+        }, parser

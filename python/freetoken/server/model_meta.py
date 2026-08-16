@@ -11,60 +11,80 @@ from __future__ import annotations
 import math
 from typing import Any, Tuple
 
-
-def think_spec(reasoning_parser: str | None) -> Tuple[Tuple[str, ...], str | None]:
-    """Return ``(gears, default_gear)`` a client can offer for a model family, keyed by its
-    configured reasoning parser. ``((), None)`` when the model has no controllable thinking.
-    Verified per family against each model's chat template / encoder."""
-    if reasoning_parser == "gpt_oss":
-        return ("low", "medium", "high"), "medium"  # always-on, 3-level effort
-    if reasoning_parser == "deepseekv32":
-        return ("off", "on", "max"), "off"  # thinking on/off + a max-effort gear
-    if reasoning_parser == "minimax":
-        return ("on",), "on"  # template always opens a think block; no off path
-    if reasoning_parser == "minimax_m3":
-        # M3's template takes thinking_mode disabled/adaptive/enabled; adaptive
-        # (the template's own default) lets the model decide per turn.
-        return ("off", "adaptive", "on"), "adaptive"
-    if reasoning_parser == "gemma4":
-        return ("off", "on"), "off"  # gemma's template defaults thinking off
-    if reasoning_parser in ("qwen3", "glm"):
-        return ("off", "on"), "on"
-    return (), None
+from freetoken.tokenizer.effort import (
+    EFFORT_SCALE,
+    OPENAI_EFFORT_TRIPLE,
+    THINKING_ADAPTIVE_KWARGS,
+    THINKING_OFF_KWARGS,
+    THINKING_ON_KWARGS,
+    ThinkingProfile,
+)
 
 
-def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -> dict:
-    """The ``chat_template_kwargs`` that select ``gear`` for the model family."""
-    if gear is None:
-        return {}
-    if reasoning_parser == "gpt_oss":
-        return {"reasoning_effort": gear}
-    if reasoning_parser == "deepseekv32":
-        if gear == "max":
-            return {"enable_thinking": True, "reasoning_effort": "max"}
-        return {"enable_thinking": gear == "on"}
-    if reasoning_parser == "minimax":
-        return {}  # always thinks; its template reads no knob
-    if reasoning_parser == "minimax_m3":
-        mode = {"off": "disabled", "adaptive": "adaptive", "on": "enabled"}[gear]
-        return {"thinking_mode": mode}
-    return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
-
-
-def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
+def thinking_toggle_kwargs(enabled: bool) -> dict:
     """``chat_template_kwargs`` for a protocol-level thinking on/off toggle
-    (Anthropic ``thinking.type``, Responses ``reasoning.effort``), routed through
-    the same per-family mapping as the chat-completions gears -- a hardcoded
-    ``enable_thinking`` is inert for templates that read a different knob (M3's
-    ``thinking_mode``). A family without the requested direction returns ``{}``;
-    with no configured parser the protocol-generic key is kept."""
-    gears, _default = think_spec(reasoning_parser)
+    (Anthropic ``thinking.type``, DeepSeek ``thinking``, Responses
+    ``reasoning.effort``): every spelling the ecosystem's templates read,
+    broadcast at once. A template picks the knob it knows and ignores the rest
+    (Jinja never sees undeclared variables), so no per-family routing exists."""
+    return dict(THINKING_ON_KWARGS if enabled else THINKING_OFF_KWARGS)
+
+
+def derive_think_gears(
+    profile: ThinkingProfile, parser_configured: bool
+) -> Tuple[Tuple[str, ...], str | None, dict] | None:
+    """``(gears, default_gear, kwargs_per_gear)`` for the /v1/cache/status
+    ``geometry.reasoning`` block, derived from the checkpoint's probed thinking
+    controls -- the checkpoint owns this knowledge; nothing here is keyed by
+    model family. ``None`` when there is nothing controllable to offer.
+
+    A template that grades effort without validating it gets the OpenAI triple
+    (the only vocabulary such a template is known to understand); an always-on
+    model with a reasoning parser but no observable knob shows a single "on"
+    gear so clients can still label the state."""
+    efforts = profile.efforts
+    gears: list[str] = []
+    kwargs: dict[str, dict] = {}
+    if profile.toggleable:
+        gears.append("off")
+        kwargs["off"] = dict(THINKING_OFF_KWARGS)
+    if profile.has_adaptive:
+        gears.append("adaptive")
+        kwargs["adaptive"] = dict(THINKING_ADAPTIVE_KWARGS)
+
+    if efforts.consumes_effort:
+        names = (
+            [n for n in efforts.supported if n in EFFORT_SCALE]
+            if efforts.validates
+            else list(OPENAI_EFFORT_TRIPLE)
+        )
+        for name in sorted(names, key=lambda n: EFFORT_SCALE[n]):
+            gears.append(name)
+            gear_kwargs = dict(THINKING_ON_KWARGS) if profile.toggleable else {}
+            gear_kwargs["reasoning_effort"] = name
+            kwargs[name] = gear_kwargs
+    elif profile.toggleable:
+        gears.append("on")
+        kwargs["on"] = dict(THINKING_ON_KWARGS)
+    elif parser_configured:
+        # Always-thinking family (minimax): no knob, but the state is real.
+        gears.append("on")
+        kwargs["on"] = {}
+
     if not gears:
-        return {"enable_thinking": enabled}
-    gear = "on" if enabled else "off"
-    if gear not in gears:
-        return {}
-    return think_chat_template_kwargs(reasoning_parser, gear)
+        return None
+
+    if profile.default_state == "off" and "off" in gears:
+        default = "off"
+    elif profile.default_state == "adaptive" and "adaptive" in gears:
+        default = "adaptive"
+    elif efforts.consumes_effort:
+        default = efforts.default if efforts.default in gears else (
+            "medium" if "medium" in gears else gears[-1]
+        )
+    else:
+        default = "on" if "on" in gears else gears[-1]
+    return tuple(gears), default, kwargs
 
 
 _THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
@@ -72,7 +92,6 @@ _DISABLE_EFFORTS = ("none", "off")
 
 
 def effort_toggle_kwargs(
-    reasoning_parser: str | None,
     effort: str | None,
     chat_template_kwargs: dict | None,
     thinking_type: str | None = None,
@@ -94,7 +113,7 @@ def effort_toggle_kwargs(
         disabled = True
     elif thinking_type == "enabled":
         disabled = False
-    mapped = dict(think_toggle_kwargs(reasoning_parser, not disabled))
+    mapped = thinking_toggle_kwargs(not disabled)
     if effort and not disabled and effort not in _DISABLE_EFFORTS:
         mapped.setdefault("reasoning_effort", effort)
     mapped.update(ctk)

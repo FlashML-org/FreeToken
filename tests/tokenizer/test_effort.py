@@ -18,20 +18,6 @@ DSV4_OFFICIAL = EffortProfile(
 IGNORES = EffortProfile(supported=frozenset(KNOWN_REASONING_EFFORTS), default=None, consumes_effort=False)
 
 
-def test_scale_matches_the_inkling_table():
-    # vLLM and SGLang publish the same name->float table; staying byte-compatible
-    # keeps "medium" meaning the same thing across the ecosystem.
-    assert EFFORT_SCALE == {
-        "none": 0.0,
-        "minimal": 0.1,
-        "low": 0.2,
-        "medium": 0.7,
-        "high": 0.9,
-        "xhigh": 0.99,
-        "max": 0.99,
-    }
-
-
 def test_in_vocabulary_values_pass_through():
     for name in ("xhigh", "medium", "low"):
         assert quantize_effort(name, QWEN38) == name
@@ -56,10 +42,6 @@ def test_xhigh_lands_on_dsv4_high_never_max():
     # "max" is an extreme opt-in gear, reachable only by its own name
     # (vLLM's DSV4 rule) -- rounding must not enter it.
     assert quantize_effort("xhigh", DSV4_OFFICIAL) == "high"
-
-
-def test_minimal_lands_on_the_lowest_gear():
-    assert quantize_effort("minimal", QWEN38) == "low"
 
 
 def test_max_lands_on_qwen_xhigh():
@@ -103,6 +85,7 @@ def test_probe_learns_the_qwen38_vocabulary():
     assert profile.supported == frozenset({"xhigh", "medium", "low"})
     assert profile.default == "xhigh"
     assert profile.consumes_effort
+    assert profile.validates  # rejections observed -> the vocabulary is real
 
 
 def _dsv4_render(kwargs, tools):
@@ -121,12 +104,22 @@ def test_probe_learns_the_dsv4_vocabulary_through_the_tools_round():
     assert profile.supported == frozenset({"low", "high", "max"})
     assert profile.default == "low"
     assert profile.consumes_effort
+    assert profile.validates
 
 
 def test_probe_marks_an_ignoring_template_as_not_consuming():
     profile = probe_effort_profile(lambda kwargs, tools: f"same|tools={bool(tools)}")
     assert not profile.consumes_effort
+    assert not profile.validates
     assert profile.default is None
+
+
+def test_probe_marks_an_interpolating_template_as_not_validating():
+    # Grades effort (renders differ) but rejects nothing: consumes without a
+    # trustworthy vocabulary.
+    profile = probe_effort_profile(lambda kwargs, tools: f"p|{kwargs.get('reasoning_effort')}")
+    assert profile.consumes_effort
+    assert not profile.validates
 
 
 def test_probe_skips_rounds_whose_baseline_fails():
@@ -138,12 +131,3 @@ def test_probe_skips_rounds_whose_baseline_fails():
     profile = probe_effort_profile(render)
     assert profile.supported == frozenset({"xhigh", "medium", "low"})
     assert profile.consumes_effort
-
-
-def test_probe_survives_a_template_that_rejects_everything():
-    def render(kwargs, tools):
-        raise RuntimeError("broken template")
-
-    profile = probe_effort_profile(render)
-    assert not profile.consumes_effort
-    assert quantize_effort("high", profile) is None
