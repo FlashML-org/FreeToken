@@ -1298,6 +1298,13 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0, n_hblk_dd = 0;
+  // Deduped pass-2 block size. 8 rows keeps the worker pool fed, and for the
+  // row-major formats the block is just "which output rows", so any size works.
+  // mxfp4 is different: its bank is transposed, so this becomes mxgemv's `ncol` --
+  // the dimension it vectorizes over. Below 16 the whole call drops into mxgemv's
+  // scalar tail, which measured 2.7x SLOWER than not deduping at all. Keep the full
+  // block there.
+  int hblk_dd = HBLK_DD;
   // Expert dedup for pass 1 (see build_dedup). dd_route holds the (tok*top_k + k)
   // route ids grouped by expert; dd_expert[j] owns dd_route[dd_start[j] ..
   // dd_start[j+1]). n_dd == 0 means "not deduped, use the per-route work split".
@@ -1591,7 +1598,7 @@ struct CpuMoeExecutor {
   // gemm1_dot (mxfp4 and ds_fp4 own their pass-1 bodies). Sets n_dd = 0 to opt out.
   void build_dedup(const MoeTask* t) {
     n_dd = 0;
-    if (!dedup_enabled || t->num_tokens < 2 || fmt == WF_MXFP4 || fmt == WF_DSFP4) return;
+    if (!dedup_enabled || t->num_tokens < 2) return;
     const int routes = t->num_tokens * top_k;
     dd_hist.assign(num_experts, 0);
     int valid = 0;
@@ -1679,16 +1686,16 @@ struct CpuMoeExecutor {
   }
 
   void do_pass1(const MoeTask* t, int64_t p) {
-    if (n_dd > 0) {
-      do_pass1_dedup(t, p);
-      return;
-    }
     if (fmt == WF_MXFP4) {
-      do_pass1_mxfp4(t, p);
+      if (n_dd > 0) do_pass1_mxfp4_dedup(t, p); else do_pass1_mxfp4(t, p);
       return;
     }
     if (fmt == WF_DSFP4) {
-      do_pass1_dsfp4(t, p);
+      if (n_dd > 0) do_pass1_dsfp4_dedup(t, p); else do_pass1_dsfp4(t, p);
+      return;
+    }
+    if (n_dd > 0) {
+      do_pass1_dedup(t, p);
       return;
     }
     const int64_t ib = p % n_iblk;
@@ -1748,8 +1755,8 @@ struct CpuMoeExecutor {
   // rounding differs in the last bits from the non-deduped path -- the same latitude
   // the kernel already takes between its ISA tiers.
   void do_pass2_dedup(const MoeTask* t, int64_t p) {
-    const int h0 = static_cast<int>(p) * HBLK_DD;
-    const int h1 = std::min(H, h0 + HBLK_DD);
+    const int h0 = static_cast<int>(p) * hblk_dd;
+    const int h1 = std::min(H, h0 + hblk_dd);
     if (h0 >= h1) return;
     const int nh = h1 - h0, nt = t->num_tokens;
     thread_local std::vector<float> acc;
@@ -1790,16 +1797,16 @@ struct CpuMoeExecutor {
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
-    if (n_dd > 0) {
-      do_pass2_dedup(t, p);
-      return;
-    }
     if (fmt == WF_MXFP4) {
-      do_pass2_mxfp4(t, p);
+      if (n_dd > 0) do_pass2_fp4_dedup(t, p, /*mx=*/true); else do_pass2_mxfp4(t, p);
       return;
     }
     if (fmt == WF_DSFP4) {
-      do_pass2_dsfp4(t, p);
+      if (n_dd > 0) do_pass2_fp4_dedup(t, p, /*mx=*/false); else do_pass2_dsfp4(t, p);
+      return;
+    }
+    if (n_dd > 0) {
+      do_pass2_dedup(t, p);
       return;
     }
     const int64_t hb = p % n_hblk;
@@ -1842,6 +1849,131 @@ struct CpuMoeExecutor {
   //
   // Dequant: w = E2M1[code] * 2^(e8m0_scale - 127); two codes per byte (low nibble
   // first), one e8m0 scale per 32 contiguous K. Matches kernel/triton/mxfp4_moe.py.
+
+  // mxfp4 pass 1, deduped. mxgemv computes a whole (Hh x ncol) tile for one token, so
+  // reuse here is the tile staying resident across the expert's routes -- 128 KiB at
+  // H=4096, so L2 rather than L1, but still not DRAM.
+  void do_pass1_mxfp4_dedup(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int es = static_cast<int>(p / n_iblk);
+    const int e = dd_expert[es];
+    const int r0 = dd_start[es], r1 = dd_start[es + 1];
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const bf16_t* gu_bias_l = reinterpret_cast<const bf16_t*>(tbl_at(gu_bias_tbl, t->layer_id));
+    const int N2 = 2 * I, Hh = H / 2;
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    const int nunit = i1 - i0, col0 = 2 * i0, ncol = 2 * nunit;
+    const uint8_t* blk_e = gu_packed_l + (size_t)e * Hh * N2;
+    const uint8_t* scl_e = gu_scale_l + (size_t)e * (size_t)(H / 32) * N2;
+    const bf16_t* bias_e = gu_bias_l + (size_t)e * N2 + col0;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int r = r0; r < r1; ++r) {
+      const int route = dd_route[r];
+      const int tok = route / top_k;
+      float gu[2 * IBLK];
+      mxgemv(gu, blk_e + col0, scl_e + col0, t->x + (size_t)tok * H, Hh, N2, ncol,
+             e2m1_lut, e8m0_lut);
+      bf16_t* g_row = g_scratch.data() + (size_t)route * I;
+      for (int j = 0; j < nunit; ++j) {
+        float gate = gu[2 * j] + bf16_to_f32(bias_e[2 * j]);
+        float up = gu[2 * j + 1] + bf16_to_f32(bias_e[2 * j + 1]);
+        if (gate > lim) gate = lim;
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
+        const float glu = gate / (1.0f + std::exp(-gate * alpha));
+        g_row[i0 + j] = f32_to_bf16(glu * (up + 1.0f));
+      }
+    }
+  }
+
+  // ds_fp4 pass 1, deduped: the expert's gate and up rows are read once and reused
+  // across its routes, exactly as in the generic path.
+  void do_pass1_dsfp4_dedup(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int es = static_cast<int>(p / n_iblk);
+    const int e = dd_expert[es];
+    const int r0 = dd_start[es], r1 = dd_start[es + 1];
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const int N2 = 2 * I, Hh = H / 2, Hs = H / 32;
+    const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
+    const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    const float lim = swiglu_limit;
+    for (int i = i0; i < i1; ++i) {
+      for (int r = r0; r < r1; ++r) {
+        const int route = dd_route[r];
+        const int tok = route / top_k;
+        const float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
+        const float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
+        float gate = bf16_to_f32(f32_to_bf16(
+            dsdot(gp + (size_t)i * Hh, gs + (size_t)i * Hs, xe, xo, H, e2m1_lut, e8m0_lut)));
+        float up = bf16_to_f32(f32_to_bf16(dsdot(
+            gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs, xe, xo, H, e2m1_lut, e8m0_lut)));
+        if (lim > 0.0f) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+        }
+        const float glu = gate / (1.0f + std::exp(-gate));
+        g_scratch[(size_t)route * I + i] = f32_to_bf16(glu * up);
+      }
+    }
+  }
+
+  // Shared deduped pass 2 for both fp4 formats: one work item owns an H-block for
+  // every token (see do_pass2_dedup for why), accumulating in a private fp32 buffer.
+  void do_pass2_fp4_dedup(const MoeTask* t, int64_t p, bool mx) {
+    const int h0 = static_cast<int>(p) * hblk_dd;
+    const int h1 = std::min(H, h0 + hblk_dd);
+    if (h0 >= h1) return;
+    const int nh = h1 - h0, nt = t->num_tokens;
+    thread_local std::vector<float> acc;
+    acc.assign((size_t)nt * nh, 0.0f);
+    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const bf16_t* dn_bias_l =
+        mx ? reinterpret_cast<const bf16_t*>(tbl_at(dn_bias_tbl, t->layer_id)) : nullptr;
+    const int Ih = I / 2, Is = I / 32;
+    for (int es = 0; es < n_dd; ++es) {
+      const int e = dd_expert[es];
+      const int r0 = dd_start[es], r1 = dd_start[es + 1];
+      for (int r = r0; r < r1; ++r) {
+        const int route = dd_route[r];
+        const int tok = route / top_k;
+        const float wt = t->w[route];
+        if (mx) {
+          const uint8_t* blk_e = dn_packed_l + (size_t)e * Ih * H;
+          const uint8_t* scl_e = dn_scale_l + (size_t)e * (size_t)Is * H;
+          float part[HBLK];
+          mxgemv(part, blk_e + h0, scl_e + h0, g_scratch.data() + (size_t)route * I, Ih, H,
+                 nh, e2m1_lut, e8m0_lut);
+          const bf16_t* bias_e = dn_bias_l + (size_t)e * H + h0;
+          for (int c = 0; c < nh; ++c)
+            acc[(size_t)tok * nh + c] += (part[c] + bf16_to_f32(bias_e[c])) * wt;
+        } else {
+          const uint8_t* dp_e = dn_packed_l + (size_t)e * (size_t)H * Ih;
+          const uint8_t* ds_e = dn_scale_l + (size_t)e * (size_t)H * Is;
+          const float* ge = ge_scratch.data() + (size_t)route * (I / 2);
+          const float* go = go_scratch.data() + (size_t)route * (I / 2);
+          for (int c = 0; c < nh; ++c) {
+            const int h = h0 + c;
+            // the reference rounds each route's weighted output to bf16 before summing
+            acc[(size_t)tok * nh + c] += bf16_to_f32(f32_to_bf16(
+                dsdot(dp_e + (size_t)h * Ih, ds_e + (size_t)h * Is, ge, go, I, e2m1_lut,
+                      e8m0_lut) * wt));
+          }
+        }
+      }
+    }
+    for (int tok = 0; tok < nt; ++tok) {
+      bf16_t* y_row = t->y + (size_t)tok * H;
+      for (int c = 0; c < nh; ++c) y_row[h0 + c] = f32_to_bf16(acc[(size_t)tok * nh + c]);
+    }
+  }
 
   void do_pass1_mxfp4(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
@@ -2060,7 +2192,8 @@ struct CpuMoeExecutor {
     // token routed to it rather than once per token.
     p1_total = n_dd > 0 ? static_cast<int64_t>(n_dd) * n_iblk
                         : static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
-    n_hblk_dd = (H + HBLK_DD - 1) / HBLK_DD;
+    hblk_dd = (fmt == WF_MXFP4) ? HBLK : HBLK_DD;
+    n_hblk_dd = (H + hblk_dd - 1) / hblk_dd;
     p2_total = n_dd > 0 ? static_cast<int64_t>(n_hblk_dd)
                         : static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
