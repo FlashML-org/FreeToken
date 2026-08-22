@@ -1293,6 +1293,15 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0;
+  // Expert dedup for pass 1 (see build_dedup). dd_route holds the (tok*top_k + k)
+  // route ids grouped by expert; dd_expert[j] owns dd_route[dd_start[j] ..
+  // dd_start[j+1]). n_dd == 0 means "not deduped, use the per-route work split".
+  std::vector<int> dd_expert, dd_start, dd_route, dd_hist;
+  int n_dd = 0;
+  // Read once per executor rather than once per process: a static would freeze the
+  // first value seen, which silently disables the A/B when both settings are
+  // exercised from one process.
+  bool dedup_enabled = true;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -1386,6 +1395,7 @@ struct CpuMoeExecutor {
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
+    if (const char* de = getenv("FREETOKEN_CPU_MOE_DEDUP")) dedup_enabled = de[0] != '0';
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
@@ -1571,7 +1581,103 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Group this task's routes by expert, counting-sort style. Only worth it when more
+  // than one token can collide on an expert, and only for the formats that go through
+  // gemm1_dot (mxfp4 and ds_fp4 own their pass-1 bodies). Sets n_dd = 0 to opt out.
+  void build_dedup(const MoeTask* t) {
+    n_dd = 0;
+    if (!dedup_enabled || t->num_tokens < 2 || fmt == WF_MXFP4 || fmt == WF_DSFP4) return;
+    const int routes = t->num_tokens * top_k;
+    dd_hist.assign(num_experts, 0);
+    int valid = 0;
+    for (int r = 0; r < routes; ++r) {
+      const int e = t->ids[r];
+      if (e < 0 || e >= num_experts) continue;
+      ++dd_hist[e];
+      ++valid;
+    }
+    if (valid == 0) return;
+    dd_expert.clear();
+    dd_start.clear();
+    dd_expert.reserve(valid);
+    dd_start.reserve(valid + 1);
+    int run = 0;
+    for (int e = 0; e < num_experts; ++e) {
+      if (!dd_hist[e]) continue;
+      dd_expert.push_back(e);
+      dd_start.push_back(run);
+      run += dd_hist[e];
+      dd_hist[e] = dd_start.back();  // reuse as the per-expert write cursor
+    }
+    dd_start.push_back(run);
+    dd_route.resize(valid);
+    for (int r = 0; r < routes; ++r) {
+      const int e = t->ids[r];
+      if (e < 0 || e >= num_experts) continue;
+      dd_route[dd_hist[e]++] = r;
+    }
+    // Every expert distinct -> the split is the same work, so keep the simpler path.
+    if ((int)dd_expert.size() == valid) return;
+    n_dd = (int)dd_expert.size();
+    if (getenv("FREETOKEN_CPU_MOE_DEDUP_DEBUG"))
+      fprintf(stderr, "[dedup] tokens=%d routes=%d valid=%d unique=%d reuse=%.2fx\n",
+              t->num_tokens, routes, valid, n_dd, (double)valid / n_dd);
+  }
+
+  // Pass 1 over (unique expert, row block): the expert's gate and up rows are loaded
+  // once and reused across every token routed to it. Both rows stay in L1 across the
+  // inner route loop (2 * H * 2 bytes = 16 KiB at H=4096), so the repeat reads never
+  // reach DRAM -- which is the whole point, the GEMV being DRAM-bound.
+  void do_pass1_dedup(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int es = static_cast<int>(p / n_iblk);
+    const int e = dd_expert[es];
+    const int r0 = dd_start[es], r1 = dd_start[es + 1];
+    const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const uint16_t* gu_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int i = i0; i < i1; ++i) {
+      for (int r = r0; r < r1; ++r) {
+        const int route = dd_route[r];
+        const int tok = route / top_k;
+        const float w_in = apply_on_input ? t->w[route] : 1.0f;
+        const bf16_t* x_row = t->x + (size_t)tok * H;
+        const float* xe = needs_di ? xe_scratch.data() + (size_t)tok * (H / 2) : nullptr;
+        const float* xo = needs_di ? xo_scratch.data() + (size_t)tok * (H / 2) : nullptr;
+        const int8_t* xi8 =
+            (use_vnni || use_q4a8) ? xi8_scratch.data() + (size_t)tok * H : nullptr;
+        const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
+                         : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
+                                    : nullptr;
+        float gate = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i,
+                               x_row, xe, xo, xi8, xas) * w_in;
+        float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i,
+                             x_row, xe, xo, xi8, xas) * w_in;
+        bf16_t* g_row = g_scratch.data() + (size_t)route * I;
+        if (swigluoai) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+          const float glu = gate / (1.0f + std::exp(-gate * alpha));
+          g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+        } else {
+          g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+        }
+      }
+    }
+  }
+
   void do_pass1(const MoeTask* t, int64_t p) {
+    if (n_dd > 0) {
+      do_pass1_dedup(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass1_mxfp4(t, p);
       return;
@@ -1880,6 +1986,7 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    build_dedup(t);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -1887,7 +1994,11 @@ struct CpuMoeExecutor {
     // this happens at most once, before any capture, while the pool is idle).
     const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
     if (need > g_scratch.size()) g_scratch.resize(need);
-    p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
+    // Deduped: one work item per (unique expert, output-row block) instead of per
+    // (token, route, block), so an expert's rows are read from DRAM once for every
+    // token routed to it rather than once per token.
+    p1_total = n_dd > 0 ? static_cast<int64_t>(n_dd) * n_iblk
+                        : static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
