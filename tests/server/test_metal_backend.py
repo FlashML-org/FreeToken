@@ -155,3 +155,93 @@ def test_handle_terminate_is_safe_on_empty():
     handle = metal.MetalBackendHandle()
     handle.terminate()  # no processes -> must not raise
     assert not handle.is_alive()
+
+
+# --------------------------------------------------------- model switching --
+
+def test_model_load_requires_model_field():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # missing field
+    r = client.post("/v1/model/load", json={"nomodel": "x"})
+    assert r.status_code == 400
+    # bad JSON body
+    r = client.post("/v1/model/load", content=b"not json", headers={"content-type": "application/json"})
+    assert r.status_code == 400
+
+
+def test_model_load_same_model_is_a_noop():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/v1/model/load", json={"model": "old-model"})
+    assert r.status_code == 200
+    assert r.json()["detail"] == "already serving this model"
+
+
+def test_model_load_switches_to_new_handle(monkeypatch):
+    """A successful switch swaps processes/upstream/model atomically."""
+    app = FastAPI()
+    old = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+    new_proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+
+    def fake_launch(backend, model, upstream_port=None):
+        assert (backend, model) == ("mlx", "new-model")
+        return metal.MetalBackendHandle(
+            processes=[new_proc],
+            upstream_base_url="http://127.0.0.1:2",
+            backend="mlx",
+            model_path="new-model",
+        )
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    metal.register_metal_proxy_routes(app, lambda: old)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    r = client.post("/v1/model/load", json={"model": "new-model"})
+    assert r.status_code == 200
+    assert old.model_path == "new-model"
+    assert old.upstream_base_url == "http://127.0.0.1:2"
+    assert len(old.processes) == 1 and old.processes[0] is new_proc
+
+
+def test_model_load_failure_keeps_old_model(monkeypatch):
+    """A failed launch must leave the old engine serving."""
+    app = FastAPI()
+    old = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+
+    def fake_launch(backend, model, upstream_port=None):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    metal.register_metal_proxy_routes(app, lambda: old)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    r = client.post("/v1/model/load", json={"model": "new-model"})
+    assert r.status_code == 500
+    assert "download failed" in r.json()["detail"]
+    assert old.model_path == "old-model"  # unchanged
+    assert old.upstream_base_url == "http://127.0.0.1:1"

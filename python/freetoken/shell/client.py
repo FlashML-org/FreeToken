@@ -214,6 +214,31 @@ class ShellClient:
                 return item["id"]
         return None
 
+    async def list_models(self) -> list[str]:
+        """All ids from ``/v1/models``, for ``/model``'s listing."""
+        doc = await self._request_json("GET", "/v1/models")
+        data = doc.get("data")
+        if not isinstance(data, list):
+            return []
+        return [
+            item["id"]
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+
+    async def load_model(self, model: str, *, wait: float = 600.0) -> dict[str, Any]:
+        """Switch the served model via ``POST /v1/model/load``.
+
+        Metal-backed servers relaunch their upstream engine for the new model
+        (the old one keeps serving until the new one is ready), so this can
+        block for the download + load; the timeout covers that. Servers without
+        the endpoint (CUDA path) answer 404 and the caller falls back to
+        showing the served model unchanged.
+        """
+        return await self._request_json(
+            "POST", "/v1/model/load", body={"model": model}, timeout=wait
+        )
+
     async def wait_until_ready(
         self,
         *,

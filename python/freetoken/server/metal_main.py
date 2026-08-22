@@ -17,6 +17,7 @@ Built on the reusable pieces in :mod:`freetoken.server.metal`.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from typing import Sequence
 
@@ -47,6 +48,11 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=1919)
     p.add_argument("--metal-port", type=int, default=0, help="Upstream port (0 = auto).")
+    p.add_argument(
+        "--shell",
+        action="store_true",
+        help="Attach the interactive ft shell to this server (serve+chat in one process).",
+    )
     return p.parse_args(list(argv))
 
 
@@ -74,6 +80,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return {"status": "ok", "backend": backend, "upstream": handle.upstream_base_url}
 
     try:
+        if args.shell:
+            import threading
+
+            origin = f"http://{args.host}:{args.port}"
+            server = uvicorn.Server(
+                uvicorn.Config(app, host=args.host, port=args.port, access_log=False)
+            )
+            thread = threading.Thread(
+                target=server.run, name="freetoken-uvicorn", daemon=True
+            )
+            thread.start()
+            from freetoken.shell.tui import run_shell
+
+            return asyncio.run(run_shell(origin, connect_grace=30.0))
         uvicorn.run(app, host=args.host, port=args.port)
     except KeyboardInterrupt:
         pass

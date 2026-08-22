@@ -23,7 +23,9 @@ ft serve-metal --model mlx-community/Qwen3-0.6B-4bit --backend mlx
 llama.cpp on Metal (see [install.md](install.md#method-3-macos--apple-silicon-metal-backend)).
 `--model` takes an MLX/HF repo id (`mlx-community/*`) or, with `--backend llama`,
 a local GGUF file. The rest of this page (`/v1/models`, chat completions, `ft shell`,
-`ft launch`) works unchanged against it.
+`ft launch`) works unchanged against it — including `ft shell --model <id>`, which
+starts the Metal engine and chats in one process on a Mac, and the `/model <id>`
+shell command to switch models without restarting.
 
 ## Send a request
 
@@ -61,7 +63,9 @@ ft shell --model ~/models/Qwen3.6-35B-A3B   # start an engine and chat, one proc
 ```
 
 `/help` lists the in-shell commands. Attach mode needs no GPU, so it also drives
-a server on another machine (`--server URL`).
+a server on another machine (`--server URL`). On a Mac, `ft shell --model <mlx/hf id>`
+starts the Metal backend instead (see [quickstart.md](quickstart.md)); `/model <id>`
+switches the served model on servers that support it (Metal).
 
 ## Use a coding agent
 

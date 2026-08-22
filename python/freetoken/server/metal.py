@@ -28,6 +28,7 @@ Backend resolution rules:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import shutil
@@ -165,17 +166,77 @@ class MetalBackendHandle:
     processes: list[subprocess.Popen] = field(default_factory=list)
     upstream_base_url: str = ""
     backend: str = ""
+    model_path: str = ""
+    _switch_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def terminate(self) -> None:
-        for p in self.processes:
-            try:
-                if p.poll() is None:
-                    p.terminate()
-            except Exception:  # noqa: BLE001 -- best-effort teardown
-                continue
+        _stop_processes(self.processes)
 
     def is_alive(self) -> bool:
         return any(p.poll() is None for p in self.processes)
+
+    def switch_model(self, model_path: str) -> None:
+        """Serve a different model: launch a second upstream for it, then swap.
+
+        The new engine loads on a fresh port *while the old one keeps serving*, so
+        the backend supervisor (which polls ``self.processes`` for liveness and
+        would otherwise read the old engine's death as a crash) only ever sees a
+        live list: ``processes`` is swapped as one reference, and the old engine
+        is terminated only after it is no longer watched. Concurrent load means
+        both models are resident during the switch -- the standard price of a
+        switch that cannot fail into a dead server.
+        """
+        with self._switch_lock:
+            new = launch_metal_backend(self.backend, model_path, upstream_port=None)
+            old_processes = self.processes
+            self.processes = new.processes
+            self.upstream_base_url = new.upstream_base_url
+            self.model_path = new.model_path
+        # The old engine keeps answering until here, so in-flight requests
+        # finish; stopping it after the swap needs the full escalate-to-kill
+        # path because its output pipe was drained (see _drain_process_output).
+        _stop_processes(old_processes)
+
+
+def _drain_process_output(proc: subprocess.Popen, name: str) -> None:
+    """Read a child's stdout until EOF on a daemon thread.
+
+    The children are launched with ``stdout=PIPE`` so launch failures are
+    visible, but an unread pipe fills (64 KiB) and then blocks the child inside
+    ``write()`` forever -- including ignoring SIGTERM. Draining on a thread
+    keeps the child healthy and makes ``terminate()`` actually work.
+    """
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            logger.debug("%s: %s", name, line.rstrip())
+    except Exception:  # noqa: BLE001 -- draining must never raise
+        pass
+
+
+def _stop_processes(processes: list[subprocess.Popen]) -> None:
+    for p in processes:
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:  # noqa: BLE001 -- best-effort teardown
+            continue
+    for p in processes:
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+                p.wait(timeout=5)
+            except Exception:  # noqa: BLE001 -- best-effort teardown
+                continue
+        except Exception:  # noqa: BLE001 -- best-effort teardown
+            continue
+
+
+def _start_drain_thread(proc: subprocess.Popen, name: str) -> None:
+    t = threading.Thread(target=_drain_process_output, args=(proc, name), daemon=True)
+    t.start()
 
 
 def _wait_for_readiness(url: str, process: subprocess.Popen, *, timeout: float) -> None:
@@ -244,10 +305,11 @@ def _launch_mlx(model_path: str, port: int) -> MetalBackendHandle:
         text=True,
         bufsize=1,
     )
+    _start_drain_thread(proc, "mlx")
     url = f"http://127.0.0.1:{port}"
     _wait_for_readiness(url, proc, timeout=_ADDRESS_HEALTH_TIMEOUT_S)
     return MetalBackendHandle(
-        processes=[proc], upstream_base_url=url, backend="mlx"
+        processes=[proc], upstream_base_url=url, backend="mlx", model_path=model_path
     )
 
 
@@ -274,10 +336,11 @@ def _launch_llama(model_path: str, port: int, **kwargs: Any) -> MetalBackendHand
         text=True,
         bufsize=1,
     )
+    _start_drain_thread(proc, "llama")
     url = f"http://127.0.0.1:{port}"
     _wait_for_readiness(url, proc, timeout=_ADDRESS_HEALTH_TIMEOUT_S)
     return MetalBackendHandle(
-        processes=[proc], upstream_base_url=url, backend="llama"
+        processes=[proc], upstream_base_url=url, backend="llama", model_path=model_path
     )
 
 
@@ -343,7 +406,85 @@ def register_metal_proxy_routes(
 
     @app.get("/v1/models")
     async def proxy_models(request: Request):
+        """List models. Overridden when the upstream reports more than the one it
+        actually serves (mlx_lm lists the whole local HF cache): the proxy reports
+        the served model only, so clients (ft shell) label the right one."""
+        response = await _forward(request, get_backend, method="GET")
+        handle = get_backend()
+        if (
+            isinstance(response, Response)
+            and response.status_code == 200
+            and handle is not None
+            and handle.model_path
+        ):
+            try:
+                doc = json.loads(response.body)
+            except Exception:  # noqa: BLE001 -- keep upstream's answer as-is
+                return response
+            data = doc.get("data") if isinstance(doc, dict) else None
+            if not isinstance(data, list):
+                return response
+            ids = [
+                item.get("id")
+                for item in data
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ]
+            if ids == [handle.model_path]:
+                return response  # already truthful
+            import time as _time
+
+            doc["data"] = [
+                {"id": handle.model_path, "object": "model", "created": doc.get("created", int(_time.time()))}
+            ]
+            return JSONResponse(doc)
+        return response
+
+    @app.get("/v1/model/list")
+    async def proxy_model_list(request: Request):
         return await _forward(request, get_backend, method="GET")
+
+    @app.post("/v1/model/load")
+    async def model_load(request: Request):
+        """Switch the Metal upstream to a different model.
+
+        Accepts ``{"model": "<path or HF id>"}`` and relaunches the upstream
+        engine (mlx/llama.cpp) on a fresh port while the old one keeps serving,
+        then swaps the proxy target. On failure the server keeps the old model
+        (the new upstream never launched) and returns the reason.
+        """
+        handle = get_backend()
+        if handle is None or not handle.is_alive():
+            return JSONResponse(
+                {"detail": "Metal backend is not running"}, status_code=503
+            )
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 -- bad JSON is a client error
+            return JSONResponse(
+                {"detail": "request body must be JSON with a 'model' field"},
+                status_code=400,
+            )
+        model = body.get("model") if isinstance(body, dict) else None
+        if not model or not isinstance(model, str):
+            return JSONResponse(
+                {"detail": "request body must be JSON with a 'model' field"},
+                status_code=400,
+            )
+        if model == handle.model_path:
+            return {
+                "status": "ok",
+                "model": model,
+                "detail": "already serving this model",
+            }
+        try:
+            # Launch may block for the model download + load; run off the event
+            # loop so /health and in-flight generations keep answering.
+            handle.switch_model(model)
+        except Exception as exc:  # noqa: BLE001 -- a failed switch must not kill the server
+            return JSONResponse(
+                {"detail": f"model switch failed: {exc}"}, status_code=500
+            )
+        return {"status": "ok", "model": model}
 
     @app.get("/health")
     async def metal_health(request: Request):
