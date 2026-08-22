@@ -21,14 +21,29 @@ def _importable(name: str) -> bool:
         return False
 
 
+def _supports_sm80() -> bool:
+    """Whether this GPU can run the optional native kernel wheels.
+
+    The sglang and triton-kernels wheels used by FreeToken carry Ampere-and-newer
+    kernels. On older GPUs, selecting them by importability causes a late CUDA
+    launch failure instead of using FreeToken's fallbacks.
+    """
+    try:
+        import torch
+
+        return not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (8, 0)
+    except Exception:
+        return True
+
+
 @functools.cache
 def is_flashinfer_installed() -> bool:
-    return _importable("flashinfer")
+    return _supports_sm80() and _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
-    return _importable("sgl_kernel")
+    return _supports_sm80() and _importable("sgl_kernel")
 
 
 @functools.cache
@@ -39,7 +54,7 @@ def is_triton_kernels_installed() -> bool:
     source tree and has no Windows wheel. It is also not one of the six ops
     ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
     """
-    return _importable("triton_kernels")
+    return _supports_sm80() and _importable("triton_kernels")
 
 
 @functools.cache

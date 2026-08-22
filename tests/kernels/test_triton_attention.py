@@ -600,6 +600,9 @@ def test_extend_triton_attention_with_sinks_matches_reference(use_split_inputs: 
         # consumer opt-in smem (sm_89 ~99KB): shrink once head_dim >= 256
         (256, 101376, (64, 32)),
         (512, 101376, (16, 16)),
+        # Turing exposes 64 KiB; use a tile that fits Triton's larger allocation.
+        (256, 65536, (32, 16)),
+        (512, 65536, (16, 16)),
         # unknown budget -> conservative small tiles (prior consumer-safe behavior)
         (256, 0, (64, 32)),
         (512, 0, (16, 16)),

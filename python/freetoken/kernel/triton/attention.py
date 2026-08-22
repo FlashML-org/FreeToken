@@ -28,6 +28,12 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
     selects the small tiles, i.e. the prior consumer-safe behavior.
     """
+    # Turing exposes only 64 KiB of opt-in shared memory. Triton needs more than
+    # the q/k/v tile estimate, so use a smaller tile instead of compiling a kernel
+    # that the device cannot launch.
+    if 0 < smem_optin <= 65536:
+        return (32, 16) if head_dim <= 256 else (16, 16)
+
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
     def fits(block_m: int, block_n: int) -> bool:
