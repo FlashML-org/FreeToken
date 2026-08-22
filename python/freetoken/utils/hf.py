@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import re
 from typing import Any
 
 from typing import FrozenSet
@@ -213,6 +214,48 @@ def download_hf_weight(model_path: str) -> str:
             allow_patterns=["*.safetensors"],
             tqdm_class=DisabledTqdm,
         )
+    except Exception as e:
+        raise ValueError(
+            f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
+        )
+
+
+# Weight formats FreeToken never loads -- it reads safetensors (plus GGUF for Gemma-4).
+# Plenty of repos still ship a duplicate .bin/.pth copy of the same tensors, so skipping
+# them can halve a first-time pull.
+_UNLOADABLE_WEIGHTS = ("*.bin", "*.pt", "*.pth", "*.h5", "*.msgpack", "*.onnx")
+
+
+# A hub repo id is "org/name" and nothing else. Anything with a leading separator, a
+# "~", or more than one "/" is a filesystem path the user got wrong, and turning that
+# into a hub lookup replaces "no such directory" with a confusing download error.
+_HUB_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def looks_like_hub_repo_id(model_path: str) -> bool:
+    """Whether ``model_path`` should be resolved against the Hub rather than the disk."""
+    return bool(_HUB_REPO_ID.match(model_path))
+
+
+def download_hf_checkpoint(model_path: str, *, dummy_weight: bool = False) -> str:
+    """Resolve a Hugging Face repo id to a complete local checkpoint directory.
+
+    ``download_hf_weight`` fetches only ``*.safetensors``, which is all the weight
+    loaders need once the engine is running. Config parsing happens earlier and wants
+    more than that: the tokenizer, and the model-specific subdirs some architectures
+    read directly off disk -- DeepSeek-V4 fails without ``inference/config.json``
+    (see ``models/deepseek_v4/args.py``). So this pulls the whole snapshot.
+
+    A path that is already a local directory is returned untouched.
+    """
+    if os.path.isdir(model_path) or not looks_like_hub_repo_id(model_path):
+        return model_path
+    ignore_patterns = list(_UNLOADABLE_WEIGHTS)
+    if dummy_weight:
+        # Config and tokenizer are still needed; the tensors are not.
+        ignore_patterns += ["*.safetensors", "*.gguf"]
+    try:
+        return snapshot_download(model_path, ignore_patterns=ignore_patterns)
     except Exception as e:
         raise ValueError(
             f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
