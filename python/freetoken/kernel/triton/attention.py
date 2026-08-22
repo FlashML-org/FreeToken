@@ -5,6 +5,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 
 _MAX_KV_SPLITS = 8
@@ -18,28 +19,72 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
-    """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
+def _select_extend_tiles(head_dim: int, block_d: int, smem_optin: int) -> list[tuple[int, int]]:
+    """Candidate ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, largest first.
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
     q/k/v tiles need about ``(BLOCK_M + 2 * BLOCK_N) * BLOCK_D * 2`` bytes of shared
     memory, which overflows consumer GPUs (sm_89 ~99KB opt-in) once head_dim >= 256.
     Keep the fast tiles where the device's opt-in shared memory fits them (datacenter
-    A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
-    selects the small tiles, i.e. the prior consumer-safe behavior.
+    A100/H100); shrink only where it does not.
+
+    That byte count is a *lower bound*: what triton actually allocates depends on how it
+    schedules the pipeline, and the split kernel wants roughly twice the tile bytes. So
+    this returns the whole descending ladder from the first plausible rung and the caller
+    lets the compiler have the final say -- see :func:`_launch_first_fitting_tile`. The
+    floor is (16, 16) because ``tl.dot`` requires N >= 16. ``smem_optin == 0`` (unknown)
+    conservatively starts at the small tiles, i.e. the prior consumer-safe behavior.
     """
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
-    def fits(block_m: int, block_n: int) -> bool:
-        return (block_m + 2 * block_n) * block_d * 2 <= budget
-
-    if head_dim <= 128:
-        return 128, 64
     if head_dim <= 256:
-        return (128, 64) if fits(128, 64) else (64, 32)
-    if head_dim <= 384:
-        return (32, 64) if fits(32, 64) else (32, 32)
-    return (32, 64) if fits(32, 64) else (16, 16)
+        ladder = [(128, 64), (64, 32), (32, 32), (16, 16)]
+    elif head_dim <= 384:
+        ladder = [(32, 64), (32, 32), (16, 16)]
+    else:
+        ladder = [(32, 64), (16, 16)]
+    if not smem_optin:
+        return ladder[1:] if len(ladder) > 1 else ladder
+    first = next(
+        (i for i, (m, n) in enumerate(ladder) if (m + 2 * n) * block_d * 2 <= budget),
+        len(ladder) - 1,
+    )
+    return ladder[first:]
+
+
+def _launch_first_fitting_tile(run, tiles: list[tuple[int, int]]):
+    """Call ``run(block_m, block_n)`` on the first tile triton can actually allocate.
+
+    ``OutOfResources`` is raised while triton sets up the launch -- after compiling the
+    kernel, before any GPU work is issued -- so dropping to a smaller tile and retrying is
+    side-effect free. Triton caches each compile, so this costs one extra compile the
+    first time a shape is seen on an undersized device and nothing afterwards.
+    """
+    for i, (block_m, block_n) in enumerate(tiles):
+        try:
+            return run(block_m, block_n)
+        except OutOfResources:
+            if i == len(tiles) - 1:
+                raise
+
+
+def _select_decode_tile(block_d: int, block_dv: int, smem_optin: int) -> tuple[int, int]:
+    """Pick ``(BLOCK_N, num_stages)`` for the split-k decode kernel, shared-memory aware.
+
+    The pipelined k/v tiles cost about ``num_stages * BLOCK_N * (BLOCK_D + BLOCK_DV) * 2``
+    bytes. The default 32/2 needs 128KB at head_dim 512 -- fine on A100/H100, over budget
+    on consumer Ampere/Ada and far over Pascal's 48KB. Shrink only where it does not fit,
+    so every device that fits the default keeps it. ``smem_optin == 0`` (unknown) keeps
+    the default, matching the prior behavior.
+    """
+    if not smem_optin:
+        return 32, 2
+    budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
+
+    for block_n, stages in ((32, 2), (32, 1), (16, 1)):
+        if stages * block_n * (block_d + block_dv) * 2 <= budget:
+            return block_n, stages
+    return 16, 1
 
 
 @triton.jit
@@ -398,6 +443,9 @@ def decode_paged_attention(
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
+    block_n, num_stages = _select_decode_tile(
+        block_d, block_dv, _optin_smem_bytes(q.device.index)
+    )
 
     _decode_grouped_stage1_kernel[
         (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
@@ -428,7 +476,7 @@ def decode_paged_attention(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        BLOCK_N=32,
+        BLOCK_N=block_n,
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
@@ -436,7 +484,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         num_warps=4,
-        num_stages=2,
+        num_stages=num_stages,
     )
     _decode_stage2_kernel[(batch, num_q_heads)](
         attn_logits,
@@ -797,18 +845,20 @@ def extend_paged_attention(
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
-    # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
-    block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
-    )
-    grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
-    if k_extend is not None or v_extend is not None:
+    # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512),
+    # and further on pre-Volta, which caps a block at 48KB with no opt-in at all.
+    tiles = _select_extend_tiles(head_dim, block_d, _optin_smem_bytes(q.device.index))
+    use_split = k_extend is not None or v_extend is not None
+    if use_split:
         assert k_extend is not None and v_extend is not None
         assert k_extend.is_cuda and v_extend.is_cuda
         assert k_extend.dim() == 3 and v_extend.dim() == 3
         assert k_extend.shape[0] == num_q_tokens and v_extend.shape[0] == num_q_tokens
         assert k_extend.shape[1] == num_kv_heads and v_extend.shape[1] == num_kv_heads
         assert k_extend.shape[-1] == head_dim and v_extend.shape[-1] == head_dim
+
+    def _run_split(block_m: int, block_n: int) -> None:
+        grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
         _extend_attention_split_kernel[grid](
             q,
             k_extend,
@@ -845,38 +895,41 @@ def extend_paged_attention(
             num_warps=8,
             num_stages=1,
         )
-        return o
 
-    _extend_attention_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        o,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        prefix_lens,
-        sm_scale,
-        sinks_arg,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        o.stride(0),
-        o.stride(1),
-        GROUP=num_q_heads // num_kv_heads,
-        D=head_dim,
-        BLOCK_D=block_d,
-        BLOCK_DV=block_dv,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        SLIDING_WINDOW=sliding_window or 0,
-        HAS_SINKS=sinks is not None,
-        num_warps=8,
-        num_stages=1,
-    )
+    def _run_plain(block_m: int, block_n: int) -> None:
+        grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
+        _extend_attention_kernel[grid](
+            q,
+            k_cache,
+            v_cache,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            prefix_lens,
+            sm_scale,
+            sinks_arg,
+            q.stride(0),
+            q.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            o.stride(0),
+            o.stride(1),
+            GROUP=num_q_heads // num_kv_heads,
+            D=head_dim,
+            BLOCK_D=block_d,
+            BLOCK_DV=block_dv,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            SLIDING_WINDOW=sliding_window or 0,
+            HAS_SINKS=sinks is not None,
+            num_warps=8,
+            num_stages=1,
+        )
+
+    _launch_first_fitting_tile(_run_split if use_split else _run_plain, tiles)
     return o
 
 
