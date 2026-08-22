@@ -120,12 +120,17 @@ def test_host_device_ptr_is_identity_under_uva():
     torch.cuda.init()
     if not _host_ptr_identity():
         pytest.skip("non-UVA platform: host_device_ptr rejects unregistered memory instead")
-    # Under UVA cudaHostGetDevicePointer degenerates to identity for any host pointer
-    # (no registration validation); rejection of pageable memory only exists on
-    # non-identity platforms (Windows/WDDM), where the translation is real.
+    # cudaHostGetDevicePointer on *unregistered* memory is unspecified: recent arches let
+    # UVA degenerate it to identity, while Pascal validates registration and returns
+    # cudaErrorInvalidValue. Either is fine -- what must never happen is a different
+    # nonzero alias, which would silently misaddress the zero-copy gather. The in-contract
+    # case (registered memory -> identity) is test_host_bank_pin_registers_and_translates.
     pageable = torch.empty(64, dtype=torch.uint8)
     ext = _load_pinned_extension()
-    assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
+    try:
+        assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
+    except RuntimeError as exc:
+        assert "cudaHostGetDevicePointer failed" in str(exc)
 
 
 def test_host_bank_pin_registers_and_translates():

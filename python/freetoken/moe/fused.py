@@ -128,6 +128,19 @@ def moe_align_block_size(
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
+        from freetoken.utils.arch import is_sm70_supported
+
+        if not is_sm70_supported():
+            # The fused triton path ranks the scatter with tl.atomic_add, and triton
+            # lowers every atomic to a scoped+ordered PTX encoding that only sm_70+
+            # can assemble -- there is no sem=/scope= that avoids it. The staged
+            # implementation computes the same buffers with a counts/cumsum chain and
+            # no atomics, so pre-Volta routes there instead. Slower (5 launches vs 1),
+            # which is the right trade against not running at all.
+            from freetoken.kernel import moe_align_block_size_triton
+
+            return moe_align_block_size_triton(topk_ids, block_size, num_experts)
+
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )

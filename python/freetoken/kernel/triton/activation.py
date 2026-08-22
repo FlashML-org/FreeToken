@@ -21,6 +21,9 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 
+from triton.language import target_info
+from triton.runtime.jit import constexpr_function
+
 from freetoken.utils.arch import is_sm90_supported
 
 SILU = 0
@@ -44,6 +47,15 @@ def _pdl_supported() -> bool:
     # ptxas rejects the intrinsic. The fallback path is exactly where a non-Hopper
     # card (3090 sm_86, 4090/4060 sm_89, A100 sm_80) is most likely, so gate it off.
     return is_sm90_supported()
+
+
+@constexpr_function
+def _fast_tanh_cx():
+    """Compile-time: can the target issue ``tanh.approx.f32``? It is an sm_75+
+    instruction and pre-Turing ptxas rejects the whole module ("Feature 'tanh' requires
+    .target sm_75 or higher"), so older cards take the libdevice fallback below. Resolved
+    from the compilation target like :mod:`freetoken.kernel.triton.e4m3_compat` does."""
+    return target_info.cuda_capability_geq(7, 5)
 
 
 @triton.jit
@@ -96,9 +108,13 @@ def _act_and_mul_kernel(
     if ACT == 0:  # SILU: x / (1 + exp(-x)) via ex2.approx
         act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
         y = act * up
-    elif ACT == 2:  # GELU_TANH via tanh.approx
+    elif ACT == 2:  # GELU_TANH via tanh.approx (sm_75+), else libdevice
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-        act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        if _fast_tanh_cx():
+            tanh_inner = _fast_tanh(inner)
+        else:
+            tanh_inner = libdevice.tanh(inner)
+        act = 0.5 * gate * (1.0 + tanh_inner)
         y = act * up
     elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
         gate = tl.minimum(gate, limit)
