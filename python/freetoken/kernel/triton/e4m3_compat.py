@@ -43,25 +43,27 @@ if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
     os.environ["TRITON_CACHE_DIR"] = os.path.join(
         os.path.expanduser("~/.triton"), "cache-e4m3emu")
 
-_native: bool | None = None
+# The sm_89 (Ada) boundary: fp8e4nv is a native tensor-core type from here up.
+NATIVE_FP8_CAPABILITY = (8, 9)
 
 
 def e4m3_native() -> bool:
     """Host-side twin of :func:`e4m3_native_cx`: True when kernels take fp8e4nv
-    tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers."""
-    global _native
+    tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers.
+
+    Reads the *same* active-driver target as :func:`e4m3_native_cx` (via
+    ``target_info``) on every call, so the host representation and the compiled
+    kernel branch can never disagree. It is deliberately NOT memoized on the
+    first call: a memoized snapshot taken before the worker binds its GPU (or on
+    the default device of a heterogeneous host) would pin a stale convention that
+    contradicts the device the kernel actually compiles for."""
     if _env_force() != FORCE_EMU:
         raise RuntimeError(
             "FREETOKEN_FORCE_E4M3_EMU changed after import: the flag is read once at "
             "import and is not part of triton's compile cache key -- set it before "
             "the process starts (with its own TRITON_CACHE_DIR)"
         )
-    if _native is None:
-        if FORCE_EMU:
-            _native = False
-        else:
-            _native = torch.cuda.get_device_capability() >= (8, 9)
-    return _native
+    return not FORCE_EMU and target_info.cuda_capability_geq(*NATIVE_FP8_CAPABILITY)
 
 
 def e4m3_kernel_view(t: torch.Tensor) -> torch.Tensor:
@@ -82,7 +84,7 @@ def e4m3_native_cx():
     Delegates to ``target_info`` (reads the active driver's target, so
     cross-compilation tests that patch ``driver.active.get_current_target``
     resolve consistently)."""
-    return not FORCE_EMU and target_info.cuda_capability_geq(8, 9)
+    return not FORCE_EMU and target_info.cuda_capability_geq(*NATIVE_FP8_CAPABILITY)
 
 
 @jit
