@@ -66,6 +66,13 @@ def measure_decode_tps(model_path: str, engine_kwargs: dict, prompt: str,
     from freetoken.core import SamplingParams
     from freetoken.llm import LLM
 
+    # `ft serve` defaults the offload-family backends to --moe-cache-auto when no
+    # cache-sizing flag is given (prepare_server_args); the offline LLM path does not,
+    # so a bare `--compare moe-backend=hybrid,offload` would die on moe_cache_size=0.
+    if not any(k in engine_kwargs
+               for k in ("moe_cache_size", "moe_cache_rate", "moe_cache_auto")):
+        engine_kwargs = {**engine_kwargs, "moe_cache_auto": True}
+
     llm = LLM(model_path, dtype=torch.bfloat16, **engine_kwargs)
     # `ignore_eos` so every run generates exactly `tokens` -- otherwise an early stop
     # silently shortens the measurement and inflates the rate.
