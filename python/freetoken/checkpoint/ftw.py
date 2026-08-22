@@ -68,18 +68,19 @@ def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
 def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
     """POSIX positional read into ``mv`` at ``offset``, looping over any short preadv.
 
-    preadv may return short (a signal, or the EOF-adjacent tail); the bare call this
-    replaces ignored the return value, so a short read silently left the tail of the
-    destination unfilled -- garbage bytes in the middle of a weight tensor with no
-    error anywhere. Resuming at the running offset stays O_DIRECT-legal: the writer
-    pads every tensor to ALIGN and cuts shards at ALIGN boundaries, so direct-IO
-    short reads land on block boundaries."""
+    preadv may return short (a signal, or the EOF-adjacent tail); the loop resumes
+    at the running offset, which stays O_DIRECT-legal: the writer pads every tensor
+    to ALIGN and cuts shards at ALIGN boundaries, so direct-IO short reads land on
+    block boundaries. EOF before the buffer is filled raises ``OSError`` — a
+    truncated shard must not silently load garbage weights."""
     done = 0
     total = len(mv)
     while done < total:
         n = os.preadv(fd, [mv[done:]], offset + done)
         if n == 0:
-            break  # EOF
+            raise OSError(
+                f"unexpected EOF reading FTW: got {done}/{total} bytes at offset {offset}"
+            )
         done += n
 
 
@@ -317,11 +318,20 @@ class FTWReader:
         if self._direct:
             def rd(job):
                 file, fo, do, ln = job
-                _pread_into(self._fd(file), dest[do:do + ln], fo)
+                try:
+                    _pread_into(self._fd(file), dest[do:do + ln], fo)
+                except OSError as e:
+                    raise OSError(f"shard {file}: {e}") from e
         else:
             def rd(job):
                 file, fo, do, ln = job
-                dest[do:do + ln] = self._map(file)[fo:fo + ln]  # memcpy from the mapping
+                mv = self._map(file)
+                if fo + ln > len(mv):
+                    raise OSError(
+                        f"unexpected EOF reading FTW: shard {file} has "
+                        f"{len(mv)} bytes, need {ln} at offset {fo}"
+                    )
+                dest[do:do + ln] = mv[fo:fo + ln]
 
         if len(jobs) <= 1:
             for j in jobs:
