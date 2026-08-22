@@ -915,18 +915,68 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
 
+def _install_routes_for_backend(config: ServerArgs) -> None:
+    """Select the route set that matches the inference backend.
+
+    The FastAPI ``app`` is module-global, and the CUDA-native generation routes are
+    registered on import (``register_openai_routes`` etc.). When the resolved backend
+    is an Apple Silicon Metal runtime, the generation surface must proxy to the
+    upstream engine instead of hitting the in-process CUDA scheduler. This replaces
+    the native generation routes with proxy routes on the *same* app object, so the
+    control/accounting/health routes (backend-agnostic) stay intact on both paths.
+
+    The CUDA path registers the native routes at import time and this is a no-op.
+    """
+    from .metal import register_metal_proxy_routes
+
+    if getattr(config, "backend", "auto") not in ("mlx", "llama"):
+        return
+
+    # Base URL is not yet known here (the handle is created in launch), so we register
+    # routes that pull the handle lazily from the module-global backend handle set
+    # below (run_api_server assigns _GLOBAL_STATE.backend_processes / handle).
+    def get_backend():
+        st = _GLOBAL_STATE
+        return getattr(st, "metal_backend_handle", None)
+
+    # Drop the native generation routes (openai, anthropic, responses) so their
+    # handlers don't also match; keep control/accounting/health.
+    paths_to_clear = {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/responses",
+        "/v1/embeddings",
+        "/v1/models",
+    }
+    filtered = []
+    for r in getattr(app, "routes", []):
+        path = getattr(r, "path", None)
+        if path in paths_to_clear:
+            continue
+        filtered.append(r)
+    app.router.routes = filtered
+
+    register_metal_proxy_routes(app, get_backend)
+
+
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
     """
-    Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
+    Run the frontend API server (FastAPI + uvicorn) and wire it to the backend.
 
-    Args:
-        config: Server configuration (host/port, ZMQ IPC addresses, etc).
-        start_backend: Callback that launches the backend worker processes (TP schedulers +
-            tokenizer/detokenizer).
-        run_shell: If True, also attach the interactive terminal shell to the served API.
+    For the native CUDA path this wires the scheduler/tokenizer workers via ZMQ
+    (unchanged). When ``start_backend()`` returns a Metal backend handle, the
+    OpenAI/Anthropic/Responses surface is registered as a proxy to the upstream
+    Metal engine instead (see server/metal.py).
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
+
+    # When a Metal backend is selected, the OpenAI/Anthropic/Responses surface must
+    # proxy to the upstream engine rather than use the in-process ZMQ scheduler.
+    # The CUDA-native routes were registered on ``app`` at import time; for Metal we
+    # swap those generation paths for proxy routes before uvicorn starts.
+    _install_routes_for_backend(config)
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
@@ -977,6 +1027,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
+    # A Metal backend handle exposes ``upstream_base_url``; the proxy routes read it
+    # lazily from here. Only set for the Metal path (CUDA handle has no this attr).
+    if hasattr(handle, "upstream_base_url"):
+        _GLOBAL_STATE.metal_backend_handle = handle
 
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend

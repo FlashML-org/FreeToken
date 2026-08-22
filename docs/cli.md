@@ -7,6 +7,7 @@ ft <command> [args]
 | Command | Purpose |
 |---|---|
 | `ft serve` | Start the API server (OpenAI `/v1/*`, Anthropic `/v1/messages`, Responses) |
+| `ft serve-metal` | Start the same API surface over an Apple Silicon Metal backend (mlx or llama.cpp) |
 | `ft shell` | Chat with a server in the terminal |
 | `ft ctl` | Query and manage a running server over HTTP |
 | `ft launch` | Configure and launch a coding agent against a server |
@@ -80,6 +81,42 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+
+## ft serve-metal
+
+`ft serve-metal` runs the same OpenAI `/v1/*`, Anthropic `/v1/messages`, and
+Responses API surface, but backs it with an **Apple Silicon Metal runtime**
+instead of FreeToken's CUDA scheduler. It does not import FreeToken's CUDA
+stack, so it works standalone on a Mac (no triton/flashinfer/sglang-kernel, no
+`flashlib`) by proxying to a Metal engine that already implements the protocol.
+
+```bash
+ft serve-metal --model mlx-community/Qwen3-0.6B-4bit --backend mlx --port 1919
+ft serve-metal --model ~/models/MyModel.Q4_K_M.gguf --backend llama --port 1919
+```
+
+The API surface (chat/completions/models/health, streaming included) is
+bit-for-bit the same FreeToken wire, so the desktop app, `ft shell`, `ft launch`
+agents, and OpenAI/Anthropic clients all work unchanged.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model` | required | Model path or HF id for the Metal engine |
+| `--backend` | `auto` | `mlx` (Apple's `mlx_lm.server`) or `llama` (llama.cpp `llama-server`); `auto` prefers mlx |
+| `--host` | 127.0.0.1 | FreeToken API bind address |
+| `--port` | 1919 | FreeToken API port (user-facing) |
+| `--metal-port` | 0 | Upstream Metal engine port; a free loopback port is chosen when `0` |
+
+Notes:
+
+- **mlx** requires the model loadable by `mlx-lm` (HF-converted or MLX weights,
+  e.g. `mlx-community/*`). `mlx_lm` uses the Apple GPU (Metal) directly.
+- **llama** requires the `llama-server` binary on PATH and a GGUF model (the
+  same format FreeToken already parses). It runs with the Metal backend
+  (`-ngl 999`).
+- `ft serve --backend mlx|llama` also switches between these backends on a CUDA
+  box, but still imports the CUDA config stack; `ft serve-metal` is the
+  standalone, CUDA-free form for Apple Silicon.
 
 ## ft shell
 

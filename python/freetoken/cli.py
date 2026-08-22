@@ -11,6 +11,8 @@ def _print_help(file: TextIO) -> None:
 
 Commands:
   serve       Start the FreeToken API server
+  serve-metal Start the FreeToken API surface over an Apple Silicon Metal
+              backend (mlx or llama.cpp); standalone, no CUDA import needed
   shell       Chat with a FreeToken server in the terminal
   ctl         Query and manage a running FreeToken server
   daemon      Run the FreeToken supervisor (persistent engine service)
@@ -29,6 +31,12 @@ def _run_serve(argv: list[str]) -> int:
 
     launch_server(argv=argv, prog="ft serve")
     return 0
+
+
+def _run_serve_metal(argv: list[str]) -> int:
+    from freetoken.server.metal_main import main
+
+    return main(argv)
 
 
 def _run_shell(argv: list[str]) -> int:
@@ -92,6 +100,7 @@ def _run_bench(argv: list[str]) -> int:
 
 COMMANDS = {
     "serve": "_run_serve",
+    "serve-metal": "_run_serve_metal",
     "shell": "_run_shell",
     "ctl": "_run_ctl",
     "daemon": "_run_daemon",
