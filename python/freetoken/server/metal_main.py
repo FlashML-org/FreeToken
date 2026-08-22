@@ -79,6 +79,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return JSONResponse({"status": "down"}, status_code=503)
         return {"status": "ok", "backend": backend, "upstream": handle.upstream_base_url}
 
+    # The shell/desktop poll /health, /v1/stats and /v1/cache/status every
+    # second; hide those from the access log so they don't bury real requests.
+    # Same filter the CUDA api_server installs (access_log_filter.py).
+    from freetoken.server.access_log_filter import install_polling_access_log_filter
+
+    install_polling_access_log_filter()
+
     try:
         if args.shell:
             import threading

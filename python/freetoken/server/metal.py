@@ -486,6 +486,32 @@ def register_metal_proxy_routes(
             )
         return {"status": "ok", "model": model}
 
+    @app.get("/v1/stats")
+    async def metal_stats(request: Request):
+        """Stable shape for the shell's status-bar poller. The Metal upstream has
+        no CUDA-style stats; every pool reports empty so the bar shows just the
+        model + token counters, which the shell counts client-side."""
+        return {
+            "kv": None,
+            "mamba": None,
+            "swa": None,
+            "vram_bytes": 0,
+        }
+
+    @app.get("/v1/cache/status")
+    async def metal_cache_status(request: Request):
+        """Minimal geometry doc so the shell's startup read resolves instead of
+        404-ing: no MoE cache on the Metal path, no reasoning gears advertised
+        (the upstream applies its own chat template)."""
+        return {
+            "geometry": {
+                "moe_cache_size": 0,
+                "moe_cache_policy": "none",
+                "reasoning": {"gears": [], "kwargs": {}, "default": None},
+            },
+            "pools": {},
+        }
+
     @app.get("/health")
     async def metal_health(request: Request):
         """Lightweight health: checks the upstream Flask/uvicorn is alive. Keeps the

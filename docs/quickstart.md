@@ -16,6 +16,17 @@ ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 ### macOS (Apple Silicon)
 
 ```bash
+scripts/start-metal.sh                             # serve + chat in one command
+scripts/start-metal.sh mlx-community/Llama-3.2-1B-Instruct-4bit
+scripts/start-metal.sh ~/models/MyModel.Q4_K_M.gguf --backend llama
+```
+
+`scripts/start-metal.sh` checks the environment, starts the Metal server,
+waits for readiness, and opens `ft shell` for interactive testing (the server
+stops when the chat exits; `NO_CHAT=1` runs the API alone). Or drive the
+pieces directly:
+
+```bash
 ft serve-metal --model mlx-community/Qwen3-0.6B-4bit --backend mlx
 ```
 
