@@ -655,6 +655,102 @@ static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
                 "cuStreamWaitValue64(done)");
 }
 
+// ================================ AMX (bf16) ================================
+// TDPBF16PS is a tile GEMM: C[16x16 fp32] += A[16x32 bf16] x B[32x16 bf16]. Mapping
+// the expert GEMV onto it only works one way round. The obvious assignment -- tokens
+// as A's rows -- needs B = weights as [K, N], and the bank is [N, K]; there is no
+// transposed-B form of the instruction. So:
+//
+//     A = 16 consecutive *output rows* of the expert  (K contiguous -> loads straight
+//                                                      from the bank, stride H*2)
+//     B = the routed tokens' activations, transposed and VNNI-interleaved
+//     C = [16 output rows x N tokens]
+//
+// N is the token count, so this needs several tokens routed to the same expert --
+// i.e. it rides on the expert dedup, and does nothing at batch size 1 where 15 of
+// the tile's 16 columns would be empty.
+//
+// Expect little on a DRAM-bound part. AMX changes arithmetic throughput, and both
+// this and the deduped GEMV read each weight row from memory exactly once; an ISA
+// sweep on this machine moves only ~7% from avx2 to avx512bf16, which bounds what
+// any arithmetic win can be worth here. Kept opt-in for that reason.
+#if defined(__GNUC__) && (__GNUC__ >= 11) && CPU_MOE_X86
+#define CPU_MOE_HAS_AMX 1
+#endif
+
+#if defined(CPU_MOE_HAS_AMX)
+#include <sys/syscall.h>
+
+#define CPU_MOE_ARCH_REQ_XCOMP_PERM 0x1023
+#define CPU_MOE_XFEATURE_XTILEDATA 18
+
+struct alignas(64) AmxTileConfig {
+  uint8_t palette_id;
+  uint8_t start_row;
+  uint8_t reserved[14];
+  uint16_t colsb[16];
+  uint8_t rows[16];
+};
+
+// AMX tile state is an extended XSAVE feature the kernel hands out on request; without
+// this every tile instruction faults. Process-wide and one-shot.
+inline bool amx_request_tile_permission() {
+  static const bool ok = [] {
+    return syscall(SYS_arch_prctl, CPU_MOE_ARCH_REQ_XCOMP_PERM,
+                   CPU_MOE_XFEATURE_XTILEDATA) == 0;
+  }();
+  return ok;
+}
+
+inline bool cpu_has_amx_bf16() {
+  const char* on = getenv("FREETOKEN_CPU_MOE_AMX");
+  if (on == nullptr || on[0] == '0') return false;  // opt-in, see the note above
+  if (!__builtin_cpu_supports("amx-tile") || !__builtin_cpu_supports("amx-bf16"))
+    return false;
+  return amx_request_tile_permission();
+}
+
+// tmm0 = C (16x16 fp32), tmm1 = A (16 rows x 32 bf16), tmm2 = B (16 rows x 32 bf16)
+__attribute__((target("amx-tile")))
+inline void amx_configure_tiles() {
+  AmxTileConfig cfg{};
+  cfg.palette_id = 1;
+  for (int t = 0; t < 3; ++t) {
+    cfg.rows[t] = 16;
+    cfg.colsb[t] = 64;
+  }
+  _tile_loadconfig(&cfg);
+}
+
+// Transpose N token activation rows into the VNNI-interleaved B layout TDPBF16PS
+// wants: for K-pair p, row p holds {x[n][2p], x[n][2p+1]} for n = 0..15, so one tile
+// row is 32 bf16 = 64 bytes. Columns past N are zeroed and contribute nothing.
+inline void amx_pack_b(const bf16_t* const* xs, int n, int K, bf16_t* bv) {
+  const int kp = K / 2;
+  std::memset(bv, 0, (size_t)kp * 32 * sizeof(bf16_t));
+  for (int p = 0; p < kp; ++p) {
+    bf16_t* row = bv + (size_t)p * 32;
+    for (int j = 0; j < n; ++j) {
+      row[j * 2 + 0] = xs[j][2 * p];
+      row[j * 2 + 1] = xs[j][2 * p + 1];
+    }
+  }
+}
+
+// C[16 rows x n tokens] = W[16 rows, K] . B, accumulated in fp32. `ldw` is the bank's
+// row stride in bf16 elements; K must be a multiple of 32 (the tile's K depth).
+__attribute__((target("amx-tile,amx-bf16")))
+inline void amx_gemm16(const bf16_t* w, int ldw, const bf16_t* bv, int K, float* c16x16) {
+  _tile_zero(0);
+  for (int k = 0; k < K; k += 32) {
+    _tile_loadd(1, w + k, (long)ldw * sizeof(bf16_t));
+    _tile_loadd(2, bv + (size_t)(k / 2) * 32, 64);
+    _tile_dpbf16ps(0, 1, 2);
+  }
+  _tile_stored(0, c16x16, 64);
+}
+#endif  // CPU_MOE_HAS_AMX
+
 struct DotChoice {
   dot_fn fn;
   const char* name;
@@ -1314,6 +1410,8 @@ struct CpuMoeExecutor {
   // first value seen, which silently disables the A/B when both settings are
   // exercised from one process.
   bool dedup_enabled = true;
+  bool amx_ok = false;          // AMX tiles usable (opt-in + CPU + kernel permission)
+  static constexpr int AMX_MIN_ROUTES = 4;  // below this the 16-wide tile is mostly empty
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -1408,6 +1506,16 @@ struct CpuMoeExecutor {
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
     if (const char* de = getenv("FREETOKEN_CPU_MOE_DEDUP")) dedup_enabled = de[0] != '0';
+#if defined(CPU_MOE_HAS_AMX)
+    // bf16 only: TDPBF16PS eats bf16 tiles, and the quantized formats would have to
+    // dequantize into a staging tile first, which is the opposite of the point.
+    amx_ok = (weight_format == WF_BF16) && (H % 32 == 0) && cpu_has_amx_bf16();
+    if (getenv("FREETOKEN_CPU_MOE_AMX_DEBUG"))
+      fprintf(stderr, "[amx] enabled=%d fmt=%d H=%d cpu_tile=%d cpu_bf16=%d perm=%d\n",
+              (int)amx_ok, weight_format, H, (int)__builtin_cpu_supports("amx-tile"),
+              (int)__builtin_cpu_supports("amx-bf16"),
+              (int)amx_request_tile_permission());
+#endif
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
@@ -1640,6 +1748,56 @@ struct CpuMoeExecutor {
   // once and reused across every token routed to it. Both rows stay in L1 across the
   // inner route loop (2 * H * 2 bytes = 16 KiB at H=4096), so the repeat reads never
   // reach DRAM -- which is the whole point, the GEMV being DRAM-bound.
+#if defined(CPU_MOE_HAS_AMX)
+  // AMX form of the deduped pass 1: 16 output rows x up to 16 routed tokens per tile.
+  // Falls back to the caller's scalar loop for the row/route remainders.
+  void do_pass1_amx(const MoeTask* t, int e, int r0, int r1, int i0, int i1) {
+    thread_local bool cfg_loaded = false;
+    if (!cfg_loaded) {                 // TILECFG is per-thread state
+      amx_configure_tiles();
+      cfg_loaded = true;
+    }
+    const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    thread_local std::vector<bf16_t> bv;
+    bv.resize((size_t)(H / 2) * 32);
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    const bf16_t* xs[16];
+    alignas(64) float cg[16 * 16], cu[16 * 16];
+
+    for (int rc = r0; rc < r1; rc += 16) {
+      const int n = std::min(16, r1 - rc);
+      for (int j = 0; j < n; ++j)
+        xs[j] = t->x + (size_t)(dd_route[rc + j] / top_k) * H;
+      amx_pack_b(xs, n, H, bv.data());
+      for (int i = i0; i + 16 <= i1; i += 16) {
+        const bf16_t* wg = gate_up_l + ((size_t)e * (2 * I) + i) * H;
+        const bf16_t* wu = gate_up_l + ((size_t)e * (2 * I) + I + i) * H;
+        amx_gemm16(wg, H, bv.data(), H, cg);
+        amx_gemm16(wu, H, bv.data(), H, cu);
+        for (int rr = 0; rr < 16; ++rr) {
+          for (int j = 0; j < n; ++j) {
+            const int route = dd_route[rc + j];
+            const float w_in = apply_on_input ? t->w[route] : 1.0f;
+            float gate = cg[rr * 16 + j] * w_in;
+            float up = cu[rr * 16 + j] * w_in;
+            bf16_t* g_row = g_scratch.data() + (size_t)route * I;
+            if (swigluoai) {
+              if (gate > lim) gate = lim;
+              if (up > lim) up = lim;
+              else if (up < -lim) up = -lim;
+              const float glu = gate / (1.0f + std::exp(-gate * alpha));
+              g_row[i + rr] = f32_to_bf16(glu * (up + 1.0f));
+            } else {
+              g_row[i + rr] = f32_to_bf16(act_apply(act, gate) * up);
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+
   void do_pass1_dedup(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
     const int es = static_cast<int>(p / n_iblk);
@@ -1650,10 +1808,16 @@ struct CpuMoeExecutor {
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
     const uint16_t* gu_global_l =
         reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
-    const int i0 = static_cast<int>(ib) * IBLK;
+    int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool swigluoai = act == ACT_SWIGLUOAI;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
+#if defined(CPU_MOE_HAS_AMX)
+    if (amx_ok && (r1 - r0) >= AMX_MIN_ROUTES && i0 + 16 <= i1) {
+      do_pass1_amx(t, e, r0, r1, i0, i1);
+      i0 += ((i1 - i0) / 16) * 16;  // AMX took the whole 16-row groups
+    }
+#endif
     for (int i = i0; i < i1; ++i) {
       for (int r = r0; r < r1; ++r) {
         const int route = dd_route[r];
