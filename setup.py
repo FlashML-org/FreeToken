@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 from setuptools import setup
@@ -18,6 +19,22 @@ def _check_toolchain() -> None:
     module.check_nvcc_matches_torch()
 
 
+def _is_rocm() -> bool:
+    import torch
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _rocm_paths() -> tuple[list[str], list[str]]:
+    rocm_home = Path(os.getenv("ROCM_HOME", "/opt/rocm"))
+    if not rocm_home.exists():
+        raise RuntimeError(
+            "ROCM_HOME is required to build on ROCm. Set ROCM_HOME to your ROCm install."
+        )
+    include_dirs = [str(rocm_home / "include")]
+    library_dirs = [str(rocm_home / "lib")]
+    return include_dirs, library_dirs
+
+
 def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     if CUDA_HOME is None:
         raise RuntimeError(
@@ -31,7 +48,19 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
-cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
+IS_ROCM = _is_rocm()
+
+if IS_ROCM:
+    runtime_include_dirs, runtime_library_dirs = _rocm_paths()
+    runtime_lib = "amdhip64"
+    # TODO(ROCm): allow override via FREETOKEN_ROCM_ARCH; default to all RDNA3.
+    rocm_arch = os.getenv("FREETOKEN_ROCM_ARCH", "gfx1100;gfx1101;gfx1102;gfx1103")
+    extra_compile = ["-O3", "-std=c++17", f"--offload-arch={rocm_arch}"]
+else:
+    runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
+    runtime_lib = "cudart"
+    extra_compile = ["-O3", "-std=c++17"]
+
 _check_toolchain()
 
 
@@ -42,12 +71,12 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17"],
+            include_dirs=runtime_include_dirs,
+            library_dirs=runtime_library_dirs,
+            libraries=[runtime_lib],
+            extra_compile_args=extra_compile,
         ),
-        # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
+        # CPU-compute MoE executor for --moe-backend cpu. Links cudart/hip for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
         # use per-function target attributes (avx512bf16/avx512f) + a runtime
         # __builtin_cpu_supports dispatch, so the single binary stays portable
@@ -57,10 +86,10 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
             ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            include_dirs=runtime_include_dirs,
+            library_dirs=runtime_library_dirs,
+            libraries=[runtime_lib],
+            extra_compile_args=extra_compile + ["-pthread"],
         ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
