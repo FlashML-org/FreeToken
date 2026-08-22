@@ -60,14 +60,7 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         else:
-            native = {torch.cuda.get_device_capability(i) >= (8, 9)
-                      for i in range(torch.cuda.device_count())}
-            if len(native) > 1:
-                raise NotImplementedError(
-                    "GPUs on both sides of the sm_89 fp8 boundary in one process: "
-                    "the host-side e4m3 convention is process-global"
-                )
-            _native = native.pop() if native else torch.cuda.get_device_capability() >= (8, 9)
+            _native = torch.cuda.get_device_capability() >= (8, 9)
     return _native
 
 
