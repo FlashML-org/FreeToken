@@ -48,6 +48,12 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # Partial-pin serving (--moe-backend offload only): MoE layers whose host banks
+    # are NOT cudaHostRegistered, for platforms whose pin quota cannot cover every
+    # layer (WSL2/WDDM caps at ~50% of physical RAM). Same grammar as
+    # moe_cpu_layers ("48,52", "15", "0.25"); "auto" is reserved (v2). Exempt
+    # layers are unioned into the CPU-decode set and prefill via staged copies.
+    pin_exempt_layers: str | None = None
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

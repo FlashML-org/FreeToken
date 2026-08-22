@@ -123,6 +123,12 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
+    # offload/PCIe path (empty = all-GPU, all layers = the plain --moe-backend cpu
+    # case). Passed at construction when known (partial-pin validation in
+    # set_bank_sources needs it); the engine may also (re)assign it afterwards for
+    # the custom-cache-factory path.
+    cpu_layer_ids: frozenset = frozenset()
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -132,10 +138,9 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
-        # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
-        # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
-        # all layers = the plain --moe-backend cpu case).
-        self.cpu_layer_ids: frozenset = frozenset()
+        # Non-pinned bank layers (partial-pin serving); set by set_bank_sources
+        # from layer_residency. Empty until banks are registered.
+        self._exempt_layers: frozenset = frozenset()
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -277,8 +282,10 @@ class OffloadMoeCache:
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value
         (default: all pinned). Non-pinned layers have no device address, so the
-        GPU movement paths cannot serve them and they are rejected here
-        (platform-specific residency policies are not implemented).
+        GPU movement paths cannot serve them; they are legal only under
+        partial-pin serving: their decode must run on the CPU executor (the
+        layer is in ``cpu_layer_ids``) and their prefill rides the staged
+        legacy full-layer copy, which requires the overlap double buffer.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -288,12 +295,25 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r != HostResidency.PINNED.value for r in residency):
-            raise NotImplementedError(
-                "non-pinned host bank layers need platform-specific movement "
-                "paths that are not implemented; only pinned layers are served"
-            )
+        exempt = frozenset(
+            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
+        )
+        if exempt:
+            not_cpu = sorted(exempt - self.cpu_layer_ids)
+            if not_cpu:
+                raise ValueError(
+                    f"non-pinned bank layers {not_cpu} are not CPU-decode layers; "
+                    "partial-pin serving requires every exempt layer in cpu_layer_ids "
+                    "(the engine unions --pin-exempt-layers into --moe-cpu-layers)"
+                )
+            if not self.prefill_overlap:
+                raise ValueError(
+                    "non-pinned bank layers require moe_prefill_overlap=True: the "
+                    "staged prefill copy rides the overlap double buffer, and the "
+                    "materialize_layer path is pinned-only"
+                )
         self.layer_residency = list(residency)
+        self._exempt_layers = exempt
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -344,6 +364,13 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
+                if layer_id in self._exempt_layers:
+                    # Non-pinned banks have no device alias to resolve. Decode never
+                    # reads these layers (CPU executor) and hit-D2D prefetch routes
+                    # them to the staged full-layer copy, so a zero placeholder
+                    # keeps the plan layer-indexed without ever being dereferenced.
+                    layer_src_ptrs[layer_id].append(0)
+                    continue
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM).
@@ -604,7 +631,12 @@ class OffloadMoeCache:
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
-        if self._prefill_hit_d2d_active:
+        # Exempt (non-pinned) layers cannot ride the hit-D2D split: its batch
+        # memcpy needs the banks' device aliases. They take the legacy full-layer
+        # torch copy below, which the driver stages from pageable memory (slower,
+        # and the enqueuing host thread stalls for the staging, but correct under
+        # the same ready/release event discipline).
+        if self._prefill_hit_d2d_active and layer_id not in self._exempt_layers:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
             copy()
@@ -684,6 +716,10 @@ class OffloadMoeCache:
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
         from freetoken.moe.offload_kernels import prefill_hit_compact
 
+        assert layer_id not in self._exempt_layers, (
+            f"hit-D2D prefetch reached exempt layer {layer_id}; prefetch_prefill_layer "
+            "must route exempt layers to the staged full-layer copy"
+        )
         E = self.num_experts
         snap = self._prefill_snapshot_np[layer_id]
         hit_mask = snap >= 2 * E
@@ -761,6 +797,10 @@ class OffloadMoeCache:
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
+        assert layer_id not in self._exempt_layers, (
+            f"GPU decode reached exempt (non-pinned) layer {layer_id}; it must be in "
+            "cpu_layer_ids and decode on the CPU executor"
+        )
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
@@ -781,6 +821,10 @@ class OffloadMoeCache:
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
+        assert layer_id not in self._exempt_layers, (
+            f"hybrid decode reached exempt (non-pinned) layer {layer_id}; hybrid "
+            "requires all-pinned banks"
+        )
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
@@ -792,6 +836,11 @@ class OffloadMoeCache:
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
+        assert layer_id not in self._exempt_layers, (
+            f"materialize_layer reached exempt (non-pinned) layer {layer_id}; the "
+            "non-overlap prefill path is pinned-only (set_bank_sources enforces "
+            "prefill_overlap for partial-pin serving)"
+        )
         self._pending_src_layer = layer_id
         materialize_layer(self, layer_id)
 

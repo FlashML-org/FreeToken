@@ -145,9 +145,16 @@ class PinPipeline:
     ~max(read, pin) instead of their sum. Use as a context manager: a clean exit
     drains the queue and re-raises the first pin failure; an exceptional exit
     still joins the thread but lets the original exception propagate.
+
+    ``exempt``: bank-layer ids whose banks are NOT pinned (partial-pin serving
+    on pin-quota platforms, e.g. Windows/WDDM). Exempt layers' banks stay
+    ``PAGEABLE``; they must be decoded by the CPU executor and prefilled via
+    the staged (non-DMA) copy path. Only the per-layer ``__call__`` sink
+    honors the plan; direct ``submit()`` has no layer identity and always pins.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, exempt: frozenset[int] | None = None) -> None:
+        self._exempt = exempt or frozenset()
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -169,7 +176,11 @@ class PinPipeline:
         self._q.put(bank)
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer."""
+        """Layer-completion sink: queue every bank of the completed layer.
+
+        Exempt layers are skipped entirely: their banks stay PAGEABLE."""
+        if layer_id in self._exempt:
+            return
         for bank in banks.values():
             self.submit(bank)
 

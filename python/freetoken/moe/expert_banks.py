@@ -60,8 +60,13 @@ def _v4_unsupported(quant):
     )
 
 
-def _bf16_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _bf16_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, pin_exempt_layers=None) -> ExpertBanks:
     from freetoken.models.weight import load_moe_expert_sources
+
+    if pin_exempt_layers:
+        raise NotImplementedError(
+            "pin_exempt_layers is only implemented for the nvfp4 provider so far"
+        )
 
     # bf16 banks are written as-loaded -> streamable (dummy fabricates in one shot, so a
     # sink given alongside dummy=True would never fire; keep it materialize-only there).
@@ -158,8 +163,16 @@ class _Nvfp4RepackSink:
         return sources, gate_up_alpha, down_alpha
 
 
-def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, pin_exempt_layers=None) -> ExpertBanks:
     from freetoken.models.weight import load_nvfp4_moe_expert_sources
+
+    if pin_exempt_layers and decode_target != "cpu":
+        # Exempt layers have no device address, so they must decode on the CPU
+        # executor; the engine unions them into cpu_layer_ids, which forces
+        # decode_target "cpu" for this provider. Anything else is a wiring bug.
+        raise NotImplementedError(
+            f"pin_exempt_layers requires CPU-decode native banks; got decode_target={decode_target!r}"
+        )
     from freetoken.moe.nvfp4_backends import (
         b12x_repack_layer,
         b12x_repack_sources_inplace,
@@ -195,14 +208,24 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # parallel only parallelizes the source read; the backend repack below is reused unchanged.
     sources = load_nvfp4_moe_expert_sources(
         model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        layer_sink=sink,
+        layer_sink=sink, pin_exempt_layers=pin_exempt_layers,
     )
     # CPU-compute decode (cpu/hybrid) reads the native ModelOpt rows directly (its
     # dequant-in-GEMV kernel), so keep the native "nvfp4" layout and skip the GPU-tiled
     # marlin/b12x repacks (which only the GPU W4A16 kernels can read).
     if decode_target == "cpu":
+        residency = None
+        if pin_exempt_layers:
+            from freetoken.moe.host_banks import HostResidency
+
+            n = len(sources["gate_up_packed"])
+            residency = [
+                HostResidency.PAGEABLE.value if i in pin_exempt_layers
+                else HostResidency.PINNED.value
+                for i in range(n)
+            ]
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
-                           streamed=sink is not None)
+                           streamed=sink is not None, layer_residency=residency)
     # Pick the expert-GEMM backend by compute capability (and MoE width: auto keeps
     # small-I MoE on the Triton M=1 GEMV, which beats b12x's tensor cores at single-stream
     # decode) and repack the banks (in place; the tiled blocks are byte-identical per
@@ -230,7 +253,11 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, pin_exempt_layers=None) -> ExpertBanks:
+    if pin_exempt_layers:
+        raise NotImplementedError(
+            "pin_exempt_layers is only implemented for the nvfp4 provider so far"
+        )
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for q4_0: GGUF is a single packed file "
@@ -250,7 +277,11 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
-def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, pin_exempt_layers=None) -> ExpertBanks:
+    if pin_exempt_layers:
+        raise NotImplementedError(
+            "pin_exempt_layers is only implemented for the nvfp4 provider so far"
+        )
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
@@ -302,13 +333,15 @@ _PROVIDERS = {
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, pin_exempt_layers=None) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
     (native, non-GPU-tiled) bank layouts. ``layer_sink`` (converter only) is forwarded to
     setups/providers that declare the parameter; the rest ignore it and stay on the
-    materialize-and-write path (``ExpertBanks.streamed`` reports which happened)."""
+    materialize-and-write path (``ExpertBanks.streamed`` reports which happened).
+    ``pin_exempt_layers`` (partial-pin serving) is forwarded only to setups/providers
+    that implement it; anything else refuses loudly rather than silently pinning all."""
     setup = _model_setup_override(model_config)
     if setup is not None:
         import inspect
@@ -321,6 +354,12 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
                 f"parallel reader not implemented for {arch} (model owns expert setup "
                 "via setup_offload_expert_banks; add a parallel path there)"
             )
+        if pin_exempt_layers and "pin_exempt_layers" not in params:
+            arch = getattr(model_config, "architectures", ["?"])[0]
+            raise NotImplementedError(
+                f"pin_exempt_layers not implemented for {arch} (model owns expert setup "
+                "via setup_offload_expert_banks; add plan-aware pinning there)"
+            )
         kw = dict(device=device, dtype=dtype, dummy=dummy)
         if supports_parallel:
             kw.update(parallel=parallel, workers=workers, chunk=chunk)
@@ -328,6 +367,8 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             kw["decode_target"] = decode_target
         if "layer_sink" in params and layer_sink is not None:
             kw["layer_sink"] = layer_sink
+        if pin_exempt_layers:
+            kw["pin_exempt_layers"] = pin_exempt_layers
         return setup(model_path, model_config, **kw)
 
     expert_quant = model_config.expert_quant
@@ -339,7 +380,7 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
     return _PROVIDERS[expert_quant](
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
+        layer_sink=layer_sink, pin_exempt_layers=pin_exempt_layers,
     )
 
 
@@ -383,6 +424,7 @@ def load_expert_banks(
     chunk: int = _PARALLEL_CHUNK,
     decode_target: str = "gpu",
     layer_sink=None,
+    pin_exempt_layers: frozenset[int] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -404,6 +446,11 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if pin_exempt_layers:
+            raise NotImplementedError(
+                "pin_exempt_layers is not implemented for FTW checkpoints (their loader "
+                "pins internally); serve the original checkpoint instead"
+            )
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk
         )
@@ -434,10 +481,10 @@ def load_expert_banks(
     # allocation) falls back to serial.
     try:
         return _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                   decode_target, layer_sink)
+                                   decode_target, layer_sink, pin_exempt_layers)
     except NotImplementedError as exc:
         if not parallel:
             raise
         logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
         return _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                   decode_target, layer_sink)
+                                   decode_target, layer_sink, pin_exempt_layers)
