@@ -49,7 +49,7 @@ import torch
 
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, numa
 
 logger = init_logger(__name__)
 
@@ -321,7 +321,11 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
     as-is. Values otherwise don't affect the kernel's work.
     """
     def pin(*shape, dtype):
-        return alloc_pinned_tensor(*shape, dtype=dtype)
+        # cudaHostAlloc faults + pins here, so the thread policy is the only lever --
+        # place the synthetic banks on the same node the worker pool will use, exactly
+        # as the real HostBank mmaps are placed (utils/numa.prefer_node).
+        with numa.allocating_on_node(numa.moe_pool_numa_node()):
+            return alloc_pinned_tensor(*shape, dtype=dtype)
 
     if fmt == "bf16":
         gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
@@ -382,8 +386,10 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     specs = _offload_bank_specs(fmt, H, I)
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
     total_bytes = 0
+    pool_node = numa.moe_pool_numa_node(device)
     for name, (elems, dtype) in specs.items():
-        src = alloc_pinned_tensor(E, elems, dtype=dtype)  # cudaHostAlloc (mapped) like the loaders
+        with numa.allocating_on_node(pool_node):
+            src = alloc_pinned_tensor(E, elems, dtype=dtype)  # cudaHostAlloc (mapped)
         dst = torch.empty(E, elems, dtype=dtype, device=device)
         cache.bank_sources[name] = [src]
         cache.bank_caches[name] = dst

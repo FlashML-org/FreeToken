@@ -28,6 +28,8 @@ from enum import Enum
 
 import torch
 
+from freetoken.utils import numa
+
 _BLK = 4096  # O_DIRECT alignment (page size)
 
 
@@ -69,6 +71,12 @@ class HostBank:
         self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
         _LIVE_BUFFERS.append(self._buf)
         self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+        # Ask for the CPU MoE pool's node *before* the fill faults these pages in --
+        # pin-after-fill means nothing is resident yet, which is the only moment
+        # placement is free. Without it the pages land wherever the loader threads
+        # happen to run and the confined worker pool reads half its bytes remote.
+        # A preference, not a reservation: a full node spills instead of OOM-ing.
+        numa.prefer_node(self.addr, len(self._buf), numa.moe_pool_numa_node())
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._pinned = False
 
