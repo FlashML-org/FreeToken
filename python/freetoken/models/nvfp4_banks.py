@@ -70,6 +70,7 @@ def load_nvfp4_expert_source_banks(
     drop_page_cache: DropPageCache,
     primary: bool,
     layer_sink=None,
+    pin_exempt_layers: frozenset[int] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build the 6 native NVFP4 source banks by streaming checkpoint shards (serial per-shard read).
 
@@ -184,9 +185,12 @@ def load_nvfp4_expert_source_banks(
         return placed
 
     if layer_sink is not None:
+        assert not pin_exempt_layers, (
+            "pin_exempt_layers is a serving concept; converters (layer_sink) pin nothing here"
+        )
         placed = _load(layer_sink)
     else:
-        with PinPipeline() as pins:
+        with PinPipeline(exempt=pin_exempt_layers) as pins:
             placed = _load(pins)
 
     expected = num_layers * E * 6
@@ -211,6 +215,7 @@ def load_nvfp4_expert_source_banks_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    pin_exempt_layers: frozenset[int] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel counterpart of :func:`load_nvfp4_expert_source_banks`, byte-for-byte same
     placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
@@ -303,9 +308,12 @@ def load_nvfp4_expert_source_banks_parallel(
         return placed
 
     if layer_sink is not None:
+        assert not pin_exempt_layers, (
+            "pin_exempt_layers is a serving concept; converters (layer_sink) pin nothing here"
+        )
         placed = _load(layer_sink)
     else:
-        with PinPipeline() as pins:
+        with PinPipeline(exempt=pin_exempt_layers) as pins:
             placed = _load(pins)
 
     expected = num_layers * E * 6

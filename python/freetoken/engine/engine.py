@@ -15,6 +15,7 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.pin_policy import resolve_pin_exempt_layers
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -512,6 +513,15 @@ class Engine:
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        # Partial-pin: exempt layers have no device address, so their decode MUST
+        # run on the CPU executor; union them in rather than making the user pass
+        # two coherent flags. The union also forces decode_target "cpu" below,
+        # which makes the nvfp4 provider keep the CPU-readable native layout.
+        pin_exempt = resolve_pin_exempt_layers(
+            config.pin_exempt_layers, config.model_config.num_moe_layers
+        )
+        if pin_exempt:
+            cpu_layer_ids = frozenset(cpu_layer_ids | pin_exempt)
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -533,6 +543,7 @@ class Engine:
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                pin_exempt_layers=pin_exempt,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -565,9 +576,24 @@ class Engine:
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                # Known here (unlike the factory branch, which assigns it below):
+                # set_bank_sources validates exempt layers against this set.
+                cpu_layer_ids=cpu_layer_ids,
             )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if pin_exempt:
+                layer_bytes = sum(
+                    src[0].numel() * src[0].element_size() for src in banks.sources.values()
+                )
+                pinned = config.model_config.num_moe_layers - len(pin_exempt)
+                logger.info_rank0(
+                    f"partial-pin plan: {pinned}/{config.model_config.num_moe_layers} "
+                    f"layers pinned ({pinned * layer_bytes / 2**30:.1f} GiB), "
+                    f"{len(pin_exempt)} exempt/pageable "
+                    f"({len(pin_exempt) * layer_bytes / 2**30:.1f} GiB, CPU decode + "
+                    f"staged prefill): layers {sorted(pin_exempt)}"
+                )
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1078,6 +1104,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "pin_exempt_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
@@ -1212,13 +1239,18 @@ def _adjust_config(config: EngineConfig):
     if (
         is_moe
         and not _cpu_moe_act_ok
-        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
-    ):
-        asked = (
-            f"--moe-cpu-layers={config.moe_cpu_layers!r}"
-            if config.moe_backend not in ("cpu", "hybrid")
-            else f"--moe-backend {config.moe_backend!r}"
+        and (
+            config.moe_backend in ("cpu", "hybrid")
+            or config.moe_cpu_layers
+            or config.pin_exempt_layers
         )
+    ):
+        if config.moe_backend in ("cpu", "hybrid"):
+            asked = f"--moe-backend {config.moe_backend!r}"
+        elif config.moe_cpu_layers:
+            asked = f"--moe-cpu-layers={config.moe_cpu_layers!r}"
+        else:
+            asked = f"--pin-exempt-layers={config.pin_exempt_layers!r}"
         raise ValueError(
             f"{asked}: the CPU MoE executor does not support this model's expert "
             f"activation {getattr(model_config, 'hidden_act', None)!r}; drop the flag "
@@ -1346,6 +1378,16 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             "--moe-cpu-layers requires --moe-backend offload (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
+        )
+
+    if is_moe and config.pin_exempt_layers and config.moe_backend != "offload":
+        # Partial-pin rides the offload machinery: exempt layers CPU-decode from the
+        # host banks and prefill through the offload double buffer. 'hybrid' fetches
+        # over PCIe from EVERY layer's banks (device aliases), so it is incompatible
+        # by construction; 'cpu' pins nothing GPU-visible and has no quota problem.
+        raise ValueError(
+            "--pin-exempt-layers requires --moe-backend offload (got "
+            f"{config.moe_backend!r})"
         )
 
     if is_moe:

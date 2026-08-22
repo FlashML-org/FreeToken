@@ -537,6 +537,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--pin-exempt-layers",
+        type=str,
+        default=ServerArgs.pin_exempt_layers,
+        help=(
+            "Partial-pin serving with --moe-backend offload: which MoE layers' host "
+            "banks are NOT pinned (cudaHostRegister), so models whose banks exceed "
+            "the platform pin quota (WSL2/WDDM: ~50%% of physical RAM) can still "
+            "serve. Same grammar as --moe-cpu-layers: id list ('48,52'), count "
+            "('15' = evenly strided), or fraction ('0.25'). Exempt layers decode on "
+            "the CPU executor (auto-unioned into --moe-cpu-layers) and prefill via "
+            "driver-staged copies (slower). 'auto' is reserved for the planned "
+            "fit-to-quota policy. Unset = pin everything (upstream behavior)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,
