@@ -27,6 +27,7 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
+    # TODO(ROCm): NCCL -> RCCL migration for multi-GPU tensor parallelism on AMD.
     return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
 
 
