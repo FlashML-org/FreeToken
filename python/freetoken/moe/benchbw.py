@@ -312,6 +312,40 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
     return min(E, max(1, _SYNTH_BANK_BUDGET // max(1, expert_bytes)))
 
 
+# Bench banks are allocated with cudaHostAlloc by default. Production does not: the
+# loaders build each bank as a lazy anonymous mmap, fill it, and only then
+# cudaHostRegister it ("pin-after-fill", see moe/host_banks.HostBank). The two behave
+# differently for anything that depends on *how the pages were obtained* -- NUMA
+# placement, transparent huge pages, page-cache interaction -- so a bench that wants to
+# measure those effects has to allocate the way production does.
+#
+# It is not the default because pinned pages cannot be released (there is no
+# cudaHostUnregister binding), so every format's banks would stay resident for the whole
+# run instead of being freed between formats. On a memlock-limited machine -- which is
+# most of them -- that turns a benchmark into an allocation failure.
+_LIVE_BENCH_BANKS: list = []
+_PRODUCTION_ALLOC = False
+
+
+def use_production_allocator(enabled: bool) -> None:
+    """Build bench banks the way the loaders do (mmap -> fill -> register)."""
+    global _PRODUCTION_ALLOC
+    _PRODUCTION_ALLOC = bool(enabled)
+
+
+def _alloc_bank(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """A pinned host bank, either the quick way or the way the loaders build them."""
+    if not _PRODUCTION_ALLOC:
+        return alloc_pinned_tensor(*shape, dtype=dtype)
+    from freetoken.moe.host_banks import HostBank
+
+    bank = HostBank(tuple(shape), dtype)
+    _LIVE_BENCH_BANKS.append(bank)  # pinned pages cannot be handed back; hold the ref
+    bank.tensor.zero_()  # fault every page BEFORE registering -- that is the whole point
+    bank.pin()
+    return bank.tensor
+
+
 def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
     """3D pinned banks in the exact layout ``CpuMoeExecutor`` expects for ``fmt``.
 
@@ -321,7 +355,7 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
     as-is. Values otherwise don't affect the kernel's work.
     """
     def pin(*shape, dtype):
-        return alloc_pinned_tensor(*shape, dtype=dtype)
+        return _alloc_bank(*shape, dtype=dtype)
 
     if fmt == "bf16":
         gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
@@ -383,7 +417,7 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
     total_bytes = 0
     for name, (elems, dtype) in specs.items():
-        src = alloc_pinned_tensor(E, elems, dtype=dtype)  # cudaHostAlloc (mapped) like the loaders
+        src = _alloc_bank(E, elems, dtype=dtype)
         dst = torch.empty(E, elems, dtype=dtype, device=device)
         cache.bank_sources[name] = [src]
         cache.bank_caches[name] = dst
@@ -690,7 +724,9 @@ def run_benchbw(
     pcie_iters: int = 30,
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
+    production_banks: bool = False,
 ) -> dict:
+    use_production_allocator(production_banks)
     if not torch.cuda.is_available():
         raise RuntimeError(
             "benchbw needs a CUDA device to measure PCIe bandwidth (both offload and "
@@ -769,6 +805,7 @@ def run_benchbw(
         "gpu": {"index": device_index, "name": torch.cuda.get_device_name(device)},
         "cpu": {"physical_cores": len(physical_core_cpus()), "threads_used": cpu["threads"]},
         "threshold": threshold,
+        "bank_allocator": "production" if production_banks else "cudaHostAlloc",
         "ceilings": {
             "cpu_stream_read_gbs": round(cpu["bw_gbs"], 2),
             "pcie_linear_h2d_gbs": round(pcie["h2d_gbs"], 2),
@@ -936,6 +973,11 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
     p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
     p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
+    p.add_argument("--production-banks", action="store_true",
+                   help="allocate the synthetic banks the way the model loaders do "
+                        "(mmap -> fill -> cudaHostRegister) instead of cudaHostAlloc. "
+                        "Needed to see NUMA placement / huge-page effects, but the pages "
+                        "cannot be released, so every format's banks stay resident")
     p.add_argument("--kernel-cpu-iters", type=_positive_int, default=64,
                    help="CPU MoE decode steps to time")
     p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,
@@ -955,6 +997,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
+            production_banks=ns.production_banks,
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")
