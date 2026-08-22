@@ -255,6 +255,134 @@ inline float e4m3_decode(uint8_t v) {
   return sign * (1.0f + man / 8.0f) * std::ldexp(1.0f, (int)exp - 7);
 }
 
+// ------------------------ block-FP8 (W8A16) dequant ------------------------
+// DeepSeek-V3-style block-fp8 experts (Qwen3.5/3.6-FP8, GLM, DSV4 dense): fp8-e4m3
+// weights row-major [rows, K] plus one bf16 scale per 128x128 weight block. The tensor
+// is named ``weight_scale_inv`` but it multiplies; the reference is the Triton decode
+// GEMV (kernel/triton/fp8_blockscale_moe.py):
+//
+//     acc += sum(w * a  over one 128-wide K block) * scale[row/128][kb]
+//
+// K is contiguous per output row -- unlike mxfp4's transposed bank -- so this maps
+// straight onto a bf16 dot product. e4m3 -> bf16 is *exact* (3 mantissa bits into 7,
+// and bf16's exponent range covers e4m3's whole 2^-9..448 span), so the AVX-512 path
+// widens the weights in-register and feeds _mm512_dpbf16_ps against the bf16
+// activations. That reproduces the reference's fp32 products exactly; only the
+// summation order differs, the same latitude the bf16 dot already takes.
+//
+// Bit math for the normal range (exp != 0), from byte b = s<<7 | e<<3 | m:
+//   bf16 = (b & 0x80) << 8  |  (((b & 0x7F) << 4) + (120 << 7))
+// because e4m3 bias 7 -> bf16 bias 127 is a constant +120 on the exponent field once
+// the magnitude is shifted into place. exp == 0 is subnormal (value = m * 2^-9) and
+// does not follow that rule, so those lanes are blended in from a small table.
+using fp8dot_fn = float (*)(const uint8_t*, const bf16_t*, const bf16_t*, int, const float*);
+
+constexpr int FP8_BLK = 128;  // K elements covered by one weight scale
+
+// e4m3 subnormals: m * 2^-9, as bf16 bit patterns (index = mantissa, 0..7).
+alignas(64) const uint16_t kE4M3SubBf16[32] = {
+    0x0000, 0x3B00, 0x3B80, 0x3BC0, 0x3C00, 0x3C20, 0x3C40, 0x3C60,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// Same values as fp32, for the AVX2 path.
+alignas(32) const float kE4M3SubF32[8] = {
+    0.0f, 1.0f / 512, 2.0f / 512, 3.0f / 512, 4.0f / 512, 5.0f / 512, 6.0f / 512, 7.0f / 512};
+
+float dot_fp8_block_scalar(const uint8_t* w, const bf16_t* x, const bf16_t* s, int K,
+                           const float* e4m3) {
+  float acc = 0.0f;
+  for (int b = 0, k0 = 0; k0 < K; ++b, k0 += FP8_BLK) {
+    const int k1 = std::min(K, k0 + FP8_BLK);
+    float blk = 0.0f;
+    for (int k = k0; k < k1; ++k) blk += e4m3[w[k]] * bf16_to_f32(x[k]);
+    acc += blk * bf16_to_f32(s[b]);
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86
+__attribute__((target("avx512f,avx512bw")))
+static inline __m512i e4m3_to_bf16_x32(__m256i raw, __m512i subtab) {
+  const __m512i b = _mm512_cvtepu8_epi16(raw);
+  const __m512i sgn = _mm512_slli_epi16(_mm512_and_si512(b, _mm512_set1_epi16(0x0080)), 8);
+  const __m512i mag = _mm512_and_si512(b, _mm512_set1_epi16(0x007F));
+  const __m512i nrm =
+      _mm512_add_epi16(_mm512_slli_epi16(mag, 4), _mm512_set1_epi16((short)(120 << 7)));
+  const __mmask32 sub = _mm512_cmplt_epu16_mask(mag, _mm512_set1_epi16(8));
+  const __m512i lut = _mm512_permutexvar_epi16(mag, subtab);  // indices wrap; only sub lanes used
+  return _mm512_or_si512(sgn, _mm512_mask_blend_epi16(sub, nrm, lut));
+}
+
+__attribute__((target("avx512bf16,avx512bw,avx512f")))
+static inline __m512bh as_bh(__m512i v) {
+  __m512bh out;
+  std::memcpy(&out, &v, sizeof(out));
+  return out;
+}
+
+__attribute__((target("avx512bf16,avx512bw,avx512f")))
+float dot_fp8_block_avx512bf16(const uint8_t* w, const bf16_t* x, const bf16_t* s, int K,
+                               const float* e4m3) {
+  const __m512i subtab = _mm512_loadu_si512(reinterpret_cast<const void*>(kE4M3SubBf16));
+  __m512 total = _mm512_setzero_ps();
+  int b = 0, k0 = 0;
+  for (; k0 + FP8_BLK <= K; k0 += FP8_BLK, ++b) {
+    // The weight stream is the bandwidth bottleneck (read once, never reused).
+    _mm_prefetch(reinterpret_cast<const char*>(w + k0) + PF_AHEAD, _MM_HINT_T0);
+    __m512 blk = _mm512_setzero_ps();
+    for (int j = 0; j < FP8_BLK; j += 32) {
+      const __m256i raw =
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + k0 + j));
+      blk = _mm512_dpbf16_ps(blk, as_bh(e4m3_to_bf16_x32(raw, subtab)),
+                             as_bh(_mm512_loadu_si512(
+                                 reinterpret_cast<const void*>(x + k0 + j))));
+    }
+    total = _mm512_fmadd_ps(blk, _mm512_set1_ps(bf16_to_f32(s[b])), total);
+  }
+  float acc = _mm512_reduce_add_ps(total);
+  if (k0 < K) {  // ragged tail shares block b's scale, as the reference's mask does
+    float blk = 0.0f;
+    for (int k = k0; k < K; ++k) blk += e4m3[w[k]] * bf16_to_f32(x[k]);
+    acc += blk * bf16_to_f32(s[b]);
+  }
+  return acc;
+}
+
+__attribute__((target("avx2,fma")))
+float dot_fp8_block_avx2(const uint8_t* w, const bf16_t* x, const bf16_t* s, int K,
+                         const float* e4m3) {
+  const __m256i mag_m = _mm256_set1_epi32(0x7F), sgn_m = _mm256_set1_epi32(0x80);
+  const __m256i bias = _mm256_set1_epi32(120 << 23), eight = _mm256_set1_epi32(8);
+  const __m256 subtab = _mm256_loadu_ps(kE4M3SubF32);
+  float acc = 0.0f;
+  int b = 0, k0 = 0;
+  for (; k0 + FP8_BLK <= K; k0 += FP8_BLK, ++b) {
+    __m256 blk = _mm256_setzero_ps();
+    for (int j = 0; j < FP8_BLK; j += 8) {
+      const __m256i raw = _mm256_cvtepu8_epi32(
+          _mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + k0 + j)));
+      const __m256i mag = _mm256_and_si256(raw, mag_m);
+      const __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(raw, sgn_m), 24);
+      // exp!=0: mantissa/exponent shift into place, bias 7 -> 127 is a constant +120.
+      const __m256i nrm = _mm256_add_epi32(_mm256_slli_epi32(mag, 20), bias);
+      const __m256 sub = _mm256_permutevar8x32_ps(subtab, mag);  // valid where mag < 8
+      const __m256 issub = _mm256_castsi256_ps(_mm256_cmpgt_epi32(eight, mag));
+      const __m256 val = _mm256_blendv_ps(_mm256_castsi256_ps(nrm), sub, issub);
+      const __m256 wf = _mm256_or_ps(val, _mm256_castsi256_ps(sgn));
+      const __m256i xi = _mm256_cvtepu16_epi32(
+          _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + k0 + j)));
+      blk = _mm256_fmadd_ps(wf, _mm256_castsi256_ps(_mm256_slli_epi32(xi, 16)), blk);
+    }
+    acc += hsum256(blk) * bf16_to_f32(s[b]);
+  }
+  if (k0 < K) {
+    float blk = 0.0f;
+    for (int k = k0; k < K; ++k) blk += e4m3[w[k]] * bf16_to_f32(x[k]);
+    acc += blk * bf16_to_f32(s[b]);
+  }
+  return acc;
+}
+#endif  // CPU_MOE_X86
+
 // Activations pre-deinterleaved to fp32 (xe[m]=x[2m], xo[m]=x[2m+1]); see the
 // ds_fp4 dot below for why (drops the hot loop to ~1.5 shuffle ops / 16 weights).
 using nvdot_fn = float (*)(const uint8_t*, const uint8_t*, float, const float*, const float*,
@@ -1001,6 +1129,18 @@ void mxfp4_gemv_avx2(float* out, const uint8_t* blk, const uint8_t* scl, const b
 }
 #endif
 
+fp8dot_fn select_fp8dot() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  // The bf16 tier is the one that matters here: e4m3 widens to bf16 exactly, so
+  // dpbf16_ps does the whole dot with no fp32 materialization of the weights.
+  if (t >= ISA_AVX512BF16) return dot_fp8_block_avx512bf16;
+  if (t >= ISA_AVX2) return dot_fp8_block_avx2;
+#endif
+  (void)t;
+  return dot_fp8_block_scalar;
+}
+
 mxgemv_fn select_mxgemv() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
@@ -1212,7 +1352,8 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4,
+             WF_FP8_BLOCK = 5 };
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1252,6 +1393,10 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  fp8dot_fn fp8dot;
+  // fp8_block: bf16 scale per 128x128 weight block, so a row uses (K/128) contiguous
+  // scales starting at scale-row (output row / 128). These are the row strides.
+  int fp8_gu_scale_row = 0, fp8_dn_scale_row = 0;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1375,6 +1520,12 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    fp8dot = select_fp8dot();
+    if (weight_format == WF_FP8_BLOCK) {
+      // gate_up scale is [2I/128, H/128], down scale is [H/128, I/128] per expert.
+      fp8_gu_scale_row = (H + FP8_BLK - 1) / FP8_BLK;
+      fp8_dn_scale_row = (I + FP8_BLK - 1) / FP8_BLK;
+    }
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -1486,6 +1637,13 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
+    if (fmt == WF_FP8_BLOCK) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)H;
+      const bf16_t* sc = reinterpret_cast<const bf16_t*>(gu_scale_l) +
+                         ((size_t)e * ((2 * I + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
+                             (size_t)fp8_gu_scale_row;
+      return fp8dot(w, x, sc, H, e4m3_lut);
+    }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
@@ -1507,6 +1665,13 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_FP8_BLOCK) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)I;
+      const bf16_t* sc = reinterpret_cast<const bf16_t*>(dn_scale_l) +
+                         ((size_t)e * ((H + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
+                             (size_t)fp8_dn_scale_row;
+      return fp8dot(w, g, sc, I, e4m3_lut);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -2147,4 +2312,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  // Weight-format ABI probe. A stale prebuilt .so accepts a newer WFmt id without
+  // complaint and then falls through to the wrong dequant branch -- silently wrong
+  // numbers, not a crash. The Python executor refuses to build against an extension
+  // that predates the format it was asked for.
+  m.def("max_weight_format_id", []() { return static_cast<int>(WF_FP8_BLOCK); });
 }

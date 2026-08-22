@@ -55,7 +55,7 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
@@ -328,6 +328,22 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         gate_up.fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
         down.fill_(0.02)
         return {"gate_up": gate_up, "down": down}
+    if fmt == "fp8_block":
+        def nb(n):
+            return (n + 127) // 128
+        b = {
+            "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
+            "gate_up_scale": pin(E, nb(2 * I), nb(H), dtype=torch.bfloat16),
+            "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
+            "down_scale": pin(E, nb(H), nb(I), dtype=torch.bfloat16),
+        }
+        # e4m3 0x00 is a clean zero and the scales are unit-ish, so nothing lands in
+        # the fp32 denormal range (which would slow the GEMV and skew the timing).
+        b["gate_up"].view(torch.uint8).fill_(0x38)  # 1.0
+        b["down"].view(torch.uint8).fill_(0x38)
+        b["gate_up_scale"].fill_(1.0)
+        b["down_scale"].fill_(1.0)
+        return b
     if fmt == "nvfp4":
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
