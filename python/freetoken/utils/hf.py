@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import re
 from typing import Any
 
 from typing import FrozenSet
@@ -225,6 +226,17 @@ def download_hf_weight(model_path: str) -> str:
 _UNLOADABLE_WEIGHTS = ("*.bin", "*.pt", "*.pth", "*.h5", "*.msgpack", "*.onnx")
 
 
+# A hub repo id is "org/name" and nothing else. Anything with a leading separator, a
+# "~", or more than one "/" is a filesystem path the user got wrong, and turning that
+# into a hub lookup replaces "no such directory" with a confusing download error.
+_HUB_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def looks_like_hub_repo_id(model_path: str) -> bool:
+    """Whether ``model_path`` should be resolved against the Hub rather than the disk."""
+    return bool(_HUB_REPO_ID.match(model_path))
+
+
 def download_hf_checkpoint(model_path: str, *, dummy_weight: bool = False) -> str:
     """Resolve a Hugging Face repo id to a complete local checkpoint directory.
 
@@ -236,7 +248,7 @@ def download_hf_checkpoint(model_path: str, *, dummy_weight: bool = False) -> st
 
     A path that is already a local directory is returned untouched.
     """
-    if os.path.isdir(model_path):
+    if os.path.isdir(model_path) or not looks_like_hub_repo_id(model_path):
         return model_path
     ignore_patterns = list(_UNLOADABLE_WEIGHTS)
     if dummy_weight:
