@@ -16,6 +16,7 @@ milliseconds of imports, not a CUDA context.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import urllib.error
@@ -203,16 +204,42 @@ class ShellClient:
         )
 
     async def model_id(self) -> str | None:
-        """The first id from ``/v1/models``. None when the server reports none (it is a single-
-        model server, so this is the model the shell will be talking to)."""
+        """The id the shell should talk to.
+
+        Single-model servers (the norm, and always the case through the Metal
+        proxy) report one id and it is used directly. Some upstreams (raw
+        mlx_lm) list every model in the local HF cache -- then the served model
+        cannot be told apart client-side, so fall back to the request-time
+        default: the id the server echoes when the ``model`` field is omitted.
+        """
         doc = await self._request_json("GET", "/v1/models")
         data = doc.get("data")
         if not isinstance(data, list):
             return None
-        for item in data:
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                return item["id"]
-        return None
+        ids = [
+            item["id"]
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        if len(ids) == 1:
+            return ids[0]
+        if not ids:
+            return None
+        # Multi-model listing: ask the server which one a bare request uses.
+        # mlx_lm (and llama.cpp) echo the served model in the response body.
+        with contextlib.suppress(ShellClientError, OSError, ValueError, KeyError, TypeError):
+            request = urllib.request.Request(
+                f"{self.origin}/v1/chat/completions",
+                data=json.dumps({"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            echoed = body.get("model")
+            if isinstance(echoed, str) and echoed in ids:
+                return echoed
+        return ids[0]
 
     async def list_models(self) -> list[str]:
         """All ids from ``/v1/models``, for ``/model``'s listing."""
