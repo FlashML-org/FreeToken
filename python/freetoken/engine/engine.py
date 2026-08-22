@@ -18,7 +18,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -329,6 +329,25 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
+
+        # Load dense NVFP4 decode modules before MoE/KV/GDN runtime caches take the
+        # remaining VRAM. The graph runner's eager forward is otherwise the first launch.
+        graph_bs = _determine_cuda_graph_bs(
+            config.cuda_graph_bs, config.cuda_graph_max_bs, init_free_memory
+        )
+        if graph_bs:
+            from freetoken.kernel.triton.nvfp4_linear import warmup_nvfp4_dense_decode
+
+            dense_warmup_bs = [1]
+            if max(graph_bs) > 1:
+                dense_warmup_bs.append(max(graph_bs))
+            logger.info_rank0(
+                f"Preloading dense NVFP4 decode kernels for batch sizes {dense_warmup_bs}"
+            )
+            loaded = warmup_nvfp4_dense_decode(self.model, dense_warmup_bs)
+            if loaded:
+                logger.info_rank0(f"Preloaded {loaded} dense NVFP4 kernel geometries")
+                torch.cuda.empty_cache()
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):

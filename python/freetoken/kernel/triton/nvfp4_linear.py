@@ -930,6 +930,69 @@ class Nvfp4LMHead(BaseOP):
         return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
 
 
+def warmup_nvfp4_dense_decode(model: BaseOP, batch_sizes: list[int]) -> int:
+    """Load dense NVFP4 decode kernels before runtime caches consume remaining VRAM.
+
+    Triton loads a compiled CUDA module on its first launch. On memory-constrained Ada
+    cards, postponing that load until the eager forward immediately before CUDA graph
+    capture can make ``cuModuleLoadData`` take minutes while the GPU reports misleading
+    100% SM utilisation. Run one representative of every distinct resident weight
+    geometry while startup still has its post-weights VRAM headroom.
+    """
+    wanted_m = sorted({m for m in batch_sizes if 0 < m <= _GEMM_MAX_INKERNEL_M})
+    if not wanted_m:
+        return 0
+
+    seen_objects: set[int] = set()
+    representatives: dict[tuple, Nvfp4DenseLinear | Nvfp4LMHead] = {}
+
+    def visit(value) -> None:
+        value_id = id(value)
+        if value_id in seen_objects:
+            return
+        seen_objects.add(value_id)
+        if isinstance(value, (Nvfp4DenseLinear, Nvfp4LMHead)):
+            if not value._transposed:
+                return
+            key = (
+                value.weight.shape,
+                value.weight.stride(),
+                value.weight_scale.shape,
+                value.weight_scale.stride(),
+                value.weight_global.shape,
+                value.weight.dtype,
+                value.weight_scale.dtype,
+            )
+            representatives.setdefault(key, value)
+            return
+        if isinstance(value, BaseOP):
+            for child in value.__dict__.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+
+    visit(model)
+    launched = 0
+    with torch.inference_mode():
+        for op in representatives.values():
+            in_features = op.weight.shape[0] * 8
+            for m in wanted_m:
+                x = torch.zeros((m, in_features), dtype=torch.bfloat16, device=op.weight.device)
+                y = nvfp4_dense_linear_t(
+                    x, op.weight, op.weight_scale, op.weight_global,
+                    getattr(op, "bias", None),
+                )
+                # Compiling is insufficient: Triton's CUDA module is loaded lazily at launch.
+                torch.cuda.synchronize(op.weight.device)
+                del x, y
+                launched += 1
+    return launched
+
+
 __all__ = [
     "FP8",
     "nvfp4_dense_linear",
@@ -938,4 +1001,5 @@ __all__ = [
     "Nvfp4DenseLinear",
     "Nvfp4DenseColMerged",
     "Nvfp4LMHead",
+    "warmup_nvfp4_dense_decode",
 ]
