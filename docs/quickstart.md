@@ -13,6 +13,18 @@ and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 
+### macOS (Apple Silicon)
+
+```bash
+ft serve-metal --model mlx-community/Qwen3-0.6B-4bit --backend mlx
+```
+
+`ft serve-metal` serves the same API surface as `ft serve`, backed by MLX or
+llama.cpp on Metal (see [install.md](install.md#method-3-macos--apple-silicon-metal-backend)).
+`--model` takes an MLX/HF repo id (`mlx-community/*`) or, with `--backend llama`,
+a local GGUF file. The rest of this page (`/v1/models`, chat completions, `ft shell`,
+`ft launch`) works unchanged against it.
+
 ## Send a request
 
 Check what is being served:

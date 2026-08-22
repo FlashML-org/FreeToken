@@ -64,12 +64,13 @@ def init_logger(
         BOLD = "\033[1m"
 
         def format(self, record):
-            from freetoken.distributed import try_get_tp_info
+            try:
+                from freetoken.distributed import try_get_tp_info
 
-            # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
+                tp_info = tp_info or try_get_tp_info()
+            except Exception:  # noqa: BLE001 -- torch may be absent (macOS/Metal)
+                tp_info = None
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
-            nonlocal tp_info
-            tp_info = tp_info or try_get_tp_info()
             if tp_info is not None and use_tp_rank is not False:
                 real_suffix = f"{suffix}|core|rank={tp_info.rank}"
             else:

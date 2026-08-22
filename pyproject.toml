@@ -1,9 +1,14 @@
 [build-system]
 # torch must match the runtime range below: build isolation resolves this list on its
-# own, and a mismatch links the C++ extensions against the wrong libtorch.
+# own, and a mismatch links the C++ extensions against the wrong libtorch. The macOS
+# (Metal) build has no compiled extensions, so it needs neither torch nor nvcc.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = [
+    "setuptools>=77",
+    "torch>=2.11,<2.12; platform_system == 'Linux'",
+    "wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,9 +43,10 @@ dependencies = [
     "einops>=0.8,<1",
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.
-    "flashlib==0.3.0", # pin it
+    "flashlib==0.3.0; platform_system == 'Linux'",
     "gguf>=0.19,<1",
     "huggingface_hub>=1.5,<2",
+    "httpx>=0.27,<1",  # Metal backend upstream proxy (server/metal.py)
     "msgpack>=1.1,<2",
     "modelscope>=1.37,<2",
     # ceiling: numba (via flashlib) needs numpy<2.5
@@ -54,7 +60,9 @@ dependencies = [
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
+    # macOS/Metal: torch is only needed by the CUDA scheduler path; the Metal
+    # backend (ft serve-metal / ft serve --backend mlx|llama) never imports it.
+    "torch>=2.11,<2.12; platform_system == 'Linux'",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
     "triton==3.6.0; platform_system == 'Linux'",
@@ -90,7 +98,10 @@ accel = ["freetoken[fi,sgl]"]
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+# Linux/CUDA only: the metal path resolves torch (if ever needed) from PyPI.
+torch = [
+    { index = "pytorch-cu130", marker = "platform_system == 'Linux'" },
+]
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
