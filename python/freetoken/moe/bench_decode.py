@@ -59,8 +59,15 @@ def _coerce(v: str):
 
 
 def measure_decode_tps(model_path: str, engine_kwargs: dict, prompt: str,
-                       tokens: int, samples: int) -> dict:
-    """Decode tokens/s for one engine configuration, median over ``samples``."""
+                       tokens: int, samples: int, concurrency: int = 1) -> dict:
+    """Decode tokens/s for one engine configuration, median over ``samples``.
+
+    ``concurrency`` generates that many streams at once, so decode steps carry that
+    many tokens. Anything whose cost depends on the decode batch -- expert dedup on
+    the CPU MoE path, CUDA-graph batch selection, the scheduler itself -- is invisible
+    at concurrency 1, which is the single-stream latency case, not the serving case.
+    Reported tokens/s is aggregate across the streams.
+    """
     import torch
 
     from freetoken.core import SamplingParams
@@ -72,6 +79,11 @@ def measure_decode_tps(model_path: str, engine_kwargs: dict, prompt: str,
     if not any(k in engine_kwargs
                for k in ("moe_cache_size", "moe_cache_rate", "moe_cache_auto")):
         engine_kwargs = {**engine_kwargs, "moe_cache_auto": True}
+    if concurrency > 1:
+        # Without room for the streams the scheduler just serializes them and the
+        # decode batch never grows, which silently measures concurrency 1.
+        engine_kwargs.setdefault("max_running_req", concurrency)
+        engine_kwargs.setdefault("cuda_graph_max_bs", concurrency)
 
     llm = LLM(model_path, dtype=torch.bfloat16, **engine_kwargs)
     # `ignore_eos` so every run generates exactly `tokens` -- otherwise an early stop
@@ -79,20 +91,23 @@ def measure_decode_tps(model_path: str, engine_kwargs: dict, prompt: str,
     one = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
     many = SamplingParams(max_tokens=tokens, temperature=0.0, ignore_eos=True)
 
-    llm.generate([prompt], SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True))
+    # Distinct prompts: the radix cache would share the KV of identical prefixes, so
+    # N copies of one prompt measures one stream plus N-1 cache hits.
+    prompts = [f"{prompt} (variant {i})" for i in range(concurrency)]
+    llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True))
 
     rates = []
     for _ in range(samples):
         t0 = time.perf_counter()
-        llm.generate([prompt], one)
+        llm.generate(prompts, one)
         t_prefill = time.perf_counter() - t0
         t0 = time.perf_counter()
-        llm.generate([prompt], many)
+        llm.generate(prompts, many)
         t_total = time.perf_counter() - t0
         decode_s = t_total - t_prefill
         if decode_s <= 0:
             continue
-        rates.append((tokens - 1) / decode_s)
+        rates.append(concurrency * (tokens - 1) / decode_s)
     if not rates:
         raise RuntimeError("no usable timing samples")
     return {
@@ -107,7 +122,8 @@ def _run_worker(argv: list[str]) -> int:
     spec = json.loads(argv[0])
     try:
         out = measure_decode_tps(spec["model"], spec["kwargs"], spec["prompt"],
-                                 spec["tokens"], spec["samples"])
+                                 spec["tokens"], spec["samples"],
+                                 spec.get("concurrency", 1))
     except Exception as e:  # noqa: BLE001 - reported to the parent, not swallowed
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}), flush=True)
         return 1
@@ -162,6 +178,10 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     p.add_argument("--samples", type=int, default=3,
                    help="timed generations per load (default 3)")
     p.add_argument("--tokens", type=int, default=128, help="tokens per generation")
+    p.add_argument("--concurrency", type=int, default=1, metavar="N",
+                   help="generate N streams at once, so decode steps carry N tokens "
+                        "(default 1). Reported tokens/s is aggregate. Anything whose "
+                        "cost depends on the decode batch is invisible at 1")
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("-o", "--out", default=None, help="write results as JSON")
     p.add_argument("-q", "--quiet", action="store_true")
@@ -173,13 +193,15 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     variants = _variants(ns.compare, ns.set)
     results: dict[str, list[float]] = {name: [] for name, _ in variants}
     print(f"  {len(variants)} variant(s) x {ns.cycles} cycle(s), "
-          f"{ns.samples} timed generations of {ns.tokens} tokens each")
+          f"{ns.samples} timed generations of {ns.tokens} tokens each"
+          + (f", {ns.concurrency} streams at once" if ns.concurrency > 1 else ""))
     print("  each measurement reloads the model in a fresh process\n")
 
     for cycle in range(1, ns.cycles + 1):
         for name, kwargs in variants:
             spec = {"model": ns.model, "kwargs": kwargs, "prompt": ns.prompt,
-                    "tokens": ns.tokens, "samples": ns.samples}
+                    "tokens": ns.tokens, "samples": ns.samples,
+                    "concurrency": ns.concurrency}
             t0 = time.perf_counter()
             out = _measure_in_subprocess(spec, ns.quiet)
             dt = time.perf_counter() - t0
@@ -208,6 +230,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     if ns.out:
         with open(ns.out, "w") as f:
             json.dump({"model": ns.model, "tokens": ns.tokens,
+                       "concurrency": ns.concurrency,
                        "results": {n: v for n, v in results.items()}}, f, indent=2)
             f.write("\n")
         print(f"\n  saved: {ns.out}")
