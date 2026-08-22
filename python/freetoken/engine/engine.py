@@ -272,14 +272,19 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    cpu_offload_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
+        # A model may keep specific (large, rarely-touched) weights in host RAM -- e.g. the
+        # Gemma-4 E-series per-layer-embedding table (~4.7 GB). Those stay on CPU so they never
+        # consume VRAM; the model's forward gathers from them on the host.
+        dst = torch.device("cpu") if key in cpu_offload_keys else device
         expected = model_state.get(key)
         if expected is None:
-            state_dict[key] = weight.to(device=device)
+            state_dict[key] = weight.to(device=dst)
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            state_dict[key] = weight.to(device=dst, dtype=expected.dtype)
     return state_dict
 
 
@@ -456,6 +461,9 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
+        cpu_offload_keys = frozenset(
+            getattr(self.model, "cpu_offloaded_weight_keys", lambda: ())()
+        )
         return _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
@@ -464,6 +472,7 @@ class Engine:
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
             ),
             device=self.device,
+            cpu_offload_keys=cpu_offload_keys,
         )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
