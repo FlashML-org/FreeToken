@@ -24,7 +24,7 @@ DEFAULT_LDFLAGS = []
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
     """CUDA nvcc flags for a kernel build. During the multi-arch AOT cache build,
-    `TVM_FFI_CUDA_ARCH_LIST` (e.g. "8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
+    `TVM_FFI_CUDA_ARCH_LIST` (e.g. "7.5 8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
     (`-gencode ...code=sm_XX`) for each listed arch — but NO PTX. We add the PTX of the HIGHEST
     listed arch so a GPU newer than any listed one (no matching SASS) still runs via the driver's
     PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
