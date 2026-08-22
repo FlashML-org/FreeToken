@@ -68,7 +68,8 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
+             "fp8_block": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -172,6 +173,14 @@ class CpuMoeExecutor:
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
         # handles its act inside the kernel and predates the marker.)
+        # A prebuilt .so that predates this format would accept the id and then take
+        # the wrong dequant branch -- silently wrong output rather than a crash.
+        if _WFMT_IDS[fmt] > getattr(_cpu_moe, "max_weight_format_id", lambda: 4)():
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates the {fmt!r} expert format; "
+                "rebuild it with `python setup.py build_ext --inplace` (or reinstall "
+                "the wheel) before serving this checkpoint on the cpu/hybrid backend."
+            )
         if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
@@ -332,6 +341,49 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
+    def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """DeepSeek-V3-style block-fp8: fp8-e4m3 rows + one bf16 scale per 128x128 block.
+
+        ``gate_up`` [E, 2I, H] / ``down`` [E, H, I] are row-major with K contiguous, and
+        ``*_scale`` is [E, ceil(rows/128), ceil(K/128)] -- so output row ``r`` reads the
+        ``K/128`` contiguous scales starting at scale-row ``r // 128`` (the C++ side
+        recomputes that; see ``fp8_gu_scale_row``). The scale tensor is named
+        ``weight_scale_inv`` upstream but multiplies, matching the Triton reference.
+        """
+        gu, gus = banks["gate_up"], banks["gate_up_scale"]
+        dn, dns = banks["down"], banks["down_scale"]
+        # torch exposes fp8 as float8_e4m3fn; the kernel reads raw bytes either way.
+        for t in (gu[0], dn[0]):
+            if t.element_size() != 1:
+                raise NotImplementedError(
+                    f"block-fp8 CPU MoE expects 1-byte e4m3 weights, got {t.dtype}"
+                )
+        if gus[0].dtype != torch.bfloat16 or dns[0].dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"block-fp8 CPU MoE expects bf16 block scales, got "
+                f"{gus[0].dtype}/{dns[0].dtype}"
+            )
+        I = int(gu[0].shape[1] // 2)
+        H = int(gu[0].shape[2])
+        assert gu[0].shape[1] == 2 * I
+        assert tuple(dn[0].shape[1:]) == (H, I), (dn[0].shape, H, I)
+        def nb(n):  # block count along one axis
+            return (n + 127) // 128
+
+        assert tuple(gus[0].shape[1:]) == (nb(2 * I), nb(H)), (gus[0].shape, I, H)
+        assert tuple(dns[0].shape[1:]) == (nb(H), nb(I)), (dns[0].shape, H, I)
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gu).data_ptr(),
+            down_ptr=self._make_table(dn).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
+            gate_up_global_ptr=0,
+            down_scale_ptr=self._make_table(dns).data_ptr(),
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
@@ -372,6 +424,9 @@ class CpuMoeExecutor:
 
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
+
+        if fmt == "fp8_block":
+            return self._resolve_fp8_block_banks(banks)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up_packed"], banks["gate_up_scale"], banks["gate_up_global"]
