@@ -646,16 +646,26 @@ def parse_args(
     if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
 
-    if kwargs["model_source"] == "modelscope":
-        model_path = kwargs["model_path"]
-        if not os.path.isdir(model_path):
+    # Resolve a hub repo id ("org/model") to a local checkpoint directory. This has to
+    # happen here, after served_model_name and the parser cascade have read the repo id
+    # (they want "DeepSeek-V4-Flash-0731", not a snapshot hash) and before anything opens
+    # the checkpoint: config parsing reads model-specific files straight off disk, so a
+    # bare repo id reaches `open()` as a relative path and dies with a FileNotFoundError.
+    model_path = kwargs["model_path"]
+    if not os.path.isdir(model_path):
+        if kwargs["model_source"] == "modelscope":
             from modelscope import snapshot_download
 
             ignore_patterns = []
             if kwargs["use_dummy_weight"]:
                 ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-            kwargs["model_path"] = model_path
+            kwargs["model_path"] = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+        else:
+            from freetoken.utils import download_hf_checkpoint
+
+            kwargs["model_path"] = download_hf_checkpoint(
+                model_path, dummy_weight=kwargs["use_dummy_weight"]
+            )
     del kwargs["model_source"]
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /

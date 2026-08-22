@@ -217,3 +217,34 @@ def download_hf_weight(model_path: str) -> str:
         raise ValueError(
             f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
         )
+
+
+# Weight formats FreeToken never loads -- it reads safetensors (plus GGUF for Gemma-4).
+# Plenty of repos still ship a duplicate .bin/.pth copy of the same tensors, so skipping
+# them can halve a first-time pull.
+_UNLOADABLE_WEIGHTS = ("*.bin", "*.pt", "*.pth", "*.h5", "*.msgpack", "*.onnx")
+
+
+def download_hf_checkpoint(model_path: str, *, dummy_weight: bool = False) -> str:
+    """Resolve a Hugging Face repo id to a complete local checkpoint directory.
+
+    ``download_hf_weight`` fetches only ``*.safetensors``, which is all the weight
+    loaders need once the engine is running. Config parsing happens earlier and wants
+    more than that: the tokenizer, and the model-specific subdirs some architectures
+    read directly off disk -- DeepSeek-V4 fails without ``inference/config.json``
+    (see ``models/deepseek_v4/args.py``). So this pulls the whole snapshot.
+
+    A path that is already a local directory is returned untouched.
+    """
+    if os.path.isdir(model_path):
+        return model_path
+    ignore_patterns = list(_UNLOADABLE_WEIGHTS)
+    if dummy_weight:
+        # Config and tokenizer are still needed; the tensors are not.
+        ignore_patterns += ["*.safetensors", "*.gguf"]
+    try:
+        return snapshot_download(model_path, ignore_patterns=ignore_patterns)
+    except Exception as e:
+        raise ValueError(
+            f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
+        )
