@@ -1,7 +1,36 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import Tuple
+
+
+@functools.cache
+def is_rocm() -> bool:
+    """True when torch is built for ROCm (AMD GPU) instead of CUDA."""
+    import torch
+    return getattr(torch.version, "hip", None) is not None
+
+
+@functools.cache
+def get_rocm_gfx_arch() -> str | None:
+    """The gfx target of the current AMD GPU (e.g. \"gfx1100\"), or None."""
+    if not is_rocm():
+        return None
+    # TODO(ROCm): parse rocm-smi for auto-detection; for now rely on env.
+    for env_var in ("PYTORCH_ROCM_ARCH", "HCC_AMDGPU_TARGET"):
+        val = os.getenv(env_var, "")
+        for gfx in ("gfx1100", "gfx1101", "gfx1102", "gfx1103"):
+            if gfx in val:
+                return gfx
+    return None
+
+
+@functools.cache
+def is_gfx11xx_family() -> bool:
+    """True when the current AMD GPU is RDNA3 (gfx110x)."""
+    arch = get_rocm_gfx_arch()
+    return arch is not None and arch.startswith("gfx110")
 
 
 @functools.cache
@@ -9,6 +38,8 @@ def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
+    if is_rocm():
+        return None
     if not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
