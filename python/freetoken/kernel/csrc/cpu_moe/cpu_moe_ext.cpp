@@ -1095,6 +1095,11 @@ struct MoeTask {
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int IBLK = 32;
 constexpr int HBLK = 32;
+// Deduped pass 2 gives one work item the whole H-block for *every* token, so it owns
+// those output rows outright and needs no cross-worker reduction. That costs work
+// items (n_hblk instead of tokens * n_hblk), so the block is smaller to keep the pool
+// fed: H/8 items is ~8 per worker at H=2048 on a 32-core part.
+constexpr int HBLK_DD = 8;
 
 // -------------------------------- Q4_0 (W4A8) --------------------------------
 // Native GGUF Q4_0 experts (gemma4 GGUF): per-32 block = fp16 scale d + 16 packed
@@ -1292,7 +1297,7 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
-  int n_iblk = 0, n_hblk = 0;
+  int n_iblk = 0, n_hblk = 0, n_hblk_dd = 0;
   // Expert dedup for pass 1 (see build_dedup). dd_route holds the (tok*top_k + k)
   // route ids grouped by expert; dd_expert[j] owns dd_route[dd_start[j] ..
   // dd_start[j+1]). n_dd == 0 means "not deduped, use the per-route work split".
@@ -1732,7 +1737,63 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Pass 2 over an H-block, all tokens, all experts. Deduping pass 2 the way pass 1
+  // is done -- work item per (expert, block) -- would have several experts summing
+  // into the same y row and need a reduction. Giving one work item every token for
+  // its rows sidesteps that: the rows are exclusively owned, the accumulation happens
+  // in a private fp32 buffer, and each expert's down rows are still read once and
+  // reused across the tokens routed to it.
+  //
+  // Summation order changes (expert order rather than route order), so the fp32
+  // rounding differs in the last bits from the non-deduped path -- the same latitude
+  // the kernel already takes between its ISA tiers.
+  void do_pass2_dedup(const MoeTask* t, int64_t p) {
+    const int h0 = static_cast<int>(p) * HBLK_DD;
+    const int h1 = std::min(H, h0 + HBLK_DD);
+    if (h0 >= h1) return;
+    const int nh = h1 - h0, nt = t->num_tokens;
+    thread_local std::vector<float> acc;
+    acc.assign((size_t)nt * nh, 0.0f);
+
+    const bf16_t* down_l = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const uint16_t* dn_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+
+    for (int es = 0; es < n_dd; ++es) {
+      const int e = dd_expert[es];
+      const int r0 = dd_start[es], r1 = dd_start[es + 1];
+      for (int h = h0; h < h1; ++h) {
+        for (int r = r0; r < r1; ++r) {
+          const int route = dd_route[r];
+          const int tok = route / top_k;
+          const float w_out = apply_on_input ? 1.0f : t->w[route];
+          const size_t gr = (size_t)route;
+          const bf16_t* g_row = g_scratch.data() + gr * I;
+          const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
+          const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
+          const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
+          const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
+                           : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
+                                        : nullptr;
+          acc[(size_t)tok * nh + (h - h0)] +=
+              gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go,
+                        gi8, gas) * w_out;
+        }
+      }
+    }
+    for (int tok = 0; tok < nt; ++tok) {
+      bf16_t* y_row = t->y + (size_t)tok * H;
+      for (int h = h0; h < h1; ++h) y_row[h] = f32_to_bf16(acc[(size_t)tok * nh + (h - h0)]);
+    }
+  }
+
   void do_pass2(const MoeTask* t, int64_t p) {
+    if (n_dd > 0) {
+      do_pass2_dedup(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass2_mxfp4(t, p);
       return;
@@ -1999,7 +2060,9 @@ struct CpuMoeExecutor {
     // token routed to it rather than once per token.
     p1_total = n_dd > 0 ? static_cast<int64_t>(n_dd) * n_iblk
                         : static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
-    p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+    n_hblk_dd = (H + HBLK_DD - 1) / HBLK_DD;
+    p2_total = n_dd > 0 ? static_cast<int64_t>(n_hblk_dd)
+                        : static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
