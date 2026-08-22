@@ -88,8 +88,19 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
+            msg = str(exc)
+            if "out of memory" in msg:
+                hint = (
+                    "the driver refused to lock more host memory (on Windows/WDDM "
+                    "the pageable-locking pool is roughly half of system RAM); "
+                    "close other processes, add RAM, or serve some layers with "
+                    "--moe-backend cpu"
+                )
+            else:
+                hint = "see the driver error above"
             raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+                f"cudaHostRegister failed for a {len(self._buf) / 2**30:.2f} GiB bank "
+                f"({msg}): {hint}"
             ) from exc
         self._pinned = True
 

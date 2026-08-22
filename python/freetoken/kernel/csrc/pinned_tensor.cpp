@@ -95,9 +95,14 @@ int64_t host_device_ptr(int64_t host_ptr) {
 }
 
 void host_register(int64_t addr, int64_t nbytes) {
-  const cudaError_t err =
-      cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
-                       cudaHostRegisterPortable | cudaHostRegisterMapped);
+  // Zero-size registrations are rejected by the driver with cudaErrorInvalidValue.
+  // Callers pin-after-fill small scale banks whose padded size can round to zero
+  // on dense layers; clamp so they register as a 1-byte mapped region instead.
+  const size_t reg_nbytes =
+      static_cast<size_t>(nbytes > 0 ? nbytes : 1);
+  const cudaError_t err = cudaHostRegister(
+      reinterpret_cast<void *>(addr), reg_nbytes,
+      cudaHostRegisterPortable | cudaHostRegisterMapped);
   TORCH_CHECK(err == cudaSuccess,
               "cudaHostRegister failed: ", cudaGetErrorString(err));
 }
