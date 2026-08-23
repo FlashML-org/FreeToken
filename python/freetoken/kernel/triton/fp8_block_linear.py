@@ -53,10 +53,15 @@ def _act_quant_kernel(
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10)
     s = amax / 448.0  # [BLOCK_M] fp32 per-token-group scale (e4m3 finite max = 448)
     y = tl.clamp(x / s[:, None], -448.0, 448.0)
+    # Round onto the e4m3 grid in fp32 FIRST, on both paths. triton's fp32 ->
+    # float8e4nv downcast double-rounds (fp32 -> fp16 RTZ -> e4m3), so a value
+    # just above a grid midpoint collapses onto the midpoint and then ties to
+    # even -- always downward. 0.38% of a uniform [-448,448] sweep lands 1 ULP
+    # low, never high, and no fp_downcast_rounding setting changes it. Once the
+    # value is already a grid point the downcast is exact and this cannot bite.
+    y = round_e4m3(y)
     if e4m3_native_cx():
         y = y.to(tl.float8e4nv)
-    else:
-        y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
     tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None])
     tl.store(s_ptr + offs_m * stride_sm + pid_k * stride_sk, s, mask=m_mask)
 
