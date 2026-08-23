@@ -30,6 +30,10 @@ one profile per card.
     ft bench bw --model qwen3.6-moe          # per-model detail instead
     ft bench bw --dtype all --model all      # both
     ft bench bw --gpu GPU-2f3a...            # bench a specific GPU (UUID or nvidia-smi index)
+    ft bench bw --dtype bf16 --batch 1,8,32,64   # what cross-token expert dedup buys
+
+The headline measurement runs at bs=1. Dedup is inert there by construction (one token
+cannot collide with itself), so ``--batch`` is what shows whether it is doing anything.
 """
 
 from __future__ import annotations
@@ -88,6 +92,24 @@ def _forced_isa(isa: str | None):
         return
     prev = os.environ.get(key)
     os.environ[key] = isa
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
+
+
+@contextlib.contextmanager
+def _forced_dedup(enabled: bool):
+    """Force the cross-token expert-dedup arm for executors constructed in this block.
+
+    The extension reads ``FREETOKEN_CPU_MOE_DEDUP`` once per executor construction, so each
+    arm of an A/B needs its own executor (see :func:`measure_cpu_moe_batch`)."""
+    key = "FREETOKEN_CPU_MOE_DEDUP"
+    prev = os.environ.get(key)
+    os.environ[key] = "1" if enabled else "0"
     try:
         yield
     finally:
@@ -446,7 +468,8 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     }
 
 
-def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: int, E: int):
+def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: int, E: int,
+                            max_tokens: int = 1):
     """A production ``CpuMoeExecutor`` over synthetic banks (via a minimal cache stand-in)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -458,7 +481,7 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
     )
     return CpuMoeExecutor(
         cache, top_k=wl.top_k, activation=wl.activation,
-        apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
+        apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=max_tokens,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
         swiglu_limit=wl.swiglu_limit,
     )
@@ -535,6 +558,86 @@ def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int
             "expert_bytes": eb, "synth_experts": E}
 
 
+def _batch_routing(bs: int, top_k: int, E: int, steps: int, seed: int = 1234) -> list:
+    """One ``[bs, top_k]`` int32 routing tensor per step, uniform-random over ``E``.
+
+    Ids are distinct within a token (a router never sends one token to the same expert
+    twice) and independent across tokens, so the only collisions are the cross-token ones
+    dedup removes. Uniform routing is the *pessimistic* case: a real router is skewed, so
+    two tokens land on the same expert more often than chance and reuse runs higher.
+
+    Drawn once per batch size and replayed for both arms, so the A/B compares identical
+    work rather than two different random routings.
+    """
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for _ in range(steps):
+        if E >= top_k:
+            ids = torch.stack([torch.randperm(E, generator=g)[:top_k] for _ in range(bs)])
+        else:  # fewer experts than routes: distinct-per-token is impossible
+            ids = torch.randint(0, E, (bs, top_k), generator=g)
+        out.append(ids.to(torch.int32))
+    return out
+
+
+def _time_cpu_moe_batch(ex, wl: Workload, bs: int, steps: list, iters: int, warmup: int) -> float:
+    """Median wall time (ms) of one ``bs``-token CPU MoE decode step on ``steps``' routing."""
+    io = ex._io_for(bs)
+    io["x"].copy_(torch.randn(bs, wl.hidden, dtype=torch.bfloat16) * 0.1)
+    io["w"].copy_(torch.rand(bs, wl.top_k, dtype=torch.float32))
+    task = ex._task_for(0, bs)
+    for i in range(warmup):
+        io["ids"].copy_(steps[i])
+        ex._ext.run_task(task)
+    samples = []
+    for i in range(iters):
+        io["ids"].copy_(steps[warmup + i])
+        t0 = time.perf_counter()
+        ex._ext.run_task(task)
+        samples.append(time.perf_counter() - t0)
+    return statistics.median(samples) * 1e3
+
+
+def measure_cpu_moe_batch(fmt: str, wl: Workload, batches: tuple[int, ...], iters: int = 32,
+                          num_threads: int = 0) -> list:
+    """CPU MoE decode cost per batch size, with and without cross-token expert dedup.
+
+    The rest of this bench runs at bs=1, where dedup is inert by construction -- one token
+    cannot collide with itself -- so the headline GB/s says nothing about it. Decode is
+    DRAM-bound, so what dedup buys is exactly the traffic it removes: with ``reuse`` distinct
+    routes per unique expert, the deduped arm reads each expert's rows once instead of
+    ``reuse`` times, and the speedup should approach ``reuse``.
+
+    Both arms run over the same banks and the same routing, and each builds its own executor
+    because the extension latches the dedup flag at construction.
+    """
+    H, I = wl.hidden, wl.inter
+    eb = _expert_bytes(fmt, H, I)
+    E = _synth_experts(wl.experts, eb)
+    banks = _cpu_moe_bank_sources(fmt, H, I, E)
+    warmup = 8
+    rows = []
+    for bs in batches:
+        steps = _batch_routing(bs, wl.top_k, E, warmup + iters)
+        routes = bs * wl.top_k
+        # Median over the timed steps: one routing draw is a sample, not the distribution.
+        unique = int(statistics.median([len(torch.unique(t)) for t in steps[warmup:]]))
+        row = {"batch": bs, "routes": routes, "unique": unique,
+               "reuse": round(routes / unique, 2), "ms": {}, "eff_gbs": {}}
+        for arm in ("off", "on"):
+            with _forced_dedup(arm == "on"):
+                ex = _build_cpu_moe_executor(fmt, wl, banks, num_threads, E, max_tokens=bs)
+            ms = _time_cpu_moe_batch(ex, wl, bs, steps, iters, warmup)
+            del ex
+            row["ms"][arm] = round(ms, 3)
+            # Bytes a non-deduped reader would move / time. Above the DRAM ceiling means
+            # the traffic was served from cache, which is the whole point of the change.
+            row["eff_gbs"][arm] = round(routes * eb / (ms / 1e3) / 1e9, 1)
+        row["speedup"] = round(row["ms"]["off"] / row["ms"]["on"], 2) if row["ms"]["on"] else None
+        rows.append(row)
+    return rows
+
+
 def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
                        num_threads: int = 0, seconds: float = 2.0) -> dict:
     """Concurrent achieved bandwidths (GB/s): the CPU MoE GEMV and the PCIe gather running
@@ -609,7 +712,7 @@ def _note(entry: dict, msg: str) -> None:
 
 def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float,
                   cpu_threads: int, cpu_iters: int, pcie_iters: int,
-                  isas: list[str] | None = None) -> dict:
+                  isas: list[str] | None = None, batches: tuple[int, ...] = ()) -> dict:
     """Per (workload, format): real PCIe gather + real CPU MoE GEMV + hybrid/offload verdict.
 
     Expected degradations (extension not built, OOM, JIT failure) are caught per bench so
@@ -620,6 +723,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         "isa_sweep": None, "pcie_gather_gbs": None,
         "cpu_moe_overlap_gbs": None, "pcie_gather_overlap_gbs": None,
         "ratio": None, "recommended": None,
+        "batch_sweep": None,
         "note": None,
     }
     try:
@@ -655,6 +759,13 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         except (ImportError, RuntimeError) as e:
             logger.warning(f"benchbw: CPU MoE bench failed for {wl.name}/{fmt}: {e}")
             _note(entry, f"cpu moe unavailable ({e})")
+
+        if batches and entry["cpu_moe_gbs"] is not None:
+            try:
+                entry["batch_sweep"] = measure_cpu_moe_batch(fmt, wl, batches, num_threads=cpu_threads)
+            except (ImportError, RuntimeError) as e:
+                logger.warning(f"benchbw: batch sweep failed for {wl.name}/{fmt}: {e}")
+                _note(entry, f"batch sweep unavailable ({e})")
 
     cpu_g, pcie_g = entry["cpu_moe_gbs"], entry["pcie_gather_gbs"]
     if cpu_g is not None and pcie_g:  # pcie_g truthy also rules out a div-by-zero
@@ -702,6 +813,7 @@ def run_benchbw(
     pcie_iters: int = 30,
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
+    batches: tuple[int, ...] = (),
 ) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -753,7 +865,8 @@ def run_benchbw(
             _prog(f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}")
             logger.info(f"benchbw: dtype {_FORMAT_DISPLAY.get(fmt, fmt)} real kernels ...")
             dtypes_out[fmt] = _bench_format(
-                fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas
+                fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters,
+                isas, batches
             )
             done += 1
         # optional per-model detail (--model): specific geometries, unchanged.
@@ -765,7 +878,8 @@ def run_benchbw(
                 _prog(f"{mname}:{_FORMAT_DISPLAY.get(fmt, fmt)}")
                 logger.info(f"benchbw: {mname}/{fmt} real kernels ...")
                 kernels[fmt] = _bench_format(
-                    fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas
+                    fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters,
+                    kernel_pcie_iters, isas, batches
                 )
                 done += 1
             workloads_out[mname] = {
@@ -831,6 +945,14 @@ def _print_kernels(kernels: dict, iw: int) -> None:
             for i, (k, v) in enumerate(tiers):
                 label = "isa:" if i == 0 else "    "
                 print(f"       {label} {k.split('(')[0]:<{iw}}  {v:>7.1f} GB/s")
+        if e.get("batch_sweep"):
+            print(f"       {'bs':>4} {'routes':>7} {'uniq':>5} {'reuse':>6} "
+                  f"{'dedup off':>11} {'dedup on':>10} {'speedup':>8}")
+            for b in e["batch_sweep"]:
+                sp = f"{b['speedup']:.2f}x" if b["speedup"] else "—"
+                print(f"       {b['batch']:>4} {b['routes']:>7} {b['unique']:>5} "
+                      f"{b['reuse']:>5.2f}x {b['ms']['off']:>9.2f}ms {b['ms']['on']:>8.2f}ms "
+                      f"{sp:>8}")
         if e.get("note"):
             print(f"           └─ {e['note']}")
 
@@ -931,6 +1053,17 @@ def _isa_list(s: str) -> list[str] | None:
     return list(dict.fromkeys(items))
 
 
+def _batch_list(s: str) -> tuple[int, ...]:
+    items = [x.strip() for x in s.split(",") if x.strip()]
+    try:
+        vals = [int(x) for x in items]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"comma-separated batch sizes, got {s!r}") from None
+    if not vals or any(v < 1 for v in vals):
+        raise argparse.ArgumentTypeError(f"batch sizes must be >= 1, got {s!r}")
+    return tuple(dict.fromkeys(vals))
+
+
 def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -946,6 +1079,10 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--isa", type=_isa_list, default=None, dest="isas",
                    help=f"CPU MoE ISA: 'auto' (default, best), 'all', or a subset of "
                         f"{list(_ISA_TIERS)} to sweep (kernel caps down to hw support)")
+    p.add_argument("--batch", type=_batch_list, default=None, dest="batches",
+                   help="comma-separated decode batch sizes to sweep the CPU MoE kernel over, "
+                        "with and without cross-token expert dedup (e.g. '1,8,32,64'). The "
+                        "headline bench runs at bs=1, where dedup is inert.")
     p.add_argument("-o", "--out", default=None,
                    help=f"JSON output path (default {default_out_path('<gpu-uuid>')})")
     p.add_argument("--threshold", type=_positive_float, default=2.0,
@@ -984,6 +1121,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
+            batches=ns.batches or (),
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")
