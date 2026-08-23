@@ -19,6 +19,14 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
+
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+
 // --- API name mapping (CUDA -> HIP) ---
 // HIP already defines most cuda* names as macros that expand to hip* equivalents
 // via hip_runtime.h, but a few are missing or differ in signature.  Define them
@@ -50,6 +58,14 @@
 
 #ifndef cudaHostAlloc
 #define cudaHostAlloc hipHostMalloc
+#endif
+
+#ifndef cudaHostAllocPortable
+#define cudaHostAllocPortable hipHostMallocPortable
+#endif
+
+#ifndef cudaHostAllocMapped
+#define cudaHostAllocMapped hipHostMallocMapped
 #endif
 
 #ifndef cudaHostRegister
@@ -120,6 +136,14 @@
 
 #ifndef cudaStream_t
 #define cudaStream_t hipStream_t
+#endif
+
+#ifndef cudaStreamSynchronize
+#define cudaStreamSynchronize hipStreamSynchronize
+#endif
+
+#ifndef cudaLaunchHostFunc
+#define cudaLaunchHostFunc hipLaunchHostFunc
 #endif
 
 #ifndef dim3

@@ -20,8 +20,9 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
+from triton.language import target_info
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_rocm, is_sm90_supported
 
 SILU = 0
 GELU = 1
@@ -48,6 +49,8 @@ def _pdl_supported() -> bool:
 
 @triton.jit
 def _fast_tanh(x):
+    if target_info.is_hip():
+        return libdevice.tanh(x)
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
         "tanh.approx.f32 $0, $1;", "=f,f", [x],
@@ -57,6 +60,8 @@ def _fast_tanh(x):
 
 @triton.jit
 def _fast_ex2(x):
+    if target_info.is_hip():
+        return libdevice.exp2(x)
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;", "=f,f", [x],
@@ -134,8 +139,9 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        **({} if is_rocm() else {"launch_pdl": pdl}),
     )
     return out
 

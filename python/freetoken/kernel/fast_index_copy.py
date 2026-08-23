@@ -22,42 +22,6 @@ def _skip_fast_index_copy_enabled() -> bool:
     return os.getenv(SKIP_FAST_INDEX_COPY_ENV, "").strip().lower() in _TRUE_VALUES
 
 
-def _is_rocm() -> bool:
-    return getattr(torch.version, "hip", None) is not None
-
-
-def _rocm_index_copy_fallback(
-    dst: torch.Tensor,
-    dst_indices: torch.Tensor,
-    src: torch.Tensor,
-    src_indices: torch.Tensor,
-    num_indices: torch.Tensor | None = None,
-) -> None:
-    """Correctness-first ROCm fallback for the CUDA-specific copy JIT.
-
-    The native fast-index-copy header still contains NVIDIA inline PTX and CUDA
-    DLPack device matchers.  Until that kernel has a HIP implementation, keep
-    ROCm functional by gathering only the requested source rows and moving that
-    bounded selection to the destination device.  CUDA continues to use the
-    existing JIT unchanged.
-    """
-    count = dst_indices.numel() if num_indices is None else int(num_indices.item())
-    assert 0 <= count <= dst_indices.numel()
-    assert count <= src_indices.numel()
-    if count == 0:
-        return
-
-    src_index = src_indices[:count].to(device=src.device, dtype=torch.long)
-    dst_index = dst_indices[:count].to(device=dst.device, dtype=torch.long)
-    rows = src.index_select(0, src_index)
-    if rows.device != dst.device:
-        rows = rows.to(
-            device=dst.device,
-            non_blocking=src.device.type == "cpu" and src.is_pinned(),
-        )
-    dst.index_copy_(0, dst_index, rows)
-
-
 @lru_cache(maxsize=None)
 def _jit_update_flag_module() -> Module:
     return load_jit(
@@ -149,14 +113,6 @@ def fast_index_copy_jit(
 
     dst = dst.as_strided(size=(dst.size(0), num_dst_feature), stride=(num_dst_feature, 1))
     src = src.as_strided(size=(src.size(0), num_src_feature), stride=(num_src_feature, 1))
-
-    if _is_rocm():
-        if priority is not None:
-            raise NotImplementedError(
-                "ROCm fast-index-copy fallback does not implement high/normal priority scheduling"
-            )
-        _rocm_index_copy_fallback(dst, dst_indices, src, src_indices, num_indices)
-        return
 
     feature_size = dst.size(-1) * dst.element_size()
     num_block = num_block or DEFAULT_NUM_BLOCKS
