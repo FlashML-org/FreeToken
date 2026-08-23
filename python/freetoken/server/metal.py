@@ -600,41 +600,27 @@ def _watch_mlx_load(
 
 
 def _gemma4_chat_template() -> str | None:
-    """The Gemma 4 turn-format chat template, for models whose snapshot ships
-    none (gemma-4 repos upload tokenizer files without a chat_template).
+    """Google's canonical Gemma 4 chat template, for gemma-4 snapshots whose
+    repo ships none (the 26b-a4b base repo uploads tokenizer files without a
+    chat_template; the -it repos carry chat_template.jinja).
 
-    Returns None when the model is not a Gemma 4 -- other models either ship
-    their own template (correct as-is) or are not chat models. The format is
-    the one transformers' own serving utils document for gemma4: a leading
-    bos_token (gemma degenerates into endless repetition without it -- the
-    tokenizer adds no specials when a chat template is applied), user turns
-    open "<|turn>user\\n" and close "<turn|>\\n"; model turns open
-    "<|turn>model\\n"; thinking lives in a "<|channel>thought" block. Plain
-    (non-stripping) block tags only: every newline is an explicit escape, so
-    whitespace control can never eat a separator."""
+    Loaded from the bundled gemma4_chat_template.jinja (Google Gemma
+    Engineering, 2026-07-09 -- fixes tool-calling loops, turn closures, and
+    thinking content-ordering). Do NOT hand-edit: the exact turn grammar
+    (<|turn>/<turn|>, <|channel>thought, <|think|>, tool blocks) is what the
+    model was trained on, and near-misses make it degenerate into raw
+    text completion (endless repetition, API-doc regurgitation).
+
+    Returns None when the asset is missing -- other models either ship their
+    own template (correct as-is) or are not chat models."""
     global _GEMMA4_TEMPLATE
     if _GEMMA4_TEMPLATE is None:
-        _GEMMA4_TEMPLATE = (
-            "{{ bos_token }}"
-            "{% if messages[0]['role'] == 'system' %}"
-            "<|turn>system\n{{ messages[0]['content'] }}<turn|>\n"
-            "{% set messages = messages[1:] %}"
-            "{% endif %}"
-            "{% for message in messages %}"
-            "{% if message['role'] == 'user' %}"
-            "<|turn>user\n{{ message['content'] }}<turn|>\n"
-            "{% elif message['role'] == 'assistant' %}"
-            "<|turn>model\n"
-            "{% if message.get('thinking') %}"
-            "<|channel>thought\n{{ message['thinking'] }}<channel|>\n"
-            "{% endif %}"
-            "{{ message['content'] }}<turn|>\n"
-            "{% endif %}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}"
-            "<|turn>model\n"
-            "{% endif %}"
-        )
+        path = os.path.join(os.path.dirname(__file__), "gemma4_chat_template.jinja")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _GEMMA4_TEMPLATE = f.read()
+        except OSError:
+            return None
     return _GEMMA4_TEMPLATE
 
 
