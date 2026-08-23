@@ -13,7 +13,9 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+# laguna ships a plain gpt2-style BPE (tokenizer.ggml.model = "gpt2"); transformers
+# has no "laguna" converter, so route it to the gpt2 one.
+_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "laguna": "gpt2"}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -28,9 +30,14 @@ def load_gguf_tokenizer(model_path: str):
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
-    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
-
     tokens = tok_dict["tokens"]
+    # Some converters (gpt2) read .bos_token/.eos_token off the skeleton, which the
+    # GGUF metadata only carries as ids -- materialize the token strings.
+    for name in ("bos", "eos"):
+        tid = tok_dict.get(f"{name}_token_id")
+        if f"{name}_token" not in tok_dict and tid is not None and int(tid) < len(tokens):
+            tok_dict[f"{name}_token"] = tokens[int(tid)]
+    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
@@ -53,7 +60,10 @@ def load_gguf_tokenizer(model_path: str):
 
 
 def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
-    """Stop ids for GGUF generation: the formal <eos> plus the chat turn end <turn|>."""
+    """Stop ids for GGUF generation: the formal <eos>, the chat turn end <turn|>, the
+    GGUF-declared eot, and gemma4's tool-response opener <|tool_response> (the model
+    emits it right after closing a tool call, so it is a stop id upstream too --
+    generation_config.json ships eos_token_id [1, 106, 50])."""
     meta = load_gguf_metadata(model_path)
     tokens = meta["tokenizer.ggml.tokens"]
     ids: set[int] = set()
@@ -64,7 +74,10 @@ def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
         ids.add(int(eid))
     # Look the stop tokens up in the vocab directly (convert_tokens_to_ids would map an
     # absent name to <unk>, wrongly adding it as a stop id).
-    for name in ("<eos>", "<turn|>"):
+    eot = meta.get("tokenizer.ggml.eot_token_id")
+    if eot is not None:
+        ids.add(int(eot))
+    for name in ("<eos>", "<turn|>", "<|tool_response>"):
         try:
             ids.add(tokens.index(name))
         except ValueError:

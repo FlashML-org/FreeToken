@@ -545,7 +545,8 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t top_k,
     int64_t type,
     int64_t row,
-    int64_t tokens) {
+    int64_t tokens,
+    int64_t expert_stride_bytes) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
@@ -568,6 +569,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 3:
@@ -581,6 +583,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 6:
@@ -594,6 +597,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 7:
@@ -607,6 +611,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 8:
@@ -620,6 +625,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 10:
@@ -633,6 +639,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 11:
@@ -646,6 +653,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 12:
@@ -659,6 +667,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 13:
@@ -672,6 +681,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 14:
@@ -685,6 +695,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 16:
@@ -698,6 +709,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 17:
@@ -711,6 +723,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 18:
@@ -724,6 +737,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 19:
@@ -737,6 +751,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 20:
@@ -750,6 +765,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 21:
@@ -763,6 +779,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 22:
@@ -776,6 +793,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 23:
@@ -789,6 +807,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
       case 29:
@@ -802,6 +821,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride_bytes,
             stream);
         break;
     }
