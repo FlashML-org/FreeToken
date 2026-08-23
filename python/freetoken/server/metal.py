@@ -605,30 +605,35 @@ def _gemma4_chat_template() -> str | None:
 
     Returns None when the model is not a Gemma 4 -- other models either ship
     their own template (correct as-is) or are not chat models. The format is
-    the one transformers' own serving utils document for gemma4: user turns
-    open "<|turn>user\\n" and close "<turn|>"; model turns open
-    "<|turn>model\\n"; thinking lives in a "<|channel>thought" block."""
+    the one transformers' own serving utils document for gemma4: a leading
+    bos_token (gemma degenerates into endless repetition without it -- the
+    tokenizer adds no specials when a chat template is applied), user turns
+    open "<|turn>user\\n" and close "<turn|>\\n"; model turns open
+    "<|turn>model\\n"; thinking lives in a "<|channel>thought" block. Plain
+    (non-stripping) block tags only: every newline is an explicit escape, so
+    whitespace control can never eat a separator."""
     global _GEMMA4_TEMPLATE
     if _GEMMA4_TEMPLATE is None:
         _GEMMA4_TEMPLATE = (
-            "{%- if messages[0]['role'] == 'system' -%}\n"
+            "{{ bos_token }}"
+            "{% if messages[0]['role'] == 'system' %}"
             "<|turn>system\n{{ messages[0]['content'] }}<turn|>\n"
-            "{%- set messages = messages[1:] -%}\n"
-            "{%- endif -%}\n"
-            "{%- for message in messages -%}\n"
-            "{%- if message['role'] == 'user' -%}\n"
+            "{% set messages = messages[1:] %}"
+            "{% endif %}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
             "<|turn>user\n{{ message['content'] }}<turn|>\n"
-            "{%- elif message['role'] == 'assistant' -%}\n"
+            "{% elif message['role'] == 'assistant' %}"
             "<|turn>model\n"
-            "{%- if message.get('thinking') -%}\n"
+            "{% if message.get('thinking') %}"
             "<|channel>thought\n{{ message['thinking'] }}<channel|>\n"
-            "{%- endif -%}\n"
+            "{% endif %}"
             "{{ message['content'] }}<turn|>\n"
-            "{%- endif -%}\n"
-            "{%- endfor -%}\n"
-            "{%- if add_generation_prompt -%}\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
             "<|turn>model\n"
-            "{%- endif -%}"
+            "{% endif %}"
         )
     return _GEMMA4_TEMPLATE
 
