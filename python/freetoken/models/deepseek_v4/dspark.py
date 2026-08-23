@@ -613,7 +613,10 @@ def sampling_probs(
         out = torch.zeros_like(logits)
         out.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
         return out
-    scaled = logits.float() / temperature
+    # DSpark evaluates standard speculative sampling at temperature 1.0. Dividing by
+    # exactly one is numerically redundant, but it still launches an elementwise kernel
+    # for every draft and target row in every cycle.
+    scaled = logits.float() if temperature == 1.0 else logits.float() / temperature
     if top_k and top_k > 0:
         kth = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1).values[..., -1:]
         scaled = scaled.masked_fill(scaled < kth, float("-inf"))
@@ -698,25 +701,36 @@ def rejection_accept_device(
         uniforms = torch.rand(
             n, device=p.device, dtype=torch.float32, generator=generator
         )
-        rejected = torch.nonzero(p_token <= uniforms * q_token, as_tuple=False)
-        n_acc = int(rejected[0, 0]) if rejected.numel() else n
+        # Keep the prefix reduction on device. Converting the first rejection to a
+        # Python int here would synchronize once for the length and again for the
+        # recovered token below. vLLM publishes both results together as well.
+        positions = torch.arange(n, device=p.device, dtype=torch.int64)
+        n_acc_device = torch.where(
+            p_token <= uniforms * q_token,
+            positions,
+            torch.full_like(positions, n),
+        ).amin()
     else:
-        n_acc = 0
+        n_acc_device = torch.zeros((), dtype=torch.int64, device=p.device)
 
-    if n_acc < n:
-        residual = torch.clamp(p[n_acc] - q[n_acc], min=0.0)
+    if n:
+        rejected_row = n_acc_device.clamp_max(n - 1)
+        residual = torch.clamp(p[rejected_row] - q[rejected_row], min=0.0)
         total = residual.sum()
-        # torch.where keeps the degenerate fallback on device; clamp_min only
-        # protects the unselected division branch from producing NaNs.
-        dist = torch.where(
+        # clamp_min protects the unselected division branch from producing NaNs.
+        residual_dist = torch.where(
             total > 0,
             residual / total.clamp_min(torch.finfo(residual.dtype).tiny),
-            p[n_acc],
+            p[rejected_row],
         )
+        dist = torch.where(n_acc_device < n, residual_dist, p[n])
     else:
         dist = p[n]
-    bonus = int(torch.multinomial(dist, 1, generator=generator).item())
-    return n_acc, bonus
+    bonus_device = torch.multinomial(dist, 1, generator=generator).squeeze(0)
+    result = torch.stack((n_acc_device, bonus_device.to(torch.int64))).to(
+        "cpu", non_blocking=False
+    )
+    return int(result[0]), int(result[1])
 
 
 def window_cols_for_block(

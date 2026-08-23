@@ -250,15 +250,15 @@ class GraphRunner:
             self.moe_offload_cache.reset()
 
     def _profile_graph_ms(self, graph: torch.cuda.CUDAGraph, replays: int = 5) -> float:
-        """Median replay cost with a cold expert cache, matching vLLM's profiler.
+        """Median replay cost for DSpark's hardware-capacity curve.
 
-        A reset precedes every sample because the real hybrid workload continually
-        changes routed experts.  Pricing a repeated dummy route after its first replay
-        would measure an all-hot cache and systematically underprice verification.
+        Begin the series cold, then let ordinary LRU fills and hits participate in
+        the curve. This prices the cache reuse present during normal engine execution
+        instead of forcing an artificial cold miss before every timed replay.
         """
         samples: list[float] = []
+        self._reset_moe_offload_cache()
         for _ in range(replays):
-            self._reset_moe_offload_cache()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record(self.stream)

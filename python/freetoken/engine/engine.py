@@ -1237,17 +1237,17 @@ class Engine:
                 f"{expected} ({1 + k} per request x {len(batch.reqs)}). The forward must "
                 "pass logit_indices covering every drafted position."
             )
-        # Not self.sampler: a speculative batch has 1+k ROWS per request while the
-        # sampling args are sized per REQUEST.  Greedy verification reduces the
-        # [rows, vocab] logits on the GPU and transfers only one int per row.  Copying
-        # the whole matrix to the CPU was ~3 MiB per six-row cycle and then repeated
-        # the reduction on the slower side of PCIe.
-        target_cpu = logits.argmax(dim=-1).to(torch.int32).to("cpu", non_blocking=False)
-        # The blocking target copy above proves the draft events have completed.
-        # Record the five startup samples here, after target launch, so timing the
-        # drafter never introduces a synchronization between draft and verify.
-        self._record_adaptive_draft_cost(batch)
         any_sampled = any(not req.sampling_params.is_greedy for req in batch.reqs)
+        any_greedy = any(req.sampling_params.is_greedy for req in batch.reqs)
+        # Not self.sampler: a speculative batch has 1+k rows per request while the
+        # sampling args are sized per request. Greedy verification needs target argmax
+        # ids. Probabilistic rejection consumes p directly; reducing and copying argmax
+        # before its p/q test inserted an otherwise unused synchronization every cycle.
+        target_cpu = (
+            logits.argmax(dim=-1).to(torch.int32).to("cpu", non_blocking=False)
+            if any_greedy
+            else None
+        )
         if any_sampled and batch.draft_probs is None:
             raise RuntimeError("sampled DSpark verification is missing draft probabilities")
         confidence = batch.draft_confidence
@@ -1256,7 +1256,18 @@ class Engine:
             raise RuntimeError(
                 "DSpark verify is missing the gamma proposals produced by its sequential stage"
             )
-        proposed_cpu = proposed_gpu.to("cpu", non_blocking=False).to(torch.int32)
+        # Greedy acceptance consumes proposal ids immediately. Sampled acceptance keeps
+        # them on device until rejection has queued directly behind target verification.
+        proposed_cpu = (
+            proposed_gpu.to("cpu", non_blocking=False).to(torch.int32)
+            if any_greedy
+            else None
+        )
+        draft_cost_recorded = False
+        if any_greedy:
+            # The blocking id copies prove the draft events have completed.
+            self._record_adaptive_draft_cost(batch)
+            draft_cost_recorded = True
 
         emitted: list[torch.Tensor] = []
         release_tail = getattr(batch, "release_tail", None)
@@ -1271,16 +1282,6 @@ class Engine:
             # one ahead of the buffer during decode (see the write-back above), so that
             # form silently yielded k-1 proposals -- a short slice, not an error.
             start = req.input_ids.numel() - k
-            proposed = proposed_cpu[i * k:(i + 1) * k]
-            # A VIEW of _ids_buf, which the accept path overwrites below. Snapshot it
-            # for the debug line, or the log shows post-mutation values and invents
-            # agreements that never happened.
-            proposed_snapshot = proposed.clone() if _SPEC_DEBUG else None
-            if proposed.numel() != k:
-                raise RuntimeError(
-                    f"block has {proposed.numel()} proposals, expected {k}; the "
-                    "request's buffer and the batch's block width disagree"
-                )
             # Fixed-width verification is the paper/vLLM fallback when the profiled
             # hardware-aware scheduler is disabled.  A static per-token threshold is
             # deliberately not used: DSpark section 3.2 schedules a GLOBAL token budget
@@ -1297,6 +1298,8 @@ class Engine:
             budget = req.max_device_len - start - 1
             width = max(0, min(width, budget))
             if greedy:
+                assert proposed_cpu is not None and target_cpu is not None
+                proposed = proposed_cpu[i * k:(i + 1) * k]
                 n_acc, bonus = accepted_prefix(
                     proposed[:width], target_cpu[off:off + width + 1]
                 )
@@ -1315,6 +1318,22 @@ class Engine:
                     proposed_gpu[i * k:i * k + width],
                     batch.draft_probs[i * k:i * k + width],
                     p_req,
+                )
+                if not draft_cost_recorded:
+                    # The rejection sampler's one small D2H result proves the draft
+                    # timing events have completed; do not add another synchronization.
+                    self._record_adaptive_draft_cost(batch)
+                    draft_cost_recorded = True
+                proposed = proposed_gpu[i * k:(i + 1) * k].to(
+                    "cpu", non_blocking=False
+                ).to(torch.int32)
+            # Snapshot before req._ids_buf is rewritten below. Without it, debug logs
+            # display post-mutation tokens and invent proposal/target agreements.
+            proposed_snapshot = proposed.clone() if _SPEC_DEBUG else None
+            if proposed.numel() != k:
+                raise RuntimeError(
+                    f"block has {proposed.numel()} proposals, expected {k}; the "
+                    "request's buffer and the batch's block width disagree"
                 )
             keep = start + n_acc
             req.input_ids = req._ids_buf[:start]
@@ -1347,6 +1366,7 @@ class Engine:
                     [round(float(c), 3) for c in confidence[i * k:(i + 1) * k]],
                     int(req._ids_buf[start - 1]) if start > 0 else None,
                     proposed_snapshot[:width].tolist(),
+                    None if target_cpu is None else
                     target_cpu[off:off + width + 1].tolist(),
                     width, n_acc, bonus,
                     emitted[-1].tolist() if emitted else None,
