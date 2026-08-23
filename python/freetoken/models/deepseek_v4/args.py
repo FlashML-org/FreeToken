@@ -69,14 +69,55 @@ class DeepseekV4Args:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
+    # ----- dSpark (semi-autoregressive speculative decoding) -----
+    # The checkpoint's ``mtp.{0..n_mtp_layers-1}`` stack. Unlike a one-token-per-step MTP
+    # head, dSpark proposes a whole block: ``dspark_block_size`` tokens per draft pass,
+    # scored by a Markov head and gated by a confidence head. Each mtp layer is a FULL
+    # DSV4 block, so enabling it costs n_mtp_layers x n_routed_experts more expert banks.
+    dspark_block_size: int = 0
+    dspark_markov_rank: int = 0
+    dspark_noise_token_id: int = -1
+    # Which target layers feed the drafter its hidden state.
+    dspark_target_layer_ids: Tuple[int, ...] = ()
+    # Runtime opt-in, set by the server from --speculative-dspark. The fields above only
+    # describe what the CHECKPOINT ships; this says whether to pay for it. Off by default
+    # because the drafter's own routed experts enlarge the host banks and the GPU cache.
+    dspark_enabled: bool = False
+
     def __post_init__(self) -> None:
         # JSON lists -> tuple so the dataclass stays hashable / immutable-ish.
         if isinstance(self.compress_ratios, list):
             self.compress_ratios = tuple(self.compress_ratios)
+        if isinstance(self.dspark_target_layer_ids, list):
+            self.dspark_target_layer_ids = tuple(self.dspark_target_layer_ids)
 
     @property
     def nope_head_dim(self) -> int:
         return self.head_dim - self.rope_head_dim
+
+    @property
+    def has_dspark(self) -> bool:
+        """Does this checkpoint ship a usable dSpark drafter?"""
+        return (
+            self.dspark_block_size > 1
+            and self.n_mtp_layers > 0
+            and self.dspark_markov_rank > 0
+        )
+
+    @property
+    def n_draft_layers(self) -> int:
+        """Drafter layers actually built. Zero unless dSpark is both shipped and enabled."""
+        return self.n_mtp_layers if (self.has_dspark and self.dspark_enabled) else 0
+
+    @property
+    def n_moe_layers(self) -> int:
+        """MoE layers the expert banks and the offload cache must cover.
+
+        The drafter's layers are appended AFTER the target's, so a draft layer keeps the
+        cache-facing id ``n_layers + k``. Every layer-indexed structure (host banks, GPU
+        slot cache, KV pools) then addresses target and draft layers the same way.
+        """
+        return self.n_layers + self.n_draft_layers
 
 
 def _config_path(model_path: str) -> str:

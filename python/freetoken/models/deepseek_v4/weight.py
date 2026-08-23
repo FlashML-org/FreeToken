@@ -22,6 +22,7 @@ from tqdm import tqdm
 from freetoken.models.loader import drop_page_cache
 
 from .args import DeepseekV4Args, load_args
+from .parallel import div_tp, shard, tp_info
 
 
 class _ShardReader:
@@ -99,31 +100,44 @@ def iter_weights(
     def get(name: str) -> torch.Tensor:
         return reader.get(name)
 
-    def linear(prefix: str):
-        yield f"{prefix}.weight", get(f"{prefix}.weight")
+    def linear(prefix: str, split: int | None = None):
+        """Yield one linear's tensors, sharded for this rank.
+
+        ``split=0`` is column-parallel (split the output rows), ``split=1`` is
+        row-parallel (split the input columns), ``None`` replicates. The 128x128 FP8
+        ``scale`` grid splits on the SAME axis as its weight, so the two stay aligned.
+        """
+        w = get(f"{prefix}.weight")
+        yield f"{prefix}.weight", w if split is None else shard(w, split)
         if reader.has(f"{prefix}.scale"):
-            yield f"{prefix}.scale", get(f"{prefix}.scale")
+            s = get(f"{prefix}.scale")
+            yield f"{prefix}.scale", s if split is None else shard(s, split)
 
     try:
-        yield "embed.weight", get("embed.weight")
+        # Vocabulary-parallel: each rank keeps one contiguous block of rows.
+        yield "embed.weight", shard(get("embed.weight"), 0)
         yield "norm.weight", get("norm.weight")
-        yield "head", get("head.weight")
+        yield "head", shard(get("head.weight"), 0)
         for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             yield nm, get(nm)
 
         for L in range(args.n_layers):
             a = f"layers.{L}.attn"
+            # wq_a / wkv / the norms stay replicated: MLA keeps ONE latent KV per token
+            # that every head reads, so there is nothing to split on that path.
             yield from linear(f"{a}.wq_a")
             yield f"{a}.q_norm.weight", get(f"{a}.q_norm.weight")
-            yield from linear(f"{a}.wq_b")
+            yield from linear(f"{a}.wq_b", split=0)  # column-parallel over heads
             yield from linear(f"{a}.wkv")
             yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
             # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{a}.wo_a", _dequant_fp8_block(
+            # Rows are o_groups blocks of o_lora_rank, so a dim-0 split hands each rank
+            # whole groups -- matching the heads its wq_b shard produced.
+            yield f"{a}.wo_a", shard(_dequant_fp8_block(
                 get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
-            )
-            yield from linear(f"{a}.wo_b")
-            yield f"{a}.attn_sink", get(f"{a}.attn_sink")
+            ), 0)
+            yield from linear(f"{a}.wo_b", split=1)  # row-parallel; all-reduced in _wo
+            yield f"{a}.attn_sink", shard(get(f"{a}.attn_sink"), 0)
 
             ratio = args.compress_ratios[L]
             if ratio:
@@ -151,8 +165,10 @@ def iter_weights(
                 yield f"{g}.tid2eid", get(f"{g}.tid2eid")
             else:
                 yield f"{g}.bias", get(f"{g}.bias")
-            for proj in ("w1", "w2", "w3"):
-                yield from linear(f"layers.{L}.ffn.shared_experts.{proj}")
+            # Shared expert: the intermediate dim splits (w1/w3 column, w2 row); the
+            # partial sum is all-reduced together with the routed half in MoE.forward.
+            for proj, split in (("w1", 0), ("w2", 1), ("w3", 0)):
+                yield from linear(f"layers.{L}.ffn.shared_experts.{proj}", split=split)
 
             for nm in (
                 "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
@@ -170,6 +186,35 @@ _EXPERT_RE = re.compile(
     r"^layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
 )
+
+# The dSpark drafter's own routed experts. Its layers are appended after the target's,
+# so ``mtp.k`` becomes bank layer ``n_layers + k`` and every layer-indexed structure
+# (host banks, GPU slot cache) addresses draft and target layers identically.
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.(?P<mtp>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
+)
+
+
+def _expert_key(name: str, args: DeepseekV4Args):
+    """``(bank_layer, expert, proj, kind)`` for a routed-expert tensor, else None.
+
+    Returns None for anything this run does not serve: a target layer past ``n_layers``
+    and, when dSpark is off, every ``mtp.*`` expert.
+    """
+    m = _EXPERT_RE.match(name)
+    if m is not None:
+        layer = int(m.group("layer"))
+        if layer >= args.n_layers:  # a trailing MTP layer in the target namespace
+            return None
+        return layer, int(m.group("expert")), m.group("proj"), m.group("kind")
+    m = _MTP_EXPERT_RE.match(name)
+    if m is None:
+        return None
+    k = int(m.group("mtp"))
+    if k >= args.n_draft_layers:  # dSpark off, or a layer beyond n_mtp_layers
+        return None
+    return args.n_layers + k, int(m.group("expert")), m.group("proj"), m.group("kind")
 
 
 def load_dsfp4_expert_sources(
@@ -191,39 +236,39 @@ def load_dsfp4_expert_sources(
 
     folder = model_path
     weight_map = _weight_map(folder)
-    L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
+    # L covers the target layers plus, when dSpark is enabled, the drafter's own.
+    L, E = args.n_moe_layers, args.n_routed_experts
 
-    for shard in sorted(set(weight_map.values())):
-        drop_page_cache(os.path.join(folder, shard))
+    for shard_file in sorted(set(weight_map.values())):
+        drop_page_cache(os.path.join(folder, shard_file))
 
-    shards: dict[str, list[tuple[str, re.Match]]] = collections.defaultdict(list)
-    for name, shard in weight_map.items():
-        m = _EXPERT_RE.match(name)
-        if m is None:
-            continue
-        if int(m.group("layer")) >= L:  # skip the MTP layer (index L)
-            continue
-        shards[shard].append((name, m))
+    shards: dict[str, list[tuple[str, tuple]]] = collections.defaultdict(list)
+    for name, shard_file in weight_map.items():
+        key = _expert_key(name, args)
+        if key is not None:
+            shards[shard_file].append((name, key))
 
-    e8m0 = torch.float8_e8m0fnu
-    specs = {  # alloc UNPINNED, fill, then pin-after-fill (skips slow cudaHostAlloc zero-fill)
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
+    specs, I, i_lo = _expert_bank_specs(args)
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
+
+    # Under TP a rank keeps only rows [i_lo, i_lo+I) of w1/w3, and those rows are
+    # CONTIGUOUS in the file -- so read just them instead of reading the whole tensor and
+    # throwing (N-1)/N of it away. w2 needs a COLUMN slice, whose rows are strided, so it
+    # is still read whole. w1+w3 are two thirds of the expert bytes, so at TP=4 this cuts
+    # a rank's read (and its copy work) roughly in half.
+    sliced_read = I != args.moe_inter_dim
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)  # {w1,w2,w3} x {weight,scale} x experts
         placed = 0
-        for shard in tqdm(sorted(shards), desc="Loading DSV4 FP4 experts"):
-            path = os.path.join(folder, shard)
+        for shard_file in tqdm(sorted(shards), desc="Loading DSV4 FP4 experts"):
+            path = os.path.join(folder, shard_file)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-                for name, m in shards[shard]:
-                    layer = _place_dsfp4(banks, name, f.get_tensor(name), I)
+                for name, key in shards[shard_file]:
+                    rows_ready = sliced_read and key[2] in ("w1", "w3")
+                    t = f.get_slice(name)[i_lo:i_lo + I] if rows_ready else f.get_tensor(name)
+                    layer = _place_dsfp4(banks, key, t, I, i_lo, rows_ready)
                     tracker.note(layer)
                     placed += 1
             drop_page_cache(path)
@@ -244,15 +289,8 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
-    L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
-    e8m0 = torch.float8_e8m0fnu
-    specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
+    L = args.n_moe_layers
+    specs, _I, _i_lo = _expert_bank_specs(args)
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
     for t in banks["gate_up_packed"]:  # packed e2m1; scales stay 0 (valid e8m0)
@@ -265,30 +303,66 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
 
 def is_expert_tensor(name: str) -> bool:
     """Predicate for the common parallel reader: is this a routed-expert tensor?"""
-    return _EXPERT_RE.match(name) is not None
+    return _EXPERT_RE.match(name) is not None or _MTP_EXPERT_RE.match(name) is not None
 
 
-def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int) -> int:
+def _expert_bank_specs(args: DeepseekV4Args) -> tuple[dict, int, int]:
+    """The 4 routed-expert bank specs for THIS rank, plus its slice of ``moe_inter_dim``.
+
+    Tensor parallelism splits the intermediate dim, so each rank allocates and reads
+    only its own ``I // tp`` rows. This is what divides the 143 GB of host expert banks
+    across the ranks instead of replicating them.
+    """
+    E, H = args.n_routed_experts, args.dim
+    # FP4 packs 2 values per byte and carries one e8m0 scale per 32 values, so a rank's
+    # slice must stay a multiple of 32 on the intermediate axis.
+    i_local = div_tp(args.moe_inter_dim, "moe_inter_dim", multiple_of=32)
+    i_lo = tp_info()[0] * i_local
+    e8m0 = torch.float8_e8m0fnu
+    specs = {  # alloc UNPINNED, fill, then pin-after-fill (skips slow cudaHostAlloc zero-fill)
+        "gate_up_packed": ((E, 2 * i_local, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * i_local, H // 32), e8m0),
+        "down_packed": ((E, H, i_local // 2), torch.uint8),
+        "down_scale": ((E, H, i_local // 32), e8m0),
+    }
+    return specs, i_local, i_lo
+
+
+def _place_dsfp4(
+    banks: dict, key: tuple, t: torch.Tensor, I: int, i_lo: int = 0,
+    rows_ready: bool = False,
+) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
-    readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
-    m = _EXPERT_RE.match(name)
-    layer, expert = int(m.group("layer")), int(m.group("expert"))
-    proj, kind = m.group("proj"), m.group("kind")
+    readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index.
+
+    ``key`` is ``_expert_key``'s ``(bank_layer, expert, proj, kind)``, so a drafter
+    expert lands in bank layer ``n_layers + k`` with no special case here.
+
+    ``I`` is this rank's intermediate width and ``i_lo`` its offset into the checkpoint's
+    full width, so each rank keeps only its own rows of w1/w3 and its own columns of w2.
+    ``rows_ready`` says the caller already read JUST those rows (the serial reader slices
+    w1/w3 at the file), so they must not be sliced a second time.
+    """
+    layer, expert, proj, kind = key
+
+    def rows(x: torch.Tensor) -> torch.Tensor:
+        return x if rows_ready else x[i_lo:i_lo + I]
+
     if kind == "weight":
         t = t.view(torch.uint8)
         if proj == "w1":
-            banks["gate_up_packed"][layer][expert, :I] = t
+            banks["gate_up_packed"][layer][expert, :I] = rows(t)
         elif proj == "w3":
-            banks["gate_up_packed"][layer][expert, I:] = t
-        else:  # w2 -> down
-            banks["down_packed"][layer][expert] = t
-    else:  # scale (e8m0)
+            banks["gate_up_packed"][layer][expert, I:] = rows(t)
+        else:  # w2 -> down; the intermediate axis is packed 2-per-byte
+            banks["down_packed"][layer][expert] = t[:, i_lo // 2:(i_lo + I) // 2]
+    else:  # scale (e8m0), one per 32 values on the intermediate axis
         if proj == "w1":
-            banks["gate_up_scale"][layer][expert, :I] = t
+            banks["gate_up_scale"][layer][expert, :I] = rows(t)
         elif proj == "w3":
-            banks["gate_up_scale"][layer][expert, I:] = t
+            banks["gate_up_scale"][layer][expert, I:] = rows(t)
         else:
-            banks["down_scale"][layer][expert] = t
+            banks["down_scale"][layer][expert] = t[:, i_lo // 32:(i_lo + I) // 32]
     return layer
 
 
@@ -302,27 +376,20 @@ def load_dsfp4_expert_sources_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
-    e8m0 = torch.float8_e8m0fnu
-    specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
+    # L covers the target layers plus, when dSpark is enabled, the drafter's own.
+    L, E = args.n_moe_layers, args.n_routed_experts
+    specs, I, i_lo = _expert_bank_specs(args)
     hb = alloc_layer_banks(specs, L)  # lazy host banks (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _is_expert(name: str) -> bool:
-        m = _EXPERT_RE.match(name)
-        return m is not None and int(m.group("layer")) < L  # skip the MTP layer (index L)
+        return _expert_key(name, args) is not None
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)
         placed = 0
         for name, t in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
-            layer = _place_dsfp4(banks, name, t, I)
+            layer = _place_dsfp4(banks, _expert_key(name, args), t, I, i_lo)
             tracker.note(layer)
             placed += 1
         return placed

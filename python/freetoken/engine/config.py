@@ -72,7 +72,12 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    # Collective timeout for the TP process group. The FIRST collective is the post-load
+    # free-memory all-reduce, and ranks reach it minutes apart on a large MoE checkpoint
+    # (each reads its own expert shards, at its own speed), so a short timeout kills the
+    # server during a healthy startup rather than protecting it. Sized for that load skew;
+    # lower it with --distributed-timeout if a hung rank should fail faster.
+    distributed_timeout: float = 1800.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None

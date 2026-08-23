@@ -31,6 +31,27 @@ for them; other checkpoints of the same architectures work too.
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it.
 
+## Tensor parallelism
+
+`ft serve --tensor-parallel-size N` shards the model over N GPUs on one host. One
+scheduler process runs per rank, and rank `i` uses `cuda:i`.
+
+DeepSeek-V4 shards:
+
+- MLA query and output heads (`wq_b` column-parallel, `wo_a` by output group,
+  `wo_b` row-parallel with one all-reduce per block)
+- the MoE intermediate dimension, for both the shared expert and the routed FP4
+  experts, so the host expert banks divide by N instead of being replicated
+- the vocabulary, for the embedding table and the output head
+
+It keeps replicated: the MLA latent KV path (`wkv` and the paged KV pools — every
+head reads the same latent KV), the compressors and the Lightning Indexer (every
+rank must select the same blocks), and the router.
+
+Constraints for DeepSeek-V4: N must divide `o_groups` (8), so N is 1, 2, 4 or 8.
+The KV pool is replicated, so its cost per GPU does not fall with N; the weights
+and the expert banks do.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

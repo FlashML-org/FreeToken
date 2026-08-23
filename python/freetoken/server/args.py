@@ -241,6 +241,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Seconds a tensor-parallel collective waits before failing. The first one is "
+            "the post-load memory all-reduce, which ranks reach minutes apart on a large "
+            "MoE checkpoint, so the default is sized for that load skew; lower it to make "
+            "a hung rank fail faster."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",

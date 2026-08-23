@@ -7,12 +7,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
 
 from .args import DeepseekV4Args
 from .layers import Linear
+from .parallel import div_tp, tp_size
 
 
 class Gate(nn.Module):
@@ -56,13 +58,19 @@ class Gate(nn.Module):
 
 
 class Expert(nn.Module):
-    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
+    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4).
+
+    Under TP the intermediate dimension splits: ``w1``/``w3`` are column-parallel and
+    ``w2`` is row-parallel, so the output is a partial sum. ``MoE.forward`` owns the
+    single all-reduce that completes it together with the routed half.
+    """
 
     def __init__(self, dim: int, inter_dim: int, swiglu_limit: float):
         super().__init__()
-        self.w1 = Linear(dim, inter_dim, kind="fp8")
-        self.w2 = Linear(inter_dim, dim, kind="fp8")
-        self.w3 = Linear(dim, inter_dim, kind="fp8")
+        inter_local = div_tp(inter_dim, "moe_inter_dim", multiple_of=128)
+        self.w1 = Linear(dim, inter_local, kind="fp8")
+        self.w2 = Linear(inter_local, dim, kind="fp8")
+        self.w3 = Linear(dim, inter_local, kind="fp8")
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -87,6 +95,16 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
+
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Suppress the base class's per-call collective.
+
+        The routed and the shared expert are both partial sums over the same output
+        dim, so DSV4 adds them first and all-reduces ONCE in ``MoE.forward``. Letting
+        the base reduce here would cost a second collective per layer and would also
+        double-count the shared expert.
+        """
+        return hidden_states
 
     def _prefill_routed(
         self,
@@ -133,6 +151,7 @@ class MoE(nn.Module):
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
+        self._comm = DistributedCommunicator() if tp_size() > 1 else None
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -147,4 +166,9 @@ class MoE(nn.Module):
         routed = self.experts.routed_forward(
             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
         )
-        return (routed + shared).view(shape)
+        out = routed + shared
+        # Both halves are partial sums over the split intermediate dim; one collective
+        # completes the layer (see DSV4OffloadMoELayer._maybe_all_reduce).
+        if self._comm is not None:
+            out = self._comm.all_reduce(out)
+        return out.view(shape)
