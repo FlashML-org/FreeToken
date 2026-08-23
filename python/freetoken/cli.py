@@ -27,6 +27,13 @@ Use "ft --version" to print the FreeToken version.""",
 
 
 def _run_serve(argv: list[str]) -> int:
+    # Apple Silicon has no CUDA torch in the Metal venv. The classic launcher
+    # imports torch at module load, so route to serve-metal *before* that import.
+    # Linux/CUDA is unchanged.
+    if sys.platform == "darwin":
+        from freetoken.server.metal_main import main
+
+        return main(argv)
     from freetoken.server import launch_server
 
     launch_server(argv=argv, prog="ft serve")

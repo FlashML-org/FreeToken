@@ -62,7 +62,15 @@ brew install llama.cpp           # option B: llama.cpp's llama-server (Metal)
 ```bash
 # Verify (no model needed):
 ft --version
-ft serve-metal --help
+ft serve --help          # on Apple Silicon this is the Metal backend
+# or: ft serve-metal --help
+```
+
+Or one shot from this repo:
+
+```bash
+./install.sh             # Metal path on Darwin arm64; CUDA wheels on Linux
+ft serve --model mlx-community/Qwen3-0.6B-4bit
 ```
 
 ### Troubleshooting: "no wheels with a matching Python implementation tag"
