@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from freetoken.engine.engine import Engine
-from freetoken.engine.graph import SharedSpecCarryJournal
+from freetoken.engine.graph import GraphRunner, SharedSpecCarryJournal
 from freetoken.models.deepseek_v4.dspark import choose_adaptive_draft_width
 
 
@@ -122,3 +122,19 @@ def test_greedy_verify_reduces_logits_before_crossing_pcie():
     body = inspect.getsource(Engine._finish_speculative)
     assert 'logits.argmax(dim=-1).to(torch.int32).to("cpu"' in body
     assert 'logits.to("cpu"' not in body
+
+
+def test_probabilistic_verify_does_not_compute_unused_target_argmax():
+    import inspect
+
+    body = inspect.getsource(Engine._finish_speculative)
+    assert "any_greedy = any(req.sampling_params.is_greedy" in body
+    assert "if any_greedy" in body
+    assert "else None" in body
+
+
+def test_capacity_profile_flushes_cache_once_not_before_every_replay():
+    import inspect
+
+    body = inspect.getsource(GraphRunner._profile_graph_ms)
+    assert body.count("self._reset_moe_offload_cache()") == 1
