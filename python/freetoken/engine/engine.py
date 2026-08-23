@@ -579,6 +579,24 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
+    def log_distribution_summary(self) -> None:
+        """Gather final TP placement and print it immediately before readiness."""
+        from freetoken.engine.distribution import (
+            format_distribution_summary,
+            local_distribution_snapshot,
+        )
+
+        tp = get_tp_info()
+        rows: list[dict[str, Any] | None] = [None] * tp.size
+        torch.distributed.all_gather_object(
+            rows,
+            local_distribution_snapshot(self),
+            group=self.tp_cpu_group,
+        )
+        if tp.is_primary():
+            for line in format_distribution_summary([row for row in rows if row is not None]):
+                logger.info(line)
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(

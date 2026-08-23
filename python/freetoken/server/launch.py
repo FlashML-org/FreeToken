@@ -98,6 +98,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler = Scheduler(args)
             scheduler.sync_all_ranks()
+            # All final serving allocations now exist (host expert banks, GPU caches,
+            # CUDA graphs). Every rank contributes its real placement before rank 0
+            # sends the ready ack, so the log maps the loaded model rather than merely
+            # describing the workstation's hardware.
+            scheduler.engine.log_distribution_summary()
         except KeyboardInterrupt:
             # A stop during the ~90s load. KeyboardInterrupt is a BaseException, so it
             # slips past the handler below and prints a traceback from wherever the
