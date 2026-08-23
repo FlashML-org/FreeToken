@@ -823,6 +823,7 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
+            object.__setattr__(config, "swa_capacity_source", "explicit")
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size)
@@ -983,8 +984,7 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
-    page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
-    the DSV4 decode batch size.
+    page_size to the window page P, and clamps cuda_graph_bs/max_bs to the DSV4 decode batch size.
     """
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
@@ -1001,11 +1001,8 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
     # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # honored, as is an explicit 'naive'. max_extend_tokens is a user-visible scheduler bound and
+    # remains authoritative; the pool's prefill_chunk_budget may narrow it further.
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
     # so a graph bs above it would exceed the backend's captured snapshot rows. Clamp any
@@ -1365,6 +1362,67 @@ def _adjust_config(config: EngineConfig):
                 f"{(config.num_token_override // config.page_size + 1) * config.page_size}"
             )
         override("num_page_override", config.num_token_override // config.page_size)
+
+    # Resolve window capacity only after model-specific page-size/cache reconciliation. DSV4's
+    # ordinary one-knob path derives the minimum window that can honor max_extend_tokens; an
+    # explicit token/page capacity is an expert override and must be at least that large.
+    swa_tokens = getattr(config, "swa_num_token_override", None)
+    swa_pages = getattr(config, "swa_num_pages_override", None)
+    explicit_swa = swa_tokens is not None or swa_pages is not None
+    if explicit_swa:
+        supports_absolute_swa = is_dsv4 or (
+            has_swa_attention and getattr(config, "cache_type", "radix") == "swa_radix"
+        )
+        if not supports_absolute_swa:
+            raise ValueError(
+                "absolute SWA capacity requires DSV4 or a sliding-window model with "
+                "--cache-type radix"
+            )
+        if swa_tokens is not None and swa_pages is not None:
+            raise ValueError(
+                "swa_num_token_override and swa_num_pages_override are mutually exclusive"
+            )
+        if swa_pages is not None and swa_pages <= 0:
+            raise ValueError(f"swa_num_pages_override must be positive, got {swa_pages}")
+        if swa_tokens is not None:
+            if swa_tokens <= 0:
+                raise ValueError(f"swa_num_token_override must be positive, got {swa_tokens}")
+            swa_page_size = model_config.dsv4_args.window_size if is_dsv4 else 1
+            if swa_tokens % swa_page_size != 0:
+                lower = swa_tokens // swa_page_size * swa_page_size
+                upper = (swa_tokens // swa_page_size + 1) * swa_page_size
+                raise ValueError(
+                    f"--swa-num-tokens {swa_tokens} is not a multiple of the resolved SWA "
+                    f"page size {swa_page_size}; nearest valid values: {lower} or {upper}"
+                )
+            swa_pages = swa_tokens // swa_page_size
+            override("swa_num_pages_override", swa_pages)
+        override("swa_capacity_source", "explicit")
+
+    if is_dsv4:
+        from freetoken.kvcache.dsv4_cost_model import (
+            dsv4_required_swa_pages,
+        )
+
+        P = model_config.dsv4_args.window_size
+        radix = config.cache_type != "naive"
+        requested_prefill = int(getattr(config, "max_extend_tokens", 8192))
+        required_pages = dsv4_required_swa_pages(
+            requested_prefill, config.max_running_req, radix, P
+        )
+        if swa_pages is None:
+            swa_pages = required_pages
+            override("swa_num_pages_override", swa_pages)
+            override("swa_capacity_source", "derived")
+        else:
+            if int(swa_pages) < required_pages:
+                raise ValueError(
+                    f"--swa-num-tokens {int(swa_pages) * P} is below the minimum "
+                    f"{required_pages * P} SWA tokens required by --max-prefill-length "
+                    f"{requested_prefill} with max_running_req={config.max_running_req}"
+                )
+    elif has_swa_attention and getattr(config, "cache_type", None) == "swa_radix" and not explicit_swa:
+        override("swa_capacity_source", "derived")
 
     # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.

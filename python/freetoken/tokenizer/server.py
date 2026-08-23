@@ -191,6 +191,11 @@ def tokenize_worker(
                             num_pages=m.num_pages,
                             mamba_slots=m.mamba_slots,
                             num_swa_pages=m.num_swa_pages,
+                            requested_prefill_tokens=m.requested_prefill_tokens,
+                            pool_prefill_cap_tokens=m.pool_prefill_cap_tokens,
+                            effective_prefill_tokens=m.effective_prefill_tokens,
+                            swa_capacity_source=m.swa_capacity_source,
+                            prefill_limiting_reason=m.prefill_limiting_reason,
                             error=m.error,
                         )
                     )

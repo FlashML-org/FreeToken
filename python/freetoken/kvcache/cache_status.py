@@ -145,7 +145,7 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
     return floors
 
 
-def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
+def compute_cache_pools(engine: "Engine") -> Dict[str, Any]:
     """The ACTUAL pool sizes allocated at load, in API units. The frontend otherwise only
     learns them from per-generation UserReply snapshots — i.e. not until the first chat —
     so this seeds /v1/cache/status geometry with truth from the moment the server is ready.
@@ -154,12 +154,32 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     pools = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
         "swa_page_size": 0, "num_swa_pages": 0,
+        "requested_prefill_tokens": 0, "pool_prefill_cap_tokens": 0,
+        "effective_prefill_tokens": 0, "swa_capacity_source": "none",
+        "prefill_limiting_reason": "none",
     }
     try:
         config = engine.config
         pools["num_pages"] = int(engine.num_pages or 0)
         if config is not None:
             pools["page_size"] = int(config.page_size or 0)
+            requested = int(getattr(config, "max_extend_tokens", 0) or 0)
+            pool_cap = int(
+                getattr(getattr(engine, "kv_cache", None), "prefill_chunk_budget", 0) or 0
+            )
+            mc = config.model_config
+            pools.update(prefill_geometry(
+                requested,
+                pool_cap,
+                getattr(config, "swa_capacity_source", "none"),
+                has_window_pool=bool(
+                    getattr(mc, "dsv4_args", None) is not None
+                    or (
+                        getattr(mc, "has_swa_attention", False)
+                        and getattr(config, "cache_type", None) == "swa_radix"
+                    )
+                ),
+            ))
             # Window pool: its own page unit (swa_page_size -- DSV4 windows are P-token pages,
             # radix-SWA is token-granular page_size 1) and the concrete current size in that unit
             # (num_swa_pages, usable count). Same source as the scheduler's _current_cache_geometry.
@@ -184,6 +204,34 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     return pools
 
 
+def prefill_geometry(
+    requested_tokens: int,
+    pool_cap_tokens: int,
+    swa_capacity_source: str,
+    *,
+    has_window_pool: bool,
+) -> Dict[str, Any]:
+    """Canonical requested/pool/effective prefill readout for startup and live rebuilds."""
+    requested = max(0, int(requested_tokens or 0))
+    pool_cap = max(0, int(pool_cap_tokens or 0))
+    effective = min(requested, pool_cap) if pool_cap else requested
+    if requested <= 0:
+        reason = "none"
+    elif pool_cap and pool_cap < requested:
+        reason = "swa_pool"
+    elif pool_cap and pool_cap == requested:
+        reason = "requested_and_swa_pool"
+    else:
+        reason = "requested_limit"
+    return {
+        "requested_prefill_tokens": requested,
+        "pool_prefill_cap_tokens": pool_cap,
+        "effective_prefill_tokens": effective,
+        "swa_capacity_source": str(swa_capacity_source) if has_window_pool else "none",
+        "prefill_limiting_reason": reason,
+    }
+
+
 def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     """Full readiness ("meta", …) payload for the desktop cache panel: the per-unit VRAM costs
     (compute_cache_unit_bytes) plus the post-weights pre-pool free-VRAM baseline (the sliders'
@@ -193,11 +241,21 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta: Dict[str, Any] = dict(compute_cache_unit_bytes(engine))
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
-    meta["pools"] = compute_cache_pools(engine)
-    # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
+    pools = meta["pools"] = compute_cache_pools(engine)
+    # Effective allocated window/full ratio, for DSV4 and radix-SWA; 0.0 otherwise. An absolute
+    # derived/explicit window supersedes the configured fallback ratio, so report live geometry.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)
-    meta["swa_full_tokens_ratio"] = float(cfg.swa_full_tokens_ratio) if has_swa_ratio else 0.0
+    ratio = 0.0
+    if has_swa_ratio:
+        try:
+            is_dsv4 = getattr(cfg.model_config, "dsv4_args", None) is not None
+            full = int(pools["num_pages"]) if is_dsv4 else int(pools["num_pages"]) * int(pools["page_size"])
+            window = int(pools["num_swa_pages"])
+            ratio = min(1.0, window / full) if full > 0 else float(cfg.swa_full_tokens_ratio)
+        except Exception:  # noqa: BLE001 -- best-effort readiness metadata
+            ratio = float(cfg.swa_full_tokens_ratio)
+    meta["swa_full_tokens_ratio"] = ratio
     # Exact total cache VRAM budget (all pools) the engine honors: memory_ratio of the
     # post-weights baseline minus weights — the same figure the rebuild fit-check uses, with
     # fixed=0 so it's the whole-cache ceiling (KV + MoE + Mamba + SWA), not the KV+MoE remainder.

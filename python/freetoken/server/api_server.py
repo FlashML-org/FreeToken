@@ -275,6 +275,11 @@ class FrontendManager:
             "num_pages": msg.num_pages,
             "mamba_slots": msg.mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
+            "requested_prefill_tokens": msg.requested_prefill_tokens,
+            "pool_prefill_cap_tokens": msg.pool_prefill_cap_tokens,
+            "effective_prefill_tokens": msg.effective_prefill_tokens,
+            "swa_capacity_source": msg.swa_capacity_source,
+            "prefill_limiting_reason": msg.prefill_limiting_reason,
             "error": msg.error,
         }
         fut = self.rebuild_futures.pop(msg.request_id, None)
@@ -495,6 +500,40 @@ class CacheRebuildRequest(BaseModel):
     timeout: float = 300.0
 
 
+def _rebuild_prefill_fields(state: Any) -> Dict[str, Any]:
+    """Best-effort current five-field prefill snapshot for every rebuild exit path."""
+    keys = (
+        "requested_prefill_tokens", "pool_prefill_cap_tokens", "effective_prefill_tokens",
+        "swa_capacity_source", "prefill_limiting_reason",
+    )
+    try:
+        geo = cache_geometry(state)
+        return {key: geo[key] for key in keys}
+    except Exception:  # loading/dummy test states may not have stats or complete config
+        from freetoken.kvcache.cache_status import prefill_geometry
+
+        config = getattr(state, "config", None)
+        pools = getattr(state, "cache_pools", None) or {}
+        last = getattr(state, "last_rebuild", None) or {}
+        requested = int(
+            last.get("requested_prefill_tokens")
+            or pools.get("requested_prefill_tokens", 0)
+            or getattr(config, "max_extend_tokens", 0) or 0
+        )
+        pool_cap = int(
+            last.get("pool_prefill_cap_tokens")
+            or pools.get("pool_prefill_cap_tokens", 0) or 0
+        )
+        source = str(
+            last.get("swa_capacity_source")
+            or pools.get("swa_capacity_source")
+            or getattr(config, "swa_capacity_source", "none") or "none"
+        )
+        return prefill_geometry(
+            requested, pool_cap, source, has_window_pool=source != "none"
+        )
+
+
 async def dispatch_rebuild(
     state: FrontendManager,
     *,
@@ -531,7 +570,10 @@ async def dispatch_rebuild(
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
         state.maintenance_state = "serving"
-        return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
+        return {
+            "status": "failed", "error": f"failed to dispatch rebuild: {e!r}",
+            **_rebuild_prefill_fields(state),
+        }
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -541,7 +583,10 @@ async def dispatch_rebuild(
         # blocked; the eventual CacheRebuildReply flips it to serving/failed via
         # _resolve_rebuild. Drop the now-cancelled future so it does not linger.
         state.rebuild_futures.pop(request_id, None)
-        return {"status": "timeout", "request_id": request_id}
+        return {
+            "status": "timeout", "request_id": request_id,
+            **_rebuild_prefill_fields(state),
+        }
 
 
 def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> int | None:
@@ -571,32 +616,51 @@ async def cache_rebuild(req: CacheRebuildRequest):
     state = get_global_state()
     if state.maintenance_state == "loading":
         return JSONResponse(
-            {"status": "loading", "error": "model is still loading; cannot rebuild cache yet"},
+            {
+                "status": "loading", "error": "model is still loading; cannot rebuild cache yet",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=503,
         )
     if state.maintenance_state == "failed":
         return JSONResponse(
-            {"status": "failed", "error": "server latched in maintenance; restart required"},
+            {
+                "status": "failed", "error": "server latched in maintenance; restart required",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=503,
         )
     if state.maintenance_state == "rebuilding":
         return JSONResponse(
-            {"status": "busy", "error": "a cache rebuild is already in progress"},
+            {
+                "status": "busy", "error": "a cache rebuild is already in progress",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=409,
         )
     if state.maintenance_state == "stopping":
         return JSONResponse(
-            {"status": "busy", "error": "engine stop is in progress"},
+            {
+                "status": "busy", "error": "engine stop is in progress",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=409,
         )
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
-            {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
+            {
+                "status": "failed",
+                "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=422,
         )
     if req.swa_full_tokens_ratio is not None and not 0.0 < req.swa_full_tokens_ratio <= 1.0:
         return JSONResponse(
-            {"status": "failed", "error": "swa_full_tokens_ratio must be in (0, 1]"},
+            {
+                "status": "failed", "error": "swa_full_tokens_ratio must be in (0, 1]",
+                **_rebuild_prefill_fields(state),
+            },
             status_code=422,
         )
     result = await dispatch_rebuild(
@@ -786,6 +850,27 @@ def cache_geometry(state: Any) -> dict:
         # Concrete current window size in that unit (usable pages): the last rebuild's value if it
         # pinned/derived one, else the load-time pool size. 0 for models without a window pool.
         "num_swa_pages": int(last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0),
+        "requested_prefill_tokens": int(
+            pools.get("requested_prefill_tokens", 0)
+            or getattr(config, "max_extend_tokens", 0) or 0
+        ),
+        "pool_prefill_cap_tokens": int(
+            last.get("pool_prefill_cap_tokens")
+            or pools.get("pool_prefill_cap_tokens", 0) or 0
+        ),
+        "effective_prefill_tokens": int(
+            last.get("effective_prefill_tokens")
+            or pools.get("effective_prefill_tokens", 0)
+            or getattr(config, "max_extend_tokens", 0) or 0
+        ),
+        "swa_capacity_source": str(
+            last.get("swa_capacity_source")
+            or pools.get("swa_capacity_source", "none") or "none"
+        ),
+        "prefill_limiting_reason": str(
+            last.get("prefill_limiting_reason")
+            or pools.get("prefill_limiting_reason", "none") or "none"
+        ),
         # Engine's exact total cache VRAM budget (all pools), from the ("meta", …) ack. 0 when
         # unknown (pre-budget engine) — the desktop then reverse-derives it from the limits.
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),

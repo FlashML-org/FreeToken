@@ -188,6 +188,16 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
     budget = _int(geometry, "cache_budget_bytes")
 
     header = f"{prefix}state={(doc or {}).get('state', 'serving')}"
+    requested_prefill = _int(geometry, "requested_prefill_tokens")
+    pool_prefill = _int(geometry, "pool_prefill_cap_tokens")
+    effective_prefill = _int(geometry, "effective_prefill_tokens")
+    if requested_prefill or effective_prefill:
+        header += (
+            f", prefill={effective_prefill} tok"
+            f" (requested {requested_prefill}, pool cap {pool_prefill or 'none'}, "
+            f"source {geometry.get('swa_capacity_source', 'none')}, "
+            f"reason {geometry.get('prefill_limiting_reason', 'none')})"
+        )
     if known:
         header += f", {format_bytes(sum(known))} allocated"
         if budget > 0:

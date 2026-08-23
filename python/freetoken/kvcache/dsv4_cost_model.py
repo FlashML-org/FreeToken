@@ -38,6 +38,26 @@ def dsv4_reserved_window_pages(max_running_req: int, radix: bool) -> int:
     return 2 * (max_running_req + 1) + (3 * max_running_req if radix else 0) + 1
 
 
+def dsv4_prefill_chunk_budget(
+    num_swa_pages: int, max_running_req: int, radix: bool, P: int = 128
+) -> int:
+    """Effective DSV4 prefill cap from a USABLE window-page count.
+
+    A prefill forward peaks at about twice the incoming chunk before between-chunk reclamation;
+    the concurrent decode/radix working set is unavailable to that peak.
+    """
+    reserved = dsv4_reserved_window_pages(max_running_req, radix)
+    return max(P, (int(num_swa_pages) - reserved) // 2 * P)
+
+
+def dsv4_required_swa_pages(
+    prefill_tokens: int, max_running_req: int, radix: bool, P: int = 128
+) -> int:
+    """Minimum USABLE SWA pages needed to honor a requested prefill chunk ceiling."""
+    chunk_pages = -(-int(prefill_tokens) // P)
+    return dsv4_reserved_window_pages(max_running_req, radix) + 2 * chunk_pages
+
+
 def ring_size_for_ratio(ratio: int) -> int:
     """Compress-state ring slots per window page (non-speculative)."""
     if ratio == 4:
@@ -235,20 +255,31 @@ def dsv4_solve_num_pages(
     floor_win_pages: int,
     P: int = 128,
     n_scratch: int = 1,
+    num_swa_pages: int | None = None,
 ) -> DSV4PoolSizes:
     """Largest budget-respecting pool: max ``num_pages`` with exact
-    ``dsv4_pool_bytes(sizes(num_pages, win=max(floor, ceil(r*num)))) <= available_bytes``.
+    ``dsv4_pool_bytes(sizes(num_pages, win)) <= available_bytes``.
 
-    The window floor is honored in PAGES (never by inflating ``swa_ratio``) and the total is
-    byte-checked: at small budgets the window pins at ``floor_win_pages`` and the full/cmp/idx
-    anchor SHRINKS to fit, instead of every tier inflating past the budget. Raises ``ValueError``
-    when even the minimal pool does not fit.
+    With no absolute target, ``win=max(floor, ceil(ratio*num_pages))``. ``num_swa_pages`` is an
+    absolute USABLE-page pin, so its physical window is ``target + 1`` for the dummy page and no
+    longer scales with the full-history anchor. The total is byte-checked in either case. Raises
+    ``ValueError`` when even the minimal geometry does not fit.
     """
+    pinned_win_pages = (
+        max(floor_win_pages, int(num_swa_pages) + 1)
+        if num_swa_pages is not None else None
+    )
+
     def _sizes(num: int) -> DSV4PoolSizes:
-        win = max(floor_win_pages, (round(swa_ratio * num * P) + P - 1) // P)
+        win = (
+            pinned_win_pages
+            if pinned_win_pages is not None
+            else max(floor_win_pages, (round(swa_ratio * num * P) + P - 1) // P)
+        )
         return dsv4_pool_sizes(num, args, swa_ratio, P=P, n_win_pages=win)
 
-    lo = max(floor_win_pages, 2)  # full history must at least cover the window working set
+    # Full history must cover both the working-set floor and an absolute window pin.
+    lo = max(floor_win_pages, pinned_win_pages or 0, 2)
     if dsv4_pool_bytes(_sizes(lo), args, n_scratch) > available_bytes:
         raise ValueError(
             f"DSV4 KV budget {available_bytes} bytes cannot fit the minimal pool "
@@ -270,13 +301,32 @@ def dsv4_solve_num_pages(
 _AUTO_KV_SLACK_BYTES = 2 << 30  # absorbs plan-vs-measured drift (observed ~265MiB) and leaves a usable pool
 
 
-def dsv4_auto_cost_model(args, swa_ratio, floor_win_pages, P=128, n_scratch=1):
+def dsv4_auto_cost_model(
+    args, swa_ratio, floor_win_pages, P=128, n_scratch=1, num_swa_pages: int | None = None
+):
     """Affine (cache_per_page, fixed_cache_size, min_reserve_tokens) for the MoE-first auto planner:
     exact marginal per-page cost across all tiers (+ the full_to_window mapping), a fixed intercept
     anchored at the minimal viable pool, and a reserve floor covering the window working set plus a
     slack absorbing plan-vs-measured drift. Conservative at the shipped swa_ratio; an extreme
     swa_ratio can dip <1% under exact (harmless -- num_pages is re-solved byte-exactly from
-    measured memory)."""
+    measured memory).
+
+    An absolute ``num_swa_pages`` target is a fixed window tier, so only the full-history tiers are
+    marginal. That geometry is exactly affine in usable full pages; price its fixed window and
+    sentinel/scratch rows in the intercept instead of applying the ratio model.
+    """
+    if num_swa_pages is not None:
+        win_pages = max(floor_win_pages, int(num_swa_pages) + 1)
+        per_page = dsv4_cache_per_page(args, 0.0, P) + P * _INT64_BYTES
+        n0 = max(win_pages, 2)  # physical full pages, including the dummy
+        base = dsv4_pool_bytes(
+            dsv4_pool_sizes(n0, args, swa_ratio, P=P, n_win_pages=win_pages), args, n_scratch
+        )
+        slack_pages = -(-_AUTO_KV_SLACK_BYTES // per_page)
+        usable0 = n0 - 1
+        min_reserve_tokens = (usable0 + slack_pages) * P
+        return per_page, max(0, base - usable0 * per_page), min_reserve_tokens
+
     per_page = dsv4_cache_per_page(args, swa_ratio, P) + P * _INT64_BYTES
     n0 = max(floor_win_pages, 2)
     win0 = max(floor_win_pages, (round(swa_ratio * n0 * P) + P - 1) // P)
@@ -295,6 +345,8 @@ __all__ = [
     "dsv4_kv_unit_bytes",
     "dsv4_pool_bytes",
     "dsv4_pool_sizes",
+    "dsv4_prefill_chunk_budget",
+    "dsv4_required_swa_pages",
     "dsv4_reserved_window_pages",
     "dsv4_solve_num_pages",
     "dsv4_window_unit_bytes",
@@ -316,16 +368,17 @@ def _dsv4_swa_ratio(config) -> float:
 
 def _dsv4_window_floor_pages(config, P: int) -> int:
     """Minimum window pages = the live sliding working set the window pool must always hold:
-    one prefill chunk's reach (capped at 8 pages == 1024 tok; chunked prefill bounds the rest)
-    + each running request's 128-tail (<=2 pages mid-boundary, concurrency-scaled) + one
-    radix-locked live tail page per concurrent cached prompt + the reserved dummy. This is the
-    only HARD floor on DSV4 KV sizing -- the full-history (cmp/idx) capacity above it is purely
-    memory-derived, and a request longer than it is gracefully gated by ``available_size``."""
+    twice one bounded prefill reach (both sides coexist before reclamation), the concurrent
+    decode/radix reserve, and one physical dummy page. This is the only HARD floor on DSV4 KV
+    sizing -- full-history capacity above it is memory-derived, and larger prefills are chunked."""
     prefill_reach_pages = (config.max_seq_len + P - 1) // P
     # DSV4 config resolution rewrites cache_type to "swa_radix" (engine._adjust_dsv4_config),
     # so the radix term must key on "not naive" -- `== "radix"` was always False here.
     radix = config.cache_type != "naive"
-    return min(prefill_reach_pages, 8) + dsv4_reserved_window_pages(config.max_running_req, radix)
+    usable = dsv4_required_swa_pages(
+        min(prefill_reach_pages, 8) * P, config.max_running_req, radix, P
+    )
+    return usable + 1  # physical dummy page
 
 
 def _dsv4_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None):
@@ -352,8 +405,18 @@ def _dsv4_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None):
         else config.swa_num_pages_override
     )
     if target is not None:
-        # Absolute window: `target` usable pages + 1 dummy, floored and capped at the full anchor.
-        win = min(num_pages, max(floor_pages, int(target) + 1))
+        # Absolute window: `target` usable pages + 1 dummy. Unlike ratio sizing, an absolute pin
+        # must never be silently truncated to the full-history anchor; every startup/rebuild path
+        # reaches this shared geometry boundary before allocation.
+        target = int(target)
+        full_usable_pages = num_pages - 1
+        if target > full_usable_pages:
+            raise ValueError(
+                f"full-history capacity {full_usable_pages} pages "
+                f"({full_usable_pages * P} tokens) is smaller than absolute DSV4 SWA "
+                f"capacity {target} pages ({target * P} tokens)"
+            )
+        win = max(floor_pages, target + 1)
     else:
         # Default: ratio x full, rounded UP to whole window pages (floor applied ONCE, in pages).
         win = max(floor_pages, (round(swa_ratio * num_pages * P) + P - 1) // P)

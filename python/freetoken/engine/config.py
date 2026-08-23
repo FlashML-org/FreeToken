@@ -65,13 +65,20 @@ class EngineConfig:
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
-    # DSV4 window/full ratio directly. Used only when swa_num_pages_override is None (a runtime
-    # rebuild can pin an absolute window instead).
+    # DSV4 fallback is superseded by its max-prefill-derived absolute window; generic radix-SWA
+    # still uses the ratio until an explicit startup/live override pins an absolute window.
     swa_full_tokens_ratio: float = 0.2
     # Absolute window-pool size in the pool's own pages (usable, dummy excluded); None -> use the
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
+    # User-facing absolute window-pool capacity in tokens. Config resolution converts this to
+    # swa_num_pages_override after the model-specific SWA page unit is known. Kept separately
+    # until then so DSV4's 128-token window pages are validated rather than silently rounded.
+    swa_num_token_override: int | None = None
+    # Current sizing source vocabulary: derived | explicit | none. DSV4 derives from max prefill;
+    # generic radix-SWA derives from its ratio; expert startup/live overrides are explicit.
+    swa_capacity_source: str = "none"
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True

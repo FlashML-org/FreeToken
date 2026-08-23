@@ -53,9 +53,18 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--swa-num-tokens` | derived/auto | Expert absolute window/SWA override; DSV4 normally derives the minimum from `--max-prefill-length`; an override must align to the SWA page size and cannot be smaller than the derived requirement |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+For DSV4, `--max-prefill-length` is the normal single sizing knob. After resolving the model's
+window page, concurrency, and radix-retained working set, startup derives the minimum SWA pool that
+can hold roughly twice that chunk before reclamation. `--swa-num-tokens` is the expert override
+(and startup counterpart of `ft ctl cache --swa`); it must be an exact multiple of the DSV4 window
+size and cannot be smaller than the derived requirement. Status and rebuild results always report
+requested, pool-cap, and effective prefill tokens, whether SWA was derived or explicit, and which
+limit is binding.
 
 ### MoE offload
 
@@ -153,4 +162,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

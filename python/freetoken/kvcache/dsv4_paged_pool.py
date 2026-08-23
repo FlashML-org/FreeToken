@@ -322,7 +322,9 @@ class DSV4PagedKVCache(BaseKVCachePool):
         P = dsv4_args.window_size
         floor = _dsv4_window_floor_pages(config, P)
         per_page, fixed, min_reserve_tokens = dsv4_auto_cost_model(
-            dsv4_args, _dsv4_swa_ratio(config), floor, P=P, n_scratch=config.max_running_req + 1
+            dsv4_args, _dsv4_swa_ratio(config), floor, P=P,
+            n_scratch=config.max_running_req + 1,
+            num_swa_pages=config.swa_num_pages_override,
         )
         return per_page, fixed, config.page_size, min_reserve_tokens
 
@@ -346,6 +348,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
                 available_memory, dsv4_args, _dsv4_swa_ratio(config),
                 floor_win_pages=_dsv4_window_floor_pages(config, P), P=P,
                 n_scratch=config.max_running_req + 1,
+                num_swa_pages=config.swa_num_pages_override,
             )
             # The solver fits PHYSICAL pages to memory; one is the dummy page, so the
             # usable (advertised) count is one less.
@@ -403,9 +406,12 @@ class DSV4PagedKVCache(BaseKVCachePool):
             # Size the pool a KV/window rebuild would build: the target anchor (or current) with
             # the target window (or current), computed BEFORE the config is mutated.
             target_pages = num_pages if num_pages is not None else current_num_pages
-            kv_sizes = _dsv4_pool_sizes(
-                config, target_pages + 1, num_swa_pages=num_swa_pages
-            )  # +1 for dummy page
+            try:
+                kv_sizes = _dsv4_pool_sizes(
+                    config, target_pages + 1, num_swa_pages=num_swa_pages
+                )  # +1 for dummy page
+            except ValueError as exc:
+                raise CacheRebuildRejected(str(exc)) from exc
         else:
             # MoE-only rebuild keeps the CURRENT pool: budget-check against its live sizes
             # (reflects DSV4_FORCE_SMALL_POOL and the physical dummy page).
@@ -463,7 +469,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         LAST window page are the reserved dummy region: page_table's dummy row points at
         ``full_token - P`` (== the generic ``fill_(num_tokens)`` convention with num_tokens = the
         allocatable token count), permanently bound so graph-padded rows scatter to a real slot."""
-        from .dsv4_cost_model import dsv4_reserved_window_pages
+        from .dsv4_cost_model import dsv4_prefill_chunk_budget
         P = self.P
         self._paged_params = (int(max_running_req), bool(radix))
         self.full_to_window.fill_(-1)
@@ -473,8 +479,9 @@ class DSV4PagedKVCache(BaseKVCachePool):
         # only between chunks; peak ~2x the chunk), so reserve the concurrent working set and
         # halve the rest -- the same formula the bespoke manager used.
         n_win_pages = (self.sizes.n_win_slots // P) - 1
-        reserved = dsv4_reserved_window_pages(max_running_req, radix)
-        self._chunk_budget = max(P, (n_win_pages - reserved) // 2 * P)
+        self._chunk_budget = dsv4_prefill_chunk_budget(
+            n_win_pages, max_running_req, radix, P
+        )
 
     @property
     def swa_num_tokens(self) -> int:

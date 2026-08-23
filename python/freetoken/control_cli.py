@@ -29,6 +29,18 @@ class ControlCliError(Exception):
         self.exit_code = exit_code
 
 
+def _prefill_summary(doc: dict[str, Any]) -> str:
+    requested = doc.get("requested_prefill_tokens", "unknown")
+    pool_cap = doc.get("pool_prefill_cap_tokens", "unknown")
+    effective = doc.get("effective_prefill_tokens", "unknown")
+    source = doc.get("swa_capacity_source", "unknown")
+    reason = doc.get("prefill_limiting_reason", "unknown")
+    return (
+        f"prefill requested={requested} pool_cap={pool_cap} effective={effective} "
+        f"source={source} reason={reason}"
+    )
+
+
 def parse_count(token: str) -> int:
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", token)
     if not match:
@@ -59,7 +71,11 @@ def _decode_error_body(raw: bytes) -> str:
         for key in ("error", "detail", "message"):
             value = doc.get(key)
             if value:
-                return str(value)
+                suffix = (
+                    f" ({_prefill_summary(doc)})"
+                    if "effective_prefill_tokens" in doc else ""
+                )
+                return f"{value}{suffix}"
         status = doc.get("status")
         if status:
             return str(status)
@@ -252,6 +268,7 @@ def _format_rebuild(doc: dict[str, Any]) -> str:
         f"kv={doc.get('num_pages', 'unknown')}",
         f"mamba={doc.get('mamba_slots', 'unknown')}",
         f"swa={doc.get('num_swa_pages', 'unknown')}",
+        _prefill_summary(doc),
     ]
     if doc.get("error"):
         parts.append(f"error={doc['error']}")
