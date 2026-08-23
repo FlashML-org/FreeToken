@@ -30,11 +30,17 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 FP8 = torch.float8_e4m3fn
-# fp8-MMA vs bf16-MMA GEMMs: identical grid values, but the MMA-internal fp32
-# reduction order may differ (dsv4_gemm / moe_prefill_fp8 happen to be bit-exact
-# on H100 -- that is lowering luck, not a guarantee).
+# fp8-MMA vs bf16-MMA GEMMs: identical grid values, but triton lowers fp8xfp8 and
+# bf16xbf16 tl.dot to different MMA shapes, so the accumulator's fp32 reduction tree
+# differs and the two land ~1 output-ULP apart. Bit-exact on H100 for dsv4_gemm /
+# moe_prefill_fp8; NOT on sm_89 (RTX 6000 Ada) -- that was lowering luck.
+#
+# The bound is on the tensor SCALE, not elementwise: moe_prefill_fp8 chains two such
+# GEMMs and then top-k-sums outputs of magnitude ~8e3 down to ~2e2, so a difference
+# worth 2e-3 of the GEMM scale reads as a 13% *elementwise* relative error. Comparing
+# against max|ref| measures the GEMM's own error instead of the cancellation's.
 _MMA_TOL_KEYS = {"blk_gemm", "dsv4_gemm", "moe_prefill_fp8"}
-_MMA_TOL = dict(rtol=5e-2, atol=0.5)
+_MMA_REL = 1e-2  # of max|ref|; observed worst case 4.6e-3 (blk_gemm, sm_89)
 
 
 def _native_cc() -> bool:
@@ -111,6 +117,40 @@ class TestPrimitives:
         k[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), BLOCK=1024)
         ref = x.to(FP8).to(torch.float32)
         assert int(((y != ref) & ~(y.isnan() & ref.isnan())).sum()) == 0
+
+    def test_native_downcast_needs_the_grid_round(self):
+        """``round_e4m3(x).to(float8e4nv)`` is RNE; the bare ``.to(float8e4nv)`` is not.
+
+        triton lowers fp32 -> float8e4nv as a double-round (via fp16, RTZ), so a value
+        a hair above a grid midpoint collapses onto the midpoint and then ties to even
+        -- one-sided, always toward zero. Every native-fp8 quantizer therefore rounds
+        onto the grid in fp32 first; this pins that the pre-round makes it exact.
+        """
+        import triton
+        import triton.language as tl
+        from freetoken.kernel.triton.e4m3_compat import round_e4m3
+
+        @triton.jit
+        def k(x_ptr, raw_ptr, fix_ptr, N, BLOCK: tl.constexpr):
+            offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            m = offs < N
+            x = tl.load(x_ptr + offs, mask=m, other=0.0)
+            tl.store(raw_ptr + offs, x.to(tl.float8e4nv), mask=m)
+            tl.store(fix_ptr + offs, round_e4m3(x).to(tl.float8e4nv), mask=m)
+
+        torch.manual_seed(0)
+        x = torch.empty(1 << 22, device="cuda").uniform_(-448, 448).contiguous()
+        raw = torch.empty_like(x, dtype=FP8)
+        fix = torch.empty_like(raw)
+        k[(triton.cdiv(x.numel(), 1024),)](x, raw, fix, x.numel(), BLOCK=1024)
+        ref = x.to(FP8)
+        assert torch.equal(fix, ref), "pre-rounding onto the grid must make the downcast exact"
+        # Not asserting raw != ref: a future triton may lower this correctly, at which
+        # point the pre-round is redundant rather than wrong. Report the bias instead.
+        bad = raw.float() != ref.float()
+        if bad.any():
+            assert (raw.float()[bad].abs() < ref.float()[bad].abs()).all(), \
+                "bare downcast should only ever err toward zero"
 
 
 # ======================================================================================
@@ -262,7 +302,10 @@ def test_forced_emu_matches_native(tmp_path):
     assert a["native"] and not b["native"]
     for k in [k for k in a if k != "native"]:
         if k in _MMA_TOL_KEYS:
-            torch.testing.assert_close(a[k], b[k], **_MMA_TOL)
+            ref = a[k].float()
+            err = (ref - b[k].float()).abs().max().item()
+            lim = _MMA_REL * ref.abs().max().item()
+            assert err <= lim, f"{k}: EMU differs from native by {err:.4g} > {lim:.4g}"
         else:
             assert torch.equal(a[k], b[k]), f"{k}: EMU output differs from native"
 
