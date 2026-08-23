@@ -16,6 +16,11 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    # Speculative accounting. Acceptance rate is the one number that says whether
+    # speculation is paying for itself; tokens/s alone cannot distinguish a good
+    # drafter from a cheap one that is always rejected.
+    _spec_accepted: int = field(default=0, init=False)
+    _spec_drafted: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -35,7 +40,10 @@ class SchedulerStatusReporter:
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
-        if batch.is_prefill:
+        # A speculative step rides the PREFILL path but IS a decode step: reporting
+        # it as a prefill would hide the tokens it produced and make decode
+        # throughput read as zero while generation is clearly happening.
+        if batch.is_prefill and not getattr(batch, "speculative", False):
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,
@@ -45,7 +53,7 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
-        elif batch.is_decode:
+        else:
             self._report_decode(
                 batch,
                 running_reqs=running_reqs,
@@ -103,7 +111,16 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        emitted = getattr(batch, "spec_emitted", None)
+        if emitted is not None:
+            # A speculative step emits a whole accepted block per request, not one
+            # token -- counting requests would understate throughput by the very
+            # factor speculation is supposed to deliver.
+            self._decode_generated_tokens += sum(int(e.numel()) for e in emitted)
+            self._spec_accepted += sum(int(e.numel()) - 1 for e in emitted)
+            self._spec_drafted += batch.spec_block * len(batch.reqs)
+        else:
+            self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
@@ -120,6 +137,7 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
+            f"{_spec_msg(self._spec_accepted, self._spec_drafted)}"
             f"#queue-req: {queue_reqs}"
         )
 
@@ -142,3 +160,14 @@ def _swa_msg(swa_tokens: tuple[int, int] | None) -> str:
         return ""
     used, total = swa_tokens
     return f"#swa-token: {used}/{total}, swa usage: {_usage_ratio(used, total):.2f}, "
+
+
+def _spec_msg(accepted: int, drafted: int) -> str:
+    """Speculative acceptance, or nothing at all when not speculating.
+
+    accepted/drafted is what decides whether the drafter earns its cost: a block that
+    is usually rejected still pays for the draft pass and the wider verify.
+    """
+    if drafted <= 0:
+        return ""
+    return f"spec: {accepted}/{drafted} accepted ({100 * accepted / drafted:.0f}%), "

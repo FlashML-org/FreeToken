@@ -179,8 +179,63 @@ def iter_weights(
                 "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
             ):
                 yield f"model.layers.{L}.{nm}", get(f"layers.{L}.{nm}")
+
+        yield from _iter_dspark_weights(args, reader, linear)
     finally:
         reader.close()
+
+
+def _iter_dspark_weights(args: DeepseekV4Args, reader: "_ShardReader", linear):
+    """The ``mtp.*`` drafter, renamed onto the ``model.drafter.*`` module tree.
+
+    Each draft block shards exactly like a target block, so the same split rules apply.
+    The per-block weights live under ``mtp.k``; the shared head pieces (main_proj,
+    main_norm, norm, hc_head, markov, confidence) live on the first or last draft layer.
+    """
+    if args.n_draft_layers == 0:
+        return
+    get = reader.get
+
+    for k in range(args.n_draft_layers):
+        src, dst = f"mtp.{k}", f"model.drafter.layers.{k}"
+        a_src, a_dst = f"{src}.attn", f"{dst}.attn"
+        # Same split map as a target block: heads column-parallel, groups on wo_a,
+        # wo_b row-parallel, shared expert on the intermediate dim.
+        yield from linear(f"{a_src}.wq_a", f"{a_dst}.wq_a")
+        yield f"{a_dst}.q_norm.weight", get(f"{a_src}.q_norm.weight")
+        yield from linear(f"{a_src}.wq_b", f"{a_dst}.wq_b", split=0)
+        yield from linear(f"{a_src}.wkv", f"{a_dst}.wkv")
+        yield f"{a_dst}.kv_norm.weight", get(f"{a_src}.kv_norm.weight")
+        yield f"{a_dst}.wo_a", shard(
+            _dequant_fp8_block(get(f"{a_src}.wo_a.weight"), get(f"{a_src}.wo_a.scale")), 0
+        )
+        yield from linear(f"{a_src}.wo_b", f"{a_dst}.wo_b", split=1)
+        yield f"{a_dst}.attn_sink", shard(get(f"{a_src}.attn_sink"), 0)
+
+        yield f"{dst}.attn_norm.weight", get(f"{src}.attn_norm.weight")
+        yield f"{dst}.ffn_norm.weight", get(f"{src}.ffn_norm.weight")
+        yield f"{dst}.ffn.gate.weight", get(f"{src}.ffn.gate.weight")
+        yield f"{dst}.ffn.gate.bias", get(f"{src}.ffn.gate.bias")
+        for proj, split in (("w1", 0), ("w2", 1), ("w3", 0)):
+            yield from linear(f"{src}.ffn.shared_experts.{proj}", f"{dst}.ffn.shared_experts.{proj}", split=split)
+        for nm in (
+            "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
+            "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
+        ):
+            yield f"{dst}.{nm}", get(f"{src}.{nm}")
+
+    # The shared pieces are stored once each, on the layer whose role they serve:
+    # the INPUT projection on the first draft layer, and the output norm / hc_head /
+    # Markov / confidence heads on the LAST one.
+    first, last = "mtp.0", f"mtp.{args.n_draft_layers - 1}"
+    yield from linear(f"{first}.main_proj", "model.drafter.main_proj")
+    yield "model.drafter.main_norm.weight", get(f"{first}.main_norm.weight")
+    yield "model.drafter.norm.weight", get(f"{last}.norm.weight")
+    for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+        yield f"model.drafter.{nm}", get(f"{last}.{nm}")
+    yield "model.drafter.markov_head.markov_w1.weight", get(f"{last}.markov_head.markov_w1.weight")
+    yield "model.drafter.markov_head.markov_w2", get(f"{last}.markov_head.markov_w2.weight")
+    yield "model.drafter.confidence_head.proj", get(f"{last}.confidence_head.proj.weight")
 
 
 # --------------------------------------------------------------------------------------
@@ -188,6 +243,13 @@ def iter_weights(
 # --------------------------------------------------------------------------------------
 _EXPERT_RE = re.compile(
     r"^layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
+)
+# The dSpark drafter's own routed experts. Its layers are appended after the target's,
+# so ``mtp.k`` becomes bank layer ``n_layers + k`` and every layer-indexed structure
+# (host banks, GPU slot cache) addresses draft and target layers identically.
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.(?P<mtp>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
 )
 _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
@@ -234,7 +296,9 @@ def iter_expert_pieces(
     prefetch: int = 2,
 ):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
-    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
+    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The dSpark drafter's own experts
+    (``mtp.k``) land in bank layer ``n_layers + k`` when the run enables it, and are
+    skipped otherwise."""
     if kind is not QuantKind.MXFP4:
         return None
     from freetoken.models.weight import iter_expert_tensors_parallel
@@ -245,9 +309,16 @@ def iter_expert_pieces(
 
     def locate(raw_name: str):
         m = _EXPERT_RE.match(raw_name)
-        if m is None or int(m["layer"]) >= L:
-            return None
-        return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
+        if m is not None:
+            if int(m["layer"]) >= L:  # a trailing MTP layer in the target namespace
+                return None
+            layer = int(m["layer"])
+        else:
+            m = _MTP_EXPERT_RE.match(raw_name)
+            if m is None or int(m["mtp"]) >= args.n_draft_layers:  # dSpark off, or past n_mtp_layers
+                return None
+            layer = L + int(m["mtp"])
+        return layer, int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
     # TP: the expert kernel sizes its banks from MoEConfig.local_intermediate (= I // tp),
     # so a rank must yield only its own block of the intermediate dim. That is the memory

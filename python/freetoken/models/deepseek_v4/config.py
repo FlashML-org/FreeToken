@@ -64,6 +64,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             base=args.rope_theta,
             scaling=rope_scaling,
         ),
+        # The dSpark drafter's layers own routed experts too, and are indexed after the
+        # target's. Without this the expert banks hold n_layers + n_draft_layers entries
+        # while the offload cache is built for n_layers, and the two assert against each
+        # other at startup.
+        extra_moe_layers=args.n_draft_layers,
         num_experts=args.n_routed_experts,
         num_experts_per_tok=args.n_activated_experts,
         moe_intermediate_size=args.moe_inter_dim,
@@ -84,7 +89,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=(
             DSV4AttentionGroupConfig(
                 name="dsv4",
-                layer_ids=tuple(range(args.n_layers)),
+                # Draft layers continue the target's ids and own a window tier each, so
+                # the group must cover them or they would have nowhere to store KV.
+                layer_ids=tuple(range(len(args.layer_compress_ratios))),
                 num_kv_heads=1,  # MLA-style shared latent (K == V)
                 head_dim=args.head_dim,
                 sliding_window=args.window_size,

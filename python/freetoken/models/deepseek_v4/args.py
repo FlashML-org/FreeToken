@@ -110,6 +110,18 @@ class DeepseekV4Args:
         return self.n_mtp_layers if (self.has_dspark and self.dspark_enabled) else 0
 
     @property
+    def layer_compress_ratios(self) -> Tuple[int, ...]:
+        """Compression ratio per KV-owning layer, target layers then draft layers.
+
+        ``compress_ratios`` in the checkpoint is longer than ``n_layers`` and describes
+        only the target. The dSpark draft layers ship no compressor or indexer, so they
+        append zeros: they own a sliding-window tier and nothing else. Every per-layer
+        KV structure -- pool sizing, the window/compressed/indexer regions -- should walk
+        THIS list rather than slicing ``compress_ratios``, so draft layers get their KV.
+        """
+        return tuple(self.compress_ratios)[: self.n_layers] + (0,) * self.n_draft_layers
+
+    @property
     def n_moe_layers(self) -> int:
         """MoE layers the expert banks and the offload cache must cover.
 
@@ -135,6 +147,26 @@ def _config_path(model_path: str) -> str:
     )
 
 
+_DSPARK_ENABLED = False
+
+
+def set_dspark_enabled(enabled: bool) -> None:
+    """Record the run's dSpark choice for every later ``load_args``.
+
+    ``load_args`` reads the checkpoint, which only says what dSpark weights EXIST --
+    never whether this run wants them. Several call sites (config resolution, the weight
+    reader, the expert-bank builder) each build their own args from that file, so the
+    runtime choice has to live beside the file rather than in one of those instances.
+    Without this the weight reader silently skips the drafter the model just built.
+    """
+    global _DSPARK_ENABLED
+    _DSPARK_ENABLED = enabled
+
+
+def dspark_enabled() -> bool:
+    return _DSPARK_ENABLED
+
+
 def load_args(model_path: str, **overrides) -> DeepseekV4Args:
     """Build :class:`DeepseekV4Args` from the checkpoint's ``inference/config.json``.
 
@@ -145,6 +177,7 @@ def load_args(model_path: str, **overrides) -> DeepseekV4Args:
         raw = json.load(f)
     valid = {f.name for f in fields(DeepseekV4Args)}
     kwargs = {k: v for k, v in raw.items() if k in valid}
+    kwargs.setdefault("dspark_enabled", _DSPARK_ENABLED)
     kwargs.update(overrides)
     return DeepseekV4Args(**kwargs)
 
