@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+import signal
 
+from freetoken.daemon import osproc
 from freetoken.daemon.serve_manager import build_serve_command
 
 
@@ -33,3 +35,14 @@ def test_build_serve_command_uses_serve_on_linux(monkeypatch, tmp_path):
     )
     assert argv[argv.index("-m") + 2] == "serve"
     assert "serve-metal" not in argv
+
+
+def test_signal_group_uses_portable_getpgid_without_proc(monkeypatch):
+    sent = []
+    monkeypatch.setattr(osproc, "_stat_fields", lambda pid: None)
+    monkeypatch.setattr(osproc.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(osproc.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+
+    osproc.signal_group(4321, signal.SIGKILL)
+
+    assert sent == [(4321, signal.SIGKILL)]

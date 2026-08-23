@@ -73,6 +73,29 @@ def test_drain_ready_detects_worker_death_during_load():
         drain_ready(handle, LoadProgress(), get=lambda _t: (_ for _ in ()).throw(_Empty()))
 
 
+def test_drain_ready_detects_popen_death_during_load():
+    import pytest
+
+    from freetoken.server.supervisor import WorkerDied
+
+    class DeadPopen:
+        name = "llama-server"
+
+        def poll(self):
+            return 1
+
+    handle = BackendHandle(
+        ack_queue=queue.Queue(), processes=[DeadPopen()], expected_acks=1
+    )
+
+    with pytest.raises(WorkerDied, match="llama-server"):
+        drain_ready(
+            handle,
+            LoadProgress(),
+            get=lambda _t: (_ for _ in ()).throw(_Empty()),
+        )
+
+
 def test_drain_ready_raises_the_real_reason_from_an_error_ack():
     """A worker that pushes ("error", reason) just before dying surfaces THAT reason (e.g. a
     config ValueError), not the generic "exited during load"."""

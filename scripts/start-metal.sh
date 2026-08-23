@@ -54,8 +54,22 @@ command -v uv >/dev/null 2>&1 || die "uv not found — install it from https://d
 
 # --- pick the engine ---------------------------------------------------------
 BACKEND="mlx"
-for a in "$@"; do
-  [[ "$a" == "llama" ]] && BACKEND="llama"
+ARGS=("$@")
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  case "${ARGS[$i]}" in
+    --backend)
+      [[ $((i + 1)) -lt ${#ARGS[@]} ]] && BACKEND="${ARGS[$((i + 1))]}"
+      ;;
+    --backend=*)
+      BACKEND="${ARGS[$i]#--backend=}"
+      ;;
+    --port)
+      [[ $((i + 1)) -lt ${#ARGS[@]} ]] && PORT="${ARGS[$((i + 1))]}"
+      ;;
+    --port=*)
+      PORT="${ARGS[$i]#--port=}"
+      ;;
+  esac
 done
 
 if [[ "$BACKEND" == "mlx" ]]; then

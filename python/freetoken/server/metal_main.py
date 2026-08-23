@@ -28,8 +28,9 @@ from freetoken.server.metal import (
     MetalBackendHandle,
     launch_metal_backend,
     register_metal_proxy_routes,
-    resolve_backend,
+    resolve_metal_backend,
 )
+from freetoken.server.cors import DEFAULT_CORS_ORIGINS, install_cors
 
 
 def _parse(argv: Sequence[str]) -> argparse.Namespace:
@@ -38,6 +39,11 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
         description="Serve a model on an Apple Silicon Metal backend (mlx or llama.cpp).",
     )
     p.add_argument("--model", required=True, help="Model path or HF id for the Metal backend.")
+    p.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Public model id (default: basename of --model).",
+    )
     p.add_argument(
         "--backend",
         default="auto",
@@ -48,7 +54,14 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=1919)
     p.add_argument("--metal-port", type=int, default=0, help="Upstream port (0 = auto).")
     p.add_argument(
+        "--cors-origins",
+        default=DEFAULT_CORS_ORIGINS,
+        help="Comma-separated CORS allow-list; empty disables and '*' allows any origin.",
+    )
+    p.add_argument(
         "--shell",
+        "--shell-mode",
+        dest="shell",
         action="store_true",
         help="Attach the interactive ft shell to this server (serve+chat in one process).",
     )
@@ -66,17 +79,21 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(sys.argv[1:] if argv is None else argv)
-    backend = resolve_backend(args.backend)
+    backend = resolve_metal_backend(args.backend)
     # Non-blocking: spawns the upstream and returns while its watcher thread
     # supervises the load (see _watch_mlx_load). uvicorn binds immediately, so
     # /health reports live load progress and ft shell can attach and render it
     # instead of the terminal sitting silent through a 50 GiB download.
     handle: MetalBackendHandle = launch_metal_backend(
-        backend, args.model, args.metal_port
+        backend,
+        args.model,
+        args.metal_port,
+        served_model_name=args.served_model_name,
     )
 
     _HANDLE = {"handle": handle}
     app = FastAPI(title="FreeToken Metal API Server")
+    install_cors(app, args.cors_origins)
 
     def get_backend():
         # Route handlers distinguish loading, terminal error, and down states.

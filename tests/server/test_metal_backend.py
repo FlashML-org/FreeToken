@@ -62,6 +62,12 @@ def test_resolve_backend_rejects_unknown():
         raise AssertionError("expected RuntimeError for unknown backend")
 
 
+def test_standalone_auto_never_selects_cuda(monkeypatch):
+    monkeypatch.setattr(metal, "_any_cuda_usable", lambda: True)
+    monkeypatch.setattr(metal, "mlx_importable", lambda: True)
+    assert metal.resolve_metal_backend("auto") == "mlx"
+
+
 def test_pick_upstream_port_defaults_into_reserved_range(monkeypatch):
     monkeypatch.setattr(metal, "_claim_port", lambda port: port)
     for preferred in (None, 0):
@@ -194,6 +200,10 @@ def test_proxy_roundtrip_to_real_upstream():
         )
         assert r.status_code == 200
         assert r.json()["choices"][0]["message"]["content"] == "hello from upstream"
+        stats = client.get("/v1/stats").json()["requests"]
+        assert stats["completed"] == 1
+        assert stats["prompt_tokens_total"] == 1
+        assert stats["completion_tokens_total"] == 3
 
         r = client.get("/health")
         assert r.status_code == 200
@@ -220,6 +230,48 @@ def test_proxy_503_when_backend_not_alive():
     assert r.status_code == 503
 
 
+def test_proxy_registration_replaces_existing_control_routes():
+    app = FastAPI()
+
+    @app.get("/health")
+    async def native_health():
+        return {"status": "native"}
+
+    @app.get("/v1/stats")
+    async def native_stats():
+        return {"backend": "native"}
+
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="m",
+        load_state="ready",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+
+    paths = [getattr(route, "path", None) for route in app.routes]
+    assert paths.count("/health") == 1
+    assert paths.count("/v1/stats") == 1
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get("/health").json()["backend"] == "mlx"
+    assert client.get("/v1/stats").json()["model"]["id"] == "m"
+
+
+def test_served_model_alias_is_published_and_rewritten_for_upstream():
+    handle = metal.MetalBackendHandle(
+        model_path="/private/models/example",
+        served_model_name="public-model",
+        served_model_name_explicit=True,
+    )
+    body = json.dumps({"model": "public-model", "messages": []}).encode()
+
+    rewritten = json.loads(metal._rewrite_public_model(body, handle))
+
+    assert rewritten["model"] == "/private/models/example"
+    assert handle.health_doc()["model"] == "public-model"
+
+
 def test_handle_terminate_is_safe_on_empty():
     handle = metal.MetalBackendHandle()
     handle.terminate()  # no processes -> must not raise
@@ -239,6 +291,64 @@ def test_reasoning_field_renamed_streaming_and_body():
     assert metal._rewrite_reasoning_field(chunk2) == chunk2
 
 
+def test_stream_rewrite_survives_split_key_and_preserves_upstream_error():
+    port = _free_port()
+    upstream = FastAPI()
+
+    @upstream.post("/v1/chat/completions")
+    async def chat(payload: dict):
+        if payload.get("prompt") == "reject":
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"error": "no"}, status_code=429)
+
+        async def chunks():
+            yield b'data: {"choices":[{"delta":{"reas'
+            await asyncio.sleep(0.01)
+            yield b'oning":"think"}}]}\n\n'
+
+        return StreamingResponse(chunks(), media_type="text/event-stream")
+
+    server = uvicorn.Server(
+        uvicorn.Config(upstream, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url=f"http://127.0.0.1:{port}",
+        backend="mlx",
+        model_path="m",
+        load_state="ready",
+    )
+    proxy = FastAPI()
+    metal.register_metal_proxy_routes(proxy, lambda: handle)
+    client = TestClient(proxy, raise_server_exceptions=False)
+    try:
+        streamed = client.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": True, "messages": []},
+        )
+        assert streamed.status_code == 200
+        assert b'"reasoning_content":' in streamed.content
+        assert b'"reasoning":' not in streamed.content
+
+        rejected = client.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": True, "prompt": "reject"},
+        )
+        assert rejected.status_code == 429
+        assert rejected.json() == {"error": "no"}
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
 def test_health_reports_maintenance_serving():
     """Tools gate on maintenance == "serving" (bench wait_ready, daemon)."""
     app = FastAPI()
@@ -256,8 +366,31 @@ def test_health_reports_maintenance_serving():
     assert doc["status"] == "ok"
     assert doc["maintenance"] == "serving"
     # ctl parity endpoints exist
-    assert client.get("/v1/requests").status_code == 200
-    assert client.get("/v1/stats").status_code == 200
+    requests = client.get("/v1/requests")
+    assert requests.status_code == 200
+    assert requests.json() == {"entries": [], "next_cursor": 0}
+    stats = client.get("/v1/stats")
+    assert stats.status_code == 200
+    assert stats.json()["model"]["id"] == "test-model"
+    assert stats.json()["requests"] == {
+        "active": 0,
+        "completed": 0,
+        "p95_ms": 0,
+        "ttft_mean_ms": 0,
+        "prompt_tokens_total": 0,
+        "completion_tokens_total": 0,
+    }
+
+    # The daemon's legacy stop fallback must accept this exact snapshot.
+    from freetoken.daemon.serve_manager import ServeManager
+
+    manager = object.__new__(ServeManager)
+    instance_id, model_id, prompt, completion, uptime = manager._snapshot_values(
+        stats.json(), model="fallback", require_instance=False
+    )
+    assert instance_id == handle.instance_id
+    assert (model_id, prompt, completion) == ("test-model", 0, 0)
+    assert uptime >= 0
 
 
 # ------------------------------------------------------- load supervision --
@@ -390,6 +523,74 @@ def test_warm_up_generation_hits_completions():
         thread.join(timeout=5)
 
 
+def test_llama_launch_returns_ready_supervisor_handle(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(metal, "_wait_for_readiness", lambda *args, **kwargs: None)
+
+    handle = metal._launch_llama("/models/example.gguf", 19001)
+
+    assert handle.load_state == "ready"
+    assert handle.served_model_name == "example.gguf"
+    assert handle.ack_queue.get_nowait() == "ready"
+
+
+def test_llama_switch_publishes_ready_on_shared_handle(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    shared = metal.MetalBackendHandle(backend="llama", load_state="loading")
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(metal, "_wait_for_readiness", lambda *args, **kwargs: None)
+
+    metal._launch_llama("/models/new.gguf", 19001, state_handle=shared)
+
+    assert shared.load_state == "ready"
+    assert shared.ack_queue.get_nowait() == "ready"
+
+
+def test_llama_launch_failure_stops_child(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    stopped = []
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(
+        metal,
+        "_wait_for_readiness",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not ready")),
+    )
+    monkeypatch.setattr(metal, "_stop_processes", lambda processes: stopped.extend(processes))
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        metal._launch_llama("/models/example.gguf", 19001)
+
+    assert stopped == [proc]
+
+
+def test_readiness_never_competes_for_process_output(monkeypatch):
+    class Output:
+        def readline(self):
+            raise AssertionError("readiness must not read the drained pipe")
+
+    proc = SimpleNamespace(
+        poll=lambda: None,
+        stdout=Output(),
+        stderr=None,
+        returncode=None,
+        _freetoken_recent_output=[],
+    )
+    monkeypatch.setattr(
+        metal.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    metal._wait_for_readiness("http://127.0.0.1:19001", proc, timeout=1)
+
+
 def test_stream_signalled_in_body_not_accept_header():
     """The OpenAI SDK sends Accept: application/json even for streaming
     requests; streaming is signalled in the body. Detecting from the header
@@ -488,6 +689,26 @@ def test_stream_signalled_in_body_not_accept_header():
 
 # --------------------------------------------------------- model switching --
 
+def test_model_load_rejects_non_loopback_client():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+        load_state="ready",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("203.0.113.9", 50000)
+    )
+
+    response = client.post("/v1/model/load", json={"model": "new-model"})
+
+    assert response.status_code == 403
+    assert handle.model_path == "old-model"
+
+
 def test_model_load_requires_model_field():
     app = FastAPI()
     handle = metal.MetalBackendHandle(
@@ -496,7 +717,9 @@ def test_model_load_requires_model_field():
         backend="mlx",
     )
     metal.register_metal_proxy_routes(app, lambda: handle)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
 
     # missing field
     r = client.post("/v1/model/load", json={"nomodel": "x"})
@@ -515,7 +738,9 @@ def test_model_load_same_model_is_a_noop():
         model_path="old-model",
     )
     metal.register_metal_proxy_routes(app, lambda: handle)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
     r = client.post("/v1/model/load", json={"model": "old-model"})
     assert r.status_code == 200
     assert r.json()["detail"] == "already serving this model"
@@ -566,7 +791,9 @@ def test_model_load_switches_to_new_handle(monkeypatch):
     monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
     monkeypatch.setattr(metal, "_stop_processes", seen_stop)
     metal.register_metal_proxy_routes(app, lambda: old)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
 
     r = client.post("/v1/model/load", json={"model": "new-model"})
     assert r.status_code == 200
@@ -674,7 +901,9 @@ def test_model_load_launch_failure_reports_error(monkeypatch):
 
     monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
     metal.register_metal_proxy_routes(app, lambda: old)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
 
     r = client.post("/v1/model/load", json={"model": "new-model"})
     assert r.status_code == 500

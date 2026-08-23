@@ -39,7 +39,12 @@ from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .cors import install_cors
 from .openai_api import register_openai_routes
+from .process_utils import (
+    reap_backend_workers as _reap_backend_workers,
+    terminate_backend_workers as _terminate_backend_workers,
+)
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
@@ -65,23 +70,12 @@ def get_global_state() -> FrontendManager:
     return _GLOBAL_STATE
 
 
-def _terminate_backend_workers(processes: List[Any]) -> None:
-    """Best-effort, non-blocking teardown of the backend worker processes on an orderly stop.
-
-    Called from the shutdown path AFTER ``_SHUTTING_DOWN`` is set, so the supervisor's liveness
-    watch is guaranteed to observe the flag before it sees these deaths — the exits are then
-    attributed to the stop, not misreported as a crash (the flag/death race, otherwise decided
-    by OS signal-delivery order, is settled in our favor). Also ensures the non-daemon workers
-    are actually torn down when an external stop signals only the main process.
-
-    Never blocks (no join) and never raises: a worker already gone / an unqueryable handle is
-    fine — this only nudges live ones toward exit."""
-    for p in processes or []:
-        try:
-            if p.is_alive():
-                p.terminate()
-        except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
-            continue
+def _current_backend_processes(state: Any) -> List[Any]:
+    """Return the live handle's current children, including after a model switch."""
+    handle = getattr(state, "metal_backend_handle", None)
+    if handle is not None:
+        return list(getattr(handle, "processes", None) or [])
+    return list(getattr(state, "backend_processes", None) or [])
 
 
 def _exit_after_backend_death(grace_s: float) -> threading.Timer:
@@ -95,20 +89,6 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     timer.daemon = True
     timer.start()
     return timer
-
-
-def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
-    """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
-    standing. Only the shell path needs this: it owns the process lifetime end to end (no
-    outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
-    the GPU and the IPC sockets after the shell has already returned to the user's terminal."""
-    for p in processes or []:
-        try:
-            p.join(timeout=timeout)
-            if p.is_alive():
-                p.kill()
-        except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
-            continue
 
 
 def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
@@ -380,7 +360,7 @@ class FrontendManager:
         self.recv_tokenizer.stop()
         # Tear the workers down ourselves (best-effort). _SHUTTING_DOWN is already set by the
         # time shutdown() runs, so the supervisor attributes the ensuing deaths to the stop.
-        _terminate_backend_workers(self.backend_processes)
+        _terminate_backend_workers(_current_backend_processes(self))
 
 
 @asynccontextmanager
@@ -393,23 +373,6 @@ async def lifespan(_: FastAPI):
     global _GLOBAL_STATE
     if _GLOBAL_STATE is not None:
         _GLOBAL_STATE.shutdown()
-
-
-def install_cors(app: FastAPI, origins_csv: str) -> None:
-    """Attach CORS headers for browser/webview clients (e.g. the desktop app).
-
-    No-op when the allow-list is empty; must run before the app starts serving."""
-    origins = [o.strip() for o in origins_csv.split(",") if o.strip()]
-    if not origins:
-        return
-    from starlette.middleware.cors import CORSMiddleware
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if "*" in origins else origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
 
 app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifespan)
@@ -859,7 +822,7 @@ def _install_shell_stop_handlers() -> None:
 
     def _flag_shutdown(signum, frame) -> None:
         _SHUTTING_DOWN.set()
-        _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
+        _terminate_backend_workers(_current_backend_processes(_GLOBAL_STATE))
         prev = previous.get(signum)
         if callable(prev):
             prev(signum, frame)
@@ -911,8 +874,9 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # Belt and braces: if uvicorn's lifespan shutdown did not run (thread wedged), flag the
         # stop and tear the workers down here so nothing outlives the shell.
         _SHUTTING_DOWN.set()
-        _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
-        _reap_backend_workers(_GLOBAL_STATE.backend_processes)
+        processes = _current_backend_processes(_GLOBAL_STATE)
+        _terminate_backend_workers(processes)
+        _reap_backend_workers(processes)
 
 
 def _install_routes_for_backend(config: ServerArgs) -> None:
@@ -922,8 +886,8 @@ def _install_routes_for_backend(config: ServerArgs) -> None:
     registered on import (``register_openai_routes`` etc.). When the resolved backend
     is an Apple Silicon Metal runtime, the generation surface must proxy to the
     upstream engine instead of hitting the in-process CUDA scheduler. This replaces
-    the native generation routes with proxy routes on the *same* app object, so the
-    control/accounting/health routes (backend-agnostic) stay intact on both paths.
+    the native generation and backend-specific control routes on the *same* app object.
+    Unsupported CUDA mutation routes are removed rather than left wired to dead state.
 
     The CUDA path registers the native routes at import time and this is a no-op.
     """
@@ -939,15 +903,26 @@ def _install_routes_for_backend(config: ServerArgs) -> None:
         st = _GLOBAL_STATE
         return getattr(st, "metal_backend_handle", None)
 
-    # Drop the native generation routes (openai, anthropic, responses) so their
-    # handlers don't also match; keep control/accounting/health.
+    # Drop native generation/control routes so their handlers cannot win
+    # FastAPI's first-match dispatch. register_metal_proxy_routes repeats its
+    # owned-path replacement defensively for direct callers.
     paths_to_clear = {
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/messages",
+        "/v1/messages/count_tokens",
         "/v1/responses",
         "/v1/embeddings",
         "/v1/models",
+        "/v1/model/list",
+        "/v1/model/load",
+        "/health",
+        "/v1/stats",
+        "/v1/requests",
+        "/v1/cache/status",
+        "/v1/cache/rebuild",
+        "/v1/admin/prepare-stop",
+        "/generate",
     }
     filtered = []
     for r in getattr(app, "routes", []):

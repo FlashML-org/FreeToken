@@ -28,6 +28,7 @@ Backend resolution rules:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import json
 import os
@@ -35,17 +36,20 @@ import queue
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from freetoken.utils import init_logger
+from freetoken.logging import init_logger
 
 logger = init_logger(__name__)
 
@@ -67,6 +71,26 @@ _LOAD_TIMEOUT_S = float(os.environ.get("FREETOKEN_METAL_LOAD_TIMEOUT", "3600"))
 #: over HTTP. Both are also verified by a live ``/v1/models`` round-trip.
 _STARTED_ONCE_TIMEOUT_S = float(os.environ.get("FREETOKEN_METAL_START_TIMEOUT", "60"))
 _POLL_INTERVAL_S = 0.5
+_PORT_LOCK_PATH = os.path.join(tempfile.gettempdir(), "freetoken-metal-port.lock")
+
+
+@contextlib.contextmanager
+def _serialize_upstream_launches():
+    """Serialize port selection until the child has bound its listener.
+
+    Checking a port and then closing the probe socket cannot itself reserve the
+    port. A small cross-process advisory lock closes the race between FreeToken
+    instances; each launcher holds it until its child is listening.
+    """
+    import fcntl
+
+    fd = os.open(_PORT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _pick_upstream_port(preferred: int | None) -> int:
@@ -171,6 +195,32 @@ def resolve_backend(requested: str) -> str:
     )
 
 
+def resolve_metal_backend(requested: str) -> str:
+    """Resolve a standalone Metal backend without ever selecting CUDA."""
+    if requested == "auto":
+        if mlx_importable():
+            logger.info("backend=auto resolved to mlx (Apple Silicon MLX)")
+            return "mlx"
+        if llama_binary() is not None:
+            logger.info("backend=auto resolved to llama (llama.cpp Metal)")
+            return "llama"
+        raise RuntimeError(
+            "FREETOKEN: no usable Metal backend. Install mlx-lm (Apple Silicon) "
+            "or llama.cpp."
+        )
+    if requested not in {"mlx", "llama"}:
+        raise RuntimeError(
+            f"unknown Metal --backend {requested!r} (expected auto, mlx, or llama)"
+        )
+    return resolve_backend(requested)
+
+
+def _default_served_model_name(model_path: str) -> str:
+    if not model_path:
+        return model_path
+    return os.path.basename(os.path.normpath(model_path)) or model_path
+
+
 @dataclass
 class MetalBackendHandle:
     """Handle to a launched Metal inference engine (blunt stand-in for the CUDA
@@ -186,6 +236,9 @@ class MetalBackendHandle:
     upstream_base_url: str = ""
     backend: str = ""
     model_path: str = ""
+    served_model_name: str = ""
+    served_model_name_explicit: bool = False
+    instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     load_state: str = "starting"
     load_phase: str = ""
     load_error: str = ""
@@ -200,6 +253,11 @@ class MetalBackendHandle:
     expected_acks: int = 1
     _switch_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _stats_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    active_requests: int = 0
+    completed_requests: int = 0
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
 
     # ------------------------------------------------------------ load state --
     def _set_state(
@@ -223,7 +281,11 @@ class MetalBackendHandle:
             phase = self.load_phase
             error = self.load_error
             weights = self.weights_bytes
-        doc: dict[str, Any] = {"model": self.model_path, "backend": self.backend}
+        doc: dict[str, Any] = {
+            "model": self.served_model_name or _default_served_model_name(self.model_path),
+            "backend": self.backend,
+            "instance_id": self.instance_id,
+        }
         if state == "error":
             doc["status"] = "error"
             doc["message"] = error or "Metal backend failed to load"
@@ -242,6 +304,61 @@ class MetalBackendHandle:
                 "total_bytes": weights,
             }
         return doc
+
+    def begin_request(self) -> None:
+        with self._stats_lock:
+            self.active_requests += 1
+
+    def finish_request(self, usage: dict[str, Any] | None, *, completed: bool) -> None:
+        """Record the best usage snapshot exposed by an upstream response."""
+        usage = usage or {}
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+        completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
+        with self._stats_lock:
+            self.active_requests = max(0, self.active_requests - 1)
+            if completed:
+                self.completed_requests += 1
+            if isinstance(prompt, int) and not isinstance(prompt, bool) and prompt > 0:
+                self.prompt_tokens_total += prompt
+            if (
+                isinstance(completion, int)
+                and not isinstance(completion, bool)
+                and completion > 0
+            ):
+                self.completion_tokens_total += completion
+
+    def stats_doc(self) -> dict[str, Any]:
+        with self._stats_lock:
+            active = self.active_requests
+            completed = self.completed_requests
+            prompt_total = self.prompt_tokens_total
+            completion_total = self.completion_tokens_total
+        ready_at = self.load_ended_at if self.load_ended_at > 0 else self.load_started_at
+        uptime = max(0, int(time.monotonic() - ready_at)) if ready_at > 0 else 0
+        return {
+            "instance_id": self.instance_id,
+            "model": {
+                "id": self.served_model_name
+                or _default_served_model_name(self.model_path),
+                "ctx": None,
+                "attn": "metal",
+                "moe": None,
+            },
+            "uptime_s": uptime,
+            "kv": None,
+            "mamba": None,
+            "swa": None,
+            "vram_bytes": 0,
+            "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+            "requests": {
+                "active": active,
+                "completed": completed,
+                "p95_ms": 0,
+                "ttft_mean_ms": 0,
+                "prompt_tokens_total": prompt_total,
+                "completion_tokens_total": completion_total,
+            },
+        }
 
     # ------------------------------------------------------------ lifecycle --
     def terminate(self) -> None:
@@ -296,11 +413,11 @@ class MetalBackendHandle:
             # handle (state_handle=self) while the load runs, and the launch
             # returns a handle carrying the new engine's identity.
             try:
+                launch_kwargs: dict[str, Any] = {"state_handle": self}
+                if self.served_model_name_explicit:
+                    launch_kwargs["served_model_name"] = self.served_model_name
                 new = launch_metal_backend(
-                    self.backend,
-                    model_path,
-                    upstream_port=None,
-                    state_handle=self,
+                    self.backend, model_path, upstream_port=None, **launch_kwargs
                 )
             except Exception as exc:
                 self._set_state("error", error=str(exc))
@@ -313,6 +430,10 @@ class MetalBackendHandle:
             self.processes = new.processes
             self.upstream_base_url = new.upstream_base_url
             self.model_path = new.model_path
+            self.served_model_name = (
+                new.served_model_name or _default_served_model_name(new.model_path)
+            )
+            self.served_model_name_explicit = new.served_model_name_explicit
             # Block until the watcher reaches a terminal state. /v1/model/load
             # must not answer "ok" while the new engine is still loading -- the
             # shell budgets this call for the full download + load. Raises on
@@ -356,7 +477,9 @@ class MetalBackendHandle:
                     return
 
 
-def _drain_process_output(proc: subprocess.Popen, name: str) -> None:
+def _drain_process_output(
+    proc: subprocess.Popen, name: str, recent: deque[str]
+) -> None:
     """Read a child's stdout until EOF on a daemon thread.
 
     The children are launched with ``stdout=PIPE`` so launch failures are
@@ -367,6 +490,7 @@ def _drain_process_output(proc: subprocess.Popen, name: str) -> None:
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            recent.append(line)
             logger.debug("%s: %s", name, line.rstrip())
     except Exception:  # noqa: BLE001 -- draining must never raise
         pass
@@ -392,9 +516,16 @@ def _stop_processes(processes: list[subprocess.Popen]) -> None:
             continue
 
 
-def _start_drain_thread(proc: subprocess.Popen, name: str) -> None:
-    t = threading.Thread(target=_drain_process_output, args=(proc, name), daemon=True)
+def _start_drain_thread(proc: subprocess.Popen, name: str) -> deque[str]:
+    recent: deque[str] = deque(maxlen=20)
+    # Keep the diagnostics with the process so readiness has one nonblocking
+    # source of output. There must never be a second reader on stdout.
+    setattr(proc, "_freetoken_recent_output", recent)
+    t = threading.Thread(
+        target=_drain_process_output, args=(proc, name, recent), daemon=True
+    )
     t.start()
+    return recent
 
 
 def _wait_for_readiness(url: str, process: subprocess.Popen, *, timeout: float) -> None:
@@ -404,12 +535,12 @@ def _wait_for_readiness(url: str, process: subprocess.Popen, *, timeout: float) 
     instead of a silent timeout."""
     deadline = time.monotonic() + timeout
     last_err = ""
-    drained: list[str] = []
+    recent = getattr(process, "_freetoken_recent_output", ())
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
                 f"Metal backend exited during startup "
-                f"(code {process.returncode}): {''.join(drained[-8:])}"
+                f"(code {process.returncode}): {''.join(list(recent)[-8:])}"
             )
         try:
             proc = subprocess.run(
@@ -423,18 +554,33 @@ def _wait_for_readiness(url: str, process: subprocess.Popen, *, timeout: float) 
             last_err = (proc.stderr or proc.stdout or "").strip()
         except Exception as exc:  # noqa: BLE001 -- not ready yet, keep polling
             last_err = str(exc)
-        if process.stdout is not None:
-            line = process.stdout.readline()
-            if line:
-                drained.append(line)
-        if process.stderr is not None:
-            line = process.stderr.readline()
-            if line:
-                drained.append(line)
         time.sleep(0.5)
     raise RuntimeError(
         f"Metal backend at {url} did not become ready within {timeout:.0f}s. "
-        f"Last probe: {last_err}. Output:\n{''.join(drained[-12:])}"
+        f"Last probe: {last_err}. Output:\n{''.join(list(recent)[-12:])}"
+    )
+
+
+def _wait_for_listener(port: int, process: subprocess.Popen, *, timeout: float) -> None:
+    """Wait until a freshly spawned child owns its selected loopback port."""
+    import socket
+
+    deadline = time.monotonic() + timeout
+    recent = getattr(process, "_freetoken_recent_output", ())
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                "Metal backend exited before binding its port "
+                f"(code {process.returncode}): {''.join(list(recent)[-8:])}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"Metal backend did not bind 127.0.0.1:{port} within {timeout:.0f}s. "
+        f"Output:\n{''.join(list(recent)[-12:])}"
     )
 
 
@@ -664,7 +810,11 @@ def _is_gemma4_model(model: str) -> bool:
 
 
 def _launch_mlx(
-    model_path: str, port: int, *, state_handle: MetalBackendHandle | None = None
+    model_path: str,
+    port: int,
+    *,
+    state_handle: MetalBackendHandle | None = None,
+    served_model_name: str | None = None,
 ) -> MetalBackendHandle:
     import sys
 
@@ -711,6 +861,11 @@ def _launch_mlx(
         env=env,
     )
     _start_drain_thread(proc, "mlx")
+    try:
+        _wait_for_listener(port, proc, timeout=_STARTED_ONCE_TIMEOUT_S)
+    except Exception:
+        _stop_processes([proc])
+        raise
     url = f"http://127.0.0.1:{port}"
     # In a switch, the watcher publishes state onto the caller's shared handle
     # (the one the proxy routes already read); the returned handle only
@@ -720,6 +875,8 @@ def _launch_mlx(
         upstream_base_url=url,
         backend="mlx",
         model_path=model_path,
+        served_model_name=served_model_name or _default_served_model_name(model_path),
+        served_model_name_explicit=served_model_name is not None,
     )
     watcher_handle = state_handle or return_handle
     if cache_dir is not None:
@@ -737,7 +894,14 @@ def _launch_mlx(
     return return_handle
 
 
-def _launch_llama(model_path: str, port: int, **kwargs: Any) -> MetalBackendHandle:
+def _launch_llama(
+    model_path: str,
+    port: int,
+    *,
+    state_handle: MetalBackendHandle | None = None,
+    served_model_name: str | None = None,
+    **kwargs: Any,
+) -> MetalBackendHandle:
     binary = llama_binary()
     assert binary is not None
     cmd = [
@@ -762,10 +926,27 @@ def _launch_llama(model_path: str, port: int, **kwargs: Any) -> MetalBackendHand
     )
     _start_drain_thread(proc, "llama")
     url = f"http://127.0.0.1:{port}"
-    _wait_for_readiness(url, proc, timeout=_ADDRESS_HEALTH_TIMEOUT_S)
-    return MetalBackendHandle(
-        processes=[proc], upstream_base_url=url, backend="llama", model_path=model_path
+    if state_handle is not None:
+        state_handle.load_started_at = time.monotonic()
+        state_handle._set_state("loading", phase="weights")
+    try:
+        _wait_for_readiness(url, proc, timeout=_ADDRESS_HEALTH_TIMEOUT_S)
+    except Exception:
+        _stop_processes([proc])
+        raise
+    handle = MetalBackendHandle(
+        processes=[proc],
+        upstream_base_url=url,
+        backend="llama",
+        model_path=model_path,
+        served_model_name=served_model_name or _default_served_model_name(model_path),
+        served_model_name_explicit=served_model_name is not None,
     )
+    handle.load_started_at = time.monotonic()
+    watcher_handle = state_handle or handle
+    watcher_handle._set_state("ready")
+    watcher_handle.ack_queue.put("ready")
+    return handle
 
 
 def launch_metal_backend(
@@ -774,6 +955,7 @@ def launch_metal_backend(
     upstream_port: int | None = None,
     *,
     state_handle: MetalBackendHandle | None = None,
+    served_model_name: str | None = None,
 ) -> MetalBackendHandle:
     """Launch an upstream engine and return a handle to it.
 
@@ -782,42 +964,88 @@ def launch_metal_backend(
     owns a shared handle the proxy routes already read from -- without this,
     the watcher would update a detached object and /health would report the
     old model's state forever."""
-    port = _pick_upstream_port(upstream_port)
-    if backend == "mlx":
-        return _launch_mlx(model_path, port, state_handle=state_handle)
-    if backend == "llama":
-        return _launch_llama(model_path, port)
-    raise RuntimeError(f"unsupported Metal backend: {backend!r}")
+    if backend not in {"mlx", "llama"}:
+        raise RuntimeError(f"unsupported Metal backend: {backend!r}")
+    with _serialize_upstream_launches():
+        port = _pick_upstream_port(upstream_port)
+        if backend == "mlx":
+            return _launch_mlx(
+                model_path,
+                port,
+                state_handle=state_handle,
+                served_model_name=served_model_name,
+            )
+        if backend == "llama":
+            return _launch_llama(
+                model_path,
+                port,
+                state_handle=state_handle,
+                served_model_name=served_model_name,
+            )
+    raise AssertionError("unreachable")
 
 
 # --- HTTP proxy over the FreeToken API -------------------------------------
 
 
+def _usage_from_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    message = payload.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return message["usage"]
+    return None
+
+
+def _usage_from_sse_line(line: bytes) -> dict[str, Any] | None:
+    if not line.startswith(b"data:"):
+        return None
+    raw = line[5:].strip()
+    if not raw or raw == b"[DONE]":
+        return None
+    try:
+        return _usage_from_payload(json.loads(raw))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 async def _proxy_stream(
-    upstream_base_url: str,
-    path: str,
-    body: bytes,
-    headers: dict[str, str],
+    response: httpx.Response,
+    client: httpx.AsyncClient,
+    handle: MetalBackendHandle,
 ) -> AsyncIterator[bytes]:
-    """Forward a request to the upstream and stream the (possibly SSE) bytes back.
+    """Stream a pre-opened successful upstream response to the client.
 
     SSE chunks are rewritten on the fly so the Metal upstream speaks FreeToken's
     wire format: mlx_lm splits the thinking channel as ``delta.reasoning`` while
     FreeToken (and vLLM/SGLang, which the shell/bench clients read) uses
     ``delta.reasoning_content``.
 
-    Chunks are yielded as they arrive -- no buffering. The upstream flushes per
-    token (mlx_lm writes + flushes each SSE event), so with body-based stream
-    detection this delivers tokens as they decode."""
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream(
-            "POST", f"{upstream_base_url}{path}", content=body, headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes(chunk_size=None):
-                if b'"reasoning"' in chunk:
-                    chunk = _rewrite_reasoning_field(chunk)
-                yield chunk
+    A partial final line is retained across arbitrary transport chunks so the
+    JSON key can never straddle two independent replacements. The request has
+    already received its upstream status before this iterator is returned, so
+    FastAPI does not commit a false HTTP 200 for upstream errors."""
+    pending = b""
+    usage: dict[str, Any] | None = None
+    completed = 200 <= response.status_code < 300
+    try:
+        async for chunk in response.aiter_bytes(chunk_size=None):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                framed = line + b"\n"
+                usage = _usage_from_sse_line(line) or usage
+                yield _rewrite_reasoning_field(framed)
+        if pending:
+            usage = _usage_from_sse_line(pending) or usage
+            yield _rewrite_reasoning_field(pending)
+    finally:
+        await response.aclose()
+        await client.aclose()
+        handle.finish_request(usage, completed=completed)
 
 
 def _rewrite_reasoning_field(chunk: bytes) -> bytes:
@@ -839,6 +1067,31 @@ def register_metal_proxy_routes(
     the upstream, which already implements the OpenAI/Anthropic-compatible
     protocol. Streaming responses pass through as SSE."""
 
+    # This function is used both with a fresh standalone app and with the
+    # native module-global app, whose routes were registered at import time.
+    # FastAPI dispatches the first matching route, so replace every path this
+    # router owns before appending the Metal handlers.
+    owned_paths = {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/responses",
+        "/v1/embeddings",
+        "/v1/models",
+        "/v1/model/list",
+        "/v1/model/load",
+        "/v1/stats",
+        "/v1/cache/status",
+        "/v1/requests",
+        "/health",
+    }
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if getattr(route, "path", None) not in owned_paths
+    ]
+
     @app.post("/v1/chat/completions")
     async def proxy_chat(request: Request):
         return await _forward(request, get_backend)
@@ -849,6 +1102,10 @@ def register_metal_proxy_routes(
 
     @app.post("/v1/messages")
     async def proxy_messages(request: Request):
+        return await _forward(request, get_backend)
+
+    @app.post("/v1/messages/count_tokens")
+    async def proxy_messages_count_tokens(request: Request):
         return await _forward(request, get_backend)
 
     @app.post("/v1/responses")
@@ -884,12 +1141,15 @@ def register_metal_proxy_routes(
                 for item in data
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ]
-            if ids == [handle.model_path]:
+            served_name = handle.served_model_name or _default_served_model_name(
+                handle.model_path
+            )
+            if ids == [served_name]:
                 return response  # already truthful
             import time as _time
 
             doc["data"] = [
-                {"id": handle.model_path, "object": "model", "created": doc.get("created", int(_time.time()))}
+                {"id": served_name, "object": "model", "created": doc.get("created", int(_time.time()))}
             ]
             return JSONResponse(doc)
         return response
@@ -907,6 +1167,12 @@ def register_metal_proxy_routes(
         On failure the broken new engine is stopped and the server retains the
         error reason for /health instead of leaking an untracked process.
         """
+        from .accounting import _is_loopback
+
+        if not _is_loopback(request.client.host if request.client else None):
+            return JSONResponse(
+                {"detail": "loopback access required"}, status_code=403
+            )
         handle = get_backend()
         if handle is None or not handle.is_alive():
             return JSONResponse(
@@ -925,7 +1191,7 @@ def register_metal_proxy_routes(
                 {"detail": "request body must be JSON with a 'model' field"},
                 status_code=400,
             )
-        if model == handle.model_path:
+        if model in {handle.model_path, handle.served_model_name}:
             return {
                 "status": "ok",
                 "model": model,
@@ -946,14 +1212,11 @@ def register_metal_proxy_routes(
     @app.get("/v1/stats")
     async def metal_stats(request: Request):
         """Stable shape for the shell's status-bar poller. The Metal upstream has
-        no CUDA-style stats; every pool reports empty so the bar shows just the
-        model + token counters, which the shell counts client-side."""
-        return {
-            "kv": None,
-            "mamba": None,
-            "swa": None,
-            "vram_bytes": 0,
-        }
+        no CUDA-style pool stats; request totals come from upstream usage docs."""
+        handle = get_backend()
+        if handle is None:
+            return JSONResponse({"detail": "Metal backend is not running"}, status_code=503)
+        return handle.stats_doc()
 
     @app.get("/v1/cache/status")
     async def metal_cache_status(request: Request):
@@ -974,7 +1237,7 @@ def register_metal_proxy_routes(
         """``ft ctl requests`` parity. The Metal path has no engine-side request
         ring (the CUDA scheduler owns that); an empty list is the truthful
         answer -- per-request accounting lives in the upstream's own logs."""
-        return {"requests": []}
+        return {"entries": [], "next_cursor": 0}
 
     @app.get("/health")
     async def metal_health(request: Request):
@@ -1000,6 +1263,23 @@ def _strip_host_header(headers: dict[str, str]) -> dict[str, str]:
     out = {k: v for k, v in headers.items() if k.lower() not in {"host", "content-length"}}
     out["accept"] = headers.get("accept", "application/json")
     return out
+
+
+def _rewrite_public_model(body: bytes, handle: MetalBackendHandle) -> bytes:
+    """Translate the public served-model alias back to the upstream model id."""
+    public_name = handle.served_model_name or _default_served_model_name(
+        handle.model_path
+    )
+    if not body or not public_name or public_name == handle.model_path:
+        return body
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict) or payload.get("model") != public_name:
+        return body
+    payload["model"] = handle.model_path
+    return json.dumps(payload).encode()
 
 
 def _inject_turn_stop(path: str, body: bytes, stream: bool) -> tuple[bytes, bool]:
@@ -1068,22 +1348,73 @@ async def _forward(
 
     # Some gemma-4 snapshots omit the turn-end token (<turn|>) from their
     # generation config, so inject it as a defensive stop word for that family.
+    body = _rewrite_public_model(body, handle)
     body, stream = _inject_turn_stop(request.url.path, body, stream)
 
     if stream:
+        client = httpx.AsyncClient(timeout=None)
+        try:
+            upstream_request = client.build_request(
+                method, f"{upstream}{path}", content=body, headers=headers
+            )
+            response = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            return JSONResponse(
+                {"detail": f"Metal upstream error: {exc}"}, status_code=502
+            )
+
+        # Obtain the status and, on failure, the body before returning a
+        # StreamingResponse. Otherwise Starlette commits 200 before the
+        # generator's first await and upstream 4xx/5xx become truncated 200s.
+        if not 200 <= response.status_code < 300:
+            try:
+                content = await response.aread()
+            finally:
+                await response.aclose()
+                await client.aclose()
+            return Response(
+                content=content,
+                status_code=response.status_code,
+                media_type=(
+                    response.headers.get("content-type", "application/json")
+                    .split(";", 1)[0]
+                ),
+            )
+
+        handle.begin_request()
         return StreamingResponse(
-            _proxy_stream(upstream, path, body, headers),
-            media_type="text/event-stream",
+            _proxy_stream(response, client, handle),
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "text/event-stream").split(
+                ";", 1
+            )[0],
         )
 
+    is_generation = request.url.path in {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/responses",
+    }
+    if is_generation:
+        handle.begin_request()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
             r = await client.request(
                 method, f"{upstream}{path}", content=body, headers=headers
             )
     except httpx.HTTPError as exc:
+        if is_generation:
+            handle.finish_request(None, completed=False)
         return JSONResponse({"detail": f"Metal upstream error: {exc}"}, status_code=502)
     content = r.content
+    if is_generation:
+        try:
+            usage = _usage_from_payload(json.loads(content))
+        except (ValueError, UnicodeDecodeError):
+            usage = None
+        handle.finish_request(usage, completed=200 <= r.status_code < 300)
     # Same reasoning-channel rename as the streaming path, for non-streaming
     # completions (mlx_lm's "reasoning" -> FreeToken's "reasoning_content").
     if b'"reasoning":' in content:

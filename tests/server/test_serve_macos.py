@@ -32,6 +32,81 @@ def test_run_serve_on_darwin_routes_to_metal_without_cuda_launcher(monkeypatch):
     assert seen["argv"] == ["--model", "mlx-community/Qwen3-0.6B-4bit", "--port", "1919"]
 
 
+def test_metal_parser_accepts_shared_shell_and_model_name_flags():
+    from freetoken.server.metal_main import _parse
+
+    args = _parse(
+        [
+            "--model",
+            "/models/example",
+            "--shell-mode",
+            "--served-model-name",
+            "public-model",
+            "--cors-origins",
+            "http://localhost:3000",
+        ]
+    )
+
+    assert args.shell is True
+    assert args.served_model_name == "public-model"
+    assert args.cors_origins == "http://localhost:3000"
+
+
+def test_shell_metal_filter_does_not_consume_backend_after_boolean_flag():
+    from freetoken.shell import _split_engine_args
+
+    model, passthrough = _split_engine_args(
+        ["--model", "M", "--moe-cache-auto", "--backend", "llama"]
+    )
+
+    assert model == "M"
+    assert passthrough == ["--backend", "llama"]
+
+
+def test_metal_cors_uses_same_browser_allow_list():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from freetoken.server.cors import install_cors
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    install_cors(app, "http://localhost:1420")
+    response = TestClient(app).options(
+        "/health",
+        headers={
+            "Origin": "http://localhost:1420",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.headers["access-control-allow-origin"] == "http://localhost:1420"
+
+
+def test_serve_metal_help_uses_lightweight_import_path():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    pkg = os.path.join(root, "python")
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = pkg + (os.pathsep + existing if existing else "")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "freetoken.cli", "serve-metal", "--help"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0
+    assert "PyTorch was not found" not in proc.stderr
+    assert "--served-model-name" in proc.stdout
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Metal venv has no torch")
 def test_ft_serve_help_does_not_need_torch():
     """``ft serve --help`` must succeed on a Metal install (no torch installed)."""

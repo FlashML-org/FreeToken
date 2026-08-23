@@ -120,11 +120,24 @@ def _launch_metal(server_args: "ServerArgs", backend: str, run_shell: bool) -> N
     a proxy to it. The CUDA scheduler path is not involved.
     """
     from .api_server import run_api_server
-    from .metal import register_metal_proxy_routes
+    from .metal import (
+        MetalBackendHandle,
+        _default_served_model_name,
+        launch_metal_backend,
+    )
 
-    handle = launch_metal_backend(backend, server_args.model_path, server_args.metal_port)
+    served_name = server_args.served_model_name
+    if served_name == _default_served_model_name(server_args.model_path):
+        served_name = None
+
+    handle = launch_metal_backend(
+        backend,
+        server_args.model_path,
+        server_args.metal_port,
+        served_model_name=served_name,
+    )
     logger.info(
-        "Metal backend %r ready at %s (upstream), FreeToken API on %s:%s",
+        "Metal backend %r started at %s (upstream), FreeToken API on %s:%s",
         backend,
         handle.upstream_base_url,
         server_args.server_host,
@@ -162,6 +175,10 @@ def launch_server(
     # resolves to CUDA when usable, else to an available Metal runtime.
     backend = resolve_backend(server_args.backend)
     if backend != "cuda":
+        # Route installation runs later inside run_api_server and reads the
+        # config object. Persist auto's concrete result so it selects Metal
+        # routes instead of leaving the native CUDA routes mounted.
+        server_args = replace(server_args, backend=backend)
         _launch_metal(server_args, backend, run_shell=run_shell)
         return
 

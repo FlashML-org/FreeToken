@@ -25,11 +25,24 @@ _ENGINE_FLAGS = ("--model", "--model-path")
 
 #: Flags the Metal path does not understand (CUDA/engine-specific); dropped when
 #: `ft shell --model` routes to `ft serve-metal` on macOS.
-_METAL_UNKNOWN_FLAGS = (
-    "--dtype", "--moe-backend", "--moe-cache-size", "--moe-cache-auto",
-    "--moe-cache-rate", "--attn", "--attention-backend", "--tool-call-parser",
-    "--reasoning-parser", "--sampling-defaults", "--use-dummy-weight",
-    "--cuda-graph-max-bs", "--max-running-req", "--silent-output", "--shell-mode",
+_METAL_UNKNOWN_VALUE_FLAGS = (
+    "--dtype",
+    "--moe-backend",
+    "--moe-cache-size",
+    "--moe-cache-rate",
+    "--attn",
+    "--attention-backend",
+    "--tool-call-parser",
+    "--reasoning-parser",
+    "--sampling-defaults",
+    "--cuda-graph-max-bs",
+    "--max-running-req",
+)
+_METAL_UNKNOWN_BOOLEAN_FLAGS = (
+    "--moe-cache-auto",
+    "--use-dummy-weight",
+    "--silent-output",
+    "--shell-mode",
 )
 
 
@@ -64,7 +77,8 @@ def _split_engine_args(argv: Sequence[str]) -> tuple[str | None, list[str]]:
     value token of engine flags that take one, so it never mistakes a value for
     a flag or leaks it into the passthrough list.
     """
-    value_flags = {f for f in _ENGINE_FLAGS + _METAL_UNKNOWN_FLAGS}
+    value_flags = set(_ENGINE_FLAGS + _METAL_UNKNOWN_VALUE_FLAGS)
+    boolean_flags = set(_METAL_UNKNOWN_BOOLEAN_FLAGS)
     model = None
     passthrough: list[str] = []
     i = 0
@@ -77,6 +91,8 @@ def _split_engine_args(argv: Sequence[str]) -> tuple[str | None, list[str]]:
                     model = value
             else:
                 passthrough.append(arg)
+            i += 1
+        elif arg in boolean_flags:
             i += 1
         elif arg in value_flags:
             value = argv[i + 1] if i + 1 < len(argv) else None
