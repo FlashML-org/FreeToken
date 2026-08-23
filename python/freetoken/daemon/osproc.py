@@ -81,7 +81,13 @@ def proc_pgid(pid: int) -> int | None:
     (b) assert ``pgid == pid`` before a group-kill so we never signal an unrelated group."""
     fields = _stat_fields(pid)
     if fields is None or len(fields) < 3:
-        return None
+        # macOS and other non-/proc POSIX hosts still expose the process group
+        # through getpgid(2). Serve children are created with
+        # start_new_session=True, so pgid == pid remains the safety invariant.
+        try:
+            return os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return None
     try:
         return int(fields[2])  # field 5 == fields[5-3]
     except (ValueError, IndexError):  # pragma: no cover - defensive

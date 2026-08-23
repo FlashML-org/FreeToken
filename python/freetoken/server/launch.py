@@ -112,6 +112,46 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             scheduler.shutdown()
 
 
+def _launch_metal(server_args: "ServerArgs", backend: str, run_shell: bool) -> None:
+    """Serve over an Apple Silicon Metal backend (mlx or llama.cpp).
+
+    Launches the chosen Metal runtime as an upstream OpenAI/Anthropic-compatible
+    engine and registers FreeToken's HTTP surface (OpenAI/Anthropic/Responses) as
+    a proxy to it. The CUDA scheduler path is not involved.
+    """
+    from .api_server import run_api_server
+    from .metal import (
+        MetalBackendHandle,
+        _default_served_model_name,
+        launch_metal_backend,
+    )
+
+    served_name = server_args.served_model_name
+    if served_name == _default_served_model_name(server_args.model_path):
+        served_name = None
+
+    handle = launch_metal_backend(
+        backend,
+        server_args.model_path,
+        server_args.metal_port,
+        served_model_name=served_name,
+    )
+    logger.info(
+        "Metal backend %r started at %s (upstream), FreeToken API on %s:%s",
+        backend,
+        handle.upstream_base_url,
+        server_args.server_host,
+        server_args.server_port,
+    )
+
+    def start_metal() -> MetalBackendHandle:
+        # Callers of run_api_server treat the return as the "backend handle" and
+        # copy its .processes for teardown; reuse ours.
+        return handle
+
+    run_api_server(server_args, start_metal, run_shell=run_shell)
+
+
 def launch_server(
     run_shell: bool = False,
     argv: list[str] | None = None,
@@ -119,6 +159,7 @@ def launch_server(
 ) -> None:
     from .api_server import run_api_server
     from .args import parse_args
+    from .metal import MetalBackendHandle, launch_metal_backend, resolve_backend
 
     server_args, run_shell = parse_args(
         sys.argv[1:] if argv is None else argv,
@@ -126,6 +167,20 @@ def launch_server(
         prog=prog,
     )
     logger = init_logger(__name__, "initializer")
+
+    # Resolve + branch on the inference backend. The classic CUDA path spawns CUDA
+    # scheduler/tokenizer workers (logic below, unchanged). The Metal backends reuse
+    # Apple's mlx / llama.cpp runtimes as an upstream OpenAI-compatible engine and
+    # FreeToken serves its API by proxying to it (see server/metal.py). ``auto``
+    # resolves to CUDA when usable, else to an available Metal runtime.
+    backend = resolve_backend(server_args.backend)
+    if backend != "cuda":
+        # Route installation runs later inside run_api_server and reads the
+        # config object. Persist auto's concrete result so it selects Metal
+        # routes instead of leaving the native CUDA routes mounted.
+        server_args = replace(server_args, backend=backend)
+        _launch_metal(server_args, backend, run_shell=run_shell)
+        return
 
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp

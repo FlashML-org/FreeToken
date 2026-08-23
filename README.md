@@ -49,6 +49,22 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+### macOS (Apple Silicon, Metal)
+
+The native engine is CUDA-only; on a Mac `ft serve` (same as `ft serve-metal`)
+runs the OpenAI/Anthropic/Responses API backed by Apple's Metal runtimes
+(MLX or llama.cpp) instead of porting the CUDA scheduler:
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e .                      # core only; skips CUDA-only deps
+uv pip install mlx-lm                     # Metal engine (or: brew install llama.cpp)
+ft serve --model mlx-community/Qwen3-0.6B-4bit
+```
+
+See [Install on macOS](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md) and
+[serve-metal in the CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md).
+
 For More details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)

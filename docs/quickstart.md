@@ -13,6 +13,31 @@ and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 
+### macOS (Apple Silicon)
+
+```bash
+scripts/start-metal.sh                             # serve + chat in one command
+scripts/start-metal.sh mlx-community/Llama-3.2-1B-Instruct-4bit
+scripts/start-metal.sh ~/models/MyModel.Q4_K_M.gguf --backend llama
+```
+
+`scripts/start-metal.sh` checks the environment, starts the Metal server,
+waits for readiness, and opens `ft shell` for interactive testing (the server
+stops when the chat exits; `NO_CHAT=1` runs the API alone). Or drive the
+pieces directly:
+
+```bash
+ft serve-metal --model mlx-community/Qwen3-0.6B-4bit --backend mlx
+```
+
+`ft serve-metal` serves the same API surface as `ft serve`, backed by MLX or
+llama.cpp on Metal (see [install.md](install.md#method-3-macos--apple-silicon-metal-backend)).
+`--model` takes an MLX/HF repo id (`mlx-community/*`) or, with `--backend llama`,
+a local GGUF file. The rest of this page (`/v1/models`, chat completions, `ft shell`,
+`ft launch`) works unchanged against it — including `ft shell --model <id>`, which
+starts the Metal engine and chats in one process on a Mac, and the `/model <id>`
+shell command to switch models without restarting.
+
 ## Send a request
 
 Check what is being served:
@@ -49,7 +74,9 @@ ft shell --model ~/models/Qwen3.6-35B-A3B   # start an engine and chat, one proc
 ```
 
 `/help` lists the in-shell commands. Attach mode needs no GPU, so it also drives
-a server on another machine (`--server URL`).
+a server on another machine (`--server URL`). On a Mac, `ft shell --model <mlx/hf id>`
+starts the Metal backend instead (see [quickstart.md](quickstart.md)); `/model <id>`
+switches the served model on servers that support it (Metal).
 
 ## Use a coding agent
 

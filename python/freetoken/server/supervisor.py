@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from queue import Empty
 from typing import Any, Callable, List
 
+from .process_utils import process_is_alive
+
 
 def phase_slug(desc: str) -> str:
     """Normalize a progress-bar desc into the stable /health phase enum. Order matters:
@@ -65,7 +67,7 @@ class WorkerDied(Exception):
 def _first_dead(processes: List[Any]) -> Any | None:
     for p in processes:
         try:
-            if not p.is_alive():
+            if not process_is_alive(p):
                 return p
         except Exception:  # noqa: BLE001 — treat an unqueryable handle as alive
             continue

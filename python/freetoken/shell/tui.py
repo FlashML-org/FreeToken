@@ -453,6 +453,7 @@ def _help_text(think_gears: Tuple[str, ...], pools: CachePools) -> str:
     rows = [
         ("/help", "show this message"),
         (think, think_help),
+        ("/model [id]", "show the served model, or switch to another one"),
         (f"/cache [status | {_cache_targets_hint(pools)}]", ""),
         ("", "show or resize the cache pools; token targets are"),
         ("", "rounded up to the pool's page size"),
@@ -679,7 +680,7 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
             history.append((cmd, text))
 
     async def handle_command(cmd: str) -> None:
-        nonlocal history, think_gear, cache_pools
+        nonlocal history, think_gear, think_gears, think_kwargs, cache_pools, model_id
         if cmd == "":
             return
         if cmd.startswith("/"):
@@ -699,6 +700,62 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
                 think_gear, message = _apply_think_command(arg, think_gears, think_gear)
                 stats.think_gear = think_gear
                 renderer.write(message + "\n")
+                return
+            if slash == "/model":
+                if len(parts) == 1:
+                    lines = [f"Serving {model_id}."]
+                    with contextlib.suppress(ShellClientError):
+                        models = await client.list_models()
+                        if models:
+                            lines.append("Available: " + ", ".join(models))
+                    lines.append("Usage: /model <id> to switch.")
+                    renderer.write("\n".join(lines) + "\n")
+                    return
+                candidate = parts[1]
+                if candidate == model_id:
+                    renderer.write(f"Already serving {model_id}.\n")
+                    return
+                renderer.write(f"Switching model to {candidate}...\n")
+
+                def _on_switch_progress(doc: dict) -> None:
+                    nonlocal last_line, last_at
+                    line = _format_load_progress(doc)
+                    now = time.monotonic()
+                    new_phase = line.split(":", 1)[0] != last_line.split(":", 1)[0]
+                    if line == last_line or (not new_phase and now - last_at < LOAD_PROGRESS_INTERVAL):
+                        return
+                    last_line, last_at = line, now
+                    renderer.write(f"{line}\n")
+                try:
+                    doc = await client.load_model(candidate, on_progress=_on_switch_progress)
+                except ShellClientError as exc:
+                    if exc.status == 404:
+                        renderer.write(
+                            "This server does not support model switching "
+                            "(no /v1/model/load endpoint).\n"
+                        )
+                    else:
+                        renderer.write(f"{exc}\n")
+                    return
+                model_id = candidate
+                history = []
+                stats.reset()
+                stats.model_label = _format_shell_model_label(model_id)
+                # Re-read what the new model offers: think gears, cache geometry,
+                # a clean stats baseline.
+                with contextlib.suppress(ShellClientError):
+                    cache_doc = await client.cache_status()
+                    geometry = cache_doc.get("geometry") or {}
+                    reasoning = geometry.get("reasoning") or {}
+                    think_gears = tuple(reasoning.get("gears") or ())
+                    think_kwargs = reasoning.get("kwargs") or {}
+                    think_gear = reasoning.get("default")
+                    stats.think_gear = think_gear
+                    stats.apply_geometry(geometry)
+                    cache_pools = CachePools.from_geometry(geometry)
+                with contextlib.suppress(ShellClientError):
+                    stats.apply_stats_doc(await client.stats())
+                renderer.write(f"Now serving {model_id}.\n")
                 return
             if slash == "/cache":
                 pools = await _handle_cache_command(parts[1:], client, stats, renderer)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
+
+_IS_MACOS = sys.platform == "darwin"
 
 
 ROOT = Path(__file__).parent
@@ -18,25 +20,32 @@ def _check_toolchain() -> None:
     module.check_nvcc_matches_torch()
 
 
-def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
-    if CUDA_HOME is None:
-        raise RuntimeError(
-            "CUDA_HOME is required to build freetoken.kernel._pinned_tensor "
-            "because it links against the CUDA runtime API."
-        )
-    cuda_home = Path(CUDA_HOME)
+def _cuda_runtime_paths(cuda_home: Path) -> tuple[list[str], list[str]]:
     library_dirs = [str(cuda_home / "lib64")]
     if (cuda_home / "lib").exists():
         library_dirs.append(str(cuda_home / "lib"))
     return [str(cuda_home / "include")], library_dirs
 
 
-cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
-_check_toolchain()
+cuda_include_dirs: list[str] = []
+cuda_library_dirs: list[str] = []
+ext_modules: list = []
+cmdclass: dict = {}
 
+if not _IS_MACOS:
+    # The two C++ extensions below link the CUDA runtime; macOS (Metal) builds
+    # have no compiled extensions at all (the Metal path runs Apple's mlx /
+    # llama.cpp runtimes as upstream engines, see server/metal.py).
+    from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDA_HOME
 
-setup(
-    ext_modules=[
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "CUDA_HOME is required to build freetoken.kernel._pinned_tensor "
+            "because it links against the CUDA runtime API."
+        )
+    cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths(Path(CUDA_HOME))
+    _check_toolchain()
+    ext_modules = [
         CppExtension(
             name="freetoken.kernel._pinned_tensor",
             sources=[
@@ -62,6 +71,11 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
-    ],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    ]
+    cmdclass = {"build_ext": BuildExtension.with_options(use_ninja=True)}
+
+
+setup(
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )

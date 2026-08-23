@@ -77,7 +77,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--backend",
         default="offload",
-        help="comma list of offload|cpu|hybrid; one server per backend",
+        help="comma list of offload|cpu|hybrid|metal; one server per backend (metal = Apple Silicon)",
+    )
+    p.add_argument(
+        "--metal-engine",
+        default="mlx",
+        choices=["mlx", "llama"],
+        help="Metal engine for --backend metal (mlx or llama.cpp; default mlx)",
     )
     p.add_argument(
         "--aime",
@@ -172,6 +178,16 @@ def free_port() -> int:
 
 
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
+    if backend == "metal":
+        # Apple Silicon: the same serving path through the Metal backend (mlx /
+        # llama.cpp upstream). CUDA engine flags do not apply, and the Metal
+        # server reports readiness through /health like the CUDA one.
+        return [
+            sys.executable, "-m", "freetoken.cli", "serve-metal",
+            "--model", args.model,
+            "--backend", args.metal_engine,
+            "--host", "127.0.0.1", "--port", str(port),
+        ]
     cmd = [
         sys.executable, "-m", "freetoken.cli", "serve",
         "--model", args.model,
@@ -209,7 +225,10 @@ def wait_ready(origin: str, proc: subprocess.Popen, log_path: str, timeout: floa
             continue
         if health.get("status") == "error":
             die_with_log(f"server reported startup error: {health}", log_path)
-        if health.get("maintenance") == "serving":
+        # The CUDA server reports its lifecycle via `maintenance`; the Metal
+        # backend is "serving" as soon as /health is ok (its upstream engine
+        # finished loading before the API ever bound).
+        if health.get("maintenance") in ("serving", None) and health.get("status") == "ok":
             return
         time.sleep(1.0)
     die_with_log(f"server not ready after {timeout:.0f}s", log_path)
@@ -339,7 +358,15 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
     completion = usage["completion_tokens"]
     if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+        why = (
+            " -- Metal upstream stops at EOS (ignore_eos is not honored)"
+            if backend == "metal"
+            else ""
+        )
+        print(
+            f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}{why}",
+            flush=True,
+        )
     steps = completion - 1
     decode_time = stamps[-1] - stamps[0]
     gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
@@ -369,6 +396,12 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
           f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
           f"{len(stamps)} events)")
     print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
+    if backend == "metal":
+        print(
+            "  note              : Metal/mlx coalesces tokens into fewer SSE events and\n"
+            "                      does not honor ignore_eos, so tok/s is an upper bound\n"
+            "                      over coalesced bursts, and steps may be < --decode."
+        )
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
     print(f"  output sample     : {r['text'][:240]!r}")
@@ -378,7 +411,7 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     backends = [b.strip() for b in args.backend.split(",") if b.strip()]
-    unknown = [b for b in backends if b not in ("offload", "cpu", "hybrid")]
+    unknown = [b for b in backends if b not in ("offload", "cpu", "hybrid", "metal")]
     if unknown:
         sys.exit(f"unknown backend(s): {unknown}")
 

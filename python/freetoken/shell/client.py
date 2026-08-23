@@ -16,6 +16,7 @@ milliseconds of imports, not a CUDA context.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import urllib.error
@@ -203,16 +204,93 @@ class ShellClient:
         )
 
     async def model_id(self) -> str | None:
-        """The first id from ``/v1/models``. None when the server reports none (it is a single-
-        model server, so this is the model the shell will be talking to)."""
+        """The id the shell should talk to.
+
+        Single-model servers (the norm, and always the case through the Metal
+        proxy) report one id and it is used directly. Some upstreams (raw
+        mlx_lm) list every model in the local HF cache -- then the served model
+        cannot be told apart client-side, so fall back to the request-time
+        default: the id the server echoes when the ``model`` field is omitted.
+        """
         doc = await self._request_json("GET", "/v1/models")
         data = doc.get("data")
         if not isinstance(data, list):
             return None
-        for item in data:
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                return item["id"]
-        return None
+        ids = [
+            item["id"]
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        if len(ids) == 1:
+            return ids[0]
+        if not ids:
+            return None
+        # Multi-model listing: ask the server which one a bare request uses.
+        # mlx_lm (and llama.cpp) echo the served model in the response body.
+        with contextlib.suppress(ShellClientError, OSError, ValueError, KeyError, TypeError):
+            request = urllib.request.Request(
+                f"{self.origin}/v1/chat/completions",
+                data=json.dumps({"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            echoed = body.get("model")
+            if isinstance(echoed, str) and echoed in ids:
+                return echoed
+        return ids[0]
+
+    async def list_models(self) -> list[str]:
+        """All ids from ``/v1/models``, for ``/model``'s listing."""
+        doc = await self._request_json("GET", "/v1/models")
+        data = doc.get("data")
+        if not isinstance(data, list):
+            return []
+        return [
+            item["id"]
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+
+    async def load_model(
+        self,
+        model: str,
+        *,
+        wait: float = 600.0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Switch the served model via ``POST /v1/model/load``, streaming load progress.
+
+        The server relaunches its engine for the new model and publishes live
+        progress (phase + byte counts) on ``/health`` while the POST is still in
+        flight. Kicking the POST off as a background task and polling /health
+        alongside it turns the switch into the same live view the startup path
+        renders, instead of an opaque minutes-long hang.
+
+        ``on_progress`` receives each /health doc as the switch runs. If the
+        server is one of those that answers the switch instantly (no load to
+        watch), the POST wins the race and no progress is ever shown."""
+        if on_progress is None:
+            return await self._request_json(
+                "POST", "/v1/model/load", body={"model": model}, timeout=wait
+            )
+        post = asyncio.create_task(
+            self._request_json("POST", "/v1/model/load", body={"model": model}, timeout=wait)
+        )
+        try:
+            while not post.done():
+                try:
+                    doc = await self.health()
+                except ShellClientError:
+                    doc = None
+                if isinstance(doc, dict) and doc.get("status") not in (None, "ok"):
+                    on_progress(doc)
+                await asyncio.sleep(READY_POLL_INTERVAL)
+            return await post
+        except BaseException:
+            post.cancel()
+            raise
 
     async def wait_until_ready(
         self,

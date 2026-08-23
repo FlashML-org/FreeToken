@@ -122,8 +122,13 @@ def build_serve_command(
 ) -> tuple[list[str], str]:
     """The serve invocation + its log path. ``python -m freetoken.cli serve`` (NOT ``-m
     freetoken``, which is a direct-server entrypoint that ignores subcommand argv) so it uses the
-    daemon's own interpreter/venv with no PATH dependency."""
-    argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port), *args]
+    daemon's own interpreter/venv with no PATH dependency.
+
+    On Apple Silicon there is no CUDA engine to serve; the same CLI argv is routed
+    to ``serve-metal`` instead (the Metal backend ignores CUDA-only engine flags
+    it does not understand). On Linux the classic invocation is unchanged."""
+    subcommand = "serve-metal" if sys.platform == "darwin" else "serve"
+    argv = [python, "-m", "freetoken.cli", subcommand, "--model", model, "--port", str(port), *args]
     log_path = os.path.join(log_dir, f"serve-{port}.log")
     return argv, log_path
 

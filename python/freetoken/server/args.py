@@ -26,6 +26,14 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Inference engine backend. "auto" resolves to CUDA when a usable CUDA GPU is
+    # present, otherwise to the first available Apple Silicon Metal runtime (mlx,
+    # then llama.cpp). "cuda" forces the native CUDA scheduler (original behavior).
+    # "mlx" / "llama" reuse Apple's Metal runtimes as an upstream engine behind
+    # FreeToken's API (see server/metal.py).
+    backend: str = "auto"
+    # Upstream port for a Metal backend; a free loopback port is auto-picked when 0.
+    metal_port: int = 0
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -593,6 +601,28 @@ def parse_args(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
+    )
+
+    parser.add_argument(
+        "--backend",
+        default=ServerArgs.backend,
+        choices=["auto", "cuda", "mlx", "llama"],
+        help=(
+            "Inference engine backend. 'auto' resolves to CUDA when a usable CUDA GPU "
+            "is present, otherwise to an Apple Silicon Metal runtime (mlx, then "
+            "llama.cpp). 'cuda' forces the native CUDA scheduler. 'mlx' / 'llama' reuse "
+            "Apple's Metal runtimes (see server/metal.py)."
+        ),
+    )
+
+    parser.add_argument(
+        "--metal-port",
+        type=int,
+        default=ServerArgs.metal_port,
+        help=(
+            "Upstream loopback port for a Metal backend (--backend mlx|llama). "
+            "A free port is auto-picked when 0."
+        ),
     )
 
     parser.add_argument(

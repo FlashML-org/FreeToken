@@ -1,0 +1,916 @@
+"""Tests for the Apple Silicon Metal backend (server/metal.py).
+
+Pure-process tests: no GPU, no Metal engine, no torch. They cover the
+backend resolver, the upstream port allocator, and the proxy routes
+mounted on a FastAPI app against a real loopback upstream (uvicorn in a
+thread).
+
+Run:  PYTHONPATH=python <venv>/bin/python -m pytest tests/server/test_metal_backend.py -v
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import socket
+import sys
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+
+
+def _free_port() -> int:
+    """A random free port (the 19000-19 range is littered with TIME_WAIT
+    residue from real Metal runs)."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    except PermissionError as exc:
+        pytest.skip(f"loopback socket binding is unavailable: {exc}")
+    finally:
+        s.close()
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PY = os.path.join(_ROOT, "python")
+if _PY not in sys.path:
+    sys.path.insert(0, _PY)
+
+from freetoken.server import metal  # noqa: E402
+
+
+# ---------------------------------------------------------------- resolver --
+
+def test_resolve_backend_explicit_passthrough():
+    assert metal.resolve_backend("mlx") == "mlx"
+    assert metal.resolve_backend("llama") == "llama"
+
+
+def test_resolve_backend_rejects_unknown():
+    try:
+        metal.resolve_backend("tpu")
+    except RuntimeError as e:
+        assert "unknown --backend" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError for unknown backend")
+
+
+def test_standalone_auto_never_selects_cuda(monkeypatch):
+    monkeypatch.setattr(metal, "_any_cuda_usable", lambda: True)
+    monkeypatch.setattr(metal, "mlx_importable", lambda: True)
+    assert metal.resolve_metal_backend("auto") == "mlx"
+
+
+def test_pick_upstream_port_defaults_into_reserved_range(monkeypatch):
+    monkeypatch.setattr(metal, "_claim_port", lambda port: port)
+    for preferred in (None, 0):
+        port = metal._pick_upstream_port(preferred)
+        assert metal._UPSTREAM_PORT_MIN <= port <= metal._UPSTREAM_PORT_MAX, port
+
+
+def test_pick_upstream_port_prefers_free_preferred_port(monkeypatch):
+    monkeypatch.setattr(metal, "_claim_port", lambda port: port)
+    assert metal._pick_upstream_port(19099) == 19099
+
+
+# --------------------------------------------------------- Gemma 4 prompt --
+
+def test_gemma4_template_renders_canonical_generation_prompt():
+    """Lock down the exact turn boundary that prevents raw-text continuation."""
+    from jinja2 import Environment
+
+    rendered = Environment().from_string(metal._gemma4_chat_template()).render(
+        messages=[{"role": "user", "content": "What is 1+1?"}],
+        bos_token="<bos>",
+        add_generation_prompt=True,
+        tools=None,
+    )
+    assert rendered == (
+        "<bos><|turn>user\nWhat is 1+1?<turn|>\n"
+        "<|turn>model\n<|channel>thought\n<channel|>"
+    )
+
+
+def test_gemma4_missing_template_has_actionable_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(metal, "_GEMMA4_TEMPLATE", None)
+    monkeypatch.setattr(metal, "__file__", str(tmp_path / "metal.py"))
+    with pytest.raises(RuntimeError, match="reinstall FreeToken"):
+        metal._gemma4_chat_template()
+
+
+def test_gemma4_stop_injection_preserves_caller_stops():
+    body = json.dumps(
+        {
+            "model": "google/gemma-4-26B-A4B-it",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "DONE",
+            "stream": True,
+        }
+    ).encode()
+    rewritten, stream = metal._inject_turn_stop(
+        "/v1/chat/completions", body, stream=True
+    )
+    assert json.loads(rewritten)["stop"] == ["DONE", "<turn|>"]
+    assert stream is True
+
+    # Existing delimiters are not duplicated, and non-Gemma requests are
+    # byte-for-byte untouched.
+    already = body.replace(b'"DONE"', b'["DONE", "<turn|>"]')
+    assert metal._inject_turn_stop("/v1/responses", already, False) == (already, False)
+    qwen = body.replace(b"gemma-4-26B-A4B-it", b"Qwen3-0.6B")
+    assert metal._inject_turn_stop("/v1/chat/completions", qwen, True) == (qwen, True)
+
+
+# ------------------------------------------------------------- proxy routes --
+
+def _start_upstream(port: int):
+    """Serve a tiny OpenAI-ish upstream on a loopback port; return a stop()."""
+    app = FastAPI()
+
+    @app.get("/v1/models")
+    async def models():
+        return {"object": "list", "data": [{"id": "test-model"}]}
+
+    @app.post("/v1/chat/completions")
+    async def chat():
+        return {
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "hello from upstream"},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 3, "total_tokens": 4},
+        }
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):  # wait for the listener
+        if server.started:
+            break
+        import time
+
+        time.sleep(0.05)
+    assert server.started, "upstream test server failed to start"
+
+    def stop():
+        server.should_exit = True
+        thread.join(timeout=5)
+
+    return stop
+
+
+def test_proxy_roundtrip_to_real_upstream():
+    port = _free_port()
+    stop = _start_upstream(port)
+    try:
+        handle = metal.MetalBackendHandle(
+            processes=[SimpleNamespace(poll=lambda: None)],
+            upstream_base_url=f"http://127.0.0.1:{port}",
+            backend="mlx",
+        )
+        handle.load_state = "ready"
+        assert handle.is_alive()
+
+        proxy = FastAPI()
+        metal.register_metal_proxy_routes(proxy, lambda: handle)
+        client = TestClient(proxy, raise_server_exceptions=False)
+
+        r = client.get("/v1/models")
+        assert r.status_code == 200
+        assert [m["id"] for m in r.json()["data"]] == ["test-model"]
+
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"] == "hello from upstream"
+        stats = client.get("/v1/stats").json()["requests"]
+        assert stats["completed"] == 1
+        assert stats["prompt_tokens_total"] == 1
+        assert stats["completion_tokens_total"] == 3
+
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+    finally:
+        stop()
+
+
+def test_proxy_503_when_backend_not_alive():
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: 1)],  # exited
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+    )
+    assert not handle.is_alive()
+
+    proxy = FastAPI()
+    metal.register_metal_proxy_routes(proxy, lambda: handle)
+    client = TestClient(proxy, raise_server_exceptions=False)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 503
+
+
+def test_proxy_registration_replaces_existing_control_routes():
+    app = FastAPI()
+
+    @app.get("/health")
+    async def native_health():
+        return {"status": "native"}
+
+    @app.get("/v1/stats")
+    async def native_stats():
+        return {"backend": "native"}
+
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="m",
+        load_state="ready",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+
+    paths = [getattr(route, "path", None) for route in app.routes]
+    assert paths.count("/health") == 1
+    assert paths.count("/v1/stats") == 1
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get("/health").json()["backend"] == "mlx"
+    assert client.get("/v1/stats").json()["model"]["id"] == "m"
+
+
+def test_served_model_alias_is_published_and_rewritten_for_upstream():
+    handle = metal.MetalBackendHandle(
+        model_path="/private/models/example",
+        served_model_name="public-model",
+        served_model_name_explicit=True,
+    )
+    body = json.dumps({"model": "public-model", "messages": []}).encode()
+
+    rewritten = json.loads(metal._rewrite_public_model(body, handle))
+
+    assert rewritten["model"] == "/private/models/example"
+    assert handle.health_doc()["model"] == "public-model"
+
+
+def test_handle_terminate_is_safe_on_empty():
+    handle = metal.MetalBackendHandle()
+    handle.terminate()  # no processes -> must not raise
+    assert not handle.is_alive()
+
+
+# ----------------------------------------------------- wire-format translation --
+
+def test_reasoning_field_renamed_streaming_and_body():
+    """mlx_lm's thinking channel is `reasoning`; FreeToken's clients (shell,
+    bench) read `reasoning_content` (the vLLM/SGLang name)."""
+    chunk = b'data: {"choices": [{"delta": {"reasoning": "think"}}]}'
+    out = metal._rewrite_reasoning_field(chunk)
+    assert b'"reasoning_content":' in out and b'"reasoning":' not in out
+    # value text that merely contains the word stays untouched
+    chunk2 = b'data: {"choices": [{"delta": {"content": "the reasoning: here"}}]}'
+    assert metal._rewrite_reasoning_field(chunk2) == chunk2
+
+
+def test_stream_rewrite_survives_split_key_and_preserves_upstream_error():
+    port = _free_port()
+    upstream = FastAPI()
+
+    @upstream.post("/v1/chat/completions")
+    async def chat(payload: dict):
+        if payload.get("prompt") == "reject":
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"error": "no"}, status_code=429)
+
+        async def chunks():
+            yield b'data: {"choices":[{"delta":{"reas'
+            await asyncio.sleep(0.01)
+            yield b'oning":"think"}}]}\n\n'
+
+        return StreamingResponse(chunks(), media_type="text/event-stream")
+
+    server = uvicorn.Server(
+        uvicorn.Config(upstream, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url=f"http://127.0.0.1:{port}",
+        backend="mlx",
+        model_path="m",
+        load_state="ready",
+    )
+    proxy = FastAPI()
+    metal.register_metal_proxy_routes(proxy, lambda: handle)
+    client = TestClient(proxy, raise_server_exceptions=False)
+    try:
+        streamed = client.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": True, "messages": []},
+        )
+        assert streamed.status_code == 200
+        assert b'"reasoning_content":' in streamed.content
+        assert b'"reasoning":' not in streamed.content
+
+        rejected = client.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": True, "prompt": "reject"},
+        )
+        assert rejected.status_code == 429
+        assert rejected.json() == {"error": "no"}
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def test_health_reports_maintenance_serving():
+    """Tools gate on maintenance == "serving" (bench wait_ready, daemon)."""
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="test-model",
+    )
+    handle.load_state = "ready"
+    handle.load_ended_at = time.monotonic()
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    doc = client.get("/health").json()
+    assert doc["status"] == "ok"
+    assert doc["maintenance"] == "serving"
+    # ctl parity endpoints exist
+    requests = client.get("/v1/requests")
+    assert requests.status_code == 200
+    assert requests.json() == {"entries": [], "next_cursor": 0}
+    stats = client.get("/v1/stats")
+    assert stats.status_code == 200
+    assert stats.json()["model"]["id"] == "test-model"
+    assert stats.json()["requests"] == {
+        "active": 0,
+        "completed": 0,
+        "p95_ms": 0,
+        "ttft_mean_ms": 0,
+        "prompt_tokens_total": 0,
+        "completion_tokens_total": 0,
+    }
+
+    # The daemon's legacy stop fallback must accept this exact snapshot.
+    from freetoken.daemon.serve_manager import ServeManager
+
+    manager = object.__new__(ServeManager)
+    instance_id, model_id, prompt, completion, uptime = manager._snapshot_values(
+        stats.json(), model="fallback", require_instance=False
+    )
+    assert instance_id == handle.instance_id
+    assert (model_id, prompt, completion) == ("test-model", 0, 0)
+    assert uptime >= 0
+
+
+# ------------------------------------------------------- load supervision --
+
+def test_health_reports_loading_progress():
+    """While the engine loads, /health answers loading + byte progress in the
+    CUDA contract the shell renders (phase + done_bytes/total_bytes)."""
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="big-model",
+    )
+    # Default state is "starting" -> loading without weights total (unknown).
+    doc = handle.health_doc()
+    assert doc["status"] == "loading"
+    assert doc["phase"] == "starting"
+    assert "progress" not in doc or doc["progress"]["total_bytes"] == 0
+
+    handle.load_state = "loading"
+    handle.load_phase = "weights"
+    handle.weights_bytes = 10 << 30
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    doc = client.get("/health").json()
+    assert doc["status"] == "loading"
+    assert doc["phase"] == "weights"
+    assert doc["progress"]["total_bytes"] == 10 << 30
+    assert 0 <= doc["progress"]["done_bytes"] <= 10 << 30
+
+
+def test_health_reports_error_with_reason():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="m",
+    )
+    handle._set_state("error", error="model load failed: HTTP timeout")
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.get("/health")
+    assert r.status_code == 503
+    assert r.json()["status"] == "error"
+    assert "model load failed" in r.json()["message"]
+
+
+def test_health_preserves_error_reason_after_backend_exits():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: 1)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="m",
+    )
+    handle._set_state("error", error="Metal backend exited during load (code 1)")
+    metal.register_metal_proxy_routes(app, lambda: handle)
+
+    response = TestClient(app, raise_server_exceptions=False).get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "error"
+    assert "exited during load" in response.json()["message"]
+
+
+def test_generation_503_with_phase_while_loading():
+    """A generation request during the load must answer immediately with the
+    loading state, not queue behind the weight load forever."""
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="m",
+    )
+    handle.load_state = "loading"
+    handle.load_phase = "weights"
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 503
+    assert "still loading" in r.json()["detail"]
+    assert r.json()["phase"] == "weights"
+    # Reads are not gated: /v1/models still proxies (a 502 here only because
+    # the fixture's upstream address has nothing listening).
+    assert client.get("/v1/models").status_code == 502
+
+
+def test_upstream_resident_bytes_of_exited_process():
+    """Progress probing must tolerate a dead/missing pid (best-effort)."""
+    class Dead:
+        pid = 999999999  # no such process
+
+    assert metal._upstream_resident_bytes([Dead()]) == 0
+
+
+def test_warm_up_generation_hits_completions():
+    port = _free_port()
+    seen = []
+
+    def stop():
+        pass
+
+    app = FastAPI()
+
+    @app.post("/v1/completions")
+    async def completions(payload: dict):
+        seen.append(payload)
+        return {"choices": [{"text": "x"}]}
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    try:
+        metal._warm_up_generation(f"http://127.0.0.1:{port}", model_id="test-model", timeout=10)
+        assert seen and seen[0]["max_tokens"] == 1
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def test_llama_launch_returns_ready_supervisor_handle(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(metal, "_wait_for_readiness", lambda *args, **kwargs: None)
+
+    handle = metal._launch_llama("/models/example.gguf", 19001)
+
+    assert handle.load_state == "ready"
+    assert handle.served_model_name == "example.gguf"
+    assert handle.ack_queue.get_nowait() == "ready"
+
+
+def test_llama_switch_publishes_ready_on_shared_handle(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    shared = metal.MetalBackendHandle(backend="llama", load_state="loading")
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(metal, "_wait_for_readiness", lambda *args, **kwargs: None)
+
+    metal._launch_llama("/models/new.gguf", 19001, state_handle=shared)
+
+    assert shared.load_state == "ready"
+    assert shared.ack_queue.get_nowait() == "ready"
+
+
+def test_llama_launch_failure_stops_child(monkeypatch):
+    proc = SimpleNamespace(poll=lambda: None)
+    stopped = []
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/tmp/llama-server")
+    monkeypatch.setattr(metal.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(metal, "_start_drain_thread", lambda *args: None)
+    monkeypatch.setattr(
+        metal,
+        "_wait_for_readiness",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not ready")),
+    )
+    monkeypatch.setattr(metal, "_stop_processes", lambda processes: stopped.extend(processes))
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        metal._launch_llama("/models/example.gguf", 19001)
+
+    assert stopped == [proc]
+
+
+def test_readiness_never_competes_for_process_output(monkeypatch):
+    class Output:
+        def readline(self):
+            raise AssertionError("readiness must not read the drained pipe")
+
+    proc = SimpleNamespace(
+        poll=lambda: None,
+        stdout=Output(),
+        stderr=None,
+        returncode=None,
+        _freetoken_recent_output=[],
+    )
+    monkeypatch.setattr(
+        metal.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    metal._wait_for_readiness("http://127.0.0.1:19001", proc, timeout=1)
+
+
+def test_stream_signalled_in_body_not_accept_header():
+    """The OpenAI SDK sends Accept: application/json even for streaming
+    requests; streaming is signalled in the body. Detecting from the header
+    alone routed streamed generations through the buffered path -- the client
+    got the whole answer in one burst and live tok/s read 0."""
+    import httpx as _httpx
+
+    port = _free_port()
+    first_chunk_at: list[float] = []
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat(payload: dict):
+        async def gen():
+            # The upstream writes + flushes each SSE event (mlx_lm does this
+            # per token); a buffered proxy delivers these as one burst.
+            for i in range(3):
+                yield (
+                    f'data: {{"choices":[{{"delta":{{"content":"{i}"}}}}]}}\n\n'
+                ).encode()
+                await asyncio.sleep(0.15)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    try:
+        handle = metal.MetalBackendHandle(
+            processes=[SimpleNamespace(poll=lambda: None)],
+            upstream_base_url=f"http://127.0.0.1:{port}",
+            backend="mlx",
+            model_path="m",
+        )
+        handle.load_state = "ready"
+        proxy_app = FastAPI()
+        metal.register_metal_proxy_routes(proxy_app, lambda: handle)
+
+        # Real uvicorn + raw socket: TestClient buffers the whole response
+        # before iteration, which would make any proxy look burst-shaped.
+        proxy_port = _free_port()
+        proxy_server = uvicorn.Server(
+            uvicorn.Config(proxy_app, host="127.0.0.1", port=proxy_port, log_level="error")
+        )
+        threading.Thread(target=proxy_server.run, daemon=True).start()
+        for _ in range(100):
+            if proxy_server.started:
+                break
+            time.sleep(0.05)
+
+        # No Accept: text/event-stream -- exactly what the OpenAI SDK sends.
+        body = json.dumps(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            }
+        ).encode()
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+            s.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                b"Accept: application/json\r\nContent-Type: application/json\r\n"
+                b"Content-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+            t0 = time.time()
+            stamps: list[float] = []
+            buf = b""
+            while len(stamps) < 3 and time.time() - t0 < 5:
+                data = s.recv(4096)
+                if not data:
+                    break
+                buf += data
+                while b"\n\n" in buf:
+                    chunk, buf = buf.split(b"\n\n", 1)
+                    if b"data:" in chunk:
+                        stamps.append(time.time() - t0)
+        assert len(stamps) >= 3, f"expected 3 SSE events, got {len(stamps)}"
+        # A buffered proxy delivers them as one burst (spread ~0); progressive
+        # delivery spreads >= ~0.2s for three events 150ms apart.
+        spread = stamps[-1] - stamps[0]
+        assert spread >= 0.2, f"chunks delivered as one burst (spread {spread:.3f}s)"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        proxy_server.should_exit = True
+
+
+# --------------------------------------------------------- model switching --
+
+def test_model_load_rejects_non_loopback_client():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+        load_state="ready",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("203.0.113.9", 50000)
+    )
+
+    response = client.post("/v1/model/load", json={"model": "new-model"})
+
+    assert response.status_code == 403
+    assert handle.model_path == "old-model"
+
+
+def test_model_load_requires_model_field():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
+
+    # missing field
+    r = client.post("/v1/model/load", json={"nomodel": "x"})
+    assert r.status_code == 400
+    # bad JSON body
+    r = client.post("/v1/model/load", content=b"not json", headers={"content-type": "application/json"})
+    assert r.status_code == 400
+
+
+def test_model_load_same_model_is_a_noop():
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
+    r = client.post("/v1/model/load", json={"model": "old-model"})
+    assert r.status_code == 200
+    assert r.json()["detail"] == "already serving this model"
+
+
+def test_model_load_switches_to_new_handle(monkeypatch):
+    """A switch stops the old engine BEFORE starting the new one, and adopts
+    the new engine's identity on the shared handle.
+
+    Sequential (stop, then start) is the point: two concurrent engines
+    over-commit the Metal working set and deadlock on this hardware."""
+    app = FastAPI()
+    old_proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+    events: list[str] = []
+    old = metal.MetalBackendHandle(
+        processes=[old_proc],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+    original_processes = old.processes
+    old.load_state = "ready"
+    new_proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+
+    real_stop = metal._stop_processes
+
+    def seen_stop(processes):
+        # switch_model captures the old list BEFORE clearing the attribute,
+        # so identity must be checked against the pre-switch list.
+        events.append(f"stopped:{processes is original_processes}")
+        real_stop(processes)
+
+    def fake_launch(backend, model, upstream_port=None, state_handle=None):
+        events.append("launch")
+        h = metal.MetalBackendHandle(
+            processes=[new_proc],
+            upstream_base_url="http://127.0.0.1:2",
+            backend="mlx",
+            model_path="new-model",
+        )
+        h.load_state = "ready"
+        # A switch passes state_handle: the watcher publishes onto the SHARED
+        # handle, so simulate that publication.
+        if state_handle is not None:
+            state_handle.load_state = "ready"
+        return h
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    monkeypatch.setattr(metal, "_stop_processes", seen_stop)
+    metal.register_metal_proxy_routes(app, lambda: old)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
+
+    r = client.post("/v1/model/load", json={"model": "new-model"})
+    assert r.status_code == 200
+    assert r.json()["model"] == "new-model"
+    # The old engine died before the new load began -- never both resident.
+    assert events == ["stopped:True", "launch"]
+    assert old.model_path == "new-model"
+    assert old.upstream_base_url == "http://127.0.0.1:2"
+    assert len(old.processes) == 1 and old.processes[0] is new_proc
+    assert old.load_state == "ready"
+
+
+def test_model_switch_tracks_new_engine_while_waiting(monkeypatch):
+    old_proc = SimpleNamespace(poll=lambda: None)
+    new_proc = SimpleNamespace(poll=lambda: None)
+    old = metal.MetalBackendHandle(
+        processes=[old_proc],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+        load_state="ready",
+    )
+    stopped: list[list[object]] = []
+    observed: dict[str, object] = {}
+
+    def fake_launch(backend, model, upstream_port=None, state_handle=None):
+        assert (backend, model, state_handle) == ("mlx", "new-model", old)
+        return metal.MetalBackendHandle(
+            processes=[new_proc],
+            upstream_base_url="http://127.0.0.1:2",
+            backend="mlx",
+            model_path="new-model",
+        )
+
+    def fake_wait(timeout=None):
+        observed["processes"] = old.processes
+        observed["upstream"] = old.upstream_base_url
+        observed["alive"] = old.is_alive()
+        old._set_state("ready")
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    monkeypatch.setattr(metal, "_stop_processes", lambda procs: stopped.append(procs))
+    monkeypatch.setattr(old, "_wait_load_terminal", fake_wait)
+
+    old.switch_model("new-model")
+
+    assert stopped == [[old_proc]]
+    assert observed == {
+        "processes": [new_proc],
+        "upstream": "http://127.0.0.1:2",
+        "alive": True,
+    }
+
+
+def test_model_switch_failure_stops_new_engine(monkeypatch):
+    old_proc = SimpleNamespace(poll=lambda: None)
+    new_proc = SimpleNamespace(poll=lambda: None)
+    old = metal.MetalBackendHandle(
+        processes=[old_proc],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+        load_state="ready",
+    )
+    stopped: list[list[object]] = []
+
+    def fake_launch(backend, model, upstream_port=None, state_handle=None):
+        return metal.MetalBackendHandle(
+            processes=[new_proc],
+            upstream_base_url="http://127.0.0.1:2",
+            backend="mlx",
+            model_path="new-model",
+        )
+
+    def fake_wait(timeout=None):
+        raise RuntimeError("warm-up failed")
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    monkeypatch.setattr(metal, "_stop_processes", lambda procs: stopped.append(procs))
+    monkeypatch.setattr(old, "_wait_load_terminal", fake_wait)
+
+    with pytest.raises(RuntimeError, match="warm-up failed"):
+        old.switch_model("new-model")
+
+    assert stopped == [[old_proc], [new_proc]]
+    assert old.processes == []
+    assert old.load_state == "error"
+    assert old.load_error == "warm-up failed"
+
+
+def test_model_load_launch_failure_reports_error(monkeypatch):
+    """A failed launch reports the error; the old engine is already gone
+    (sequential switch), so the honest state is the error itself."""
+    app = FastAPI()
+    old_proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+    old = metal.MetalBackendHandle(
+        processes=[old_proc],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+        model_path="old-model",
+    )
+
+    def fake_launch(backend, model, upstream_port=None, state_handle=None):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(metal, "launch_metal_backend", fake_launch)
+    metal.register_metal_proxy_routes(app, lambda: old)
+    client = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000)
+    )
+
+    r = client.post("/v1/model/load", json={"model": "new-model"})
+    assert r.status_code == 500
+    assert "download failed" in r.json()["detail"]
+    assert old.load_state == "error"
+    assert old.load_error == "download failed"
+    health = client.get("/health")
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["message"] == "download failed"

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# FreeToken engine installer (Linux, NVIDIA CUDA) — user-facing, wheel-based.
+# FreeToken engine installer — user-facing.
 #
-# Installs the `freetoken` runtime (the `ft` CLI) and its prebuilt kernel-cache
-# wheel into a managed venv, then wires it up so FreeToken Desktop can find it.
-# Dependencies come from PyPI via uv, except torch and sglang-kernel whose cu130
-# wheels live on dedicated indexes (see CU_INDEX_ARGS below).
+# Linux (NVIDIA CUDA): installs the `freetoken` runtime (the `ft` CLI) and its
+# prebuilt kernel-cache wheel into a managed venv, then wires it up so FreeToken
+# Desktop can find it. Dependencies come from PyPI via uv, except torch and
+# sglang-kernel whose cu130 wheels live on dedicated indexes (see CU_INDEX_ARGS).
+#
+# macOS (Apple Silicon): no CUDA. Installs the core package + mlx-lm and runs
+# the Metal backend (`ft serve` routes to serve-metal). No kernel-cache wheel.
 #
 # Typical use (once a release exists):
 #   curl -fsSL https://<host>/install.sh | bash
@@ -152,6 +155,70 @@ else
   [ -x "$UV" ] || die "uv bootstrap failed. Install uv from https://docs.astral.sh/uv/ and re-run."
 fi
 say "uv $("$UV" --version | awk '{print $2}')"
+
+install_metal_macos() {
+  [ "$(uname -s)" = Darwin ] || return 1
+  [ "$(uname -m)" = arm64 ] || die "FreeToken on macOS requires Apple Silicon (arm64). This machine is $(uname -m)."
+
+  local script_dir src
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+
+  say "macOS Apple Silicon — Metal backend (no CUDA, no kernel-cache wheel)"
+  mkdir -p "$FT_HOME"
+  "$UV" venv "$VENV" --python "$PY_VERSION" --clear
+
+  if [ -f "$script_dir/pyproject.toml" ]; then
+    src="$script_dir"
+    say "installing from source checkout: $src"
+    "$UV" pip install --python "$VENV" -e "$src"
+  else
+    # Pin the Metal branch until it lands on default. A piped `curl | bash` of
+    # this script has no adjacent checkout, so "git+...FreeToken.git" would
+    # otherwise install CUDA-only main and fail on macOS. Prefer FlashML-org;
+    # fall back to the working fork while the PR is open.
+    src="git+https://github.com/FlashML-org/FreeToken.git@feat/apple-metal-backend"
+    src_fork="git+https://github.com/jasonkneen/FreeToken.git@feat/apple-metal-backend"
+    say "installing from $src"
+    if ! "$UV" pip install --python "$VENV" "$src"; then
+      say "FlashML-org does not have feat/apple-metal-backend yet; using $src_fork"
+      "$UV" pip install --python "$VENV" "$src_fork"
+    fi
+  fi
+  say "installing mlx-lm (Apple Metal engine)"
+  "$UV" pip install --python "$VENV" mlx-lm
+
+  local ft_bin="$VENV/bin/ft"
+  [ -x "$ft_bin" ] || die "install finished but $ft_bin is missing."
+  mkdir -p "$BIN_DIR"
+  ln -sf "$ft_bin" "$BIN_DIR/ft"
+  say "symlinked $BIN_DIR/ft -> $ft_bin"
+  mkdir -p "$ENV_DIR"
+  printf 'FREETOKEN_FT_BIN=%s\n' "$ft_bin" > "$ENV_DIR/50-freetoken.conf"
+  say "wrote $ENV_DIR/50-freetoken.conf (FREETOKEN_FT_BIN)"
+
+  if "$ft_bin" --help >/dev/null 2>&1; then
+    say "self-check: \`ft --help\` OK"
+  else
+    warn "self-check: \`ft --help\` returned non-zero — inspect with: $ft_bin --help"
+  fi
+
+  cat <<EOF
+
+${C_GREEN}FreeToken (Metal) installed.${C_RESET}
+
+  ft binary        $ft_bin
+  on PATH as       $BIN_DIR/ft   (ensure $BIN_DIR is on PATH)
+
+Run:
+  ft serve --model mlx-community/Qwen3-0.6B-4bit --port 1919
+
+EOF
+}
+
+if [ "$(uname -s)" = Darwin ]; then
+  install_metal_macos
+  exit 0
+fi
 
 # Resolve the runtime wheel: explicit env → ./dist bundle → build from a source checkout.
 find_bundled_wheel
