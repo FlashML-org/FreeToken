@@ -109,6 +109,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _swa_ratio(value: str) -> float:
+        try:
+            r = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0.0 < r <= 1.0:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return r
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -250,6 +259,21 @@ def parse_args(
         help=(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
             "cache + KV cache combined; the remainder is reserved runtime headroom."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_swa_ratio,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Window/full ratio for the SWA radix cache (--cache-type radix on sliding-window "
+            "models) and the DSV4 window tier: the startup window-pool size = "
+            "max(working-set floor, ratio x full-pool tokens). A larger ratio retains more "
+            "window-prefix KV for cross-request reuse (a shared prefix longer than the window "
+            "is reusable only when its windowed KV is retained), at the cost of full-pool "
+            "capacity; < 1.0 trades that reuse for memory. Must be in (0, 1]. Equivalent to a "
+            "startup /v1/cache/rebuild with swa_full_tokens_ratio, sized at load."
         ),
     )
 
