@@ -154,6 +154,45 @@ def _resolve_auto_attention_backend(
     )
 
 
+def _validate_kv_cache_dtype(config, model_config) -> None:
+    """Gate --kv-cache-dtype against what the 8-bit path actually implements.
+
+    The storage lives in the DSV4 window/compressed pools and the two sparse-attention
+    kernels that read them. Every other model's KV goes through different pools and
+    kernels, so reject those here, at config time, rather than letting a wrong-dtype
+    tensor reach a kernel.
+    """
+    name = getattr(config, "kv_cache_dtype", "auto")
+    dsv4_args = getattr(model_config, "dsv4_args", None)
+    # Stamp the args here, at config resolution, not when the pool is built: the cost model
+    # reads this to size the KV budget, and --moe-cache-auto divides that budget to pick the
+    # expert-cache size well before any pool exists. Setting it later leaves the auto-sizer
+    # working from bf16 bytes and the 8-bit saving never reaches the expert cache.
+    if dsv4_args is not None:
+        dsv4_args.kv_quant = name != "auto"
+    if name == "auto":
+        return
+
+    if dsv4_args is None:
+        raise ValueError(
+            f"--kv-cache-dtype {name} is implemented for DeepSeek-V4 KV pools only; this "
+            "checkpoint uses a different pool family. Drop the flag."
+        )
+
+    from freetoken.kvcache.dsv4_kv_quant import BLOCK
+
+    if dsv4_args.head_dim % BLOCK:
+        raise ValueError(
+            f"--kv-cache-dtype {name} needs head_dim to be a multiple of {BLOCK}, the "
+            f"quantization block; this checkpoint has {dsv4_args.head_dim}."
+        )
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        raise ValueError(
+            f"--kv-cache-dtype {name} needs native fp8 (sm_89 or newer): below that a "
+            "float8 pointer is illegal inside a triton kernel. Use --kv-cache-dtype auto."
+        )
+
+
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
     """Config-time type x backend capability check for the resolved (or explicit)
     backend string: every comma part must serve every required type and have its
@@ -1190,6 +1229,7 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    _validate_kv_cache_dtype(config, model_config)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

@@ -79,6 +79,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
+        # Stamped on dsv4_args at config resolution (see _validate_kv_cache_dtype), because
+        # --moe-cache-auto sizes the expert cache off the KV budget before this runs.
+        kv_quant = bool(getattr(model_config.dsv4_args, "kv_quant", False))
         pool = DSV4PagedKVCache(
             sizes=_dsv4_pool_sizes(config, num_pages + 1),  # +1 for dummy page
             args=model_config.dsv4_args,
@@ -86,6 +89,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
             n_scratch=config.max_running_req + 1,
+            kv_quant=kv_quant,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool

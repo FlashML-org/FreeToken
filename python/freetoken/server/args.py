@@ -508,6 +508,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        dest="kv_cache_dtype",
+        choices=("auto", "fp8_e4m3"),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "Storage dtype for the DeepSeek-V4 window/compressed KV pools. 'auto' keeps "
+            "bf16; 'fp8_e4m3' stores fp8 plus one fp16 scale per 32 elements (1.0625 "
+            "bytes/element against 2), which frees VRAM for a larger KV pool or a larger "
+            "expert cache. Needs a DeepSeek-V4 checkpoint and native fp8 (sm_89+)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
