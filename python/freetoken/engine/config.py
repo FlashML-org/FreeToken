@@ -83,6 +83,9 @@ class EngineConfig:
     # lower it with --distributed-timeout if a hung rank should fail faster.
     distributed_timeout: float = 1800.0
     use_dummy_weight: bool = False
+    # DeepSeek-V4 only: build the checkpoint's dSpark drafter for block speculative
+    # decoding. Reaches the model through dsv4_args.dspark_enabled (_adjust_dsv4_config).
+    speculative_dspark: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages

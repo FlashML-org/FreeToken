@@ -17,6 +17,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 
 from __future__ import annotations
 
+import glob
 import os
 import threading
 import time
@@ -105,10 +106,20 @@ def _tp_core_share(cores: list[int]) -> list[int]:
     info = try_get_tp_info()
     if info is None or info.size <= 1:
         return cores
-    per = len(cores) // info.size
+    # ``cores`` is already filtered by this process's affinity. When the engine has bound
+    # each rank to a NUMA node, that mask is ONE node's cpus and only the ranks on that
+    # node compete for them -- dividing by the full TP size would hand each rank a
+    # fraction of a fraction and leave most of the socket idle.
+    from freetoken.utils.numa import placement as numa_placement
+
+    placed = numa_placement()
+    siblings, index = (
+        (placed[2], placed[3]) if placed is not None else (info.size, info.rank)
+    )
+    per = len(cores) // siblings
     if per < 1:  # fewer cores than ranks: let the OS schedule them
         return cores
-    return cores[info.rank * per: (info.rank + 1) * per]
+    return cores[index * per: (index + 1) * per]
 
 
 def _smt_siblings_of(cores: list[int]) -> list[int]:
@@ -351,9 +362,16 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
-        logger.info_rank0(
-            f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+        # Per-rank, not rank0-only: this pool sits on the decode critical path, and the
+        # way its core split goes wrong is ranks landing on each other's cores. That is
+        # only visible when every rank says where it went.
+        from freetoken.distributed import try_get_tp_info
+
+        info = try_get_tp_info()
+        who = f"rank{info.rank}/{info.size}" if info is not None else "single"
+        logger.info(
+            f"NUMA {who}: CPU MoE pool threads={nthreads} on cores "
+            f"{core_ids[0]}..{core_ids[-1]} | isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )

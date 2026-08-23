@@ -293,7 +293,7 @@ class Compressor(nn.Module):
 
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
-        window_slots: torch.Tensor, rows: torch.Tensor,
+        window_slots: torch.Tensor, rows: torch.Tensor, ti: int | None = None,
     ) -> None:
         """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
         ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
@@ -358,7 +358,7 @@ class Compressor(nn.Module):
         # it). Read off the full-loc SNAPSHOT so a concurrent next-batch allocate cannot redirect
         # this write (overlap safety); real rows resolve to a live row, dummy rows to reserved 0.
         cmp_dst = self.attn.decode_compress_rows(
-            rows, pos, ratio, self.layer_id, self.tier, should.view(B)
+            rows, pos, ratio, self.layer_id, self.tier, should.view(B), ti=ti
         )
         self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(B, -1))
 

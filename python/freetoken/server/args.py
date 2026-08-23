@@ -241,6 +241,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-dspark",
+        action="store_true",
+        dest="speculative_dspark",
+        default=False,
+        help=(
+            "DeepSeek-V4 only: build the checkpoint's dSpark drafter (the mtp.* stack) "
+            "for block speculative decoding. Off by default because the drafter's own "
+            "routed experts enlarge the host expert banks and the GPU slot cache. Fails "
+            "at config time if the checkpoint ships no dSpark weights."
+        ),
+    )
+
+    parser.add_argument(
         "--distributed-timeout",
         type=float,
         default=ServerArgs.distributed_timeout,

@@ -245,3 +245,95 @@ def test_tp_rejects_ftw_tp1_layout_before_model_setup(tmp_path):
 
     with pytest.raises(ValueError, match="FTW stores the TP=1"):
         _adjust_dsv4_config(config, lambda _name, _value: None)
+
+
+def test_the_expert_banks_and_the_offload_cache_agree_on_layer_count(args):
+    """The banks and the cache must be built for the SAME number of MoE layers.
+
+    They are derived independently -- the banks from the checkpoint's mtp.* keys, the
+    cache from ModelConfig.num_moe_layers -- so a drafter that adds layers to one and
+    not the other asserts at startup, after the full expert load has already run:
+
+        AssertionError: ('gate_up_packed', 46)
+
+    which costs a five-minute load to discover. Check it in a millisecond instead.
+    """
+    import dataclasses
+
+    from freetoken.models.deepseek_v4.config import parse_config
+    from freetoken.models.deepseek_v4.weight import _expert_bank_specs
+
+    class _HF:  # parse_config only needs the checkpoint path off the hf config
+        _name_or_path = "/home/carlos/models/DeepSeek-V4-Flash-0731"
+
+    for enabled in (False, True):
+        from freetoken.models.deepseek_v4.args import set_dspark_enabled
+
+        set_dspark_enabled(enabled)
+        try:
+            cfg = parse_config(_HF())
+        except Exception:  # no checkpoint on this host -- skip rather than fail
+            return
+        a = dataclasses.replace(cfg.dsv4_args, dspark_enabled=enabled)
+        _specs, _i, _lo = _expert_bank_specs(a)
+        assert cfg.num_moe_layers == a.n_moe_layers, (
+            f"dspark_enabled={enabled}: offload cache expects {cfg.num_moe_layers} "
+            f"layers, expert banks build {a.n_moe_layers}"
+        )
+    set_dspark_enabled(False)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_every_consumer_of_the_moe_layer_count_agrees(enabled):
+    """Four places derive "how many MoE layers are there" independently.
+
+    Enabling the dSpark drafter adds three, and each consumer learned about them in a
+    separate commit -- every miss cost a full expert load to discover, because the
+    assertions fire only after the banks are built:
+
+        AssertionError: ('gate_up_packed', 46)          # the offload cache's banks
+        assert len(layers) == num_moe_layers            # the model's MoE layer iterator
+
+    So check all of them together, offline, instead of one per five-minute run.
+    """
+    import dataclasses
+
+    import torch
+
+    from freetoken.models.deepseek_v4.args import load_args, set_dspark_enabled
+    from freetoken.models.deepseek_v4.model import DeepseekV4ForCausalLM
+    from freetoken.models.deepseek_v4.weight import _expert_bank_specs
+
+    model_path = "/home/carlos/models/DeepSeek-V4-Flash-0731"
+    _set_tp(4)
+    set_dspark_enabled(enabled)
+    try:
+        args = load_args(model_path, max_seq_len=4096)
+    except Exception:  # no checkpoint on this host
+        set_dspark_enabled(False)
+        return
+
+    expected = args.n_moe_layers
+    assert expected == args.n_layers + (3 if enabled else 0)
+
+    # 1. the KV-owning layer list
+    assert len(args.layer_compress_ratios) == expected
+
+    # 2. the host expert banks (one entry per layer, per bank)
+    specs, _i, _lo = _expert_bank_specs(args)
+    assert all(len(s) == 3 for s, _d in specs.values()), "bank specs are per-layer shapes"
+
+    # 3. the DSV4 KV pool, which indexes window_pool by layer id -- a draft layer
+    #    storing its KV past the end of that list is an IndexError mid-generation,
+    #    not at startup.
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    assert len(args.layer_compress_ratios) == expected
+
+    # 4. the model's offload-MoE layer iterator, which the cache counts
+    class _Cfg:
+        dsv4_args = args
+    with torch.device("meta"):
+        model = DeepseekV4ForCausalLM(_Cfg())
+    assert len(list(model._iter_offload_moe_layers())) == expected
+
+    set_dspark_enabled(False)

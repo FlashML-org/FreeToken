@@ -175,8 +175,69 @@ def iter_weights(
                 "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
             ):
                 yield f"layers.{L}.{nm}", get(f"layers.{L}.{nm}")
+
+        yield from _iter_dspark_weights(args, reader, linear)
     finally:
         reader.close()
+
+
+def _iter_dspark_weights(args: DeepseekV4Args, reader: "_ShardReader", linear):
+    """The ``mtp.*`` drafter, renamed onto the ``drafter.*`` module tree.
+
+    Each draft block shards exactly like a target block, so the same split rules apply.
+    The per-block weights live under ``mtp.k``; the shared head pieces (main_proj,
+    main_norm, norm, hc_head, markov, confidence) live under ``mtp.0`` only.
+    """
+    if args.n_draft_layers == 0:
+        return
+    get = reader.get
+
+    for k in range(args.n_draft_layers):
+        src, dst = f"mtp.{k}", f"drafter.layers.{k}"
+        a_src, a_dst = f"{src}.attn", f"{dst}.attn"
+        # Same split map as a target block: heads column-parallel, groups on wo_a,
+        # wo_b row-parallel, shared expert on the intermediate dim.
+        for name, tensor in linear(f"{a_src}.wq_a"):
+            yield name.replace(a_src, a_dst), tensor
+        yield f"{a_dst}.q_norm.weight", get(f"{a_src}.q_norm.weight")
+        for name, tensor in linear(f"{a_src}.wq_b", split=0):
+            yield name.replace(a_src, a_dst), tensor
+        for name, tensor in linear(f"{a_src}.wkv"):
+            yield name.replace(a_src, a_dst), tensor
+        yield f"{a_dst}.kv_norm.weight", get(f"{a_src}.kv_norm.weight")
+        yield f"{a_dst}.wo_a", shard(
+            _dequant_fp8_block(get(f"{a_src}.wo_a.weight"), get(f"{a_src}.wo_a.scale")), 0
+        )
+        for name, tensor in linear(f"{a_src}.wo_b", split=1):
+            yield name.replace(a_src, a_dst), tensor
+        yield f"{a_dst}.attn_sink", shard(get(f"{a_src}.attn_sink"), 0)
+
+        yield f"{dst}.attn_norm.weight", get(f"{src}.attn_norm.weight")
+        yield f"{dst}.ffn_norm.weight", get(f"{src}.ffn_norm.weight")
+        yield f"{dst}.ffn.gate.weight", get(f"{src}.ffn.gate.weight")
+        yield f"{dst}.ffn.gate.bias", get(f"{src}.ffn.gate.bias")
+        for proj, split in (("w1", 0), ("w2", 1), ("w3", 0)):
+            for name, tensor in linear(f"{src}.ffn.shared_experts.{proj}", split=split):
+                yield name.replace(src, dst), tensor
+        for nm in (
+            "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
+            "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
+        ):
+            yield f"{dst}.{nm}", get(f"{src}.{nm}")
+
+    # The shared pieces are stored once each, on the layer whose role they serve:
+    # the INPUT projection on the first draft layer, and the output norm / hc_head /
+    # Markov / confidence heads on the LAST one.
+    first, last = "mtp.0", f"mtp.{args.n_draft_layers - 1}"
+    for name, tensor in linear(f"{first}.main_proj"):
+        yield name.replace(first, "drafter"), tensor
+    yield "drafter.main_norm.weight", get(f"{first}.main_norm.weight")
+    yield "drafter.norm.weight", get(f"{last}.norm.weight")
+    for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+        yield f"drafter.{nm}", get(f"{last}.{nm}")
+    yield "drafter.markov_head.markov_w1.weight", get(f"{last}.markov_head.markov_w1.weight")
+    yield "drafter.markov_head.markov_w2", get(f"{last}.markov_head.markov_w2.weight")
+    yield "drafter.confidence_head.proj", get(f"{last}.confidence_head.proj.weight")
 
 
 # --------------------------------------------------------------------------------------

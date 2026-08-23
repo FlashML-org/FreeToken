@@ -52,12 +52,12 @@ from .parallel import div_tp, tp_info, validate_tp
 class Block(nn.Module):
     """Decoder block with manifold-constrained Hyper-Connections (4 residual streams)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, compress_ratio: int | None = None):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
-        self.attn = Attention(layer_id, args)
+        self.attn = Attention(layer_id, args, compress_ratio=compress_ratio)
         self.ffn = MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -160,10 +160,42 @@ class Transformer(nn.Module):
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32), requires_grad=False)
+        # dSpark drafter, only when the checkpoint ships it AND the run asked for it.
+        # Its blocks continue this model's layer ids, so they share the expert banks,
+        # the GPU slot cache and the KV pools with no separate index space.
+        self.drafter = None
+        # Layers whose output the drafter reads, as 0-based indices. The checkpoint's
+        # dspark_target_layer_ids count layers from 1 (40, 41, 42 = the 40th, 41st and
+        # 42nd block), so the tap fires after 0-based 39, 40 and 41.
+        self._aux_layer_ids: frozenset[int] = frozenset()
+        if args.n_draft_layers:
+            from .dspark import DSparkDrafter
+
+            self.drafter = DSparkDrafter(args)
+            # The drafter shares this model's embedding table and output head; both are
+            # vocabulary-parallel under TP, so it reaches them through these methods
+            # rather than holding tensors that would only cover one rank's slice.
+            self.drafter._embed_tokens = self.embed_tokens
+            self._aux_layer_ids = frozenset(i - 1 for i in args.dspark_target_layer_ids)
+            bad = [i for i in self._aux_layer_ids if not 0 <= i < args.n_layers]
+            if bad:
+                raise ValueError(
+                    f"dspark_target_layer_ids {args.dspark_target_layer_ids} are 1-based "
+                    f"and must land inside the {args.n_layers} target layers"
+                )
+        # The concatenated tap from the last forward, [.., dim * len(target_layer_ids)],
+        # or None when dSpark is off. The drafter reads this and nothing else.
+        self._last_aux_hidden: torch.Tensor | None = None
 
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
             layer.attn.bind(pool, device)
+        if self.drafter is not None:
+            self.drafter.bind(pool, device)
+
+    def last_aux_hidden(self) -> torch.Tensor | None:
+        """The tap from the most recent forward, or None if nothing has run yet."""
+        return self._last_aux_hidden
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Vocabulary-parallel lookup. Rows outside this rank's block contribute zero, so
@@ -204,7 +236,7 @@ class Transformer(nn.Module):
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
-        last_indices: torch.Tensor,
+        last_indices: torch.Tensor, logit_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Ragged batched prefill (bs >= 1). ``input_ids`` is [1, T] -- the requests' NEW tokens
         # concatenated (cu_seqlens, no padding); each request starts at its own cached_len
@@ -218,11 +250,22 @@ class Transformer(nn.Module):
         # final token -> its next-token logits row.
         h = self.embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
+        aux: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+            if i in self._aux_layer_ids:
+                # The drafter's whole view of the context: this block's output with the
+                # hyper-connection copies averaged away, [1, T, dim].
+                aux.append(h.mean(dim=2))
+        self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
         h = self.hc_head(h)
         h = self.norm(h)
-        return self.logits(h[0, last_indices])  # [B, vocab]
+        # Normally only each request's final token needs logits. A speculative VERIFY
+        # pass is the same ragged prefill -- each request resuming from its own
+        # start_pos -- but it needs the logits at EVERY drafted position, to compare
+        # them against what the drafter proposed. logit_indices selects which rows.
+        idx = last_indices if logit_indices is None else logit_indices
+        return self.logits(h[0, idx])  # [len(idx), vocab]
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -246,8 +289,12 @@ class Transformer(nn.Module):
         # into every layer. They read only the shared snapshot / positions, so they are identical
         # across layers.
         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
-        for layer in self.layers:
+        aux: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+            if i in self._aux_layer_ids:
+                aux.append(h.mean(dim=2))  # [B, 1, dim]
+        self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
         h = self.hc_head(h)
         h = self.norm(h)
         return self.logits(h[:, -1])
@@ -285,8 +332,15 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         # Hook for moe.offload_cache.iter_offload_moe_layers: DSV4's MoE block (block.ffn)
         # is a bespoke nn.Module (not OffloadMoELayer), so yield its inner routed-expert
         # layer instead, whose .offload_cache the generic attach sets.
+        #
+        # The dSpark draft blocks own routed experts too, and their layer ids continue the
+        # target's, so they come AFTER and in order -- the cache indexes by position in
+        # this sequence, and it asserts the count against model_config.num_moe_layers.
         for block in self._transformer.layers:
             yield block.ffn.experts
+        if self._transformer.drafter is not None:
+            for block in self._transformer.drafter.layers:
+                yield block.ffn.experts
 
     def state_dict(self, *, prefix: str = "", result=None):
         result = {} if result is None else result
@@ -305,6 +359,61 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         self._transformer.load_state_dict(casted, assign=True, strict=False)
 
+    def catch_up_draft_context(self, batch) -> None:
+        """Write the draft layers' KV for the positions the target has just committed.
+
+        The drafter never runs the prompt; its sliding window fills in behind the target
+        one step at a time, derived from the target's own hidden state. Skipped when
+        there is no tap yet -- the first draft then attends over a short window, which
+        costs acceptance on the opening block and nothing after.
+        """
+        drafter = self._transformer.drafter
+        if drafter is None:
+            return
+        aux = self._transformer.last_aux_hidden()
+        if aux is None:
+            return
+        md = batch.attn_metadata
+        if not md.segments:
+            return
+        backend = get_global_ctx().attn_backend
+        for off, n, ti, start in md.segments:
+            positions = torch.arange(start, start + n, device=aux.device)
+            slots = backend.window_slots_of(ti, start, start + n)
+            flat = aux.view(-1, aux.shape[-1])
+            if flat.shape[0] < off + n:
+                return  # the tap covers a different span; skip rather than misalign
+            drafter.catch_up_context(flat[off:off + n], positions, slots)
+
+    def draft(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Propose the current batch's block with the dSpark drafter.
+
+        Runs over the SAME prepared batch as the verify pass that follows -- the same
+        positions, the same segments, the same paged slots. The draft layers own layer
+        ids after the target's, so ``allocate_paged`` has already given them their own
+        window slots at these positions and they write KV there without disturbing the
+        target's.
+
+        Returns ``(proposed [T], confidence [T])``, or None when there is nothing to
+        draft from: the drafter needs the target's hidden state at its tap layers, and
+        that only exists once a forward has produced it.
+        """
+        if self._transformer.drafter is None:
+            return None
+        aux = self._transformer.last_aux_hidden()
+        if aux is None:
+            return None
+        self._ensure_bound()
+        batch = get_global_ctx().batch
+        md = batch.attn_metadata
+        return self._transformer.drafter.propose(
+            aux,
+            batch.input_ids.long().view(1, -1),
+            md.segments,
+            batch.positions.long(),
+            self._transformer.logits,
+        )
+
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch
@@ -317,9 +426,17 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             # FROM THE RING. Per-token ops (embed / HC / norm / MoE) run batched over the
             # concatenated tokens; attention runs per segment so the carry / slot maps never
             # cross requests.
+            # A speculative verify needs logits at EVERY drafted position, not just each
+            # request's last one: acceptance compares the target's own prediction at each
+            # position against what the drafter proposed there.
+            logit_indices = None
+            if getattr(batch, "speculative", False):
+                logit_indices = torch.arange(
+                    input_ids.numel(), device=input_ids.device, dtype=torch.long
+                )
             return self._transformer.prefill_batched(
                 input_ids.view(1, -1), md.segments, batch.positions.long(),
-                md.last_indices.long(),
+                md.last_indices.long(), logit_indices=logit_indices,
             )
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1

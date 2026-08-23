@@ -88,6 +88,8 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        self._speculative = _speculative_config(config)
+        self._warned_non_greedy = False
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
@@ -334,42 +336,68 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
+                spec_emitted = getattr(batch, "spec_emitted", None)
+                if spec_emitted is not None:
+                    # A speculative step already wrote the accepted block into
+                    # req.input_ids and moved the counters, so this must NOT append
+                    # again. The block is reported to the client as a unit; the EOS and
+                    # stop checks below run on its final token, and any earlier EOS is
+                    # caught by the trimming the detokenizer already does.
+                    block = spec_emitted[i]
+                    reply_tokens = block
+                    next_token = int(block[-1].item())
+                else:
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    reply_tokens = None
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                # A speculative step emits a whole accepted block. Every token needs its
+                # own stop check: an EOS at block position 2 must end the request there,
+                # not after position 5 -- otherwise the client receives text generated
+                # past the end of the reply.
+                block = (
+                    [int(t) for t in reply_tokens]
+                    if reply_tokens is not None
+                    else [next_token]
                 )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                finished = False
+                for pos, tok in enumerate(block):
+                    hit_length = not req.can_decode and pos == len(block) - 1
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and tok in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        tok == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=tok,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break  # drop the rest of the block: it is past the reply's end
+                next_token = block[-1]
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -836,9 +864,48 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        self._maybe_make_speculative(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _maybe_make_speculative(self, batch: Batch) -> None:
+        """Turn a decode batch into a speculative block, in place.
+
+        A verify step is not a special kind of forward -- it is a PREFILL of ``1 + k``
+        tokens per request, each resuming from its own position. The engine already
+        builds exactly that from ``extend_len`` and ``cached_len``, so extending the
+        requests and flipping the phase is the whole change: allocation, positions, the
+        compressor carry and the per-position logits all follow.
+
+        The extra ``k`` tokens are the checkpoint's noise placeholder. Slots depend on
+        POSITIONS, not on token values, so ``allocate_paged`` can hand out every layer's
+        slots before the drafter has decided what the tokens are; ``_forward`` fills
+        them in immediately afterwards.
+        """
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and speculation must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it.
+        spec = getattr(self, "_speculative", None)
+        if not hasattr(self, "_warned_non_greedy"):
+            self._warned_non_greedy = False
+        if spec is None or not batch.is_decode:
+            return
+        k = spec.block_size - 1
+        if k < 1:
+            return
+        for req in batch.reqs:
+            # Room for the block AND its bonus token; a request near its budget just
+            # decodes normally rather than being truncated mid-block.
+            if req.remain_len <= k + 1:
+                return
+        noise = torch.full((k,), spec.noise_token_id, dtype=self.token_pool.dtype)
+        for req in batch.reqs:
+            req.append_host(noise)
+            req.device_len += k
+        batch.phase = "prefill"
+        batch.speculative = True
+        batch.spec_block = k
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -868,10 +935,40 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if getattr(batch, "speculative", False):
+            # Draft BEFORE the verify forward, over the same prepared batch: the draft
+            # replaces this batch's placeholder token ids in place, so the verify that
+            # follows scores the drafter's actual proposal.
+            batch.draft_confidence = self.engine.draft_into_batch(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+class _SpeculativeConfig(NamedTuple):
+    block_size: int
+    noise_token_id: int
+    confidence_threshold: float
+
+
+def _speculative_config(config) -> "_SpeculativeConfig | None":
+    """The run's speculative settings, or None when it will not speculate.
+
+    Reads the MODEL's own numbers rather than taking a block size on the command line:
+    dSpark's block width and noise token are properties of the checkpoint, and a run
+    that used different ones would put the drafter off its training distribution.
+    """
+    args = getattr(config.model_config, "dsv4_args", None)
+    if args is None or not getattr(args, "dspark_enabled", False):
+        return None
+    if not args.has_dspark:
+        return None
+    return _SpeculativeConfig(
+        block_size=args.dspark_block_size,
+        noise_token_id=args.dspark_noise_token_id,
+        confidence_threshold=float(ENV.DSPARK_CONFIDENCE_THRESHOLD.value),
+    )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
