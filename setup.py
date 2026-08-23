@@ -11,6 +11,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
+KERNEL_INCLUDE = ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include"
 
 
 def _check_toolchain() -> None:
@@ -62,6 +63,8 @@ else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     extra_compile = ["-O3", "-std=c++17"]
+
+runtime_include_dirs.append(str(KERNEL_INCLUDE))
 
 _check_toolchain()
 
