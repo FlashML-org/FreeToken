@@ -157,6 +157,37 @@ def test_handle_terminate_is_safe_on_empty():
     assert not handle.is_alive()
 
 
+# ----------------------------------------------------- wire-format translation --
+
+def test_reasoning_field_renamed_streaming_and_body():
+    """mlx_lm's thinking channel is `reasoning`; FreeToken's clients (shell,
+    bench) read `reasoning_content` (the vLLM/SGLang name)."""
+    chunk = b'data: {"choices": [{"delta": {"reasoning": "think"}}]}'
+    out = metal._rewrite_reasoning_field(chunk)
+    assert b'"reasoning_content":' in out and b'"reasoning":' not in out
+    # value text that merely contains the word stays untouched
+    chunk2 = b'data: {"choices": [{"delta": {"content": "the reasoning: here"}}]}'
+    assert metal._rewrite_reasoning_field(chunk2) == chunk2
+
+
+def test_health_reports_maintenance_serving():
+    """Tools gate on maintenance == "serving" (bench wait_ready, daemon)."""
+    app = FastAPI()
+    handle = metal.MetalBackendHandle(
+        processes=[SimpleNamespace(poll=lambda: None)],
+        upstream_base_url="http://127.0.0.1:1",
+        backend="mlx",
+    )
+    metal.register_metal_proxy_routes(app, lambda: handle)
+    client = TestClient(app, raise_server_exceptions=False)
+    doc = client.get("/health").json()
+    assert doc["status"] == "ok"
+    assert doc["maintenance"] == "serving"
+    # ctl parity endpoints exist
+    assert client.get("/v1/requests").status_code == 200
+    assert client.get("/v1/stats").status_code == 200
+
+
 # --------------------------------------------------------- model switching --
 
 def test_model_load_requires_model_field():

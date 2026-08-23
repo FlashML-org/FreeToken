@@ -53,7 +53,16 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Attach the interactive ft shell to this server (serve+chat in one process).",
     )
-    return p.parse_args(list(argv))
+    args, unknown = p.parse_known_args(list(argv))
+    if unknown:
+        # Callers built for the CUDA engine (the daemon, benchmarks, `ft serve`
+        # flag passthrough) legitimately carry CUDA-only flags; the Metal path
+        # has no such engine knobs, so drop them loudly rather than refusing.
+        print(
+            f"ft serve-metal: ignoring CUDA-only engine flags: {' '.join(unknown)}",
+            file=sys.stderr,
+        )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:

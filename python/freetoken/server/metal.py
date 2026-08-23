@@ -364,14 +364,30 @@ async def _proxy_stream(
     body: bytes,
     headers: dict[str, str],
 ) -> AsyncIterator[bytes]:
-    """Forward a request to the upstream and stream the (possibly SSE) bytes back."""
+    """Forward a request to the upstream and stream the (possibly SSE) bytes back.
+
+    SSE chunks are rewritten on the fly so the Metal upstream speaks FreeToken's
+    wire format: mlx_lm splits the thinking channel as ``delta.reasoning`` while
+    FreeToken (and vLLM/SGLang, which the shell/bench clients read) uses
+    ``delta.reasoning_content``."""
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
             "POST", f"{upstream_base_url}{path}", content=body, headers=headers
         ) as resp:
             resp.raise_for_status()
             async for chunk in resp.aiter_bytes():
+                if b'"reasoning"' in chunk:
+                    chunk = _rewrite_reasoning_field(chunk)
                 yield chunk
+
+
+def _rewrite_reasoning_field(chunk: bytes) -> bytes:
+    """Rename ``"reasoning"`` to ``"reasoning_content"`` inside SSE data lines.
+
+    Byte-level and conservative: only touches the exact ``"reasoning":`` JSON
+    key (mlx_lm's name for the thinking channel), never the value text, and
+    leaves non-data bytes (keepalives, separators) untouched."""
+    return chunk.replace(b'"reasoning":', b'"reasoning_content":')
 
 
 def register_metal_proxy_routes(
@@ -512,14 +528,23 @@ def register_metal_proxy_routes(
             "pools": {},
         }
 
+    @app.get("/v1/requests")
+    async def metal_requests(request: Request):
+        """``ft ctl requests`` parity. The Metal path has no engine-side request
+        ring (the CUDA scheduler owns that); an empty list is the truthful
+        answer -- per-request accounting lives in the upstream's own logs."""
+        return {"requests": []}
+
     @app.get("/health")
     async def metal_health(request: Request):
-        """Lightweight health: checks the upstream Flask/uvicorn is alive. Keeps the
-        desktop/shell poll working with the same semantics as the CUDA path."""
+        """Same contract the CUDA path answers: tools poll /health and gate on
+        ``maintenance == "serving"`` (bench_decode_moe.wait_ready, the daemon,
+        the desktop). The Metal server is "serving" exactly when its upstream
+        engine is alive -- the proxy itself has no load phase of its own."""
         handle = get_backend()
         if handle is None or not handle.is_alive():
             return JSONResponse({"status": "down"}, status_code=503)
-        return {"status": "ok"}
+        return {"status": "ok", "maintenance": "serving"}
 
 
 def _strip_host_header(headers: dict[str, str]) -> dict[str, str]:
@@ -560,8 +585,13 @@ async def _forward(
             )
     except httpx.HTTPError as exc:
         return JSONResponse({"detail": f"Metal upstream error: {exc}"}, status_code=502)
+    content = r.content
+    # Same reasoning-channel rename as the streaming path, for non-streaming
+    # completions (mlx_lm's "reasoning" -> FreeToken's "reasoning_content").
+    if b'"reasoning":' in content:
+        content = content.replace(b'"reasoning":', b'"reasoning_content":')
     return Response(
-        content=r.content,
+        content=content,
         status_code=r.status_code,
         media_type=r.headers.get("content-type"),
     )
