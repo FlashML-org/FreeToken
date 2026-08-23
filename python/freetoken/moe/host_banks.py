@@ -22,6 +22,7 @@ import math
 import mmap
 import os
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -89,13 +90,31 @@ class HostBank:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             msg = str(exc)
-            if "out of memory" in msg:
-                hint = (
-                    "the driver refused to lock more host memory (on Windows/WDDM "
-                    "the pageable-locking pool is roughly half of system RAM); "
-                    "close other processes, add RAM, or serve some layers with "
-                    "--moe-backend cpu"
-                )
+            if "out of memory" in msg or "lock" in msg.lower():
+                if sys.platform == "win32":
+                    hint = (
+                        "the driver refused to lock more host memory (on Windows/WDDM "
+                        "the pageable-locking pool is roughly half of system RAM); "
+                        "close other processes, add RAM, or serve some layers with "
+                        "--moe-backend cpu"
+                    )
+                else:
+                    try:
+                        import resource
+
+                        soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+                        rlimit = (
+                            f"{soft // 1048576} MB" if soft != resource.RLIM_INFINITY else "unlimited"
+                        )
+                    except Exception:
+                        rlimit = "? MB"
+                    hint = (
+                        "the kernel refused to lock more host memory: RLIMIT_MEMLOCK "
+                        f"is {rlimit} (often RAM/8 by default). Check `ulimit -l`, "
+                        "raise it via /etc/security/limits.d/*.conf and re-login -- "
+                        "an existing SSH ControlMaster session keeps serving the old "
+                        "limit until `ssh -O exit <host>`"
+                    )
             else:
                 hint = "see the driver error above"
             raise RuntimeError(
