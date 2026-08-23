@@ -21,15 +21,20 @@ import gguf
 from freetoken.models.gguf.dequant import (
     BLOCK_SHAPE,
     GGML_IQ1_S,
+    GGML_IQ2_S,
     GGML_IQ2_XXS,
     GGML_IQ3_XXS,
     GGML_IQ4_XS,
+    GGML_Q3_K,
     GGML_Q4_K,
     GGML_Q5_K,
     dequantize,
 )
 
-TYPES = [GGML_Q4_K, GGML_Q5_K, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_XS]
+TYPES = [
+    GGML_Q3_K, GGML_Q4_K, GGML_Q5_K,
+    GGML_IQ1_S, GGML_IQ2_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ4_XS,
+]
 
 
 def _packed_rows(qtype: int, rows: int, seed: int) -> np.ndarray:
@@ -105,7 +110,7 @@ def test_mmvq_matches_linear(qtype):
     assert (got.reshape(-1) - ref.reshape(-1)).abs().max() <= tol
 
 
-@pytest.mark.parametrize("qtype", [GGML_Q4_K, GGML_Q5_K])
+@pytest.mark.parametrize("qtype", [GGML_Q3_K, GGML_Q4_K, GGML_Q5_K])
 def test_mmq_matches_linear(qtype):
     from freetoken.kernel.gguf import ggml_mul_mat_a8
 
@@ -123,7 +128,7 @@ def test_mmq_matches_linear(qtype):
 
 
 @pytest.mark.parametrize(
-    "qtype", [GGML_Q4_K, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_XS]
+    "qtype", [GGML_Q3_K, GGML_Q4_K, GGML_IQ2_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_XS]
 )
 def test_moe_vec_matches_mmvq(qtype):
     """moe_vec shares mmvq's vec_dot; per selected expert it must reproduce the
@@ -145,7 +150,7 @@ def test_moe_vec_matches_mmvq(qtype):
         torch.testing.assert_close(out[j], ref, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("qtype", [GGML_IQ1_S, GGML_IQ3_XXS])
+@pytest.mark.parametrize("qtype", [GGML_IQ1_S, GGML_IQ2_S, GGML_IQ3_XXS])
 def test_moe_vec_expert_stride_padded_bank(qtype):
     """Mixed-quant banks store each expert's payload in the leading bytes of a
     padded flat slot; expert_stride_bytes must reproduce the dense-bank result."""

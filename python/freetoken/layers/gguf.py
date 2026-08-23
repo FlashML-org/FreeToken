@@ -22,9 +22,11 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_IQ1_S,
+    GGML_IQ2_S,
     GGML_IQ2_XXS,
     GGML_IQ3_XXS,
     GGML_IQ4_XS,
+    GGML_Q3_K,
     GGML_Q4_0,
     GGML_Q4_K,
     GGML_Q5_K,
@@ -39,15 +41,15 @@ from .base import BaseOP
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
 _MMVQ = {
-    GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-    GGML_IQ1_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ4_XS,
+    GGML_Q4_0, GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+    GGML_IQ1_S, GGML_IQ2_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ4_XS,
 }
 # The vendored CUDA MMQ switch covers the standard + K-quants only (no IQ cases);
 # IQ types take the dequant fallback for large batches.
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
 _DEQUANT = {
-    GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-    GGML_IQ1_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ4_XS,
+    GGML_Q4_0, GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+    GGML_IQ1_S, GGML_IQ2_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ4_XS,
 }
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
