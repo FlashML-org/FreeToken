@@ -90,9 +90,37 @@ class DetokenizeManager:
         accumulated ids and text stay in ``decode_map`` for the life of the worker."""
         self.decode_map.pop(uid, None)
 
+    def _append_token(self, s: DecodeStatus, token: int, *, skip: bool = False) -> str:
+        """Advance one request by one token, preserving tokenizer boundary context."""
+        if not skip:
+            s.decoded_ids.append(token)
+        read_str, surr_str = self.tokenizer.batch_decode(
+            [
+                s.decoded_ids[s.surr_offset :],
+                s.decoded_ids[s.surr_offset : s.read_offset],
+            ]
+        )
+        new_text = read_str[len(surr_str) :]
+        if len(new_text) > 0 and not new_text.endswith("�"):
+            output_str = s.decoded_str + new_text
+            s.decoded_str = output_str
+            s.surr_offset = s.read_offset
+            s.read_offset = len(s.decoded_ids)
+        else:
+            new_text = find_printable_text(new_text)
+            output_str = s.decoded_str + new_text
+        return output_str
+
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        read_ids: List[List[int]] = []
-        surr_ids: List[List[int]] = []
+        """Detokenize each request's newly emitted token block in order.
+
+        A speculative step can deliver multiple accepted tokens for one uid. The
+        original two-pass batch implementation appended every token before updating
+        the uid's offsets, so each decoded prefix was appended cumulatively. vLLM's
+        speculative output processor advances tokens sequentially; doing so here is
+        both exact and safe when multiple messages for one uid are coalesced.
+        """
+        incremental_strs: List[str] = []
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus(
@@ -103,27 +131,15 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
-                s.decoded_ids.append(msg.next_token)
-            read_ids.append(s.decoded_ids[s.surr_offset :])
-            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
-
-        read_texts = self.tokenizer.batch_decode(read_ids)
-        surr_texts = self.tokenizer.batch_decode(surr_ids)
-
-        incremental_strs: List[str] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
-            s = self.decode_map[msg.uid]
-            new_text = read_str[len(surr_str) :]
-            # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
-                output_str = s.decoded_str + new_text
-                s.decoded_str = output_str
-                s.surr_offset = s.read_offset
-                s.read_offset = len(s.decoded_ids)
-            else:
-                new_text = find_printable_text(new_text)
-                output_str = s.decoded_str + new_text
+            tokens = msg.token_ids if msg.token_ids is not None else [msg.next_token]
+            output_str = s.decoded_str
+            for pos, token in enumerate(tokens):
+                final_eos = (
+                    msg.finished
+                    and pos == len(tokens) - 1
+                    and token in self.eos_token_ids
+                )
+                output_str = self._append_token(s, token, skip=final_eos)
 
             prev_sent = s.sent_offset
             if msg.finished:
