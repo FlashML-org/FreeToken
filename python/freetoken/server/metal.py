@@ -295,20 +295,37 @@ class MetalBackendHandle:
             # Sequential from here: the watcher publishes load state onto THIS
             # handle (state_handle=self) while the load runs, and the launch
             # returns a handle carrying the new engine's identity.
-            new = launch_metal_backend(
-                self.backend,
-                model_path,
-                upstream_port=None,
-                state_handle=self,
-            )
+            try:
+                new = launch_metal_backend(
+                    self.backend,
+                    model_path,
+                    upstream_port=None,
+                    state_handle=self,
+                )
+            except Exception as exc:
+                self._set_state("error", error=str(exc))
+                raise
+            # Publish the new engine immediately. Its watcher reports load
+            # progress through this shared handle, and both health_doc() and
+            # is_alive() need the new process while the route waits. Deferring
+            # this adoption until readiness made /health report "down", kept
+            # RSS progress at zero, and lost the process entirely on failure.
+            self.processes = new.processes
+            self.upstream_base_url = new.upstream_base_url
+            self.model_path = new.model_path
             # Block until the watcher reaches a terminal state. /v1/model/load
             # must not answer "ok" while the new engine is still loading -- the
             # shell budgets this call for the full download + load. Raises on
             # failure so the route reports the reason instead of a false ok.
-            self._wait_load_terminal()
-            self.processes = new.processes
-            self.upstream_base_url = new.upstream_base_url
-            self.model_path = new.model_path
+            try:
+                self._wait_load_terminal()
+            except Exception as exc:
+                failed_processes = self.processes
+                self.processes = []
+                self.upstream_base_url = ""
+                _stop_processes(failed_processes)
+                self._set_state("error", error=str(exc))
+                raise
 
     def _wait_load_terminal(self, timeout: float | None = None) -> None:
         """Block until this handle's load watcher reports ready or error.
@@ -599,7 +616,7 @@ def _watch_mlx_load(
     handle.ack_queue.put("ready")
 
 
-def _gemma4_chat_template() -> str | None:
+def _gemma4_chat_template() -> str:
     """Google's canonical Gemma 4 chat template, for gemma-4 snapshots whose
     repo ships none (the 26b-a4b base repo uploads tokenizer files without a
     chat_template; the -it repos carry chat_template.jinja).
@@ -611,16 +628,18 @@ def _gemma4_chat_template() -> str | None:
     model was trained on, and near-misses make it degenerate into raw
     text completion (endless repetition, API-doc regurgitation).
 
-    Returns None when the asset is missing -- other models either ship their
-    own template (correct as-is) or are not chat models."""
+    A missing asset means the FreeToken installation is incomplete, so fail
+    with an actionable error before trying to launch the MLX child."""
     global _GEMMA4_TEMPLATE
     if _GEMMA4_TEMPLATE is None:
         path = os.path.join(os.path.dirname(__file__), "gemma4_chat_template.jinja")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 _GEMMA4_TEMPLATE = f.read()
-        except OSError:
-            return None
+        except OSError as exc:
+            raise RuntimeError(
+                "bundled Gemma 4 chat template is missing; reinstall FreeToken"
+            ) from exc
     return _GEMMA4_TEMPLATE
 
 
@@ -630,11 +649,10 @@ _GEMMA4_TEMPLATE: str | None = None
 def _needs_turn_stop_token(body: dict[str, Any]) -> bool:
     """True when the request targets a gemma-4 model served through mlx_lm.
 
-    Those snapshots ship no chat template and define eos as <eos> only, so the
-    model's turn-end token (<turn|>) is not in the engine's stop set: the model
-    answers and then keeps generating a fake USER:/ASSISTANT: transcript. The
-    proxy injects <turn|> into the request's stop list for exactly those
-    models; everything else keeps its engine-default behavior."""
+    The base 26B snapshot defines eos as <eos> only, and converted/derived
+    snapshots may omit the instruction-tuned checkpoint's additional stop
+    ids. Injecting the turn delimiter is therefore a defensive compatibility
+    measure for Gemma 4; everything else keeps its engine-default behavior."""
     return _is_gemma4_model(body.get("model") or "")
 
 
@@ -662,14 +680,11 @@ def _launch_mlx(
         "--port",
         str(port),
     ]
-    # gemma-4's snapshot ships NO chat template (neither in tokenizer_config.json
-    # nor as chat_template.jinja), so without help mlx_lm serves raw-text prompts
-    # to a chat model. Pass the Gemma 4 turn format explicitly (the same wire
-    # format transformers' own serving utils document: turns open with
-    # "<|turn>user\n"/"<|turn>model\n" and close with "<turn|>"). Stopping is
-    # handled at the proxy (stop-word injection), since the model's
-    # generation_config eos_token_id is only <eos> (1) and mlx_lm builds its
-    # stop set from that alone.
+    # The instruction-tuned Gemma 4 repos ship this template, but the base 26B
+    # snapshot and some converted/derived snapshots do not. Always pass the
+    # canonical turn grammar explicitly so MLX behavior is consistent across
+    # those layouts. The proxy also adds the turn delimiter as a defensive
+    # stop word for snapshots whose generation config omits it.
     if _is_gemma4_model(model_path):
         cmd += ["--chat-template", _gemma4_chat_template()]
     # When the weights are already fully in the local HF cache, pin the child
@@ -888,9 +903,9 @@ def register_metal_proxy_routes(
         """Switch the Metal upstream to a different model.
 
         Accepts ``{"model": "<path or HF id>"}`` and relaunches the upstream
-        engine (mlx/llama.cpp) on a fresh port while the old one keeps serving,
-        then swaps the proxy target. On failure the server keeps the old model
-        (the new upstream never launched) and returns the reason.
+        engine (mlx/llama.cpp) on a fresh port after stopping the old engine.
+        On failure the broken new engine is stopped and the server retains the
+        error reason for /health instead of leaking an untracked process.
         """
         handle = get_backend()
         if handle is None or not handle.is_alive():
@@ -971,11 +986,13 @@ def register_metal_proxy_routes(
         supervised load state, not just process liveness: mlx_lm answers
         /v1/models before weights load, so "port up" would lie."""
         handle = get_backend()
-        if handle is None or not handle.is_alive():
+        if handle is None:
             return JSONResponse({"status": "down"}, status_code=503)
         doc = handle.health_doc()
         if doc.get("status") == "error":
             return JSONResponse(doc, status_code=503)
+        if doc.get("status") != "loading" and not handle.is_alive():
+            return JSONResponse({"status": "down"}, status_code=503)
         return doc
 
 
@@ -1049,10 +1066,8 @@ async def _forward(
             payload = {}
         stream = bool(payload.get("stream")) if isinstance(payload, dict) else False
 
-    # gemma-4's turn-end token (<turn|>) is not in mlx_lm's stop set (the
-    # model's generation_config lists only <eos>), so without this the model
-    # answers and then keeps generating a fake USER:/ASSISTANT: transcript
-    # until max_tokens. Inject it as a stop word for exactly those models.
+    # Some gemma-4 snapshots omit the turn-end token (<turn|>) from their
+    # generation config, so inject it as a defensive stop word for that family.
     body, stream = _inject_turn_stop(request.url.path, body, stream)
 
     if stream:

@@ -680,7 +680,7 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
             history.append((cmd, text))
 
     async def handle_command(cmd: str) -> None:
-        nonlocal history, think_gear, cache_pools, model_id
+        nonlocal history, think_gear, think_gears, think_kwargs, cache_pools, model_id
         if cmd == "":
             return
         if cmd.startswith("/"):

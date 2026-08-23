@@ -22,8 +22,7 @@ import sys
 from typing import Sequence
 
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
 from freetoken.server.metal import (
     MetalBackendHandle,
@@ -80,20 +79,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     app = FastAPI(title="FreeToken Metal API Server")
 
     def get_backend():
-        h = _HANDLE["handle"]
-        return h if h is not None and h.is_alive() else None
+        # Route handlers distinguish loading, terminal error, and down states.
+        # Filtering here would erase a failed engine's actionable error reason.
+        return _HANDLE["handle"]
 
     register_metal_proxy_routes(app, get_backend)
-
-    @app.get("/health")
-    async def health(request: Request):
-        h = _HANDLE["handle"]
-        if h is None or not h.is_alive():
-            return JSONResponse({"status": "down"}, status_code=503)
-        doc = h.health_doc()
-        if doc.get("status") == "error":
-            return JSONResponse(doc, status_code=503)
-        return doc
 
     # The shell/desktop poll /health, /v1/stats and /v1/cache/status every
     # second; hide those from the access log so they don't bury real requests.
