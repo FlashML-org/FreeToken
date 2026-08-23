@@ -89,8 +89,9 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
-            msg = str(exc)
-            if "out of memory" in msg or "lock" in msg.lower():
+            msg = str(exc).lower()
+            lock_words = {"lock", "locked", "locking", "memlock"}
+            if "out of memory" in msg or bool(lock_words & set(msg.split())) or "memlock" in msg:
                 if sys.platform == "win32":
                     hint = (
                         "the driver refused to lock more host memory (on Windows/WDDM "
@@ -103,11 +104,14 @@ class HostBank:
                         import resource
 
                         soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
-                        rlimit = (
-                            f"{soft // 1048576} MB" if soft != resource.RLIM_INFINITY else "unlimited"
-                        )
+                        if soft == resource.RLIM_INFINITY:
+                            rlimit = "unlimited"
+                        elif soft >= 1073741824:
+                            rlimit = f"{soft / 1073741824:.0f} GB"
+                        else:
+                            rlimit = f"{soft // 1048576} MB"
                     except Exception:
-                        rlimit = "? MB"
+                        rlimit = "?"
                     hint = (
                         "the kernel refused to lock more host memory: RLIMIT_MEMLOCK "
                         f"is {rlimit} (often RAM/8 by default). Check `ulimit -l`, "
