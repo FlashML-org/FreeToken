@@ -906,6 +906,9 @@ class Scheduler(SchedulerIOMixin):
         batch.phase = "prefill"
         batch.speculative = True
         batch.spec_block = k
+        # device_len now covers the whole block, so allocate_paged will size for it.
+        # Acceptance keeps only a prefix and must give the rest back through this.
+        batch.release_tail = self.cache_manager.release_speculative_tail
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

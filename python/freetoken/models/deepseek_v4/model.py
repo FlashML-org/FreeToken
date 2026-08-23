@@ -21,6 +21,8 @@ activation quant + Hadamard rotation re-introduced; see ``ops.py`` / the dsv4 ke
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,6 +32,7 @@ from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .attention import Attention
@@ -47,6 +50,8 @@ from .layers import (  # noqa: F401
 )
 from .moe import Expert, Gate  # noqa: F401
 from .parallel import div_tp, tp_info, validate_tp
+
+logger = init_logger(__name__)
 
 
 class Block(nn.Module):
@@ -176,16 +181,45 @@ class Transformer(nn.Module):
             # vocabulary-parallel under TP, so it reaches them through these methods
             # rather than holding tensors that would only cover one rank's slice.
             self.drafter._embed_tokens = self.embed_tokens
-            self._aux_layer_ids = frozenset(i - 1 for i in args.dspark_target_layer_ids)
-            bad = [i for i in self._aux_layer_ids if not 0 <= i < args.n_layers]
+            # Which base dspark_target_layer_ids uses is NOT documented, and the
+            # checkpoint does not settle it. It declares [40, 41, 42] with n_layers=43:
+            # read 0-based those are the last three layers; read 1-based they are the
+            # 2nd-to-4th from last. Both land inside the model, so no range check can
+            # tell them apart, and the only symptom of the wrong choice is a drafter
+            # whose proposals get rejected.
+            #
+            # Measured on this checkpoint at a fixed 800 drafted tokens:
+            #   1-based (ids-1 -> 39,40,41): 25% accepted
+            #   0-based (ids   -> 40,41,42): 20% accepted
+            # so 1-based is what this checkpoint means, and is the default. The override
+            # exists because that is an empirical answer on one checkpoint, not a spec.
+            base = int(os.environ.get("FREETOKEN_DSPARK_LAYER_BASE", "1"))
+            if base not in (0, 1):
+                raise ValueError(
+                    f"FREETOKEN_DSPARK_LAYER_BASE must be 0 or 1, got {base}"
+                )
+            ids = tuple(i - base for i in args.dspark_target_layer_ids)
+            self._aux_layer_ids = frozenset(ids)
+            bad = [i for i in ids if not 0 <= i < args.n_layers]
             if bad:
                 raise ValueError(
-                    f"dspark_target_layer_ids {args.dspark_target_layer_ids} are 1-based "
-                    f"and must land inside the {args.n_layers} target layers"
+                    f"dspark_target_layer_ids {tuple(args.dspark_target_layer_ids)} read "
+                    f"as {base}-based give {ids}, which fall outside the "
+                    f"{args.n_layers} target layers"
                 )
+            logger.info_rank0(
+                f"dSpark: tapping target layers {sorted(ids)} "
+                f"(config {list(args.dspark_target_layer_ids)} read as {base}-based)"
+            )
         # The concatenated tap from the last forward, [.., dim * len(target_layer_ids)],
         # or None when dSpark is off. The drafter reads this and nothing else.
         self._last_aux_hidden: torch.Tensor | None = None
+        # The positions and page-table rows the tap above was computed AT. The
+        # drafter writes context KV derived from the tap, so it must address the
+        # positions that produced it -- which are the PREVIOUS forward's, not the
+        # batch the drafter is about to fill.
+        self._last_aux_positions: torch.Tensor | None = None
+        self._last_aux_rows: torch.Tensor | None = None
 
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
@@ -196,6 +230,22 @@ class Transformer(nn.Module):
     def last_aux_hidden(self) -> torch.Tensor | None:
         """The tap from the most recent forward, or None if nothing has run yet."""
         return self._last_aux_hidden
+
+    def last_aux_addressing(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """``(positions, table_rows)`` for the rows of :meth:`last_aux_hidden`.
+
+        The tap and its addressing must travel together. A consumer that pairs the tap
+        with any OTHER batch's positions writes hidden states derived from one set of
+        tokens into the slots of a different set -- which raises nothing, and shows up
+        only as a drafter that proposes badly.
+        """
+        if (
+            self._last_aux_hidden is None
+            or self._last_aux_positions is None
+            or self._last_aux_rows is None
+        ):
+            return None
+        return self._last_aux_positions, self._last_aux_rows
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Vocabulary-parallel lookup. Rows outside this rank's block contribute zero, so
@@ -258,6 +308,12 @@ class Transformer(nn.Module):
                 # hyper-connection copies averaged away, [1, T, dim].
                 aux.append(h.mean(dim=2))
         self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
+        if aux:
+            self._last_aux_positions = flat_positions
+            rows = torch.empty_like(flat_positions)
+            for off, n, ti, _start in segments:
+                rows[off:off + n] = ti
+            self._last_aux_rows = rows
         h = self.hc_head(h)
         h = self.norm(h)
         # Normally only each request's final token needs logits. A speculative VERIFY
@@ -295,6 +351,9 @@ class Transformer(nn.Module):
             if i in self._aux_layer_ids:
                 aux.append(h.mean(dim=2))  # [B, 1, dim]
         self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
+        if aux:
+            self._last_aux_positions = pos.reshape(-1)
+            self._last_aux_rows = rows.reshape(-1)
         h = self.hc_head(h)
         h = self.norm(h)
         return self.logits(h[:, -1])
@@ -362,28 +421,40 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def catch_up_draft_context(self, batch) -> None:
         """Write the draft layers' KV for the positions the target has just committed.
 
-        The drafter never runs the prompt; its sliding window fills in behind the target
-        one step at a time, derived from the target's own hidden state. Skipped when
-        there is no tap yet -- the first draft then attends over a short window, which
-        costs acceptance on the opening block and nothing after.
+        The drafter never runs the prompt; its sliding window fills in behind the target,
+        derived from the target's own hidden state at those positions.
+
+        The addressing comes from the TAP, not from ``batch``. This runs before the
+        target's forward for the current step, so the newest tap belongs to the PREVIOUS
+        forward and covers that forward's positions. Pairing it with the current batch's
+        positions -- which is the block about to be drafted -- would store hidden states
+        derived from one set of tokens into the slots of a different set. That raises
+        nothing at all; it just makes the drafter propose badly, which reads as a weak
+        drafter rather than a wiring fault.
+
+        ``batch`` is still taken so the caller need not know what the drafter addresses
+        by, and so a future batched form has it.
         """
+        del batch
         drafter = self._transformer.drafter
         if drafter is None:
             return
         aux = self._transformer.last_aux_hidden()
-        if aux is None:
-            return
-        md = batch.attn_metadata
-        if not md.segments:
-            return
+        addressing = self._transformer.last_aux_addressing()
+        if aux is None or addressing is None:
+            return  # nothing has run yet; the first block attends over a short window
+        positions, rows = addressing
+        flat = aux.view(-1, aux.shape[-1])
+        if flat.shape[0] != positions.numel():
+            # The tap and its addressing are written together, so this cannot drift --
+            # unless a new forward path records one and not the other.
+            raise RuntimeError(
+                f"aux tap has {flat.shape[0]} rows but {positions.numel()} positions; "
+                "every forward that stores the tap must store its addressing too"
+            )
         backend = get_global_ctx().attn_backend
-        for off, n, ti, start in md.segments:
-            positions = torch.arange(start, start + n, device=aux.device)
-            slots = backend.window_slots_of(ti, start, start + n)
-            flat = aux.view(-1, aux.shape[-1])
-            if flat.shape[0] < off + n:
-                return  # the tap covers a different span; skip rather than misalign
-            drafter.catch_up_context(flat[off:off + n], positions, slots)
+        slots = backend.window_slots_at(rows, positions)
+        drafter.catch_up_context(flat, positions, slots)
 
     def draft(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Propose the current batch's block with the dSpark drafter.

@@ -253,6 +253,41 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
+    def release_speculative_tail(self, req: Req, new_device_len: int) -> None:
+        """Give back the pages and SWA slots of a rejected block's abandoned positions.
+
+        allocate_paged sizes itself from ``req.device_len``, so a speculative step
+        allocates for the whole block up front. Acceptance then LOWERS device_len to the
+        prefix it kept -- and the pages above it are simply forgotten. Nothing else
+        reclaims them: the per-step window free walks the live range, and the
+        end-of-request free walks the page table from the request's CURRENT length, so
+        the tail is outside both.
+
+        The result is a slow leak that never fails a decode. It surfaces at the next
+        idle integrity check, as far from the cause as it is possible to get:
+
+            SWA-slot leak/double-free: free(11520) + tree(256) != capacity(12160)
+
+        Call this BEFORE lowering device_len -- it reads the current value to find the
+        range to return.
+        """
+        first_page = div_ceil(new_device_len, self.page_size)
+        last_page = div_ceil(req.device_len, self.page_size)
+        if last_page <= first_page or req.table_idx < 0:
+            return
+        # The page table is indexed by TOKEN POSITION and holds token slots (see
+        # _write_page_table, which fills one entry per position over the page's span) --
+        # so the slice runs over positions, not pages, and needs no page->token mapping.
+        # clone: this is a view into the row, and the next allocation rewrites it -- the
+        # same aliasing lazy_free_region guards against.
+        slots = self.page_table[
+            req.table_idx, first_page * self.page_size : last_page * self.page_size
+        ].clone()
+        if self.swa_paged:
+            self._free_swa(slots)
+        # free_slots holds page-START slots, one per page.
+        self.free_slots = torch.cat([self.free_slots, slots[:: self.page_size]])
+
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []

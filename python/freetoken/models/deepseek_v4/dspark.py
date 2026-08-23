@@ -194,7 +194,12 @@ class DSparkDrafter(nn.Module):
         """
         from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 
-        from .ops import apply_rotary_emb
+        # apply_rotary_emb_decode, not apply_rotary_emb: the frequencies here are
+        # PER ROW (gathered by absolute position), which is the decode variant's
+        # contract. apply_rotary_emb broadcasts ONE row of frequencies across the
+        # sequence and reshapes freqs_cis to [1, T, 1, D] -- with T rows of frequencies
+        # it fails on the view rather than rotating anything wrongly.
+        from .ops import apply_rotary_emb_decode
 
         if positions.shape[0] != main_x.shape[0]:
             raise ValueError(
@@ -206,7 +211,11 @@ class DSparkDrafter(nn.Module):
             attn = layer.attn
             freqs = attn.freqs_cis.index_select(0, positions)
             kv = attn.kv_norm(attn.wkv(main_x))
-            apply_rotary_emb(kv[..., -rd:], freqs)
+            # [T, rd] -> [T, 1, rd]: the decode rotary wants a head dim to broadcast
+            # each row's frequencies over. The view aliases kv, so the in-place write
+            # lands in the tensor that gets stored.
+            rope_view = kv[..., -rd:].unsqueeze(1)
+            apply_rotary_emb_decode(rope_view, freqs)
             act_quant_fp8_inplace(kv[..., :-rd], 64)
             attn.attn.store_window(kv, attn.layer_id, window_slots)
 

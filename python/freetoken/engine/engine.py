@@ -637,14 +637,51 @@ class Engine:
         # cpu/hybrid both read experts on the CPU, so banks load in the native (CPU-readable)
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
-        cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        n_moe = config.model_config.num_moe_layers
+        cpu_layer_ids = _resolve_cpu_layers(config, n_moe)
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes() is not None
         ):
-            cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
+            cpu_layer_ids = _auto_cpu_layers(config, n_moe)
+        # The drafter's MoE layers are the tail of the sequence (see the model's
+        # _iter_offload_moe_layers). Keep them on the GPU whatever the CPU plan says: the
+        # draft is a hard serial dependency of every block -- the verify cannot start
+        # until it finishes -- so a draft layer on the CPU pool adds the engine's slowest
+        # path to each block, and it is 3 layers against the target's 43.
+        # Read the drafter's layer count from dsv4_args, NOT from extra_moe_layers.
+        # extra_moe_layers is patched onto model_config later than this (parse_config
+        # runs before the flag exists), so it is still 0 here even though
+        # num_moe_layers already counts the drafter's layers -- which made this whole
+        # path silently inert the first time it was written.
+        dsv4 = getattr(config.model_config, "dsv4_args", None)
+        n_draft = 0
+        if getattr(dsv4, "dspark_enabled", False):
+            n_draft = int(getattr(dsv4, "n_draft_layers", 0) or 0)
+        if not n_draft:
+            n_draft = int(getattr(config.model_config, "extra_moe_layers", 0) or 0)
+        draft_layer_ids = frozenset(range(n_moe - n_draft, n_moe)) if n_draft else frozenset()
+        if draft_layer_ids:
+            # Always report it. The exclusion below is a no-op under --moe-backend
+            # hybrid (nothing is assigned to the CPU up front), so its absence from the
+            # log says nothing about whether the drafter's layers were identified at
+            # all -- and if extra_moe_layers is still 0 here, this whole path is inert
+            # and the drafter shares the capped fetch with the target.
+            logger.info_rank0(
+                f"dSpark: draft MoE layers {min(draft_layer_ids)}..{max(draft_layer_ids)} "
+                f"of {n_moe} fetch uncapped on the GPU (serial with every block)"
+            )
+            if cpu_layer_ids & draft_layer_ids:
+                cpu_layer_ids = cpu_layer_ids - draft_layer_ids
+        elif getattr(dsv4, "dspark_enabled", False):
+            logger.warning_rank0(
+                "dSpark is on but no draft MoE layers were identified "
+                f"(extra_moe_layers={n_draft}): the drafter's layers will share the "
+                "target's capped fetch and can be computed on the CPU pool, in series "
+                "with every block"
+            )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -750,6 +787,8 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+        cache.cpu_layer_ids = cpu_layer_ids
+        cache.draft_layer_ids = draft_layer_ids
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -813,7 +852,18 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        #
+        # A dSpark verify carries block_size ROWS per request, not one: the last
+        # committed token plus the drafted block. max_tokens sizes the C++ pool's
+        # per-task scratch, so a pool built for one row per request would be handed
+        # block_size times that and overrun it.
+        rows_per_req = 1
+        dsv4 = getattr(config.model_config, "dsv4_args", None)
+        if getattr(dsv4, "dspark_enabled", False):
+            rows_per_req = max(1, int(getattr(dsv4, "dspark_block_size", 1) or 1))
+        max_tokens = max(
+            config.max_running_req * rows_per_req, config.cuda_graph_max_bs or 0, 1
+        )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -1084,6 +1134,7 @@ class Engine:
 
         emitted: list[torch.Tensor] = []
         any_rejected = False
+        release_tail = getattr(batch, "release_tail", None)
         off = 0
         for i, req in enumerate(batch.reqs):
             span = 1 + k                       # this request's rows in the flat batch
@@ -1094,6 +1145,14 @@ class Engine:
                 width = draft_width(
                     confidence[off + 1:off + span], self.spec_threshold, k
                 )
+            # A block emits n_acc accepted tokens PLUS the bonus token, so it can carry
+            # up to width+1 past `start`. Nothing upstream clamps that to the request's
+            # output budget: a block that starts with 2 tokens left would write 6, run
+            # off the end of _ids_buf, and leave device_len past max_device_len -- where
+            # remain_len goes negative, can_decode never turns False, and the request
+            # decodes forever instead of finishing on "length".
+            budget = req.max_device_len - start - 1
+            width = max(0, min(width, budget))
             if greedy:
                 n_acc, bonus = accepted_prefix(
                     proposed[:width], target_cpu[off:off + width + 1]
@@ -1112,6 +1171,13 @@ class Engine:
             keep = start + n_acc
             req.input_ids = req._ids_buf[:keep]
             req.append_host(torch.tensor([bonus], dtype=req.input_ids.dtype))
+            # Hand back the pages and SWA slots of the positions this block did not
+            # keep, BEFORE device_len drops past them. allocate_paged sized itself from
+            # the full block width, and nothing else walks a range above the request's
+            # current length -- so what is not released here is leaked until the next
+            # idle integrity check fails, far from the cause.
+            if release_tail is not None:
+                release_tail(req, keep + 1)
             req.cached_len, req.device_len = keep, keep + 1
             emitted.append(
                 torch.cat([proposed[:n_acc], torch.tensor([bonus], dtype=torch.int32)])
