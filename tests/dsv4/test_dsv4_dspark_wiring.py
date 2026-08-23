@@ -160,3 +160,15 @@ class TestVerifyReturnsEveryPosition:
             "prefill_batched takes logit_indices but the forward never passes it, so a "
             "speculative verify scores only each request's last token"
         )
+
+
+class TestMHCBoundsLargePrefillResiduals:
+    def test_target_and_drafter_use_the_fused_inv_rms(self):
+        model = (PKG / "models" / "deepseek_v4" / "model.py").read_text()
+        dspark = (PKG / "models" / "deepseek_v4" / "dspark.py").read_text()
+        assert "inv_rms(x2d, self.norm_eps)" in model
+        assert "inv_rms(x2d, self.norm_eps)" in dspark
+        norm = (PKG / "kernel" / "triton" / "dsv4" / "norm.py").read_text()
+        assert "def _inv_rms_kernel" in norm
+        assert "x.float().square()" not in model
+        assert "x.float().square()" not in dspark

@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+from freetoken.kernel.triton.dsv4.norm import inv_rms
 from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
@@ -503,13 +504,13 @@ class DSparkDrafter(nn.Module):
     def hc_head(self, x: torch.Tensor) -> torch.Tensor:
         """Reduce the hyper-connection copies to one hidden state (mirrors Transformer)."""
         shape, dtype = x.size(), x.dtype
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, self.hc_head_fn) * rsqrt
+        x2d = x.flatten(2)
+        xf = x2d.float()
+        mixes = F.linear(xf, self.hc_head_fn) * inv_rms(x2d, self.norm_eps)
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
         return hc_pre_combine(
-            xf.view(M, self.hc_mult, self.dim), pre.view(M, self.hc_mult), dtype
+            x.view(M, self.hc_mult, self.dim), pre.view(M, self.hc_mult), dtype
         ).view(*shape[:2], self.dim)
 
     def head_hidden(

@@ -108,7 +108,7 @@ class Block(nn.Module):
             mixes.view(-1, mixes.size(-1)), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
         )
         M = shape[0] * shape[1]
-        y = hc_pre_combine(xf.view(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
+        y = hc_pre_combine(x.view(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
         return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
 
     def hc_post(self, x, residual, post, comb):
@@ -282,7 +282,9 @@ class Transformer(nn.Module):
         mixes = F.linear(xf, self.hc_head_fn) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
-        return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
+        return hc_pre_combine(
+            x.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype
+        ).view(*shape[:2], dim)
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,

@@ -5,6 +5,7 @@ import math
 import glob
 import os
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -310,6 +311,9 @@ _SPEC_DEBUG = os.environ.get("FREETOKEN_SPEC_DEBUG", "0") == "1"
 # Diagnostic only: synchronize and report the first speculative cycles by stage.
 # Disabled by default because the per-cycle synchronization deliberately removes overlap.
 _SPEC_TIMING = os.environ.get("FREETOKEN_SPEC_TIMING", "0") == "1"
+# One-shot operator profile of the target verify. Explicit opt-in: Kineto adds
+# substantial CPU overhead and synchronizes CUDA when the table is emitted.
+_SPEC_PROFILE = os.environ.get("FREETOKEN_SPEC_PROFILE", "0") == "1"
 
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
@@ -482,6 +486,7 @@ class Engine:
         self._spec_debug_left = 6
         self._spec_drafted = 0
         self._spec_timing_left = 12
+        self._spec_profile_left = 1
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1537,21 +1542,47 @@ class Engine:
         timing = bool(
             batch.speculative and _SPEC_TIMING and self._spec_timing_left > 0
         )
+        profiling = bool(
+            batch.speculative and _SPEC_PROFILE and self._spec_profile_left > 0
+        )
         if timing:
             target_start = torch.cuda.Event(enable_timing=True)
             target_end = torch.cuda.Event(enable_timing=True)
             target_start.record(self.stream)
-        with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_spec_cuda_graph(batch):
-                logits = self.graph_runner.replay_spec(batch)
-                target_features = self.graph_runner.dspark_spec_target_features(batch)
-            elif self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-                target_features = self.graph_runner.dspark_target_features(batch)
-            else:
-                logits = self.model.forward()
-                get_features = getattr(self.model, "dspark_target_features", None)
-                target_features = get_features() if get_features is not None else None
+        profile_ctx = (
+            torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            )
+            if profiling else nullcontext()
+        )
+        with profile_ctx as prof:
+            with self.ctx.forward_batch(batch):
+                if self.graph_runner.can_use_spec_cuda_graph(batch):
+                    logits = self.graph_runner.replay_spec(batch)
+                    target_features = self.graph_runner.dspark_spec_target_features(batch)
+                elif self.graph_runner.can_use_cuda_graph(batch):
+                    logits = self.graph_runner.replay(batch)
+                    target_features = self.graph_runner.dspark_target_features(batch)
+                else:
+                    logits = self.model.forward()
+                    get_features = getattr(self.model, "dspark_target_features", None)
+                    target_features = get_features() if get_features is not None else None
+        if profiling:
+            torch.cuda.synchronize(self.device)
+            assert prof is not None
+            logger.info(
+                "speculative verify profile (by CUDA time):\n%s",
+                prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30),
+            )
+            logger.info(
+                "speculative verify profile (by CPU time):\n%s",
+                prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30),
+            )
+            self._spec_profile_left -= 1
         if timing:
             target_end.record(self.stream)
         if self.cpu_moe_executor is not None:
@@ -1703,8 +1734,8 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
-    page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
-    the DSV4 decode batch size.
+    page_size to the window page P, and clamps cuda_graph_bs/max_bs to the DSV4
+    decode batch size.
     """
     if config.tp_info.size > 1:
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
@@ -1755,12 +1786,12 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     # 'naive' stays naive with the pool's swa currency riding swa_paged.
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
-    # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # Honor --max-prefill-length. DSV4's compressor carry and dSpark context
+    # catch-up both support continuation chunks; overriding the user's limit to
+    # max_seq_len made a long prompt materialize the full mHC activation at once.
+    # On memory-tight deployments that turns one oversized client history into a
+    # process-fatal prefill OOM. The pool's prefill_chunk_budget remains a second,
+    # capacity-derived upper bound in Scheduler.
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
     # so a graph bs above it would exceed the backend's captured snapshot rows. Clamp any

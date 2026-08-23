@@ -20,6 +20,7 @@ PORT="${PORT:-8081}"
 TP_SIZE="${TP_SIZE:-4}"
 MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
+MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-1024}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
@@ -38,6 +39,8 @@ SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
 [ -n "${FREETOKEN_SPEC_HYBRID_MOE:-}" ] && export FREETOKEN_SPEC_HYBRID_MOE
 # FREETOKEN_SPEC_DEBUG=1 dumps the first few blocks' token flow.
 [ -n "${FREETOKEN_SPEC_DEBUG:-}" ] && export FREETOKEN_SPEC_DEBUG
+[ -n "${FREETOKEN_SPEC_TIMING:-}" ] && export FREETOKEN_SPEC_TIMING
+[ -n "${FREETOKEN_SPEC_PROFILE:-}" ] && export FREETOKEN_SPEC_PROFILE
 [ -n "${FREETOKEN_SPEC_FORCE_REJECT:-}" ] && export FREETOKEN_SPEC_FORCE_REJECT
 [ -n "${FREETOKEN_CMP_FIRST_ONLY:-}" ] && export FREETOKEN_CMP_FIRST_ONLY
 [ -n "${FREETOKEN_SPEC_WINDOW_ONLY:-}" ] && export FREETOKEN_SPEC_WINDOW_ONLY
@@ -125,6 +128,7 @@ cmd_start() {
         --tensor-parallel-size "$TP_SIZE" \
         --memory-ratio "$MEMORY_RATIO" \
         --max-running-requests "$MAX_RUNNING_REQUESTS" \
+        --max-prefill-length "$MAX_PREFILL_LENGTH" \
         --expert-load "$EXPERT_LOAD" \
         "${spec[@]}" \
         >> "$LOG" 2>&1 < /dev/null &
