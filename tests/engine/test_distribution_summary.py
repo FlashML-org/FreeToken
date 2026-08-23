@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from freetoken.engine import distribution
 from freetoken.engine.distribution import format_distribution_summary, host_expert_bytes
 
 
@@ -14,6 +15,13 @@ def test_host_expert_bytes_sums_every_rank_local_bank():
     )
     assert host_expert_bytes(cache) == 48
     assert host_expert_bytes(None) == 0
+
+
+def test_physical_core_count_uses_sysfs_sibling_groups(monkeypatch):
+    siblings = {0: "0,40", 40: "0,40", 1: "1,41", 41: "1,41"}
+    monkeypatch.setattr(distribution, "_thread_siblings", siblings.get)
+
+    assert distribution._physical_core_count([0, 1, 40, 41]) == 2
 
 
 def test_summary_groups_ranks_by_numa_and_reports_cpu_gpu_split():

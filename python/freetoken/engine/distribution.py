@@ -35,8 +35,19 @@ def host_expert_bytes(cache: Any) -> int:
     )
 
 
+def _thread_siblings(cpu: int) -> str | None:
+    """Return the kernel topology key without depending on optional NUMA helpers."""
+    try:
+        with open(
+            f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
 def _physical_core_count(cpus: list[int]) -> int:
-    siblings = {numa.thread_siblings(cpu) or f"cpu:{cpu}" for cpu in cpus}
+    siblings = {_thread_siblings(cpu) or f"cpu:{cpu}" for cpu in cpus}
     return len(siblings)
 
 
@@ -66,7 +77,9 @@ def local_distribution_snapshot(engine: Any) -> dict[str, Any]:
     free, total = torch.cuda.mem_get_info(engine.device)
     placed = numa.placement()
     node = placed[0] if placed is not None else numa.device_numa_node(rank)
-    node_cpus = list(placed[1]) if placed is not None else numa._allowed_cpus()
+    node_cpus = (
+        list(placed[1]) if placed is not None else sorted(numa.allowed_cpus())
+    )
     executor = getattr(engine, "cpu_moe_executor", None)
     workers = int(getattr(executor, "num_threads", 0) or 0)
     coordinator = int(getattr(executor, "_coord_core", -1) >= 0)
