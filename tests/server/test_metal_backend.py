@@ -465,13 +465,16 @@ def test_model_load_switches_to_new_handle(monkeypatch):
         backend="mlx",
         model_path="old-model",
     )
+    original_processes = old.processes
     old.load_state = "ready"
     new_proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
 
     real_stop = metal._stop_processes
 
     def seen_stop(processes):
-        events.append(f"stopped:{processes is old.processes}")
+        # switch_model captures the old list BEFORE clearing the attribute,
+        # so identity must be checked against the pre-switch list.
+        events.append(f"stopped:{processes is original_processes}")
         real_stop(processes)
 
     def fake_launch(backend, model, upstream_port=None, state_handle=None):

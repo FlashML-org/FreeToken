@@ -282,10 +282,12 @@ class MetalBackendHandle:
                 self.load_phase = "stopping"
                 self.load_error = ""
                 self.weights_bytes = 0
-                # A switch drains the queue the supervisor may still be reading;
-                # its terminal acks for the old engine must not leak into the
-                # new one's readiness handshake.
-                self._drain_acks()
+            # A switch drains the queue the supervisor may still be reading;
+            # its terminal acks for the old engine must not leak into the new
+            # one's readiness handshake. _drain_acks takes _state_lock itself,
+            # so it MUST run outside the block above (non-reentrant Lock --
+            # calling it inside self-deadlocked every model switch).
+            self._drain_acks()
             # Full escalate-to-kill teardown BEFORE the new load: the child's
             # output pipe is drained (see _drain_process_output), and a partial
             # teardown here would leave it holding its port -- and its memory.
