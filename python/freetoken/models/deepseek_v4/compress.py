@@ -338,9 +338,21 @@ class Compressor(nn.Module):
             compressed = gated_pool(ks, ss, dtype)
         # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
         # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.
+        carry_state = torch.cat([ks, ss], dim=-1)
         self.attn.write_carry_blocks(
-            self.layer_id, self.tier, window_slots, self.ring_size, torch.cat([ks, ss], dim=-1)
+            self.layer_id, self.tier, window_slots, self.ring_size, carry_state
         )
+        batch = get_global_ctx().batch
+        if getattr(batch, "speculative", False):
+            journal = batch.spec_carry_states
+            if journal is None:
+                raise RuntimeError("a speculative verify did not initialize its carry journal")
+            key = (self.layer_id, self.tier, self.ring_size)
+            record = getattr(journal, "record", None)
+            if record is None:
+                journal.setdefault(key, []).append(carry_state)
+            else:
+                record(key, carry_state)
 
         compressed = self.norm(compressed)
         freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
@@ -446,6 +458,57 @@ class Indexer(nn.Module):
             topk=self.index_topk, offset=offset,
         )
 
+    def extend_unaligned(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0):
+        """``extend``, for a segment that does NOT start on a compress-ratio boundary.
+
+        ``extend`` cannot serve one: it advances its compressor through
+        ``Compressor.forward``, which for ``start_pos > 0`` delegates to
+        ``Compressor.extend`` and asserts 128-alignment, because that path seeds the
+        carry from a matched tail PAGE.
+
+        A speculative block starts wherever generation reached, so it is unaligned 127
+        times out of 128 -- and without this the caller had no indexer to fall back on
+        and chose compressed blocks POSITIONALLY instead. That silently replaces
+        DeepSeek-V4's learned sparse selection with a fixed one, so the TARGET attends
+        to the wrong blocks and its own logits are wrong. It never raises; it just
+        degenerates the output.
+
+        Everything below the compressor advance is identical to ``extend``: only the way
+        the compressor is walked differs, one token at a time off the previous token's
+        window slot -- the same movement a decode step makes, with no block-boundary
+        arithmetic, so any ``start_pos`` is valid.
+        """
+        bsz, seqlen, _ = x.size()
+        end = start_pos + seqlen
+        freqs_cis = self.freqs_cis[start_pos:end]
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = hadamard_transform(q)
+        fp4_act_quant_inplace(q, 32)
+
+        # The one difference from extend(): walk the indexer's own compressor per token.
+        device = x.device
+        rows = torch.zeros(1, dtype=torch.int64, device=device)
+        prev = torch.full(
+            (1,),
+            tail_window_slot if tail_window_slot is not None else int(window_slots[0]),
+            dtype=window_slots.dtype, device=device,
+        )
+        for t in range(seqlen):
+            cur = window_slots[t:t + 1]
+            pos_t = torch.full((1,), start_pos + t, dtype=torch.int64, device=device)
+            self.compressor.decode_step(x[:, t], pos_t, prev, cur, rows, ti=ti)
+            prev = cur
+
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
+        scores = self.attn.indexer_prefill_logits(q, keys, weights)
+        return self.attn.indexer_select_prefill(
+            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
+            topk=self.index_topk, offset=offset,
+        )
+
     def decode_step(
         self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
         prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
@@ -475,8 +538,56 @@ class Indexer(nn.Module):
         index_score = self.attn.indexer_decode_scores(
             q.reshape(B, self.n_heads, self.head_dim),
             weights.reshape(B, self.n_heads),
-            valid, n_stage, ratio, self.layer_id,
+            valid, n_stage, ratio, self.layer_id, rows,
         ).view(B, 1, n_stage)
         return self.attn.indexer_select_decode(
             index_score, valid=valid, topk=self.index_topk, offset=offset
+        )
+
+    def verify_block(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        pos: torch.Tensor,
+        prev_window_slots: torch.Tensor,
+        window_slots: torch.Tensor,
+        rows: torch.Tensor,
+        n_stage: int,
+        num_reqs: int,
+        span: int,
+    ) -> torch.Tensor:
+        """Graph-safe Lightning Indexer for a fixed DSpark target block.
+
+        Projection and scoring stay batched over every verification row. Only the
+        indexer's recurrent compressor walks in request-major token order, matching
+        ``extend_unaligned`` while positions and addresses remain device-resident.
+        """
+        n, _ = x.shape
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb_decode(
+            q[..., -rd:].unsqueeze(1), self.freqs_cis.index_select(0, pos)
+        )
+        q = hadamard_transform(q)
+        fp4_act_quant_inplace(q, 32)
+
+        for r in range(num_reqs):
+            base = r * span
+            row = rows[base:base + 1]
+            for s in range(span):
+                i = base + s
+                self.compressor.decode_step(
+                    x[i:i + 1], pos[i:i + 1],
+                    prev_window_slots[i:i + 1], window_slots[i:i + 1], row,
+                )
+
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        valid = (pos + 1) // ratio
+        scores = self.attn.indexer_decode_scores(
+            q.reshape(n, self.n_heads, self.head_dim),
+            weights.reshape(n, self.n_heads),
+            valid, n_stage, ratio, self.layer_id, rows,
+        ).view(n, 1, n_stage)
+        return self.attn.indexer_select_decode(
+            scores, valid=valid, topk=self.index_topk, offset=0
         )

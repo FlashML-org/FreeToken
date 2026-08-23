@@ -15,6 +15,7 @@ from freetoken.layers import OffloadMoELayer
 
 from .args import DeepseekV4Args
 from .layers import Linear
+
 from .parallel import div_tp, tp_size
 
 
@@ -142,8 +143,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         #
         # Hybrid decode caps the fetch and overlaps the overflow on the CPU pool, which
         # is what a handful of rows wants.
-        if getattr(get_global_ctx().batch, "speculative", False) and (
-            cache.decode_target == "hybrid"
+        if (
+            getattr(get_global_ctx().batch, "speculative", False)
+            and cache.decode_target == "hybrid"
         ):
             return self._decode_routed(hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot

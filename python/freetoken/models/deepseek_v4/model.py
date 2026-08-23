@@ -22,6 +22,7 @@ activation quant + Hadamard rotation re-introduced; see ``ops.py`` / the dsv4 ke
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +53,24 @@ from .moe import Expert, Gate  # noqa: F401
 from .parallel import div_tp, tp_info, validate_tp
 
 logger = init_logger(__name__)
+
+# FREETOKEN_SPEC_DEBUG=1 also reports where the draft context KV lands.
+_DRAFT_CTX_DEBUG = os.environ.get("FREETOKEN_SPEC_DEBUG", "0") == "1"
+
+
+@dataclass(frozen=True)
+class DSparkTargetFeatures:
+    """The target outputs consumed by the next DSpark proposal.
+
+    vLLM passes auxiliary hidden states, target positions, and context slot mappings
+    together.  FreeToken stores request table rows instead of physical slots so the
+    slots are resolved from the live page map when the feature bundle is consumed.
+    Every tensor is produced by the same target forward.
+    """
+
+    hidden: torch.Tensor
+    positions: torch.Tensor
+    table_rows: torch.Tensor
 
 
 class Block(nn.Module):
@@ -133,6 +152,28 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, post, comb)
         return x
 
+    def verify_block(
+        self, x, pos, rows, cmp_stage_cap, input_ids, num_reqs, span, wctx
+    ):
+        """Fixed-width DSpark target block; algebra matches ``decode_step``."""
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.attn_norm(x)
+        x = self.attn.verify_block(
+            x, pos, rows, cmp_stage_cap, num_reqs, span, wctx
+        )
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        return self.hc_post(x, residual, post, comb)
+
 
 class Transformer(nn.Module):
     def __init__(self, args: DeepseekV4Args):
@@ -169,9 +210,9 @@ class Transformer(nn.Module):
         # Its blocks continue this model's layer ids, so they share the expert banks,
         # the GPU slot cache and the KV pools with no separate index space.
         self.drafter = None
-        # Layers whose output the drafter reads, as 0-based indices. The checkpoint's
-        # dspark_target_layer_ids count layers from 1 (40, 41, 42 = the 40th, 41st and
-        # 42nd block), so the tap fires after 0-based 39, 40 and 41.
+        # Layers whose output the drafter reads, as 0-based indices. vLLM converts the
+        # checkpoint ids [40, 41, 42] to aux ids [41, 42, 43], then captures when
+        # ``idx + 1`` is in that set: target outputs 40, 41 and 42 exactly.
         self._aux_layer_ids: frozenset[int] = frozenset()
         if args.n_draft_layers:
             from .dspark import DSparkDrafter
@@ -181,45 +222,18 @@ class Transformer(nn.Module):
             # vocabulary-parallel under TP, so it reaches them through these methods
             # rather than holding tensors that would only cover one rank's slice.
             self.drafter._embed_tokens = self.embed_tokens
-            # Which base dspark_target_layer_ids uses is NOT documented, and the
-            # checkpoint does not settle it. It declares [40, 41, 42] with n_layers=43:
-            # read 0-based those are the last three layers; read 1-based they are the
-            # 2nd-to-4th from last. Both land inside the model, so no range check can
-            # tell them apart, and the only symptom of the wrong choice is a drafter
-            # whose proposals get rejected.
-            #
-            # Measured on this checkpoint at a fixed 800 drafted tokens:
-            #   1-based (ids-1 -> 39,40,41): 25% accepted
-            #   0-based (ids   -> 40,41,42): 20% accepted
-            # so 1-based is what this checkpoint means, and is the default. The override
-            # exists because that is an empirical answer on one checkpoint, not a spec.
-            base = int(os.environ.get("FREETOKEN_DSPARK_LAYER_BASE", "1"))
-            if base not in (0, 1):
-                raise ValueError(
-                    f"FREETOKEN_DSPARK_LAYER_BASE must be 0 or 1, got {base}"
-                )
-            ids = tuple(i - base for i in args.dspark_target_layer_ids)
+            ids = tuple(args.dspark_target_layer_ids)
             self._aux_layer_ids = frozenset(ids)
             bad = [i for i in ids if not 0 <= i < args.n_layers]
             if bad:
                 raise ValueError(
-                    f"dspark_target_layer_ids {tuple(args.dspark_target_layer_ids)} read "
-                    f"as {base}-based give {ids}, which fall outside the "
+                    f"0-based dspark_target_layer_ids {ids} fall outside the "
                     f"{args.n_layers} target layers"
                 )
             logger.info_rank0(
-                f"dSpark: tapping target layers {sorted(ids)} "
-                f"(config {list(args.dspark_target_layer_ids)} read as {base}-based)"
+                f"dSpark: tapping target layer outputs {sorted(ids)}"
             )
-        # The concatenated tap from the last forward, [.., dim * len(target_layer_ids)],
-        # or None when dSpark is off. The drafter reads this and nothing else.
-        self._last_aux_hidden: torch.Tensor | None = None
-        # The positions and page-table rows the tap above was computed AT. The
-        # drafter writes context KV derived from the tap, so it must address the
-        # positions that produced it -- which are the PREVIOUS forward's, not the
-        # batch the drafter is about to fill.
-        self._last_aux_positions: torch.Tensor | None = None
-        self._last_aux_rows: torch.Tensor | None = None
+        self._target_features: DSparkTargetFeatures | None = None
 
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
@@ -227,25 +241,8 @@ class Transformer(nn.Module):
         if self.drafter is not None:
             self.drafter.bind(pool, device)
 
-    def last_aux_hidden(self) -> torch.Tensor | None:
-        """The tap from the most recent forward, or None if nothing has run yet."""
-        return self._last_aux_hidden
-
-    def last_aux_addressing(self) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """``(positions, table_rows)`` for the rows of :meth:`last_aux_hidden`.
-
-        The tap and its addressing must travel together. A consumer that pairs the tap
-        with any OTHER batch's positions writes hidden states derived from one set of
-        tokens into the slots of a different set -- which raises nothing, and shows up
-        only as a drafter that proposes badly.
-        """
-        if (
-            self._last_aux_hidden is None
-            or self._last_aux_positions is None
-            or self._last_aux_rows is None
-        ):
-            return None
-        return self._last_aux_positions, self._last_aux_rows
+    def target_features(self) -> DSparkTargetFeatures | None:
+        return self._target_features
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Vocabulary-parallel lookup. Rows outside this rank's block contribute zero, so
@@ -307,13 +304,21 @@ class Transformer(nn.Module):
                 # The drafter's whole view of the context: this block's output with the
                 # hyper-connection copies averaged away, [1, T, dim].
                 aux.append(h.mean(dim=2))
-        self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
+        aux_hidden = (
+            torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
+            if aux else None
+        )
         if aux:
-            self._last_aux_positions = flat_positions
             rows = torch.empty_like(flat_positions)
             for off, n, ti, _start in segments:
                 rows[off:off + n] = ti
-            self._last_aux_rows = rows
+            self._target_features = DSparkTargetFeatures(
+                aux_hidden,
+                flat_positions.clone(),
+                rows.clone(),
+            )
+        else:
+            self._target_features = None
         h = self.hc_head(h)
         h = self.norm(h)
         # Normally only each request's final token needs logits. A speculative VERIFY
@@ -350,13 +355,73 @@ class Transformer(nn.Module):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
             if i in self._aux_layer_ids:
                 aux.append(h.mean(dim=2))  # [B, 1, dim]
-        self._last_aux_hidden = torch.cat(aux, dim=-1) if aux else None
+        aux_hidden = (
+            torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
+            if aux else None
+        )
         if aux:
-            self._last_aux_positions = pos.reshape(-1)
-            self._last_aux_rows = rows.reshape(-1)
+            table_rows = get_global_ctx().batch.active_table_idx
+            if table_rows is None:
+                raise RuntimeError("DSpark decode features require request table rows")
+            # clone() is captured: replay updates these output buffers without leaving
+            # them aliased to the graph input buffers that the next batch overwrites.
+            self._target_features = DSparkTargetFeatures(
+                aux_hidden,
+                pos.reshape(-1).clone(),
+                table_rows[:B].reshape(-1).clone(),
+            )
+        else:
+            self._target_features = None
         h = self.hc_head(h)
         h = self.norm(h)
         return self.logits(h[:, -1])
+
+    def verify_block(
+        self, input_ids: torch.Tensor, pos: torch.Tensor, span: int
+    ) -> torch.Tensor:
+        """Run one fixed-shape DSpark target verification inside a CUDA graph.
+
+        ``input_ids`` is request-major ``[1, R * span]`` and every request contributes
+        exactly anchor + gamma rows. The attention backend supplies one persistent
+        whole-history snapshot per request; ``rows`` maps every token to that request.
+        """
+        total = input_ids.numel()
+        if span < 1 or total % span:
+            raise ValueError(f"invalid DSpark verify shape: {total} rows, span={span}")
+        num_reqs = total // span
+        rows = torch.arange(num_reqs, device=input_ids.device).repeat_interleave(span)
+        md = get_global_ctx().batch.attn_metadata
+        cmp_stage_cap = md.stage_width - 1
+        wctx = md.window_ctx(pos, rows)
+
+        h = self.embed_tokens(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        aux: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            h = layer.verify_block(
+                h, pos, rows, cmp_stage_cap, input_ids,
+                num_reqs, span, wctx,
+            )
+            if i in self._aux_layer_ids:
+                aux.append(h.mean(dim=2))
+
+        aux_hidden = (
+            torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
+            if aux else None
+        )
+        if aux:
+            table_rows = get_global_ctx().batch.active_table_idx
+            if table_rows is None or table_rows.numel() < num_reqs:
+                raise RuntimeError("DSpark verify features require one table row per request")
+            self._target_features = DSparkTargetFeatures(
+                aux_hidden,
+                pos.reshape(-1).clone(),
+                table_rows[:num_reqs].repeat_interleave(span).clone(),
+            )
+        else:
+            self._target_features = None
+        h = self.norm(self.hc_head(h))
+        return self.logits(h.view(-1, self.args.dim))
 
 
 class DeepseekV4ForCausalLM(BaseLLMModel):
@@ -372,6 +437,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._args: DeepseekV4Args = config.dsv4_args
         self._transformer = Transformer(self._args)
         self._bound = False
+        self.speculative_verify_block_size = (
+            self._args.dspark_block_size if self._args.n_draft_layers else 0
+        )
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -418,45 +486,42 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         self._transformer.load_state_dict(casted, assign=True, strict=False)
 
-    def catch_up_draft_context(self, batch) -> None:
-        """Write the draft layers' KV for the positions the target has just committed.
+    def dspark_target_features(self) -> DSparkTargetFeatures | None:
+        """Outputs of the most recent target forward, as one addressed bundle."""
+        return self._transformer.target_features()
 
-        The drafter never runs the prompt; its sliding window fills in behind the target,
-        derived from the target's own hidden state at those positions.
-
-        The addressing comes from the TAP, not from ``batch``. This runs before the
-        target's forward for the current step, so the newest tap belongs to the PREVIOUS
-        forward and covers that forward's positions. Pairing it with the current batch's
-        positions -- which is the block about to be drafted -- would store hidden states
-        derived from one set of tokens into the slots of a different set. That raises
-        nothing at all; it just makes the drafter propose badly, which reads as a weak
-        drafter rather than a wiring fault.
-
-        ``batch`` is still taken so the caller need not know what the drafter addresses
-        by, and so a future batched form has it.
-        """
-        del batch
+    def catch_up_draft_context(self, features: DSparkTargetFeatures) -> None:
+        """Precompute draft-layer context KV from one target feature bundle."""
         drafter = self._transformer.drafter
         if drafter is None:
             return
-        aux = self._transformer.last_aux_hidden()
-        addressing = self._transformer.last_aux_addressing()
-        if aux is None or addressing is None:
-            return  # nothing has run yet; the first block attends over a short window
-        positions, rows = addressing
-        flat = aux.view(-1, aux.shape[-1])
-        if flat.shape[0] != positions.numel():
-            # The tap and its addressing are written together, so this cannot drift --
-            # unless a new forward path records one and not the other.
+        flat = features.hidden
+        positions = features.positions
+        rows = features.table_rows
+        if flat.shape[0] != positions.numel() or rows.numel() != positions.numel():
             raise RuntimeError(
-                f"aux tap has {flat.shape[0]} rows but {positions.numel()} positions; "
-                "every forward that stores the tap must store its addressing too"
+                "DSpark target features must have one hidden, position, and table row "
+                f"per token; got {flat.shape[0]}, {positions.numel()}, {rows.numel()}"
             )
         backend = get_global_ctx().attn_backend
         slots = backend.window_slots_at(rows, positions)
+        valid = slots >= 0
+        flat = flat[valid]
+        positions = positions[valid]
+        slots = slots[valid]
+        if positions.numel() == 0:
+            return
+        if _DRAFT_CTX_DEBUG:
+            logger.debug_rank0(
+                "draft ctx: %d rows, positions %s..%s, slots %s..%s",
+                flat.shape[0], int(positions.min()), int(positions.max()),
+                int(slots.min()), int(slots.max()),
+            )
         drafter.catch_up_context(flat, positions, slots)
 
-    def draft(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def draft(
+        self, sampling_params
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Propose the current batch's block with the dSpark drafter.
 
         Runs over the SAME prepared batch as the verify pass that follows -- the same
@@ -465,24 +530,19 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         window slots at these positions and they write KV there without disturbing the
         target's.
 
-        Returns ``(proposed [T], confidence [T])``, or None when there is nothing to
-        draft from: the drafter needs the target's hidden state at its tap layers, and
-        that only exists once a forward has produced it.
+        Returns ``(proposed [R*gamma], q [R*gamma,V], confidence [R*gamma])``.
         """
         if self._transformer.drafter is None:
-            return None
-        aux = self._transformer.last_aux_hidden()
-        if aux is None:
             return None
         self._ensure_bound()
         batch = get_global_ctx().batch
         md = batch.attn_metadata
         return self._transformer.drafter.propose(
-            aux,
             batch.input_ids.long().view(1, -1),
             md.segments,
             batch.positions.long(),
             self._transformer.logits,
+            sampling_params,
         )
 
     def forward(self) -> torch.Tensor:
@@ -490,6 +550,11 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         input_ids = batch.input_ids.long()
         md = batch.attn_metadata
+        if getattr(batch, "spec_verify_decode", False):
+            span = int(batch.spec_block) + 1
+            return self._transformer.verify_block(
+                input_ids.view(1, -1), batch.positions.long(), span
+            )
         if batch.is_prefill:
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
             # A cold segment (start_pos == 0) re-seeds the compressor carry register inside its
@@ -525,4 +590,4 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         return self._transformer.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
 
 
-__all__ = ["Transformer", "DeepseekV4ForCausalLM"]
+__all__ = ["DSparkTargetFeatures", "Transformer", "DeepseekV4ForCausalLM"]

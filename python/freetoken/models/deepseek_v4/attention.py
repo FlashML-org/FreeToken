@@ -158,9 +158,13 @@ class Attention(nn.Module):
             # natural width min(n, win); the caller pads to the batch-uniform width
             win_global = self.attn.win_cols_to_global(win_cols, slots)
         else:
-            # Candidates span [w_lo, end): each new query's 128-sliding window over the retained
-            # prefix plus the new tokens, causal-masked to -1 past its own position.
-            w_lo = max(0, start_pos - win + 1)
+            # Target attention uses its ordinary 128-token causal window.  A DSpark
+            # draft query instead sees 128 CONTEXT tokens plus every token in its
+            # parallel query block (paper section 3.1; same sparse list as vLLM).
+            w_lo = max(
+                0,
+                start_pos - win if self.non_causal else start_pos - win + 1,
+            )
             ws_pool = self.attn.window_slots_of(ti, w_lo, end)
             # One implementation of the masking rule, shared with the tests that pin it.
             # Non-causal (dSpark draft layers) gives every query in the block the SAME
@@ -188,7 +192,11 @@ class Attention(nn.Module):
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
             self.compressor(x_seg, 0, slots, ti=ti)
-        elif self.non_causal or start_pos % self.P != 0:
+        elif (
+            self.non_causal
+            or getattr(get_global_ctx().batch, "speculative", False)
+            or start_pos % self.P != 0
+        ):
             # A speculative block starts wherever generation reached, which is mid-page
             # 127 times out of 128. The compressor's EXTEND path cannot serve that: it
             # reduces tokens with ``start_pos // ratio`` arithmetic and asserts
@@ -202,7 +210,18 @@ class Attention(nn.Module):
             # the compressor is cheap next to the expert fetch this block exists to
             # amortize.
             self._advance_compressor_per_token(x_seg, start_pos, n, slots, tail_ws, ti)
-            blocks = self._compress_topk_extend(n, start_pos, end, 0, device, 1)
+            # Run the INDEXER here too. Falling back to _compress_topk_extend chooses
+            # compressed blocks positionally, which silently replaces DeepSeek-V4's
+            # learned sparse selection with a fixed one -- so the target attends to the
+            # wrong blocks and its own logits are wrong. Since a speculative block is
+            # unaligned 127 times out of 128, that was every verify.
+            blocks = (
+                self.indexer.extend_unaligned(
+                    x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti
+                )
+                if self.indexer is not None
+                else self._compress_topk_extend(n, start_pos, end, 0, device, 1)
+            )
         else:
             blocks = (
                 self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
@@ -288,7 +307,16 @@ class Attention(nn.Module):
         # they shift the kernel's window/compressed tile split, and that rounding-order change
         # is enough to flip a greedy near-tie. bs>1 pads every part to win (the historical
         # batched behavior).
-        n_window = win if len(segments) > 1 else win_parts[0].shape[-1]
+        # Ordinary target segments keep the historical batch-uniform ``win`` width.
+        # DSpark's non-causal query block is wider: trailing ``win`` context columns
+        # PLUS all gamma query columns.  Labeling only the first 128 columns as window
+        # in a multi-request draft misclassifies/drops the query-query suffix even
+        # though the sparse indices themselves correctly contain all 133 columns.
+        n_window = (
+            max(part.shape[-1] for part in win_parts)
+            if self.non_causal
+            else (win if len(segments) > 1 else win_parts[0].shape[-1])
+        )
         flat = []
         for i, (off, n, ti, _start) in enumerate(segments):
             wg = win_parts[i]
@@ -398,3 +426,77 @@ class Attention(nn.Module):
         )
         apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)  # per-row position freqs (inverse)
         return self._wo(o, B, 1)
+
+    def verify_block(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        rows: torch.Tensor,
+        cmp_stage_cap: int,
+        num_reqs: int,
+        span: int,
+        wctx,
+    ) -> torch.Tensor:
+        """Fixed-shape causal target verification using decode-addressed kernels.
+
+        Large projections, MoE work and sparse attention remain batched over all
+        verification rows. Stateful compressors advance in request-major token order
+        so each token reads its predecessor's new carry, with no host-derived position
+        or address embedded in the CUDA graph.
+        """
+        n = x.shape[1]
+        if n != num_reqs * span:
+            raise ValueError(f"verify block has {n} rows, expected {num_reqs} * {span}")
+        win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
+        flat = x.reshape(n, self.dim)
+        xq = flat.unsqueeze(1)
+        freqs_t = self.freqs_cis.index_select(0, pos)
+
+        qr = q = self.q_norm(self.wq_a(xq))
+        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = rms_norm(q, None, self.eps)
+        apply_rotary_emb_decode(q[..., -rd:], freqs_t)
+
+        kv = self.kv_norm(self.wkv(xq))
+        apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+        act_quant_fp8_inplace(kv[..., :-rd], 64)
+
+        window_slots, prev_window_slots, window_slots_topk = wctx
+        self.attn.store_window(kv.view(n, -1), self.layer_id, window_slots)
+        n_cmp_stage = (cmp_stage_cap + 1) // ratio if ratio else 0
+        cmp_counts = None
+        if ratio:
+            # This order is also the carry-journal order consumed after acceptance.
+            for r in range(num_reqs):
+                base = r * span
+                row = rows[base:base + 1]
+                for s in range(span):
+                    i = base + s
+                    self.compressor.decode_step(
+                        flat[i:i + 1], pos[i:i + 1],
+                        prev_window_slots[i:i + 1], window_slots[i:i + 1], row,
+                    )
+            valid = (pos + 1) // ratio
+            if self.indexer is not None:
+                blocks = self.indexer.verify_block(
+                    flat, qr.reshape(n, -1), pos,
+                    prev_window_slots, window_slots, rows, n_cmp_stage,
+                    num_reqs, span,
+                )
+            else:
+                blk = torch.arange(n_cmp_stage, device=x.device)
+                blocks = torch.where(
+                    blk[None, :] < valid[:, None], blk[None, :], -1
+                ).view(n, 1, n_cmp_stage)
+            compress_idxs = self.attn.blocks_to_global(blocks, ratio, rows=rows)
+            topk_idxs = torch.cat([window_slots_topk, compress_idxs], dim=-1)
+            cmp_counts = valid.clamp(max=compress_idxs.shape[-1]).to(torch.int32).view(n, 1)
+        else:
+            topk_idxs = window_slots_topk
+
+        o = self.attn.attend(
+            q, self.layer_id, topk_idxs.int(), win, self.attn_sink,
+            self.softmax_scale, cmp_counts=cmp_counts, has_compression=bool(ratio),
+        )
+        apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)
+        return self._wo(o, n, 1).view(1, n, self.dim)

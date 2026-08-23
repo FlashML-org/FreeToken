@@ -43,7 +43,7 @@ class IndexerBackendMixin:
 
     def indexer_decode_scores(
         self, q: torch.Tensor, weights: torch.Tensor, valid: torch.Tensor, n_stage: int,
-        ratio: int, layer_id: int,
+        ratio: int, layer_id: int, rows: torch.Tensor,
     ) -> torch.Tensor:
         """Head-reduced scores ``[B, n_stage]`` for a decode step, gathering each block's key off
         the decode SNAPSHOT and bounding the work by the live block count read from device
@@ -52,7 +52,7 @@ class IndexerBackendMixin:
 
         return indexer_decode_logits(
             q, weights, self.compress_pool(layer_id, "idx"), self.snapshot(),
-            valid, n_stage, ratio,
+            rows, valid, n_stage, ratio,
         )
 
     def indexer_select_prefill(

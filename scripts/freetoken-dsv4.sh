@@ -28,6 +28,19 @@ EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 # disappear from the log's `layers=` count, which is the quickest way to tell which
 # mode a run was in.
 SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
+# Which base dspark_target_layer_ids is read with (0 or 1). Exported so it reaches the
+# rank subprocesses; unset means the model's own default. See the note in model.py --
+# this is settled by measurement, not by the config.
+[ -n "${FREETOKEN_DSPARK_LAYER_BASE:-}" ] && export FREETOKEN_DSPARK_LAYER_BASE
+# FREETOKEN_DSPARK_MARKOV=0 drops the Markov bias from the draft logits.
+[ -n "${FREETOKEN_DSPARK_MARKOV:-}" ] && export FREETOKEN_DSPARK_MARKOV
+# FREETOKEN_SPEC_HYBRID_MOE=0 sends speculative verifies down the prefill expert path.
+[ -n "${FREETOKEN_SPEC_HYBRID_MOE:-}" ] && export FREETOKEN_SPEC_HYBRID_MOE
+# FREETOKEN_SPEC_DEBUG=1 dumps the first few blocks' token flow.
+[ -n "${FREETOKEN_SPEC_DEBUG:-}" ] && export FREETOKEN_SPEC_DEBUG
+[ -n "${FREETOKEN_SPEC_FORCE_REJECT:-}" ] && export FREETOKEN_SPEC_FORCE_REJECT
+[ -n "${FREETOKEN_CMP_FIRST_ONLY:-}" ] && export FREETOKEN_CMP_FIRST_ONLY
+[ -n "${FREETOKEN_SPEC_WINDOW_ONLY:-}" ] && export FREETOKEN_SPEC_WINDOW_ONLY
 LOG="${LOG:-/tmp/freetoken-dsv4.log}"
 # The TP ranks' torch.distributed rendezvous. Held by every rank, not just the
 # frontend, so it is the one that lingers after a stop.

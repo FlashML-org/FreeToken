@@ -48,45 +48,19 @@ class TestTheWrongBaseIsRejected:
         assert _resolve(_args([], 43)) == frozenset()
 
 
-class TestTheBaseIsSelectableAndMeasured:
-    """Which base the ids use is an empirical answer, not a spec.
-
-    The checkpoint declares [40, 41, 42] with n_layers=43. Read 0-based those are the
-    last three layers; read 1-based they are the 2nd-to-4th from last. Both land inside
-    the model, so no assertion can decide it -- only a measurement can, and it did:
-
-        1-based (39, 40, 41): 25% accepted at 800 drafted tokens
-        0-based (40, 41, 42): 20% accepted at the same point
-
-    So 1-based is the default, and the override stays because that answer came from one
-    checkpoint rather than from documentation.
-    """
-
-    def test_the_default_is_one_based(self):
-        src = _model_src()
-        assert 'FREETOKEN_DSPARK_LAYER_BASE", "1"' in src, (
-            "1-based measured better on this checkpoint; it is the default"
-        )
-
-    def test_the_base_is_an_override_not_a_hardcode(self):
-        assert "FREETOKEN_DSPARK_LAYER_BASE" in _model_src()
-
-    def test_only_zero_or_one_is_accepted(self):
-        assert "base not in (0, 1)" in _model_src()
-
+class TestTheReferenceMappingIsFixed:
     def test_the_resolved_layers_are_logged(self):
-        # The wrong base costs acceptance and raises nothing, so the run must say which
-        # layers it actually tapped.
-        src = _model_src()
-        assert "dSpark: tapping target layers" in src
+        assert "dSpark: tapping target layer outputs" in _model_src()
 
-    @pytest.mark.parametrize("base,expected", [(1, {39, 40, 41}), (0, {40, 41, 42})])
-    def test_both_readings_stay_inside_the_model(self, base, expected):
-        ids = tuple(i - base for i in (40, 41, 42))
-        assert set(ids) == expected
-        assert all(0 <= i < 43 for i in ids), (
-            "both readings are in range, which is why only a measurement can choose"
-        )
+    def test_no_runtime_base_override_remains(self):
+        assert "FREETOKEN_DSPARK_LAYER_BASE" not in _model_src()
+
+    def test_vllm_mapping_selects_the_last_three_outputs(self):
+        # vLLM adds one to the config ids, then captures when idx+1 is selected.
+        config = (40, 41, 42)
+        aux_ids = tuple(i + 1 for i in config)
+        captured = tuple(i for i in range(43) if i + 1 in aux_ids)
+        assert captured == config
 
 
 def _model_src() -> str:

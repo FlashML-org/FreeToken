@@ -75,8 +75,7 @@ class TestConfidenceHead:
         assert out.shape == (4,)
 
     def test_scores_are_probabilities(self):
-        # draft_width compares them against a threshold, so anything outside [0, 1]
-        # would make the adaptive width meaningless.
+        # Equation 7 defines a probability consumed by the load-aware scheduler.
         head = ConfidenceHead(_args())
         torch.nn.init.normal_(head.proj, std=10.0)  # push the pre-sigmoid range wide
         out = head(torch.randn(16, DIM), torch.randn(16, RANK))
@@ -89,31 +88,64 @@ class TestConfidenceHead:
         )
 
 
-class TestLogitsUnderTensorParallelism:
-    """The bug the review caught: the drafter must not use the head weight directly."""
-
-    def test_the_draft_logits_are_full_vocabulary_at_tp4(self):
+class TestSequentialMarkovStage:
+    def test_each_step_reads_the_token_sampled_by_the_previous_step(self):
         from freetoken.models.deepseek_v4.dspark import DSparkDrafter
 
-        info_mod._TP_INFO = DistributedInfo(0, 4)
-        args = _args(dim=512, moe_inter_dim=512, n_heads=8, o_groups=4, vocab_size=64)
-        with torch.device("meta"):
-            drafter = DSparkDrafter(args)
+        seen = []
 
-        # The target's logits() all-gathers the vocabulary; stand in for it here.
-        def target_logits(h):
-            return torch.zeros(h.shape[0], args.vocab_size)
+        class _Markov(torch.nn.Module):
+            def embed(self, ids):
+                seen.append(ids.clone())
+                return torch.zeros(ids.shape[0], RANK)
 
-        drafter.markov_head = MarkovHead(args)  # real (small) weights, off meta
-        drafter.confidence_head = ConfidenceHead(args)
-        logits, conf = drafter.logits(
-            torch.zeros(3, args.dim), target_logits, torch.tensor([1, 2, 3])
+            def bias(self, embeds):
+                return torch.zeros(embeds.shape[0], VOCAB)
+
+        class _Confidence(torch.nn.Module):
+            def forward(self, hidden, embeds):
+                return torch.ones(hidden.shape[0])
+
+        class _Params:
+            temperature = 0.0
+            top_p = 1.0
+            top_k = -1
+            is_greedy = True
+
+        drafter = DSparkDrafter.__new__(DSparkDrafter)
+        torch.nn.Module.__init__(drafter)
+        drafter.markov_head = _Markov()
+        drafter.confidence_head = _Confidence()
+        base = torch.full((1, 3, VOCAB), -10.0)
+        base[0, 0, 2] = 10.0
+        base[0, 1, 3] = 10.0
+        base[0, 2, 4] = 10.0
+        proposed, q, confidence = drafter.sample_block(
+            base, torch.zeros(1, 3, DIM), torch.tensor([1]), [_Params()]
         )
-        assert logits.shape == (3, args.vocab_size), (
-            "draft logits must span the full vocabulary; a per-rank slice cannot be "
-            "added to the replicated Markov bias"
-        )
-        assert conf.shape == (3,)
+        assert proposed.tolist() == [2, 3, 4]
+        assert [x.tolist() for x in seen] == [[1], [2], [3]]
+        assert q.shape == (3, VOCAB)
+        assert confidence.shape == (3,)
+
+
+class TestDraftHeadNormalization:
+    def test_backbone_returns_pre_norm_hidden_for_the_confidence_head(self):
+        import inspect
+
+        from freetoken.models.deepseek_v4.dspark import DSparkDrafter
+
+        body = inspect.getsource(DSparkDrafter.head_hidden)
+        assert "return self.hc_head(h)" in body
+        assert "return self.norm(self.hc_head(h))" not in body
+
+    def test_only_base_logits_apply_the_final_norm(self):
+        import inspect
+
+        from freetoken.models.deepseek_v4.dspark import DSparkDrafter
+
+        body = inspect.getsource(DSparkDrafter.propose)
+        assert "target_logits_fn(self.norm(head_hidden))" in body
 
 
 class TestContextKvPositions:
@@ -167,3 +199,37 @@ class TestBlockInputIds:
         d, _ = self._drafter(dspark_noise_token_id=-1)
         with pytest.raises(ValueError, match="noise"):
             d.block_input_ids(1, torch.device("cpu"))
+
+    def test_propose_does_not_trust_uninitialized_gpu_placeholder_rows(self):
+        from freetoken.models.deepseek_v4.dspark import DSparkDrafter
+
+        d = DSparkDrafter.__new__(DSparkDrafter)
+        torch.nn.Module.__init__(d)
+        d.block_size = 3
+        d.noise_token_id = 99
+        d.norm = torch.nn.Identity()
+        seen = {}
+        d.embed_block = lambda ids: torch.zeros(1, ids.numel(), DIM)
+
+        def head_hidden(_embeds, ids, _segments, _positions):
+            seen["ids"] = ids.clone()
+            return torch.zeros(1, ids.numel(), DIM)
+
+        d.head_hidden = head_hidden
+        d.sample_block = lambda *_args: (
+            torch.zeros(6, dtype=torch.long),
+            torch.zeros(6, VOCAB),
+            torch.zeros(6),
+        )
+        # Each target span is anchor + gamma proposal slots. The proposal slots here
+        # deliberately contain stale values, exactly like an unwritten GPU token-pool row.
+        target_ids = torch.tensor([[11, 7, 8, 9, 22, 70, 80, 90]])
+        segments = [(0, 4, 1, 10), (4, 4, 2, 20)]
+        d.propose(
+            target_ids,
+            segments,
+            torch.arange(8),
+            lambda h: torch.zeros(h.shape[0], VOCAB),
+            [object(), object()],
+        )
+        assert seen["ids"].tolist() == [[11, 99, 99, 22, 99, 99]]

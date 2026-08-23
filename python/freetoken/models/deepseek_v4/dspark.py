@@ -27,19 +27,188 @@ slot cache and the KV pools address draft and target layers with one index space
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple
+import math
+import statistics
+from collections import deque
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .layers import Linear, RMSNorm
 from .parallel import div_tp
-from .rollback import needs_rollback
+
+logger = init_logger(__name__)
+
+
+def choose_adaptive_draft_width(
+    stale_confidence: Sequence[float] | torch.Tensor,
+    draft_cost_ms: float,
+    verify_cost_ms: Sequence[float],
+) -> int:
+    """Choose the DSpark prefix that maximizes expected tokens per millisecond.
+
+    This is Algorithm 1 / Section 5.2 specialized to FreeToken's present DSV4
+    serving shape of one active request.  ``verify_cost_ms[k]`` is the measured
+    target cost for anchor + ``k`` draft rows.  The drafter has already produced
+    its whole block, so its measured cost is common to every candidate width.
+
+    For one request, globally sorting cumulative survival probabilities is exactly
+    the same as considering its prefixes in order: the survival product cannot
+    increase as the prefix grows.  Ties retain the smaller prefix, matching
+    ``argmax`` in the vLLM implementation.
+    """
+    confidence = [float(c) for c in stale_confidence]
+    if len(verify_cost_ms) != len(confidence) + 1:
+        raise ValueError(
+            "adaptive DSpark needs one verify cost for every width 0..gamma; "
+            f"got {len(verify_cost_ms)} costs for gamma={len(confidence)}"
+        )
+    if not math.isfinite(draft_cost_ms) or draft_cost_ms < 0:
+        raise ValueError(f"invalid DSpark draft cost {draft_cost_ms}")
+
+    survival = 1.0
+    expected = 1.0  # target bonus token; a verify always advances at least once
+    best_width = 0
+    best_throughput = expected / max(
+        draft_cost_ms + float(verify_cost_ms[0]), 1e-6
+    )
+    for width, token_confidence in enumerate(confidence, start=1):
+        survival *= token_confidence
+        expected += survival
+        throughput = expected / max(
+            draft_cost_ms + float(verify_cost_ms[width]), 1e-6
+        )
+        if throughput > best_throughput:
+            best_width = width
+            best_throughput = throughput
+    return best_width
+
+
+class DSparkAdaptiveVerification:
+    """Two-buffer stale-confidence scheduler from DSpark Section 5.2.
+
+    Current confidences are copied asynchronously to pinned host memory.  Capacity
+    selection reads the other buffer, creating the paper's causal barrier across
+    jagged CUDA-graph buckets.  The target curve is profiled at graph capture; the
+    fixed-cost draft pass is priced from five real executions, like vLLM's five
+    startup profiling replays.
+    """
+
+    _DRAFT_PROFILE_SAMPLES = 5
+
+    def __init__(
+        self,
+        block_size: int,
+        verify_curve: Sequence[tuple[int, float]],
+        device: torch.device,
+    ) -> None:
+        expected_spans = list(range(1, block_size + 2))
+        curve = sorted((int(span), float(cost)) for span, cost in verify_curve)
+        if [span for span, _ in curve] != expected_spans:
+            raise ValueError(
+                "adaptive DSpark needs profiled graphs for every anchor+prefix span "
+                f"{expected_spans}, got {[span for span, _ in curve]}"
+            )
+        high = 0.0
+        self.verify_cost_ms: list[float] = []
+        for _span, cost in curve:
+            high = max(high, cost, 1e-6)
+            self.verify_cost_ms.append(high)
+
+        self.block_size = block_size
+        self.device = device
+        self._copy_stream = torch.cuda.Stream(device=device)
+        self._stale = [
+            torch.ones(block_size, dtype=torch.float32, pin_memory=True)
+            for _ in range(2)
+        ]
+        self._events: list[torch.cuda.Event | None] = [None, None]
+        self._stale_idx = 0
+        self._active_uid: int | None = None
+        self._draft_samples: deque[float] = deque(
+            maxlen=self._DRAFT_PROFILE_SAMPLES
+        )
+        self._debug_left = 12
+
+    @property
+    def needs_draft_profile(self) -> bool:
+        return len(self._draft_samples) < self._DRAFT_PROFILE_SAMPLES
+
+    @property
+    def draft_cost_ms(self) -> float | None:
+        if self.needs_draft_profile:
+            return None
+        return float(statistics.median(self._draft_samples))
+
+    def record_draft_cost(self, cost_ms: float) -> None:
+        if self.needs_draft_profile and math.isfinite(cost_ms) and cost_ms >= 0:
+            self._draft_samples.append(float(cost_ms))
+            if not self.needs_draft_profile:
+                logger.info_rank0(
+                    "DSpark profiled draft cost: %.2fms (median of %d real steps)",
+                    self.draft_cost_ms,
+                    self._DRAFT_PROFILE_SAMPLES,
+                )
+
+    def _reset_request(self, uid: int) -> None:
+        for event in self._events:
+            if event is not None:
+                event.synchronize()
+        for slot in self._stale:
+            slot.fill_(1.0)
+        self._events = [None, None]
+        self._stale_idx = 0
+        self._active_uid = uid
+
+    def record_and_choose(self, confidence: torch.Tensor, uid: int) -> int:
+        """Publish this block's confidence and choose from the stale buffer."""
+        flat = confidence.detach().float().reshape(-1)
+        if flat.numel() != self.block_size:
+            raise RuntimeError(
+                f"DSpark confidence has {flat.numel()} rows, expected {self.block_size}"
+            )
+        if self._active_uid != uid:
+            self._reset_request(uid)
+
+        ready_idx = self._stale_idx ^ 1
+        ready = self._events[ready_idx]
+        if ready is not None:
+            ready.synchronize()
+        self._stale_idx, write_idx = ready_idx, self._stale_idx
+        stale = self._stale[self._stale_idx]
+
+        current_stream = torch.cuda.current_stream(self.device)
+        self._copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._copy_stream):
+            self._stale[write_idx].copy_(flat, non_blocking=True)
+            event = torch.cuda.Event(blocking=True)
+            event.record(self._copy_stream)
+            self._events[write_idx] = event
+
+        draft_cost = self.draft_cost_ms
+        # Collect five real drafter samples before changing shape.  This is a
+        # measured warmup, not a guessed initial cost.
+        if draft_cost is None:
+            return self.block_size
+        width = choose_adaptive_draft_width(
+            stale, draft_cost, self.verify_cost_ms
+        )
+        if self._debug_left > 0:
+            self._debug_left -= 1
+            logger.info_rank0(
+                "DSpark adaptive verify: stale=%s draft=%.2fms width=%d/%d",
+                [round(float(c), 3) for c in stale],
+                draft_cost,
+                width,
+                self.block_size,
+            )
+        return width
 
 
 class MarkovHead(nn.Module):
@@ -73,10 +242,9 @@ class MarkovHead(nn.Module):
 class ConfidenceHead(nn.Module):
     """Per-position acceptance confidence, from the head hidden plus the Markov embedding.
 
-    Its output is what makes verification ADAPTIVE: a block whose tail positions score
-    low can be verified short instead of paying for tokens that will be rejected.
-    Runs in fp32 -- it is one row of arithmetic per position, and the threshold it feeds
-    decides how many tokens the verify step covers.
+    Its output feeds DSpark's hardware-aware prefix scheduler: cumulative survival
+    probabilities are ranked against profiled draft/verify costs. Runs in fp32 because
+    the checkpoint defines this as a calibrated scalar probability per position.
     """
 
     def __init__(self, args: DeepseekV4Args):
@@ -238,32 +406,69 @@ class DSparkDrafter(nn.Module):
         self.store_context_kv(main_x, positions, window_slots)
 
     def propose(
-        self, aux_hidden: torch.Tensor, input_ids: torch.Tensor, segments,
-        positions: torch.Tensor, target_logits_fn,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the draft stack over one block and propose its tokens.
+        self,
+        input_ids: torch.Tensor,
+        segments,
+        positions: torch.Tensor,
+        target_logits_fn,
+        sampling_params: Sequence,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the paper's parallel backbone and sequential Markov sampler.
 
-        ``aux_hidden`` is the target's tap at ``dspark_target_layer_ids`` for these
-        positions, ``[1, T, dim * len(target_layer_ids)]``. ``input_ids`` is what the
-        block is fed -- the last committed token then noise -- and ``segments`` /
-        ``positions`` are the batch's, so the draft blocks address the same paged slots
-        the caller allocated.
+        The prepared target VERIFY span has ``1 + gamma`` rows per request: the anchor
+        followed by ``gamma`` proposal slots.  The DSpark backbone takes only ``gamma``
+        inputs -- anchor plus ``gamma - 1`` masks -- and produces ``gamma`` base-logit
+        rows.  Equation 4 then samples those rows left to right, conditioning row ``k``
+        on the token sampled at ``k - 1`` (the anchor for the first row).
 
-        Returns ``(draft_logits [T, vocab], confidence [T])`` -- the LOGITS, not a token
-        choice. Speculative sampling needs the draft's whole distribution q, not just
-        its argmax: a sampled request accepts a proposal with probability
-        min(1, p(x)/q(x)) and, on rejection, resamples from the residual p - q. Reducing
-        to argmax here would throw q away and force the caller into greedy-only
-        acceptance.
+        Returns the proposed tokens, the exact shaped distribution each proposal was
+        drawn from, and the confidence from equation 7, all flattened request-major.
         """
-        # The block runs on token embeddings ALONE. The projected target hidden
-        # (main_x) is not added here -- it is what the draft layers derive their CONTEXT
-        # KV from, over the positions the target has already committed. Adding it to the
-        # block would also mismatch: aux covers the previous forward's positions, which
-        # is the prompt on the first step and one token thereafter, never the block.
-        embeds = self.embed_block(input_ids)
-        head_hidden = self.head_hidden(embeds, input_ids, segments, positions)
-        return self.logits(head_hidden[0], target_logits_fn, input_ids.view(-1))
+        gamma = self.block_size
+        draft_segments = []
+        rows = []
+        for i, (off, n, ti, start) in enumerate(segments):
+            if n != gamma + 1:
+                raise ValueError(
+                    f"a DSpark verify span has {n} rows, expected gamma + 1 = "
+                    f"{gamma + 1}"
+                )
+            rows.append(torch.arange(off, off + gamma, device=input_ids.device))
+            draft_segments.append((i * gamma, gamma, ti, start))
+        row_idx = torch.cat(rows)
+        # The scheduler extends the CPU Req with noise placeholders, but the model's
+        # flat input is gathered from the GPU token pool; those newly allocated pool
+        # positions have never been initialized.  Construct the reference layout here
+        # from device-resident data: one live anchor followed by gamma-1 checkpoint
+        # noise tokens per request (vLLM's sample_from_anchor path).
+        if self.noise_token_id < 0:
+            raise ValueError("DSpark requires the checkpoint's noise token id")
+        draft_ids = torch.full(
+            (len(segments), gamma),
+            self.noise_token_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        draft_ids[:, 0] = input_ids[0, row_idx.view(len(segments), gamma)[:, 0]]
+        draft_ids = draft_ids.view(1, -1)
+        draft_pos = positions[row_idx]
+        head_hidden = self.head_hidden(
+            self.embed_block(draft_ids), draft_ids, draft_segments, draft_pos
+        )[0]
+        # The checkpoint's two heads consume different forms of this tensor.  vLLM's
+        # DSV4 DSpark model returns the PRE-norm hc_head output to the speculator:
+        # base logits use norm(head_hidden), while equation 7's confidence projection
+        # consumes head_hidden itself.  Normalizing before returning silently changes
+        # every confidence score even though the proposal logits still look plausible.
+        base_logits = target_logits_fn(self.norm(head_hidden)).view(
+            len(segments), gamma, -1
+        )
+        return self.sample_block(
+            base_logits,
+            head_hidden.view(len(segments), gamma, -1),
+            draft_ids.view(len(segments), gamma)[:, 0],
+            sampling_params,
+        )
 
     def embed_block(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Token embeddings for the block, ``[1, T, dim]``.
@@ -310,7 +515,7 @@ class DSparkDrafter(nn.Module):
     def head_hidden(
         self, embeds: torch.Tensor, input_ids: torch.Tensor, segments, positions: torch.Tensor
     ) -> torch.Tensor:
-        """Run the draft stack over one block and return the pre-logits hidden.
+        """Run the draft stack and return the pre-norm ``hc_head`` hidden.
 
         ``embeds`` is ``[1, T, dim]`` -- the block's token embeddings, already summed with
         the projected target hidden by the caller. Returns ``[1, T, dim]``.
@@ -318,23 +523,55 @@ class DSparkDrafter(nn.Module):
         h = embeds.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer.prefill_batched(h, input_ids, segments, positions)
-        return self.norm(self.hc_head(h))
+        return self.hc_head(h)
 
-    def logits(self, head_hidden: torch.Tensor, target_logits_fn,
-               prev_token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Draft logits and per-position acceptance confidence.
-
-        ``target_logits_fn`` must be the TARGET's own logits method, not its head
-        weight. Under tensor parallelism that head is vocabulary-parallel: a bare
-        ``F.linear`` against it returns this rank's vocabulary SLICE, while the Markov
-        bias is full-vocabulary because the head is replicated. Adding the two would
-        line a [B, vocab/tp] tensor up against a [B, vocab] one -- broadcasting either
-        into nonsense or a shape error, depending on the TP size. Going through the
-        target's method keeps the all-gather in one place.
-        """
-        markov = self.markov_head.embed(prev_token_ids)
-        logits = target_logits_fn(head_hidden) + self.markov_head.bias(markov)
-        return logits, self.confidence_head(head_hidden, markov)
+    def sample_block(
+        self,
+        base_logits: torch.Tensor,
+        head_hidden: torch.Tensor,
+        anchor: torch.Tensor,
+        sampling_params: Sequence,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Equation 4/5/7 over ``[request, gamma, ...]`` backbone outputs."""
+        requests, gamma, vocab = base_logits.shape
+        if len(sampling_params) != requests:
+            raise ValueError(
+                f"got {len(sampling_params)} sampling parameter sets for {requests} requests"
+            )
+        prev = anchor.long()
+        proposed = torch.empty(
+            (requests, gamma), dtype=torch.long, device=base_logits.device
+        )
+        q = torch.empty(
+            (requests, gamma, vocab), dtype=torch.float32, device=base_logits.device
+        )
+        confidence = torch.empty(
+            (requests, gamma), dtype=torch.float32, device=base_logits.device
+        )
+        for k in range(gamma):
+            markov = self.markov_head.embed(prev)
+            logits_k = base_logits[:, k].float() + self.markov_head.bias(markov).float()
+            step_tokens = []
+            for r, params in enumerate(sampling_params):
+                q_r = sampling_probs(
+                    logits_k[r : r + 1],
+                    params.temperature,
+                    params.top_p,
+                    params.top_k,
+                )
+                q[r, k].copy_(q_r[0])
+                step_tokens.append(
+                    q_r.argmax(dim=-1)
+                    if params.is_greedy
+                    else torch.multinomial(q_r, 1).squeeze(-1)
+                )
+            next_token = torch.cat(step_tokens)
+            proposed[:, k].copy_(next_token)
+            confidence[:, k].copy_(
+                self.confidence_head(head_hidden[:, k], markov)
+            )
+            prev = next_token
+        return proposed.flatten(), q.flatten(0, 1), confidence.flatten()
 
 
 def accepted_prefix(
@@ -434,117 +671,75 @@ def rejection_accept(
     return n, int(torch.multinomial(p[n], 1, generator=generator))
 
 
-def draft_width(confidence: torch.Tensor, threshold: float, block_size: int) -> int:
-    """How many of the block's positions are worth verifying.
+def rejection_accept_device(
+    proposed: torch.Tensor,
+    q: torch.Tensor,
+    p: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[int, int]:
+    """Device-resident form of vLLM's standard rejection sampler.
 
-    The confidence head scores each drafted position. Verification costs a full target
-    pass over whatever width it covers, so carrying tail positions the drafter itself
-    doubts is paid-for work that will be thrown away. Cut the block at the first
-    position that scores below ``threshold``, keeping at least one -- that is the
-    "adaptive" in adaptive verification.
+    The acceptance ratios, prefix break, residual distribution, and recovered-token
+    draw stay on the logits device.  Only the accepted length and recovered token
+    cross to the host, which the scheduler needs to resize the request.  This has the
+    same p/q rule as :func:`rejection_accept`; it removes the full-vocabulary D2H copy,
+    not any part of the distribution-correct algorithm.
     """
-    below = (confidence < threshold).nonzero()
-    if below.numel() == 0:
-        return min(block_size, int(confidence.numel()))
-    return max(1, int(below[0]))
+    n = int(proposed.numel())
+    if q.shape[0] != n or p.shape[0] < n + 1:
+        raise ValueError(
+            f"rejection sampler shape mismatch: proposed={n}, q={q.shape}, p={p.shape}"
+        )
+    if n:
+        token_ids = proposed.long()
+        rows = torch.arange(n, device=proposed.device)
+        p_token = p[:n][rows, token_ids]
+        q_token = q[:n][rows, token_ids]
+        uniforms = torch.rand(
+            n, device=p.device, dtype=torch.float32, generator=generator
+        )
+        rejected = torch.nonzero(p_token <= uniforms * q_token, as_tuple=False)
+        n_acc = int(rejected[0, 0]) if rejected.numel() else n
+    else:
+        n_acc = 0
 
-
-class StepResult(NamedTuple):
-    """What one speculative step produced."""
-
-    tokens: list[int]      # what the request actually emits, in order
-    drafted: int           # positions the drafter proposed
-    verified: int          # positions verification covered (<= drafted)
-    accepted: int          # positions the target agreed with
-    rolled_back: bool      # whether the compressor carry had to be restored
-
-
-class SpeculativeLoop:
-    """One dSpark step: draft a block, verify it, keep the prefix the target agrees with.
-
-    This class exists for the ORDER, which is where speculative decoding goes wrong in
-    ways that do not crash. Three orderings matter and all three are enforced here:
-
-    1. Snapshot the compressor carry BEFORE drafting. The draft advances it in place;
-       once that has happened the state a rejection must return to no longer exists.
-    2. Choose the verify width from the drafter's confidence BEFORE verifying, not
-       after. Verification costs a full target pass over whatever width it covers, so
-       deciding afterwards spends exactly what the confidence head exists to save.
-    3. Accept a PREFIX, and take the target's own token at the first disagreement. A
-       block therefore always advances by at least one token and can never stall.
-
-    The model-facing operations are injected, so the loop's control flow is testable
-    without a GPU -- and so the same logic serves both the eager and captured paths.
-    """
-
-    def __init__(self, block_size: int, confidence_threshold: float = 0.5,
-                 page_size: int = 128):
-        if block_size < 1:
-            raise ValueError(f"block_size must be >= 1, got {block_size}")
-        self.block_size = block_size
-        self.confidence_threshold = confidence_threshold
-        self.page_size = page_size
-
-    def step(
-        self,
-        *,
-        draft: "Callable[[], tuple[torch.Tensor, torch.Tensor]]",
-        verify: "Callable[[torch.Tensor], torch.Tensor]",
-        positions: torch.Tensor,
-        snapshot=None,
-    ) -> StepResult:
-        """Run one block.
-
-        ``draft()`` returns ``(proposed_ids [k], confidence [k])``.
-        ``verify(tokens [w])`` returns the target's argmax at each of the ``w`` drafted
-        positions plus one more -- the token that follows a fully accepted block.
-        ``positions`` are the block's absolute positions, used only to decide whether a
-        rejection can strand the carry.
-        ``snapshot`` is called BEFORE drafting; its result is restored on rejection.
-        """
-        saved = snapshot() if snapshot is not None else None
-
-        proposed, confidence = draft()
-        width = draft_width(confidence, self.confidence_threshold, self.block_size)
-        proposed = proposed[:width]
-
-        target = verify(proposed)
-        n_accepted, bonus = accepted_prefix(proposed, target)
-
-        tokens = [int(t) for t in proposed[:n_accepted]]
-        if bonus >= 0:
-            tokens.append(bonus)
-
-        rolled_back = False
-        if n_accepted < width and saved is not None:
-            if needs_rollback(n_accepted, positions[:width], self.page_size):
-                saved.restore()
-                rolled_back = True
-        return StepResult(tokens, self.block_size, width, n_accepted, rolled_back)
+    if n_acc < n:
+        residual = torch.clamp(p[n_acc] - q[n_acc], min=0.0)
+        total = residual.sum()
+        # torch.where keeps the degenerate fallback on device; clamp_min only
+        # protects the unselected division branch from producing NaNs.
+        dist = torch.where(
+            total > 0,
+            residual / total.clamp_min(torch.finfo(residual.dtype).tiny),
+            p[n_acc],
+        )
+    else:
+        dist = p[n]
+    bonus = int(torch.multinomial(dist, 1, generator=generator).item())
+    return n_acc, bonus
 
 
 def window_cols_for_block(
     start_pos: int, n: int, window: int, non_causal: bool,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """The window candidate columns a segment's queries may read, as ``[n, window]``.
+    """The window candidate columns a segment's queries may read.
 
     Extracted from ``Attention._prefill_segment`` so the masking rule -- the one thing
     that decides whether a block is genuinely semi-autoregressive -- can be checked
     without a GPU or a KV pool. ``-1`` marks a column no query may read.
 
     Causal: row i sees ``[pos_i - window + 1, pos_i]``.
-    Non-causal: EVERY row sees ``[last - window + 1, last]``, where ``last`` is the
-    block's final position, so each drafted query sees the whole block.
+    Non-causal DSpark: every row sees the trailing ``window`` CONTEXT tokens plus all
+    ``n`` block tokens, matching the paper and vLLM's sparse-index construction.
     """
     end = start_pos + n
+    if non_causal:
+        w_lo = max(0, start_pos - window)
+        width = end - w_lo
+        return torch.arange(width, device=device).unsqueeze(0).expand(n, width)
     w_lo = max(0, start_pos - window + 1)
     ar = torch.arange(window, device=device)
-    if non_causal:
-        last = end - 1
-        lo = max(w_lo, last - window + 1)
-        cand = lo + ar
-        return torch.where(cand > last, -1, cand - w_lo).unsqueeze(0).expand(n, window)
     abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
     cand = (abs_p - window + 1).clamp(min=w_lo) + ar
     return torch.where(cand > abs_p, -1, cand - w_lo)
@@ -552,11 +747,11 @@ def window_cols_for_block(
 
 __all__ = [
     "ConfidenceHead",
+    "DSparkAdaptiveVerification",
     "DSparkDrafter",
     "MarkovHead",
-    "SpeculativeLoop",
-    "StepResult",
     "accepted_prefix",
-    "draft_width",
+    "choose_adaptive_draft_width",
+    "rejection_accept_device",
     "window_cols_for_block",
 ]

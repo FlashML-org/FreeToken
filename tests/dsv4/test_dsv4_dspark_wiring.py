@@ -6,9 +6,8 @@ nobody called:
 * ``logit_indices`` was added so a verify could score every drafted position, then never
   passed. The verify returned one row per request and acceptance died on an IndexError
   four frames away from the cause.
-* ``CarrySnapshot`` was written and tested precisely because a mid-page rejection
-  corrupts the compressor carry in silence -- and was never invoked, so the one failure
-  it existed to prevent was live.
+* Per-token compressor states must be selected after acceptance; restoring a single
+  pre-block snapshot loses any accepted prefix in the same page.
 * ``catch_up_context`` was written to keep the draft layers' window fresh, and never
   called, which reads as a weak drafter rather than a missing call.
 
@@ -20,6 +19,7 @@ package, and behavioural checks that the wiring carries data through.
 from __future__ import annotations
 
 import ast
+import inspect
 import pathlib
 
 import pytest
@@ -64,13 +64,12 @@ def _calls_in_package() -> set[str]:
         ("catch_up_context", "draft layers would attend over a stale window"),
         ("store_context_kv", "draft layers would have no context KV at all"),
         ("propose", "nothing would produce a draft"),
-        ("rejection_accept", "sampled requests would fall back to argmax bias"),
+        ("rejection_accept_device", "sampled requests would fall back to argmax bias"),
         ("accepted_prefix", "greedy requests would have no acceptance rule"),
-        ("draft_width", "the confidence head would score nothing"),
         ("sampling_probs", "q and p would not be shaped like the sampler's draws"),
         ("window_cols_for_block", "the block mask would silently stay causal"),
-        ("restore", "a rejected block would strand the compressor carry"),
-        ("_snapshot_carry", "there would be nothing to restore"),
+        ("_restore_speculative_carry", "acceptance would leave the rejected carry live"),
+        ("_trim_dspark_target_features", "rejected target rows would become draft context"),
         ("draft_into_batch", "the block would keep its noise placeholders"),
         ("_finish_speculative", "nothing would apply acceptance"),
         ("_maybe_make_speculative", "no batch would ever become speculative"),
@@ -93,7 +92,8 @@ class TestSpeculativeStateIsCarried:
     @pytest.mark.parametrize(
         "field",
         ["speculative", "spec_block", "spec_emitted", "draft_probs",
-         "draft_confidence", "carry_snapshot"],
+         "draft_confidence", "draft_tokens", "spec_carry_states",
+         "spec_verify_decode"],
     )
     def test_batch_declares_the_field(self, field):
         import torch
@@ -115,7 +115,30 @@ class TestSpeculativeStateIsCarried:
         assert b.speculative is False
         assert b.spec_block == 0
         assert b.spec_emitted is None
-        assert b.carry_snapshot is None
+        assert b.draft_tokens is None
+        assert b.spec_carry_states is None
+        assert b.spec_verify_decode is False
+
+
+class TestFixedVerifyGraphWiring:
+    def test_target_graph_is_selected_before_ordinary_decode_graph(self):
+        engine = (PKG / "engine" / "engine.py").read_text()
+        spec_at = engine.index("can_use_spec_cuda_graph")
+        decode_at = engine.index("can_use_cuda_graph", spec_at)
+        assert spec_at < decode_at
+
+    def test_graph_replays_graph_owned_partial_states(self):
+        graph = (PKG / "engine" / "graph.py").read_text()
+        assert "journal = self._spec_carry_map[key]" in graph
+        assert "batch.spec_carry_states = journal" in graph
+        assert "prepare_for_spec_replay" in graph
+
+    def test_verify_uses_device_positions_not_a_host_start_position(self):
+        from freetoken.models.deepseek_v4.model import Transformer
+
+        body = inspect.getsource(Transformer.verify_block)
+        assert "pos: torch.Tensor" in body
+        assert "start_pos" not in body
 
 
 class TestVerifyReturnsEveryPosition:

@@ -154,6 +154,10 @@ class Batch:
     # it from a real prefill -- these say so explicitly.
     speculative: bool = field(default=False, init=False)
     spec_block: int = field(default=0, init=False)
+    # GraphRunner sets this only while the target verify graph is capturing/replaying.
+    # It selects DSV4's fixed-shape, device-addressed verify implementation; the eager
+    # prefill implementation remains the fallback when no verify graph is available.
+    spec_verify_decode: bool = field(default=False, init=False)
     draft_confidence: torch.Tensor | None = field(default=None, init=False)
     # Per-request accepted tokens from a speculative step: the reply path emits one
     # token per request, so the rest of each block is read from here.
@@ -161,8 +165,14 @@ class Batch:
     # The draft distribution q for this block, kept so acceptance can run the
     # p/q ratio test rather than an argmax comparison.
     draft_probs: torch.Tensor | None = field(default=None, init=False)
-    # Compressor carry saved before the block advanced it, restored on rejection.
-    carry_snapshot: object | None = field(default=None, init=False)
+    # Tokens produced by the paper's sequential Markov stage, [requests * gamma].
+    # They stay on GPU through verification; only the accepted prefix is copied back.
+    draft_tokens: torch.Tensor | None = field(default=None, init=False)
+    # Per-token compressor partial states produced by a speculative target verify.
+    # FreeToken's compressor ring is page-addressed, so later tokens in the same page
+    # overwrite earlier states.  This journal is the engine-native equivalent of
+    # vLLM's save_partial_states: acceptance selects the state at the last valid row.
+    spec_carry_states: dict | None = field(default=None, init=False)
     # Returns a rejected block's unused pages/SWA slots. Supplied by the scheduler,
     # which owns the cache manager and is what inflated device_len to the block width.
     release_tail: object | None = field(default=None, init=False)

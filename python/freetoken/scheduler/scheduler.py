@@ -230,6 +230,33 @@ class Scheduler(SchedulerIOMixin):
         # table_idx can have its freshly copied prompt clobbered by the prior occupant's
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
+        # Speculation cannot be overlapped as written. The loop below schedules and
+        # LAUNCHES batch N+1 before _process_last_data applies batch N's tokens. Plain
+        # decode survives that because complete_one() pre-advances device_len by exactly
+        # one -- the token count is known before the forward runs, which is why
+        # device_len legitimately leads the buffer by one.
+        #
+        # A speculative block contributes 1..k+1 tokens and the count is only known
+        # AFTER its verify. Overlapped, N+1 is scheduled as though nothing was accepted,
+        # so it re-drafts positions N already consumed. Measured directly:
+        #
+        #   draft ctx: 5 rows, positions 18..22   <- block N
+        #   draft ctx: 5 rows, positions 18..22   <- N+1, same positions, same proposals
+        #   draft ctx: 5 rows, positions 20..24   <- then a jump of two
+        #
+        # which duplicates tokens in the reply and makes the acceptance figure
+        # meaningless.
+        #
+        # vLLM overlaps and corrects for this by threading num_rejected into the next
+        # step's input preparation (valid_ctx_end = ctx_end - num_rejected in its
+        # dflash kernel). Without that correction the only correct option is to drain
+        # first, which costs the overlap but not the answer.
+        if self._speculative is not None and last_data is not None:
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -248,8 +275,10 @@ class Scheduler(SchedulerIOMixin):
         # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
-        self._process_last_data(last_data)
-        self._flush_abort_acks()
+        # None when the speculative drain above already handled it.
+        if last_data is not None:
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -362,14 +391,16 @@ class Scheduler(SchedulerIOMixin):
                     if reply_tokens is not None
                     else [next_token]
                 )
+                block_start = req.input_ids.numel() - len(block)
                 finished = False
                 for pos, tok in enumerate(block):
+                    visible_len = block_start + pos + 1
                     hit_length = not req.can_decode and pos == len(block) - 1
                     hit_eos = (
                         not req.sampling_params.ignore_eos and tok in self.eos_token_ids
                     )
                     matched_stop = (
-                        self._match_stop_str(req)
+                        self._match_stop_str(req, end_len=visible_len)
                         if not hit_eos and req.sampling_params.stop_strs
                         else None
                     )
@@ -384,7 +415,7 @@ class Scheduler(SchedulerIOMixin):
                         and req.toolcall_anchor_len is None
                         and not finished
                     ):
-                        req.toolcall_anchor_len = req.input_ids.numel()
+                        req.toolcall_anchor_len = visible_len
                     reply.append(
                         DetokenizeMsg(
                             uid=req.uid,
@@ -445,17 +476,20 @@ class Scheduler(SchedulerIOMixin):
         )
         self.send_result(reply)
 
-    def _match_stop_str(self, req: Req) -> str | None:
+    def _match_stop_str(self, req: Req, end_len: int | None = None) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
         only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        N chars spans at most N tokens) to keep the per-step cost small. ``end_len``
+        makes a speculative block visible one token at a time: looking at the already-
+        appended whole block would let a stop in token 5 terminate the reply at token 1."""
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end_len = len(req.input_ids) if end_len is None else end_len
+        if end_len <= prompt_len:
             return None
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        tail_start = max(prompt_len, end_len - (max_chars + 1))
+        tail = self.tokenizer.decode(req.input_ids[tail_start:end_len].tolist())
         for s in stop_strs:
             if s in tail:
                 return s
@@ -834,10 +868,19 @@ class Scheduler(SchedulerIOMixin):
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if batch.is_decode or getattr(batch, "speculative", False):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            # A DSpark verify is phase="prefill" but its fixed-shape target graph uses
+            # the same device-addressed snapshot contract.
+            if getattr(batch, "speculative", False):
+                batch.active_table_idx = torch.tensor(
+                    [r.table_idx for r in batch.padded_reqs],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                batch.active_table_idx = input_mapping[0].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -891,21 +934,24 @@ class Scheduler(SchedulerIOMixin):
             self._warned_non_greedy = False
         if spec is None or not batch.is_decode:
             return
-        k = spec.block_size - 1
-        if k < 1:
+        gamma = spec.block_size
+        if gamma < 1:
             return
         for req in batch.reqs:
-            # Room for the block AND its bonus token; a request near its budget just
-            # decodes normally rather than being truncated mid-block.
-            if req.remain_len <= k + 1:
+            # Room for gamma proposals AND the bonus token; equality fits exactly.
+            # A request with less room decodes normally rather than being truncated.
+            if req.remain_len < gamma + 1:
                 return
-        noise = torch.full((k,), spec.noise_token_id, dtype=self.token_pool.dtype)
+        # The target verify has anchor + gamma proposal rows.  The drafter takes the
+        # first gamma of those rows -- anchor + gamma-1 masks -- exactly as DSpark's
+        # sample-from-anchor layout specifies.
+        noise = torch.full((gamma,), spec.noise_token_id, dtype=self.token_pool.dtype)
         for req in batch.reqs:
             req.append_host(noise)
-            req.device_len += k
+            req.device_len += gamma
         batch.phase = "prefill"
         batch.speculative = True
-        batch.spec_block = k
+        batch.spec_block = gamma
         # device_len now covers the whole block, so allocate_paged will size for it.
         # Acceptance keeps only a prefix and must give the rest back through this.
         batch.release_tail = self.cache_manager.release_speculative_tail
@@ -943,8 +989,27 @@ class Scheduler(SchedulerIOMixin):
             # replaces this batch's placeholder token ids in place, so the verify that
             # follows scores the drafter's actual proposal.
             batch.draft_confidence = self.engine.draft_into_batch(batch)
+            self.engine.adapt_speculative_batch(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if getattr(batch, "speculative", False):
+            # output_mapping was prepared before acceptance, when device_len still
+            # pointed past the whole gamma-wide verify span.  A rejection moves each
+            # request's live bonus position independently; writing through the stale
+            # mapping leaves noise at the next cycle's anchor.  Rebuild the tiny mapping
+            # from the post-acceptance frontiers.
+            rows = torch.tensor(
+                [req.table_idx for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            positions = torch.tensor(
+                [req.device_len - 1 for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.token_pool[rows, positions] = forward_output.next_tokens_gpu
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
@@ -952,7 +1017,6 @@ class Scheduler(SchedulerIOMixin):
 class _SpeculativeConfig(NamedTuple):
     block_size: int
     noise_token_id: int
-    confidence_threshold: float
 
 
 def _speculative_config(config) -> "_SpeculativeConfig | None":
@@ -970,7 +1034,6 @@ def _speculative_config(config) -> "_SpeculativeConfig | None":
     return _SpeculativeConfig(
         block_size=args.dspark_block_size,
         noise_token_id=args.dspark_noise_token_id,
-        confidence_threshold=float(ENV.DSPARK_CONFIDENCE_THRESHOLD.value),
     )
 
 

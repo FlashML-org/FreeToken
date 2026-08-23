@@ -4,6 +4,7 @@ import gc
 import math
 import glob
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -304,10 +305,33 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+# FREETOKEN_SPEC_DEBUG=1 dumps the first few blocks' token flow.
+_SPEC_DEBUG = os.environ.get("FREETOKEN_SPEC_DEBUG", "0") == "1"
+# Diagnostic only: synchronize and report the first speculative cycles by stage.
+# Disabled by default because the per-cycle synchronization deliberately removes overlap.
+_SPEC_TIMING = os.environ.get("FREETOKEN_SPEC_TIMING", "0") == "1"
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+
+
+def _cpu_moe_max_tokens(config: EngineConfig) -> int:
+    """Largest row count one CPU-expert task can receive.
+
+    Ordinary decode has one row per request.  DSpark target verification has the
+    anchor plus ``gamma`` proposal rows per request, while the draft itself has only
+    ``gamma``; therefore ``1 + gamma`` is the required upper bound.
+    """
+    rows_per_req = 1
+    dsv4 = getattr(config.model_config, "dsv4_args", None)
+    if getattr(dsv4, "dspark_enabled", False):
+        rows_per_req = 1 + max(
+            1, int(getattr(dsv4, "dspark_block_size", 1) or 1)
+        )
+    max_reqs = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+    return max_reqs * rows_per_req
 
 
 def _bind_rank_to_numa_node(tp_info) -> None:
@@ -455,8 +479,9 @@ class Engine:
         # Speculative accounting: acceptance rate is the one number that says whether
         # speculation is paying for itself, and it cannot be inferred from tokens/s.
         self._spec_accepted = 0
+        self._spec_debug_left = 6
         self._spec_drafted = 0
-        self.spec_threshold = float(ENV.DSPARK_CONFIDENCE_THRESHOLD.value)
+        self._spec_timing_left = 12
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -544,6 +569,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        self._init_dspark_adaptive_verification()
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -788,7 +814,6 @@ class Engine:
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.draft_layer_ids = draft_layer_ids
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -853,17 +878,11 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         #
-        # A dSpark verify carries block_size ROWS per request, not one: the last
-        # committed token plus the drafted block. max_tokens sizes the C++ pool's
+        # A dSpark target verify carries 1 + block_size ROWS per request: the anchor
+        # plus every drafted token. max_tokens sizes the C++ pool's
         # per-task scratch, so a pool built for one row per request would be handed
-        # block_size times that and overrun it.
-        rows_per_req = 1
-        dsv4 = getattr(config.model_config, "dsv4_args", None)
-        if getattr(dsv4, "dspark_enabled", False):
-            rows_per_req = max(1, int(getattr(dsv4, "dspark_block_size", 1) or 1))
-        max_tokens = max(
-            config.max_running_req * rows_per_req, config.cuda_graph_max_bs or 0, 1
-        )
+        # more rows than it owns and overrun it.
+        max_tokens = _cpu_moe_max_tokens(config)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -1086,9 +1105,107 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        self._init_dspark_adaptive_verification()
+
+    def _init_dspark_adaptive_verification(self) -> None:
+        """Install the paper's measured-cost scheduler when every prefix is captured."""
+        self._adaptive_verification = None
+        curve = list(getattr(self.graph_runner, "spec_verify_cost_curve", ()) or ())
+        block_size = int(getattr(self.graph_runner, "spec_block_size", 0) or 0)
+        if not curve or block_size < 1:
+            return
+        if self.config.max_running_req != 1:
+            logger.warning_rank0(
+                "DSpark adaptive verification needs the paper's marker-tensor varlen "
+                "layout for request batches >1; using fixed gamma for this run"
+            )
+            return
+
+        # Every TP rank must select the same graph shape.  vLLM broadcasts its
+        # profiled cost curves from rank 0; do exactly that rather than letting
+        # small per-GPU timing noise choose different collective graphs.
+        tp = get_tp_info()
+        if tp.size > 1:
+            payload = [curve if tp.is_primary() else None]
+            torch.distributed.broadcast_object_list(
+                payload, src=0, group=self.tp_cpu_group
+            )
+            curve = payload[0]
+        from freetoken.models.deepseek_v4.dspark import DSparkAdaptiveVerification
+
+        self._adaptive_verification = DSparkAdaptiveVerification(
+            block_size, curve, self.device
+        )
+
+    def adapt_speculative_batch(self, batch: Batch) -> None:
+        """Compact one prepared DSpark block to the paper-selected prefix width.
+
+        Allocation deliberately remains at gamma until acceptance, so abandoned
+        page/window slots are still returned by ``release_speculative_tail``.  Only
+        the target's input views and metadata shrink before graph replay.
+        """
+        manager = self._adaptive_verification
+        if manager is None:
+            return
+        if len(batch.reqs) != 1 or batch.padded_size != 1:
+            raise RuntimeError(
+                "adaptive DSpark compaction currently requires one unpadded request"
+            )
+        confidence = batch.draft_confidence
+        if confidence is None:
+            raise RuntimeError("adaptive DSpark received no confidence probabilities")
+
+        max_width = int(batch.spec_block)
+        if max_width != manager.block_size:
+            raise RuntimeError(
+                f"DSpark prepared width {max_width}, expected checkpoint gamma "
+                f"{manager.block_size}"
+            )
+        req = batch.reqs[0]
+        width = manager.record_and_choose(confidence, req.uid)
+        if width == max_width:
+            return
+        if not 0 <= width < max_width:
+            raise RuntimeError(f"adaptive DSpark selected invalid width {width}")
+
+        base = req.input_ids.numel() - max_width
+        span = width + 1
+        req.input_ids = req._ids_buf[: base + width]
+        batch.input_ids = batch.input_ids[:span]
+        batch.positions = batch.positions[:span]
+        if batch.out_loc is not None:
+            batch.out_loc = batch.out_loc[:span]
+        if batch.draft_tokens is None or batch.draft_probs is None:
+            raise RuntimeError("adaptive DSpark cannot compact a missing draft")
+        batch.draft_tokens = batch.draft_tokens[:width]
+        batch.draft_probs = batch.draft_probs[:width]
+        batch.draft_confidence = confidence[:width]
+        segments = getattr(batch.attn_metadata, "segments", None)
+        if segments is None or len(segments) != 1:
+            raise RuntimeError("adaptive DSpark needs one target metadata segment")
+        _off, _old_n, table_idx, start_pos = segments[0]
+        batch.attn_metadata.segments = [(0, span, table_idx, start_pos)]
+        batch.spec_block = width
+
+    def _record_adaptive_draft_cost(self, batch: Batch) -> None:
+        """Publish rank-0's real drafter time to the shared five-sample profile."""
+        manager = self._adaptive_verification
+        if manager is None or not manager.needs_draft_profile:
+            return
+        start = getattr(batch, "_spec_draft_start", None)
+        end = getattr(batch, "_spec_draft_end", None)
+        if start is None or end is None:
+            raise RuntimeError("adaptive DSpark draft timing events are missing")
+        tp = get_tp_info()
+        cost = start.elapsed_time(end) if tp.is_primary() else 0.0
+        if tp.size > 1:
+            shared = torch.tensor([cost], dtype=torch.float64)
+            torch.distributed.broadcast(shared, src=0, group=self.tp_cpu_group)
+            cost = float(shared.item())
+        manager.record_draft_cost(cost)
 
     def _finish_speculative(
-        self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs
+        self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs, target_features
     ) -> ForwardOutput:
         """Keep the prefix of each block the target agrees with, and collapse the rest.
 
@@ -1104,14 +1221,11 @@ class Engine:
         """
         from freetoken.models.deepseek_v4.dspark import (
             accepted_prefix,
-            draft_width,
-            rejection_accept,
+            rejection_accept_device,
             sampling_probs,
         )
 
         k = batch.spec_block
-        sp = batch.reqs[0].sampling_params
-        greedy = sp.is_greedy
         # Acceptance reads one logits row per position of every block. Getting fewer
         # means the verify scored only each request's LAST token -- the default for a
         # prefill -- and the failure would otherwise surface as an opaque IndexError
@@ -1124,27 +1238,56 @@ class Engine:
                 "pass logit_indices covering every drafted position."
             )
         # Not self.sampler: a speculative batch has 1+k ROWS per request while the
-        # sampling args are sized per REQUEST.
-        target_cpu = logits.argmax(dim=-1).to("cpu", non_blocking=False).to(torch.int32)
-        p = None if greedy else sampling_probs(
-            logits.cpu(), sp.temperature, sp.top_p, sp.top_k
-        )
-        q = None if greedy else batch.draft_probs.cpu()
+        # sampling args are sized per REQUEST.  Greedy verification reduces the
+        # [rows, vocab] logits on the GPU and transfers only one int per row.  Copying
+        # the whole matrix to the CPU was ~3 MiB per six-row cycle and then repeated
+        # the reduction on the slower side of PCIe.
+        target_cpu = logits.argmax(dim=-1).to(torch.int32).to("cpu", non_blocking=False)
+        # The blocking target copy above proves the draft events have completed.
+        # Record the five startup samples here, after target launch, so timing the
+        # drafter never introduces a synchronization between draft and verify.
+        self._record_adaptive_draft_cost(batch)
+        any_sampled = any(not req.sampling_params.is_greedy for req in batch.reqs)
+        if any_sampled and batch.draft_probs is None:
+            raise RuntimeError("sampled DSpark verification is missing draft probabilities")
         confidence = batch.draft_confidence
+        proposed_gpu = batch.draft_tokens
+        if proposed_gpu is None or proposed_gpu.numel() != k * len(batch.reqs):
+            raise RuntimeError(
+                "DSpark verify is missing the gamma proposals produced by its sequential stage"
+            )
+        proposed_cpu = proposed_gpu.to("cpu", non_blocking=False).to(torch.int32)
 
         emitted: list[torch.Tensor] = []
-        any_rejected = False
         release_tail = getattr(batch, "release_tail", None)
+        selected_rows: list[int] = []
+        accepted_counts: list[int] = []
         off = 0
         for i, req in enumerate(batch.reqs):
+            sp = req.sampling_params
+            greedy = sp.is_greedy
             span = 1 + k                       # this request's rows in the flat batch
-            start = req.device_len - k         # where the block began
-            proposed = req.input_ids[start:start + k]
-            width = k
-            if confidence is not None:
-                width = draft_width(
-                    confidence[off + 1:off + span], self.spec_threshold, k
+            # Where the block begins IN THE BUFFER. Not device_len - k: device_len runs
+            # one ahead of the buffer during decode (see the write-back above), so that
+            # form silently yielded k-1 proposals -- a short slice, not an error.
+            start = req.input_ids.numel() - k
+            proposed = proposed_cpu[i * k:(i + 1) * k]
+            # A VIEW of _ids_buf, which the accept path overwrites below. Snapshot it
+            # for the debug line, or the log shows post-mutation values and invents
+            # agreements that never happened.
+            proposed_snapshot = proposed.clone() if _SPEC_DEBUG else None
+            if proposed.numel() != k:
+                raise RuntimeError(
+                    f"block has {proposed.numel()} proposals, expected {k}; the "
+                    "request's buffer and the batch's block width disagree"
                 )
+            # Fixed-width verification is the paper/vLLM fallback when the profiled
+            # hardware-aware scheduler is disabled.  A static per-token threshold is
+            # deliberately not used: DSpark section 3.2 schedules a GLOBAL token budget
+            # from cumulative survival probabilities and the measured draft/verify cost
+            # curves.  Until that manager is ported, verify the full gamma without
+            # claiming that the confidence head is itself a threshold rule.
+            width = k
             # A block emits n_acc accepted tokens PLUS the bonus token, so it can carry
             # up to width+1 past `start`. Nothing upstream clamps that to the request's
             # output budget: a block that starts with 2 tokens left would write 6, run
@@ -1161,15 +1304,22 @@ class Engine:
                 # Sampled: accept with probability min(1, p(x)/q(x)) and resample from
                 # the residual on rejection, so the emitted token stays exactly
                 # p-distributed. An argmax comparison here would bias towards the mode.
-                n_acc, bonus = rejection_accept(
-                    proposed[:width],
-                    q[off:off + width],
-                    p[off:off + width + 1],
+                p_req = sampling_probs(
+                    logits[off:off + width + 1],
+                    sp.temperature,
+                    sp.top_p,
+                    sp.top_k,
                 )
-            if n_acc < width:
-                any_rejected = True
+                assert batch.draft_probs is not None
+                n_acc, bonus = rejection_accept_device(
+                    proposed_gpu[i * k:i * k + width],
+                    batch.draft_probs[i * k:i * k + width],
+                    p_req,
+                )
             keep = start + n_acc
-            req.input_ids = req._ids_buf[:keep]
+            req.input_ids = req._ids_buf[:start]
+            if n_acc:
+                req.append_host(proposed[:n_acc].to(req.input_ids.dtype))
             req.append_host(torch.tensor([bonus], dtype=req.input_ids.dtype))
             # Hand back the pages and SWA slots of the positions this block did not
             # keep, BEFORE device_len drops past them. allocate_paged sized itself from
@@ -1177,22 +1327,43 @@ class Engine:
             # current length -- so what is not released here is leaked until the next
             # idle integrity check fails, far from the cause.
             if release_tail is not None:
-                release_tail(req, keep + 1)
+                release_tail(req, keep)
             req.cached_len, req.device_len = keep, keep + 1
             emitted.append(
                 torch.cat([proposed[:n_acc], torch.tensor([bonus], dtype=torch.int32)])
             )
+            if _SPEC_DEBUG and self._spec_debug_left > 0:
+                self._spec_debug_left -= 1
+                # One block's whole token flow, in the order acceptance sees it. Reading
+                # this beats reasoning about the indices: the greedy output showed every
+                # word duplicated ("are are", "first first"), which is an emission fault,
+                # and only the actual tokens say where.
+                logger.info_rank0(
+                    "spec block: greedy=%s temp=%s topp=%s conf=%s "
+                    "committed=%s proposed=%s target=%s width=%d n_acc=%d bonus=%s "
+                    "emitted=%s",
+                    greedy, sp.temperature, sp.top_p,
+                    None if confidence is None else
+                    [round(float(c), 3) for c in confidence[i * k:(i + 1) * k]],
+                    int(req._ids_buf[start - 1]) if start > 0 else None,
+                    proposed_snapshot[:width].tolist(),
+                    target_cpu[off:off + width + 1].tolist(),
+                    width, n_acc, bonus,
+                    emitted[-1].tolist() if emitted else None,
+                )
             self._spec_accepted += n_acc
             self._spec_drafted += width
+            selected_rows.append(off + n_acc)
+            accepted_counts.append(n_acc)
             off += span
 
-        # Undo the carry the verify advanced across positions this block did not keep.
-        # The compressor's state is a reduction over the tokens seen, not a function of
-        # the KV, so a stranded carry cannot be rebuilt -- the request would simply
-        # continue from state that saw tokens it never emitted.
-        snap = getattr(batch, "carry_snapshot", None)
-        if any_rejected and snap is not None:
-            snap.restore()
+        # Select the target's saved compressor state after anchor + accepted prefix.
+        # Later rejected rows may share its 128-token page and overwrite the live ring.
+        self._restore_speculative_carry(batch, selected_rows)
+        committed_features = self._trim_dspark_target_features(
+            target_features, batch, accepted_counts
+        )
+        self._commit_dspark_target_features(committed_features)
 
         # The reply path reads one token per request; hand it the LAST emitted token and
         # let the scheduler read the rest off req.input_ids, which already holds them.
@@ -1203,32 +1374,91 @@ class Engine:
         done.record(self.stream)
         return ForwardOutput(gpu, last, done)
 
-    def _snapshot_carry(self, batch: Batch):
-        """Save the compressor carry a rejected block would strand, or None.
-
-        Only the page each request is currently in can be stranded: a rejection in a
-        LATER page leaves the surviving page untouched, and the abandoned pages take
-        their ring blocks with them.
-        """
-        from freetoken.models.deepseek_v4.rollback import CarrySnapshot
-
-        layers = getattr(self.model, "_transformer", None)
-        if layers is None or not batch.reqs:
-            return None
-        try:
-            slots = torch.stack([
-                self.attn_backend.window_slots_of(r.table_idx, r.cached_len - 1, r.cached_len)
-                .reshape(())
-                for r in batch.reqs
-            ])
-            return CarrySnapshot(
-                self.attn_backend, [b.attn for b in layers.layers], slots
+    def _restore_speculative_carry(self, batch: Batch, selected_rows: list[int]) -> None:
+        """Commit the per-token partial state selected by DSpark acceptance."""
+        journal = batch.spec_carry_states
+        if not journal:
+            raise RuntimeError("a DSpark target verify produced no compressor partial states")
+        device_rows = torch.tensor(selected_rows, dtype=torch.long, device=self.device)
+        md = batch.attn_metadata
+        table_rows = torch.tensor(
+            [md.segments[i][2] for i in range(len(selected_rows))],
+            dtype=torch.long,
+            device=self.device,
+        )
+        positions = batch.positions.index_select(0, device_rows).long()
+        slots = self.attn_backend.window_slots_at(table_rows, positions)
+        for (layer_id, tier, ring_size), pieces in journal.items():
+            if len(pieces) != batch.input_ids.numel():
+                raise RuntimeError(
+                    f"DSpark partial-state journal for layer {layer_id}/{tier} has "
+                    f"{len(pieces)} rows, expected {batch.input_ids.numel()}"
+                )
+            states = torch.cat(pieces, dim=0).index_select(0, device_rows)
+            self.attn_backend.write_carry_blocks(
+                layer_id, tier, slots, ring_size, states
             )
-        except Exception as exc:  # a snapshot is an optimization for correctness, not
-            # a correctness requirement on its own -- but say so, loudly, rather than
-            # silently running without the ability to undo a rejection.
-            logger.warning_rank0(f"dSpark: no carry snapshot this step ({exc})")
-            return None
+
+    def _trim_dspark_target_features(self, features, batch: Batch, accepted: list[int]):
+        """Keep target features through each request's accepted predecessor row."""
+        if features is None:
+            raise RuntimeError("a DSpark target verify returned no target features")
+        from freetoken.models.deepseek_v4.model import DSparkTargetFeatures
+
+        segments = batch.attn_metadata.segments
+        if segments is None or len(segments) != len(accepted):
+            raise RuntimeError(
+                "DSpark feature trimming needs one target segment per accepted count"
+            )
+        indices = []
+        for (off, _n, _ti, _start), n_acc in zip(segments, accepted, strict=True):
+            indices.append(
+                torch.arange(off, off + n_acc + 1, dtype=torch.long, device=self.device)
+            )
+        idx = torch.cat(indices)
+        if features.hidden.shape[0] != batch.input_ids.numel():
+            raise RuntimeError(
+                f"DSpark target returned {features.hidden.shape[0]} feature rows for "
+                f"{batch.input_ids.numel()} verify inputs"
+            )
+        return DSparkTargetFeatures(
+            features.hidden.index_select(0, idx),
+            features.positions.index_select(0, idx),
+            features.table_rows.index_select(0, idx),
+        )
+
+    def _real_dspark_target_features(self, features, batch: Batch):
+        """Drop CUDA-graph padding rows before context KV is committed."""
+        if features is None or batch.is_prefill or features.hidden.shape[0] == batch.size:
+            return features
+        from freetoken.models.deepseek_v4.model import DSparkTargetFeatures
+
+        if features.hidden.shape[0] < batch.size:
+            raise RuntimeError(
+                f"target produced {features.hidden.shape[0]} feature rows for "
+                f"{batch.size} real decode requests"
+            )
+        idx = torch.arange(batch.size, dtype=torch.long, device=self.device)
+        return DSparkTargetFeatures(
+            features.hidden.index_select(0, idx),
+            features.positions.index_select(0, idx),
+            features.table_rows.index_select(0, idx),
+        )
+
+    def _commit_dspark_target_features(self, features) -> None:
+        """Precompute draft context KV as soon as target rows become committed.
+
+        vLLM performs this precompute immediately before its next proposal.  FreeToken
+        cannot safely retain one model-global bundle across unrelated prefill/decode
+        batches (or across several captured batch sizes), so it performs the same write
+        once the target rows are known to be valid.  The next proposal observes the
+        identical draft-layer KV without stale cross-request ownership.
+        """
+        if features is None:
+            return
+        catch_up = getattr(self.model, "catch_up_draft_context", None)
+        if catch_up is not None:
+            catch_up(features)
 
     def draft_into_batch(self, batch: Batch) -> torch.Tensor | None:
         """Fill a speculative batch's placeholder positions with the drafter's proposal.
@@ -1244,58 +1474,95 @@ class Engine:
 
         Returns the confidence per position, or None when the model cannot draft yet.
         """
-        from freetoken.models.deepseek_v4.dspark import sampling_probs
-
         drafter = getattr(self.model, "draft", None)
         if drafter is None:
             return None
-        # Snapshot the compressor carry BEFORE anything advances it. The verify pass
-        # walks the compressor across the whole block; if the block is then partly
-        # rejected, the carry the next real step must read has already been overwritten
-        # in place, and nothing else can rebuild it.
-        batch.carry_snapshot = self._snapshot_carry(batch)
+        measure_draft = (
+            self._adaptive_verification is not None
+            and self._adaptive_verification.needs_draft_profile
+        ) or (_SPEC_TIMING and self._spec_timing_left > 0)
+        if measure_draft:
+            batch._spec_wall_start = time.perf_counter()
+            batch._spec_draft_start = torch.cuda.Event(enable_timing=True)
+            batch._spec_draft_end = torch.cuda.Event(enable_timing=True)
+            batch._spec_draft_start.record(self.stream)
         with self.ctx.forward_batch(batch):
-            # Give the draft layers KV for the positions the target has committed since
-            # the last step. Without it they attend over a stale window and propose
-            # badly -- which reads as a weak drafter, not a missing call.
-            catch_up = getattr(self.model, "catch_up_draft_context", None)
-            if catch_up is not None:
-                catch_up(batch)
-            out = drafter()
+            out = drafter(
+                [req.sampling_params for req in batch.reqs],
+            )
+        if measure_draft:
+            batch._spec_draft_end.record(self.stream)
         if out is None:
-            return None
-        draft_logits, confidence = out
-        # q must be the distribution the sampler would DRAW from, not the raw softmax:
-        # the ratio test compares q against a target p shaped the same way.
-        sp = batch.reqs[0].sampling_params
-        q = sampling_probs(draft_logits, sp.temperature, sp.top_p, sp.top_k)
-        # Draft by SAMPLING from q, not by taking its argmax. Speculative sampling's
-        # guarantee assumes the proposal was drawn from q; an argmax proposal is not,
-        # and the acceptance probabilities would no longer preserve p.
-        proposed = (
-            q.argmax(dim=-1) if sp.is_greedy
-            else torch.multinomial(q, 1).squeeze(-1)
-        )
-        # Position i's logits predict i+1, so the proposal for the block's positions
-        # 1..k is proposed[0..k-1]; the last entry predicts past the block and is dropped.
-        batch.input_ids[1:] = proposed[:-1].to(batch.input_ids.dtype)
+            raise RuntimeError("DSpark was scheduled without a loaded drafter")
+        proposed, q, confidence = out
+        k = batch.spec_block
+        span = 1 + k
+        if proposed.numel() != k * len(batch.reqs):
+            raise RuntimeError(
+                f"DSpark proposed {proposed.numel()} tokens, expected "
+                f"{k} x {len(batch.reqs)}"
+            )
+        for i in range(len(batch.reqs)):
+            batch.input_ids[i * span + 1:(i + 1) * span].copy_(
+                proposed[i * k:(i + 1) * k].to(batch.input_ids.dtype)
+            )
+        batch.draft_tokens = proposed
         batch.draft_probs = q
+        batch.spec_carry_states = {}
         return confidence
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        target_features = None
+        timing = bool(
+            batch.speculative and _SPEC_TIMING and self._spec_timing_left > 0
+        )
+        if timing:
+            target_start = torch.cuda.Event(enable_timing=True)
+            target_end = torch.cuda.Event(enable_timing=True)
+            target_start.record(self.stream)
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if self.graph_runner.can_use_spec_cuda_graph(batch):
+                logits = self.graph_runner.replay_spec(batch)
+                target_features = self.graph_runner.dspark_spec_target_features(batch)
+            elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+                target_features = self.graph_runner.dspark_target_features(batch)
             else:
                 logits = self.model.forward()
+                get_features = getattr(self.model, "dspark_target_features", None)
+                target_features = get_features() if get_features is not None else None
+        if timing:
+            target_end.record(self.stream)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
         if batch.speculative:
-            return self._finish_speculative(batch, logits, args)
+            finish_wall_start = time.perf_counter()
+            output = self._finish_speculative(batch, logits, args, target_features)
+            if timing:
+                cycle_end = torch.cuda.Event(enable_timing=True)
+                cycle_end.record(self.stream)
+                cycle_end.synchronize()
+                draft_start = batch._spec_draft_start
+                draft_end = batch._spec_draft_end
+                logger.info_rank0(
+                    "spec timing: draft_cuda=%.2fms target_cuda=%.2fms "
+                    "post_cuda=%.2fms finish_wall=%.2fms cycle_wall=%.2fms",
+                    draft_start.elapsed_time(draft_end),
+                    target_start.elapsed_time(target_end),
+                    target_end.elapsed_time(cycle_end),
+                    (time.perf_counter() - finish_wall_start) * 1000,
+                    (time.perf_counter() - batch._spec_wall_start) * 1000,
+                )
+                self._spec_timing_left -= 1
+            return output
+
+        self._commit_dspark_target_features(
+            self._real_dspark_target_features(target_features, batch)
+        )
 
         for req in batch.reqs:
             req.complete_one()

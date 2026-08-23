@@ -33,31 +33,39 @@ def _fn(name: str) -> str:
 
 
 class TestTheTapCarriesItsAddressing:
-    def test_every_site_that_stores_the_tap_stores_positions(self):
-        # The two forwards (ragged prefill, batched decode) each write the tap. A third
-        # that writes only the tensor would leave last_aux_addressing stale, and the
-        # drafter would silently address the wrong step.
-        sites = SRC.count("self._last_aux_hidden = torch.cat(aux, dim=-1)")
-        writes = SRC.count("self._last_aux_positions = ")
-        assert writes >= sites, (
-            f"{sites} sites store the tap but only {writes} store its positions"
-        )
+    def test_prefill_and_decode_build_one_feature_bundle(self):
+        assert SRC.count("DSparkTargetFeatures(") >= 2
 
     def test_addressing_is_exposed_as_one_unit(self):
-        from freetoken.models.deepseek_v4.model import Transformer
+        from freetoken.models.deepseek_v4.model import DSparkTargetFeatures
 
-        assert hasattr(Transformer, "last_aux_addressing"), (
-            "positions and rows must be readable together with the tap"
-        )
+        assert set(DSparkTargetFeatures.__dataclass_fields__) == {
+            "hidden", "positions", "table_rows"
+        }
 
     def test_addressing_returns_none_until_a_forward_has_run(self):
         from freetoken.models.deepseek_v4.model import Transformer
 
         t = Transformer.__new__(Transformer)
-        t._last_aux_hidden = None
-        t._last_aux_positions = None
-        t._last_aux_rows = None
-        assert t.last_aux_addressing() is None
+        t._target_features = None
+        assert t.target_features() is None
+
+    def test_tap_reshape_reads_the_dimension_from_model_args(self):
+        # Transformer has no direct ``dim`` field. This typo survives source-only
+        # wiring tests and crashes only when the first real aux tap runs.
+        assert "self.dim * len(aux)" not in SRC
+        assert SRC.count("self.args.dim * len(aux)") == 3
+
+    def test_cuda_graph_features_are_owned_per_captured_batch_size(self):
+        graph_src = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "python" / "freetoken" / "engine" / "graph.py"
+        ).read_text()
+        assert "self._dspark_feature_map[bs] = features" in graph_src
+        assert "self._dspark_feature_map.get(batch.padded_size)" in graph_src
+        assert "self._spec_feature_map[key] = features" in graph_src
+        assert "self._spec_carry_map[key]" in graph_src
+        assert "shared_carry if shared_carry is not None" in graph_src
 
 
 class TestTheCatchUpUsesTheTapsOwnPositions:
@@ -69,8 +77,10 @@ class TestTheCatchUpUsesTheTapsOwnPositions:
                 "forward's, so the current batch's positions address the wrong tokens"
             )
 
-    def test_it_takes_addressing_from_the_transformer(self):
-        assert "last_aux_addressing()" in _fn("catch_up_draft_context")
+    def test_it_takes_one_explicit_feature_bundle(self):
+        body = _fn("catch_up_draft_context")
+        for field in ("features.hidden", "features.positions", "features.table_rows"):
+            assert field in body
 
     def test_a_row_count_mismatch_is_an_error_not_a_silent_skip(self):
         # Truncating to the shorter of the two would write SOME rows at wrong positions,
