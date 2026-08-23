@@ -1001,10 +1001,17 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
     # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+    # honored, as is an explicit 'naive'. Don't let the DEFAULT max_extend_tokens force a second
+    # chunk within one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the
+    # window pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
+    # An EXPLICIT --max-prefill-length is honored: single-pass prefill allocates O(prompt-len)
+    # activation transients (q/o alone are ~64KB/token at 64 heads x 512 dim), which on tightly
+    # packed cards exhausts free VRAM and kills the backend with "CUDA driver error: device not
+    # ready" (WSL2: dxg make_resident -12) once prompts pass the headroom -- chunking is the
+    # only lever a user has against that, so the override must not silently disable it.
+    if not getattr(config, "max_extend_tokens_explicit", False) and (
+        getattr(config, "max_extend_tokens", 0) < config.max_seq_len
+    ):
         override("max_extend_tokens", config.max_seq_len)
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
