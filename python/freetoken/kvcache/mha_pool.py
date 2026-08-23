@@ -7,9 +7,11 @@ from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
+from .quant import NONE, KVQuantSpec
+from .quant_storage import QuantizedKVStorageMixin
 
 
-class MHAKVCache(BaseKVCachePool):
+class MHAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
     """
     Base class for key-value caches.
     This class defines the interface for key-value caches used in LLMs.
@@ -32,7 +34,9 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        quant: KVQuantSpec = NONE,
     ) -> None:
+        self._quant = quant
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
@@ -47,13 +51,16 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
+        self._compute_dtype = dtype
+        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
         self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+            kv_shape, device=device, dtype=self._buffer_dtype(dtype)
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
+        self._scale_buffer = self._alloc_scales(kv_shape, device)
+        self._k_scale = self._scale_buffer[0] if self._scale_buffer is not None else None
+        self._v_scale = self._scale_buffer[1] if self._scale_buffer is not None else None
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
@@ -70,16 +77,21 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
+        # Drop the scale slab too before reallocating, for the same reason the KV slab is
+        # dropped: holding the old one alive can OOM a rebuild the target size would fit.
+        self._k_scale = None
+        self._v_scale = None
+        self._scale_buffer = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
+        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+        self._kv_buffer = torch.empty(kv_shape, device=device, dtype=dtype)
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
+        self._scale_buffer = self._alloc_scales(kv_shape, device)
+        self._k_scale = self._scale_buffer[0] if self._scale_buffer is not None else None
+        self._v_scale = self._scale_buffer[1] if self._scale_buffer is not None else None
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     @classmethod
@@ -101,7 +113,10 @@ class MHAKVCache(BaseKVCachePool):
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        total = buf.numel() * buf.element_size()
+        if self._scale_buffer is not None:
+            total += self._scale_buffer.numel() * self._scale_buffer.element_size()
+        return int(total) // tokens, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -117,6 +132,12 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._k_scale is None else self._k_scale[self._dense(index)]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._v_scale is None else self._v_scale[self._dense(index)]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -124,15 +145,16 @@ class MHAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
-        from freetoken.kernel import store_cache
-
         dense = self._dense(layer_id)
-        store_cache(
-            k_cache=self._k_buffer[dense].view(self._storage_shape),
-            v_cache=self._v_buffer[dense].view(self._storage_shape),
-            indices=out_loc,
-            k=k,
-            v=v,
+        scale_shape = (self._storage_shape[0], self._storage_shape[1], -1)
+        self._store_kv_into(
+            self._k_buffer[dense].view(self._storage_shape),
+            self._v_buffer[dense].view(self._storage_shape),
+            None if self._k_scale is None else self._k_scale[dense].view(scale_shape),
+            None if self._v_scale is None else self._v_scale[dense].view(scale_shape),
+            out_loc,
+            k,
+            v,
         )
 
     @property
@@ -142,6 +164,10 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._kv_buffer.dtype
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self._compute_dtype
 
     @property
     def num_layers(self) -> int:
