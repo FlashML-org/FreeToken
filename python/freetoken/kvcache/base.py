@@ -21,15 +21,29 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
+    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+
+    An 8-bit KV pool prices at its scheme's bytes per element (1 + 2/32 with the fp16
+    per-block scale amortized), not the compute dtype's -- the whole point of the flag is
+    that this number, times every token of every layer, is what frees VRAM for experts.
+    The index slab stays bf16: it is never quantized.
+    """
+    bytes_per_elem = _kv_bytes_per_element(config)
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2
+    return int(per_token * bytes_per_elem) + spec.index_head_dim * spec.num_index_layers * 2
+
+
+def _kv_bytes_per_element(config) -> float:
+    """Storage bytes per K/V element for this engine config's KV pools."""
+    quant = getattr(config, "kv_quant", None)
+    if quant is None or not quant.enabled:
+        return float(config.dtype.itemsize)
+    return quant.bytes_per_element(config.dtype)
 
 
 class BaseKVCachePool(ABC):

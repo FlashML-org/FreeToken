@@ -89,6 +89,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.quant import KV_CACHE_DTYPES
     from freetoken.moe import SUPPORTED_MOE_BACKENDS
 
     def _parse_moe_cache_rate(value: str) -> float:
@@ -343,6 +344,20 @@ def parse_args(
         type=int,
         default=ServerArgs.page_size,
         help="Set the page size for system management.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=list(KV_CACHE_DTYPES),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "KV-cache element storage. 'auto' keeps the compute dtype (bf16). 'q8_0' and "
+            "'fp8_e4m3' store 8 bits plus an fp16 scale per 32 elements along head_dim "
+            "(1.0625 bytes/element vs 2), freeing VRAM for the MoE expert cache. q8_0 is "
+            "the more accurate of the two at this block size. Needs the triton attention "
+            "backend and head_dim divisible by 32."
+        ),
     )
 
     parser.add_argument(
