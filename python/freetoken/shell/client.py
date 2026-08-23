@@ -253,18 +253,44 @@ class ShellClient:
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         ]
 
-    async def load_model(self, model: str, *, wait: float = 600.0) -> dict[str, Any]:
-        """Switch the served model via ``POST /v1/model/load``.
+    async def load_model(
+        self,
+        model: str,
+        *,
+        wait: float = 600.0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Switch the served model via ``POST /v1/model/load``, streaming load progress.
 
-        Metal-backed servers relaunch their upstream engine for the new model
-        (the old one keeps serving until the new one is ready), so this can
-        block for the download + load; the timeout covers that. Servers without
-        the endpoint (CUDA path) answer 404 and the caller falls back to
-        showing the served model unchanged.
-        """
-        return await self._request_json(
-            "POST", "/v1/model/load", body={"model": model}, timeout=wait
+        The server relaunches its engine for the new model and publishes live
+        progress (phase + byte counts) on ``/health`` while the POST is still in
+        flight. Kicking the POST off as a background task and polling /health
+        alongside it turns the switch into the same live view the startup path
+        renders, instead of an opaque minutes-long hang.
+
+        ``on_progress`` receives each /health doc as the switch runs. If the
+        server is one of those that answers the switch instantly (no load to
+        watch), the POST wins the race and no progress is ever shown."""
+        if on_progress is None:
+            return await self._request_json(
+                "POST", "/v1/model/load", body={"model": model}, timeout=wait
+            )
+        post = asyncio.create_task(
+            self._request_json("POST", "/v1/model/load", body={"model": model}, timeout=wait)
         )
+        try:
+            while not post.done():
+                try:
+                    doc = await self.health()
+                except ShellClientError:
+                    doc = None
+                if isinstance(doc, dict) and doc.get("status") not in (None, "ok"):
+                    on_progress(doc)
+                await asyncio.sleep(READY_POLL_INTERVAL)
+            return await post
+        except BaseException:
+            post.cancel()
+            raise
 
     async def wait_until_ready(
         self,

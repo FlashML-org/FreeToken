@@ -716,8 +716,18 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
                     renderer.write(f"Already serving {model_id}.\n")
                     return
                 renderer.write(f"Switching model to {candidate}...\n")
+
+                def _on_switch_progress(doc: dict) -> None:
+                    nonlocal last_line, last_at
+                    line = _format_load_progress(doc)
+                    now = time.monotonic()
+                    new_phase = line.split(":", 1)[0] != last_line.split(":", 1)[0]
+                    if line == last_line or (not new_phase and now - last_at < LOAD_PROGRESS_INTERVAL):
+                        return
+                    last_line, last_at = line, now
+                    renderer.write(f"{line}\n")
                 try:
-                    doc = await client.load_model(candidate)
+                    doc = await client.load_model(candidate, on_progress=_on_switch_progress)
                 except ShellClientError as exc:
                     if exc.status == 404:
                         renderer.write(

@@ -68,6 +68,10 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(sys.argv[1:] if argv is None else argv)
     backend = resolve_backend(args.backend)
+    # Non-blocking: spawns the upstream and returns while its watcher thread
+    # supervises the load (see _watch_mlx_load). uvicorn binds immediately, so
+    # /health reports live load progress and ft shell can attach and render it
+    # instead of the terminal sitting silent through a 50 GiB download.
     handle: MetalBackendHandle = launch_metal_backend(
         backend, args.model, args.metal_port
     )
@@ -86,7 +90,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         h = _HANDLE["handle"]
         if h is None or not h.is_alive():
             return JSONResponse({"status": "down"}, status_code=503)
-        return {"status": "ok", "backend": backend, "upstream": handle.upstream_base_url}
+        doc = h.health_doc()
+        if doc.get("status") == "error":
+            return JSONResponse(doc, status_code=503)
+        return doc
 
     # The shell/desktop poll /health, /v1/stats and /v1/cache/status every
     # second; hide those from the access log so they don't bury real requests.
