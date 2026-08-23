@@ -106,6 +106,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        quant=getattr(config, "kv_quant", None),
     )
 
 
@@ -116,7 +117,11 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
     num_swa_tokens: int | None = None,
+    quant=None,
 ) -> BaseKVCachePool:
+    from .quant import NONE
+
+    quant = quant if quant is not None else NONE
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -128,6 +133,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            quant=quant,
         )
 
     from .mha_pool import MHAKVCache
@@ -207,6 +213,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        quant=quant,
     )
 
 
