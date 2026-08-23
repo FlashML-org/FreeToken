@@ -29,6 +29,11 @@ EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 # disappear from the log's `layers=` count, which is the quickest way to tell which
 # mode a run was in.
 SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
+# Experimental request-local circuit breaker. A zero acceptance threshold leaves
+# production behavior unchanged. The measured Lenovo A/B starts at 0.60/32/64.
+DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0}"
+DSPARK_FALLBACK_MIN_DRAFTED="${DSPARK_FALLBACK_MIN_DRAFTED:-32}"
+DSPARK_FALLBACK_STEPS="${DSPARK_FALLBACK_STEPS:-64}"
 # Which base dspark_target_layer_ids is read with (0 or 1). Exported so it reaches the
 # rank subprocesses; unset means the model's own default. See the note in model.py --
 # this is settled by measurement, not by the config.
@@ -118,6 +123,14 @@ cmd_start() {
 
     local spec=()
     [ "$SPECULATIVE_DSPARK" = "1" ] && spec=(--speculative-dspark)
+    local fallback=()
+    if [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0" ] && [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0.0" ]; then
+        fallback=(
+            --dspark-fallback-acceptance "$DSPARK_FALLBACK_ACCEPTANCE"
+            --dspark-fallback-min-drafted "$DSPARK_FALLBACK_MIN_DRAFTED"
+            --dspark-fallback-steps "$DSPARK_FALLBACK_STEPS"
+        )
+    fi
 
     echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter})"
     : > "$LOG"
@@ -131,6 +144,7 @@ cmd_start() {
         --max-prefill-length "$MAX_PREFILL_LENGTH" \
         --expert-load "$EXPERT_LOAD" \
         "${spec[@]}" \
+        "${fallback[@]}" \
         >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
 

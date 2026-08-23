@@ -7,7 +7,64 @@ import torch
 
 from freetoken.engine.engine import Engine
 from freetoken.engine.graph import GraphRunner, SharedSpecCarryJournal
-from freetoken.models.deepseek_v4.dspark import choose_adaptive_draft_width
+from freetoken.models.deepseek_v4.dspark import (
+    DSparkAcceptanceFallback,
+    choose_adaptive_draft_width,
+)
+from freetoken.scheduler.scheduler import Scheduler
+
+
+def test_acceptance_fallback_trips_only_after_minimum_sample():
+    fallback = DSparkAcceptanceFallback(0.60, min_drafted=8, cooldown_steps=3)
+
+    assert fallback.record(2, 5) is None
+    trip = fallback.record(1, 3)
+
+    assert trip == pytest.approx((3 / 8, 8))
+
+
+def test_acceptance_fallback_skips_exact_cooldown_then_probes():
+    fallback = DSparkAcceptanceFallback(0.60, min_drafted=4, cooldown_steps=3)
+    assert fallback.record(1, 4) is not None
+
+    assert [fallback.take_decision() for _ in range(3)] == [
+        (False, False),
+        (False, False),
+        (False, False),
+    ]
+    assert fallback.take_decision() == (True, True)
+    assert fallback.take_decision() == (True, False)
+
+
+def test_acceptance_fallback_keeps_high_acceptance_speculating():
+    fallback = DSparkAcceptanceFallback(0.60, min_drafted=8, cooldown_steps=3)
+
+    assert fallback.record(5, 8) is None
+    assert fallback.take_decision() == (True, False)
+
+
+def test_acceptance_fallback_reset_clears_request_state():
+    fallback = DSparkAcceptanceFallback(0.60, min_drafted=4, cooldown_steps=3)
+    fallback.record(1, 4)
+
+    fallback.reset()
+
+    assert fallback.take_decision() == (True, False)
+    assert fallback.record(1, 3) is None
+
+
+def test_scheduler_fallback_bypasses_block_before_appending_noise():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._speculative = SimpleNamespace(block_size=5, noise_token_id=17)
+    scheduler.engine = SimpleNamespace(should_speculate=lambda _req: False)
+    scheduler._warned_non_greedy = False
+    req = SimpleNamespace(remain_len=100, input_ids=torch.tensor([1, 2]))
+    batch = SimpleNamespace(reqs=[req], is_decode=True, phase="decode")
+
+    scheduler._maybe_make_speculative(batch)
+
+    assert batch.phase == "decode"
+    assert req.input_ids.tolist() == [1, 2]
 
 
 def test_profile_cliff_stops_before_expensive_graph_bucket():
