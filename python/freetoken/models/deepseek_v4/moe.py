@@ -51,7 +51,11 @@ class Gate(BaseOP):
 
 
 class Expert(BaseOP):
-    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
+    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4).
+
+    Under TP the intermediate dim splits on its own: ``w1``/``w3`` are column-parallel
+    and ``w2`` row-parallel, so the pair of classes derives the rank-local width and
+    ``w2`` all-reduces this expert's output. The reader supplies the rank's slice."""
 
     def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
         self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
