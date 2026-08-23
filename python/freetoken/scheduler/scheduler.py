@@ -393,6 +393,9 @@ class Scheduler(SchedulerIOMixin):
                 )
                 block_start = req.input_ids.numel() - len(block)
                 finished = False
+                visible_tokens: list[int] = []
+                finish_reason = None
+                matched_stop = None
                 for pos, tok in enumerate(block):
                     visible_len = block_start + pos + 1
                     hit_length = not req.can_decode and pos == len(block) - 1
@@ -416,19 +419,26 @@ class Scheduler(SchedulerIOMixin):
                         and not finished
                     ):
                         req.toolcall_anchor_len = visible_len
-                    reply.append(
-                        DetokenizeMsg(
-                            uid=req.uid,
-                            next_token=tok,
-                            finished=finished,
-                            finish_reason=finish_reason,
-                            matched_stop=matched_stop,
-                            stop_strs=req.sampling_params.stop_strs or None,
-                        )
-                    )
+                    visible_tokens.append(tok)
                     if finished:
                         break  # drop the rest of the block: it is past the reply's end
-                next_token = block[-1]
+                # vLLM carries all newly accepted speculative ids in one engine
+                # output and advances its incremental detokenizer sequentially. Do
+                # the same here. Sending one DetokenizeMsg per token in a single
+                # BatchTokenizerMsg made the old batched decoder append cumulative
+                # prefixes ("pres" + "presidencia" + ...).
+                next_token = visible_tokens[-1]
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        token_ids=visible_tokens if len(visible_tokens) > 1 else None,
+                        finish_reason=finish_reason,
+                        matched_stop=matched_stop,
+                        stop_strs=req.sampling_params.stop_strs or None,
+                    )
+                )
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
