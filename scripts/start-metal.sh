@@ -53,7 +53,7 @@ command -v uv >/dev/null 2>&1 || die "uv not found — install it from https://d
 [[ -x "$PY" ]] || die "no .venv at $ROOT — run: cd $ROOT && uv venv && uv pip install -e . && uv pip install mlx-lm"
 
 # --- pick the engine ---------------------------------------------------------
-BACKEND="mlx"
+BACKEND="auto"
 ARGS=("$@")
 for ((i = 0; i < ${#ARGS[@]}; i++)); do
   case "${ARGS[$i]}" in
@@ -72,11 +72,22 @@ for ((i = 0; i < ${#ARGS[@]}; i++)); do
   esac
 done
 
-if [[ "$BACKEND" == "mlx" ]]; then
-  "$PY" -c "import mlx_lm" 2>/dev/null || die "mlx-lm not installed in .venv — run: uv pip install mlx-lm"
-else
-  command -v llama-server >/dev/null 2>&1 || die "llama-server not on PATH — run: brew install llama.cpp"
-fi
+case "$BACKEND" in
+  mlx)
+    "$PY" -c "import mlx_lm" 2>/dev/null || die "mlx-lm not installed in .venv — run: uv pip install mlx-lm"
+    ;;
+  llama)
+    command -v llama-server >/dev/null 2>&1 || die "llama-server not on PATH — run: brew install llama.cpp"
+    ;;
+  auto)
+    if ! "$PY" -c "import mlx_lm" 2>/dev/null && ! command -v llama-server >/dev/null 2>&1; then
+      die "no Metal backend installed — run: uv pip install mlx-lm, or: brew install llama.cpp"
+    fi
+    ;;
+  *)
+    die "invalid backend '$BACKEND' — expected auto, mlx, or llama"
+    ;;
+esac
 
 # --- port pre-check -----------------------------------------------------------
 # Fail fast and clearly instead of racing another server into "address already in
