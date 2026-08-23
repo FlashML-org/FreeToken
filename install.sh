@@ -174,10 +174,15 @@ install_metal_macos() {
   else
     # Pin the Metal branch until it lands on default. A piped `curl | bash` of
     # this script has no adjacent checkout, so "git+...FreeToken.git" would
-    # otherwise install CUDA-only main and fail on macOS.
+    # otherwise install CUDA-only main and fail on macOS. Prefer FlashML-org;
+    # fall back to the working fork while the PR is open.
     src="git+https://github.com/FlashML-org/FreeToken.git@feat/apple-metal-backend"
+    src_fork="git+https://github.com/jasonkneen/FreeToken.git@feat/apple-metal-backend"
     say "installing from $src"
-    "$UV" pip install --python "$VENV" "$src"
+    if ! "$UV" pip install --python "$VENV" "$src"; then
+      say "FlashML-org does not have feat/apple-metal-backend yet; using $src_fork"
+      "$UV" pip install --python "$VENV" "$src_fork"
+    fi
   fi
   say "installing mlx-lm (Apple Metal engine)"
   "$UV" pip install --python "$VENV" mlx-lm
