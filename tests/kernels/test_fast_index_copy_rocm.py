@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kernel import fast_index_copy as fast_copy
+import freetoken.kernel.fast_index_copy as fast_copy
 
 
 def test_rocm_fallback_copies_only_requested_rows() -> None:
