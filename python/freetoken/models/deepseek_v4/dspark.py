@@ -47,6 +47,73 @@ from .parallel import div_tp
 logger = init_logger(__name__)
 
 
+class DSparkAcceptanceFallback:
+    """Request-local measured-acceptance circuit breaker.
+
+    DSpark's confidence scheduler chooses how many proposals to verify after the
+    drafter has run. It cannot recover that draft cost when a high-entropy request
+    repeatedly rejects the proposals. This controller observes actual target
+    acceptance over a bounded window, temporarily selects ordinary target decoding,
+    and then probes DSpark again. It deliberately knows nothing about the prompt.
+
+    ``take_decision`` returns ``(should_speculate, is_resume_probe)``. A tripped
+    controller skips exactly ``cooldown_steps`` calls before returning one probe.
+    """
+
+    def __init__(
+        self,
+        threshold: float,
+        min_drafted: int,
+        cooldown_steps: int,
+    ) -> None:
+        if not math.isfinite(threshold) or not 0 < threshold <= 1:
+            raise ValueError("DSpark fallback threshold must be in (0, 1]")
+        if min_drafted < 1:
+            raise ValueError("DSpark fallback min_drafted must be >= 1")
+        if cooldown_steps < 1:
+            raise ValueError("DSpark fallback cooldown_steps must be >= 1")
+        self.threshold = float(threshold)
+        self.min_drafted = int(min_drafted)
+        self.cooldown_steps = int(cooldown_steps)
+        self.reset()
+
+    def reset(self) -> None:
+        self.accepted = 0
+        self.drafted = 0
+        self.cooldown_left = 0
+        self._resume_probe = False
+
+    def take_decision(self) -> tuple[bool, bool]:
+        if self.cooldown_left > 0:
+            self.cooldown_left -= 1
+            if self.cooldown_left == 0:
+                self._resume_probe = True
+            return False, False
+        resumed = self._resume_probe
+        self._resume_probe = False
+        return True, resumed
+
+    def record(self, accepted: int, drafted: int) -> tuple[float, int] | None:
+        if drafted < 0 or accepted < 0 or accepted > drafted:
+            raise ValueError(
+                f"invalid DSpark acceptance sample {accepted}/{drafted}"
+            )
+        self.accepted += int(accepted)
+        self.drafted += int(drafted)
+        if self.drafted < self.min_drafted:
+            return None
+
+        measured_drafted = self.drafted
+        rate = self.accepted / measured_drafted
+        self.accepted = 0
+        self.drafted = 0
+        if rate >= self.threshold:
+            return None
+        self.cooldown_left = self.cooldown_steps
+        self._resume_probe = False
+        return rate, measured_drafted
+
+
 def choose_adaptive_draft_width(
     stale_confidence: Sequence[float] | torch.Tensor,
     draft_cost_ms: float,
@@ -108,6 +175,9 @@ class DSparkAdaptiveVerification:
         block_size: int,
         verify_curve: Sequence[tuple[int, float]],
         device: torch.device,
+        fallback_acceptance: float = 0.0,
+        fallback_min_drafted: int = 32,
+        fallback_steps: int = 64,
     ) -> None:
         expected_spans = list(range(1, block_size + 2))
         curve = sorted((int(span), float(cost)) for span, cost in verify_curve)
@@ -136,6 +206,13 @@ class DSparkAdaptiveVerification:
             maxlen=self._DRAFT_PROFILE_SAMPLES
         )
         self._debug_left = 12
+        self._acceptance_fallback = (
+            DSparkAcceptanceFallback(
+                fallback_acceptance, fallback_min_drafted, fallback_steps
+            )
+            if fallback_acceptance > 0
+            else None
+        )
 
     @property
     def needs_draft_profile(self) -> bool:
@@ -166,6 +243,43 @@ class DSparkAdaptiveVerification:
         self._events = [None, None]
         self._stale_idx = 0
         self._active_uid = uid
+        if self._acceptance_fallback is not None:
+            self._acceptance_fallback.reset()
+
+    def should_speculate(self, uid: int) -> bool:
+        if self._active_uid != uid:
+            self._reset_request(uid)
+        fallback = self._acceptance_fallback
+        if fallback is None:
+            return True
+        speculate, resumed = fallback.take_decision()
+        if resumed:
+            logger.info_rank0(
+                "DSpark fallback: request %d probing speculation after %d "
+                "target-only steps",
+                uid,
+                fallback.cooldown_steps,
+            )
+        return speculate
+
+    def record_acceptance(self, uid: int, accepted: int, drafted: int) -> None:
+        if self._active_uid != uid:
+            self._reset_request(uid)
+        fallback = self._acceptance_fallback
+        if fallback is None:
+            return
+        trip = fallback.record(accepted, drafted)
+        if trip is None:
+            return
+        rate, measured_drafted = trip
+        logger.info_rank0(
+            "DSpark fallback: request %d accepted %.1f%% of %d proposals; "
+            "target-only for %d steps",
+            uid,
+            100.0 * rate,
+            measured_drafted,
+            fallback.cooldown_steps,
+        )
 
     def record_and_choose(self, confidence: torch.Tensor, uid: int) -> int:
         """Publish this block's confidence and choose from the stale buffer."""
@@ -762,6 +876,7 @@ def window_cols_for_block(
 
 __all__ = [
     "ConfidenceHead",
+    "DSparkAcceptanceFallback",
     "DSparkAdaptiveVerification",
     "DSparkDrafter",
     "MarkovHead",

@@ -1157,8 +1157,35 @@ class Engine:
         from freetoken.models.deepseek_v4.dspark import DSparkAdaptiveVerification
 
         self._adaptive_verification = DSparkAdaptiveVerification(
-            block_size, curve, self.device
+            block_size,
+            curve,
+            self.device,
+            fallback_acceptance=self.config.dspark_fallback_acceptance,
+            fallback_min_drafted=self.config.dspark_fallback_min_drafted,
+            fallback_steps=self.config.dspark_fallback_steps,
         )
+        if self.config.dspark_fallback_acceptance > 0:
+            logger.info_rank0(
+                "DSpark acceptance fallback enabled: threshold=%.1f%%, "
+                "min-drafted=%d, target-only-steps=%d",
+                100.0 * self.config.dspark_fallback_acceptance,
+                self.config.dspark_fallback_min_drafted,
+                self.config.dspark_fallback_steps,
+            )
+
+    def should_speculate(self, req: Req) -> bool:
+        """Return whether this request should pay for a DSpark draft this step."""
+        manager = self._adaptive_verification
+        if manager is None:
+            return True
+        return manager.should_speculate(req.uid)
+
+    def _record_dspark_acceptance(
+        self, req: Req, accepted: int, drafted: int
+    ) -> None:
+        manager = self._adaptive_verification
+        if manager is not None:
+            manager.record_acceptance(req.uid, accepted, drafted)
 
     def adapt_speculative_batch(self, batch: Batch) -> None:
         """Compact one prepared DSpark block to the paper-selected prefix width.
@@ -1396,6 +1423,7 @@ class Engine:
                 )
             self._spec_accepted += n_acc
             self._spec_drafted += width
+            self._record_dspark_acceptance(req, n_acc, width)
             selected_rows.append(off + n_acc)
             accepted_counts.append(n_acc)
             off += span

@@ -254,6 +254,31 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dspark-fallback-acceptance",
+        type=_parse_moe_cache_rate,
+        default=ServerArgs.dspark_fallback_acceptance,
+        help=(
+            "Experimental request-local DSpark fallback threshold in [0, 1]. "
+            "After measured proposal acceptance falls below this value, temporarily "
+            "use ordinary target decode; 0 disables the fallback."
+        ),
+    )
+
+    parser.add_argument(
+        "--dspark-fallback-min-drafted",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_min_drafted,
+        help="Minimum measured DSpark proposals before evaluating the fallback.",
+    )
+
+    parser.add_argument(
+        "--dspark-fallback-steps",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_steps,
+        help="Ordinary target-decode steps before probing DSpark again.",
+    )
+
+    parser.add_argument(
         "--distributed-timeout",
         type=float,
         default=ServerArgs.distributed_timeout,

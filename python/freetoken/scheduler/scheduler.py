@@ -944,6 +944,13 @@ class Scheduler(SchedulerIOMixin):
             self._warned_non_greedy = False
         if spec is None or not batch.is_decode:
             return
+        should_speculate = getattr(
+            getattr(self, "engine", None), "should_speculate", None
+        )
+        if should_speculate is not None and any(
+            not should_speculate(req) for req in batch.reqs
+        ):
+            return
         gamma = spec.block_size
         if gamma < 1:
             return
