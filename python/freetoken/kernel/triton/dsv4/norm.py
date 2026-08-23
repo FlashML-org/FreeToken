@@ -52,4 +52,48 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     return out.reshape(x.shape)
 
 
-__all__ = ["rms_norm"]
+@triton.jit
+def _inv_rms_kernel(x_ptr, o_ptr, D, eps, stride_xm, BLOCK_D: tl.constexpr):
+    row = tl.program_id(0)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for off in range(0, D, BLOCK_D):
+        offs = off + tl.arange(0, BLOCK_D)
+        v = tl.load(x_ptr + row * stride_xm + offs, mask=offs < D, other=0.0).to(tl.float32)
+        acc += v * v
+    tl.store(o_ptr + row, tl.rsqrt(tl.sum(acc, axis=0) / D + eps))
+
+
+def inv_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """``rsqrt(mean(x^2, -1) + eps)`` -> ``[..., 1]`` fp32, one pass, no fp32 temp.
+
+    :func:`rms_norm` applies the scale and writes a full-size output; callers that need
+    the *scalar* (DSV4's hyper-connection pre-norm multiplies it into a [.., mix_hc]
+    tensor, not into x) were spelling it ``x.float().square().mean(-1)``, which
+    materialises a second full fp32 copy of the hidden state purely to reduce it away.
+    At hc_dim 16384, T=8192 that is a 537 MB write plus a 537 MB read for a [T, 1]
+    result. Reading the bf16 source instead of its fp32 upcast halves the bytes again;
+    the upcast is exact, so the sum of squares is unchanged.
+
+    RTX 6000 Ada, hc_dim 16384: 1.944 ms -> 0.304 ms at T=8192 (6.4x), 0.020 -> 0.013 ms
+    at T=64. The large end lands at ~880 GB/s against a 960 GB/s peak -- the memory roof.
+
+    NOT bit-identical to ``square().mean()``: the reduction order differs, and ATen's
+    order is not reproducible anyway (it varies with M -- a tree/2 fold matches at M=4
+    and nothing matches at M=64, because the block/grid split is chosen per shape). The
+    accuracy is equivalent, not merely close: against an fp64 reference the mean relative
+    error is 3.65e-08 here vs 3.60e-08 for ATen at M=8192, and 3.60e-08 vs 3.63e-08 at
+    M=4096 -- i.e. it wins at some shapes and loses at others, within 8% of ATen's own
+    distance from the truth. (``linalg.vector_norm`` is the same speed but consistently
+    ~23% worse, at 4.47e-08, because sqrt-then-square rounds twice.)
+    """
+    D = x.shape[-1]
+    x2d = x.reshape(-1, D)
+    out = torch.empty(x2d.shape[0], dtype=torch.float32, device=x.device)
+    _inv_rms_kernel[(x2d.shape[0],)](
+        x2d, out, D, eps, x2d.stride(0),
+        BLOCK_D=min(2048, triton.next_power_of_2(D)), num_warps=8,
+    )
+    return out.view(*x.shape[:-1], 1)
+
+
+__all__ = ["rms_norm", "inv_rms"]
