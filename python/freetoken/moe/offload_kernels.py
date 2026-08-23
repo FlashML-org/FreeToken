@@ -8,8 +8,11 @@ import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
-# count). "recency" (default) fetches the experts most-recently active before this step
-# (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
+# count). "recency" (default) first fetches misses used by the most routes in THIS
+# batch, then the experts most-recently active before this step (LRU on the expert).
+# The route-count priority spends each paper-derived q* PCIe copy where it removes the
+# most repeated CPU GEMVs during a multi-row speculative verify; recency breaks ties and
+# preserves the steady-state hit-rate policy.
 # "lowest_id" fetches the smallest expert ids (the original, routing-blind heuristic).
 _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
@@ -132,9 +135,11 @@ def _ensure_experts_hybrid_cpu(
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
     the bandwidth-matched ``~frac_q16/2^16 * misses`` when ``frac_q16`` > 0) of the missing
     experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
-    most-recently-active misses (ties -> lower id); else the lowest ids."""
+    highest-current-route-count, most-recently-active misses (ties -> lower id);
+    else the lowest ids."""
+    flat_experts = expert_ids.view(-1).tolist()
     seen = []
-    for expert in expert_ids.view(-1).tolist():
+    for expert in flat_experts:
         if expert not in seen:
             seen.append(expert)
 
@@ -150,9 +155,10 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
+    route_counts = {e: flat_experts.count(e) for e in seen}
     if _HYBRID_FETCH_BY_RECENCY:
         rec = cache.expert_recency[layer_id].tolist()
-        missing.sort(key=lambda e: (-rec[e], e))
+        missing.sort(key=lambda e: (-route_counts[e], -rec[e], e))
     else:
         missing.sort()
     if frac_q16 > 0:
@@ -321,10 +327,11 @@ def _ensure_experts_hybrid_kernel(
     = the capped fetch count (copy_missing), ``num_missing_full`` = the pre-cap miss count
     (stats).
 
-    Which misses to fetch is the cap policy. ``BY_RECENCY`` (default) fetches the experts
-    most-recently active before this step (LRU on the expert, via ``expert_recency``),
-    breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
-    caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
+    Which misses to fetch is the cap policy. ``BY_RECENCY`` (default) first prioritizes
+    the experts used by the most routes in the current batch, so one PCIe copy removes
+    as many repeated CPU GEMVs as possible during a speculative verify. It then uses
+    most-recent activity (LRU on the expert, via ``expert_recency``), breaking final ties
+    toward the lower expert id. Otherwise the lowest expert ids are fetched
     (``missing_rank``), the original routing-blind heuristic."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
@@ -333,10 +340,11 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    route_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+        route_count += (off_e == e).to(tl.int32)
+    is_active = route_count > 0
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -358,13 +366,17 @@ def _ensure_experts_hybrid_kernel(
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
-    # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
-    # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
-    # spans only [0, num_experts), so it can only break exact-recency ties).
+    # Fetch-selection priority: encode (current route count desc, recency desc, id asc)
+    # into one strictly-ordered score. Previous recency is <= step-1, so multiplying
+    # route_count by step+1 makes one additional current route dominate the full recency
+    # range. The id term spans only [0, num_experts), breaking exact ties only.
     if BY_RECENCY:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
-            is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            is_missing,
+            (route_count.to(tl.int64) * (step + 1) + rec) * num_experts
+            + (num_experts - 1 - off_e),
+            -1152921504606846976,
         ).to(tl.int64)
     else:
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
