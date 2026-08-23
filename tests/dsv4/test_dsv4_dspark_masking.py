@@ -15,6 +15,8 @@ without a GPU or a KV pool.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -51,7 +53,7 @@ class TestNonCausalBlock:
         n = 5
         start = 500
         cols = window_cols_for_block(start_pos=start, n=n, window=WIN, non_causal=True)
-        w_lo = start - WIN + 1
+        w_lo = start - WIN
         last_col = (start + n - 1) - w_lo
         for row in range(n):
             assert last_col in _visible(cols, row), (
@@ -74,28 +76,36 @@ class TestNonCausalBlock:
     def test_it_never_reaches_beyond_the_block(self):
         n, start = 5, 500
         cols = window_cols_for_block(start_pos=start, n=n, window=WIN, non_causal=True)
-        w_lo = start - WIN + 1
+        w_lo = start - WIN
         highest = max(max(_visible(cols, r)) for r in range(n)) + w_lo
         assert highest == start + n - 1, "a query must not read past its own block"
 
     def test_the_shared_context_stays_visible(self):
         n, start = 5, 500
         cols = window_cols_for_block(start_pos=start, n=n, window=WIN, non_causal=True)
-        w_lo = start - WIN + 1
+        w_lo = start - WIN
         lowest = min(min(_visible(cols, r)) for r in range(n)) + w_lo
         assert lowest < start, "the block must still attend over the context before it"
 
     @pytest.mark.parametrize("n", [1, 2, 5, 8])
-    def test_the_candidate_width_is_the_window_for_any_block_size(self, n):
+    def test_the_candidate_width_is_context_window_plus_block(self, n):
         cols = window_cols_for_block(start_pos=900, n=n, window=WIN, non_causal=True)
-        assert cols.shape == (n, WIN)
+        assert cols.shape == (n, WIN + n)
 
-    def test_a_single_token_block_matches_the_causal_mask(self):
-        # With n == 1 there is no future inside the block, so the two must agree --
-        # a non-causal mask that differs here is reaching somewhere it should not.
+    def test_a_single_token_still_keeps_all_context_tokens(self):
         a = window_cols_for_block(start_pos=700, n=1, window=WIN, non_causal=True)
         b = window_cols_for_block(start_pos=700, n=1, window=WIN, non_causal=False)
-        assert torch.equal(a, b)
+        assert a.shape[-1] == WIN + 1
+        assert b.shape[-1] == WIN
+
+    def test_ragged_launcher_labels_the_full_non_causal_width(self):
+        # The index helper can correctly build 133 columns while the attention call
+        # still labels only 128 of them as window columns. That only fails at bs > 1.
+        from freetoken.models.deepseek_v4.attention import Attention
+
+        body = inspect.getsource(Attention.forward_ragged)
+        assert "max(part.shape[-1] for part in win_parts)" in body
+        assert "if self.non_causal" in body
 
 
 class TestMaskBounds:
@@ -105,7 +115,10 @@ class TestMaskBounds:
     @pytest.mark.parametrize("start_pos,n", [(1, 5), (127, 5), (128, 5), (5000, 5)])
     def test_columns_stay_inside_the_gathered_slot_range(self, non_causal, start_pos, n):
         cols = window_cols_for_block(start_pos, n, WIN, non_causal)
-        w_lo = max(0, start_pos - WIN + 1)
+        w_lo = max(
+            0,
+            start_pos - WIN if non_causal else start_pos - WIN + 1,
+        )
         width = (start_pos + n) - w_lo  # slots the caller gathered for this segment
         assert int(cols.max()) < width, "a column past the gathered slots reads foreign KV"
         assert int(cols.min()) >= -1, "only -1 encodes 'masked'"

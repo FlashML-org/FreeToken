@@ -71,11 +71,6 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
-    # dSpark adaptive verification: a drafted position scoring below this is not
-    # verified. Verification costs a full target pass over whatever width it covers, so
-    # carrying a tail the drafter itself doubts is work bought and thrown away. 0 keeps
-    # the whole block, 1 keeps only the first position.
-    DSPARK_CONFIDENCE_THRESHOLD = EnvFloat(0.5)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).

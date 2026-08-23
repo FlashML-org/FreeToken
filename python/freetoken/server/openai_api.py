@@ -24,6 +24,7 @@ from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    _acks,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -208,7 +209,9 @@ async def handle_chat_completion(
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await generate_full(
+            uid, spec, state, source="/v1/chat/completions", request=request
+        )
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
@@ -435,7 +438,9 @@ async def handle_completion(
         )
         text = ""
         finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
+        # Watch the client: a non-streaming request otherwise generates to max_tokens
+        # for a caller that has already hung up.
+        async for ack in _acks(state, uid, request):
             if getattr(ack, "error", None):
                 return create_error_response(ack.error)
             prompt_tokens += ack.prompt_tokens_delta
