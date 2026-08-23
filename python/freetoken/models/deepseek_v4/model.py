@@ -31,6 +31,7 @@ from torch import nn
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
+from freetoken.kernel.triton.dsv4.norm import inv_rms
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import init_logger
@@ -99,8 +100,9 @@ class Block(nn.Module):
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base):
         shape, dtype = x.size(), x.dtype
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
+        x2d = x.flatten(2)
+        xf = x2d.float()
+        rsqrt = inv_rms(x2d, self.norm_eps)
         mixes = F.linear(xf, hc_fn) * rsqrt
         pre, post, comb = hc_split_sinkhorn(
             mixes.view(-1, mixes.size(-1)), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
@@ -274,8 +276,9 @@ class Transformer(nn.Module):
     def hc_head(self, x):
         shape, dtype = x.size(), x.dtype
         dim = self.args.dim
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
+        x2d = x.flatten(2)
+        xf = x2d.float()
+        rsqrt = inv_rms(x2d, self.norm_eps)
         mixes = F.linear(xf, self.hc_head_fn) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
