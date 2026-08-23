@@ -165,6 +165,9 @@ class Batch:
     draft_probs: torch.Tensor | None = field(default=None, init=False)
     # Compressor carry saved before the block advanced it, restored on rejection.
     carry_snapshot: object | None = field(default=None, init=False)
+    # Returns a rejected block's unused pages/SWA slots. Supplied by the scheduler,
+    # which owns the cache manager and is what inflated device_len to the block width.
+    release_tail: object | None = field(default=None, init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     mm_rows: torch.Tensor | None = field(default=None, init=False)
