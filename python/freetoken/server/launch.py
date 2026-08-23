@@ -55,9 +55,19 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     tokenize_worker(**kwargs)
 
 
+def _configure_worker_tqdm_lock() -> None:
+    import threading
+
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
+
+    _configure_worker_tqdm_lock()
 
     import torch
     from freetoken.scheduler import Scheduler
