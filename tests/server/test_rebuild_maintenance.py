@@ -59,6 +59,11 @@ def _reply(request_id, status, **over):
         num_pages=0,
         mamba_slots=0,
         num_swa_pages=0,
+        requested_prefill_tokens=0,
+        pool_prefill_cap_tokens=0,
+        effective_prefill_tokens=0,
+        swa_capacity_source="none",
+        prefill_limiting_reason="none",
         error=None,
     )
     base.update(over)
@@ -80,6 +85,10 @@ def test_dispatch_exception_returns_to_serving():
     result = asyncio.run(_run())
     assert result["status"] == "failed"
     assert "zmq push failed" in result["error"]
+    assert set((
+        "requested_prefill_tokens", "pool_prefill_cap_tokens", "effective_prefill_tokens",
+        "swa_capacity_source", "prefill_limiting_reason",
+    )).issubset(result)
     assert state.maintenance_state == "serving"
     assert state.rebuild_futures == {}  # no dangling future leaked
 
@@ -98,6 +107,7 @@ def test_timeout_stays_rebuilding_then_late_reply_resolves():
 
     result = asyncio.run(_run())
     assert result["status"] == "timeout"
+    assert result["swa_capacity_source"] == "none"
     assert state.maintenance_state == "rebuilding"  # still gated on purpose
     assert state.rebuild_futures == {}  # cancelled future dropped, not leaked
 
@@ -254,6 +264,7 @@ def test_cache_rebuild_guarded_during_loading():
         client = TestClient(api.app)
         r = client.post("/v1/cache/rebuild", json={})
         assert r.status_code == 503
+        assert r.json()["prefill_limiting_reason"] == "none"
         assert "loading" in r.json().get("error", "").lower()
     finally:
         api._GLOBAL_STATE = prev

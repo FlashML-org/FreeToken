@@ -67,4 +67,9 @@ class CacheRebuildReply(BaseFrontendMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    requested_prefill_tokens: int = 0
+    pool_prefill_cap_tokens: int = 0
+    effective_prefill_tokens: int = 0
+    swa_capacity_source: str = "none"
+    prefill_limiting_reason: str = "none"
     error: str | None = None

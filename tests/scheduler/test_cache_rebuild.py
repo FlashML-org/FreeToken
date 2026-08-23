@@ -145,26 +145,82 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
+    from freetoken.scheduler.cache import CacheManager
+
+    pool = SimpleNamespace(prefill_chunk_budget=5000, swa_paged=False)
+    page_table = _page_table(4, 64)
+    cache_manager = CacheManager(
+        num_pages=8, page_size=2, page_table=page_table, type="radix", swa_pool=pool
+    )
+
     sched = Scheduler.__new__(Scheduler)
     sched.prefill_manager = SimpleNamespace(runnable=False)
     sched.decode_manager = SimpleNamespace(runnable=False)
     sched.device = torch.device("cpu")
     sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1), max_extend_tokens=100_000)
+    def rebuild_runtime_cache(**kw):
+        # DSV4 pools rebuild in place; their capability changes without replacing the object held
+        # by CacheManager.
+        pool.prefill_chunk_budget = 1000
+
     sched.engine = SimpleNamespace(
-        rebuild_runtime_cache=lambda **kw: None, num_pages=32, page_table=None
+        rebuild_runtime_cache=rebuild_runtime_cache, num_pages=8, page_table=page_table
     )
-    # engine.page_table unchanged across the (stubbed) rebuild -> no token_pool re-point.
-    sched.table_manager = SimpleNamespace(page_table=None)
-    # DSV4-like manager: prefill_chunk_budget tracks the (about-to-shrink) window pool; no shared
-    # page table, so rebuild_cache's prefix-cache rebuild branch is skipped.
-    cache_manager = SimpleNamespace(
-        prefill_chunk_budget=5000, rebuild=lambda *a: None, check_integrity=lambda: None)
+    # A window-only rebuild leaves the generic page table and token pool in place.
+    sched.table_manager = SimpleNamespace(page_table=page_table)
     sched.cache_manager = cache_manager
-    sched.table_manager.rebuild = lambda pt: None
-    sched.table_manager.token_pool = None
     sched.prefill_budget = min(sched.config.max_extend_tokens, cache_manager.prefill_chunk_budget)
     assert sched.prefill_budget == 5000
 
-    cache_manager.prefill_chunk_budget = 1000  # the (stubbed) engine rebuild shrank the pool
-    Scheduler.rebuild_cache(sched, num_pages=16)
+    Scheduler.rebuild_cache(sched, num_swa_pages=10)
+    assert cache_manager.prefill_chunk_budget == 1000
     assert sched.prefill_budget == 1000  # tracks the shrunk cap, not the stale 5000
+
+
+def test_destructive_swa_rollback_restores_prior_capacity_source():
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    sched = Scheduler.__new__(Scheduler)
+    sched._pending_rebuild = SimpleNamespace(
+        request_id="r1", moe_cache_size=None, num_pages=None,
+        num_mamba_slots=None, num_swa_pages=10,
+    )
+    sched.config = SimpleNamespace(
+        tp_info=SimpleNamespace(size=1), swa_capacity_source="derived"
+    )
+    sched.engine = SimpleNamespace(rebuild_teardown_started=False)
+    snapshot = {
+        "moe_cache_size": 4602, "num_pages": 4096, "num_mamba_slots": None,
+        "num_swa_pages": 407, "requested_prefill_tokens": 24576,
+        "pool_prefill_cap_tokens": 24576, "effective_prefill_tokens": 24576,
+        "swa_capacity_source": "derived",
+        "prefill_limiting_reason": "requested_and_swa_pool",
+    }
+    sched._current_cache_geometry = lambda: dict(snapshot)
+    calls = []
+
+    def rebuild_cache(**targets):
+        calls.append(targets)
+        object.__setattr__(sched.config, "swa_capacity_source", "explicit")
+        if len(calls) == 1:
+            sched.engine.rebuild_teardown_started = True
+            raise RuntimeError("injected post-teardown failure")
+
+    replies = []
+    sched.rebuild_cache = rebuild_cache
+    sched._log_cache_geometry = lambda event: None
+    sched._reply_rebuild = lambda request_id, status, error=None: replies.append(
+        (request_id, status, error)
+    )
+
+    Scheduler._execute_pending_rebuild(sched)
+
+    assert calls == [
+        {"moe_cache_size": None, "num_pages": None, "num_mamba_slots": None,
+         "num_swa_pages": 10},
+        {"num_swa_pages": 407},
+    ]
+    assert sched.config.swa_capacity_source == "derived"
+    assert replies[0][1] == "rejected"

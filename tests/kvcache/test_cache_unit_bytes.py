@@ -255,8 +255,10 @@ def test_compute_cache_pools_reads_load_time_allocations():
         num_pages=90112,
         config=SimpleNamespace(
             page_size=1,
+            max_extend_tokens=8192,
             model_config=SimpleNamespace(dsv4_args=None, has_swa_attention=False),
         ),
+        kv_cache=SimpleNamespace(prefill_chunk_budget=8064),
         moe_offload_cache=SimpleNamespace(cache_size=526, bank_caches={}),
         # num_slots includes the reserved padding sink; API units are usable slots.
         linear_state_pool=SimpleNamespace(num_slots=65),
@@ -268,6 +270,11 @@ def test_compute_cache_pools_reads_load_time_allocations():
         "num_mamba_slots": 64,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        "requested_prefill_tokens": 8192,
+        "pool_prefill_cap_tokens": 8064,
+        "effective_prefill_tokens": 8064,
+        "swa_capacity_source": "none",
+        "prefill_limiting_reason": "swa_pool",
     }
 
 
@@ -282,7 +289,55 @@ def test_compute_cache_pools_zero_for_missing_pools():
         "num_mamba_slots": 0,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        "requested_prefill_tokens": 0,
+        "pool_prefill_cap_tokens": 0,
+        "effective_prefill_tokens": 0,
+        "swa_capacity_source": "none",
+        "prefill_limiting_reason": "none",
     }
+
+
+def test_cache_status_reports_effective_prefill_clamp():
+    from freetoken.cache_report import format_cache_status
+
+    rendered = format_cache_status({
+        "state": "serving",
+        "geometry": {
+            "requested_prefill_tokens": 8192,
+            "pool_prefill_cap_tokens": 8064,
+            "effective_prefill_tokens": 8064,
+            "swa_capacity_source": "explicit",
+            "prefill_limiting_reason": "swa_pool",
+        },
+    })
+    assert (
+        "prefill=8064 tok (requested 8192, pool cap 8064, "
+        "source explicit, reason swa_pool)"
+    ) in rendered
+
+
+def test_cache_status_always_reports_equal_and_generic_prefill_geometry():
+    from freetoken.cache_report import format_cache_status
+
+    equal = format_cache_status({"geometry": {
+        "requested_prefill_tokens": 8192,
+        "pool_prefill_cap_tokens": 8192,
+        "effective_prefill_tokens": 8192,
+        "swa_capacity_source": "derived",
+        "prefill_limiting_reason": "requested_and_swa_pool",
+    }})
+    assert (
+        "requested 8192, pool cap 8192, source derived, reason requested_and_swa_pool"
+    ) in equal
+
+    generic = format_cache_status({"geometry": {
+        "requested_prefill_tokens": 8192,
+        "pool_prefill_cap_tokens": 0,
+        "effective_prefill_tokens": 8192,
+        "swa_capacity_source": "none",
+        "prefill_limiting_reason": "requested_limit",
+    }})
+    assert "requested 8192, pool cap none, source none, reason requested_limit" in generic
 
 
 def test_status_meta_includes_pools():
@@ -292,3 +347,30 @@ def test_status_meta_includes_pools():
     meta = compute_cache_status_meta(eng)
     assert meta["pools"]["num_pages"] == 100
     assert meta["pools"]["page_size"] == 16
+
+
+def test_status_meta_reports_effective_derived_dsv4_ratio(monkeypatch):
+    import freetoken.kvcache.cache_status as cache_status
+
+    monkeypatch.setattr(cache_status, "compute_cache_unit_bytes", lambda engine: {})
+    monkeypatch.setattr(cache_status, "compute_cache_floors", lambda engine: {})
+    config = SimpleNamespace(
+        page_size=128, max_extend_tokens=24576, max_running_req=4,
+        cache_type="swa_radix", swa_capacity_source="derived",
+        swa_full_tokens_ratio=0.2, memory_ratio=0.9,
+        model_config=SimpleNamespace(
+            dsv4_args=SimpleNamespace(window_size=128), has_swa_attention=False,
+        ),
+    )
+    engine = SimpleNamespace(
+        config=config, num_pages=4096,
+        kv_cache=SimpleNamespace(
+            sizes=SimpleNamespace(n_win_pages=408), prefill_chunk_budget=24576,
+        ),
+        moe_offload_cache=None, linear_state_pool=None,
+        _post_weights_free=0, _baseline_free=0, _weights_bytes=0,
+    )
+
+    meta = compute_cache_status_meta(engine)
+    assert meta["pools"]["num_swa_pages"] == 407
+    assert meta["swa_full_tokens_ratio"] == pytest.approx(407 / 4096)

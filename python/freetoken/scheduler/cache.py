@@ -50,11 +50,6 @@ class CacheManager:
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
         # SWARadixCache reuse machinery (tree match/insert/evict_swa/swa_uuid lock).
         self.swa_paged = swa_pool is not None and getattr(swa_pool, "swa_paged", False)
-        # Owned-pool capability pickup: a plugged-in swa pool may cap the prefill chunk (DSV4:
-        # ~half the window working set). Instance attrs shadow the class defaults; absent
-        # attributes leave the defaults untouched (Gemma4).
-        if swa_pool is not None:
-            self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
         self.num_pages = num_pages
@@ -64,7 +59,17 @@ class CacheManager:
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
-    prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
+    @property
+    def prefill_chunk_budget(self) -> int | None:
+        """Current pool-provided prefill cap, if any.
+
+        Pools rebuild in place, so this must remain a live delegation rather than a snapshot taken
+        during CacheManager construction. Generic shared pools expose no cap and return None.
+        """
+        return (
+            getattr(self.swa_pool, "prefill_chunk_budget", None)
+            if self.swa_pool is not None else None
+        )
 
     def page_usage(self) -> tuple[int, int]:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total

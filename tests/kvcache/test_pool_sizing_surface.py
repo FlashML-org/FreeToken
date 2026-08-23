@@ -112,6 +112,107 @@ def test_dsv4_kv_cost_and_floor_parity():
         DSV4PagedKVCache.solve_num_pages(_dsv4_config(num_page_override=1), 0)
 
 
+def test_dsv4_prefill_budget_and_required_window_are_inverse_at_page_boundaries():
+    from freetoken.kvcache.dsv4_cost_model import (
+        dsv4_prefill_chunk_budget,
+        dsv4_required_swa_pages,
+    )
+
+    # max_running_req=4 + radix reserves 23 usable pages. A 64-page (8192-token)
+    # chunk therefore needs 23 + 2*64 = 151 usable SWA pages.
+    assert dsv4_prefill_chunk_budget(150, 4, True) == 8064
+    assert dsv4_required_swa_pages(8192, 4, True) == 151
+    assert dsv4_prefill_chunk_budget(151, 4, True) == 8192
+    assert dsv4_required_swa_pages(24576, 4, True) == 407
+    assert dsv4_prefill_chunk_budget(407, 4, True) == 24576
+
+
+def test_dsv4_physical_floor_can_hold_its_minimum_prefill_reach():
+    from freetoken.kvcache.dsv4_cost_model import (
+        _dsv4_window_floor_pages,
+        dsv4_prefill_chunk_budget,
+    )
+
+    config = _dsv4_config()
+    object.__setattr__(config, "max_seq_len", 128)
+    object.__setattr__(config, "max_running_req", 4)
+    floor_physical = _dsv4_window_floor_pages(config, config.page_size)
+    assert floor_physical == 26  # 25 usable (23 reserve + twice one 128-token chunk) + dummy
+    assert dsv4_prefill_chunk_budget(floor_physical - 1, 4, True) == 128
+
+
+def test_dsv4_pinned_window_cost_matches_allocated_geometry():
+    from freetoken.kvcache.dsv4_cost_model import _dsv4_pool_sizes, dsv4_pool_bytes
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    config = _dsv4_config()
+    object.__setattr__(config, "swa_full_tokens_ratio", 0.9)  # must lose to the absolute pin
+    object.__setattr__(config, "swa_num_pages_override", 150)
+    per_page, fixed, page_size, _reserve = DSV4PagedKVCache.kv_cost(config)
+
+    for usable_pages in (150, 512, 4096):
+        sizes = _dsv4_pool_sizes(config, usable_pages + 1)
+        exact = dsv4_pool_bytes(
+            sizes, config.model_config.dsv4_args, config.max_running_req + 1
+        )
+        assert sizes.n_win_pages == 151  # 150 usable + the dummy; ratio is not consulted
+        assert usable_pages * per_page + fixed == exact
+        assert page_size == config.page_size
+
+
+def test_dsv4_pinned_window_solver_honors_exact_geometry():
+    from freetoken.kvcache.dsv4_cost_model import _dsv4_pool_sizes, dsv4_pool_bytes
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    config = _dsv4_config()
+    object.__setattr__(config, "swa_full_tokens_ratio", 0.01)
+    object.__setattr__(config, "swa_num_pages_override", 150)
+    target_pages = 512
+    target = _dsv4_pool_sizes(config, target_pages + 1)
+    budget = dsv4_pool_bytes(
+        target, config.model_config.dsv4_args, config.max_running_req + 1
+    )
+
+    assert DSV4PagedKVCache.solve_num_pages(config, budget) == target_pages
+
+
+def test_dsv4_explicit_full_capacity_must_cover_absolute_window():
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    config = _dsv4_config(num_page_override=150)
+    object.__setattr__(config, "swa_num_pages_override", 150)
+    assert DSV4PagedKVCache.solve_num_pages(config, available_memory=0) == 150
+
+    object.__setattr__(config, "num_page_override", 149)
+    with pytest.raises(ValueError, match="is smaller than absolute DSV4 SWA capacity"):
+        DSV4PagedKVCache.solve_num_pages(config, available_memory=0)
+
+
+def test_dsv4_live_rebuild_rejects_full_capacity_below_absolute_window():
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    config = _dsv4_config()
+    object.__setattr__(config, "memory_ratio", 1.0)
+    object.__setattr__(config, "swa_num_pages_override", 150)
+    pool = object.__new__(DSV4PagedKVCache)
+    common = dict(
+        target_moe=0, per_expert_bytes=0, baseline_free=10**15,
+        weights_bytes=0, current_num_pages=512,
+    )
+
+    # Equality is valid for a combined rebuild: both counts are usable pages.
+    pool.validate_rebuild(config, num_pages=150, num_swa_pages=150, **common)
+
+    # A combined full+window resize must not silently truncate the requested window.
+    with pytest.raises(CacheRebuildRejected, match="is smaller than absolute DSV4 SWA capacity"):
+        pool.validate_rebuild(config, num_pages=149, num_swa_pages=150, **common)
+
+    # A KV-only shrink must honor the existing absolute pin from startup or an earlier rebuild.
+    with pytest.raises(CacheRebuildRejected, match="is smaller than absolute DSV4 SWA capacity"):
+        pool.validate_rebuild(config, num_pages=149, num_swa_pages=None, **common)
+
+
 def test_startup_kv_budget_composition():
     # The engine-side budget must stay ratio*old - (old - new); a sign/order slip here
     # mis-sizes every model's startup KV pool with the whole CPU suite green.

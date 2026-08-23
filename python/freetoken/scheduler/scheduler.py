@@ -129,6 +129,28 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
+        from freetoken.kvcache.cache_status import prefill_geometry
+
+        prefill = prefill_geometry(
+            config.max_extend_tokens,
+            _chunk_cap or 0,
+            getattr(config, "swa_capacity_source", "none"),
+            has_window_pool=bool(
+                getattr(config.model_config, "dsv4_args", None) is not None
+                or (
+                    getattr(config.model_config, "has_swa_attention", False)
+                    and getattr(config, "cache_type", None) == "swa_radix"
+                )
+            ),
+        )
+        logger.info_rank0(
+            "Prefill chunk budget: "
+            f"requested={prefill['requested_prefill_tokens']}, "
+            f"pool_cap={prefill['pool_prefill_cap_tokens']}, "
+            f"effective={prefill['effective_prefill_tokens']}, "
+            f"source={prefill['swa_capacity_source']}, "
+            f"reason={prefill['prefill_limiting_reason']}"
+        )
         self.config = config
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
@@ -619,6 +641,11 @@ class Scheduler(SchedulerIOMixin):
                     num_pages=geo["num_pages"],
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
+                    requested_prefill_tokens=geo["requested_prefill_tokens"],
+                    pool_prefill_cap_tokens=geo["pool_prefill_cap_tokens"],
+                    effective_prefill_tokens=geo["effective_prefill_tokens"],
+                    swa_capacity_source=geo["swa_capacity_source"],
+                    prefill_limiting_reason=geo["prefill_limiting_reason"],
                     error=error,
                 )
             ]
@@ -641,6 +668,7 @@ class Scheduler(SchedulerIOMixin):
         # the prefix cache that a successful resize of just the requested pool preserves.
         snapshot = self._current_cache_geometry()
         prior = {k: snapshot[k] for k, v in requested.items() if v is not None}
+        prior_swa_source = snapshot["swa_capacity_source"]
         # Cleared here, set by engine.rebuild_runtime_cache at its point of no return — lets the
         # except below tell a pre-teardown failure (engine untouched) from a mid-teardown one.
         self.engine.rebuild_teardown_started = False
@@ -677,6 +705,8 @@ class Scheduler(SchedulerIOMixin):
             logger.error(f"cache rebuild failed: {e!r} — rolling back to the previous geometry")
             try:
                 self.rebuild_cache(**prior)
+                if "num_swa_pages" in prior:
+                    object.__setattr__(self.config, "swa_capacity_source", prior_swa_source)
             except Exception as e2:  # noqa: BLE001 — rollback failed too; genuinely unrecoverable
                 logger.error(f"cache rebuild rollback failed: {e2!r} — server latched failed")
                 self._reply_rebuild(
@@ -714,11 +744,20 @@ class Scheduler(SchedulerIOMixin):
             getattr(config, "cache_type", None) == "swa_radix"
         ):  # usable window tokens = pool tokens minus the slot-0 sentinel
             num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import prefill_geometry
+
+        prefill = prefill_geometry(
+            config.max_extend_tokens,
+            int(getattr(eng.kv_cache, "prefill_chunk_budget", 0) or 0),
+            getattr(config, "swa_capacity_source", "none"),
+            has_window_pool=num_swa_pages is not None,
+        )
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
             num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
             num_swa_pages=num_swa_pages,
+            **prefill,
         )
 
     def _log_cache_geometry(self, event: str) -> None:
@@ -741,6 +780,13 @@ class Scheduler(SchedulerIOMixin):
                     f"swa {pools['num_swa_pages']} pages"
                     f" ({swa_tokens} tokens, {_gib(swa_tokens * unit['swa_bytes_per_token'])})"
                 )
+            parts.append(
+                f"prefill {pools['effective_prefill_tokens']} tokens"
+                f" (requested {pools['requested_prefill_tokens']}, "
+                f"pool cap {pools['pool_prefill_cap_tokens'] or 'none'}, "
+                f"source {pools['swa_capacity_source']}, "
+                f"reason {pools['prefill_limiting_reason']})"
+            )
             if pools["num_mamba_slots"]:
                 parts.append(
                     f"mamba {pools['num_mamba_slots']} slots"

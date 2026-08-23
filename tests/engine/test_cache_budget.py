@@ -166,6 +166,99 @@ def test_adjust_config_allows_auto_for_dsv4():
     assert cfg.moe_backend == "offload"
     assert cfg.moe_cache_auto is True  # resolved later at engine init, not here
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
+    assert cfg.swa_capacity_source == "derived"
+
+
+def test_adjust_config_preserves_dsv4_prefill_limit():
+    # DSV4's pool may narrow the scheduler bound, but config resolution must not replace an
+    # explicit chunk limit with the full context length.
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(max_seq_len=524288, max_extend_tokens=8192)
+    _adjust_config(cfg)
+    assert cfg.max_extend_tokens == 8192
+
+
+def test_adjust_config_resolves_dsv4_swa_tokens_to_window_pages():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_num_token_override=19200)
+    _adjust_config(cfg)
+    assert cfg.swa_num_pages_override == 150
+    # Keep the user-facing value intact as the record of what was requested.
+    assert cfg.swa_num_token_override == 19200
+    assert cfg.swa_capacity_source == "explicit"
+
+
+def test_adjust_config_derives_swa_from_prefill_as_the_normal_dsv4_path():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(max_running_req=4, max_extend_tokens=24576)
+    _adjust_config(cfg)
+    assert getattr(cfg, "swa_num_token_override", None) is None
+    assert cfg.swa_num_pages_override == 407
+    assert cfg.swa_capacity_source == "derived"
+
+
+def test_adjust_config_rejects_swa_too_small_for_requested_prefill():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        max_running_req=4, max_extend_tokens=8192, swa_num_token_override=19200
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"19200 is below the minimum 19328 SWA tokens required",
+    ):
+        _adjust_config(cfg)
+
+
+def test_adjust_config_accepts_exact_swa_requirement_for_prefill():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        max_running_req=4, max_extend_tokens=8192, swa_num_token_override=19328
+    )
+    _adjust_config(cfg)
+    assert cfg.swa_num_pages_override == 151
+
+
+def test_adjust_config_rejects_tiny_override_before_working_set_floor_inflation():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        max_seq_len=128,
+        max_running_req=4,
+        max_extend_tokens=128,
+        swa_num_token_override=128,
+    )
+    with pytest.raises(ValueError, match=r"128 is below the minimum 3200 SWA tokens required"):
+        _adjust_config(cfg)
+
+
+def test_adjust_config_rejects_misaligned_dsv4_swa_tokens():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_num_token_override=19199)
+    with pytest.raises(ValueError, match="resolved SWA page size 128"):
+        _adjust_config(cfg)
+
+
+def test_adjust_config_rejects_nonpositive_programmatic_swa_tokens():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_num_token_override=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        _adjust_config(cfg)
+
+
+def test_adjust_config_rejects_absolute_swa_capacity_without_window_pool():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _generic_rotary_cfg(max_position=1024, override=1024)
+    object.__setattr__(cfg, "swa_num_token_override", 19200)
+    with pytest.raises(ValueError, match="requires DSV4 or a sliding-window model"):
+        _adjust_config(cfg)
 
 
 def test_adjust_config_resolves_num_tokens_for_dsv4():

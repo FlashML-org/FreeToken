@@ -152,6 +152,19 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
     assert config.page_size == 128
 
 
+def test_swa_capacity_source_vocabulary_for_generic_and_dense_models(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    swa = _config("swa", attention_backend="triton")
+    _adjust_config(swa)
+    assert swa.swa_capacity_source == "derived"
+
+    dense = _config("full", attention_backend="triton")
+    _adjust_config(dense)
+    assert dense.swa_capacity_source == "none"
+
+
 @pytest.mark.parametrize(
     "kind, backend",
     [

@@ -339,6 +339,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-num-tokens",
+        type=_positive_int,
+        dest="swa_num_token_override",
+        default=ServerArgs.swa_num_token_override,
+        help=(
+            "Expert override for absolute window (SWA) capacity in tokens. DSV4 normally "
+            "derives the minimum from --max-prefill-length; an override must be large enough "
+            "to honor that request and align to the resolved SWA page size (DSV4: its window "
+            "size; radix-SWA: 1)."
+        ),
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,
