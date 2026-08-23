@@ -49,9 +49,10 @@ Validated end-to-end on `Laguna-XS-2.1-APEX-I-Mini.gguf` (Q3_K/Q4_K/Q5_K/Q6_K/IQ
 3. **Pre/post-fill perf on IQ types** (IQ2_S, IQ1_S, IQ3_XXS have no MMQ kernel, so
    the dense-quant prefill path dequantizes; MoE prefill uses moe_vec). Tune only if
    S prefill is slow.
-4. **hybrid/cpu MoE backends refuse `gguf`.** `cpu_executor._WFMT_IDS` has no `gguf`
-   entry, so `--moe-backend hybrid` errors. S host (likely CPU-bw > PCIe) is where
-   hybrid matters -- see the fix note below.
+4. **hybrid/cpu MoE backends refuse `gguf`.** No `WFmt` case exists in the compiled
+   C++ CPU executor, so `--moe-backend hybrid` errors. S host (CPU-bw > PCIe) is where
+   hybrid matters -- see the full scope in "Things that will bite you" #8 (a C++ SIMD
+   kernel port, not a Python change).
 5. **FTW conversion refused** on purpose (metadata-only GGUF drops per-tensor types).
    Serve the `.gguf` directly.
 6. **TP=1 only**, text-only.
@@ -113,10 +114,21 @@ ft serve --model /path/Laguna-S-2.1-UD-IQ1_S.gguf \
    restarting, or wait ~60 s for TIME_WAIT to drain. `serve_supervised.sh` in
    `.claude/scratch/` does this sweep + drain.
 8. **hybrid/cpu fix (for the S host).** To enable `--moe-backend hybrid` for `gguf`:
-   add a `gguf` entry to `_WFMT_IDS` in `python/freetoken/moe/cpu_executor.py`, teach
-   `_resolve_banks`/`_resolve_q4_0_banks` to read a flat `[E, stride]` uint8 bank with
-   the per-layer `(gate_up_type, down_type)` from `config.gguf_expert_types`, and use
-   the already-existing `dequantize` (gguf-py-backed) for the CPU GEMV. ~1 file.
+   - Python side: add a `"gguf"` entry to `_WFMT_IDS` in
+     `python/freetoken/moe/cpu_executor.py` and a `_resolve_gguf_banks` that reads the
+     flat `[E, stride]` uint8 banks with per-layer `(gate_up_type, down_type)` from
+     `config.gguf_expert_types`.
+   - **The hard part (not "~1 file"): the CPU executor's hot path is a compiled C++
+     extension** (`python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`) whose `WFmt`
+     enum has no `gguf` case. It needs vec-dot kernels for every type laguna uses
+     (Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_XS — ported from llama.cpp's
+     ggml-cpu AVX-512 paths) plus per-layer type plumbing from `_resolve_gguf_banks`.
+     That is a C++ kernel port, several hundred lines of SIMD per family plus the
+     dispatch -- not a Python fallback (the Python `dequantize` is gguf-py/numpy,
+     far too slow for the decode GEMV to beat PCIe).
+   - Scope note: only worth it where CPU-bw > PCIe (i.e. the S host's calibration, NOT
+     this 16 GB box — its own `ft bench bw` profile recommends `offload` for every
+     format, so hybrid would lose here regardless).
 
 ## Map of the change
 
