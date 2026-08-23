@@ -29,7 +29,10 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
         from freetoken.models.gguf.tokenizer import load_gguf_tokenizer
 
         return load_gguf_tokenizer(gguf_src)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # Keep this aligned with ``_load_hf_config`` below.  Checkpoints with a custom
+    # tokenizer (Kimi-K3's tiktoken wrapper is one) cannot be loaded otherwise;
+    # model loading already opts into the checkpoint's custom config code.
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
         try:

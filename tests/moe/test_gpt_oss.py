@@ -119,20 +119,22 @@ def test_gpt_oss_fused_routing_matches_softmax_topk_renorm(num_experts):
             assert abs(got[e] - want[e]) < 1e-3, f"token {t} expert {e}: {got[e]} vs {want[e]}"
 
 
-def _mxfp4_dequant_reference(run, M, seed):
+def _mxfp4_dequant_reference(
+    run, M, seed, *, activation="gpt_oss_swiglu", alpha=1.702, limit=7.0
+):
     """Run `run` (a split-K decode or _t prefill helper) on random mxfp4 experts and
     compare against a full dequant -> linear -> swiglu -> linear reference."""
     from freetoken.moe.fused_mxfp4 import (
         _transpose_mxfp4_for_decode,
         dequant_mxfp4_blocks,
         gpt_oss_swiglu,
+        kimi_situ,
     )
 
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(seed)
     E, H, I = 8, 128, 64
     top_k = 2
-    alpha, limit = 1.702, 7.0
     hb, ib = H // 32, I // 32
 
     gu_b = torch.randint(0, 256, (E, 2 * I, hb, 16), device=device, dtype=torch.uint8, generator=gen)
@@ -151,6 +153,7 @@ def _mxfp4_dequant_reference(run, M, seed):
     out = run(
         hidden, tw, tid, gbt, gst, gu_bias, dbt, dst, dn_bias,
         top_k=top_k, hidden_act_alpha=alpha, swiglu_limit=limit,
+        activation=activation,
     )
 
     expected = torch.zeros(M, H, device=device, dtype=torch.float32)
@@ -159,7 +162,10 @@ def _mxfp4_dequant_reference(run, M, seed):
             e = int(tid[t, r])
             gw = dequant_mxfp4_blocks(gu_b[e], gu_s[e], out_dtype=torch.float32)
             gate_up = torch.nn.functional.linear(hidden[t].float(), gw, gu_bias[e].float())
-            act = gpt_oss_swiglu(gate_up, alpha=alpha, limit=limit)
+            if activation == "situ":
+                act = kimi_situ(gate_up, beta=alpha, linear_beta=limit)
+            else:
+                act = gpt_oss_swiglu(gate_up, alpha=alpha, limit=limit)
             dw = dequant_mxfp4_blocks(dn_b[e], dn_s[e], out_dtype=torch.float32)
             expected[t] += torch.nn.functional.linear(act, dw, dn_bias[e].float()) * float(tw[t, r])
     torch.cuda.synchronize()
@@ -180,6 +186,36 @@ def test_run_mxfp4_prefill_experts_t_matches_reference(M):
     from freetoken.moe.fused_mxfp4 import run_mxfp4_prefill_experts_t
 
     _mxfp4_dequant_reference(run_mxfp4_prefill_experts_t, M, seed=31)
+
+
+@CUDA
+@pytest.mark.parametrize("M", [1, 3])
+def test_run_mxfp4_splitk_kimi_situ_matches_reference(M):
+    """Kimi's interleaved gate/up SiTU epilogue matches full MXFP4 dequantization."""
+    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts
+
+    _mxfp4_dequant_reference(
+        run_mxfp4_splitk_decode_experts,
+        M,
+        seed=41,
+        activation="situ",
+        alpha=4.0,
+        limit=25.0,
+    )
+
+
+@CUDA
+def test_run_mxfp4_prefill_kimi_situ_matches_reference():
+    from freetoken.moe.fused_mxfp4 import run_mxfp4_prefill_experts_t
+
+    _mxfp4_dequant_reference(
+        run_mxfp4_prefill_experts_t,
+        24,
+        seed=51,
+        activation="situ",
+        alpha=4.0,
+        limit=25.0,
+    )
 
 
 # ── offload movement (bit-identical vs the same kernel on the banks) ─────────

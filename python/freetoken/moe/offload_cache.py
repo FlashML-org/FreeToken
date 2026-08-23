@@ -180,10 +180,12 @@ class OffloadMoeCache:
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
-        # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
-        plan_slots = max(self.num_experts, self.cache_size)
-        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
-        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # A batched decode can route more rows than one layer has experts (for
+        # example bs=32, top-k=2 -> 64 queries for an 8-expert layer). flashlib's
+        # copy plan requires min(query rows, cache slots), so size the plan by the
+        # cache rather than by one expert layer.
+        self.evict_slots = torch.empty((self.cache_size,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((self.cache_size,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
@@ -478,9 +480,8 @@ class OffloadMoeCache:
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
-        plan_slots = max(self.num_experts, cache_size)
-        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
-        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.evict_slots = torch.empty((cache_size,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((cache_size,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()

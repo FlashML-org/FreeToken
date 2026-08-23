@@ -18,10 +18,9 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
-from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
-
 from freetoken.utils.arch import is_sm90_supported
+from triton.language.extra import libdevice
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 SILU = 0
 GELU = 1
@@ -31,6 +30,12 @@ GELU_TANH = 2
 # variant lives in triton/mxfp4_moe.py):
 #   y = clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)
 SWIGLUOAI = 3
+# Kimi-K3 SiTU over un-interleaved gate/up halves:
+#   beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+# The public checkpoint fixes beta=4 and linear_beta=25. They are runtime scalars
+# here so the model adapter can validate the checkpoint and the kernel can remain
+# independently testable.
+SITU = 4
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -50,8 +55,12 @@ def _pdl_supported() -> bool:
 def _fast_tanh(x):
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
-        "tanh.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
+        "tanh.approx.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
     )
 
 
@@ -59,8 +68,12 @@ def _fast_tanh(x):
 def _fast_ex2(x):
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
+        "ex2.approx.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
     )
 
 
@@ -105,6 +118,11 @@ def _act_and_mul_kernel(
         up = tl.minimum(tl.maximum(up, -limit), limit)
         act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * (up + 1.0)
+    elif ACT == 4:  # SiTU (Kimi-K3)
+        gate_situ = alpha * _fast_tanh(gate / alpha)
+        gate_situ *= 1.0 / (1.0 + _fast_ex2(-gate * _LOG2E))
+        up_situ = limit * _fast_tanh(up / limit)
+        y = gate_situ * up_situ
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
         y = act * up
@@ -134,8 +152,17 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        o2,
+        x2,
+        d,
+        alpha,
+        limit,
+        ACT=kind,
+        ENABLE_PDL=pdl,
+        launch_pdl=pdl,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=num_stages,
     )
     return out
 
@@ -166,4 +193,23 @@ def swigluoai_and_mul(
     return _act_and_mul(SWIGLUOAI, x, out, alpha=alpha, limit=limit)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]
+def situ_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
+) -> torch.Tensor:
+    """Kimi-K3 SiTU over un-interleaved ``gate | up`` halves."""
+    if beta <= 0 or linear_beta <= 0:
+        raise ValueError("SiTU beta values must be positive")
+    return _act_and_mul(SITU, x, out, alpha=beta, limit=linear_beta)
+
+
+__all__ = [
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "silu_and_mul",
+    "situ_and_mul",
+    "swigluoai_and_mul",
+]

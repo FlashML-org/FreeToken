@@ -622,8 +622,26 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
     # bookkeeping resized + reset
     assert cache.id_of_slot.shape == (10,)
     assert cache.usage.shape == (10,)
+    assert cache.evict_slots.shape == (10,)
+    assert cache.src_indices.shape == (10,)
     assert torch.all(cache.slot_for_id == -1)
     assert torch.all(cache.id_of_slot == -1)
+
+
+def test_offload_copy_plan_supports_batched_topk_larger_than_expert_count():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=7,
+        num_experts=8,
+        cache_size=56,
+        device=torch.device("cpu"),
+    )
+    # Kimi-K3's graph capture uses bs=32, top-k=2: flashlib needs a
+    # min(64 query rows, 56 slots) plan, not an 8-row expert-layer plan.
+    assert cache.src_indices.numel() >= min(32 * 2, cache.cache_size)
+    assert cache.evict_slots.numel() >= min(32 * 2, cache.cache_size)
 
 
 def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():

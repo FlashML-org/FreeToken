@@ -1,7 +1,6 @@
 import triton
 import triton.language as tl
 
-
 # ── Split-K expert GEMV (transposed weight layout [E, K_bytes, N]) ──────────
 # The MXFP4 MoE decode/prefill at small token counts is a memory-bound GEMV per
 # (route, expert); splitting the K
@@ -105,7 +104,9 @@ def mxfp4_splitk_reduce_kernel(
     acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     for k in range(NUM_K_SPLITS):
         acc += tl.load(
-            partial_ptr + (pid_e * NUM_K_SPLITS + k) * N + offs_n, mask=mask_n, other=0.0
+            partial_ptr + (pid_e * NUM_K_SPLITS + k) * N + offs_n,
+            mask=mask_n,
+            other=0.0,
         )
     if HAS_EXPERT_WTS:
         acc *= ewt
@@ -218,6 +219,9 @@ def mxfp4_fused_moe_kernel(
             mask=(offs_n[None, :] < N) & (k_offsets[:, None] < K),
             other=127,
         )
+        # 0xff is reserved by E8M0. Keep this grouped path bit-contract aligned
+        # with split-K and the CPU executor, both of which clamp to 254.
+        scale_u8 = tl.minimum(scale_u8.to(tl.int32), 254)
         scale = tl.exp2(scale_u8.to(tl.float32) - 127.0)
         b = (_dequant_fp4_lut(nibble) * scale).to(compute_type)
 
@@ -232,7 +236,9 @@ def mxfp4_fused_moe_kernel(
     accumulator += bias[None, :]
 
     if MUL_ROUTED_WEIGHT:
-        route_weight = tl.load(topk_weights_ptr + offs_route, mask=route_mask, other=0.0)
+        route_weight = tl.load(
+            topk_weights_ptr + offs_route, mask=route_mask, other=0.0
+        )
         accumulator *= route_weight[:, None]
 
     c_ptrs = c_ptr + stride_cm * offs_route[:, None] + stride_cn * offs_n[None, :]
@@ -329,4 +335,3 @@ def gpt_oss_routing_kernel(
     out_off = token_id * K + offs_e
     tl.store(topk_weights_ptr + out_off, weights, mask=top_mask)
     tl.store(topk_ids_ptr + out_off, all_ids, mask=top_mask)
-

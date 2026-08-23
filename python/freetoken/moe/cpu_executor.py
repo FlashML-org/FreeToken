@@ -56,7 +56,8 @@ _FLAG_SLOTS_PER_LAYER = 16
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
-# "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel.
+# "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel. Id 4 is
+# Kimi-K3 SiTU and is likewise supported by generic and MXFP4 paths.
 _ACT_IDS = {
     "silu": 0,
     "swish": 0,
@@ -65,6 +66,7 @@ _ACT_IDS = {
     "gelu_pytorch_tanh": 2,
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
+    "situ": 4,
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
@@ -104,7 +106,9 @@ def physical_core_cpus() -> list[int]:
     seen: set[str] = set()
     for cpu in allowed:
         try:
-            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            with open(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            ) as f:
                 key = f.read().strip()
         except OSError:
             reps.append(cpu)
@@ -167,12 +171,14 @@ class CpuMoeExecutor:
                 f"{fmt!r}; use --moe-backend offload (GPU-side dequant) instead."
             )
         if activation not in _ACT_IDS:
-            raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
+            raise NotImplementedError(
+                f"CPU MoE backend: unsupported activation {activation!r}"
+            )
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
-        # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
-        # handles its act inside the kernel and predates the marker.)
-        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+        # epilogue -- fail loudly with the rebuild instruction instead. MXFP4
+        # also dispatches activation ids, so it must obey the same ABI marker.
+        if _ACT_IDS[activation] >= 3:
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
                 raise RuntimeError(
@@ -234,7 +240,9 @@ class CpuMoeExecutor:
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
             weight_format=_WFMT_IDS[fmt],
             swiglu_alpha=float(swiglu_alpha),
-            swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
+            swiglu_limit=float(swiglu_limit)
+            if swiglu_limit is not None
+            else float("inf"),
             core_ids=core_ids,
             **ptrs,
         )
@@ -276,7 +284,9 @@ class CpuMoeExecutor:
             self._done.zero_()
             self._err.zero_()
             self._ext.start_flag_coordinator(
-                self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
+                self._ready.data_ptr(),
+                self._done.data_ptr(),
+                self._flag_capacity,
                 self._coord_core,
             )
             self._watchdog_stop = False
@@ -352,16 +362,16 @@ class CpuMoeExecutor:
             I = int(gate_up[0].shape[1] // 2)
             assert gate_up[0].shape[1] == 2 * I
             assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
-            ptrs = dict(
-                gate_up_ptr=self._make_table(gate_up).data_ptr(),
-                down_ptr=self._make_table(down).data_ptr(),
-                gate_up_scale_ptr=0,
-                gate_up_global_ptr=0,
-                down_scale_ptr=0,
-                down_global_ptr=0,
-                gate_up_bias_ptr=0,
-                down_bias_ptr=0,
-            )
+            ptrs = {
+                "gate_up_ptr": self._make_table(gate_up).data_ptr(),
+                "down_ptr": self._make_table(down).data_ptr(),
+                "gate_up_scale_ptr": 0,
+                "gate_up_global_ptr": 0,
+                "down_scale_ptr": 0,
+                "down_global_ptr": 0,
+                "gate_up_bias_ptr": 0,
+                "down_bias_ptr": 0,
+            }
             return ptrs, (H, I)
 
         if fmt == "q4_0":
@@ -374,11 +384,23 @@ class CpuMoeExecutor:
             return self._resolve_dsfp4_banks(banks)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
-        gup, gus, gug = banks["gate_up_packed"], banks["gate_up_scale"], banks["gate_up_global"]
+        gup, gus, gug = (
+            banks["gate_up_packed"],
+            banks["gate_up_scale"],
+            banks["gate_up_global"],
+        )
         dnp, dns, dng = banks["down_packed"], banks["down_scale"], banks["down_global"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
+        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (
+            gup[0].dtype,
+            dnp[0].dtype,
+        )
+        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, (
+            "block scales must be 1 byte"
+        )
+        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (
+            gug[0].dtype,
+            dng[0].dtype,
+        )
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
@@ -387,16 +409,16 @@ class CpuMoeExecutor:
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 16), (dns[0].shape, H, I)
         assert tuple(gug[0].shape[1:]) == (2 * I,) and tuple(dng[0].shape[1:]) == (H,)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gup).data_ptr(),
-            down_ptr=self._make_table(dnp).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=self._make_table(gug).data_ptr(),
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=self._make_table(dng).data_ptr(),
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
+        ptrs = {
+            "gate_up_ptr": self._make_table(gup).data_ptr(),
+            "down_ptr": self._make_table(dnp).data_ptr(),
+            "gate_up_scale_ptr": self._make_table(gus).data_ptr(),
+            "gate_up_global_ptr": self._make_table(gug).data_ptr(),
+            "down_scale_ptr": self._make_table(dns).data_ptr(),
+            "down_global_ptr": self._make_table(dng).data_ptr(),
+            "gate_up_bias_ptr": 0,
+            "down_bias_ptr": 0,
+        }
         return ptrs, (H, I)
 
     def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
@@ -406,7 +428,8 @@ class CpuMoeExecutor:
         row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
-            gate_up[0].dtype, down[0].dtype,
+            gate_up[0].dtype,
+            down[0].dtype,
         )
         I = int(gate_up[0].shape[1] // 2)
         H = int(down[0].shape[1])
@@ -414,16 +437,16 @@ class CpuMoeExecutor:
         assert H % 32 == 0 and I % 32 == 0, (H, I)
         assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
         assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gate_up).data_ptr(),
-            down_ptr=self._make_table(down).data_ptr(),
-            gate_up_scale_ptr=0,
-            gate_up_global_ptr=0,
-            down_scale_ptr=0,
-            down_global_ptr=0,
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
+        ptrs = {
+            "gate_up_ptr": self._make_table(gate_up).data_ptr(),
+            "down_ptr": self._make_table(down).data_ptr(),
+            "gate_up_scale_ptr": 0,
+            "gate_up_global_ptr": 0,
+            "down_scale_ptr": 0,
+            "down_global_ptr": 0,
+            "gate_up_bias_ptr": 0,
+            "down_bias_ptr": 0,
+        }
         return ptrs, (H, I)
 
     def _resolve_mxfp4_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
@@ -431,11 +454,24 @@ class CpuMoeExecutor:
         (N innermost) + per-output-row biases. The C++ kernel streams K and
         accumulates a contiguous N-block, so the GPU-tiled layout is read in place
         (no repack, no extra host memory). Block scales are e8m0 (1 byte / 32 K)."""
-        gub, gus, gob = banks["gate_up_blocks"], banks["gate_up_scales"], banks["gate_up_bias"]
+        gub, gus, gob = (
+            banks["gate_up_blocks"],
+            banks["gate_up_scales"],
+            banks["gate_up_bias"],
+        )
         dnb, dns, dob = banks["down_blocks"], banks["down_scales"], banks["down_bias"]
-        assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (gub[0].dtype, dnb[0].dtype)
-        assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (gus[0].dtype, dns[0].dtype)
-        assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (gob[0].dtype, dob[0].dtype)
+        assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (
+            gub[0].dtype,
+            dnb[0].dtype,
+        )
+        assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (
+            gus[0].dtype,
+            dns[0].dtype,
+        )
+        assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (
+            gob[0].dtype,
+            dob[0].dtype,
+        )
         # gate_up_blocks [E, H//2, 2I]; down_blocks [E, I//2, H]
         H = int(gub[0].shape[1] * 2)
         I = int(gub[0].shape[2] // 2)
@@ -445,16 +481,16 @@ class CpuMoeExecutor:
         assert tuple(gus[0].shape[1:]) == (H // 32, 2 * I), (gus[0].shape, H, I)
         assert tuple(dns[0].shape[1:]) == (I // 32, H), (dns[0].shape, H, I)
         assert tuple(gob[0].shape[1:]) == (2 * I,) and tuple(dob[0].shape[1:]) == (H,)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gub).data_ptr(),
-            down_ptr=self._make_table(dnb).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=0,
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=0,
-            gate_up_bias_ptr=self._make_table(gob).data_ptr(),
-            down_bias_ptr=self._make_table(dob).data_ptr(),
-        )
+        ptrs = {
+            "gate_up_ptr": self._make_table(gub).data_ptr(),
+            "down_ptr": self._make_table(dnb).data_ptr(),
+            "gate_up_scale_ptr": self._make_table(gus).data_ptr(),
+            "gate_up_global_ptr": 0,
+            "down_scale_ptr": self._make_table(dns).data_ptr(),
+            "down_global_ptr": 0,
+            "gate_up_bias_ptr": self._make_table(gob).data_ptr(),
+            "down_bias_ptr": self._make_table(dob).data_ptr(),
+        }
         return ptrs, (H, I)
 
     def _resolve_dsfp4_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
@@ -464,25 +500,33 @@ class CpuMoeExecutor:
         activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
         gup, gus = banks["gate_up_packed"], banks["gate_up_scale"]
         dnp, dns = banks["down_packed"], banks["down_scale"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
+        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (
+            gup[0].dtype,
+            dnp[0].dtype,
+        )
+        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, (
+            "block scales must be 1 byte"
+        )
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        assert H % 128 == 0 and I % 128 == 0, (
+            H,
+            I,
+        )  # FP8 activation round-trip block=128
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gup).data_ptr(),
-            down_ptr=self._make_table(dnp).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=0,
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=0,
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
+        ptrs = {
+            "gate_up_ptr": self._make_table(gup).data_ptr(),
+            "down_ptr": self._make_table(dnp).data_ptr(),
+            "gate_up_scale_ptr": self._make_table(gus).data_ptr(),
+            "gate_up_global_ptr": 0,
+            "down_scale_ptr": self._make_table(dns).data_ptr(),
+            "down_global_ptr": 0,
+            "gate_up_bias_ptr": 0,
+            "down_bias_ptr": 0,
+        }
         return ptrs, (H, I)
 
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
@@ -574,7 +618,9 @@ class CpuMoeExecutor:
             # doorbell). No kernel launched; no host-func round trip.
             self._cpu_moe.memop_submit(
                 torch.cuda.current_stream().cuda_stream,
-                self._done.data_ptr(), self._ready.data_ptr(), slot,
+                self._done.data_ptr(),
+                self._ready.data_ptr(),
+                slot,
             )
         else:
             stream = torch.cuda.current_stream().cuda_stream
@@ -590,7 +636,9 @@ class CpuMoeExecutor:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
             self._cpu_moe.memop_sync(
-                torch.cuda.current_stream().cuda_stream, self._done.data_ptr(), slot,
+                torch.cuda.current_stream().cuda_stream,
+                self._done.data_ptr(),
+                slot,
             )
         else:
             stream = torch.cuda.current_stream().cuda_stream
@@ -624,7 +672,10 @@ class CpuMoeExecutor:
             served = self._ext.flag_served_count(slot)
             first_seen, served_then = suspects.get(slot, (None, None))
             if first_seen is None or served != served_then:
-                suspects[slot] = (now, served)  # new suspect, or alive-but-loaded: rearm
+                suspects[slot] = (
+                    now,
+                    served,
+                )  # new suspect, or alive-but-loaded: rearm
                 continue
             if now - first_seen >= 10.0:
                 dead.append(slot)

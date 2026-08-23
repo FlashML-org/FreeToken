@@ -55,6 +55,8 @@ dependencies = [
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
     "torch>=2.11,<2.12",
+    # Kimi-K3's checkpoint-provided tokenizer wraps tiktoken.
+    "tiktoken>=0.9,<1",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
     "triton==3.6.0; platform_system == 'Linux'",

@@ -17,6 +17,8 @@ bytes off the attention-group spec) stay correct by construction.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 
 from .base import BaseKVCachePool
@@ -37,9 +39,23 @@ class MLAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        layer_ids: Sequence[int] | None = None,
     ) -> None:
         self._latent_dim = latent_dim
         self._num_layers = num_layers
+        if layer_ids is None:
+            self._num_storage_layers = num_layers
+            self._layer_map: list[int] | None = None
+        else:
+            self._num_storage_layers = len(layer_ids)
+            layer_map = [-1] * num_layers
+            for dense, global_id in enumerate(layer_ids):
+                if global_id < 0 or global_id >= num_layers:
+                    raise ValueError(
+                        f"KV layer id {global_id} outside [0, {num_layers})"
+                    )
+                layer_map[global_id] = dense
+            self._layer_map = layer_map
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
@@ -48,15 +64,32 @@ class MLAKVCache(BaseKVCachePool):
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
         self._kv_buffer = torch.empty(
-            (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
+            (
+                1,
+                self._num_storage_layers,
+                num_pages,
+                self._page_size,
+                1,
+                self._latent_dim,
+            ),
             device=self._device,
             dtype=self._dtype,
         )
 
     # -- views ------------------------------------------------------------------
+    def _dense(self, layer_id: int) -> int:
+        if self._layer_map is None:
+            return layer_id
+        dense = self._layer_map[layer_id]
+        if dense < 0:
+            raise KeyError(f"layer {layer_id} has no paged KV storage")
+        return dense
+
     def k_cache(self, layer_id: int) -> torch.Tensor:
         """Paged latent view ``[num_pages, page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(self._num_pages, self._page_size, -1)
+        return self._kv_buffer[0, self._dense(layer_id)].view(
+            self._num_pages, self._page_size, -1
+        )
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
         # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
@@ -64,7 +97,7 @@ class MLAKVCache(BaseKVCachePool):
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(-1, self._latent_dim)
+        return self._kv_buffer[0, self._dense(layer_id)].view(-1, self._latent_dim)
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -141,10 +174,19 @@ class DSAKVCache(MLAKVCache):
         device: torch.device,
         index_head_dim: int,
         num_index_layers: int,
+        layer_ids: Sequence[int] | None = None,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
-        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device)
+        super().__init__(
+            latent_dim,
+            num_layers,
+            num_pages,
+            page_size,
+            dtype,
+            device,
+            layer_ids,
+        )
 
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step: rebuild can never leave the pool with a

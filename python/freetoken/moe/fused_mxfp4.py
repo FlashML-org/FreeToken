@@ -1,4 +1,4 @@
-"""GPT-OSS MXFP4 fused-MoE kernels: transposed split-K GEMV decode + grouped
+"""MXFP4 fused-MoE kernels: transposed split-K GEMV decode + grouped
 ``_t`` prefill over ``[E, K//2, N]``-layout blocks/scales (N innermost, shared
 between the resident and offload paths).
 """
@@ -16,13 +16,48 @@ from freetoken.moe.fused import moe_align_block_size, try_get_optimal_moe_config
 MXFP4_DECODE_MAX_TOKENS = 16
 
 
-def gpt_oss_swiglu(gate_up: torch.Tensor, *, alpha: float, limit: float | None) -> torch.Tensor:
+def gpt_oss_swiglu(
+    gate_up: torch.Tensor, *, alpha: float, limit: float | None
+) -> torch.Tensor:
     gate = gate_up[..., ::2]
     up = gate_up[..., 1::2]
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
     return gate * torch.sigmoid(gate * alpha) * (up + 1.0)
+
+
+def kimi_situ(
+    gate_up: torch.Tensor, *, beta: float = 4.0, linear_beta: float = 25.0
+) -> torch.Tensor:
+    """Kimi-K3 SiTU over the interleaved MXFP4 expert output ``gate, up`` pairs."""
+    if beta <= 0 or linear_beta <= 0:
+        raise ValueError("SiTU beta values must be positive")
+    gate = gate_up[..., ::2]
+    up = gate_up[..., 1::2]
+    return (
+        beta
+        * torch.tanh(gate / beta)
+        * torch.sigmoid(gate)
+        * linear_beta
+        * torch.tanh(up / linear_beta)
+    )
+
+
+def _activate_interleaved(
+    gate_up: torch.Tensor,
+    *,
+    activation: str,
+    act_alpha: float,
+    act_limit: float | None,
+) -> torch.Tensor:
+    if activation in {"gpt_oss_swiglu", "swigluoai"}:
+        return gpt_oss_swiglu(gate_up, alpha=act_alpha, limit=act_limit)
+    if activation == "situ":
+        if act_limit is None:
+            raise ValueError("SiTU requires linear_beta")
+        return kimi_situ(gate_up, beta=act_alpha, linear_beta=act_limit)
+    raise NotImplementedError(f"MXFP4 expert activation {activation!r} is unsupported")
 
 
 def dequant_mxfp4_blocks(
@@ -67,7 +102,10 @@ def dequant_mxfp4_blocks(
         dtype=torch.float32,
     )
     unpacked = values[nibbles.long()]
-    scale = torch.exp2(scales.float() - 127).unsqueeze(-1)
+    # E8M0 reserves 0xff.  Match the split-K and CPU production kernels by
+    # clamping that byte to the largest finite exponent instead of producing a
+    # path-dependent infinity in the Python/grouped reference.
+    scale = torch.exp2(scales.float().clamp_(max=254) - 127).unsqueeze(-1)
     dequantized = unpacked * scale
     return dequantized.reshape(*blocks.shape[:-2], blocks.shape[-2] * 32).to(out_dtype)
 
@@ -76,22 +114,22 @@ def run_mxfp4_prefill_experts_t(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    gate_up_blocks_t: torch.Tensor,   # [E, H//2, 2*I]
-    gate_up_scales_t: torch.Tensor,   # [E, H//32, 2*I]
-    gate_up_bias: torch.Tensor,       # [E, 2*I]
-    down_blocks_t: torch.Tensor,      # [E, I//2, H]
-    down_scales_t: torch.Tensor,      # [E, I//32, H]
-    down_bias: torch.Tensor,          # [E, H]
+    gate_up_blocks_t: torch.Tensor,  # [E, H//2, 2*I]
+    gate_up_scales_t: torch.Tensor,  # [E, H//32, 2*I]
+    gate_up_bias: torch.Tensor,  # [E, 2*I]
+    down_blocks_t: torch.Tensor,  # [E, I//2, H]
+    down_scales_t: torch.Tensor,  # [E, I//32, H]
+    down_bias: torch.Tensor,  # [E, H]
     *,
     top_k: int,
     hidden_act_alpha: float,
     swiglu_limit: float | None,
+    activation: str = "gpt_oss_swiglu",
 ) -> torch.Tensor:
     """Prefill experts using the transposed weight layout shared with split-K decode
     ([E, K//2, N] blocks, [E, K//32, N] scales, N innermost). Uses
     mxfp4_fused_moe_kernel_t_triton for the grouped GEMM."""
     from freetoken.kernel import (
-        gpt_oss_swiglu_triton,
         moe_sum_reduce_triton,
         mxfp4_fused_moe_kernel_t_triton,
     )
@@ -146,18 +184,12 @@ def run_mxfp4_prefill_experts_t(
         compute_type=hidden_states.dtype,
     )
 
-    activated = torch.empty(
-        (num_tokens * top_k, local_intermediate_size),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    gpt_oss_swiglu_triton(
+    activated = _activate_interleaved(
         gate_up.view(num_tokens * top_k, 2 * local_intermediate_size),
-        activated,
-        alpha=hidden_act_alpha,
-        limit=swiglu_limit if swiglu_limit is not None else float("inf"),
-        compute_type=hidden_states.dtype,
-    )
+        activation=activation,
+        act_alpha=hidden_act_alpha,
+        act_limit=swiglu_limit,
+    ).contiguous()
 
     down = torch.empty(
         (num_tokens, top_k, hidden_size),
@@ -192,7 +224,9 @@ def _transpose_mxfp4_for_decode(
     """HF MXFP4 [E, N, K//32, 16] blocks / [E, N, K//32] scales -> split-K GEMV
     layout: blocks_t [E, K//2, N], scales_t [E, K//32, N] (N innermost/contiguous)."""
     num_experts, n, k_blocks, _ = blocks.shape
-    blocks_t = blocks.reshape(num_experts, n, k_blocks * 16).permute(0, 2, 1).contiguous()
+    blocks_t = (
+        blocks.reshape(num_experts, n, k_blocks * 16).permute(0, 2, 1).contiguous()
+    )
     scales_t = scales.permute(0, 2, 1).contiguous()
     return blocks_t, scales_t
 
@@ -218,12 +252,13 @@ def run_mxfp4_splitk_decode_experts(
     top_k: int,
     hidden_act_alpha: float,
     swiglu_limit: float | None,
+    activation: str = "gpt_oss_swiglu",
 ) -> torch.Tensor:
     """Split-K GEMV MoE decode over TRANSPOSED MXFP4 weights:
     gate_up_blocks_t [E, H//2, 2I], gate_up_scales_t [E, H//32, 2I], bias [E, 2I];
     down_blocks_t [E, I//2, H], down_scales_t [E, I//32, H], bias [E, H].
     Targets small token counts (M <= MXFP4_DECODE_MAX_TOKENS)."""
-    from freetoken.kernel import gpt_oss_swiglu_triton, mxfp4_splitk_gemv_triton
+    from freetoken.kernel import mxfp4_splitk_gemv_triton
 
     if not hidden_states.is_cuda:
         raise RuntimeError("GPT-OSS MXFP4 MoE requires the Triton CUDA kernel")
@@ -251,23 +286,42 @@ def run_mxfp4_splitk_decode_experts(
 
     gu_splits = _decode_split_count(routes, H // 32, target_programs=180)
     gate_up_out = mxfp4_splitk_gemv_triton(
-        routed_x, gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
-        route_experts, N=two_I, K=H, stride_xe=gu_stride_xe, num_splits=gu_splits,
+        routed_x,
+        gate_up_blocks_t,
+        gate_up_scales_t,
+        gate_up_bias,
+        route_experts,
+        N=two_I,
+        K=H,
+        stride_xe=gu_stride_xe,
+        num_splits=gu_splits,
     )
 
-    hidden_out = torch.empty((routes, local_intermediate_size), device=device, dtype=compute_type)
-    gpt_oss_swiglu_triton(
-        gate_up_out, hidden_out,
-        alpha=hidden_act_alpha,
-        limit=swiglu_limit if swiglu_limit is not None else float("inf"),
-        compute_type=compute_type,
+    hidden_out = (
+        _activate_interleaved(
+            gate_up_out,
+            activation=activation,
+            act_alpha=hidden_act_alpha,
+            act_limit=swiglu_limit,
+        )
+        .to(compute_type)
+        .contiguous()
     )
 
-    dp_splits = _decode_split_count(routes, local_intermediate_size // 32, target_programs=72)
+    dp_splits = _decode_split_count(
+        routes, local_intermediate_size // 32, target_programs=72
+    )
     down_out = mxfp4_splitk_gemv_triton(
-        hidden_out, down_blocks_t, down_scales_t, down_bias,
-        route_experts, N=H, K=local_intermediate_size,
-        stride_xe=hidden_out.stride(0), num_splits=dp_splits, expert_wts=route_weights,
+        hidden_out,
+        down_blocks_t,
+        down_scales_t,
+        down_bias,
+        route_experts,
+        N=H,
+        K=local_intermediate_size,
+        stride_xe=hidden_out.stride(0),
+        num_splits=dp_splits,
+        expert_wts=route_weights,
     )
 
     return down_out.view(M, top_k, H).sum(dim=1).to(compute_type)
@@ -277,6 +331,7 @@ __all__ = [
     "MXFP4_DECODE_MAX_TOKENS",
     "dequant_mxfp4_blocks",
     "gpt_oss_swiglu",
+    "kimi_situ",
     "run_mxfp4_prefill_experts_t",
     "run_mxfp4_splitk_decode_experts",
 ]
