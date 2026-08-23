@@ -1,5 +1,6 @@
 #pragma once
 
+#include <freetoken/hip_compat.h>
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -115,6 +116,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#ifdef __HIP__
+    (void)use_pdl;
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +128,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 

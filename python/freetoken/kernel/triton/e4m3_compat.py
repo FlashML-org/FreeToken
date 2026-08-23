@@ -59,6 +59,10 @@ def e4m3_native() -> bool:
     if _native is None:
         if FORCE_EMU:
             _native = False
+        elif torch.version.hip is not None:
+            # ROCm reports gfx1101 as capability (11, 0), which is not a CUDA
+            # compute capability and must not select the native fp8e4nv path.
+            _native = False
         else:
             native = {torch.cuda.get_device_capability(i) >= (8, 9)
                       for i in range(torch.cuda.device_count())}
