@@ -111,9 +111,16 @@ Modified:
   registry entry, gpt2-converter routing, `gguf_tensor_type`
 - `models/gemma4/gguf.py`, `layers/base.py` — small shared-infra pickups
 
-## Not in this commit
+## The other workstream in this repo
 
-The KV-cache quantization workstream (`tasks/todo.md`, `kvcache/quant*.py`,
+The KV-cache quantization effort (`tasks/todo.md`, `kvcache/quant*.py`,
 `kernel/triton/kv_quant.py`, `attention/triton.py`, `engine/*`, `server/args.py`, its
-tests) is a **separate, still-uncommitted** effort in the same tree. The laguna commit
-deliberately leaves it alone, but note the two meet at `--kv-cache-dtype`.
+tests) is **separate** but shipped in the commit right after this one, because the two
+meet at `--kv-cache-dtype`: the `q8_0` / `fp8_e4m3` flag used in every serve command
+above comes from there, and without it laguna's KV falls back to bf16 (2x the bytes).
+
+Its own status: 53 tests green plus the 33 pre-existing triton-attention tests, but
+step 9 of `tasks/todo.md` is open — no needle-in-246k, no perplexity vs bf16, no
+measured expert-slot / tok-s gain. So `q8_0` vs `fp8_e4m3` as the default is still
+undecided, and on the big host it is worth settling that on the same run that
+validates laguna: both questions need one loaded model and a long context.
