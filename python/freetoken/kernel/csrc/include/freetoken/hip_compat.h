@@ -7,25 +7,21 @@
 // On NVIDIA platforms the CUDA headers are included as-is and every macro below
 // resolves to the original CUDA symbol, so there is zero overhead.
 //
-// Supported ROCm targets (RDNA3):
+// Supported ROCm targets:
 //   gfx1100 — RX 7900 XTX / XT
 //   gfx1101 — RX 7900 GRE
 //   gfx1102 — RX 7700 / XT
 //   gfx1103 — RX 7600 / XT
+//   gfx1200 — RX 9060 family
+//   gfx1201 — RX 9070 family / Radeon AI PRO R9700
 
-#ifdef __HIP__
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+
+#define FREETOKEN_USE_ROCM 1
 
 // --- HIP runtime headers ---
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
-
-#ifndef CUDART_CB
-#define CUDART_CB
-#endif
-
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
 
 // --- API name mapping (CUDA -> HIP) ---
 // HIP already defines most cuda* names as macros that expand to hip* equivalents
@@ -60,14 +56,6 @@
 #define cudaHostAlloc hipHostMalloc
 #endif
 
-#ifndef cudaHostAllocPortable
-#define cudaHostAllocPortable hipHostMallocPortable
-#endif
-
-#ifndef cudaHostAllocMapped
-#define cudaHostAllocMapped hipHostMallocMapped
-#endif
-
 #ifndef cudaHostRegister
 #define cudaHostRegister hipHostRegister
 #endif
@@ -78,6 +66,14 @@
 
 #ifndef cudaHostRegisterMapped
 #define cudaHostRegisterMapped hipHostRegisterMapped
+#endif
+
+#ifndef cudaHostAllocPortable
+#define cudaHostAllocPortable hipHostMallocPortable
+#endif
+
+#ifndef cudaHostAllocMapped
+#define cudaHostAllocMapped hipHostMallocMapped
 #endif
 
 #ifndef cudaHostGetDevicePointer
@@ -115,8 +111,7 @@
 #endif
 
 #ifndef cudaLaunchKernelEx
-// TODO(ROCm): hipLaunchKernelEx is available in newer ROCm; use it when widely shipped.
-// For now, fall back to hipLaunchKernel with config extracted manually.
+// ROCm 7 exposes the CUDA-compatible extended launch configuration through HIP.
 #define cudaLaunchKernelEx hipLaunchKernelEx
 #endif
 
@@ -146,12 +141,22 @@
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #endif
 
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
+
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+
 #ifndef dim3
 // HIP already provides dim3; this is a no-op guard.
 #endif
 
-#else  // !__HIP__ — NVIDIA CUDA path
+#else  // NVIDIA CUDA path
+
+#define FREETOKEN_USE_ROCM 0
 
 #include <cuda_runtime_api.h>
 
-#endif  // __HIP__
+#endif
