@@ -207,10 +207,9 @@ _LAYER_MAP: dict[str, str] = {
     # shared by both layer kinds
     "attn_norm.weight": "input_layernorm.weight",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
-    # full-attention layers
-    "attn_q.weight": "self_attn.q_proj.weight",
-    "attn_k.weight": "self_attn.k_proj.weight",
-    "attn_v.weight": "self_attn.v_proj.weight",
+    # full-attention layers. attn_q/attn_k/attn_v are deliberately absent: the model has
+    # no q_proj/k_proj/v_proj attributes -- Qwen3_5Attention builds one merged qkv_proj
+    # (_qkv_split = [8192, 512, 512]) -- so they are fused by iter_gguf_weights, not renamed.
     "attn_output.weight": "self_attn.o_proj.weight",
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
@@ -220,20 +219,33 @@ _LAYER_MAP: dict[str, str] = {
     "ssm_out.weight": "linear_attn.out_proj.weight",
     "ssm_a": "linear_attn.A_log",
     "ssm_dt.bias": "linear_attn.dt_bias",
-    # MoE router + shared expert
+    # MoE router + shared expert. ffn_gate_shexp / ffn_up_shexp are absent for the same
+    # reason as attn_q/k/v: _SharedExpert has a single merged gate_up_proj, so they are
+    # fused rather than renamed.
     "ffn_gate_inp.weight": "mlp.gate.weight",
     "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
-    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
-    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
     "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
 }
 
-# Pairs llama.cpp splits that FreeToken's model code wants fused, in concat order.
-# Mirrors _PT_FP8_FUSE / _PT_BF16_FUSE in weight.py.
-_FUSE: dict[str, tuple[str, str]] = {
-    "linear_attn.in_proj_qkvz.weight": ("attn_qkv.weight", "attn_gate.weight"),
-    "linear_attn.in_proj_ba.weight": ("ssm_beta.weight", "ssm_alpha.weight"),
-}
+# Suffixes that are PARTS of a merged projection: never renamed 1:1, always combined by
+# iter_gguf_weights into the merged buffer the model actually declares. Listed here so
+# gguf_name_to_freetoken can report them as "handled elsewhere" (None) instead of
+# inventing a parameter name that does not exist on the module.
+#
+# The merged targets and their concat orders:
+#   self_attn.qkv_proj   <- attn_q, attn_k, attn_v          (_qkv_split [8192, 512, 512])
+#   linear_attn.in_proj  <- attn_qkv, attn_gate, ssm_beta, ssm_alpha
+#                           (_in_proj_split [conv_dim, value_dim, n_v, n_v])
+#   mlp.shared_expert.gate_up_proj <- ffn_gate_shexp, ffn_up_shexp
+#
+# NOTE the GDN target is ``in_proj``, not ``in_proj_qkvz``/``in_proj_ba``: gdn.py only
+# splits those two out on the fp8 branch (``self._fp8``), and a GGUF checkpoint sets
+# attn_quant="gguf", so the single fused in_proj is what exists.
+_MERGED_PARTS: frozenset[str] = frozenset({
+    "attn_q.weight", "attn_k.weight", "attn_v.weight",
+    "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+})
 
 # Routed-expert stacks: [num_experts, out, in] packed blocks, handled by the offload
 # expert-bank loader rather than yielded as ordinary parameters.
@@ -253,8 +265,13 @@ _GLOBAL_MAP: dict[str, str] = {
 def gguf_name_to_freetoken(name: str, num_layers: int) -> str | None:
     """Map one llama.cpp tensor name to its FreeToken parameter name.
 
-    Returns ``None`` for tensors FreeToken does not consume (the NextN/MTP block, and
-    the routed-expert stacks, which the expert-bank loader reads directly).
+    Returns ``None`` for anything this function does not rename 1:1 -- the NextN/MTP
+    block, the routed-expert stacks (read directly by the expert-bank loader), and the
+    parts of a merged projection (combined by :func:`iter_gguf_weights`, which is the
+    only place that knows the concat order and the per-part quant types). Callers that
+    want full coverage accounting should treat ``None`` as "handled elsewhere", not
+    "unmapped": returning an invented ``q_proj``/``gate_proj`` name for a fusion part
+    would name an attribute the module does not have.
     """
     if name in _GLOBAL_MAP:
         return _GLOBAL_MAP[name]
@@ -268,6 +285,8 @@ def gguf_name_to_freetoken(name: str, num_layers: int) -> str | None:
         return None
     if suffix in _EXPERT_SUFFIXES:
         return None
+    if suffix in _MERGED_PARTS:
+        return None  # fused by iter_gguf_weights into the merged buffer
     mapped = _LAYER_MAP.get(suffix)
     if mapped is None:
         return None
@@ -667,6 +686,6 @@ __all__ = [
     "gguf_name_to_freetoken",
     "iter_gguf_weights",
     "convert_qwen35_to_gguf",
-    "_FUSE",
+    "_MERGED_PARTS",
     "_EXPERT_SUFFIXES",
 ]
