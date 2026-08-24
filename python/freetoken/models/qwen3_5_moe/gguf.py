@@ -320,23 +320,23 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
     return quant_types
 
 
-# Qwen3.5 stores these RMSNorm weights as ``w`` with an effective scale of ``1 + w``,
-# while FreeToken's GemmaRMSNorm multiplies by the raw weight -- so the +1 is baked in at
-# load time. This mirrors _GEMMA_NORM_SUFFIXES / _is_gemma_norm in weight.py exactly,
-# including the exclusion: linear_attn.norm (GDN gated norm, ssm_norm in the GGUF) is a
-# standard w*x norm and must NOT be shifted.
+# NOTE on the Gemma-style (1 + weight) RMSNorm convention: do NOT apply it here.
 #
-# Getting this wrong is silent and total: w is typically 0.01-0.1, so scaling by w instead
-# of 1+w attenuates every residual stream by 10-100x and the model emits fluent nonsense.
-_PLUS_ONE_NORM_SUFFIXES = (
-    "attn_norm.weight",            # -> input_layernorm
-    "post_attention_norm.weight",  # -> post_attention_layernorm
-    "attn_q_norm.weight",          # -> self_attn.q_norm
-    "attn_k_norm.weight",          # -> self_attn.k_norm
-)
+# HF Qwen3.5 stores these norm weights as raw ``w`` with an effective scale of ``1 + w``,
+# and FreeToken's GemmaRMSNorm multiplies by the raw buffer -- so weight.py adds 1.0 at
+# load time (_is_gemma_norm / _GEMMA_NORM_SUFFIXES). llama.cpp's converter ALREADY folds
+# the +1 into the tensors it writes, so a GGUF checkpoint arrives pre-shifted and adding
+# it again double-counts.
+#
+# Measured on Ornith-1.5-35B IQ3_S (mean, min, max):
+#   blk.3.attn_norm.weight             0.920  0.701  1.660
+#   blk.3.post_attention_norm.weight   1.135  0.004  1.279
+#   blk.3.attn_q_norm.weight           1.326  0.684  1.883
+#   output_norm.weight                 2.640  0.763  3.484
+# Raw w would centre near 0.0X; these centre near 1, i.e. already 1+w.
 
 
-def _to_bf16_plus1(t) -> torch.Tensor:
+def _to_bf16(t) -> torch.Tensor:
     """A (1 + weight) norm: dequantize then add 1, matching weight.py's load-time shift."""
     return _to_bf16(t) + 1.0
 
@@ -437,7 +437,7 @@ def iter_gguf_weights(
             yield "model.embed_tokens.qweight", t.packed()  # IQ3_S packed table
             continue
         if name == "output_norm.weight":
-            yield "model.norm.weight", _to_bf16_plus1(t)  # (1 + w), see _PLUS_ONE_NORM_SUFFIXES
+            yield "model.norm.weight", _to_bf16(t)
             continue
         if name == "output.weight":
             # The untied LM head, packed (Q6_K here). Ornith ships output.weight, so
@@ -468,10 +468,10 @@ def iter_gguf_weights(
         # A_log, dt_bias -> float32
         # conv1d.weight -> float32, reshaped
         if suffix == "attn_norm.weight":
-            yield f"{base}.input_layernorm.weight", _to_bf16_plus1(t)
+            yield f"{base}.input_layernorm.weight", _to_bf16(t)
             continue
         if suffix == "post_attention_norm.weight":
-            yield f"{base}.post_attention_layernorm.weight", _to_bf16_plus1(t)
+            yield f"{base}.post_attention_layernorm.weight", _to_bf16(t)
             continue
         if suffix == "ffn_gate_inp.weight":
             yield f"{base}.mlp.gate.weight", _to_bf16(t)
@@ -485,7 +485,21 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
             continue
         if suffix == "ssm_a":
-            yield f"{base}.linear_attn.A_log", _to_f32(t)
+            # llama.cpp writes this tensor already transformed: it holds A = -exp(A_log),
+            # not A_log. Measured on Ornith IQ3_S every value is negative, spanning
+            # [-70.11, -0.0189]. gdn.py computes
+            #     g = -A_log.exp() * softplus(a + dt_bias)
+            # so handing it A directly gives -exp(-10.6) ~ -2.5e-5 and the recurrent decay
+            # gate collapses to zero in all 30 GDN layers -- healthy activation magnitudes,
+            # incoherent text. Invert the transform so -exp(A_log) reproduces the stored A.
+            a = _to_f32(t)
+            if not bool((a < 0).all()):
+                raise ValueError(
+                    f"{name}: expected llama.cpp's pre-transformed A = -exp(A_log) (all "
+                    f"negative); got min={float(a.min())} max={float(a.max())}, which would "
+                    f"make log(-A) NaN"
+                )
+            yield f"{base}.linear_attn.A_log", torch.log(-a)
             continue
         if suffix == "ssm_dt.bias":
             yield f"{base}.linear_attn.dt_bias", _to_f32(t)
@@ -498,10 +512,10 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.conv1d.weight", w
             continue
         if suffix == "attn_q_norm.weight":
-            yield f"{base}.self_attn.q_norm.weight", _to_bf16_plus1(t)
+            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
             continue
         if suffix == "attn_k_norm.weight":
-            yield f"{base}.self_attn.k_norm.weight", _to_bf16_plus1(t)
+            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
             continue
 
         # Shared expert (present on every layer, both kinds) -- must be handled BEFORE the
