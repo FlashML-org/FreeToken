@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-24T02:15:19.233806Z",
+  "qualification": {
+    "status": "passed",
+    "hostedProviderDirectOpenAIEndpoint": "passed",
+    "communityEnrollment": "not attempted: enrollment credential was unavailable"
+  },
+  "environment": {
+    "provider": "Vast.ai",
+    "instanceId": 48502647,
+    "machineId": 131918,
+    "gpu": "4x NVIDIA H200 (143771 MiB each)",
+    "driver": "580.159.03",
+    "model": "moonshotai/Kimi-K3",
+    "freetokenCommit": "0cb565f6e98ab34208b07bf13d1390fde04a80a2"
+  },
+  "server": {
+    "firstOpenAIModelsResponseSecondsFromLaunch": 1290,
+    "expertBankBuildSeconds": 1179,
+    "cudaGraphCaptureSeconds": 31,
+    "configuration": {
+      "moeBackend": "auto",
+      "memoryRatio": 0.96,
+      "prefillOverlap": false,
+      "maxSequenceLength": 32768,
+      "maxRunningRequests": 16
+    }
+  },
+  "warmup": {
+    "promptTokens": 101,
+    "completionTokens": 15,
+    "ttftSeconds": 34.803,
+    "elapsedSeconds": 42.665,
+    "steadyDecodeTokensPerSecond": 1.781
+  },
+  "streamingTrials": {
+    "count": 3,
+    "promptTokensPerTrial": 101,
+    "completionTokensPerTrial": 127,
+    "medianTTFTSeconds": 30.35,
+    "medianEndToEndTokensPerSecond": 1.211,
+    "medianSteadyDecodeTokensPerSecond": 1.69
+  },
+  "concurrency": [
+    {"level": 1, "successful": true, "aggregateCompletionTokensPerSecond": 0.645, "medianTTFTSeconds": 30.295, "batchElapsedSeconds": 48.047},
+    {"level": 2, "successful": true, "aggregateCompletionTokensPerSecond": 0.971, "medianTTFTSeconds": 32.846, "batchElapsedSeconds": 63.845},
+    {"level": 4, "successful": true, "aggregateCompletionTokensPerSecond": 1.339, "medianTTFTSeconds": 35.007, "batchElapsedSeconds": 92.637},
+    {"level": 8, "successful": true, "aggregateCompletionTokensPerSecond": 1.822, "medianTTFTSeconds": 38.433, "batchElapsedSeconds": 136.126},
+    {"level": 16, "successful": true, "aggregateCompletionTokensPerSecond": 2.4, "medianTTFTSeconds": 41.698, "batchElapsedSeconds": 206.627}
+  ],
+  "highestFullySuccessfulTestedConcurrency": 16,
+  "expertBankCache": {
+    "persistentCheckpointCreated": false,
+    "reason": "The 1.8 TiB volume had only 287 GiB free; a full FTW checkpoint needs a second model-sized output and at least 3.25 TiB total persistent capacity."
+  }
+}
