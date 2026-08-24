@@ -157,11 +157,11 @@ def _resolve_auto_attention_backend(
 def _validate_kv_cache_dtype(config, model_config) -> None:
     """Gate --kv-cache-dtype against what the quantized path actually implements.
 
-    8-bit KV storage lives in the triton attention kernels and the MHA/hybrid-SWA pools.
-    Every other backend reads the KV slabs through its own kernels (flashinfer's
-    ``kv_data_type``, trtllm's fp8 path) which this has not been wired into, and the
-    MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations here,
-    at config time, rather than letting a wrong-dtype tensor reach a kernel.
+    Compact KV storage (8-bit and packed int4) lives in the Triton attention kernels and
+    MHA/hybrid-SWA pools. Every other backend reads the KV slabs through its own kernels
+    (flashinfer's ``kv_data_type``, trtllm's fp8 path) which this has not been wired into,
+    and the MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations
+    here at config time, rather than letting a wrong-dtype tensor reach a kernel.
     """
     quant = getattr(config, "kv_quant", None)
     if quant is None or not quant.enabled:

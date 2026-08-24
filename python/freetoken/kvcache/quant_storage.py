@@ -1,10 +1,11 @@
 """Scale-buffer bookkeeping shared by the quantizable KV pools.
 
-A quantized pool allocates, alongside each K/V slab, a scale slab with the same shape
-but the last dimension divided by :data:`~freetoken.kvcache.quant.BLOCK`. The two must
-be allocated, rebuilt and freed together, and ``store_kv`` has to route to the
-quantizing kernel instead of the byte-copy one -- that is all this mixin owns. The pools
-keep their own geometry and indexing.
+A quantized pool allocates, alongside each K/V slab, a scale slab with the same logical
+shape but the last dimension divided by :data:`~freetoken.kvcache.quant.BLOCK`. Packed
+formats additionally shrink the K/V slab's physical last dimension. The slabs must be
+allocated, rebuilt and freed together, and ``store_kv`` routes to the quantizing kernel
+instead of the byte-copy one -- that is all this mixin owns. The pools keep their own
+geometry and indexing.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from .quant import NONE, SCALE_DTYPE, KVQuantSpec
 
 
 class QuantizedKVStorageMixin:
-    """Allocation + store routing for pools whose K/V slabs may be 8-bit.
+    """Allocation + store routing for pools whose K/V slabs may be compact.
 
     Subclasses set ``self._quant`` before allocating and call :meth:`_alloc_scales` for
     each K/V buffer they create. ``_quant`` defaulting to the unquantized spec keeps
@@ -32,11 +33,17 @@ class QuantizedKVStorageMixin:
         """Element dtype for a K/V slab under the active scheme."""
         return self._quant.storage_dtype if self._quant.enabled else compute_dtype
 
+    def _buffer_shape(self, kv_shape: tuple[int, ...]) -> tuple[int, ...]:
+        """Slab shape for a logical KV shape (last dim halves when packed)."""
+        return self._quant.storage_shape(kv_shape) if self._quant.enabled else kv_shape
+
     def _alloc_scales(self, kv_shape: tuple[int, ...], device: torch.device) -> torch.Tensor | None:
-        """Scale slab matching a ``[2, layers, ..., heads, head_dim]`` K/V buffer.
+        """Scale slab matching a ``[2, layers, ..., heads, head_dim]`` logical K/V buffer.
 
         None when unquantized -- callers store that verbatim and the attention path reads
-        it as "no scales", which is what selects the bf16 kernel branch.
+        it as "no scales", which is what selects the bf16 kernel branch. ``kv_shape`` is
+        the unpacked (element-counted) geometry: the scale extent is D // BLOCK regardless
+        of how the slab packs its elements.
         """
         if not self._quant.enabled:
             return None
@@ -54,7 +61,7 @@ class QuantizedKVStorageMixin:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Write one layer's K/V, quantizing on the way in when the pool is 8-bit."""
+        """Write one layer's K/V, quantizing on the way in when the pool is compact."""
         if not self._quant.enabled:
             from freetoken.kernel import store_cache
 
@@ -63,7 +70,8 @@ class QuantizedKVStorageMixin:
 
         from freetoken.kernel.triton.kv_quant import store_kv_quant
 
-        heads, head_dim = k_cache.shape[-2], k_cache.shape[-1]
+        heads, storage_head_dim = k_cache.shape[-2:]
+        head_dim = storage_head_dim * self._quant.elements_per_byte
         store_kv_quant(
             k_cache,
             k_scale,

@@ -1,9 +1,9 @@
-"""Quantizing store into an 8-bit KV pool.
+"""Quantizing store into a compact KV pool.
 
 The unquantized path stores K/V with ``kernel/store.py``'s CUDA kernel, which is a
 pure byte copy parameterized by element size. Quantized storage has to compute a scale
 per block of :data:`~freetoken.kvcache.quant.BLOCK` elements along ``head_dim`` on the
-way in, so it gets its own kernel here.
+way in, so it gets its own kernel here. The int4 path packs two signed values per byte.
 
 One program handles one ``(token, kv_head)`` pair: it loads that head's ``head_dim``
 values as a ``[head_dim // BLOCK, BLOCK]`` tile, reduces max-abs along the block, and
@@ -23,7 +23,7 @@ import triton.language as tl
 def _store_kv_quant_kernel(
     k_ptr,  # [tokens, heads, D] source, compute dtype
     v_ptr,
-    kc_ptr,  # [slots, heads, D] destination, storage dtype
+    kc_ptr,  # [slots, heads, D // EPB] destination, storage dtype
     vc_ptr,
     ks_ptr,  # [slots, heads, D // BLOCK] scales, fp16
     vs_ptr,
@@ -36,6 +36,7 @@ def _store_kv_quant_kernel(
     stride_sh,
     MAX_MAG: tl.constexpr,
     IS_INT: tl.constexpr,
+    EPB: tl.constexpr,
     BLOCK: tl.constexpr,
     NBLOCK: tl.constexpr,
 ):
@@ -43,6 +44,49 @@ def _store_kv_quant_kernel(
     head = tl.program_id(1)
     slot = tl.load(indices_ptr + tok).to(tl.int64)
 
+    if EPB == 2:
+        # Nibble-packed int4: tile the source as [NBLOCK, BLOCK // 2, 2], where the last
+        # axis is a (even, odd) element pair that becomes one byte. The scale is still
+        # per BLOCK (per row), computed over all BLOCK elements of the row.
+        pair_offs = (
+            tl.arange(0, NBLOCK)[:, None, None] * BLOCK
+            + tl.arange(0, BLOCK // 2)[None, :, None] * 2
+            + tl.arange(0, 2)[None, None, :]
+        )
+        byte_offs = tl.arange(0, NBLOCK)[:, None] * (BLOCK // 2) + tl.arange(0, BLOCK // 2)[None, :]
+        scale_offs = tl.arange(0, NBLOCK)
+
+        for is_v in tl.static_range(2):
+            src_ptr = v_ptr if is_v else k_ptr
+            dst_ptr = vc_ptr if is_v else kc_ptr
+            sc_ptr = vs_ptr if is_v else ks_ptr
+
+            x = tl.load(src_ptr + tok * stride_kt + head * stride_kh + pair_offs).to(tl.float32)
+            amax = tl.max(tl.abs(x), axis=2)  # [NBLOCK, BLOCK // 2]
+            amax = tl.max(amax, axis=1)  # [NBLOCK]
+            scale = tl.where(amax > 0, amax / MAX_MAG, 1.0)
+            scale = scale.to(sc_ptr.dtype.element_ty).to(tl.float32)
+            # Element-wise quantize: half away from zero, clamp to [-MAX_MAG, MAX_MAG].
+            q = tl.math.div_rn(x, scale[:, None, None])
+            q = tl.where(q >= 0, tl.floor(q + 0.5), tl.ceil(q - 0.5))
+            q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
+            # Bias into [0, 2*MAX_MAG] (= [0, 14]), then low nibble = even (index 0),
+            # high nibble = odd (index 1). Triton has no integer indexing, so split the
+            # last axis (size 2) into its two lanes. Pack arithmetically: even + odd*16.
+            q = (q + MAX_MAG).to(tl.int8)
+            even, odd = tl.split(q)
+            packed = even + odd * 16
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + byte_offs,
+                packed.to(dst_ptr.dtype.element_ty),
+            )
+            tl.store(
+                sc_ptr + slot * stride_st + head * stride_sh + scale_offs,
+                scale.to(sc_ptr.dtype.element_ty),
+            )
+        return
+
+    # EPB == 1: 8-bit element-shaped storage, one byte per element.
     # [NBLOCK, BLOCK] tile over head_dim: rows are quant blocks, columns the elements
     # sharing one scale.
     offs = tl.arange(0, NBLOCK)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
@@ -93,8 +137,9 @@ def store_kv_quant(
 ) -> None:
     """Quantize ``k``/``v`` ``[tokens, heads, D]`` into the pool slots ``indices``.
 
-    ``k_cache``/``v_cache`` are ``[slots, heads, D]`` in the spec's storage dtype and
-    ``k_scale``/``v_scale`` ``[slots, heads, D // BLOCK]`` in fp16.
+    ``k_cache``/``v_cache`` are ``[slots, heads, D // EPB]`` in the spec's storage dtype
+    (``D // EPB == D`` for 8-bit, ``D // 2`` for packed int4) and ``k_scale``/``v_scale``
+    ``[slots, heads, D // BLOCK]`` in fp16.
     """
     from freetoken.kvcache.quant import BLOCK
 
@@ -102,8 +147,9 @@ def store_kv_quant(
     if num_tokens == 0:
         return
     assert head_dim % BLOCK == 0, f"head_dim {head_dim} not a multiple of {BLOCK}"
-    assert k_cache.shape[1:] == (num_heads, head_dim), (
-        f"cache head geometry {tuple(k_cache.shape[1:])} != source {(num_heads, head_dim)}"
+    assert k_cache.shape[1:] == (num_heads, head_dim // spec.elements_per_byte), (
+        f"packed cache geometry {tuple(k_cache.shape[1:])} != "
+        f"{(num_heads, head_dim // spec.elements_per_byte)}"
     )
     _store_kv_quant_kernel[(num_tokens, num_heads)](
         k,
@@ -121,6 +167,7 @@ def store_kv_quant(
         k_scale.stride(1),
         MAX_MAG=spec.max_magnitude,
         IS_INT=spec.is_integer,
+        EPB=spec.elements_per_byte,
         BLOCK=BLOCK,
         NBLOCK=head_dim // BLOCK,
         num_warps=4,

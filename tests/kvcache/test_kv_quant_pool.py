@@ -1,21 +1,21 @@
-"""KV pools backed by 8-bit storage: allocation, store/read-back, cost, rebuild."""
+"""KV pools backed by compact storage: allocation, store/read-back, cost, rebuild."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from freetoken.kvcache.quant import BLOCK, FP8_E4M3, NONE, Q8_0
+from freetoken.kvcache.quant import BLOCK, FP8_E4M3, INT4, NONE, Q8_0
 
 from .test_hybrid_swa_kv_cache import _kv_group_specs, _patch_tp
 
-SPECS = [Q8_0, FP8_E4M3]
+SPECS = [Q8_0, FP8_E4M3, INT4]
 IDS = [spec.name for spec in SPECS]
 
-# Measured relative L2 error of a round trip through each scheme on gaussian KV with a
-# 32-element block: q8_0 ~0.005, fp8_e4m3 ~0.024. int8 wins by ~4.5x because a block that
-# small keeps outliers from stretching the scale, which is the reason q8_0 is the default.
-MAX_REL_ERR = {Q8_0.name: 0.01, FP8_E4M3.name: 0.03}
+# Measured relative L2 error of a round trip through each scheme on Gaussian KV with a
+# 32-element block: q8_0 ~0.005, fp8_e4m3 ~0.024, int4 ~0.09. q8_0 remains the quality
+# default; int4 trades accuracy for roughly 89% more capacity than the 8-bit formats.
+MAX_REL_ERR = {Q8_0.name: 0.01, FP8_E4M3.name: 0.03, INT4.name: 0.12}
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -52,7 +52,7 @@ def _mha_pool(quant, device="cuda", num_pages=64):
 
 @cuda_only
 @pytest.mark.parametrize("spec", SPECS, ids=IDS)
-def test_swa_pool_allocates_8bit_slabs_and_matching_scales(monkeypatch, spec):
+def test_swa_pool_allocates_compact_slabs_and_matching_scales(monkeypatch, spec):
     _patch_tp(monkeypatch)
     pool = _swa_pool(spec)
 
@@ -62,7 +62,7 @@ def test_swa_pool_allocates_8bit_slabs_and_matching_scales(monkeypatch, spec):
         s = pool.k_scale(layer)
         assert k.dtype == spec.storage_dtype
         assert s.dtype == torch.float16
-        assert k.shape[-2:] == (heads, head_dim)
+        assert k.shape[-2:] == (heads, head_dim // spec.elements_per_byte)
         assert s.shape[-2:] == (heads, head_dim // BLOCK)
         assert s.shape[:-1] == k.shape[:-1]
 
@@ -83,7 +83,8 @@ def test_unquantized_pool_keeps_bf16_and_has_no_scales(monkeypatch):
 def test_store_kv_round_trips_through_the_quantized_pool(monkeypatch, spec, layer):
     _patch_tp(monkeypatch)
     pool = _swa_pool(spec)
-    heads, head_dim = pool.k_cache(layer).shape[-2:]
+    heads, storage_head_dim = pool.k_cache(layer).shape[-2:]
+    head_dim = storage_head_dim * spec.elements_per_byte
 
     tokens = 8
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -99,7 +100,7 @@ def test_store_kv_round_trips_through_the_quantized_pool(monkeypatch, spec, laye
         pool.translate_loc_from_full_to_swa(out_loc) if pool.is_swa_layer(layer) else out_loc
     ).to(torch.long)
     got = spec.dequantize(
-        pool.k_cache(layer).view(-1, heads, head_dim)[slots].float(),
+        pool.k_cache(layer).view(-1, heads, storage_head_dim)[slots].float(),
         pool.k_scale(layer).view(-1, heads, head_dim // BLOCK)[slots],
     )
     # Storing is lossy by construction; what must hold is that it round-trips to within
@@ -113,8 +114,7 @@ def test_store_kv_round_trips_through_the_quantized_pool(monkeypatch, spec, laye
 @cuda_only
 @pytest.mark.parametrize("spec", SPECS, ids=IDS)
 def test_unit_bytes_counts_the_scale_slab(monkeypatch, spec):
-    """Budgeting has to see 1 + 2/32 bytes per element, not 1 -- otherwise a rebuild
-    would size pools against memory the scales are quietly consuming."""
+    """Budgeting must include the compact payload and per-block scales."""
     _patch_tp(monkeypatch)
     quantized = _swa_pool(spec)
     plain = _swa_pool(NONE)
@@ -122,8 +122,7 @@ def test_unit_bytes_counts_the_scale_slab(monkeypatch, spec):
     q_full, q_swa = quantized.unit_bytes()
     p_full, p_swa = plain.unit_bytes()
     for q, p in ((q_full, p_full), (q_swa, p_swa)):
-        # bf16 is 2 bytes/element, the quantized pool 1 + 2/32 = 1.0625.
-        assert q == pytest.approx(p * (1.0625 / 2.0), rel=1e-3)
+        assert q == pytest.approx(p * (spec.bytes_per_element(torch.bfloat16) / 2.0), rel=1e-3)
 
 
 @cuda_only
@@ -141,7 +140,7 @@ def test_rebuild_reallocates_scales_and_keeps_identity(monkeypatch, spec):
         assert k.dtype == spec.storage_dtype
         assert s is not None and s.dtype == torch.float16
         assert s.shape[:-1] == k.shape[:-1]
-        assert s.shape[-1] == k.shape[-1] // BLOCK
+        assert s.shape[-1] == k.shape[-1] * spec.elements_per_byte // BLOCK
     assert pool.k_cache(2).shape[0] == 128
     assert pool.k_cache(0).shape[0] == 64
 
@@ -156,6 +155,7 @@ def test_mha_pool_quantizes_and_round_trips(monkeypatch, spec):
     )
     pool = _mha_pool(spec)
     assert pool.k_cache(0).dtype == spec.storage_dtype
+    assert pool.k_cache(0).shape[-1] == 256 // spec.elements_per_byte
     assert pool.k_scale(0).shape[-1] == 256 // BLOCK
 
     g = torch.Generator(device="cuda").manual_seed(1)
@@ -166,7 +166,7 @@ def test_mha_pool_quantizes_and_round_trips(monkeypatch, spec):
 
     idx = out_loc.to(torch.long)
     got = spec.dequantize(
-        pool.k_cache(0).view(-1, 2, 256)[idx].float(),
+        pool.k_cache(0).view(-1, 2, 256 // spec.elements_per_byte)[idx].float(),
         pool.k_scale(0).view(-1, 2, 256 // BLOCK)[idx],
     )
     rel = ((got - k.float()).norm() / k.float().norm()).item()
@@ -178,7 +178,7 @@ def test_mha_pool_quantizes_and_round_trips(monkeypatch, spec):
 
 
 def test_cost_model_prices_the_quantized_pool_below_bf16(monkeypatch):
-    """The whole point of the flag, as arithmetic: same geometry, ~half the bytes."""
+    """The compact formats reduce the same logical geometry's memory footprint."""
     from freetoken.kvcache.base import spec_kv_bytes_per_token
     from freetoken.distributed.info import DistributedInfo
     from types import SimpleNamespace
@@ -191,7 +191,10 @@ def test_cost_model_prices_the_quantized_pool_below_bf16(monkeypatch):
 
     plain = spec_kv_bytes_per_token(spec, cfg(NONE))
     quantized = spec_kv_bytes_per_token(spec, cfg(Q8_0))
-    assert quantized == pytest.approx(plain * (1.0625 / 2.0), rel=1e-3)
+    packed = spec_kv_bytes_per_token(spec, cfg(INT4))
+    assert quantized == pytest.approx(plain * (Q8_0.bytes_per_element(torch.bfloat16) / 2.0), rel=1e-3)
+    assert packed == pytest.approx(plain * (INT4.bytes_per_element(torch.bfloat16) / 2.0), rel=1e-3)
+    assert packed < quantized
     # A config with no kv_quant attribute at all must price as bf16 (back-compat with
     # every caller that predates the flag).
     legacy = spec_kv_bytes_per_token(spec, SimpleNamespace(tp_info=tp, dtype=torch.bfloat16))
@@ -221,7 +224,7 @@ def test_q8_0_stores_kv_more_accurately_than_fp8(monkeypatch):
         pool.store_kv(k, v, out_loc, 0)
         slots = pool.translate_loc_from_full_to_swa(out_loc).to(torch.long)
         got = spec.dequantize(
-            pool.k_cache(0).view(-1, 8, 256)[slots].float(),
+            pool.k_cache(0).view(-1, 8, 256 // spec.elements_per_byte)[slots].float(),
             pool.k_scale(0).view(-1, 8, 256 // BLOCK)[slots],
         )
         errs[spec.name] = ((got - k.float()).norm() / k.float().norm()).item()

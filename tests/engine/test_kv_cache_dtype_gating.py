@@ -4,10 +4,9 @@ must be refused at config time, not at the first kernel launch."""
 from __future__ import annotations
 
 import pytest
-import torch
 
 from freetoken.engine.engine import _validate_kv_cache_dtype
-from freetoken.kvcache.quant import NONE, Q8_0
+from freetoken.kvcache.quant import FP8_E4M3, INT4, NONE, Q8_0
 from freetoken.models.config import KVCacheGroupSpec
 
 
@@ -37,8 +36,9 @@ def _spec(name="full", head_dim=256, mla=False, index_head_dim=0):
     )
 
 
-def test_triton_backend_with_aligned_head_dim_is_accepted():
-    _validate_kv_cache_dtype(_Cfg(), _Model(_spec(head_dim=256), _spec("swa", 512)))
+@pytest.mark.parametrize("quant", [Q8_0, FP8_E4M3, INT4], ids=lambda spec: spec.name)
+def test_triton_backend_with_aligned_head_dim_is_accepted(quant):
+    _validate_kv_cache_dtype(_Cfg(quant=quant), _Model(_spec(head_dim=256), _spec("swa", 512)))
 
 
 def test_auto_dtype_skips_every_check():
