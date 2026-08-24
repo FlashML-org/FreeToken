@@ -238,11 +238,36 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    # Optional Marlin-packed scales for INT4 models on sm_75.
+    # When present and device is sm_75, routes to the Marlin WNA16 path.
+    w1_scales: torch.Tensor | None = None,
+    w2_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
-    not shared; the resident bf16 path routes decode through here too."""
+    not shared; the resident bf16 path routes decode through here too.
+
+    sm_75 (Turing) INT4 path: when ``w1``/``w2`` are Marlin-packed int32 tensors and
+    ``w1_scales``/``w2_scales`` are provided, dispatches to the sm_75 Marlin WNA16
+    extension (stages=2) instead of the Triton kernels.
+    """
+    # ── sm_75 Marlin WNA16 path (AWQ/GPTQ INT4 on Turing) ──────────────────
+    if w1_scales is not None and w2_scales is not None:
+        from freetoken.moe.marlin_sm75 import (
+            fused_experts_marlin_sm75,
+            is_marlin_sm75_applicable,
+        )
+        if is_marlin_sm75_applicable(hidden_states.device, w1, activation):
+            return fused_experts_marlin_sm75(
+                hidden_states,
+                w1, w2,
+                w1_scales, w2_scales,
+                topk_weights, topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+    # ── standard Triton path ────────────────────────────────────────────────
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
