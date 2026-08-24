@@ -50,6 +50,11 @@ def _parse_ggml_common_h() -> dict[str, int]:
     macros = {
         "QK_K": 256,
         "K_SCALE_SIZE": 12,
+        # ggml-common.h: `#define IQ3S_N_SCALE QK_K / 64`. Without it block_iq3_s's
+        # `scales[IQ3S_N_SCALE]` field parses as 0 and the struct comes out 106 instead
+        # of 110 -- which the real-checkpoint check disproves: Ornith's IQ3_S
+        # token_embd.weight is 248320*2048/256*110 == 218,521,600 bytes on disk exactly.
+        "IQ3S_N_SCALE": 4,
         "QK4_0": 32,
         "QK4_1": 32,
         "QK5_0": 32,
