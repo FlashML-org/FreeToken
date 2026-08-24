@@ -207,11 +207,22 @@ def load_gguf_expert_sources(
 
             # Emit gate_up bank once both gate and up are present.
             if layer in gate_buf and layer in up_buf:
-                gate_up_row_bytes = specs["gate_up"][0][2]
-                # Concatenate gate [H*I, row_bytes(E, type)] and up [H*I, row_bytes(E, type)]
-                # to get [H*2*I, row_bytes(E, type)], then reshape to [E, 2*I, row_bytes(H, type)]
-                combined = torch.cat([gate_buf[layer], up_buf[layer]], dim=0)
-                banks["gate_up"][layer].copy_(combined.reshape(E, 2 * I, gate_up_row_bytes))
+                rb = specs["gate_up"][0][2]
+                # gate and up each arrive as [rows, row_bytes] = [E*I, row_bytes(H)], and
+                # ggml's fastest-first dims [H, I, E] make E the slowest axis, so those rows
+                # are EXPERT-MAJOR: expert e owns rows [e*I, (e+1)*I).
+                #
+                # The bank must be [E, 2I, row_bytes(H)] with each expert's own gate rows
+                # followed by its own up rows. So reshape to [E, I, rb] and concatenate on
+                # the ROW axis (dim=1), per expert.
+                #
+                # cat(dim=0) then reshape(E, 2I, rb) -- the obvious-looking version -- is
+                # wrong: it lays down every expert's gate before any up, so expert 0 would
+                # get its gate rows plus expert 1's gate rows, and up would be E*I rows
+                # away. That loads and runs at full speed and emits fluent nonsense.
+                g = gate_buf[layer].reshape(E, I, rb)
+                u = up_buf[layer].reshape(E, I, rb)
+                banks["gate_up"][layer].copy_(torch.cat([g, u], dim=1))
                 del gate_buf[layer], up_buf[layer]
                 if tracker is not None:
                     tracker.note(layer)
