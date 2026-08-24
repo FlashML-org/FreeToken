@@ -191,6 +191,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attention_groups=groups,
         expert_quant="gguf",
         gguf_expert_types=_uniform_expert_types(shim.model_path, num_layers),
+        gguf_model_path=shim.model_path,
         weight_block_size=None,
         attn_quant="gguf",
         dense_quant="gguf",
@@ -602,6 +603,11 @@ def iter_gguf_weights(
     assert not gate_up_buf, f"incomplete shared_expert gate_up groups: {sorted(gate_up_buf)}"
 
 
+def is_gguf_model(config: ModelConfig) -> bool:
+    """True when this config came from a GGUF checkpoint (native block-quant path)."""
+    return getattr(config, "expert_quant", "none") == "gguf"
+
+
 def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> None:
     """In place: replace qwen35moe's dense projections + embedding with native GGUF ops.
 
@@ -718,6 +724,7 @@ __all__ = [
     "gguf_name_to_freetoken",
     "iter_gguf_weights",
     "convert_qwen35_to_gguf",
+    "is_gguf_model",
     "_MERGED_PARTS",
     "_EXPERT_SUFFIXES",
 ]

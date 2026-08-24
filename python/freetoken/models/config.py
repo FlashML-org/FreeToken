@@ -257,6 +257,11 @@ class ModelConfig:
     # *_M mixes do: Ornith IQ3_M splits ffn_down_exps across Q4_K and IQ3_S, while its
     # IQ3_S/IQ3_XXS siblings are uniform and load fine).
     gguf_expert_types: tuple[int, int] | None = None
+    # Path to the .gguf this config was parsed from, for ``expert_quant == "gguf"``. The
+    # model's __init__ swaps its dense ops for GGUF ops and has to size each packed buffer
+    # by the ggml type that tensor actually uses, which is only in the file -- unlike
+    # gemma4's all-Q4_0 checkpoint, llama.cpp's mixed quants pick a type per tensor.
+    gguf_model_path: str | None = None
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
