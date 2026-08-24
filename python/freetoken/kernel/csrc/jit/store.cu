@@ -72,18 +72,18 @@ struct StoreKernel {
 
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
         .with_strides({Y, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
     TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
