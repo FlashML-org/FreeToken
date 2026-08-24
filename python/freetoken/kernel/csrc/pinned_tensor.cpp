@@ -7,20 +7,27 @@ namespace {
 // A failed runtime call latches its status in the calling thread until someone
 // reads it. TORCH_CHECK reports the error but does not clear it, so the next
 // unrelated CUDA call -- torch's, in practice -- reports *this* failure instead
-// of its own. Drain it before raising: every error below is non-sticky, so the
-// context stays usable for a caller that handles the exception.
+// of its own. Drain it before raising. The failures these calls can originate
+// are non-sticky, so draining leaves the context usable; a sticky error latched
+// elsewhere will simply re-latch on the next call, which is correct.
 #define FT_CUDA_CHECK(expr, ...)                                               \
   do {                                                                         \
     const cudaError_t ft_err_ = (expr);                                        \
     if (ft_err_ != cudaSuccess) {                                              \
-      cudaGetLastError();                                                      \
+      [[maybe_unused]] const cudaError_t ft_drained_ = cudaGetLastError();      \
       TORCH_CHECK(false, __VA_ARGS__, cudaGetErrorString(ft_err_));            \
     }                                                                          \
   } while (0)
 
 void free_pinned(void *ptr) {
-  if (ptr != nullptr) {
-    cudaFreeHost(ptr);
+  if (ptr == nullptr) {
+    return;
+  }
+  // A from_blob deleter runs during GC, with no exception to attribute a failure
+  // to -- so this drains and never throws. Left latched it would be the worst
+  // case of the bug above: a stale status with no visible origin at all.
+  if (cudaFreeHost(ptr) != cudaSuccess) {
+    [[maybe_unused]] const cudaError_t drained = cudaGetLastError();
   }
 }
 
@@ -89,12 +96,20 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
 bool host_ptr_identity() {
   int device = 0;
   FT_CUDA_CHECK(cudaGetDevice(&device), "cudaGetDevice failed: ");
+  // An unqueryable attribute stays 0 and answers "no identity", which is the safe
+  // answer: device_ptr() then goes through host_device_ptr(), the real translation,
+  // correct on every platform. Only the latch is new here -- do not raise, or an
+  // attribute query that used to degrade gracefully becomes fatal on the offload path.
   int uva = 0, reg = 0;
-  FT_CUDA_CHECK(cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device),
-                "cudaDeviceGetAttribute(UnifiedAddressing) failed: ");
-  FT_CUDA_CHECK(cudaDeviceGetAttribute(
-                    &reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device),
-                "cudaDeviceGetAttribute(CanUseHostPointerForRegisteredMem) failed: ");
+  if (cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device) != cudaSuccess) {
+    [[maybe_unused]] const cudaError_t drained = cudaGetLastError();
+    uva = 0;
+  }
+  if (cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem,
+                             device) != cudaSuccess) {
+    [[maybe_unused]] const cudaError_t drained = cudaGetLastError();
+    reg = 0;
+  }
   return uva == 1 && reg == 1;
 }
 
