@@ -96,41 +96,34 @@ def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
 
 def gguf_expert_specs(
     config: ModelConfig, types: dict[str, list[int]]
-) -> dict[str, list[tuple[tuple[int, ...], torch.dtype]]]:
-    """Per-layer expert bank shapes, accounting for per-layer dtype variation.
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Expert bank shapes as ``{name: (shape, dtype)}`` -- ``alloc_layer_banks``' contract.
 
-    The routed experts are stored as 3D stacks [E, out, in] in torch order.
-    Returns a list of (shape, dtype) tuples per expert bank:
-    - ``gate_up[layer]``: ``((E, 2*I, row_bytes(H, types["gate_up"][layer])), torch.uint8)``
-    - ``down[layer]``: ``((E, H, row_bytes(I, types["down"][layer])), torch.uint8)``
+    The routed experts are 3D stacks in torch order::
 
-    where ``E=num_experts``, ``H=hidden_size``, ``I=moe_intermediate_size``.
+        gate_up  (E, 2*I, row_bytes(H, t_gate_up))   uint8, packed blocks
+        down     (E, H,   row_bytes(I, t_down))      uint8, packed blocks
 
-    The row_bytes dimension varies by layer because the quant type varies,
-    and the MoE kernel needs to read the exact byte width for its quant type.
+    One spec per bank, not per layer: every layer of a bank MUST share a ggml type. The
+    GPU slot pool is a single allocation shared by all layers and ``moe_vec.cuh`` indexes
+    it as ``expert * nrows * (ncols / qk)`` with no padding allowance, so two strides in
+    one pool would read every block at the wrong offset. A non-uniform bank is rejected
+    here rather than mis-decoded; ``expert_banks._gguf_banks`` raises the user-facing
+    error naming the offending layers.
     """
-    E = config.num_experts
-    H = config.hidden_size
-    I = config.moe_intermediate_size
-    num_layers = config.num_layers
-
-    gate_up_specs = []
-    down_specs = []
-
-    for layer in range(num_layers):
-        gate_up_type = types["gate_up"][layer]
-        down_type = types["down"][layer]
-
-        gate_up_row_bytes = row_bytes(H, gate_up_type)
-        down_row_bytes = row_bytes(I, down_type)
-
-        gate_up_specs.append(((E, 2 * I, gate_up_row_bytes), torch.uint8))
-        down_specs.append(((E, H, down_row_bytes), torch.uint8))
-
-    return {
-        "gate_up": gate_up_specs,
-        "down": down_specs,
-    }
+    E, H, I = config.num_experts, config.hidden_size, config.moe_intermediate_size
+    out = {}
+    for name, elems in (("gate_up", H), ("down", I)):
+        distinct = sorted(set(types[name]))
+        if len(distinct) != 1:
+            raise ValueError(
+                f"expert bank {name!r} mixes ggml types across layers ({distinct}); a bank "
+                f"must be uniform because its slot pool is one allocation with one stride"
+            )
+        rb = row_bytes(elems, distinct[0])
+        shape = (E, 2 * I, rb) if name == "gate_up" else (E, H, rb)
+        out[name] = (shape, torch.uint8)
+    return out
 
 
 def load_gguf_expert_sources(
@@ -203,7 +196,7 @@ def load_gguf_expert_sources(
                 # Shape from GGUF: [E, H, I] in torch order = [I, H, E] in ggml order
                 # t.packed() is [I*H, row_bytes(E, type)]
                 # Reshape to [E, H, row_bytes(I, type)]
-                down_row_bytes = specs["down"][layer][0][2]
+                down_row_bytes = specs["down"][0][2]
                 banks["down"][layer].copy_(t.packed().reshape(E, H, down_row_bytes))
                 seen_down.add(layer)
                 if tracker is not None:
@@ -214,7 +207,7 @@ def load_gguf_expert_sources(
 
             # Emit gate_up bank once both gate and up are present.
             if layer in gate_buf and layer in up_buf:
-                gate_up_row_bytes = specs["gate_up"][layer][0][2]
+                gate_up_row_bytes = specs["gate_up"][0][2]
                 # Concatenate gate [H*I, row_bytes(E, type)] and up [H*I, row_bytes(E, type)]
                 # to get [H*2*I, row_bytes(E, type)], then reshape to [E, 2*I, row_bytes(H, type)]
                 combined = torch.cat([gate_buf[layer], up_buf[layer]], dim=0)

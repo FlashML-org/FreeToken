@@ -309,6 +309,9 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
     quant_types = {}
     for t in iter_gguf_tensors(model_path):
         if not t.name.startswith("blk."):
+            # Globals (token_embd.weight, output.weight, output_norm.weight) keyed under
+            # layer -1 so the swap can size the embedding and lm_head from the file too.
+            quant_types[(-1, t.name)] = t.ggml_type
             continue
         _, idx, suffix = t.name.split(".", 2)
         layer = int(idx)
@@ -623,8 +626,25 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
         if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
     }
 
-    def swap_linear(owner, attr, quant_type=GGML_Q4_K):
-        """Replace a dense Linear with GGUFLinear."""
+    def qt(layer: int, suffix: str) -> int:
+        """The ggml type of one tensor, straight from the file.
+
+        No default: a guessed type silently allocates a wrong-sized packed buffer, and the
+        only symptom is garbage output. (An earlier version defaulted o_proj to Q4_K, which
+        happened to match IQ3_M and mis-sized every full-attention o_proj on IQ3_S.)
+        """
+        key = (layer, suffix)
+        if key not in quant_map:
+            raise ValueError(
+                f"GGUF {model_path}: expected tensor "
+                f"{suffix if layer < 0 else f'blk.{layer}.{suffix}'} is absent, so its quant "
+                f"type cannot be read; this checkpoint does not match the qwen35moe layout "
+                f"this adapter expects"
+            )
+        return quant_map[key]
+
+    def swap_linear(owner, attr, quant_type: int):
+        """Replace a dense Linear with the GGUFLinear its packed weight will land in."""
         lin = getattr(owner, attr)
         out_features, in_features = lin.weight.shape
         setattr(
@@ -637,60 +657,60 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_IQ3_S,
+        quant_type=qt(-1, "token_embd.weight"),
     )
     inner.embed_tokens = embed
 
     for layer_idx, layer in enumerate(inner.layers.op_list):
         if layer_idx in full_layer_ids:
-            # Full-attention layer: qkv_proj (mixed quant), o_proj (Q4_K)
-            types = [
-                quant_map.get((layer_idx, "attn_q.weight"), GGML_IQ3_S),
-                quant_map.get((layer_idx, "attn_k.weight"), GGML_IQ3_S),
-                quant_map.get((layer_idx, "attn_v.weight"), GGML_Q4_K),
-            ]
-            output_sizes = [8192, 512, 512]
+            # qkv_proj: q | k | v. Mixed in every Ornith quant level (v is a K-quant while
+            # q/k are I-quants), so this is normally the GGUFMergedLinear path.
             layer.self_attn.qkv_proj = gguf_merged_or_plain(
-                config.hidden_size, output_sizes, types, has_bias=False
+                config.hidden_size,
+                [8192, 512, 512],
+                [
+                    qt(layer_idx, "attn_q.weight"),
+                    qt(layer_idx, "attn_k.weight"),
+                    qt(layer_idx, "attn_v.weight"),
+                ],
+                has_bias=False,
             )
-            swap_linear(layer.self_attn, "o_proj", GGML_Q4_K)
+            swap_linear(layer.self_attn, "o_proj", qt(layer_idx, "attn_output.weight"))
         else:
-            # GDN layer: in_proj (mixed quant), out_proj (IQ3_S)
-            types = [
-                quant_map.get((layer_idx, "attn_qkv.weight"), GGML_Q4_K),
-                quant_map.get((layer_idx, "attn_gate.weight"), GGML_IQ3_S),
-                quant_map.get((layer_idx, "ssm_beta.weight"), GGML_IQ3_S),
-                quant_map.get((layer_idx, "ssm_alpha.weight"), GGML_IQ3_S),
-            ]
-            output_sizes = [8192, 4096, 32, 32]
+            # in_proj: qkv | z | b | a, matching gdn.py's
+            # _in_proj_split = [conv_dim, value_dim, num_v_heads, num_v_heads].
             layer.linear_attn.in_proj = gguf_merged_or_plain(
-                config.hidden_size, output_sizes, types, has_bias=False
+                config.hidden_size,
+                [8192, 4096, 32, 32],
+                [
+                    qt(layer_idx, "attn_qkv.weight"),
+                    qt(layer_idx, "attn_gate.weight"),
+                    qt(layer_idx, "ssm_beta.weight"),
+                    qt(layer_idx, "ssm_alpha.weight"),
+                ],
+                has_bias=False,
             )
-            swap_linear(layer.linear_attn, "out_proj", GGML_IQ3_S)
+            swap_linear(layer.linear_attn, "out_proj", qt(layer_idx, "ssm_out.weight"))
 
-        # Shared expert: gate_up_proj (IQ3_S, uniform), down_proj (Q4_K or IQ3_S).
-        gate_up_type = quant_map.get((layer_idx, "ffn_gate_shexp.weight"), GGML_IQ3_S)
-        down_type = quant_map.get((layer_idx, "ffn_down_shexp.weight"), GGML_Q4_K)
-
-        # gate_up is typically uniform IQ3_S, but use gguf_merged_or_plain for safety.
-        up_type = quant_map.get((layer_idx, "ffn_up_shexp.weight"), GGML_IQ3_S)
+        # Shared expert: gate|up fuse when they share a type (they do in every quant level
+        # seen so far); down is independent and does vary (Q4_K on IQ3_M's first layers).
+        I = config.shared_expert_intermediate_size
         layer.mlp.shared_expert.gate_up_proj = gguf_merged_or_plain(
             config.hidden_size,
-            [config.shared_expert_intermediate_size, config.shared_expert_intermediate_size],
-            [gate_up_type, up_type],
+            [I, I],
+            [qt(layer_idx, "ffn_gate_shexp.weight"), qt(layer_idx, "ffn_up_shexp.weight")],
             has_bias=False,
         )
-        swap_linear(layer.mlp.shared_expert, "down_proj", down_type)
+        swap_linear(
+            layer.mlp.shared_expert, "down_proj", qt(layer_idx, "ffn_down_shexp.weight")
+        )
 
-    # lm_head: use output.weight quant type (Q6_K in Ornith).
     if config.tie_word_embeddings:
-        # Tied head: reference the embedding's qweight.
         from freetoken.models.gemma4.gguf import GGUFTiedLMHead
 
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, qt(-1, "token_embd.weight"))
     else:
-        # Untied head: create a separate GGUFLinear (rare for qwen35moe).
-        swap_linear(model, "lm_head", GGML_Q6_K)
+        swap_linear(model, "lm_head", qt(-1, "output.weight"))
 
 
 __all__ = [
