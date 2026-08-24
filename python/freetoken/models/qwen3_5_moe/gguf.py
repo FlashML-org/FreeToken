@@ -474,9 +474,13 @@ def iter_gguf_weights(
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts, (
-        "qwen35moe GGUF stores experts as IQ3_S and only supports the offload backend; "
-        "experts are loaded into the offload cache via the expert-bank loader."
+    # Only the MoE variant keeps its routed experts out of this iterator; they come from
+    # the offload cache instead. A dense qwen35 checkpoint has no routed experts at all, so
+    # the engine legitimately asks for "everything" and the assert must not fire.
+    config_moe = int(_kv(cached_load_hf_config(model_path), "expert_count", 0)) > 0
+    assert not (config_moe and include_moe_experts), (
+        "qwen35moe GGUF keeps its routed experts in the offload cache; they are loaded by "
+        "the expert-bank loader, not by iter_gguf_weights."
     )
     assert include_non_moe
     _require_tp1("weight loading")
