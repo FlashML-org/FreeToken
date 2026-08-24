@@ -123,7 +123,7 @@ class TestMergedLinearConcatenatesOutputs:
 
         # Forward pass: batch size 1 (small batch, uses MMVQ)
         x = torch.randn(1, in_features, dtype=torch.bfloat16)
-        output = merged(x)
+        output = merged.forward(x)
 
         # Output shape should be [1, 9216]
         assert output.shape == (1, 9216)
