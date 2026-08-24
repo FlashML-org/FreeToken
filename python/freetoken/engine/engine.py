@@ -423,7 +423,17 @@ class Engine:
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        use_pynccl = config.use_pynccl
+        if config.tp_info.size > 1 and use_pynccl:
+            from freetoken.kernel.backend import is_rocm
+
+            if is_rocm():
+                logger.warning_rank0(
+                    "PyNCCL is NVIDIA-only; using PyTorch's ROCm/RCCL process group instead"
+                )
+                use_pynccl = False
+
+        if config.tp_info.size == 1 or use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
