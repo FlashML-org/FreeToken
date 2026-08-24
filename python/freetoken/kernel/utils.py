@@ -71,7 +71,7 @@ def _rocm_link_flags() -> List[str]:
     Traditional ROCm installs provide ``libamdhip64.so`` under ``$ROCM_HOME/lib``.
     ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
     still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
-    ``LIBRARY_PATH`` without modifying the image's Python environment.
+    an explicit linker search path without modifying the Python environment.
     """
     candidates: list[pathlib.Path] = []
     if os.getenv("ROCM_HOME"):
@@ -100,13 +100,13 @@ def _rocm_link_flags() -> List[str]:
             link_dir.mkdir(parents=True, exist_ok=True)
             compat_link = link_dir / "libamdhip64.so"
             if not compat_link.exists() and not compat_link.is_symlink():
-                compat_link.symlink_to(versioned[-1])
+                try:
+                    compat_link.symlink_to(versioned[-1])
+                except FileExistsError:
+                    # Multiple tensor-parallel ranks may prepare the same cache.
+                    pass
 
-        current = [path for path in os.getenv("LIBRARY_PATH", "").split(":") if path]
-        os.environ["LIBRARY_PATH"] = ":".join(
-            dict.fromkeys([str(link_dir), str(library_dir), *current])
-        )
-        return [f"-Wl,-rpath,{library_dir}"]
+        return [f"-L{link_dir}", f"-Wl,-rpath,{library_dir}"]
 
     raise RuntimeError("Unable to locate libamdhip64 for ROCm JIT linking")
 
