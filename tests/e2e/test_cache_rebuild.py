@@ -91,20 +91,27 @@ def _wait_until_serving(base: str, proc: subprocess.Popen, deadline: float) -> N
 
 
 def _generate(base: str) -> str:
-    """A short non-thinking completion — the point is that the engine still runs, not what it says."""
+    """A short completion — the point is that the engine still runs, not what it says.
+
+    ``enable_thinking`` is a Qwen chat-template knob and does nothing on a
+    checkpoint that reasons by its own protocol (gpt-oss and friends), so the
+    budget has to cover a reasoning trace and either channel counts as alive --
+    otherwise the gate fails on a healthy engine before it has torn anything down.
+    """
     code, body = _post(
         base,
         "/v1/chat/completions",
         {
             "model": "rebuild-test",
             "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
-            "max_tokens": 32,
+            "max_tokens": 256,
             "temperature": 0.0,
             "chat_template_kwargs": {"enable_thinking": False},
         },
     )
     assert code == 200, body
-    return str(body["choices"][0]["message"]["content"])
+    message = body["choices"][0]["message"]
+    return str(message.get("content") or message.get("reasoning_content") or "")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache rebuild e2e needs CUDA")
