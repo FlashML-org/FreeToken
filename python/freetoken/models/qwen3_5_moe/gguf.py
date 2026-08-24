@@ -46,6 +46,7 @@ from freetoken.models.config import (
     RotaryConfig,
 )
 from freetoken.models.gguf.dequant import (
+    GGML_UNQUANTIZED as GGML_UNQUANTIZED_SET,
     GGML_IQ3_S,
     GGML_NAME,
     GGML_Q4_K,
@@ -391,6 +392,30 @@ def _to_bf16(t) -> torch.Tensor:
     return flat.reshape(t.shape)
 
 
+def _dequant_any(t) -> torch.Tensor:
+    """Dequantize a GgufTensor of ANY ggml type to dense bf16, via the CUDA kernel.
+
+    The pure-torch ``dequantize`` in models/gguf/dequant.py implements only Q4_0 and Q6_K
+    (it is the reference/test path). ``ggml_dequantize`` covers all 19 quant types, so use
+    it for the one tensor that genuinely has to be materialized dense -- ssm_out, whose
+    columns need un-tiling. Round-trips through the GPU; the result is a CPU tensor so the
+    normal load path places it.
+    """
+    from freetoken.kernel.gguf import ggml_dequantize
+
+    if t.ggml_type in GGML_UNQUANTIZED_SET:
+        return _to_bf16(t)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{t.name}: needs dense dequantization of ggml type "
+            f"{GGML_NAME.get(t.ggml_type, t.ggml_type)}, which only the CUDA kernel "
+            f"implements, but no CUDA device is available"
+        )
+    out_f, in_f = t.shape[0], t.shape[1]
+    packed = t.packed().reshape(out_f, row_bytes(in_f, t.ggml_type)).cuda()
+    return ggml_dequantize(packed, t.ggml_type, out_f, in_f, torch.bfloat16).cpu()
+
+
 def _to_f32(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense float32 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32)
@@ -675,7 +700,7 @@ def iter_gguf_weights(
                 # is dequantized to dense bf16. Cost: out*in*2 bytes per GDN layer
                 # (2048*4096*2 = 16 MiB, ~503 MiB over 30 layers). convert_qwen35_to_gguf
                 # therefore leaves linear_attn.out_proj as a dense Linear.
-                w = _to_bf16(t)
+                w = _dequant_any(t)
                 if _untile:
                     w = _ungroup_v(w, 1, _vK, _vR, _vD)
                 yield f"{base}.linear_attn.out_proj.weight", w
