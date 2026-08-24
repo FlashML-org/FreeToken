@@ -17,13 +17,18 @@ def generate_clangd():
     if is_rocm():
         arch_flags = ["-xhip", f"--offload-arch={get_rocm_gfx_arch() or 'gfx1201'}"]
     else:
-        status = subprocess.run(
-            args=["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            check=True,
-        )
-        compute_cap = status.stdout.decode("utf-8").strip().split("\n")[0]
-        major, minor = compute_cap.split(".")
+        try:
+            status = subprocess.run(
+                args=["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                capture_output=True,
+                check=True,
+            )
+            compute_cap = status.stdout.decode("utf-8").strip().split("\n")[0]
+            major, minor = compute_cap.split(".")
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
         arch_flags = ["-xcuda", f"--cuda-gpu-arch=sm_{major}{minor}"]
     compile_flags = ",\n    ".join(
         arch_flags + ["-std=c++20", "-Wall", "-Wextra"]

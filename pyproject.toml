@@ -60,7 +60,10 @@ dependencies = [
     "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
-    "triton==3.6.0; platform_system == 'Linux'",
+    # CUDA torch 2.11 resolves Triton 3.6; AMD's ROCm 7.14 image supplies its
+    # gfx1201-enabled Triton 3.7 build. Keep both supported without replacing the
+    # runtime-specific wheel selected by the PyTorch distribution.
+    "triton>=3.6,<3.8; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 
