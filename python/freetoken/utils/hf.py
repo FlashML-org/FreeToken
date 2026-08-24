@@ -210,7 +210,7 @@ def download_hf_weight(model_path: str) -> str:
     try:
         return snapshot_download(
             model_path,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=["*.safetensors", "*.json"],
             tqdm_class=DisabledTqdm,
         )
     except Exception as e:
