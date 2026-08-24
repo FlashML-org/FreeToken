@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 from setuptools import setup
@@ -8,6 +9,12 @@ from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
+
+# sm_75 / CUDA 12.8 support: include Turing (7.5) in the default arch list.
+# Downstream users can override via TORCH_CUDA_ARCH_LIST as usual.
+# We start at 7.5 (2080 Ti / sm_75) rather than 8.0 so the pinned_tensor and
+# cpu_moe C++ extensions compile with sm_75 PTX fallback.
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.0;8.6;8.9;9.0")
 
 
 def _check_toolchain() -> None:

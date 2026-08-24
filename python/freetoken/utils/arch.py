@@ -3,6 +3,8 @@ from __future__ import annotations
 import functools
 from typing import Tuple
 
+import torch
+
 
 @functools.cache
 def _get_torch_cuda_version() -> Tuple[int, int] | None:
@@ -46,3 +48,25 @@ def is_sm90_supported() -> bool:
 
 def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
+
+
+def default_compute_dtype(device: torch.device | None = None) -> torch.dtype:
+    """Return the preferred floating-point dtype for ``device``.
+
+    sm_80+ (Ampere and newer): BF16 — native ALUs, stable training range.
+    sm_75 (Turing) and below: FP16 — BF16 has no hardware ALUs on Turing and
+    runs in software emulation (~1.5-2× slower with identical accuracy).
+    Falls back to float16 when no CUDA device is available.
+
+    This matches the behaviour of vLLM-2080Ti-Definitive's CudaPlatformBase
+    ``supported_dtypes``: ``has_device_capability(80)`` gates BF16.
+    """
+    if device is None:
+        device = torch.device("cuda", 0) if torch.cuda.is_available() else None
+    if device is None or device.type != "cuda":
+        return torch.float16
+    cc = torch.cuda.get_device_capability(device)
+    if cc >= (8, 0):
+        return torch.bfloat16
+    # sm_75 / Turing and below: FP16 only
+    return torch.float16

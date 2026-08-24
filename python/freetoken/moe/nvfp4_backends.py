@@ -246,6 +246,21 @@ def select_nvfp4_backend(
     if device.type != "cuda":
         return "triton"
     cc = torch.cuda.get_device_capability(device)
+
+    # sm_75 (Turing) and below: NVFP4/MXFP4/DS-FP4 use e2m1 + fp8-e4m3 compute types
+    # that require sm_80+ (Ampere) tensor core instructions. There is no software path
+    # for these formats. Fall back to Triton and log a clear message so the user knows
+    # to load a Q4_0 or INT4 model instead.
+    if cc < (8, 0):
+        logger.warning(
+            f"sm_{cc[0]}{cc[1]} detected ({torch.cuda.get_device_name(device)}): "
+            "NVFP4/MXFP4/DS-FP4 formats require sm_80+ (Ampere or newer) for e2m1 "
+            "and fp8-e4m3 compute. Falling back to Triton inline-dequant. "
+            "For full sm_75 performance load a Q4_0 or AWQ/GPTQ INT4 checkpoint "
+            "and use --moe-backend hybrid."
+        )
+        return "triton"
+
     if (
         (8, 0) <= cc < (10, 0)
         and importlib.util.find_spec("vllm") is not None

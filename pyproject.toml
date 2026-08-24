@@ -23,6 +23,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -52,8 +53,8 @@ dependencies = [
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
-    # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
-    # correctly from PyPI alone; uv additionally pins the index below.
+    # PyPI's torch 2.11.0 wheel is itself the cu130 build; this fork uses the cu128
+    # wheel via the pytorch-cu128 index (see [tool.uv.sources] below).
     "torch>=2.11,<2.12",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
@@ -74,7 +75,12 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+# sm_75 / CUDA 12.8: use the cu12 flashinfer build. The cu13 build requires a CUDA 13
+# driver (r570+) which is above the 2080 Ti's ceiling (r553 = CUDA 12.8 max).
+# flashinfer 0.6.x ships cu12 AOT wheels; sm_75 attention kernels may not be in the
+# AOT set (sm_80+ focused), but kernel/backend.py gates every call site with
+# is_flashinfer_installed() and falls back to Triton attention gracefully.
+fi = ["flashinfer-python[cu12]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
@@ -89,18 +95,24 @@ accel = ["freetoken[fi,sgl]"]
 # indexes serve. `explicit = true` scopes each index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
+#
+# sm_75 / CUDA 12.8 fork: we use the cu128 wheels instead of cu130.
+# torch 2.11.0 ships both cu128 and cu130 builds; cu128 is the last torch that supports
+# CUDA 12.x (the 2080 Ti's driver ceiling is r553 = CUDA 12.8 max).
+# nvcc 12.8 and torch cu128 are both CUDA major 12, so check_nvcc_matches_torch() passes
+# without needing FREETOKEN_ALLOW_CUDA_MISMATCH.
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-sglang-kernel = { index = "sglang-cu130" }
+torch = { index = "pytorch-cu128" }
+sglang-kernel = { index = "sglang-cu128" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [[tool.uv.index]]
-name = "sglang-cu130"
-url = "https://docs.sglang.io/whl/cu130"
+name = "sglang-cu128"
+url = "https://docs.sglang.io/whl/cu128"
 explicit = true
 
 [tool.setuptools]
