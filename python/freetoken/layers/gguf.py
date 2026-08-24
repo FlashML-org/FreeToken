@@ -1,5 +1,6 @@
 """Native-GGUF quantized layers: weights stay in their packed block layout and are
-dequantized *inside* the borrowed llama.cpp kernels (no bf16 copy ever materialized).
+dequantized *inside* the borrowed llama.cpp CUDA kernels -- either fused into the matmul
+(MMVQ/MMQ) or, for types with no MMQ kernel, by an explicit ``ggml_dequantize`` pass.
 
 Mirrors vLLM/sglang's ``GGUFLinearMethod`` / ``GGUFEmbeddingMethod`` dispatch, ported
 onto FreeToken's ``BaseOP``. FreeToken keeps fused projections (qkv, gate_up) as a
@@ -7,6 +8,18 @@ single tensor: because Q4_0/K-quants pack each *output row* independently over t
 input dim, the loader can concatenate the per-shard packed rows along dim 0 (they
 share an input dim, hence the same ``row_bytes``), so a fused layer is still one
 ``[out, row_bytes]`` qweight -- no per-shard padding bookkeeping needed.
+
+**Matmul dispatch strategy** (4-tier, per fused_mul_mat_gguf):
+
+1. **Unquantized (F32, F16, BF16)**: straight torch matmul ``x @ qweight.T``.
+2. **Small-batch quantized (batch <= 6, MMVQ types)**: GEMV kernel via ``ggml_mul_mat_vec_a8``.
+3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants)**: MMQ kernel
+   via ``ggml_mul_mat_a8``.
+4. **Large-batch I-quants (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)**:
+   I-quants have MMVQ and dequant kernels but NO MMQ kernel. Prefill therefore falls back to
+   ``ggml_dequantize`` + plain torch matmul. This materializes a transient BF16 copy of the weight
+   (cost: ``out_features * in_features * 2 bytes``), which is a real tradeoff for memory-bound
+   prefill on large I-quant weights.
 
 TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path).
 """
@@ -17,31 +30,29 @@ import torch
 
 from freetoken.models.gguf.dequant import (
     BLOCK_SHAPE,
-    GGML_BF16,
-    GGML_F16,
-    GGML_F32,
+    DEQUANT_TYPES,
     GGML_NAME,
-    GGML_Q4_0,
-    GGML_Q6_K,
-    GGML_Q8_0,
+    GGML_UNQUANTIZED,
+    MMQ_TYPES,
+    MMVQ_TYPES,
     row_bytes,
 )
 
 from .base import BaseOP
-
-# ggml type groups for kernel dispatch (subset we build kernels for).
-_UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
-# standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
-    """y = x @ dequant(qweight).T, dispatched by batch size and quant type."""
+    """y = x @ dequant(qweight).T, dispatched by batch size and quant type.
+
+    Dispatch order:
+    1. Unquantized (F32/F16/BF16): plain torch matmul
+    2. Small-batch quantized (batch <= 6, in MMVQ_TYPES): GEMV kernel
+    3. Large-batch standard quants (in MMQ_TYPES): MMQ kernel
+    4. Large-batch with I-quants (in DEQUANT_TYPES but not MMQ_TYPES): dequant + torch matmul
+    """
     from freetoken.kernel.gguf import (
         ggml_dequantize,
         ggml_mul_mat_a8,
@@ -51,13 +62,13 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     out_features = qweight.shape[0]
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
-    if qweight_type in _UNQUANTIZED:
+    if qweight_type in GGML_UNQUANTIZED:
         return x @ qweight.T
-    if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
+    if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in _MMQ:
+    if qweight_type in MMQ_TYPES:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in _DEQUANT:
+    if qweight_type in DEQUANT_TYPES:
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
