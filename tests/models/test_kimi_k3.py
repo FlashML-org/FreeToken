@@ -150,6 +150,22 @@ def _development_config():
 
 
 class KimiK3ConfigTests(unittest.TestCase):
+    def test_kda_conv_weight_matches_activation_dtype(self):
+        import torch
+
+        # The released checkpoint holds KDA convolution weights in FP32, while
+        # the fused causal-convolution kernel requires same-typed activations
+        # and weights on the BF16 inference path.
+        attn = object.__new__(KimiDeltaAttention)
+        attn.q_conv1d = _ns(weight=torch.ones(2, 1, 3, dtype=torch.float32))
+        attn.k_conv1d = _ns(weight=torch.full((2, 1, 3), 2.0, dtype=torch.float32))
+        attn.v_conv1d = _ns(weight=torch.full((2, 1, 3), 3.0, dtype=torch.float32))
+
+        got = attn._conv_weight(torch.bfloat16)
+
+        self.assertEqual(got.dtype, torch.bfloat16)
+        torch.testing.assert_close(got.float(), torch.tensor([[1.0] * 3] * 2 + [[2.0] * 3] * 2 + [[3.0] * 3] * 2))
+
     def test_kda_decay_adapter_matches_official_bounded_gate(self):
         import torch
         import torch.nn.functional as F

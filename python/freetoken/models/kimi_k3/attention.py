@@ -196,10 +196,16 @@ class KimiDeltaAttention(BaseOP):
             self.projection_size, args.hidden_size, has_bias=False
         )
 
-    def _conv_weight(self) -> torch.Tensor:
+    def _conv_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """Return KDA's checkpoint FP32 convolution weights in the activation dtype.
+
+        The public checkpoint intentionally stores these weights in FP32, but the
+        fused ``sgl_kernel`` causal-convolution op requires its input and weight
+        dtypes to match.  Kimi-K3 activations are BF16 in production.
+        """
         return torch.cat(
             [self.q_conv1d.weight, self.k_conv1d.weight, self.v_conv1d.weight], dim=0
-        ).squeeze(1)
+        ).squeeze(1).to(dtype=dtype)
 
     def _safe_a(self, a: torch.Tensor) -> torch.Tensor:
         """Fold per-key A into ``a`` and apply Kimi's lower bound exactly.
@@ -281,12 +287,15 @@ class KimiDeltaAttention(BaseOP):
         li = pool.local_index(self.layer_id)
         if batch.is_decode:
             mixed = causal_conv1d_decode(
-                qkv_in, pool.conv_states[li], self._conv_weight(), fla.cache_indices
+                qkv_in,
+                pool.conv_states[li],
+                self._conv_weight(qkv_in.dtype),
+                fla.cache_indices,
             )
         else:
             mixed = causal_conv1d_varlen(
                 qkv_in.transpose(0, 1).contiguous(),
-                self._conv_weight(),
+                self._conv_weight(qkv_in.dtype),
                 pool.conv_states[li],
                 fla.cu_seqlens,
                 fla.cache_indices,
