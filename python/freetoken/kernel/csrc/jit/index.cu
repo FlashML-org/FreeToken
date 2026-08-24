@@ -114,15 +114,15 @@ struct IndexKernel {
 
     TensorMatcher({-1, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(weights);
     TensorMatcher({L, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(output);
     TensorMatcher({L}) //
         .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices);
 
     const auto device = device_.unwrap();
