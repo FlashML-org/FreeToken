@@ -320,6 +320,27 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
     return quant_types
 
 
+# Qwen3.5 stores these RMSNorm weights as ``w`` with an effective scale of ``1 + w``,
+# while FreeToken's GemmaRMSNorm multiplies by the raw weight -- so the +1 is baked in at
+# load time. This mirrors _GEMMA_NORM_SUFFIXES / _is_gemma_norm in weight.py exactly,
+# including the exclusion: linear_attn.norm (GDN gated norm, ssm_norm in the GGUF) is a
+# standard w*x norm and must NOT be shifted.
+#
+# Getting this wrong is silent and total: w is typically 0.01-0.1, so scaling by w instead
+# of 1+w attenuates every residual stream by 10-100x and the model emits fluent nonsense.
+_PLUS_ONE_NORM_SUFFIXES = (
+    "attn_norm.weight",            # -> input_layernorm
+    "post_attention_norm.weight",  # -> post_attention_layernorm
+    "attn_q_norm.weight",          # -> self_attn.q_norm
+    "attn_k_norm.weight",          # -> self_attn.k_norm
+)
+
+
+def _to_bf16_plus1(t) -> torch.Tensor:
+    """A (1 + weight) norm: dequantize then add 1, matching weight.py's load-time shift."""
+    return _to_bf16(t) + 1.0
+
+
 def _to_bf16(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
@@ -416,7 +437,7 @@ def iter_gguf_weights(
             yield "model.embed_tokens.qweight", t.packed()  # IQ3_S packed table
             continue
         if name == "output_norm.weight":
-            yield "model.norm.weight", _to_bf16(t)
+            yield "model.norm.weight", _to_bf16_plus1(t)  # (1 + w), see _PLUS_ONE_NORM_SUFFIXES
             continue
         if name == "output.weight":
             # The untied LM head, packed (Q6_K here). Ornith ships output.weight, so
@@ -447,10 +468,10 @@ def iter_gguf_weights(
         # A_log, dt_bias -> float32
         # conv1d.weight -> float32, reshaped
         if suffix == "attn_norm.weight":
-            yield f"{base}.input_layernorm.weight", _to_bf16(t)
+            yield f"{base}.input_layernorm.weight", _to_bf16_plus1(t)
             continue
         if suffix == "post_attention_norm.weight":
-            yield f"{base}.post_attention_layernorm.weight", _to_bf16(t)
+            yield f"{base}.post_attention_layernorm.weight", _to_bf16_plus1(t)
             continue
         if suffix == "ffn_gate_inp.weight":
             yield f"{base}.mlp.gate.weight", _to_bf16(t)
@@ -477,10 +498,10 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.conv1d.weight", w
             continue
         if suffix == "attn_q_norm.weight":
-            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.q_norm.weight", _to_bf16_plus1(t)
             continue
         if suffix == "attn_k_norm.weight":
-            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.k_norm.weight", _to_bf16_plus1(t)
             continue
 
         # Shared expert (present on every layer, both kinds) -- must be handled BEFORE the
