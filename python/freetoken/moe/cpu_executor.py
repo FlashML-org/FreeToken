@@ -67,7 +67,9 @@ _ACT_IDS = {
     "swigluoai": 3,
 }
 
-# Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
+# Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp:1215.
+# Q4_0 is the only GGUF format with AVX/VNNI kernels; adding more requires new
+# intrinsics work (out of scope). The CPU path for other GGUF formats is not implemented.
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
@@ -372,6 +374,15 @@ class CpuMoeExecutor:
 
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
+
+        # Detect unsupported GGUF formats (any ggml type name that isn't q4_0).
+        # GGUF format strings follow the pattern of ggml type names (q*, iq*).
+        if fmt.startswith(("q", "iq")) and fmt != "q4_0":
+            raise NotImplementedError(
+                f"the CPU/hybrid MoE backend does not support GGUF format {fmt!r}; "
+                f"it has AVX/VNNI kernels for Q4_0 only. Use --moe-backend fused for GPU "
+                f"dequantization, or --moe-backend offload to stream experts to the GPU."
+            )
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up_packed"], banks["gate_up_scale"], banks["gate_up_global"]
