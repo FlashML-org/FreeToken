@@ -414,6 +414,14 @@ def iter_gguf_weights(
         if name == "output_norm.weight":
             yield "model.norm.weight", _to_bf16(t)
             continue
+        if name == "output.weight":
+            # The untied LM head, packed (Q6_K here). Ornith ships output.weight, so
+            # tie_word_embeddings is False and lm_head is a real GGUFLinear that must be
+            # filled; when a checkpoint omits it the head aliases the embedding table and
+            # there is nothing to yield.
+            if not config.tie_word_embeddings:
+                yield "lm_head.qweight", t.packed()
+            continue
         if not name.startswith("blk."):
             continue
 
