@@ -17,7 +17,13 @@ from .reader import gguf_architecture, load_gguf_metadata
 # heard of raises KeyError inside convert_gguf_tokenizer. qwen35moe is a GPT2-style BPE
 # with merges (tokenizer.ggml.model == "gpt2", pre == "qwen35"), which the qwen2 converter
 # handles; there is no qwen3.5-specific converter and it would be the same BPE anyway.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "qwen35moe": "qwen2", "qwen35": "qwen2"}
+# qwen3moe is also a GPT2-style BPE (tokenizer.ggml.model == "gpt2", pre == "qwen3").
+_TOKENIZER_ARCH = {
+    "gemma4": "gemma4_text",
+    "qwen35moe": "qwen2",
+    "qwen35": "qwen2",
+    "qwen3moe": "qwen2",
+}
 
 # Per-arch chat/stop tokens, in preference order: the first one present in the vocab
 # becomes eos (so chat generation halts on the turn end rather than the formal document
@@ -29,6 +35,7 @@ _STOP_TOKENS: dict[str, tuple[str, ...]] = {
     "qwen35moe": ("<|im_end|>", "<|endoftext|>"),
     # Dense sibling: same vocab and same chat markers as the MoE variant.
     "qwen35": ("<|im_end|>", "<|endoftext|>"),
+    "qwen3moe": ("<|im_end|>", "<|endoftext|>"),
 }
 
 

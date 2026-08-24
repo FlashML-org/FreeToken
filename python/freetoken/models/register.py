@@ -121,6 +121,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF qwen3moe: simpler than qwen3.5moe (full attention, no GDN/shared expert, plain
+    # norms), same model class as qwen3_moe HF, GGUF config + weight loaders.
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",

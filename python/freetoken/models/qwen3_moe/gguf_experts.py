@@ -1,4 +1,4 @@
-"""Routed-expert host bank sources for the qwen35moe GGUF checkpoint.
+"""Routed-expert host bank sources for the qwen3moe GGUF checkpoint.
 
 This module loads the per-expert weight tensors that are stored as GGUF stacks
 and allocates them into host banks for the offload cache. The layout is a 3D
@@ -12,13 +12,12 @@ tensors must be exactly `row_bytes` wide for their own quant type — never pad
 a smaller-type layer up to a larger type's stride, because the kernel would
 then read every block at the wrong offset and return plausible-looking garbage.
 
-For qwen35moe specifically:
-- ``ffn_gate_exps`` and ``ffn_up_exps`` are always IQ3_S (layers 0-39)
-- ``ffn_down_exps`` is Q4_K for layers 0-4, IQ3_S for layers 5-39
-
-The gate_up bank per layer is the per-expert concatenation of gate rows
-then up rows along the output dimension, giving [E, 2*I, row_bytes(H, t)],
-valid because gate and up share a quant type and therefore a row stride.
+For qwen3moe:
+- ``ffn_gate_exps`` and ``ffn_up_exps`` must share a quant type per layer
+- ``ffn_down_exps`` can vary independently per layer
+- The gate_up bank per layer is the per-expert concatenation of gate rows
+  then up rows along the output dimension, giving [E, 2*I, row_bytes(H, t)],
+  valid because gate and up share a quant type and therefore a row stride.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from freetoken.models.gguf.dequant import GGML_IQ3_S, GGML_Q4_K, GGML_NAME, row_bytes
+from freetoken.models.gguf.dequant import GGML_NAME, row_bytes
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -41,9 +40,6 @@ def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
       gate and up for each layer must have the same type (they are row-concatenated).
       If they differ for any layer, raises a clear ValueError naming the layer and both types.
     - ``"down"``: list of ``num_layers`` ggml_type enums for ``ffn_down_exps``.
-
-    For qwen35moe: gate_up is always IQ3_S (uniformly), and down varies by layer
-    (Q4_K for 0-4, IQ3_S for 5-39).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
@@ -56,7 +52,7 @@ def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
             continue
         layer = int(t.name.split(".")[1])
         if layer >= num_layers:
-            continue  # skip the trailing NextN/MTP block
+            continue  # skip out-of-bounds layers
 
         if t.name.endswith("ffn_gate_exps.weight"):
             gate_types[layer] = t.ggml_type
@@ -178,7 +174,7 @@ def load_gguf_expert_sources(
                 continue
             layer = int(t.name.split(".")[1])
             if layer >= L:
-                continue  # skip the trailing NextN/MTP block
+                continue  # skip out-of-bounds layers
 
             if t.name.endswith("ffn_gate_exps.weight"):
                 # Shape from GGUF: [E, I, H] in torch order = [H, I, E] in ggml order
@@ -254,6 +250,7 @@ def load_gguf_expert_sources(
 
 def dummy_gguf_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
     """Random expert banks shaped like ``load_gguf_expert_sources`` output."""
+    from freetoken.models.gguf.dequant import GGML_IQ3_S
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
     # Use uniform IQ3_S for all layers (a simplification for the dummy).
