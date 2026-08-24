@@ -13,6 +13,7 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import pathlib
 import shutil
@@ -20,6 +21,32 @@ import shutil
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+
+
+def _staged_rocm_sources() -> pathlib.Path:
+    """Copy CUDA sources out of the checkout before PyTorch HIPifies them.
+
+    ``torch.utils.cpp_extension.load`` writes generated ``*_hip`` sources next to
+    the input file.  Keeping the staging directory under the extension cache makes
+    the source checkout stay clean while still allowing normal incremental builds.
+    """
+    cache_root = pathlib.Path(
+        os.environ.get("TORCH_EXTENSIONS_DIR", pathlib.Path.home() / ".cache" / "torch_extensions")
+    )
+    digest = hashlib.sha256()
+    digest.update(f"torch={torch.__version__};hip={torch.version.hip}".encode())
+    for source in sorted(_CSRC.iterdir()):
+        if source.is_file() and "_hip." not in source.name and source.suffix != ".hip":
+            digest.update(source.name.encode())
+            digest.update(source.read_bytes())
+    staged = cache_root / f"freetoken_gguf_sources_{digest.hexdigest()[:16]}"
+    shutil.copytree(
+        _CSRC,
+        staged,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("*_hip.*", "*.hip", "__pycache__"),
+    )
+    return staged
 
 
 def _host_compiler() -> str | None:
@@ -47,12 +74,29 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
-    host_cxx = _host_compiler()
+    is_rocm = getattr(torch.version, "hip", None) is not None
+    extra_cuda_cflags = ["-O3"]
+    extra_ldflags: list[str] = []
+    if is_rocm:
+        from freetoken.kernel.utils import _rocm_link_flags
+
+        extra_ldflags = _rocm_link_flags()
+        # Ubuntu's generic Thrust headers otherwise select the CUDA backend and
+        # try to include cuda_runtime_api.h. GGUF only reaches Thrust through a
+        # libtorch complex-number header, so the backend-neutral C++ path is
+        # sufficient for HIP compilation.
+        extra_cuda_cflags.append("-DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CPP")
+        csrc = _staged_rocm_sources()
+    else:
+        extra_cuda_cflags.append("--expt-relaxed-constexpr")
+        csrc = _CSRC
+
+    host_cxx = None if is_rocm else _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
@@ -66,9 +110,10 @@ def _module():
     # plain `load` of the single source compiles + binds the ggml_* ops.
     return load(
         name="freetoken_gguf_kernels",
-        sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        sources=[str(csrc / "gguf_kernel.cu")],
+        extra_include_paths=[str(csrc)],
         extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=extra_ldflags,
         verbose=True,
     )
 

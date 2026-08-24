@@ -44,6 +44,13 @@ python -m pip install --no-build-isolation -e .
 Set both architecture variables to `gfx1200` for RX 9060 family GPUs, or to the
 actual target reported by `rocminfo`.
 
+The optional native GGUF kernels also require Thrust headers. Install the generic
+headers before the first GGUF kernel JIT build:
+
+```bash
+apt-get update && apt-get install -y --no-install-recommends libthrust-dev
+```
+
 ## Method 2: Install from source
 
 ```bash
