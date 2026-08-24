@@ -29,6 +29,38 @@ def _config(
     )
 
 
+def _official_expert_tensors(config):
+    tensors = {}
+    hidden = config.kimi_k3_args.routed_expert_hidden_size
+    intermediate = config.moe_intermediate_size
+    for checkpoint_layer in range(config.first_k_dense_replace, config.num_layers):
+        for expert in range(config.num_experts):
+            prefix = (
+                f"language_model.model.layers.{checkpoint_layer}.block_sparse_moe."
+                f"experts.{expert}"
+            )
+            marker = checkpoint_layer * 31 + expert * 7
+            for proj, shape in (
+                ("w1", (intermediate, hidden // 2)),
+                ("w3", (intermediate, hidden // 2)),
+                ("w2", (hidden, intermediate // 2)),
+            ):
+                value = marker + {"w1": 1, "w2": 2, "w3": 3}[proj]
+                tensors[f"{prefix}.{proj}.weight_packed"] = torch.full(
+                    shape, value % 256, dtype=torch.uint8
+                )
+            for proj, shape in (
+                ("w1", (intermediate, hidden // 32)),
+                ("w3", (intermediate, hidden // 32)),
+                ("w2", (hidden, intermediate // 32)),
+            ):
+                value = marker + {"w1": 4, "w2": 5, "w3": 6}[proj]
+                tensors[f"{prefix}.{proj}.weight_scale"] = torch.full(
+                    shape, value % 256, dtype=torch.uint8
+                )
+    return tensors
+
+
 def test_resident_names_strip_wrapper_and_skip_vision_mtp_and_experts():
     assert weight._resident_name("language_model.model.embed_tokens.weight", 93) == (
         "model.embed_tokens.weight"
@@ -260,6 +292,71 @@ def test_official_keys_load_into_92_zero_based_moe_banks(tmp_path, monkeypatch):
     assert banks["gate_up_bias"][0] is banks["gate_up_bias"][91]
     assert banks["down_bias"][0] is banks["down_bias"][91]
     assert not torch.count_nonzero(banks["gate_up_bias"][0])
+
+
+def test_parallel_loader_matches_serial_banks(tmp_path, monkeypatch):
+    monkeypatch.setattr(weight, "get_tp_info", _tp1)
+    config = _config(experts=2, num_layers=3)
+    tensors = _official_expert_tensors(config)
+    save_file(tensors, tmp_path / "model.safetensors")
+
+    calls = []
+
+    def portable_parallel_reader(model_path, is_expert, *, workers, chunk):
+        calls.append((model_path, workers, chunk))
+        with weight.safetensors.safe_open(
+            tmp_path / "model.safetensors", framework="pt", device="cpu"
+        ) as checkpoint:
+            for name in checkpoint.keys():
+                if is_expert(name):
+                    yield name, checkpoint.get_tensor(name)
+
+    from freetoken.models import weight as common_weight
+
+    monkeypatch.setattr(
+        common_weight, "iter_expert_tensors_parallel", portable_parallel_reader
+    )
+    serial = weight.load_mxfp4_expert_banks(
+        str(tmp_path), config, dtype=torch.bfloat16
+    )
+    parallel = weight.load_mxfp4_expert_banks_parallel(
+        str(tmp_path), config, dtype=torch.bfloat16, workers=3, chunk=4096
+    )
+
+    assert calls == [(str(tmp_path), 3, 4096)]
+    assert serial.keys() == parallel.keys()
+    for bank_name in serial:
+        assert len(serial[bank_name]) == len(parallel[bank_name])
+        for serial_layer, parallel_layer in zip(
+            serial[bank_name], parallel[bank_name], strict=True
+        ):
+            torch.testing.assert_close(serial_layer, parallel_layer)
+
+
+def test_setup_dispatches_parallel_reader_options(monkeypatch):
+    monkeypatch.setattr(weight, "get_tp_info", _tp1)
+    config = _config(num_layers=2)
+    sources = {"sentinel": [torch.tensor(1)]}
+    calls = []
+
+    def fake_parallel(model_path, model_config, *, dtype, workers, chunk):
+        calls.append((model_path, model_config, dtype, workers, chunk))
+        return sources
+
+    monkeypatch.setattr(weight, "load_mxfp4_expert_banks_parallel", fake_parallel)
+    result = weight.setup_offload_expert_banks(
+        "/checkpoint",
+        config,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        parallel=True,
+        workers=5,
+        chunk=8192,
+    )
+
+    assert result.quant_format == "mxfp4_triton"
+    assert result.sources is sources
+    assert calls == [("/checkpoint", config, torch.bfloat16, 5, 8192)]
 
 
 def test_loader_rejects_missing_and_unexpected_expert_tensors(tmp_path, monkeypatch):

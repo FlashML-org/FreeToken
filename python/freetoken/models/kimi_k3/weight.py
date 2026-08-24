@@ -263,13 +263,8 @@ def _copy_expert_tensor(
     banks[bank][layer][expert, :, parity::2].copy_(value.t())
 
 
-def load_mxfp4_expert_banks(
-    model_path: str,
-    model_config,
-    *,
-    dtype: torch.dtype,
-) -> dict[str, list[torch.Tensor]]:
-    """Load official per-expert MXFP4 tensors into transposed group-32 banks."""
+def _expert_bank_geometry(model_config) -> tuple[int, int, int, int, int]:
+    """Validate the Kimi expert-bank ABI and return its dimensions."""
     if model_config.moe_weight_format != "mxfp4":
         raise ValueError("Kimi-K3 expert offload requires MXFP4 weights")
     args = model_config.kimi_k3_args
@@ -288,8 +283,85 @@ def load_mxfp4_expert_banks(
         raise NotImplementedError(
             "Kimi-K3 MXFP4 expert banks currently support TP=1 only"
         )
+    return (
+        first_moe_layer,
+        num_moe_layers,
+        model_config.num_experts,
+        hidden,
+        intermediate,
+    )
 
-    num_experts = model_config.num_experts
+
+def _expert_key(
+    name: str,
+    *,
+    first_moe_layer: int,
+    num_layers: int,
+    num_experts: int,
+) -> tuple[int, int, str, str]:
+    """Parse and range-check an official routed-expert tensor name."""
+    match = _EXPERT_KEY_RE.fullmatch(name)
+    if match is None:
+        raise ValueError(f"unexpected Kimi-K3 expert tensor: {name}")
+    checkpoint_layer = int(match.group("layer"))
+    expert = int(match.group("expert"))
+    if (
+        not first_moe_layer <= checkpoint_layer < num_layers
+        or not 0 <= expert < num_experts
+    ):
+        raise ValueError(f"out-of-range Kimi-K3 expert tensor: {name}")
+    return (
+        checkpoint_layer - first_moe_layer,
+        expert,
+        match.group("proj"),
+        match.group("kind"),
+    )
+
+
+def _check_complete_expert_banks(
+    seen: set[tuple[int, int, str, str]],
+    *,
+    num_moe_layers: int,
+    num_experts: int,
+) -> None:
+    expected = {
+        (layer, expert, proj, kind)
+        for layer in range(num_moe_layers)
+        for expert in range(num_experts)
+        for proj in ("w1", "w2", "w3")
+        for kind in ("weight_packed", "weight_scale")
+    }
+    missing = expected - seen
+    if missing:
+        raise ValueError(f"missing Kimi-K3 expert tensors: {sorted(missing)[:8]}")
+
+
+def _pin_expert_banks(
+    banks: dict[str, list[torch.Tensor]],
+    host_banks: dict,
+    num_moe_layers: int,
+) -> None:
+    if not host_banks:
+        return
+    from freetoken.moe.host_banks import pin_banks
+
+    pin_banks(host_banks)
+    # Bias banks are small relative to weights and shared across layers. Pin one
+    # copy of each so all repeated source pointers are DMA-safe.
+    banks["gate_up_bias"] = [banks["gate_up_bias"][0].pin_memory()] * num_moe_layers
+    banks["down_bias"] = [banks["down_bias"][0].pin_memory()] * num_moe_layers
+
+
+def load_mxfp4_expert_banks(
+    model_path: str,
+    model_config,
+    *,
+    dtype: torch.dtype,
+) -> dict[str, list[torch.Tensor]]:
+    """Load official per-expert MXFP4 tensors into transposed group-32 banks."""
+    first_moe_layer, num_moe_layers, num_experts, hidden, intermediate = (
+        _expert_bank_geometry(model_config)
+    )
     banks, host_banks = _allocate_banks(
         num_moe_layers, num_experts, hidden, intermediate, dtype
     )
@@ -302,21 +374,11 @@ def load_mxfp4_expert_banks(
             for name in f.keys():  # noqa: SIM118
                 if _EXPERT_FRAGMENT not in name:
                     continue
-                match = _EXPERT_KEY_RE.fullmatch(name)
-                if match is None:
-                    raise ValueError(f"unexpected Kimi-K3 expert tensor: {name}")
-                checkpoint_layer = int(match.group("layer"))
-                expert = int(match.group("expert"))
-                if (
-                    not first_moe_layer <= checkpoint_layer < model_config.num_layers
-                    or not 0 <= expert < num_experts
-                ):
-                    raise ValueError(f"out-of-range Kimi-K3 expert tensor: {name}")
-                key = (
-                    checkpoint_layer - first_moe_layer,
-                    expert,
-                    match.group("proj"),
-                    match.group("kind"),
+                key = _expert_key(
+                    name,
+                    first_moe_layer=first_moe_layer,
+                    num_layers=model_config.num_layers,
+                    num_experts=num_experts,
                 )
                 if key in seen:
                     raise ValueError(f"duplicate Kimi-K3 expert tensor: {name}")
@@ -324,7 +386,7 @@ def load_mxfp4_expert_banks(
                 _copy_expert_tensor(
                     banks,
                     layer=key[0],
-                    expert=expert,
+                    expert=key[1],
                     proj=key[2],
                     kind=key[3],
                     value=f.get_tensor(name),
@@ -332,23 +394,79 @@ def load_mxfp4_expert_banks(
                     intermediate=intermediate,
                 )
 
-    expected = {
-        (layer, expert, proj, kind)
-        for layer in range(num_moe_layers)
-        for expert in range(num_experts)
-        for proj in ("w1", "w2", "w3")
-        for kind in ("weight_packed", "weight_scale")
-    }
-    missing = expected - seen
-    if missing:
-        raise ValueError(f"missing Kimi-K3 expert tensors: {sorted(missing)[:8]}")
+    _check_complete_expert_banks(
+        seen, num_moe_layers=num_moe_layers, num_experts=num_experts
+    )
+    _pin_expert_banks(banks, host_banks, num_moe_layers)
+    return banks
+
+
+def load_mxfp4_expert_banks_parallel(
+    model_path: str,
+    model_config,
+    *,
+    dtype: torch.dtype,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+) -> dict[str, list[torch.Tensor]]:
+    """Load Kimi MXFP4 experts with shard prefetch and parallel O_DIRECT reads."""
+    from freetoken.models.weight import iter_expert_tensors_parallel
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
+
+    first_moe_layer, num_moe_layers, num_experts, hidden, intermediate = (
+        _expert_bank_geometry(model_config)
+    )
+    banks, host_banks = _allocate_banks(
+        num_moe_layers, num_experts, hidden, intermediate, dtype
+    )
+    seen: set[tuple[int, int, str, str]] = set()
+
+    def _load(sink) -> None:
+        tracker = (
+            LayerCompletionTracker(num_experts * 6, host_banks, sink)
+            if host_banks
+            else None
+        )
+        for name, value in iter_expert_tensors_parallel(
+            model_path,
+            lambda candidate: _EXPERT_FRAGMENT in candidate,
+            workers=workers,
+            chunk=chunk,
+        ):
+            key = _expert_key(
+                name,
+                first_moe_layer=first_moe_layer,
+                num_layers=model_config.num_layers,
+                num_experts=num_experts,
+            )
+            if key in seen:
+                raise ValueError(f"duplicate Kimi-K3 expert tensor: {name}")
+            seen.add(key)
+            _copy_expert_tensor(
+                banks,
+                layer=key[0],
+                expert=key[1],
+                proj=key[2],
+                kind=key[3],
+                value=value,
+                hidden=hidden,
+                intermediate=intermediate,
+            )
+            if tracker is not None:
+                tracker.note(key[0])
 
     if host_banks:
-        from freetoken.moe.host_banks import pin_banks
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)
 
-        pin_banks(host_banks)
-        # Bias banks are small relative to weights and shared across layers. Pin
-        # one copy of each so all repeated source pointers are DMA-safe.
+    _check_complete_expert_banks(
+        seen, num_moe_layers=num_moe_layers, num_experts=num_experts
+    )
+    # Layer banks were pinned by PinPipeline as each layer completed. Only the
+    # small shared zero-bias banks remain.
+    if host_banks:
         banks["gate_up_bias"] = [banks["gate_up_bias"][0].pin_memory()] * num_moe_layers
         banks["down_bias"] = [banks["down_bias"][0].pin_memory()] * num_moe_layers
     return banks
@@ -386,6 +504,9 @@ def setup_offload_expert_banks(
     device: torch.device,
     dtype: torch.dtype,
     dummy: bool = False,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
 ):
     """Model-specific ExpertBanks provider used by the offload engine."""
     del device  # host banks are CPU-resident by contract
@@ -393,12 +514,24 @@ def setup_offload_expert_banks(
 
     if model_config.moe_weight_format != "mxfp4":
         raise ValueError("Kimi-K3 offload requires MXFP4 expert weights")
-    sources = (
-        _dummy_banks(model_config, dtype)
-        if dummy
-        else load_mxfp4_expert_banks(model_path, model_config, dtype=dtype)
-    )
+    if dummy:
+        sources = _dummy_banks(model_config, dtype)
+    elif parallel:
+        sources = load_mxfp4_expert_banks_parallel(
+            model_path,
+            model_config,
+            dtype=dtype,
+            workers=workers,
+            chunk=chunk,
+        )
+    else:
+        sources = load_mxfp4_expert_banks(model_path, model_config, dtype=dtype)
     return ExpertBanks("mxfp4_triton", sources)
 
 
-__all__ = ["iter_weights", "load_mxfp4_expert_banks", "setup_offload_expert_banks"]
+__all__ = [
+    "iter_weights",
+    "load_mxfp4_expert_banks",
+    "load_mxfp4_expert_banks_parallel",
+    "setup_offload_expert_banks",
+]
