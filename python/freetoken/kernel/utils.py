@@ -12,6 +12,8 @@ if TYPE_CHECKING:
 KERNEL_PATH = pathlib.Path(__file__).parent / "csrc"
 KERNEL_CACHE_PACKAGE = "freetoken_kernel_cache"
 KERNEL_CACHE_DIR_ENV = "FREETOKEN_KERNEL_CACHE_DIR"
+HIP_JIT_SHIM = KERNEL_PATH / "jit_hip_shim.h"
+
 DISABLE_KERNEL_CACHE_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE"
 DISABLE_KERNEL_CACHE_VERSION_CHECK_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE_VERSION_CHECK"
 DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
@@ -30,7 +32,15 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
+    import torch
+
     flags = DEFAULT_CUDA_CFLAGS + extra
+    if getattr(torch.version, "hip", None):
+        # AMD ROCm port: hipcc rejects nvcc's --expt-relaxed-constexpr (its
+        # relaxed constexpr is already the default) and needs the HIP
+        # launch-API shim force-included.
+        flags += ["-include", str(HIP_JIT_SHIM)]
+        flags = [f for f in flags if f != "--expt-relaxed-constexpr"]
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:

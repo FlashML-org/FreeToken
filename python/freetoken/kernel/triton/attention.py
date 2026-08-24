@@ -396,6 +396,11 @@ def decode_paged_attention(
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
     block_h = triton.next_power_of_2(valid_block_h)
+    if getattr(torch.version, "hip", None):
+        # AMD WMMA requires M >= 16 for tl.dot; the kernel already masks
+        # padded head lanes, so raise the tile floor instead of failing
+        # instruction selection on small GQA groups.
+        block_h = max(block_h, 16)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
 

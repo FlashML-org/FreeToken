@@ -30,7 +30,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_hip, is_sm90_supported
 
 _HEUR = {"BLOCK": lambda a: triton.next_power_of_2(a["H"])}
 
@@ -142,9 +142,12 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # PDL only on the contiguous (decode-replay) path: on the strided qk-norm's
     # 32k-CTA prefill grids the per-CTA gdc_wait poll costs more than it hides.
     pdl = contig and is_sm90_supported()
+    # The AMD triton launcher rejects the launch_pdl keyword
+    # outright; NVIDIA keeps the upstream launch_pdl=pdl call.
+    launch_kwargs = {} if is_hip() else {"launch_pdl": pdl}
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, **launch_kwargs, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
     )
     return out
@@ -170,9 +173,12 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     _, _, sra, srb = _leading(residual)
     contig = input.ndim == 2 and input.is_contiguous() and residual.is_contiguous()
     pdl = contig and is_sm90_supported()
+    # The AMD triton launcher rejects the launch_pdl keyword
+    # outright; NVIDIA keeps the upstream launch_pdl=pdl call.
+    launch_kwargs = {} if is_hip() else {"launch_pdl": pdl}
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, **launch_kwargs, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
     )
 
