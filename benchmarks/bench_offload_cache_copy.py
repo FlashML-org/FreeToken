@@ -195,18 +195,24 @@ def print_table(
     miss_rates: list[float],
     repeat: int,
     device: torch.device,
-) -> None:
+) -> bool:
+    """False when the geometry is refused and nothing was measured; the caller tallies those."""
     per_expert = expert_bytes(profile)
     cache_gib = cache_slots * per_expert / 2**30
-    # Build before printing: a backend that refuses this slot count would otherwise leave a
-    # header with no rows under it, which is what the abort already looked like. The limit is
-    # the backend's (marlin caps padded experts at 1024) -- ask it by constructing rather than
-    # copying the number here, where it would drift the first time a backend changes.
+    # Build before printing: a refused geometry would otherwise leave a header with no rows
+    # under it, which is what the abort already looked like. `validate_rebuild` runs in
+    # __post_init__ ahead of the allocations, so the refused path costs nothing.
+    #
+    # Catch rather than pre-check: the rule is the pool's and covers both the num_experts
+    # floor and the nvfp4_marlin slot cap (992 -- moe_align_block_size needs
+    # round_up(experts, 32) < 1024). Re-deriving that here would duplicate the rule, not just
+    # the number. Note this is ValueError only: a device OOM is a RuntimeError and still
+    # aborts, which is correct -- it is not a statement about this geometry being illegal.
     try:
         cache = make_cache(profile, cache_slots, device)
     except ValueError as exc:
-        print(f"\n{name} @ cache_slots={cache_slots}: SKIPPED -- {exc}")
-        return
+        print(f"\n{name} @ cache_slots={cache_slots} ({cache_gib:.1f} GiB): SKIPPED -- {exc}")
+        return False
 
     print(
         f"\n{name} ({profile.quant_format}, {len(bank_specs(profile))} banks, "
@@ -232,26 +238,44 @@ def print_table(
             )
     del cache
     torch.cuda.empty_cache()
+    return True
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     assert torch.cuda.is_available(), "CUDA is required"
     torch.cuda.set_device(args.device)
     device = torch.device("cuda")
 
     print("gpu", torch.cuda.get_device_name(device), flush=True)
-    for name in args.models:
-        profile = MODELS[name]
-        slot_counts = args.cache_slots or [
-            profile.experts,
-            int(0.4 * profile.layers * profile.experts),
-        ]
-        for cache_slots in slot_counts:
-            print_table(
-                name, profile, cache_slots, args.batch_sizes, args.miss_rates, args.repeat, device
-            )
+    plan = [
+        (name, MODELS[name], cache_slots)
+        for name in args.models
+        for cache_slots in (
+            args.cache_slots
+            or [MODELS[name].experts, int(0.4 * MODELS[name].layers * MODELS[name].experts)]
+        )
+    ]
+    skipped = []
+    for name, profile, cache_slots in plan:
+        if print_table(
+            name, profile, cache_slots, args.batch_sizes, args.miss_rates, args.repeat, device
+        ):
+            continue
+        skipped.append(f"{name}@{cache_slots}")
+    if not skipped:
+        return 0
+
+    print(f"\nskipped {len(skipped)} of {len(plan)} combinations: {', '.join(skipped)}")
+    # A derived default that one backend cannot satisfy is expected output, not a failed
+    # run -- the no-arg sweep would otherwise be red forever. Asking for a geometry by hand
+    # and getting nothing is a different thing, and so is measuring nothing at all.
+    if len(skipped) == len(plan):
+        return 1
+    if args.cache_slots is not None:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
