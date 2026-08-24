@@ -1212,7 +1212,151 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+// ----------------------------- Q4_K and Q6_K (W4A16) ----------------------------
+// Correctness-first scalar K-quant expert dot kernels: dequantize blocks and accumulate
+// against bf16 activation rows. AVX2/VNNI optimizations are a deliberate follow-up.
+// Reference: llama.cpp ggml-quants.c, ggml-cuda/convert.cu, models/gguf/dequant.py.
+
+// Helper: extract 6-bit scale and min from Q4_K's packed scales array.
+// Q4_K packs scales and mins using 6 bits each, packed into 12 bytes for 256 elements.
+inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& scale, uint8_t& minv) {
+  if (j < 4) {
+    scale = q[j] & 63;
+    minv = q[j + 4] & 63;
+  } else {
+    scale = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+    minv = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+  }
+}
+
+float q4_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  // Q4_K, 256-element super-blocks of 144 bytes: half2 dm | scales[12] | qs[128].
+  // dm.x scales the quants, dm.y scales the per-sub-block minimum that is SUBTRACTED.
+  //
+  // Two things here are easy to get wrong and both produce fluent-looking garbage rather
+  // than an obvious failure, so this mirrors dequantize_block_q4_K in gguf/dequantize.cuh
+  // element for element:
+  //   * the quants are UNSIGNED 0..15. There is no -8 bias; that is Q4_0's encoding. Q4_K
+  //     centres the range with the per-sub-block min instead.
+  //   * within a 64-element group the low nibble of byte l is element l and the HIGH nibble
+  //     is element l+32, not l+1. The two nibbles of a byte are 32 apart, and they carry
+  //     different scale/min pairs (is+0 vs is+1).
+  float acc = 0.0f;
+  const int nb = K / 256;
+
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 144;
+
+    uint16_t dh_scale, dh_min;
+    std::memcpy(&dh_scale, blk, sizeof(uint16_t));
+    std::memcpy(&dh_min, blk + 2, sizeof(uint16_t));
+    const float dall = fp16_to_f32(dh_scale);
+    const float dmin = fp16_to_f32(dh_min);
+
+    const uint8_t* scales = blk + 4;   // 12 bytes of packed 6-bit scales + mins
+    const uint8_t* qs = blk + 16;      // 128 bytes of 4-bit quants
+    const bf16_t* xb = x + (size_t)256 * b;
+
+    for (int il = 0; il < 4; ++il) {   // four 64-element groups
+      const int is = 2 * il;
+
+      uint8_t sc, m;
+      get_scale_min_k4(is + 0, scales, sc, m);
+      const float d1 = dall * sc;
+      const float m1 = dmin * m;
+      get_scale_min_k4(is + 1, scales, sc, m);
+      const float d2 = dall * sc;
+      const float m2 = dmin * m;
+
+      for (int ir = 0; ir < 8; ++ir) {
+        const uint8_t* q = qs + 32 * il + 4 * ir;
+        const bf16_t* y = xb + 64 * il + 4 * ir;
+        for (int l = 0; l < 4; ++l) {
+          acc += (d1 * (float)(q[l] & 0xF) - m1) * bf16_to_f32(y[l]);
+          acc += (d2 * (float)(q[l] >> 4) - m2) * bf16_to_f32(y[l + 32]);
+        }
+      }
+    }
+  }
+
+  return acc;
+}
+
+float q6_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  // Q6_K: 256-element blocks, 210 bytes each.
+  // Block layout: ql[128] | qh[64] | scales[16] | d (fp16)
+  // ql: lower 4 bits of 6-bit quant values (128 bytes)
+  // qh: upper 2 bits of 6-bit quant values, packed (64 bytes, 2 bits per element)
+  // scales: 16 int8 sub-scales (8 per 128-element half)
+  // d: fp16 block scale
+  // Dequant: q in [-32,31], w = d * scales[is] * (q - 32)
+  // Reference: ggml-cuda/convert.cu::dequantize_block_q6_K and models/gguf/dequant.py::dequant_q6_k
+
+  float acc = 0.0f;
+  const int nb = K / 256;  // number of Q6_K blocks
+
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 210;
+
+    const uint8_t* ql = blk;           // 128 bytes (lower 4 bits)
+    const uint8_t* qh = blk + 128;     // 64 bytes (upper 2 bits)
+    const int8_t* scales = (const int8_t*)(blk + 192);  // 16 int8 sub-scales
+
+    uint16_t dh;
+    std::memcpy(&dh, blk + 208, sizeof(uint16_t));
+    const float d = fp16_to_f32(dh);
+
+    const int elem_base = 256 * b;
+
+    // Process in two 128-element halves
+    for (int h = 0; h < 2; ++h) {
+      const uint8_t* ql_h = ql + 64 * h;   // 64 bytes for this half
+      const uint8_t* qh_h = qh + 32 * h;   // 32 bytes for this half
+      const int8_t* sc_h = scales + 8 * h; // 8 scales for this half
+      const int h_base = elem_base + 128 * h;
+
+      // Process 4 groups of 32 elements, each group uses 2 of the 8 scales
+      for (int g = 0; g < 4; ++g) {
+        const int8_t* sc_g = sc_h + 2 * g;  // 2 scales for this group
+        const int qh_bits_base = 2 * g;     // Starting bit position in qh bytes
+
+        // Group 1: ql_h[0:32] low nibbles, qh high bits [0:2]
+        // Group 2: ql_h[32:64] low nibbles, qh high bits [2:4]
+        // Group 3: ql_h[0:32] high nibbles, qh high bits [4:6]
+        // Group 4: ql_h[32:64] high nibbles, qh high bits [6:8]
+        const bool use_hi_nibble = (g >= 2);
+        const int ql_offset = (g % 2 == 1) ? 32 : 0;
+
+        for (int l = 0; l < 32; ++l) {
+          const uint8_t ql_val = ql_h[ql_offset + l];
+          const uint8_t qh_val = qh_h[l];
+
+          // Extract the 6-bit quant value: 4 bits from ql, 2 bits from qh
+          const int q_lo = use_hi_nibble ? (ql_val >> 4) : (ql_val & 0x0F);
+          // Shift is per-GROUP only. An extra term in l here silently corrupts the
+          // upper half of every group: see dequantize_block_q6_K, which reads
+          // (qh >> 2*g) & 3 for all 32 lanes of the group.
+          const int q_hi = (qh_val >> qh_bits_base) & 3;
+          const int q = (q_lo | (q_hi << 4)) - 32;
+
+          // Select scale: use sc_g[0] for first 16 elements, sc_g[1] for next 16
+          const int sc_idx = l / 16;
+          const int scale = sc_g[sc_idx];
+
+          // Calculate element index
+          const int elem_offset = 32 * g + l;
+          const int elem_idx = h_base + elem_offset;
+
+          acc += d * scale * q * bf16_to_f32(x[elem_idx]);
+        }
+      }
+    }
+  }
+
+  return acc;
+}
+
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q4_K = 5, WF_Q6_K = 6 };
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1259,7 +1403,7 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
-  // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
+  // K-quant packed-row byte strides (Q4_0: H/32*18, Q4_K: H/256*144, Q6_K: H/256*210 for gate_up over K=H).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
   float e4m3_lut[256];
@@ -1381,6 +1525,18 @@ struct CpuMoeExecutor {
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
+    if (weight_format == WF_Q4_K) {
+      if (H % 256 != 0 || I % 256 != 0)
+        throw std::runtime_error("Q4_K CPU MoE requires H and I to be multiples of 256");
+      q4_gu_row_bytes = (H / 256) * 144;  // K = H (gate_up rows)
+      q4_dn_row_bytes = (I / 256) * 144;  // K = I (down rows)
+    }
+    if (weight_format == WF_Q6_K) {
+      if (H % 256 != 0 || I % 256 != 0)
+        throw std::runtime_error("Q6_K CPU MoE requires H and I to be multiples of 256");
+      q4_gu_row_bytes = (H / 256) * 210;  // K = H (gate_up rows)
+      q4_dn_row_bytes = (I / 256) * 210;  // K = I (down rows)
+    }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
@@ -1486,6 +1642,14 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
+    if (fmt == WF_Q4_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+      return q4_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
+    }
+    if (fmt == WF_Q6_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+      return q6_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
+    }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
@@ -1507,6 +1671,14 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_Q4_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+      return q4_k_dot_f32_scalar(w, g, I);  // W4A16: bf16 activations, K-quant dequant
+    }
+    if (fmt == WF_Q6_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+      return q6_k_dot_f32_scalar(w, g, I);  // W4A16: bf16 activations, K-quant dequant
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
