@@ -198,6 +198,16 @@ def print_table(
 ) -> None:
     per_expert = expert_bytes(profile)
     cache_gib = cache_slots * per_expert / 2**30
+    # Build before printing: a backend that refuses this slot count would otherwise leave a
+    # header with no rows under it, which is what the abort already looked like. The limit is
+    # the backend's (marlin caps padded experts at 1024) -- ask it by constructing rather than
+    # copying the number here, where it would drift the first time a backend changes.
+    try:
+        cache = make_cache(profile, cache_slots, device)
+    except ValueError as exc:
+        print(f"\n{name} @ cache_slots={cache_slots}: SKIPPED -- {exc}")
+        return
+
     print(
         f"\n{name} ({profile.quant_format}, {len(bank_specs(profile))} banks, "
         f"L={profile.layers} E={profile.experts} k={profile.topk}) "
@@ -207,7 +217,6 @@ def print_table(
     print("bs active miss_rate misses time_ms copy_MiB bw_GBps tok_ms")
     print("-- ------ --------- ------ ------- -------- ------- ------")
 
-    cache = make_cache(profile, cache_slots, device)
     for batch_size in batch_sizes:
         for miss_rate in miss_rates:
             active, misses, time_ms = time_case(
