@@ -62,10 +62,16 @@ _ARCH = "qwen35moe"
 
 
 def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
-    """Read ``qwen35moe.<key>`` from the GGUF metadata."""
-    val = shim.metadata.get(f"{_ARCH}.{key}", default)
+    """Read ``<arch>.<key>`` from the GGUF metadata.
+
+    The prefix is the checkpoint's own ``general.architecture``: "qwen35moe" for the MoE
+    variant, "qwen35" for the dense one (e.g. Qwen3.8-27B). Same geometry keys either way.
+    """
+    val = shim.metadata.get(f"{shim.model_type}.{key}", default)
     if val is None and default is None:
-        raise ValueError(f"GGUF {shim.model_path}: missing required key {_ARCH}.{key}")
+        raise ValueError(
+            f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}"
+        )
     return val
 
 
@@ -108,10 +114,15 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     rotary_dim = int(_kv(shim, "rope.dimension_count"))
     max_pos = int(_kv(shim, "context_length"))
 
+    # Dense variants (qwen35, e.g. Qwen3.8-27B) carry no expert_* keys at all: every
+    # decoder layer gets a plain SwiGLU MLP sized by feed_forward_length instead of the
+    # routed block plus shared expert.
     num_experts = int(_kv(shim, "expert_count", 0))
     experts_per_tok = int(_kv(shim, "expert_used_count", 0))
     moe_inter = int(_kv(shim, "expert_feed_forward_length", 0))
     shared_inter = int(_kv(shim, "expert_shared_feed_forward_length", 0))
+    dense_inter = int(_kv(shim, "feed_forward_length", 0))
+    moe_enabled = num_experts > 0
 
     # GDN geometry. state_size is the per-head dim; group_count is the number of k heads
     # and time_step_rank the number of v heads (see module docstring for the arithmetic
@@ -173,7 +184,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         head_dim=head_dim,
         hidden_size=hidden_size,
         vocab_size=shim.vocab_size,
-        intermediate_size=0,  # every layer is MoE in qwen35moe
+        intermediate_size=0 if moe_enabled else dense_inter,
         hidden_act="silu",
         rms_norm_eps=rms_eps,
         tie_word_embeddings=shim.tie_word_embeddings,
@@ -183,15 +194,21 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_intermediate_size=moe_inter,
         shared_expert_intermediate_size=shared_inter,
         norm_topk_prob=True,
-        moe_enabled=num_experts > 0,
+        moe_enabled=moe_enabled,
         use_qk_norm=True,
-        model_type=_ARCH,
-        architectures=["Qwen35MoeGGUFForCausalLM"],
+        model_type=shim.model_type,
+        architectures=list(shim.architectures),
         vision_config=None,
         image_token_id=None,
         attention_groups=groups,
-        expert_quant="gguf",
-        gguf_expert_types=_uniform_expert_types(shim.model_path, num_layers),
+        # Only the MoE variant has offload expert banks; a dense checkpoint must not
+        # advertise expert_quant="gguf" or the engine would go looking for banks that do
+        # not exist. is_gguf_model() keys on gguf_model_path instead, so the op swap still
+        # runs for both.
+        expert_quant="gguf" if moe_enabled else "none",
+        gguf_expert_types=(
+            _uniform_expert_types(shim.model_path, num_layers) if moe_enabled else None
+        ),
         gguf_model_path=shim.model_path,
         weight_block_size=None,
         attn_quant="gguf",
@@ -500,7 +517,8 @@ def iter_gguf_weights(
     # Per-layer fusion buffers: layer -> {slot: packed[out, row_bytes]}.
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}  # full-attn qkv
     in_proj_buf: dict[int, dict[str, torch.Tensor]] = {}  # GDN in_proj (qkv+gate+beta+alpha)
-    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}  # shared_expert gate_up
+    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}  # shared_expert gate_up (MoE)
+    dense_mlp_buf: dict[int, dict[str, torch.Tensor]] = {}  # mlp gate_up (dense qwen35)
 
     def layer_of(name: str) -> int:
         return int(name.split(".")[1])
@@ -603,6 +621,34 @@ def iter_gguf_weights(
             continue
         if suffix == "attn_k_norm.weight":
             yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            continue
+
+        # Dense variant (qwen35): a plain SwiGLU MLP per layer instead of the routed block.
+        # Qwen3_5DenseMLP subclasses _SharedExpert, so the targets are mlp.gate_up_proj
+        # (gate|up fused) and mlp.down_proj. Same placement rule as the shared expert below:
+        # these appear on both layer kinds, so they must be consumed before the layer-kind
+        # branch whose `else: continue` drops anything it does not recognise.
+        if suffix in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"):
+            if suffix == "ffn_down.weight":
+                yield f"{base}.mlp.down_proj.qweight", t.packed()
+            else:
+                dense_mlp_buf.setdefault(layer, {})[
+                    "gate" if suffix == "ffn_gate.weight" else "up"
+                ] = t.packed()
+                d = dense_mlp_buf[layer]
+                if "gate" in d and "up" in d:
+                    types = [
+                        quant_map.get((layer, "ffn_gate.weight")),
+                        quant_map.get((layer, "ffn_up.weight")),
+                    ]
+                    if len(set(types)) == 1:
+                        yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
+                            [d["gate"], d["up"]], dim=0
+                        )
+                    else:
+                        yield f"{base}.mlp.gate_up_proj.qweight_0", d["gate"]
+                        yield f"{base}.mlp.gate_up_proj.qweight_1", d["up"]
+                    del dense_mlp_buf[layer]
             continue
 
         # Shared expert (present on every layer, both kinds) -- must be handled BEFORE the
@@ -746,11 +792,17 @@ def iter_gguf_weights(
     assert not qkv_buf, f"incomplete full-attn qkv groups: {sorted(qkv_buf)}"
     assert not in_proj_buf, f"incomplete GDN in_proj groups: {sorted(in_proj_buf)}"
     assert not gate_up_buf, f"incomplete shared_expert gate_up groups: {sorted(gate_up_buf)}"
+    assert not dense_mlp_buf, f"incomplete dense mlp gate_up groups: {sorted(dense_mlp_buf)}"
 
 
 def is_gguf_model(config: ModelConfig) -> bool:
-    """True when this config came from a GGUF checkpoint (native block-quant path)."""
-    return getattr(config, "expert_quant", "none") == "gguf"
+    """True when this config came from a GGUF checkpoint (native block-quant path).
+
+    Keys on gguf_model_path rather than expert_quant: the dense qwen35 variant has no
+    expert banks and therefore no expert_quant="gguf", but still needs its dense ops
+    swapped for GGUF ops.
+    """
+    return getattr(config, "gguf_model_path", None) is not None
 
 
 def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> None:
@@ -776,6 +828,25 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
         for lid in range(config.num_layers)
         if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
     }
+
+    # Split widths come from the config, not constants: Ornith-1.5 is 16 q heads / 2 kv /
+    # 32 v heads, Qwen3.8-27B is 24 / 4 / 48. Hardcoding either breaks the other.
+    _qkv_split = [
+        config.num_qo_heads * config.head_dim * 2,   # q is gated, hence *2
+        config.num_kv_heads * config.head_dim,
+        config.num_kv_heads * config.head_dim,
+    ]
+    _g = config.linear_attention_group()
+    _in_proj_split = (
+        [
+            2 * _g.num_key_heads * _g.key_head_dim + _g.num_value_heads * _g.value_head_dim,
+            _g.num_value_heads * _g.value_head_dim,
+            _g.num_value_heads,
+            _g.num_value_heads,
+        ]
+        if _g is not None
+        else []
+    )
 
     def qt(layer: int, suffix: str) -> int:
         """The ggml type of one tensor, straight from the file.
@@ -818,7 +889,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
             # q/k are I-quants), so this is normally the GGUFMergedLinear path.
             layer.self_attn.qkv_proj = gguf_merged_or_plain(
                 config.hidden_size,
-                [8192, 512, 512],
+                _qkv_split,
                 [
                     qt(layer_idx, "attn_q.weight"),
                     qt(layer_idx, "attn_k.weight"),
@@ -832,7 +903,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
             # _in_proj_split = [conv_dim, value_dim, num_v_heads, num_v_heads].
             layer.linear_attn.in_proj = gguf_merged_or_plain(
                 config.hidden_size,
-                [8192, 4096, 32, 32],
+                _in_proj_split,
                 [
                     qt(layer_idx, "attn_qkv.weight"),
                     qt(layer_idx, "attn_gate.weight"),
@@ -845,6 +916,19 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
             # V-head dimension, which llama.cpp tiled, and un-tiling columns needs dense
             # values (a 128-wide head straddles the quant blocks). iter_gguf_weights yields
             # it as dense bf16 ".weight", so the constructed Linear must stay dense.
+
+        if not config.moe_enabled:
+            # Dense qwen35: one SwiGLU MLP per layer (Qwen3_5DenseMLP), no routed experts
+            # and no shared expert.
+            I = config.intermediate_size
+            layer.mlp.gate_up_proj = gguf_merged_or_plain(
+                config.hidden_size,
+                [I, I],
+                [qt(layer_idx, "ffn_gate.weight"), qt(layer_idx, "ffn_up.weight")],
+                has_bias=False,
+            )
+            swap_linear(layer.mlp, "down_proj", qt(layer_idx, "ffn_down.weight"))
+            continue
 
         # Shared expert: gate|up fuse when they share a type (they do in every quant level
         # seen so far); down is independent and does vary (Q4_K on IQ3_M's first layers).
