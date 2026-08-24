@@ -6,7 +6,7 @@ for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
-| Kimi-K3 | [inference-optimization/Kimi-K3-0.40B-MXFP4](https://huggingface.co/inference-optimization/Kimi-K3-0.40B-MXFP4) (development checkpoint), [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (full checkpoint) |
+| Kimi-K3 | [inference-optimization/Kimi-K3-0.40B-MXFP4](https://huggingface.co/inference-optimization/Kimi-K3-0.40B-MXFP4) (development checkpoint), [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) (full checkpoint); [4x H200 qualification](../benchmarks/kimi_k3_vast_h200_20260824.md) |
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |
@@ -44,5 +44,7 @@ for them; other checkpoints of the same architectures work too.
   through the offload-family MoE backends. The 0.40B development checkpoint is
   suitable for validating the complete KDA/MLA, latent-MoE, SiTU, and checkpoint
   loading path on a single consumer GPU; it is not a performance proxy for the
-  2.8T full checkpoint.
+  2.8T full checkpoint. The full checkpoint passed an OpenAI-compatible
+  qualification on 4x H200; see the linked record for cold-start, streaming,
+  and concurrency measurements.
 - Multimodal checkpoints are served text-only.

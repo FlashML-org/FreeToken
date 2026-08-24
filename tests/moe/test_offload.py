@@ -415,7 +415,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -475,6 +475,8 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
             return torch.zeros(batch.size, 3)
 
     class FakeOffloadCache:
+        cache_size = 1
+
         def reset(self):
             events.append("reset")
 

@@ -3,8 +3,7 @@
   "recordedAt": "2026-08-24T02:15:19.233806Z",
   "qualification": {
     "status": "passed",
-    "hostedProviderDirectOpenAIEndpoint": "passed",
-    "communityEnrollment": "not attempted: enrollment credential was unavailable"
+    "hostedProviderDirectOpenAIEndpoint": "passed"
   },
   "environment": {
     "provider": "Vast.ai",
