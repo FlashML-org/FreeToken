@@ -277,11 +277,14 @@ class TestQwenNameMapping:
         assert gguf_name_to_freetoken("output_norm.weight", num_layers) == "model.norm.weight"
         assert gguf_name_to_freetoken("output.weight", num_layers) == "lm_head.weight"
 
-        # Layer 3 (full-attention): single-output projections
-        assert gguf_name_to_freetoken("blk.3.attn_q.weight", num_layers) == "model.layers.3.self_attn.q_proj.weight"
-        assert gguf_name_to_freetoken("blk.3.attn_k.weight", num_layers) == "model.layers.3.self_attn.k_proj.weight"
-        assert gguf_name_to_freetoken("blk.3.attn_v.weight", num_layers) == "model.layers.3.self_attn.v_proj.weight"
+        # Layer 3 (full-attention). Only o_proj is a 1:1 rename. attn_q/k/v are PARTS of
+        # the merged qkv_proj (Qwen3_5Attention has no q_proj/k_proj/v_proj attribute), so
+        # the mapper reports None -- iter_gguf_weights owns their fusion because only it
+        # knows the concat order and the per-part quant types. Asserting a q_proj name here
+        # would lock in a parameter the module does not have.
         assert gguf_name_to_freetoken("blk.3.attn_output.weight", num_layers) == "model.layers.3.self_attn.o_proj.weight"
+        for part in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
+            assert gguf_name_to_freetoken(f"blk.3.{part}", num_layers) is None, part
 
         # Layer 0 (GDN): linear attention with conv1d and SSM
         assert gguf_name_to_freetoken("blk.0.ssm_conv1d.weight", num_layers) == "model.layers.0.linear_attn.conv1d.weight"
@@ -293,9 +296,11 @@ class TestQwenNameMapping:
         # MoE tensors: shared expert and router
         assert gguf_name_to_freetoken("blk.5.ffn_gate_inp.weight", num_layers) == "model.layers.5.mlp.gate.weight"
         assert gguf_name_to_freetoken("blk.5.ffn_gate_inp_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert_gate.weight"
-        assert gguf_name_to_freetoken("blk.5.ffn_gate_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert.gate_proj.weight"
-        assert gguf_name_to_freetoken("blk.5.ffn_up_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert.up_proj.weight"
         assert gguf_name_to_freetoken("blk.5.ffn_down_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert.down_proj.weight"
+        # gate/up shexp are parts of _SharedExpert's merged gate_up_proj -- same reasoning
+        # as attn_q/k/v above.
+        for part in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"):
+            assert gguf_name_to_freetoken(f"blk.5.{part}", num_layers) is None, part
 
     def test_name_map_ignores_routed_experts(self):
         """gguf_name_to_freetoken ignores routed-expert stacks (handled by offload banks)."""
