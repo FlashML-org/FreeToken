@@ -415,13 +415,25 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # A model may forbid CUDA graphs when its forward does a host-side gather that capture
+        # cannot record (e.g. Gemma-4 E-series with FREETOKEN_GEMMA4_PLE_CPU=1). Force graphs
+        # off rather than crashing during capture on the default flags.
+        graph_bs = config.cuda_graph_bs
+        graph_max_bs = config.cuda_graph_max_bs
+        if not getattr(self.model, "supports_cuda_graph", True) and graph_max_bs != 0:
+            logger.info_rank0(
+                "CUDA graphs disabled: the model's forward uses a host-resident weight "
+                "gather that graph capture cannot record."
+            )
+            # Mirror `--cuda-graph-max-bs 0` (bs=None so _determine_cuda_graph_bs yields []).
+            graph_bs, graph_max_bs = None, 0
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=graph_bs,
+            cuda_graph_max_bs=graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,

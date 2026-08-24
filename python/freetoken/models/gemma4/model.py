@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -132,10 +133,22 @@ class Gemma4Model(BaseOP):
 
         # --- Gemma-4 E-series Per-Layer Embeddings (PLE) ---
         self._has_ple = config.per_layer_hidden_size > 0
+        # PLE per-layer table (~4.7 GB bf16 for E2B). Default: an on-GPU embedding, which is
+        # CUDA-graph-safe (the reason graphs are on by default). Opt in with
+        # FREETOKEN_GEMMA4_PLE_CPU=1 to keep it in host RAM on a VRAM-tight box -- but the
+        # per-forward host gather cannot be captured, so the engine then disables CUDA graphs
+        # for this model (see Gemma4ForCausalLM.supports_cuda_graph). The GGUF path replaces
+        # this with a compact Q6_K GGUFEmbedding on-GPU regardless (also graph-safe).
+        self._ple_on_cpu = os.getenv("FREETOKEN_GEMMA4_PLE_CPU", "0").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
         if self._has_ple:
             P = config.per_layer_hidden_size
             L = config.num_layers
-            self.embed_tokens_per_layer = CpuPerLayerEmbedding(
+            per_layer_embed_cls = (
+                CpuPerLayerEmbedding if self._ple_on_cpu else VocabParallelEmbedding
+            )
+            self.embed_tokens_per_layer = per_layer_embed_cls(
                 num_embeddings=config.per_layer_vocab_size,
                 embedding_dim=L * P,
                 embed_scale=float(P) ** 0.5,
@@ -191,8 +204,9 @@ class Gemma4Model(BaseOP):
         context projection of ``inputs_embeds``. Mirrors transformers' get_per_layer_inputs +
         project_per_layer_inputs."""
         T = input_ids.shape[0]
-        # embed_tokens_per_layer is CpuPerLayerEmbedding (bf16, host RAM) or a GGUFEmbedding
-        # (Q6_K, GPU) after the GGUF swap -- both take input_ids and return [T, L*P].
+        # embed_tokens_per_layer takes input_ids and returns [T, L*P]: an on-GPU
+        # VocabParallelEmbedding (default), a host-RAM CpuPerLayerEmbedding (opt-in), or a
+        # Q6_K GGUFEmbedding after the GGUF swap. The .to() is a no-op for the on-GPU variants.
         tok = self.embed_tokens_per_layer.forward(input_ids).to(inputs_embeds.device).view(
             T, self._num_layers, self._ple_hidden
         )
@@ -233,6 +247,14 @@ class Gemma4ForCausalLM(BaseLLMModel):
 
         if is_gguf_model(config):
             convert_gemma4_to_gguf(self, config)
+
+    @property
+    def supports_cuda_graph(self) -> bool:
+        """False only when the PLE table is host-resident (FREETOKEN_GEMMA4_PLE_CPU=1): the
+        per-forward host gather in CpuPerLayerEmbedding does a CPU<->GPU copy that CUDA graph
+        capture forbids (and that graph replay could not re-run anyway). The default on-GPU /
+        GGUF PLE embeddings are graph-safe, so graphs stay on by default."""
+        return not getattr(self.model, "_ple_on_cpu", False)
 
     def cpu_offloaded_weight_keys(self) -> tuple[str, ...]:
         """Weights the engine should keep in host RAM instead of VRAM (E-series bf16 PLE
