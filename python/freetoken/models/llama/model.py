@@ -11,6 +11,8 @@ from freetoken.models.blocks import BaseLLMModel, GatedMLP as LlamaMLP
 
 from .attention import LlamaAttention as LlamaAttn
 
+from freetoken.models.llama.gguf import is_gguf_model, convert_llama_to_gguf, parse_gguf_config
+
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
@@ -75,6 +77,9 @@ class LlamaForCausalLM(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
         super().__init__()
+        if is_gguf_model(config):
+            convert_llama_to_gguf(self,config)
+
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
