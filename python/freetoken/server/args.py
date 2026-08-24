@@ -214,6 +214,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bfloat16", "fp8_e4m3", "fp8_e5m2"],
+        help="KV-cache storage dtype. 'auto' matches the model dtype (bf16). fp8_e4m3/fp8_e5m2 "
+        "halve KV bytes/token (~2x the token budget that fits) with negligible quality loss; "
+        "queries stay bf16 and the FlashInfer fp8 kernels dequantize on read. fp8 currently "
+        "supports full-attention (MHA) models on the FlashInfer backend only.",
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -680,6 +691,16 @@ def parse_args(
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+
+    # KV-cache dtype: "auto" -> None (falls back to the model dtype in resolved_kv_dtype).
+    KV_DTYPE_MAP = {
+        "auto": None,
+        "bfloat16": torch.bfloat16,
+        "fp8_e4m3": torch.float8_e4m3fn,
+        "fp8_e5m2": torch.float8_e5m2,
+    }
+    kwargs["kv_dtype"] = KV_DTYPE_MAP[kwargs["kv_dtype"]]
+
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
