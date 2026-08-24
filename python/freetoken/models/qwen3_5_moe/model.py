@@ -109,6 +109,18 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+        # A GGUF checkpoint carries native block-quantized weights: swap the dense
+        # projections + embedding for GGUF-quant ops so the packed buffers have somewhere
+        # to land (routed experts stay on the offload cache). Mirrors gemma4/model.py.
+        from .gguf import convert_qwen35_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            assert config.gguf_model_path is not None, (
+                "expert_quant=='gguf' but ModelConfig.gguf_model_path is unset; the per-tensor "
+                "ggml types can only be read from the file"
+            )
+            convert_qwen35_to_gguf(self, config, model_path=config.gguf_model_path)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
