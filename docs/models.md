@@ -26,8 +26,14 @@ the kernels rather than expanded to bf16 at load.
 | GGUF `general.architecture` | Covers |
 |---|---|
 | `gemma4` | Gemma-4 |
+| `qwen3moe` | Qwen3 MoE (e.g. Qwen3-235B-A22B, Qwen3-30B-A3B) |
 | `qwen35moe` | Qwen3.5 / Qwen3.6 MoE (e.g. Qwen3.6-35B-A3B, Qwen3.5-122B-A10B) |
 | `qwen35` | Qwen3.5 / Qwen3.6 dense (e.g. Qwen3.6-27B, Qwen3.5-9B) |
+
+Split checkpoints load: point `--model` at any shard of a `-00001-of-000NN` set, or at the
+directory holding them. Metadata, config and tokenizer are read from shard 1 (later shards
+carry only `split.*` keys), and the tensor tables are aggregated across the set. A missing
+shard raises with the index named rather than loading a partial model.
 
 Quant types follow what the vendored kernels in `csrc/gguf/` implement:
 
