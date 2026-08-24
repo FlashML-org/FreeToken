@@ -6,7 +6,21 @@ from dataclasses import dataclass
 from typing import Iterator
 
 import torch
-from flashlib.kernels.slot_cache import N_STATS, Stat
+
+# flashlib (and its triton dependency) is only needed by the GPU offload MoE
+# backend. To keep the package importable on a CPU-only build (no triton, no
+# NVIDIA toolkit) we import it lazily and fall back to a numeric shim for the
+# two constants the module uses at construction time. The real flashlib is used
+# whenever it is importable, so the GPU path is untouched.
+try:
+    from flashlib.kernels.slot_cache import N_STATS, Stat
+except Exception:  # pragma: no cover - flashlib/triton absent on CPU-only build
+    N_STATS = 3  # ACTIVE, MISS, CALLS
+
+    class Stat:
+        ACTIVE = 0
+        MISS = 1
+        CALLS = 2
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
