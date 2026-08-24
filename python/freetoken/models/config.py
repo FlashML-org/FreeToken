@@ -243,6 +243,20 @@ class ModelConfig:
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
     # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
     lm_head_quant: str = "none"
+    # Routed-expert bank ggml types for ``expert_quant == "gguf"``, as
+    # ``(gate_up_type, down_type)``. Unlike the other quant tags, which name a *format*
+    # whose geometry is then fixed, a GGUF checkpoint picks a ggml type per tensor, so the
+    # bank row stride (``row_bytes``) is only knowable from the file. The offload cache
+    # sizes its slot pool from these and the MoE kernels take the type as an argument.
+    #
+    # Both entries must be uniform across layers: the GPU slot pool is one contiguous
+    # allocation shared by every layer, and moe_vec.cuh addresses it as
+    # ``expert * nrows * (ncols / qk)`` with no padding allowance -- so two layers with
+    # different row strides in one pool would read every block at the wrong offset.
+    # ``load_gguf_expert_sources`` raises when a checkpoint violates that (llama.cpp's
+    # *_M mixes do: Ornith IQ3_M splits ffn_down_exps across Q4_K and IQ3_S, while its
+    # IQ3_S/IQ3_XXS siblings are uniform and load fine).
+    gguf_expert_types: tuple[int, int] | None = None
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----

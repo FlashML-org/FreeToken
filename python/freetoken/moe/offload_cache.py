@@ -45,6 +45,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF experts of any MMVQ-capable ggml type (the generalization of "q4_0"):
+    # gate_up [L*E, 2I, row_bytes(H, t_gate_up)], down [L*E, H, row_bytes(I, t_down)],
+    # with the two types carried on ModelConfig.gguf_expert_types because they are a
+    # property of the checkpoint, not of the format. Same two banks and the same
+    # dequant-in-kernel grouped GEMV as q4_0 -- only the row stride is type-dependent.
+    "gguf": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -114,6 +120,12 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
+    # For quant_format == "gguf": the (gate_up, down) ggml types of the two banks. Unlike
+    # every other format, "gguf" does not imply a row stride -- the checkpoint picks a ggml
+    # type per tensor -- so the MoE kernels need the types handed to them at dispatch.
+    # Per-bank (each bank owns its own slot pool) but NOT per-layer: one pool is shared by
+    # all layers and moe_vec.cuh addresses it with no padding allowance.
+    gguf_expert_types: tuple[int, int] | None = None
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;

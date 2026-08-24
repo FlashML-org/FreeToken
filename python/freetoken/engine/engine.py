@@ -491,6 +491,7 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
+            gguf_expert_types=banks.gguf_expert_types,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -609,6 +610,7 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
+                gguf_expert_types=banks.gguf_expert_types,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )

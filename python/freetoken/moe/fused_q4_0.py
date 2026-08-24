@@ -33,6 +33,7 @@ def fused_experts_gguf(
     topk_ids: torch.Tensor,
     activation: str,
     quant_type: int,
+    down_quant_type: int | None = None,
 ) -> torch.Tensor:
     """Fused GGUF MoE expert compute over any MMVQ-supported quantization type.
 
@@ -40,15 +41,24 @@ def fused_experts_gguf(
     dequantization happens inside the ``ggml_moe_a8_vec`` CUDA kernel. ``quant_type`` must be
     in ``MOE_VEC_TYPES``, which mirrors the supported types in ``ggml_moe_a8_vec``
     (gguf_kernel.cu:559).
+
+    ``quant_type`` is the gate_up bank's type; ``down_quant_type`` defaults to it. They may
+    differ because gate_up and down are separate banks with separate slot pools, and
+    llama.cpp routinely quantizes the down projection differently from gate/up. What may
+    NOT differ is the type *within* one bank across layers -- that pool is one allocation.
     """
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
-    if quant_type not in MOE_VEC_TYPES:
-        from freetoken.models.gguf.dequant import GGML_NAME
-        raise NotImplementedError(
-            f"fused GGUF MoE kernel does not support quant type {GGML_NAME.get(quant_type, quant_type)} "
-            f"(only {sorted(MOE_VEC_TYPES)} supported)"
-        )
+    if down_quant_type is None:
+        down_quant_type = quant_type
+    for label, qt in (("gate_up", quant_type), ("down", down_quant_type)):
+        if qt not in MOE_VEC_TYPES:
+            from freetoken.models.gguf.dequant import GGML_NAME
+            raise NotImplementedError(
+                f"fused GGUF MoE kernel does not support quant type "
+                f"{GGML_NAME.get(qt, qt)} for the {label} bank "
+                f"(only {sorted(MOE_VEC_TYPES)} supported)"
+            )
 
     act_fn = _ACT.get(activation)
     if act_fn is None:
@@ -64,7 +74,7 @@ def fused_experts_gguf(
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
+    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )
