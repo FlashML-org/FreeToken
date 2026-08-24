@@ -60,6 +60,19 @@ def gguf_shards(path: str) -> list[str]:
     Raises a clear error naming the missing indices if any are absent (truncated downloads
     are the common failure case and must not load silently).
     """
+    # A directory: find the first shard inside it and continue from there. Users routinely
+    # pass the folder a split model was downloaded into rather than a specific shard.
+    if os.path.isdir(path):
+        first = sorted(glob.glob(os.path.join(path, "*-00001-of-?????.gguf")))
+        if len(first) > 1:
+            raise ValueError(
+                f"{path}: contains {len(first)} different split models "
+                f"({[os.path.basename(f) for f in first]}); point at one shard instead"
+            )
+        if not first:
+            return [path]
+        path = first[0]
+
     basename = os.path.basename(path)
     match = re.match(r"(?P<base>.+)-(\d{5})-of-(\d{5})\.gguf$", basename)
     if not match:
@@ -71,7 +84,7 @@ def gguf_shards(path: str) -> list[str]:
     shard_dir = os.path.dirname(path)
 
     # Glob all sibling shards
-    pattern = os.path.join(shard_dir, f"{base}-?????.of-{total_shards_str}.gguf")
+    pattern = os.path.join(shard_dir, f"{base}-?????-of-{total_shards_str}.gguf")
     found_shards = sorted(glob.glob(pattern))
 
     # Parse indices and validate completeness
