@@ -307,6 +307,8 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        # Paged KV storage dtype (may be fp8 via --kv-dtype); queries/activations stay self.dtype.
+        self.kv_dtype = config.resolved_kv_dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
@@ -350,7 +352,7 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=self.kv_dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -384,6 +386,9 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
+        # Query/activation dtype for attention (the fp8-KV path needs it distinct from the KV
+        # storage dtype); backends read it off the global context in their constructors.
+        self.ctx.compute_dtype = self.dtype
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )

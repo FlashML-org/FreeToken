@@ -22,11 +22,13 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
+    # KV slabs use the (possibly fp8) KV dtype; duck-typed test configs lack the property.
+    kv_dtype = getattr(config, "resolved_kv_dtype", None) or config.dtype
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_dtype.itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2

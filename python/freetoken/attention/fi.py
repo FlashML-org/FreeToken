@@ -57,7 +57,8 @@ class FIMetadata(BaseAttnMetadata):
     page_size:          Literal[1] # currently only support page_size=1
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
-    dtype:              torch.dtype
+    dtype:              torch.dtype    # KV-cache storage dtype (may be fp8)
+    q_dtype:            torch.dtype    # query dtype (model activation dtype, bf16)
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
     # fmt: on
@@ -86,6 +87,8 @@ class FlashInferBackend(BaseAttnBackend):
 
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
+        # Query dtype (bf16), distinct from self.kvcache.dtype when KV is fp8.
+        self.q_dtype = get_global_ctx().compute_dtype
         self.device = self.kvcache.device
         # fa2 split-KV prefill needs ``tmp_v <= qo_heads_local * padded_batch_size *
         # cta_tile_q * head_dim * 4`` bytes of scratch, where flashinfer's scheduler
@@ -165,8 +168,7 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
             )
@@ -182,7 +184,7 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
                 causal=True,
@@ -256,6 +258,7 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
+            q_dtype=self.q_dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 
