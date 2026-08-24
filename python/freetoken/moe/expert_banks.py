@@ -320,11 +320,14 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
                 for t in distinct
             }
             raise NotImplementedError(
-                f"GGUF expert bank {name!r} mixes ggml types across layers ({spread}); the "
-                f"offload slot pool is one allocation with a single row stride, so this "
-                f"checkpoint cannot be served. Use a quant level whose expert banks are "
-                f"uniform (for Ornith-1.5-35B: IQ3_S or IQ3_XXS are; IQ3_M/IQ2_M/IQ2_XXS/"
-                f"IQ1_S split ffn_down_exps across two types)."
+                f"GGUF expert bank {name!r} mixes ggml types across layers ({spread}). "
+                f"The offload slot pool is a single allocation shared by every layer and "
+                f"moe_vec.cuh addresses it as expert * nrows * (ncols / qk) with no padding "
+                f"allowance, so one pool cannot hold two row strides. "
+                f"llama.cpp's mixed quant levels (the *_M and *_XXS families) raise the "
+                f"precision of the first few layers' ffn_down_exps, which is what trips this. "
+                f"Re-quantize with `llama-quantize --pure` to get one type throughout, or pick "
+                f"a level that is already uniform."
             )
         resolved[name] = distinct[0]
 
