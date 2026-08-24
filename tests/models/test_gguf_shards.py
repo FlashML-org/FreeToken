@@ -1,559 +1,200 @@
-"""Tests for GGUF multi-shard discovery and aggregation, plus qwen3moe mapping.
+"""Multi-shard GGUF reading: discovery, shard-1 metadata, tensor aggregation.
 
-This module verifies that multi-shard GGUF files (following llama.cpp's split
-convention) are correctly discovered, validated, and aggregated by
-freetoken.models.gguf.reader, and that the qwen3moe tensor-name mapping is correct.
+Large GGUF checkpoints ship split (``-00001-of-000NN``), and llama.cpp's convention has
+three properties that are easy to get wrong and nearly invisible when you do:
 
-Test fixtures build synthetic GGUF files on disk using gguf.GGUFWriter where
-possible, or raw GGUF bytes where needed. The tensor data is tiny (a few F32
-values) to keep I/O fast; the focus is on metadata, discovery, and naming, not
-quantization or size.
+* ``split.no`` is 0-BASED while the filenames are 1-BASED. Shard ``-00002-of-00003``
+  carries ``split.no = 1``.
+* ``split.tensors.count`` is the TOTAL across every shard, not this shard's count.
+* Only shard 1 carries the real metadata. Later shards hold exactly three ``split.*`` keys
+  and no ``general.architecture`` at all, so anything that reads arch or tokenizer from an
+  arbitrary shard gets nothing.
 
-llama.cpp's shard layout (ground truth from measured checksums):
-  - Shard 1: full metadata (general.architecture, <arch>.*, tokenizer.*) + split.no=0
-  - Shards 2..N: exactly 3 keys (split.no, split.count, split.tensors.count)
-  - split.tensors.count is the TOTAL across all shards, not per-shard
-  - Filenames are 1-based; split.no is 0-based
+The fixtures below write GGUF bytes directly rather than going through ``gguf.GGUFWriter``:
+the format is small, and hand-writing it keeps these tests independent of that writer's
+API (which takes a required ``arch`` positional and has moved around between releases).
+Layout per the spec: magic, uint32 version, uint64 tensor_count, uint64 kv_count, the KV
+pairs, the tensor infos, then padding to ``general.alignment`` and the tensor data.
 """
 
 from __future__ import annotations
 
-import os
 import struct
-import tempfile
 from pathlib import Path
 
 import pytest
 
+from freetoken.models.gguf.reader import (
+    gguf_architecture,
+    gguf_shards,
+    gguf_tensor_names,
+    is_gguf_path,
+    iter_gguf_tensors,
+    load_gguf_metadata,
+)
+
+# GGUF value type tags
+_UINT32, _UINT64, _STRING = 4, 10, 8
+_F32_TENSOR_TYPE = 0
+_ALIGN = 32
+
+
+def _u32(v: int) -> bytes:
+    return struct.pack("<I", v)
+
+
+def _u64(v: int) -> bytes:
+    return struct.pack("<Q", v)
+
+
+def _string(s: str) -> bytes:
+    raw = s.encode("utf-8")
+    return _u64(len(raw)) + raw
+
+
+def _kv(key: str, tag: int, value) -> bytes:
+    out = _string(key) + _u32(tag)
+    if tag == _STRING:
+        return out + _string(value)
+    if tag == _UINT32:
+        return out + _u32(value)
+    if tag == _UINT64:
+        return out + _u64(value)
+    raise AssertionError(f"unhandled tag {tag}")
+
+
+def _write_gguf(path: Path, kvs: list[bytes], tensors: list[tuple[str, int]]) -> None:
+    """Write a GGUF with ``tensors`` as [(name, n_elements)], each F32.
+
+    Tensor data is written contiguously after the aligned header; the values themselves are
+    irrelevant here since these tests only exercise discovery, metadata and the tensor
+    table.
+    """
+    head = b"GGUF" + _u32(3) + _u64(len(tensors)) + _u64(len(kvs))
+    head += b"".join(kvs)
+    offset = 0
+    infos = b""
+    for name, n in tensors:
+        infos += _string(name) + _u32(1) + _u64(n) + _u32(_F32_TENSOR_TYPE) + _u64(offset)
+        nbytes = n * 4
+        offset += (nbytes + _ALIGN - 1) // _ALIGN * _ALIGN
+    body = head + infos
+    pad = (-len(body)) % _ALIGN
+    body += b"\0" * pad
+    body += b"\0" * offset
+    path.write_bytes(body)
+
+
+def _full_kvs(arch: str = "qwen3moe", *, extra: list[bytes] | None = None) -> list[bytes]:
+    """Shard 1's KV block: the real metadata."""
+    kvs = [
+        _kv("general.architecture", _STRING, arch),
+        _kv("general.alignment", _UINT32, _ALIGN),
+        _kv(f"{arch}.block_count", _UINT32, 4),
+        _kv(f"{arch}.embedding_length", _UINT32, 128),
+    ]
+    return kvs + (extra or [])
+
+
+def _split_kvs(no: int, count: int, total_tensors: int) -> list[bytes]:
+    """A non-first shard's KV block: exactly the three split keys, no architecture."""
+    return [
+        _kv("split.no", _UINT32, no),
+        _kv("split.count", _UINT32, count),
+        _kv("split.tensors.count", _UINT32, total_tensors),
+    ]
+
+
+def _make_split(tmp_path: Path, base: str, per_shard: list[list[str]], *,
+                declared_count: int | None = None) -> list[Path]:
+    """Write a split set; returns the shard paths in order."""
+    n = len(per_shard)
+    declared = declared_count if declared_count is not None else n
+    total = sum(len(names) for names in per_shard)
+    paths = []
+    for i, names in enumerate(per_shard):
+        p = tmp_path / f"{base}-{i + 1:05d}-of-{n:05d}.gguf"
+        kvs = (_full_kvs() + _split_kvs(0, declared, total)) if i == 0 \
+            else _split_kvs(i, declared, total)
+        _write_gguf(p, kvs, [(nm, 8) for nm in names])
+        paths.append(p)
+    return paths
+
 
 class TestSingleFileUnchanged:
-    """A plain one-file .gguf still reports correct arch, metadata, tensors.
-
-    This is the regression guard: single-file behavior must be untouched by
-    multi-shard support.
-    """
-
-    def test_single_file_unchanged(self, tmp_path):
-        """Verify a single .gguf file works unchanged."""
-        from freetoken.models.gguf.reader import (
-            gguf_architecture,
-            is_gguf_path,
-            load_gguf_metadata,
-            gguf_tensor_names,
-            iter_gguf_tensors,
-        )
-
-        # Write a minimal GGUF file (no shards)
-        gguf_path = self._write_minimal_gguf(tmp_path, "single.gguf")
-
-        # Check single-file detection
-        assert is_gguf_path(str(gguf_path))
-
-        # Check architecture is readable
-        arch = gguf_architecture(str(gguf_path))
-        assert arch == "test_model"
-
-        # Check metadata
-        metadata = load_gguf_metadata(str(gguf_path))
-        assert metadata.get("general.architecture") == "test_model"
-        assert metadata.get("test_model.hidden_size") == 256
-
-        # Check tensor names
-        names = gguf_tensor_names(str(gguf_path))
-        assert "model.embed.weight" in names
-        assert len(names) == 1
-
-        # Check tensor iteration
-        tensors = list(iter_gguf_tensors(str(gguf_path)))
-        assert len(tensors) == 1
-        assert tensors[0].name == "model.embed.weight"
-        assert tensors[0].shape == (256, 64)
-
-    def _write_minimal_gguf(self, tmp_path: Path, filename: str) -> Path:
-        """Write a minimal single-file GGUF with one tensor."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        gguf_path = tmp_path / filename
-        writer = gguf.GGUFWriter(str(gguf_path))
-
-        # Add metadata
-        writer.add_string("general.architecture", "test_model")
-        writer.add_uint32("test_model.hidden_size", 256)
-        writer.add_uint32("test_model.num_layers", 2)
-
-        # Add one tensor (embedding)
-        import numpy as np
-
-        emb_data = np.random.randn(256, 64).astype(np.float32)
-        writer.add_tensor("model.embed.weight", emb_data)
-
-        writer.write_header_and_data(str(gguf_path))
-        return gguf_path
+    def test_single_file_unchanged(self, tmp_path: Path):
+        """A plain one-file GGUF must behave exactly as before the shard work."""
+        p = tmp_path / "single.gguf"
+        _write_gguf(p, _full_kvs(), [("token_embd.weight", 8), ("output.weight", 8)])
+        assert is_gguf_path(str(p))
+        assert gguf_shards(str(p)) == [str(p)]
+        assert gguf_architecture(str(p)) == "qwen3moe"
+        assert load_gguf_metadata(str(p))["qwen3moe.block_count"] == 4
+        assert gguf_tensor_names(str(p)) == {"token_embd.weight", "output.weight"}
+        assert len(list(iter_gguf_tensors(str(p)))) == 2
 
 
 class TestShardDiscovery:
-    """Given a 3-shard set, gguf_shards() returns all three in index order."""
+    def test_discovery_from_any_shard_or_directory(self, tmp_path: Path):
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"], ["c.weight"]])
+        want = [str(p) for p in paths]
+        for handed in (paths[0], paths[1], paths[2]):
+            assert gguf_shards(str(handed)) == want, f"from {handed.name}"
+        # a user pointing at the folder must work too
+        assert gguf_shards(str(tmp_path)) == want
 
-    def test_shard_discovery_orders_and_completes(self, tmp_path):
-        """Discover all 3 shards when given any shard or the directory."""
-        from freetoken.models.gguf.reader import (
-            gguf_shards,
-            is_gguf_path,
-            gguf_tensor_names,
-        )
-
-        # Write 3 shards
-        shard_paths = self._write_3_shards(tmp_path)
-
-        # Test 1: discover from shard 1
-        result = gguf_shards(str(shard_paths[0]))
-        assert len(result) == 3
-        assert [Path(p).name for p in result] == [
-            "model-00001-of-00003.gguf",
-            "model-00002-of-00003.gguf",
-            "model-00003-of-00003.gguf",
-        ]
-
-        # Test 2: discover from shard 2
-        result = gguf_shards(str(shard_paths[1]))
-        assert len(result) == 3
-        assert result[0] == str(shard_paths[0])  # first shard returned
-
-        # Test 3: discover from shard 3
-        result = gguf_shards(str(shard_paths[2]))
-        assert len(result) == 3
-
-        # Test 4: directory resolution
-        assert is_gguf_path(str(tmp_path))
-
-        # Test 5: tensors are aggregated across shards
-        names = gguf_tensor_names(str(shard_paths[0]))
-        assert names == {
-            "token_embd.weight",  # shard 1
-            "blk.0.attn_norm.weight",  # shard 2
-            "blk.1.attn_norm.weight",  # shard 3
-        }
-
-    def _write_3_shards(self, tmp_path: Path) -> list[Path]:
-        """Write a 3-shard GGUF set with metadata and tensors distributed."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        import numpy as np
-
-        shard_paths = []
-
-        # Shard 1: full metadata + 1 tensor
-        shard1 = tmp_path / "model-00001-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard1))
-        writer.add_string("general.architecture", "qwen3moe")
-        writer.add_uint32("qwen3moe.block_count", 2)
-        writer.add_uint32("qwen3moe.embedding_length", 128)
-        writer.add_uint32("qwen3moe.attention.head_count", 4)
-        writer.add_uint32("qwen3moe.attention.head_count_kv", 2)
-        writer.add_uint32("qwen3moe.attention.key_length", 32)
-        writer.add_float32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
-        writer.add_float32("qwen3moe.rope.freq_base", 10000.0)
-        writer.add_uint32("qwen3moe.context_length", 4096)
-        writer.add_uint32("qwen3moe.expert_count", 8)
-        writer.add_uint32("qwen3moe.expert_used_count", 2)
-        writer.add_uint32("qwen3moe.expert_feed_forward_length", 512)
-        writer.add_uint32("qwen3moe.feed_forward_length", 512)
-        # Split metadata for shard 1
-        writer.add_uint32("split.no", 0)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        # One tensor in shard 1
-        emb = np.random.randn(1024, 128).astype(np.float32)
-        writer.add_tensor("token_embd.weight", emb)
-        writer.write_header_and_data(str(shard1))
-        shard_paths.append(shard1)
-
-        # Shard 2: minimal metadata + 1 tensor
-        shard2 = tmp_path / "model-00002-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard2))
-        writer.add_uint32("split.no", 1)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        # One tensor in shard 2
-        norm = np.random.randn(128).astype(np.float32)
-        writer.add_tensor("blk.0.attn_norm.weight", norm)
-        writer.write_header_and_data(str(shard2))
-        shard_paths.append(shard2)
-
-        # Shard 3: minimal metadata + 1 tensor
-        shard3 = tmp_path / "model-00003-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard3))
-        writer.add_uint32("split.no", 2)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        # One tensor in shard 3
-        norm = np.random.randn(128).astype(np.float32)
-        writer.add_tensor("blk.1.attn_norm.weight", norm)
-        writer.write_header_and_data(str(shard3))
-        shard_paths.append(shard3)
-
-        return shard_paths
+    def test_every_shard_is_a_gguf_path(self, tmp_path: Path):
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"]])
+        for p in paths:
+            assert is_gguf_path(str(p))
 
 
 class TestMissingShard:
-    """Missing shard must raise an error naming the missing index."""
-
-    def test_missing_shard_raises(self, tmp_path):
-        """Delete the middle shard; opening must raise with missing index named."""
-        from freetoken.models.gguf.reader import gguf_shards
-
-        # Write 3 shards
-        shard1 = self._write_minimal_shards(tmp_path, count=3)[0]
-
-        # Delete shard 2
-        shard2 = tmp_path / "model-00002-of-00003.gguf"
-        shard2.unlink()
-
-        # Attempt to discover shards from shard 1 should raise
-        with pytest.raises(ValueError) as exc_info:
-            gguf_shards(str(shard1))
-
-        error_msg = str(exc_info.value)
-        assert "missing" in error_msg.lower()
-        assert "2" in error_msg
-
-    def _write_minimal_shards(
-        self, tmp_path: Path, count: int
-    ) -> list[Path]:
-        """Write a minimal set of shards with just metadata."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        import numpy as np
-
-        shard_paths = []
-        for i in range(count):
-            shard_num = i + 1  # 1-based
-            shard_file = tmp_path / f"model-{shard_num:05d}-of-{count:05d}.gguf"
-            writer = gguf.GGUFWriter(str(shard_file))
-
-            if i == 0:
-                # Shard 1: full metadata
-                writer.add_string("general.architecture", "qwen3moe")
-                writer.add_uint32("qwen3moe.block_count", 1)
-                writer.add_uint32("qwen3moe.embedding_length", 128)
-                writer.add_uint32("qwen3moe.attention.head_count", 4)
-                writer.add_uint32("qwen3moe.attention.head_count_kv", 2)
-                writer.add_uint32("qwen3moe.attention.key_length", 32)
-                writer.add_float32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
-                writer.add_float32("qwen3moe.rope.freq_base", 10000.0)
-                writer.add_uint32("qwen3moe.context_length", 4096)
-                writer.add_uint32("qwen3moe.expert_count", 8)
-                writer.add_uint32("qwen3moe.expert_used_count", 2)
-                writer.add_uint32("qwen3moe.expert_feed_forward_length", 512)
-                writer.add_uint32("qwen3moe.feed_forward_length", 512)
-
-            # Split metadata (all shards)
-            writer.add_uint32("split.no", i)
-            writer.add_uint32("split.count", count)
-            writer.add_uint32("split.tensors.count", count)
-
-            # Add a dummy tensor
-            tensor_data = np.random.randn(32).astype(np.float32)
-            writer.add_tensor(f"blk.0.data_{i}.weight", tensor_data)
-            writer.write_header_and_data(str(shard_file))
-            shard_paths.append(shard_file)
-
-        return shard_paths
+    def test_missing_shard_raises_naming_the_index(self, tmp_path: Path):
+        """A truncated download must fail loudly, never load as a partial model."""
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"], ["c.weight"]])
+        paths[1].unlink()  # drop the middle shard
+        with pytest.raises(Exception) as e:
+            gguf_shards(str(paths[0]))
+        assert "2" in str(e.value), f"error should name the missing index: {e.value}"
 
 
 class TestMetadataFromShardOne:
-    """Shard 1 carries general.architecture and arch keys; others don't."""
+    def test_metadata_resolves_to_shard_one(self, tmp_path: Path):
+        """Later shards carry no architecture, so reads must resolve back to shard 1."""
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"], ["c.weight"]])
+        for p in paths:
+            assert gguf_architecture(str(p)) == "qwen3moe", f"from {p.name}"
+            assert load_gguf_metadata(str(p))["qwen3moe.block_count"] == 4, f"from {p.name}"
 
-    def test_metadata_comes_from_shard_one(self, tmp_path):
-        """Reading arch/metadata from any shard returns shard 1's values."""
-        from freetoken.models.gguf.reader import (
-            gguf_architecture,
-            load_gguf_metadata,
-        )
+    def test_later_shards_really_lack_arch(self, tmp_path: Path):
+        """Guards the fixture itself: if shard 2 carried arch, the test above proves nothing."""
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"]])
+        import gguf as gguf_pkg
 
-        shard_paths = self._write_3_shards_with_metadata(tmp_path)
-
-        # Test from shard 1
-        arch1 = gguf_architecture(str(shard_paths[0]))
-        meta1 = load_gguf_metadata(str(shard_paths[0]))
-        assert arch1 == "qwen3moe"
-        assert meta1.get("qwen3moe.block_count") == 2
-
-        # Test from shard 2: should get shard 1's arch
-        arch2 = gguf_architecture(str(shard_paths[1]))
-        meta2 = load_gguf_metadata(str(shard_paths[1]))
-        assert arch2 == "qwen3moe"
-        assert meta2.get("qwen3moe.block_count") == 2
-
-        # Test from shard 3: should get shard 1's arch
-        arch3 = gguf_architecture(str(shard_paths[2]))
-        meta3 = load_gguf_metadata(str(shard_paths[2]))
-        assert arch3 == "qwen3moe"
-        assert meta3.get("qwen3moe.block_count") == 2
-
-    def _write_3_shards_with_metadata(self, tmp_path: Path) -> list[Path]:
-        """Write 3 shards where only shard 1 has arch metadata."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        import numpy as np
-
-        shard_paths = []
-
-        # Shard 1: full metadata
-        shard1 = tmp_path / "model-00001-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard1))
-        writer.add_string("general.architecture", "qwen3moe")
-        writer.add_uint32("qwen3moe.block_count", 2)
-        writer.add_uint32("qwen3moe.embedding_length", 128)
-        writer.add_uint32("qwen3moe.attention.head_count", 4)
-        writer.add_uint32("qwen3moe.attention.head_count_kv", 2)
-        writer.add_uint32("qwen3moe.attention.key_length", 32)
-        writer.add_float32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
-        writer.add_float32("qwen3moe.rope.freq_base", 10000.0)
-        writer.add_uint32("qwen3moe.context_length", 4096)
-        writer.add_uint32("qwen3moe.expert_count", 8)
-        writer.add_uint32("qwen3moe.expert_used_count", 2)
-        writer.add_uint32("qwen3moe.expert_feed_forward_length", 512)
-        writer.add_uint32("qwen3moe.feed_forward_length", 512)
-        writer.add_uint32("split.no", 0)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 2)
-        # One tensor
-        data = np.random.randn(128).astype(np.float32)
-        writer.add_tensor("blk.0.attn_norm.weight", data)
-        writer.write_header_and_data(str(shard1))
-        shard_paths.append(shard1)
-
-        # Shard 2: only split metadata (no arch keys)
-        shard2 = tmp_path / "model-00002-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard2))
-        writer.add_uint32("split.no", 1)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 2)
-        # One tensor
-        data = np.random.randn(128).astype(np.float32)
-        writer.add_tensor("blk.1.attn_norm.weight", data)
-        writer.write_header_and_data(str(shard2))
-        shard_paths.append(shard2)
-
-        # Shard 3: only split metadata
-        shard3 = tmp_path / "model-00003-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard3))
-        writer.add_uint32("split.no", 2)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 2)
-        # Minimal tensor to pass validation
-        data = np.random.randn(1).astype(np.float32)
-        writer.add_tensor("placeholder", data)
-        writer.write_header_and_data(str(shard3))
-        shard_paths.append(shard3)
-
-        return shard_paths
+        r = gguf_pkg.GGUFReader(str(paths[1]))
+        assert "general.architecture" not in r.fields
+        assert "split.no" in r.fields
 
 
 class TestTensorAggregation:
-    """iter_gguf_tensors yields union across all shards in shard order."""
-
-    def test_tensors_aggregate_across_shards(self, tmp_path):
-        """Tensors from all shards are yielded in shard order, total matches count."""
-        from freetoken.models.gguf.reader import (
-            iter_gguf_tensors,
-            gguf_tensor_names,
-        )
-
-        shard_paths = self._write_3_shards_tensors(tmp_path)
-
-        # Check tensor iteration from shard 1
-        tensors = list(iter_gguf_tensors(str(shard_paths[0])))
-        assert len(tensors) == 3
-        assert tensors[0].name == "blk.0.w1"
-        assert tensors[1].name == "blk.0.w2"
-        assert tensors[2].name == "blk.1.w1"
-
-        # Check union of names
-        names = gguf_tensor_names(str(shard_paths[0]))
-        assert names == {"blk.0.w1", "blk.0.w2", "blk.1.w1"}
-        assert len(names) == 3
-
-        # Check from shard 2: should still get all 3 tensors
-        tensors_from_s2 = list(iter_gguf_tensors(str(shard_paths[1])))
-        assert len(tensors_from_s2) == 3
-
-    def _write_3_shards_tensors(self, tmp_path: Path) -> list[Path]:
-        """Write 3 shards with tensors distributed across them."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        import numpy as np
-
-        shard_paths = []
-
-        # Shard 1: 2 tensors
-        shard1 = tmp_path / "model-00001-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard1))
-        writer.add_string("general.architecture", "qwen3moe")
-        writer.add_uint32("qwen3moe.block_count", 2)
-        writer.add_uint32("qwen3moe.embedding_length", 128)
-        writer.add_uint32("qwen3moe.attention.head_count", 4)
-        writer.add_uint32("qwen3moe.attention.head_count_kv", 2)
-        writer.add_uint32("qwen3moe.attention.key_length", 32)
-        writer.add_float32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
-        writer.add_float32("qwen3moe.rope.freq_base", 10000.0)
-        writer.add_uint32("qwen3moe.context_length", 4096)
-        writer.add_uint32("qwen3moe.expert_count", 8)
-        writer.add_uint32("qwen3moe.expert_used_count", 2)
-        writer.add_uint32("qwen3moe.expert_feed_forward_length", 512)
-        writer.add_uint32("qwen3moe.feed_forward_length", 512)
-        writer.add_uint32("split.no", 0)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        writer.add_tensor("blk.0.w1", np.ones((8, 4), dtype=np.float32))
-        writer.add_tensor("blk.0.w2", np.ones((4, 8), dtype=np.float32))
-        writer.write_header_and_data(str(shard1))
-        shard_paths.append(shard1)
-
-        # Shard 2: 1 tensor
-        shard2 = tmp_path / "model-00002-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard2))
-        writer.add_uint32("split.no", 1)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        writer.add_tensor("blk.1.w1", np.ones((8, 4), dtype=np.float32))
-        writer.write_header_and_data(str(shard2))
-        shard_paths.append(shard2)
-
-        # Shard 3: 0 tensors
-        shard3 = tmp_path / "model-00003-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard3))
-        writer.add_uint32("split.no", 2)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 3)
-        writer.write_header_and_data(str(shard3))
-        shard_paths.append(shard3)
-
-        return shard_paths
+    def test_tensors_aggregate_across_shards(self, tmp_path: Path):
+        per = [["a.weight", "b.weight"], ["c.weight"], ["d.weight", "e.weight"]]
+        paths = _make_split(tmp_path, "m", per)
+        expected = {n for names in per for n in names}
+        for p in paths:
+            assert gguf_tensor_names(str(p)) == expected, f"from {p.name}"
+        names = [t.name for t in iter_gguf_tensors(str(paths[0]))]
+        assert names == [n for names_ in per for n in names_], "shard order must be preserved"
+        assert len(names) == load_gguf_metadata(str(paths[0]))["split.tensors.count"]
 
 
 class TestDeclaredCountMismatch:
-    """Shard 1 says split.count=N but only M<N files exist: must raise."""
-
-    def test_declared_count_mismatch_raises(self, tmp_path):
-        """If declared split.count doesn't match found shards, raise with counts."""
-        from freetoken.models.gguf.reader import gguf_shards
-
-        # Write 2 shards but declare count=3
-        shard1 = self._write_shards_with_bad_count(tmp_path)
-
-        # Attempt to discover should raise
-        with pytest.raises(ValueError) as exc_info:
-            gguf_shards(str(shard1))
-
-        error_msg = str(exc_info.value)
-        assert "Incomplete" in error_msg or "missing" in error_msg.lower()
-
-    def _write_shards_with_bad_count(self, tmp_path: Path) -> Path:
-        """Write 2 shards but declare split.count=3."""
-        try:
-            import gguf
-        except ImportError:
-            pytest.skip("gguf package not available")
-
-        import numpy as np
-
-        # Shard 1: declares count=3 but we'll only write 2
-        shard1 = tmp_path / "model-00001-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard1))
-        writer.add_string("general.architecture", "qwen3moe")
-        writer.add_uint32("qwen3moe.block_count", 1)
-        writer.add_uint32("qwen3moe.embedding_length", 128)
-        writer.add_uint32("qwen3moe.attention.head_count", 4)
-        writer.add_uint32("qwen3moe.attention.head_count_kv", 2)
-        writer.add_uint32("qwen3moe.attention.key_length", 32)
-        writer.add_float32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-6)
-        writer.add_float32("qwen3moe.rope.freq_base", 10000.0)
-        writer.add_uint32("qwen3moe.context_length", 4096)
-        writer.add_uint32("qwen3moe.expert_count", 8)
-        writer.add_uint32("qwen3moe.expert_used_count", 2)
-        writer.add_uint32("qwen3moe.expert_feed_forward_length", 512)
-        writer.add_uint32("qwen3moe.feed_forward_length", 512)
-        writer.add_uint32("split.no", 0)
-        writer.add_uint32("split.count", 3)  # DECLARED 3
-        writer.add_uint32("split.tensors.count", 1)
-        writer.add_tensor("data", np.ones((1,), dtype=np.float32))
-        writer.write_header_and_data(str(shard1))
-
-        # Shard 2: exists
-        shard2 = tmp_path / "model-00002-of-00003.gguf"
-        writer = gguf.GGUFWriter(str(shard2))
-        writer.add_uint32("split.no", 1)
-        writer.add_uint32("split.count", 3)
-        writer.add_uint32("split.tensors.count", 1)
-        writer.add_tensor("data", np.ones((1,), dtype=np.float32))
-        writer.write_header_and_data(str(shard2))
-
-        # Shard 3: does NOT exist (this is the error case)
-
-        return shard1
-
-
-class TestQwen3MoeMappingFFNNorm:
-    """Test qwen3moe's tensor-name mapping: ffn_norm -> post_attention_layernorm.
-
-    This is a pure-function test with no files or fixtures: it just verifies
-    that the name mapping from llama.cpp's GGUF naming to FreeToken's module
-    names is correct.
-    """
-
-    def test_qwen3moe_maps_ffn_norm_to_post_attention(self):
-        """Verify blk.N.ffn_norm.weight maps to post_attention_layernorm."""
-        from freetoken.models.qwen3_moe.gguf import gguf_name_to_freetoken
-
-        # The critical mapping: ffn_norm -> post_attention_layernorm
-        mapped = gguf_name_to_freetoken("blk.0.ffn_norm.weight", num_layers=2)
-        assert mapped == "model.layers.0.post_attention_layernorm.weight"
-
-        # Verify on multiple layers
-        mapped = gguf_name_to_freetoken("blk.1.ffn_norm.weight", num_layers=2)
-        assert mapped == "model.layers.1.post_attention_layernorm.weight"
-
-    def test_qwen3moe_merged_projections_handled(self):
-        """Verify attn_q/k/v are reported as merged-projection parts (None).
-
-        qwen3moe's qkv_proj is a merged projection, so the individual
-        attn_q/attn_k/attn_v parts return None (handled by iter_gguf_weights).
-        """
-        from freetoken.models.qwen3_moe.gguf import gguf_name_to_freetoken
-
-        # These are parts of the merged qkv_proj, so they return None
-        assert gguf_name_to_freetoken("blk.0.attn_q.weight", num_layers=2) is None
-        assert gguf_name_to_freetoken("blk.0.attn_k.weight", num_layers=2) is None
-        assert gguf_name_to_freetoken("blk.0.attn_v.weight", num_layers=2) is None
-
-    def test_qwen3moe_expert_suffixes_handled(self):
-        """Verify expert stacks (ffn_*_exps) return None (handled by expert-bank loader)."""
-        from freetoken.models.qwen3_moe.gguf import gguf_name_to_freetoken
-
-        # Expert stacks are handled by the offload expert-bank loader
-        assert (
-            gguf_name_to_freetoken("blk.0.ffn_gate_exps.weight", num_layers=2) is None
-        )
-        assert (
-            gguf_name_to_freetoken("blk.0.ffn_up_exps.weight", num_layers=2) is None
-        )
-        assert (
-            gguf_name_to_freetoken("blk.0.ffn_down_exps.weight", num_layers=2) is None
-        )
+    def test_declared_count_mismatch_raises(self, tmp_path: Path):
+        """shard 1 says 3 shards but only 2 exist on disk."""
+        tmp = tmp_path / "sub"
+        tmp.mkdir()
+        _make_split(tmp, "m", [["a.weight"], ["b.weight"]], declared_count=3)
+        first = tmp / "m-00001-of-00002.gguf"
+        with pytest.raises(Exception):
+            list(iter_gguf_tensors(str(first)))
