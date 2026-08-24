@@ -89,6 +89,9 @@ _BANK_BYTES_PER_EXPERT = {
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+    # Upper bound for the mixed Poolside artifact.  Its early layers are groupwise
+    # INT4, while ignored tail layers are BF16 and therefore determine slot-cache size.
+    "laguna_int4": lambda H, I: 3 * I * H * 2,
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
@@ -249,6 +252,11 @@ class OffloadMoeCache:
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
+        self._copy_feat_bytes_by_layer: list[torch.Tensor] | None = None
+        self._copy_dst_strides: torch.Tensor | None = None
+        self._copy_src_strides: list[torch.Tensor] | None = None
+        self._variable_bank_rows: set[str] = set()
+        self._bank_cache_shapes: dict[str, tuple[int, ...]] = {}
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -321,20 +329,35 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self._variable_bank_rows.clear()
+        self._bank_cache_shapes.clear()
+        self.bank_sources.clear()
+        self.bank_caches.clear()
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
+            dtype = head.dtype
+            row_numels = []
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
-                    name, layer_id, source.shape, source.dtype,
-                )
+                assert source.dtype == dtype, (name, layer_id, source.dtype, dtype)
+                row_numels.append(math.prod(source.shape[1:]))
             self.bank_sources[name] = list(per_layer)
+            if len(set(row_numels)) == 1:
+                cache_tail = tuple(head.shape[1:])
+            else:
+                # Mixed-precision layers have different compact payload sizes.  The GPU
+                # slot uses the largest flat row; each source occupies only its prefix.
+                self._variable_bank_rows.add(name)
+                cache_tail = (max(row_numels),)
+                if dtype is not torch.uint8:
+                    raise ValueError("variable-size expert rows must use flat uint8 storage")
+            self._bank_cache_shapes[name] = cache_tail
             self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
+                (self.cache_size, *cache_tail),
+                dtype=dtype,
                 device=self.device,
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -354,50 +377,73 @@ class OffloadMoeCache:
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._copy_feat_bytes_by_layer = None
+        self._copy_dst_strides = None
+        self._copy_src_strides = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
+        self._copy_feat_bytes_by_layer_host: list[list[int]] = []
+        self._copy_dst_strides_host: list[int] = []
+        self._copy_src_strides_host: list[list[int]] = []
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
-        if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
+        if (not _FUSED_COPY and not self._variable_bank_rows) or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
 
-        dst_ptrs, feats = [], []
+        dst_ptrs, dst_strides = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
+        layer_src_strides = [[] for _ in range(self.num_layers)]
+        layer_feats = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
-            if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
+            dst_stride = math.prod(cache.shape[1:]) * cache.element_size()
+            if dst_stride % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
+                src_stride = math.prod(source.shape[1:]) * source.element_size()
+                if src_stride % 16 != 0:
+                    return
                 if layer_id in self._unpinned_layers:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
-                    continue
-                # The kernel dereferences these on the GPU, so store each host bank's
-                # device alias (== data_ptr() under UVA identity; differs on
-                # Windows/WDDM).
-                src_dev = device_ptr(source)
-                if src_dev % 16 != 0:
-                    return
-                layer_src_ptrs[layer_id].append(src_dev)
+                else:
+                    # The kernel dereferences these on the GPU, so store each host bank's
+                    # device alias (== data_ptr() under UVA identity; differs on WDDM).
+                    src_dev = device_ptr(source)
+                    if src_dev % 16 != 0:
+                        return
+                    layer_src_ptrs[layer_id].append(src_dev)
+                layer_src_strides[layer_id].append(src_stride)
+                layer_feats[layer_id].append(src_stride)
             dst_ptrs.append(cache.data_ptr())
-            feats.append(feat)
+            dst_strides.append(dst_stride)
         self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
         self._copy_src_ptrs = [
             torch.tensor(ptrs, dtype=torch.int64, device=self.device)
             for ptrs in layer_src_ptrs
         ]
-        self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+        self._copy_src_strides = [
+            torch.tensor(v, dtype=torch.int64, device=self.device) for v in layer_src_strides
+        ]
+        self._copy_feat_bytes_by_layer = [
+            torch.tensor(v, dtype=torch.int64, device=self.device) for v in layer_feats
+        ]
+        self._copy_dst_strides = torch.tensor(dst_strides, dtype=torch.int64, device=self.device)
+        # Full cache-row sizes are used only for cache-to-cache hit gathers.
+        self._copy_feat_bytes = self._copy_dst_strides.clone()
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
-        self._copy_feat_bytes_host = feats
+        self._copy_feat_bytes_host = dst_strides
+        self._copy_feat_bytes_by_layer_host = layer_feats
+        self._copy_dst_strides_host = dst_strides
+        self._copy_src_strides_host = layer_src_strides
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
-        self._gather_bank_ids = [i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES]
-        if len(self._gather_bank_ids) == len(feats):
+        self._gather_bank_ids = [i for i, f in enumerate(dst_strides) if f >= _SMALL_BANK_FEAT_BYTES]
+        if len(self._gather_bank_ids) == len(dst_strides):
             self._gather_dst_ptrs = self._copy_dst_ptrs
             self._gather_feat_bytes = self._copy_feat_bytes
         elif self._gather_bank_ids:
@@ -453,7 +499,7 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
             self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+                (cache_size, *self._bank_cache_shapes[name]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
@@ -643,8 +689,15 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            for name, (per_layer, _), buffer in zip(
+                self.bank_schema, self.banks, self.prefill_bank_buffers
+            ):
+                src = per_layer[layer_id]
+                dst = buffer[buffer_id]
+                if name in self._variable_bank_rows:
+                    dst[:, : src.shape[1]].copy_(src, non_blocking=True)
+                else:
+                    dst.copy_(src, non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -754,18 +807,34 @@ class OffloadMoeCache:
                 starts = miss[run_starts]
                 lengths = np.diff(np.concatenate((run_starts, [miss.size])))
             dst, src, nbytes = [], [], []
-            for b, feat in enumerate(self._copy_feat_bytes_host):
-                if feat < _SMALL_BANK_FEAT_BYTES:
+            layer_feats = self._copy_feat_bytes_by_layer_host[layer_id]
+            src_strides = self._copy_src_strides_host[layer_id]
+            for b, feat in enumerate(layer_feats):
+                dst_stride = self._copy_dst_strides_host[b]
+                src_stride = src_strides[b]
+                if feat < _SMALL_BANK_FEAT_BYTES and feat == dst_stride == src_stride:
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
                     # rows the gather skips for these banks.
-                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
+                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * dst_stride)
                     src.append(self._copy_src_ptrs_host[layer_id][b])
                     nbytes.append(E * feat)
                 elif miss.size:
-                    dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
-                    src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
-                    nbytes.extend(lengths * feat)
+                    if feat == dst_stride == src_stride:
+                        dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * dst_stride)
+                        src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * src_stride)
+                        nbytes.extend(lengths * feat)
+                    else:
+                        for expert in miss:
+                            dst.append(
+                                self._copy_dst_ptrs_host[b]
+                                + (buffer_id * E + int(expert)) * dst_stride
+                            )
+                            src.append(
+                                self._copy_src_ptrs_host[layer_id][b]
+                                + int(expert) * src_stride
+                            )
+                            nbytes.append(feat)
             if dst:
                 self._batch_memcpy(
                     torch.tensor(dst, dtype=torch.int64),
@@ -982,28 +1051,51 @@ class OffloadMoeCache:
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+                source = per_layer[layer_id]
+                if source.shape[1:] == cache.shape[1:]:
+                    cache[: self.num_experts].copy_(source)
+                else:
+                    cache[: self.num_experts, : source.shape[1]].copy_(source)
             return
         if self._copy_fused_ok:
-            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+            from freetoken.kernel.fast_index_copy import (
+                fast_index_copy_multi_jit,
+                fast_index_copy_multi_strided_jit,
+            )
 
             # One launch copies the missing rows for every bank (instead of one launch per
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
-            fast_index_copy_multi_jit(
-                self._copy_dst_ptrs,
-                self._copy_src_ptrs[layer_id],
-                self._copy_feat_bytes,
-                self.evict_slots,
-                self.src_indices,
-                self.num_indices,
-            )
+            if self._variable_bank_rows:
+                fast_index_copy_multi_strided_jit(
+                    self._copy_dst_ptrs,
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_feat_bytes_by_layer[layer_id],
+                    self._copy_dst_strides,
+                    self._copy_src_strides[layer_id],
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                )
+            else:
+                fast_index_copy_multi_jit(
+                    self._copy_dst_ptrs,
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_feat_bytes,
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                )
             return
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for per_layer, cache in self.banks:
+        for name, (per_layer, cache) in zip(self.bank_schema, self.banks):
+            if name in self._variable_bank_rows:
+                raise RuntimeError(
+                    "variable-size expert banks require the fused strided copy kernel"
+                )
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,

@@ -21,6 +21,7 @@ import os
 import threading
 import time
 import weakref
+from types import SimpleNamespace
 
 import torch
 
@@ -156,6 +157,7 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
+        flag_sync: bool | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -198,7 +200,8 @@ class CpuMoeExecutor:
         # probe): its coordinator needs a core of its own, which the auto thread sizing
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
-        self._flag_sync = _FLAG_SYNC and device.type == "cuda"
+        use_flag_sync = _FLAG_SYNC if flag_sync is None else flag_sync
+        self._flag_sync = use_flag_sync and device.type == "cuda"
         self._cpu_moe = _cpu_moe  # module ref for the decode-path memop calls
         if self._flag_sync:
             probe_scratch = alloc_pinned_tensor(1, dtype=torch.int64)
@@ -653,6 +656,136 @@ class CpuMoeExecutor:
                 "engine, or set FREETOKEN_CPU_MOE_FLAG_SYNC=0 to use the "
                 "cudaLaunchHostFunc sync."
             )
+
+
+class MixedGgufCpuMoeExecutor:
+    """CPU dispatcher for Laguna's per-layer Q4_0/BF16 expert banks.
+
+    The native extension has one weight format per executor. Build one executor
+    for each format over zero-copy views of the same host banks, then route each
+    layer to the matching pool. Placeholder pointer-table entries are never run.
+    """
+
+    def __init__(
+        self,
+        cache,
+        *,
+        top_k: int,
+        activation: str,
+        apply_router_weight_on_input: bool,
+        num_threads: int,
+        max_tokens: int,
+        device: torch.device,
+        swiglu_alpha: float = 1.702,
+        swiglu_limit: float | None = None,
+    ) -> None:
+        from freetoken.models.gguf.dequant import GGML_BF16, GGML_Q4_0, row_bytes
+
+        types = getattr(cache, "gguf_expert_types", None)
+        if not types or len(types) != cache.num_layers:
+            raise ValueError("mixed GGUF CPU decode requires per-layer expert types")
+        if any(gu != dn or gu not in (GGML_Q4_0, GGML_BF16) for gu, dn in types):
+            raise NotImplementedError(
+                "mixed GGUF CPU decode currently supports only Laguna Q4_0/BF16 layers"
+            )
+
+        num_experts = cache.num_experts
+        hidden = int(cache.expert_hidden_size)
+        intermediate = int(cache.expert_intermediate_size)
+        raw_gu = cache.bank_sources["gate_up"]
+        raw_dn = cache.bank_sources["down"]
+
+        q4_layers = [i for i, (gu, _) in enumerate(types) if gu == GGML_Q4_0]
+        bf16_layers = [i for i, (gu, _) in enumerate(types) if gu == GGML_BF16]
+        if not q4_layers or not bf16_layers:
+            raise ValueError("mixed GGUF executor requires both Q4_0 and BF16 layers")
+
+        q4_gu = {
+            i: raw_gu[i].view(
+                num_experts,
+                2 * intermediate,
+                row_bytes(hidden, GGML_Q4_0),
+            )
+            for i in q4_layers
+        }
+        q4_dn = {
+            i: raw_dn[i].view(
+                num_experts,
+                hidden,
+                row_bytes(intermediate, GGML_Q4_0),
+            )
+            for i in q4_layers
+        }
+        bf16_gu = {
+            i: raw_gu[i].view(torch.bfloat16).view(
+                num_experts, 2 * intermediate, hidden
+            )
+            for i in bf16_layers
+        }
+        bf16_dn = {
+            i: raw_dn[i].view(torch.bfloat16).view(
+                num_experts, hidden, intermediate
+            )
+            for i in bf16_layers
+        }
+
+        def proxy(fmt: str, gate_up: dict, down: dict, reference: int):
+            return SimpleNamespace(
+                quant_format=fmt,
+                bank_sources={
+                    "gate_up": [
+                        gate_up.get(i, gate_up[reference])
+                        for i in range(cache.num_layers)
+                    ],
+                    "down": [
+                        down.get(i, down[reference])
+                        for i in range(cache.num_layers)
+                    ],
+                },
+                num_layers=cache.num_layers,
+                num_experts=num_experts,
+            )
+
+        common = dict(
+            top_k=top_k,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            num_threads=num_threads,
+            max_tokens=max_tokens,
+            device=device,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            # Two busy-poll coordinators would contend for one reserved core. The
+            # host-function path is graph-capturable and only used on CPU layers.
+            flag_sync=False,
+        )
+        self._by_type = {
+            GGML_Q4_0: CpuMoeExecutor(
+                proxy("q4_0", q4_gu, q4_dn, q4_layers[0]), **common
+            ),
+            GGML_BF16: CpuMoeExecutor(
+                proxy("bf16", bf16_gu, bf16_dn, bf16_layers[0]), **common
+            ),
+        }
+        self._layer_types = tuple(gu for gu, _ in types)
+
+    def _executor(self, layer_id: int) -> CpuMoeExecutor:
+        return self._by_type[self._layer_types[layer_id]]
+
+    def decode(self, layer_id: int, *args):
+        return self._executor(layer_id).decode(layer_id, *args)
+
+    def decode_submit(self, layer_id: int, *args) -> tuple:
+        executor = self._executor(layer_id)
+        return executor, executor.decode_submit(layer_id, *args)
+
+    def decode_sync(self, pending: tuple) -> torch.Tensor:
+        executor, inner = pending
+        return executor.decode_sync(inner)
+
+    def raise_if_unhealthy(self) -> None:
+        for executor in self._by_type.values():
+            executor.raise_if_unhealthy()
 
 
 def _watchdog_main(executor_ref) -> None:

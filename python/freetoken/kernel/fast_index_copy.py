@@ -185,6 +185,50 @@ def fast_index_copy_multi_jit(
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
 
 
+@lru_cache(maxsize=None)
+def _jit_fast_index_copy_multi_strided_module(
+    *, num_threads: int, blocks_per_bank: int
+) -> Module:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+    return load_jit(
+        "fast_index_copy_multi_strided",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[("launch", f"&MultiIndexCopyStridedKernel<{args}>::run")],
+    )
+
+
+def fast_index_copy_multi_strided_jit(
+    dst_ptrs: torch.Tensor,
+    src_ptrs: torch.Tensor,
+    feat_bytes: torch.Tensor,
+    dst_strides: torch.Tensor,
+    src_strides: torch.Tensor,
+    dst_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    num_indices: torch.Tensor | None = None,
+    *,
+    num_threads: int = 1024,
+    blocks_per_bank: int = 8,
+) -> None:
+    """Fused index copy where compact source rows occupy a larger cache-row prefix."""
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_copy_multi_strided_module(
+        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    module.launch(
+        dst_ptrs,
+        src_ptrs,
+        feat_bytes,
+        dst_strides,
+        src_strides,
+        dst_indices,
+        src_indices,
+        num_indices,
+    )
+
+
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:
     assert sync_flag.is_cuda
     assert sync_flag.numel() == 1

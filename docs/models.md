@@ -1,7 +1,7 @@
 # Supported models
 
 FreeToken loads HF safetensors checkpoints directly (plus native GGUF for
-Gemma-4). The checkpoints below are known-good — the prebuilt kernels are tuned
+Gemma-4 and Laguna). The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
@@ -14,6 +14,7 @@ for them; other checkpoints of the same architectures work too.
 | Qwen3-MoE | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
 | gpt-oss | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) |
 | Gemma-4 | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
+| Poolside Laguna-S 2.1 | compressed-tensors INT4 safetensors (including its BF16 expert tail), native GGUF |
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 
@@ -38,3 +39,11 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Multimodal checkpoints are served text-only.
+- Laguna-S INT4 needs the `offload` backend. On WSL, FreeToken automatically
+  keeps enough layers on CPU when the mixed INT4/BF16 banks exceed the CUDA
+  pinned-memory budget.
+- A single-session 200K Laguna configuration on a 16 GB GPU should reserve the
+  minimum 256 expert slots, use INT4 KV, and keep the SWA pool near its working-set
+  floor: `--max-running-requests 1 --max-seq-len-override 200000 --num-tokens 200000
+  --kv-cache-dtype int4 --moe-cache-size 256 --disable-moe-prefill-overlap
+  --swa-full-tokens-ratio 0.006 --memory-ratio 0.95`.

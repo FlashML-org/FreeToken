@@ -14,7 +14,7 @@ import torch
 import gguf
 
 import freetoken.distributed.info as di
-from freetoken.models.gguf.dequant import GGML_Q8_0, row_bytes
+from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, dequantize, row_bytes
 
 # Tiny geometry: 4 layers (full at 0), heads 4 full / 6 swa, kv 2, head_dim 32.
 L, H, FF = 4, 64, 96
@@ -202,3 +202,63 @@ def test_deferred_materialization(tiny_gguf):
     mod.materialize(GGML_Q8_0)
     assert mod.qweight.shape == (6 * HD, row_bytes(H, GGML_Q8_0))
     assert cfg.gguf_model_path == tiny_gguf
+
+
+def test_compressed_tensors_int4_repack_is_bit_faithful():
+    from freetoken.models.laguna.weight import _ct_int4_to_q4_0
+
+    torch.manual_seed(4)
+    rows, groups = 5, 3
+    q = torch.randint(-8, 8, (rows, groups, 32), dtype=torch.int32)
+    unsigned = q + 8
+    words = torch.zeros((rows, groups, 4), dtype=torch.int32)
+    for word in range(4):
+        for nibble in range(8):
+            words[..., word] |= unsigned[..., word * 8 + nibble] << (4 * nibble)
+    packed = words.reshape(rows, groups * 4)
+    scales = torch.randn(rows, groups).abs().add_(0.01).to(torch.bfloat16)
+
+    got = _ct_int4_to_q4_0(packed, scales)
+    assert got.shape == (rows, groups * 18)
+    decoded = dequantize(got.reshape(-1), GGML_Q4_0, torch.float32).reshape(
+        rows, groups, 32
+    )
+    expected = q.float() * scales.to(torch.float16).float().unsqueeze(-1)
+    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
+
+
+def test_safetensors_dense_weight_mapping(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    from freetoken.models.laguna.weight import iter_weights
+
+    tensors = {
+        "model.embed_tokens.weight": torch.randn(8, 4, dtype=torch.bfloat16),
+        "model.layers.0.post_attention_layernorm.weight": torch.randn(4),
+        "model.layers.0.self_attn.g_proj.weight": torch.randn(2, 4),
+        "model.layers.0.mlp.gate_proj.weight": torch.randn(3, 4),
+        "model.layers.0.mlp.up_proj.weight": torch.randn(3, 4),
+        "model.layers.1.mlp.shared_expert.gate_proj.weight": torch.randn(2, 4),
+        "model.layers.1.mlp.shared_expert.up_proj.weight": torch.randn(2, 4),
+        "model.layers.1.mlp.gate.weight": torch.randn(2, 4, dtype=torch.bfloat16),
+        "model.layers.1.mlp.experts.e_score_correction_bias": torch.randn(2),
+        "model.layers.1.mlp.experts.0.gate_proj.weight_packed": torch.zeros(
+            2, 2, dtype=torch.int32
+        ),
+    }
+    safetensors.save_file(tensors, tmp_path / "model.safetensors")
+    got = dict(
+        iter_weights(
+            str(tmp_path),
+            torch.device("cpu"),
+            include_moe_experts=False,
+            include_non_moe=True,
+        )
+    )
+
+    assert "model.layers.0.self_attn.gate_proj.weight" in got
+    assert "model.layers.0.ffn_norm.weight" in got
+    assert got["model.layers.0.mlp.gate_up_proj.weight"].shape == (6, 4)
+    assert got["model.layers.1.mlp.shared_experts.gate_up_proj.weight"].shape == (4, 4)
+    assert got["model.layers.1.mlp.gate.weight"].dtype == torch.float32
+    assert "model.layers.1.mlp.e_score_correction_bias" in got
+    assert not any("weight_packed" in name for name in got)

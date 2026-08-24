@@ -110,6 +110,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _positive_ratio(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0 < ratio <= 1:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return ratio
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -384,6 +393,18 @@ def parse_args(
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="KV cache strategy (naive | radix). For hybrid GDN models 'radix' is materialized "
         "as a GDN-aware radix (cross-request GDN-state prefix reuse); pass 'naive' to opt out.",
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_positive_ratio,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Sliding-window KV-pool size as a fraction of the full-attention KV token "
+            "capacity. The runtime concurrency/window floor still applies. Lower values "
+            "leave more VRAM for long-context full-attention KV; effective only for "
+            "sliding-window models with radix caching."
+        ),
     )
 
     parser.add_argument(

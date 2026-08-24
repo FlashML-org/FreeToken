@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import platform
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -650,6 +651,11 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
+            # Per-layer mixed GGUF geometry is also consumed by Laguna's split
+            # Q4_0/BF16 CPU executor when WSL cannot pin every expert layer.
+            cache.gguf_expert_types = config.model_config.gguf_expert_types
+            cache.expert_hidden_size = config.model_config.hidden_size
+            cache.expert_intermediate_size = config.model_config.moe_intermediate_size
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
@@ -711,7 +717,10 @@ class Engine:
         must be stable for the captured nodes. Buffers/tasks themselves are
         allocated lazily on the first (eager) forward at each batch size.
         """
-        from freetoken.moe.cpu_executor import CpuMoeExecutor
+        from freetoken.moe.cpu_executor import (
+            CpuMoeExecutor,
+            MixedGgufCpuMoeExecutor,
+        )
 
         sample = layers[0]
         required = ("top_k", "activation", "apply_router_weight_on_input")
@@ -724,7 +733,12 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
-        executor = CpuMoeExecutor(
+        executor_cls = (
+            MixedGgufCpuMoeExecutor
+            if cache.quant_format == "gguf"
+            else CpuMoeExecutor
+        )
+        executor = executor_cls(
             cache,
             top_k=sample.top_k,
             activation=sample.activation,
@@ -1049,6 +1063,13 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
+    # PyTorch 2.11 + CUDA 13 currently accepts this allocator setting under WSL but the
+    # first CUDA allocation then fails with ``CUDA driver error: unknown error``.  Keep
+    # WSL on the native caching allocator until the driver/runtime combination supports
+    # expandable segments reliably.
+    if os.environ.get("WSL_DISTRO_NAME") or "microsoft" in platform.release().lower():
+        logger.info_rank0("WSL detected; using the native CUDA caching allocator")
+        return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
@@ -1181,7 +1202,7 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return fmt == "mxfp4" or fmt in _WFMT_IDS
+    return fmt in ("mxfp4", "laguna_int4") or fmt in _WFMT_IDS
 
 
 def _pin_budget_bytes() -> int | None:
@@ -1465,6 +1486,18 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_size", 0)
             override("moe_cache_rate", None)
             override("moe_cache_auto", False)
+
+    if (
+        is_moe
+        and config.moe_backend == "cpu"
+        and expert_quant == "laguna_int4"
+    ):
+        raise ValueError(
+            "Laguna INT4/BF16 needs --moe-backend offload (or auto); the all-CPU "
+            "backend reserves a two-layer BF16-sized prefill cache that does not fit "
+            "on typical 16 GiB GPUs. Offload automatically assigns enough layers to "
+            "CPU decode under WSL's pin budget."
+        )
 
     if is_moe and config.moe_backend == "cpu":
         # CPU-compute decode keeps experts in host RAM and computes them on the CPU;

@@ -274,6 +274,48 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _laguna_int4_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel=False,
+    workers=8,
+    chunk=_PARALLEL_CHUNK,
+    decode_target="gpu",
+    layer_sink=None,
+) -> ExpertBanks:
+    """Poolside compressed-tensors INT4 plus its intentionally BF16 tail layers.
+
+    INT4 tensors are losslessly nibble-reordered into Q4_0 blocks (the bf16 group
+    scale is rounded to fp16); ignored BF16 expert layers remain BF16.  The shared
+    ``gguf`` execution format understands both per-layer types and variable payloads.
+    """
+    if parallel:
+        raise NotImplementedError("parallel expert reader is not implemented for Laguna INT4")
+    if decode_target not in ("gpu", "cpu"):
+        raise NotImplementedError(
+            "Laguna compressed INT4 experts support GPU offload and split CPU decode only"
+        )
+    from freetoken.models.laguna.weight import (
+        dummy_int4_expert_sources,
+        load_int4_expert_sources,
+    )
+
+    sink = None if dummy else layer_sink
+    sources = (
+        dummy_int4_expert_sources(model_config)
+        if dummy
+        else load_int4_expert_sources(model_path, model_config, layer_sink=sink)
+    )
+    return ExpertBanks(
+        "gguf",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf"]},
+        streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -324,6 +366,7 @@ _PROVIDERS = {
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
     "gguf": _gguf_banks,
+    "laguna_int4": _laguna_int4_banks,
 }
 
 
@@ -423,6 +466,24 @@ def bank_bytes_estimate(model_config) -> int | None:
     experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
+    if fmt == "laguna_int4" and all((experts, hidden, inter)):
+        from freetoken.models.gguf.dequant import GGML_BF16, GGML_Q4_0, row_bytes
+
+        types = getattr(model_config, "gguf_expert_types", None)
+        if types:
+
+            def projection_bytes(qtype: int, rows: int, cols: int) -> int:
+                if qtype == GGML_Q4_0:
+                    return rows * row_bytes(cols, qtype)
+                if qtype == GGML_BF16:
+                    return rows * cols * 2
+                raise ValueError(f"unsupported Laguna expert type {qtype}")
+
+            return experts * sum(
+                projection_bytes(gu, 2 * inter, hidden)
+                + projection_bytes(dn, hidden, inter)
+                for gu, dn in types
+            )
     if per_expert is None or not all((layers, experts, hidden, inter)):
         return None
     return layers * experts * per_expert(hidden, inter)

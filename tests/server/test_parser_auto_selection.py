@@ -30,6 +30,8 @@ ANON_PATH = "/models/anon"
 # Families with no thinking format of their own. Everything else must resolve to a real reasoning
 # parser, and a new architecture landing here is the bug this file exists to catch.
 NO_REASONING_FORMAT = {
+    "LagunaForCausalLM",
+    "LagunaGGUFForCausalLM",
     "LlamaForCausalLM",
     "MistralForCausalLM",
     "Mistral3ForConditionalGeneration",
@@ -38,7 +40,11 @@ NO_REASONING_FORMAT = {
 
 # `llama3` is the end of the cascade -- the answer when nothing matched.
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
-NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM"}
+NO_DEDICATED_TOOL_FORMAT = {
+    "LagunaForCausalLM",
+    "LagunaGGUFForCausalLM",
+    "LlamaForCausalLM",
+}
 
 
 class _Config:
@@ -94,3 +100,18 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_swa_full_tokens_ratio_cli_surface():
+    config = _Config({"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            ["--model", ANON_PATH, "--swa-full-tokens-ratio", "0.006"]
+        )
+    assert args.swa_full_tokens_ratio == pytest.approx(0.006)
+
+
+@pytest.mark.parametrize("ratio", ["0", "-0.1", "1.1", "not-a-number"])
+def test_swa_full_tokens_ratio_rejects_invalid_values(ratio):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", ANON_PATH, "--swa-full-tokens-ratio", ratio])

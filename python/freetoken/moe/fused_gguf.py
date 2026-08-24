@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+from freetoken.models.gguf.dequant import GGML_BF16
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
@@ -71,6 +72,40 @@ def fused_experts_gguf(
     num_tokens = hidden_states.shape[0]
     top_k = topk_ids.shape[1]
     assert gate_up_q.dim() == 2 and down_q.dim() == 2, "gguf banks are flat padded slots"
+
+    # Safetensors Laguna-S keeps its last expert layers in BF16.  Variable-size
+    # cache rows place the real payload at the start of each padded slot, so expose
+    # that prefix as ordinary dense expert tensors and reuse the native BF16 MoE.
+    if gate_up_type == down_type == GGML_BF16:
+        from freetoken.moe.fused import fused_experts_impl
+
+        hidden = hidden_states.shape[-1]
+        intermediate = gate_up_rows // 2
+        gu_elems = gate_up_rows * hidden
+        dn_elems = down_rows * intermediate
+        # The leading payload is contiguous within each slot, while the slot-to-slot
+        # stride includes padding for the largest layer. ``view`` preserves that outer
+        # stride, giving the dense kernel an exact zero-copy 3-D view.
+        gate_up = gate_up_q[:, : gu_elems * 2].view(torch.bfloat16).view(
+            gate_up_q.shape[0], gate_up_rows, hidden
+        )
+        down = down_q[:, : dn_elems * 2].view(torch.bfloat16).view(
+            down_q.shape[0], down_rows, intermediate
+        )
+        return fused_experts_impl(
+            # fused_experts_impl writes its input in place. Laguna evaluates the
+            # shared expert afterwards from the original hidden states, so preserve
+            # that input just as the quantized path does.
+            hidden_states.clone(),
+            gate_up,
+            down,
+            topk_weights,
+            topk_ids,
+            activation,
+            False,
+        )
+    if gate_up_type == GGML_BF16 or down_type == GGML_BF16:
+        raise ValueError("mixed BF16/quantized projections within one expert layer are unsupported")
 
     gate_up = _moe_vec_chunked(
         hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_type),

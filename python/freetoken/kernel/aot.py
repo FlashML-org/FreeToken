@@ -124,6 +124,27 @@ def _fast_index_copy_multi_spec(num_threads: int, blocks_per_bank: int) -> Kerne
     return KernelSpec(name=_make_name("fast_index_copy_multi", *args), build=build)
 
 
+def _fast_index_copy_multi_strided_spec(
+    num_threads: int, blocks_per_bank: int
+) -> KernelSpec:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+
+    def build(build_directory: pathlib.Path) -> object:
+        return load_jit(
+            "fast_index_copy_multi_strided",
+            *args,
+            cuda_files=["fast_index_copy.cuh"],
+            cuda_wrappers=[
+                ("launch", f"&MultiIndexCopyStridedKernel<{args}>::run")
+            ],
+            build_directory=str(build_directory),
+        )
+
+    return KernelSpec(
+        name=_make_name("fast_index_copy_multi_strided", *args), build=build
+    )
+
+
 def _batch_memcpy_spec() -> KernelSpec:
     def build(build_directory: pathlib.Path) -> object:
         return load_jit(
@@ -153,6 +174,7 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
         for feature_size in DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES
     )
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=8))
+    specs.append(_fast_index_copy_multi_strided_spec(num_threads=1024, blocks_per_bank=8))
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=64))
     specs.append(_batch_memcpy_spec())

@@ -476,6 +476,8 @@ struct MultiIndexCopyParams {
     const int64_t* __restrict__ dst_ptrs;     // [B] device, each base addr of a bank slot cache
     const int64_t* __restrict__ src_ptrs;     // [B] device, each GPU-visible base addr of a bank host source
     const int64_t* __restrict__ feat_bytes;   // [B] device, per-row bytes (multiple of 16)
+    const int64_t* __restrict__ dst_strides;  // [B] device, destination row stride in bytes
+    const int64_t* __restrict__ src_strides;  // [B] device, source row stride in bytes
     const void* __restrict__ dst_indices;     // [L]
     const void* __restrict__ src_indices;     // [L]
     const int64_t* __restrict__ valid_length; // [1] or null
@@ -506,17 +508,19 @@ __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
         const int64_t col = (u - row * units) << 4;  // byte offset within the row
         const int64_t pd = static_cast<int64_t>(di[row]);
         const int64_t ps = static_cast<int64_t>(si[row]);
-        const uint4 v = *reinterpret_cast<const uint4*>(src + ps * feat + col);
-        *reinterpret_cast<uint4*>(dst + pd * feat + col) = v;
+        const uint4 v = *reinterpret_cast<const uint4*>(src + ps * p.src_strides[b] + col);
+        *reinterpret_cast<uint4*>(dst + pd * p.dst_strides[b] + col) = v;
     }
 }
 
 template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
-struct MultiIndexCopyKernel {
+struct MultiIndexCopyStridedKernel {
     static void run(
         tvm::ffi::TensorView dst_ptrs,
         tvm::ffi::TensorView src_ptrs,
         tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_strides,
+        tvm::ffi::TensorView src_strides,
         tvm::ffi::TensorView dst_indices,
         tvm::ffi::TensorView src_indices,
         tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
@@ -530,7 +534,8 @@ struct MultiIndexCopyKernel {
         auto num_indices_dtype = SymbolicDType{};
 
         TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
-            .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
+            .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes)
+            .verify(dst_strides).verify(src_strides);
         TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
             .verify(dst_indices).verify(src_indices);
 
@@ -546,6 +551,8 @@ struct MultiIndexCopyKernel {
             static_cast<const int64_t*>(dst_ptrs.data_ptr()),
             static_cast<const int64_t*>(src_ptrs.data_ptr()),
             static_cast<const int64_t*>(feat_bytes.data_ptr()),
+            static_cast<const int64_t*>(dst_strides.data_ptr()),
+            static_cast<const int64_t*>(src_strides.data_ptr()),
             dst_indices.data_ptr(),
             src_indices.data_ptr(),
             valid_length,
@@ -558,5 +565,25 @@ struct MultiIndexCopyKernel {
             : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank>;
         LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
                      device.unwrap())(kernel, params);
+    }
+};
+
+// Backward-compatible uniform-row entry point used by the prebuilt kernel cache.
+// Keep its signature stable; variable-size banks compile/load the separately named
+// MultiIndexCopyStridedKernel wrapper.
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+struct MultiIndexCopyKernel {
+    static void run(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptrs,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
+    ) {
+        MultiIndexCopyStridedKernel<kNumThreads, kBlocksPerBank>::run(
+            dst_ptrs, src_ptrs, feat_bytes, feat_bytes, feat_bytes,
+            dst_indices, src_indices, num_indices
+        );
     }
 };
