@@ -23,9 +23,9 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
 
-    An 8-bit KV pool prices at its scheme's bytes per element (1 + 2/32 with the fp16
-    per-block scale amortized), not the compute dtype's -- the whole point of the flag is
-    that this number, times every token of every layer, is what frees VRAM for experts.
+    A quantized KV pool prices at its scheme's payload bytes plus the amortized fp16
+    per-block scale (1.0625 bytes for 8-bit; 0.5625 for packed int4), not the compute
+    dtype. This number, times every token of every layer, is what frees VRAM for experts.
     The index slab stays bf16: it is never quantized.
     """
     bytes_per_elem = _kv_bytes_per_element(config)

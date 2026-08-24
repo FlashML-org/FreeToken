@@ -227,3 +227,6 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Local scratch / agent worktrees (never committed)
+.claude/

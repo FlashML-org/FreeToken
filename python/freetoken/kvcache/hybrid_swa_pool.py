@@ -98,14 +98,17 @@ class HybridSWAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
         device: torch.device,
     ) -> _KVGroupStorage:
         local_kv_heads = div_even(spec.num_kv_heads, tp_size, allow_replicate=True)
-        shape = (2, spec.num_layers, outer_size, inner_size, local_kv_heads, spec.head_dim)
-        buffer = torch.empty(shape, device=device, dtype=self._buffer_dtype(dtype))
-        scales = self._alloc_scales(shape, device)
+        logical_head_dim = spec.head_dim
+        head_dim = logical_head_dim // self._quant.elements_per_byte  # packed slabs halve it
+        phys_shape = (2, spec.num_layers, outer_size, inner_size, local_kv_heads, head_dim)
+        log_shape = (2, spec.num_layers, outer_size, inner_size, local_kv_heads, logical_head_dim)
+        buffer = torch.empty(phys_shape, device=device, dtype=self._buffer_dtype(dtype))
+        scales = self._alloc_scales(log_shape, device)
         return _KVGroupStorage(
             buffer=buffer,
             k_buffer=buffer[0],
             v_buffer=buffer[1],
-            storage_shape=(outer_size * inner_size, local_kv_heads, spec.head_dim),
+            storage_shape=(outer_size * inner_size, local_kv_heads, head_dim),
             scale_buffer=scales,
             k_scale=None if scales is None else scales[0],
             v_scale=None if scales is None else scales[1],
@@ -265,16 +268,19 @@ class HybridSWAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
     @staticmethod
     def _group_geometry(group: _KVGroupStorage) -> tuple:
         # Everything the realloc needs that does NOT pin the old buffer alive: layer count,
-        # kv heads, head_dim, device, dtype. (Plain ints + device/dtype handles, no tensor.)
+        # kv heads, head_dim (physical storage dim -- half for packed int4), device, dtype.
         _, num_layers, _old_outer, _old_inner, local_kv_heads, head_dim = group.buffer.shape
         return (num_layers, local_kv_heads, head_dim, group.buffer.device, group.buffer.dtype)
 
     def _alloc_group(self, geom: tuple, outer_size: int, inner_size: int) -> _KVGroupStorage:
         # Only the outer (page/token) dimension changes; the rest comes from ``geom``.
         num_layers, local_kv_heads, head_dim, device, dtype = geom
+        epb = self._quant.elements_per_byte
         shape = (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim)
         buffer = torch.empty(shape, device=device, dtype=dtype)
-        scales = self._alloc_scales(shape, device)
+        # Scales key off the LOGICAL head dim (extent D // BLOCK regardless of packing).
+        log_shape = (*shape[:-1], head_dim * epb)
+        scales = self._alloc_scales(log_shape, device)
         return _KVGroupStorage(
             buffer=buffer,
             k_buffer=buffer[0],

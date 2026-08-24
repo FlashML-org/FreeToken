@@ -52,17 +52,20 @@ class MHAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
                 layer_map[global_id] = dense
             self._layer_map = layer_map
         self._compute_dtype = dtype
-        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+        storage_head_dim = head_dim // self._quant.elements_per_byte
+        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, storage_head_dim)
         self._kv_buffer = torch.empty(
             kv_shape, device=device, dtype=self._buffer_dtype(dtype)
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._scale_buffer = self._alloc_scales(kv_shape, device)
+        # Scales key off the LOGICAL head_dim: extent D // BLOCK regardless of packing.
+        log_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+        self._scale_buffer = self._alloc_scales(log_shape, device)
         self._k_scale = self._scale_buffer[0] if self._scale_buffer is not None else None
         self._v_scale = self._scale_buffer[1] if self._scale_buffer is not None else None
         self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, storage_head_dim)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -71,7 +74,7 @@ class MHAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
+        _, num_storage_layers, _old_pages, page_size, local_kv_heads, storage_head_dim = self._kv_buffer.shape
         dtype = self._kv_buffer.dtype
         device = self._device
         self._k_buffer = None
@@ -85,14 +88,15 @@ class MHAKVCache(QuantizedKVStorageMixin, BaseKVCachePool):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+        kv_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, storage_head_dim)
         self._kv_buffer = torch.empty(kv_shape, device=device, dtype=dtype)
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._scale_buffer = self._alloc_scales(kv_shape, device)
+        log_shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, storage_head_dim * self._quant.elements_per_byte)
+        self._scale_buffer = self._alloc_scales(log_shape, device)
         self._k_scale = self._scale_buffer[0] if self._scale_buffer is not None else None
         self._v_scale = self._scale_buffer[1] if self._scale_buffer is not None else None
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, storage_head_dim)
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:

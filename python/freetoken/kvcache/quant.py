@@ -1,20 +1,18 @@
-"""KV-cache quantization schemes: 8-bit storage with a per-block scale.
+"""KV-cache quantization schemes with a per-block scale.
 
-The KV pool normally stores K/V in the model's compute dtype (bf16). A quantized pool
-stores them in an 8-bit dtype plus a parallel scale tensor holding one fp16 scale per
-:data:`BLOCK` elements along ``head_dim`` -- the same geometry GGUF's Q8_0 uses, and the
-reason the block is small: KV outliers (mostly in the keys) concentrate in a few
+The KV pool normally stores K/V in the model's compute dtype (bf16). Quantized pools
+store a compact payload plus a parallel scale tensor holding one fp16 scale per
+:data:`BLOCK` elements along ``head_dim`` -- the same block geometry GGUF's Q8_0 uses.
+The block is small because KV outliers (mostly in the keys) concentrate in a few
 channels, and a block of 32 keeps an outlier from stretching the scale of the whole
 head.
 
-Both schemes share this layout, the store kernel and the dequant path in the attention
-kernels; they differ only in the storage dtype and the divisor that maps a block's
-max-abs onto the dtype's range. That is deliberate -- picking between them is a flag,
-not a second port.
-
-The scale varies along ``head_dim``, which is the reduction dimension of ``q @ k``, so
-the attention kernels cannot fold it in after the dot: they dequantize to bf16 before
-the dot. Storage bandwidth is what this buys, not tensor-core throughput.
+The 8-bit schemes store one element per byte; ``int4`` stores two signed values in each
+``uint8`` byte. All share the store kernel and the dequant path in the attention kernels;
+the format only changes payload layout and the divisor mapping a block's max-abs onto its
+representable range. The scale varies along ``head_dim``, the reduction dimension of
+``q @ k``, so attention dequantizes before the dot. This saves storage bandwidth, not
+tensor-core compute.
 """
 
 from __future__ import annotations
@@ -36,12 +34,17 @@ class KVQuantSpec:
     ``name`` is the ``--kv-cache-dtype`` value. ``storage_dtype`` is None for the
     unquantized pool, in which case the pool allocates in the compute dtype and no
     scale tensor exists.
+
+    ``elements_per_byte`` is 1 for the 8-bit schemes (allocation is element-shaped) and
+    2 for int4 (torch has no int4 dtype, so the slab is ``uint8`` with two 4-bit
+    elements packed per byte and the last dim halves).
     """
 
     name: str
     storage_dtype: torch.dtype | None
     # Max-abs of a block maps to this magnitude in the storage dtype.
     max_magnitude: float
+    elements_per_byte: int = 1
 
     @property
     def enabled(self) -> bool:
@@ -50,20 +53,39 @@ class KVQuantSpec:
     @property
     def is_integer(self) -> bool:
         """Integer schemes round; float ones just divide."""
-        return self.storage_dtype == torch.int8
+        return self.storage_dtype in (torch.int8, torch.uint8)
+
+    @property
+    def packed(self) -> bool:
+        """True when the slab packs several elements per byte (int4)."""
+        return self.elements_per_byte > 1
 
     def bytes_per_element(self, compute_dtype: torch.dtype) -> float:
         """Storage bytes per K/V element, scales amortized over the block.
 
-        Unquantized: the compute dtype's itemsize. Quantized: 1 byte + 2/32 for the
-        fp16 scale = 1.0625 -- 6% over a bare 8 bits, versus 16 bits stored.
+        Unquantized: the compute dtype's itemsize. 8-bit: 1 byte + 2/32 for the fp16
+        scale = 1.0625. int4: half a byte + 2/32 = 0.5625.
         """
         if not self.enabled:
             return float(compute_dtype.itemsize)
-        return 1.0 + SCALE_DTYPE.itemsize / BLOCK
+        return 1.0 / self.elements_per_byte + SCALE_DTYPE.itemsize / BLOCK
+
+    def storage_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        """Element-storage slab shape for a logical KV shape (last dim halves when packed)."""
+        if self.packed:
+            if shape[-1] % self.elements_per_byte:
+                raise ValueError(
+                    f"head_dim {shape[-1]} is not a multiple of {self.elements_per_byte}"
+                )
+            return (*shape[:-1], shape[-1] // self.elements_per_byte)
+        return shape
 
     def scale_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
-        """Scale-tensor shape for a KV buffer shape: last dim divided by the block."""
+        """Scale-tensor shape for a *logical* KV shape: last dim divided by the block.
+
+        ``shape`` is the element-counted (unpacked) KV geometry, so the scale extent is
+        the same whether the slab is 8-bit (element-shaped) or int4 (byte-packed).
+        """
         if shape[-1] % BLOCK:
             raise ValueError(
                 f"head_dim {shape[-1]} is not a multiple of the KV quant block {BLOCK}"
@@ -73,39 +95,65 @@ class KVQuantSpec:
     # ---- reference implementations (correctness oracle for the Triton kernels) ----
 
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``x[..., D]`` (float) -> ``(quantized[..., D], scales[..., D // BLOCK])``."""
+        """``x[..., D]`` (float) -> ``(quantized[..., D // epb], scales[..., D // BLOCK])``.
+
+        The quantized tensor has the *storage* shape: element-shaped for 8-bit,
+        byte-packed (last dim halves) for int4.
+        """
         assert self.enabled, "quantize() on an unquantized spec"
         blocks = x.float().unflatten(-1, (x.shape[-1] // BLOCK, BLOCK))
         amax = blocks.abs().amax(dim=-1)
-        # An all-zero block would divide by zero; its quantized values are zero either
-        # way, so any positive scale works.
         scales = torch.where(amax > 0, amax / self.max_magnitude, torch.ones_like(amax))
         # Round the scale to its stored precision BEFORE dividing, so quantize and
-        # dequantize use the identical value. Dividing by the fp32 scale and storing the
-        # fp16 one leaves a residual error the round-trip cannot cancel.
+        # dequantize use the identical value.
         scales = scales.to(SCALE_DTYPE)
         q = blocks / scales.float().unsqueeze(-1)
         if self.is_integer:
-            # Half away from zero, matching GGUF's Q8_0 and the store kernel.
-            # ``Tensor.round`` is half-to-even and would disagree on ties.
+            # Half away from zero, matching the store kernel. ``Tensor.round`` is
+            # half-to-even and would disagree on ties.
             q = torch.where(q >= 0, (q + 0.5).floor(), (q - 0.5).ceil())
             q = q.clamp_(-self.max_magnitude, self.max_magnitude)
-        return (q.flatten(-2).to(self.storage_dtype), scales)
+        if self.packed:
+            # Two signed int4 per byte: value v -> nibble v + max_magnitude, so the
+            # even element (low nibble) and odd element (high nibble) interleave.
+            q = q.flatten(-2)
+            q = (q + self.max_magnitude).to(torch.uint8)
+            even = q[..., 0::2]
+            odd = q[..., 1::2]
+            packed = even | (odd << 4)
+            return packed, scales
+        return q.flatten(-2).to(self.storage_dtype), scales
 
     def dequantize(self, q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-        """Inverse of :meth:`quantize`, in float32."""
+        """Inverse of :meth:`quantize`, in float32 (logical element shape)."""
         assert self.enabled, "dequantize() on an unquantized spec"
-        blocks = q.float().unflatten(-1, (q.shape[-1] // BLOCK, BLOCK))
-        return (blocks * scales.float().unsqueeze(-1)).flatten(-2)
+        if self.packed:
+            logical_d = q.shape[-1] * self.elements_per_byte
+            nblock = logical_d // BLOCK
+            # Each block of BLOCK elements occupies BLOCK // elements_per_byte bytes;
+            # split each byte's low (even element) and high (odd) nibbles. Operate on
+            # the integer codes (the caller may pass the packed tensor already floated).
+            codes = q.to(torch.uint8)
+            blocks = codes.unflatten(-1, (nblock, BLOCK // self.elements_per_byte))
+            values = torch.stack([blocks & 0x0F, blocks >> 4], dim=-1)
+            values = values.reshape(*blocks.shape[:-1], BLOCK).float()
+            values = values - self.max_magnitude
+        else:
+            values = q.float().unflatten(-1, (q.shape[-1] // BLOCK, BLOCK))
+        return (values * scales.float().unsqueeze(-1)).flatten(-2)
 
 
 # int8 symmetric: a block's max-abs maps to 127.
 Q8_0 = KVQuantSpec(name="q8_0", storage_dtype=torch.int8, max_magnitude=127.0)
 # e4m3: 4-bit exponent, 3-bit mantissa, max finite magnitude 448.
 FP8_E4M3 = KVQuantSpec(name="fp8_e4m3", storage_dtype=torch.float8_e4m3fn, max_magnitude=448.0)
+# signed int4, two per byte: a block's max-abs maps to 7.
+INT4 = KVQuantSpec(
+    name="int4", storage_dtype=torch.uint8, max_magnitude=7.0, elements_per_byte=2
+)
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
-_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3)}
+_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, INT4)}
 KV_CACHE_DTYPES = tuple(_BY_NAME)
 
 
@@ -128,6 +176,7 @@ __all__ = [
     "KV_CACHE_DTYPES",
     "Q8_0",
     "FP8_E4M3",
+    "INT4",
     "NONE",
     "resolve_kv_quant",
 ]

@@ -352,11 +352,11 @@ def parse_args(
         choices=list(KV_CACHE_DTYPES),
         default=ServerArgs.kv_cache_dtype,
         help=(
-            "KV-cache element storage. 'auto' keeps the compute dtype (bf16). 'q8_0' and "
-            "'fp8_e4m3' store 8 bits plus an fp16 scale per 32 elements along head_dim "
-            "(1.0625 bytes/element vs 2), freeing VRAM for the MoE expert cache. q8_0 is "
-            "the more accurate of the two at this block size. Needs the triton attention "
-            "backend and head_dim divisible by 32."
+            "KV-cache element storage. 'auto' keeps the compute dtype (bf16); 'q8_0' and "
+            "'fp8_e4m3' use 1.0625 bytes/element, while packed signed 'int4' uses 0.5625 "
+            "bytes/element, each including an fp16 scale per 32 head-dim elements. q8_0 is "
+            "the most accurate compact format; int4 maximizes capacity. Needs the triton "
+            "attention backend and head_dim divisible by 32."
         ),
     )
 

@@ -15,7 +15,8 @@ _MIN_BLOCK_KV = 32
 def _load_kv(
     ptr,
     scale_ptr,
-    offsets,
+    base,  # slot/head byte base (already carries the broadcast), per-row/per-col
+    elem,  # within-head element index (the heads dim), broadcast to match ``base``
     scale_offsets,
     mask,
     scale_mask,
@@ -23,15 +24,20 @@ def _load_kv(
     QUANT: tl.constexpr,
     QBLOCK: tl.constexpr,
     D_ON_ROWS: tl.constexpr,
+    EPB: tl.constexpr,
 ):
-    """Load a K or V tile, dequantizing it when the pool stores 8-bit values.
+    """Load a K or V tile, dequantizing it when the pool stores quantized values.
 
-    ``offsets`` addresses the tile in the KV buffer; ``scale_offsets`` addresses the
+    ``base + elem`` addresses the tile in the KV buffer; ``scale_offsets`` addresses the
     matching scales, whose ``head_dim`` extent is ``QBLOCK`` times smaller -- one scale
     per block, loaded once and broadcast across the block rather than re-read per
-    element. Reading it per element instead costs 2 bytes of load per 1 byte of payload
-    and measured 1.6x slower than bf16 on prefill; this broadcast is what makes 8-bit
-    storage actually cheaper to read.
+    element.
+
+    ``base`` is kept separate from ``elem`` because packed storage halves the byte
+    extent of ``elem`` only: with ``EPB`` (elements-per-byte) == 2 the within-head
+    element index maps to ``elem // EPB`` bytes, and the slot/head strides in ``base``
+    are *byte* counts that must not be divided. The element's parity (``elem``'s low bit)
+    selects the low or high nibble.
 
     ``D_ON_ROWS`` says which way the tile is laid out: the dot-product kernels want K as
     ``[D, N]`` and V as ``[N, D]``, and the block axis has to be expanded along whichever
@@ -41,7 +47,31 @@ def _load_kv(
     cannot be folded in after the dot -- the tile is dequantized into ``out_dtype`` (the
     query's dtype) and fed to the tensor cores like the bf16 path does.
     """
-    vals = tl.load(ptr + offsets, mask=mask, other=0.0)
+    if QUANT and EPB == 2:
+        # Nibble-packed int4: uint8 byte per element pair; low nibble = even element,
+        # high nibble = odd element (each sign-offset into [0, 14] by MAX_MAG == 7).
+        packed = tl.load(ptr + base + elem // EPB, mask=mask, other=0)
+        # Nibble extraction via integer arithmetic: Triton's ``&``/``>>`` are not
+        # defined on block tensors, but ``%``/``//`` are.
+        lo = (packed % 16).to(tl.float32)
+        hi = (packed // 16).to(tl.float32)
+        vals = tl.where((elem % EPB) == 0, lo, hi)
+        # Masked lanes must read as 0 (like the ``other=0.0`` loads in the element path),
+        # not as the -7 bias, or they would poison the dot when head_dim is not a power
+        # of two and BLOCK_D probes past D.
+        vals = tl.where(mask, vals - 7.0, 0.0)
+        scale = tl.load(scale_ptr + scale_offsets, mask=scale_mask, other=0.0)
+        if D_ON_ROWS:
+            nb_p: tl.constexpr = scale.shape[0]
+            n_p: tl.constexpr = scale.shape[1]
+            wide = tl.broadcast_to(scale[:, None, :], (nb_p, QBLOCK, n_p)).reshape(nb_p * QBLOCK, n_p)
+        else:
+            n_p: tl.constexpr = scale.shape[0]
+            nb_p: tl.constexpr = scale.shape[1]
+            wide = tl.broadcast_to(scale[:, :, None], (n_p, nb_p, QBLOCK)).reshape(n_p, nb_p * QBLOCK)
+        return (vals * wide.to(tl.float32)).to(out_dtype)
+
+    vals = tl.load(ptr + base + elem, mask=mask, other=0.0)
     if QUANT:
         scale = tl.load(scale_ptr + scale_offsets, mask=scale_mask, other=0.0)
         if D_ON_ROWS:
@@ -124,6 +154,7 @@ def _paged_attention_kernel(
     HAS_SINKS: tl.constexpr,
     QUANT: tl.constexpr,
     QBLOCK: tl.constexpr,
+    EPB: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -171,7 +202,8 @@ def _paged_attention_kernel(
             k = _load_kv(
                 k_ptr,
                 ks_ptr,
-                slots[:, None] * stride_ks + kv_head * stride_kh + offs_d[None, :],
+                slots[:, None] * stride_ks + kv_head * stride_kh,
+                offs_d[None, :],
                 slots[:, None] * stride_kss + kv_head * stride_ksh + offs_nb[None, :],
                 kv_mask,
                 kv_scale_mask,
@@ -179,6 +211,7 @@ def _paged_attention_kernel(
                 QUANT,
                 QBLOCK,
                 False,
+                EPB,
             ).to(tl.float32)
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
@@ -192,7 +225,8 @@ def _paged_attention_kernel(
             v = _load_kv(
                 v_ptr,
                 vs_ptr,
-                slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :],
+                slots[:, None] * stride_vs + kv_head * stride_vh,
+                offs_d[None, :],
                 slots[:, None] * stride_vss + kv_head * stride_vsh + offs_nb[None, :],
                 kv_mask,
                 kv_scale_mask,
@@ -200,6 +234,7 @@ def _paged_attention_kernel(
                 QUANT,
                 QBLOCK,
                 False,
+                EPB,
             ).to(tl.float32)
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -256,6 +291,7 @@ def _decode_grouped_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr,
     QUANT: tl.constexpr,
     QBLOCK: tl.constexpr,
+    EPB: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -300,8 +336,8 @@ def _decode_grouped_stage1_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
 
     q_offsets = batch_id * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :]
-    k_base_offsets = kv_head * stride_kh + offs_d[:, None]
-    v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
+    k_base_offsets = kv_head * stride_kh
+    v_base_offsets = kv_head * stride_vh
     ks_base_offsets = kv_head * stride_ksh + offs_nb[:, None]
     vs_base_offsets = kv_head * stride_vsh + offs_nbv[None, :]
 
@@ -323,6 +359,7 @@ def _decode_grouped_stage1_kernel(
                 k_ptr,
                 ks_ptr,
                 slots[None, :] * stride_ks + k_base_offsets,
+                offs_d[:, None],
                 slots[None, :] * stride_kss + ks_base_offsets,
                 mask_n[None, :] & mask_d[:, None],
                 mask_n[None, :] & mask_nb[:, None],
@@ -330,6 +367,7 @@ def _decode_grouped_stage1_kernel(
                 QUANT,
                 QBLOCK,
                 True,
+                EPB,
             )
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
@@ -338,6 +376,7 @@ def _decode_grouped_stage1_kernel(
                 v_ptr,
                 vs_ptr,
                 slots[:, None] * stride_vs + v_base_offsets,
+                offs_dv[None, :],
                 slots[:, None] * stride_vss + vs_base_offsets,
                 mask_n[:, None] & mask_dv[None, :],
                 mask_n[:, None] & mask_nbv[None, :],
@@ -345,6 +384,7 @@ def _decode_grouped_stage1_kernel(
                 QUANT,
                 QBLOCK,
                 False,
+                EPB,
             )
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
@@ -450,21 +490,28 @@ def _decode_stage2_kernel(
     )
 
 
-def _kv_scale_args(k_cache, v_cache, k_scale, v_scale):
-    """Scale tensors + strides + the QUANT/QBLOCK constexprs for a kernel launch.
+def _kv_scale_args(k_cache, v_cache, k_scale, v_scale, epb: int = 1):
+    """Scale tensors + strides + the QUANT/QBLOCK/EPB constexprs for a kernel launch.
 
     Unquantized pools pass ``k_scale=None``; the kernels then never touch the scale
     pointers, so the KV buffers themselves stand in and ``QUANT=False`` compiles the
     dequant away entirely -- the bf16 path emits the same code it did before.
+
+    ``epb`` (elements-per-byte) is 1 for 8-bit element-shaped storage and 2 for packed
+    int4, whose slab's last dim is D // epb. Callers infer it from
+    ``head_dim // k_cache.shape[-1]`` when quantized (== 1 unquantized, since there the
+    slab is element-shaped in the compute dtype). Everything below (``head_dim``,
+    ``BLOCK_D``, ``offs_d``, scales) stays in LOGICAL element space; only ``_load_kv``'s
+    byte addressing divides by ``epb``.
     """
     if k_scale is None:
         assert v_scale is None, "k_scale and v_scale must be given together"
-        return (k_cache, v_cache, 0, 0, 0, 0, False, 1)
+        return (k_cache, v_cache, 0, 0, 0, 0, False, 1, epb)
     assert v_scale is not None, "k_scale and v_scale must be given together"
     assert k_scale.dim() == v_scale.dim() == 3, "scales are [slots, heads, D // block]"
-    block = k_cache.shape[-1] // k_scale.shape[-1]
-    assert k_cache.shape[-1] == block * k_scale.shape[-1], (
-        f"head_dim {k_cache.shape[-1]} is not a whole number of {k_scale.shape[-1]} blocks"
+    block = k_cache.shape[-1] * epb // k_scale.shape[-1]
+    assert k_cache.shape[-1] * epb == block * k_scale.shape[-1], (
+        f"head_dim {k_cache.shape[-1] * epb} is not a whole number of {k_scale.shape[-1]} blocks"
     )
     return (
         k_scale,
@@ -475,6 +522,7 @@ def _kv_scale_args(k_cache, v_cache, k_scale, v_scale):
         v_scale.stride(1),
         True,
         block,
+        epb,
     )
 
 
@@ -500,14 +548,15 @@ def decode_paged_attention(
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
-    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock = _kv_scale_args(
-        k_cache, v_cache, k_scale, v_scale
-    )
     batch, num_q_heads, head_dim = q.shape
+    epb = head_dim // k_cache.shape[-1]
+    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock, epb = _kv_scale_args(
+        k_cache, v_cache, k_scale, v_scale, epb
+    )
     num_kv_heads = k_cache.shape[1]
     assert batch == indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] * epb == head_dim and v_cache.shape[-1] * epb == head_dim
     assert num_q_heads % num_kv_heads == 0
     assert attn_logits.shape[0] >= batch
     assert attn_logits.shape[1] >= num_q_heads
@@ -577,6 +626,7 @@ def decode_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         QUANT=quant,
         QBLOCK=qblock,
+        EPB=epb,
         num_warps=4,
         num_stages=2,
     )
@@ -644,6 +694,7 @@ def _extend_attention_kernel(
     HAS_SINKS: tl.constexpr,
     QUANT: tl.constexpr,
     QBLOCK: tl.constexpr,
+    EPB: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -702,7 +753,8 @@ def _extend_attention_kernel(
             k = _load_kv(
                 k_ptr,
                 ks_ptr,
-                slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None],
+                slots[None, :] * stride_ks + kv_head * stride_kh,
+                offs_d[:, None],
                 slots[None, :] * stride_kss + kv_head * stride_ksh + offs_nb[:, None],
                 mask_n[None, :] & mask_d[:, None],
                 mask_n[None, :] & mask_nb[:, None],
@@ -710,6 +762,7 @@ def _extend_attention_kernel(
                 QUANT,
                 QBLOCK,
                 True,
+                EPB,
             )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
@@ -723,7 +776,8 @@ def _extend_attention_kernel(
             v = _load_kv(
                 v_ptr,
                 vs_ptr,
-                slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :],
+                slots[:, None] * stride_vs + kv_head * stride_vh,
+                offs_dv[None, :],
                 slots[:, None] * stride_vss + kv_head * stride_vsh + offs_nbv[None, :],
                 mask_n[:, None] & mask_dv[None, :],
                 mask_n[:, None] & mask_nbv[None, :],
@@ -731,6 +785,7 @@ def _extend_attention_kernel(
                 QUANT,
                 QBLOCK,
                 False,
+                EPB,
             )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -789,6 +844,7 @@ def _extend_attention_split_kernel(
     HAS_SINKS: tl.constexpr,
     QUANT: tl.constexpr,
     QBLOCK: tl.constexpr,
+    EPB: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -849,7 +905,8 @@ def _extend_attention_split_kernel(
             k = _load_kv(
                 k_cache_ptr,
                 ks_ptr,
-                slots[None, :] * stride_kcs + kv_head * stride_kch + offs_d[:, None],
+                slots[None, :] * stride_kcs + kv_head * stride_kch,
+                offs_d[:, None],
                 slots[None, :] * stride_kss + kv_head * stride_ksh + offs_nb[:, None],
                 mask_n[None, :] & mask_d[:, None],
                 mask_n[None, :] & mask_nb[:, None],
@@ -857,6 +914,7 @@ def _extend_attention_split_kernel(
                 QUANT,
                 QBLOCK,
                 True,
+                EPB,
             )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
@@ -870,7 +928,8 @@ def _extend_attention_split_kernel(
             v = _load_kv(
                 v_cache_ptr,
                 vs_ptr,
-                slots[:, None] * stride_vcs + kv_head * stride_vch + offs_dv[None, :],
+                slots[:, None] * stride_vcs + kv_head * stride_vch,
+                offs_dv[None, :],
                 slots[:, None] * stride_vss + kv_head * stride_vsh + offs_nbv[None, :],
                 mask_n[:, None] & mask_dv[None, :],
                 mask_n[:, None] & mask_nbv[None, :],
@@ -878,6 +937,7 @@ def _extend_attention_split_kernel(
                 QUANT,
                 QBLOCK,
                 False,
+                EPB,
             )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -962,15 +1022,16 @@ def extend_paged_attention(
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
-    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock = _kv_scale_args(
-        k_cache, v_cache, k_scale, v_scale
-    )
     num_q_tokens, num_q_heads, head_dim = q.shape
+    epb = head_dim // k_cache.shape[-1]
+    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock, epb = _kv_scale_args(
+        k_cache, v_cache, k_scale, v_scale, epb
+    )
     num_kv_heads = k_cache.shape[1]
     assert qo_indptr.numel() == kv_indptr.numel()
     assert prefix_lens.numel() == qo_indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] * epb == head_dim and v_cache.shape[-1] * epb == head_dim
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -1037,6 +1098,7 @@ def extend_paged_attention(
             HAS_SINKS=sinks is not None,
             QUANT=quant,
             QBLOCK=qblock,
+            EPB=epb,
             num_warps=8,
             num_stages=1,
         )
@@ -1077,6 +1139,7 @@ def extend_paged_attention(
         HAS_SINKS=sinks is not None,
         QUANT=quant,
         QBLOCK=qblock,
+        EPB=epb,
         num_warps=8,
         num_stages=1,
     )
@@ -1108,13 +1171,14 @@ def paged_attention(
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
-    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock = _kv_scale_args(
-        k_cache, v_cache, k_scale, v_scale
-    )
     num_tokens, num_q_heads, head_dim = q.shape
+    epb = head_dim // k_cache.shape[-1]
+    ks, vs, s_kss, s_ksh, s_vss, s_vsh, quant, qblock, epb = _kv_scale_args(
+        k_cache, v_cache, k_scale, v_scale, epb
+    )
     num_kv_heads = k_cache.shape[1]
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] * epb == head_dim and v_cache.shape[-1] * epb == head_dim
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -1159,6 +1223,7 @@ def paged_attention(
         HAS_SINKS=sinks is not None,
         QUANT=quant,
         QBLOCK=qblock,
+        EPB=epb,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,
     )

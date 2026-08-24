@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.quant import BLOCK, FP8_E4M3, NONE, Q8_0, resolve_kv_quant
+from freetoken.kvcache.quant import BLOCK, FP8_E4M3, INT4, NONE, Q8_0, resolve_kv_quant
 
-SPECS = [Q8_0, FP8_E4M3]
+SPECS = [Q8_0, FP8_E4M3, INT4]
 IDS = [spec.name for spec in SPECS]
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -20,6 +20,9 @@ def test_bytes_per_element_amortizes_the_scale():
     # 8 bits of payload + one fp16 scale per 32 elements.
     assert Q8_0.bytes_per_element(torch.bfloat16) == 1.0 + 2 / 32
     assert FP8_E4M3.bytes_per_element(torch.bfloat16) == 1.0 + 2 / 32
+    # Packed int4 stores two values per byte, with the same scale slab.
+    assert INT4.bytes_per_element(torch.bfloat16) == 0.5 + 2 / 32
+    assert INT4.storage_shape((7, 4, 256)) == (7, 4, 128)
     # Unquantized pools price at the compute dtype.
     assert NONE.bytes_per_element(torch.bfloat16) == 2.0
     assert NONE.bytes_per_element(torch.float32) == 4.0
@@ -29,8 +32,7 @@ def test_resolve_and_scale_shape():
     assert resolve_kv_quant(None) is NONE
     assert resolve_kv_quant("auto") is NONE
     assert resolve_kv_quant("q8_0") is Q8_0
-    with pytest.raises(ValueError, match="unknown --kv-cache-dtype"):
-        resolve_kv_quant("int4")
+    assert resolve_kv_quant("int4") is INT4
     assert Q8_0.scale_shape((7, 4, 256)) == (7, 4, 8)
     with pytest.raises(ValueError, match="not a multiple"):
         Q8_0.scale_shape((7, 4, 100))
@@ -57,6 +59,15 @@ def test_reference_roundtrip_error_is_within_the_scheme_envelope(spec):
     assert (err <= amax * bound + 1e-6).all()
     # And the typical error should sit well under the worst case, not at it.
     assert err.mean() <= amax.mean() * bound * 0.5
+
+
+def test_int4_packs_signed_nibbles_in_element_order():
+    x = torch.tensor([-7.0, -6.0, -1.0, 0.0, 1.0, 6.0, 7.0, 0.0] * 4).view(1, 1, BLOCK)
+    packed, scales = INT4.quantize(x)
+
+    # scale=1 gives v + 7 codes. Low nibble is the even logical element, high nibble odd.
+    assert packed[0, 0, :4].tolist() == [0x10, 0x76, 0xD8, 0x7E]
+    torch.testing.assert_close(INT4.dequantize(packed, scales), x)
 
 
 def test_int8_beats_fp8_on_a_flat_block_and_loses_on_a_spiky_one():
@@ -92,7 +103,7 @@ def test_store_kernel_matches_the_reference_quantizer(spec, head_dim):
     # Scatter to non-contiguous slots: the kernel must honour the index indirection.
     indices = torch.randperm(slots, device="cuda")[:tokens].to(torch.int32)
 
-    kc = torch.zeros(slots, heads, head_dim, device="cuda", dtype=spec.storage_dtype)
+    kc = torch.zeros(slots, heads, head_dim // spec.elements_per_byte, device="cuda", dtype=spec.storage_dtype)
     vc = torch.zeros_like(kc)
     ks = torch.zeros(slots, heads, head_dim // BLOCK, device="cuda", dtype=torch.float16)
     vs = torch.zeros_like(ks)
@@ -118,7 +129,7 @@ def test_store_kernel_leaves_untouched_slots_alone(spec):
     v = _kv(4, heads, head_dim, seed=4)
     indices = torch.tensor([1, 3, 5, 7], device="cuda", dtype=torch.int32)
 
-    kc = torch.zeros(slots, heads, head_dim, device="cuda", dtype=spec.storage_dtype)
+    kc = torch.zeros(slots, heads, head_dim // spec.elements_per_byte, device="cuda", dtype=spec.storage_dtype)
     vc = torch.zeros_like(kc)
     ks = torch.zeros(slots, heads, head_dim // BLOCK, device="cuda", dtype=torch.float16)
     vs = torch.zeros_like(ks)
@@ -140,13 +151,15 @@ def test_store_kernel_handles_an_all_zero_head(spec):
     v = torch.zeros_like(k)
     indices = torch.zeros(1, device="cuda", dtype=torch.int32)
 
-    kc = torch.empty(4, heads, head_dim, device="cuda", dtype=spec.storage_dtype)
+    kc = torch.empty(4, heads, head_dim // spec.elements_per_byte, device="cuda", dtype=spec.storage_dtype)
     vc = torch.empty_like(kc)
     ks = torch.empty(4, heads, head_dim // BLOCK, device="cuda", dtype=torch.float16)
     vs = torch.empty_like(ks)
     store_kv_quant(kc, ks, vc, vs, indices, k, v, spec)
 
-    assert (kc[0].float() == 0).all()
+    # Zero must dequantize back to zero. int4 encodes 0 as the offset nibble (0x77),
+    # not 0x00, so compare the DEQUANTIZED values, not the raw packed bytes.
+    assert (spec.dequantize(kc[0].float(), ks[0]).abs() == 0).all()
     assert torch.isfinite(ks[0]).all() and (ks[0] > 0).all()
 
 
@@ -164,15 +177,16 @@ def _quantized_pool(spec, k_bf16, v_bf16):
     from freetoken.kernel.triton.kv_quant import store_kv_quant
 
     slots, heads, dim = k_bf16.shape
-    kq = torch.zeros(slots, heads, dim, device="cuda", dtype=spec.storage_dtype)
+    epb = spec.elements_per_byte
+    kq = torch.zeros(slots, heads, dim // epb, device="cuda", dtype=spec.storage_dtype)
     vq = torch.zeros_like(kq)
     ks = torch.zeros(slots, heads, dim // BLOCK, device="cuda", dtype=torch.float16)
     vs = torch.zeros_like(ks)
     indices = torch.arange(slots, device="cuda", dtype=torch.int32)
     store_kv_quant(kq, ks, vq, vs, indices, k_bf16, v_bf16, spec)
     # What the attention kernel will effectively see, in the dtype it dequantizes into.
-    k_deq = spec.dequantize(kq.float(), ks).to(torch.bfloat16)
-    v_deq = spec.dequantize(vq.float(), vs).to(torch.bfloat16)
+    k_deq = spec.dequantize(kq.float(), ks).to(torch.bfloat16).reshape(slots, heads, dim)
+    v_deq = spec.dequantize(vq.float(), vs).to(torch.bfloat16).reshape(slots, heads, dim)
     return kq, ks, vq, vs, k_deq, v_deq
 
 
@@ -283,4 +297,8 @@ def test_quantized_attention_tracks_the_bf16_pool(spec):
     got = paged_attention(q=q, k_cache=kq, v_cache=vq, k_scale=ks, v_scale=vs, **kw)
     ref = paged_attention(q=q, k_cache=k, v_cache=v, **kw)
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
-    assert rel < 0.05, f"{spec.name}: relative error {rel:.4f} vs bf16 pool"
+    # 8-bit ~1% here; int4's 4-bit mantissa is inherently ~7x coarser, so it gets a
+    # looser (still meaningful) bound. The strict per-kernel equivalence is pinned by
+    # the tests above; this only whats the TOTAL storage cost.
+    bound = 0.16 if spec.packed else 0.05
+    assert rel < bound, f"{spec.name}: relative error {rel:.4f} vs bf16 pool (bound {bound})"
