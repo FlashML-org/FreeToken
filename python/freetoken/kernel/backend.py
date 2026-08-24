@@ -23,11 +23,15 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("sgl_kernel")
 
 
@@ -39,6 +43,8 @@ def is_triton_kernels_installed() -> bool:
     source tree and has no Windows wheel. It is also not one of the six ops
     ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
     """
+    if is_rocm():
+        return False
     return _importable("triton_kernels")
 
 
@@ -68,6 +74,8 @@ def driver_cuda_version() -> int | None:
     toolkit version. Resolved through the ``_pinned_tensor`` extension's link-time
     cudart, so it works wherever the extension builds (including Windows) -- no dlopen
     by soname."""
+    if is_rocm():
+        return None
     try:
         from freetoken.kernel.pinned import _load_pinned_extension
 
