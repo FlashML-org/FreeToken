@@ -358,7 +358,7 @@ def iter_gguf_weights(
     models).
 
     A_log and dt_bias stay float32 (gdn.py keeps recurrence-gating params in fp32).
-    conv1d.weight stays float32 and is reshaped to [conv_dim, 1, kernel].
+    conv1d.weight is bf16 (model dtype) reshaped to [conv_dim, 1, kernel].
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
@@ -444,7 +444,9 @@ def iter_gguf_weights(
             yield f"{base}.mlp.gate.weight", _to_bf16(t)
             continue
         if suffix == "ffn_gate_inp_shexp.weight":
-            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t)
+            # llama.cpp stores the single-output shared-expert gate as a 1-D [hidden]
+            # vector; _SharedExpert's LinearReplicated(hidden, 1) declares [1, hidden].
+            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
             continue
         if suffix == "ssm_norm.weight":
             yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
@@ -456,9 +458,10 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.dt_bias", _to_f32(t)
             continue
         if suffix == "ssm_conv1d.weight":
-            # F32, reshape to [conv_dim, 1, kernel] where conv_dim is attn_qkv output size
-            w = _to_f32(t)
-            w = w.reshape(gdn_attn_qkv_size, 1, gdn_conv_kernel)
+            # F32 in the file, but _DepthwiseConv1d allocates at the model dtype: gdn.py
+            # exempts only A_log / dt_bias from the downcast, so this one is bf16. Reshape
+            # to [conv_dim, 1, kernel] -- gdn.py's _conv_weight() does .squeeze(1).
+            w = _to_bf16(t).reshape(gdn_attn_qkv_size, 1, gdn_conv_kernel)
             yield f"{base}.linear_attn.conv1d.weight", w
             continue
         if suffix == "attn_q_norm.weight":
@@ -466,6 +469,34 @@ def iter_gguf_weights(
             continue
         if suffix == "attn_k_norm.weight":
             yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            continue
+
+        # Shared expert (present on every layer, both kinds) -- must be handled BEFORE the
+        # per-layer-kind branch below, whose `else: continue` swallows any suffix it does
+        # not recognize.
+        if suffix in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"):
+            if suffix == "ffn_gate_shexp.weight":
+                gate_up_buf.setdefault(layer, {})["gate"] = t.packed()
+            elif suffix == "ffn_up_shexp.weight":
+                gate_up_buf.setdefault(layer, {})["up"] = t.packed()
+            else:
+                yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
+
+            # Emit the fused gate_up once both parts have arrived.
+            gu = gate_up_buf.get(layer)
+            if gu is not None and "gate" in gu and "up" in gu:
+                types = [
+                    quant_map.get((layer, "ffn_gate_shexp.weight")),
+                    quant_map.get((layer, "ffn_up_shexp.weight")),
+                ]
+                if len(set(types)) == 1:
+                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
+                        [gu["gate"], gu["up"]], dim=0
+                    )
+                else:
+                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_0", gu["gate"]
+                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_1", gu["up"]
+                del gate_up_buf[layer]
             continue
 
         # Quantized projections: keep packed; fuse per layer.
@@ -553,33 +584,6 @@ def iter_gguf_weights(
                     yield f"{base}.linear_attn.in_proj.qweight_2", slots["beta"]
                     yield f"{base}.linear_attn.in_proj.qweight_3", slots["alpha"]
                 del in_proj_buf[layer]
-
-        # Shared expert gate_up: every layer gets this
-        if suffix == "ffn_gate_shexp.weight":
-            gate_up_buf.setdefault(layer, {})["gate"] = t.packed()
-        elif suffix == "ffn_up_shexp.weight":
-            gate_up_buf.setdefault(layer, {})["up"] = t.packed()
-        elif suffix == "ffn_down_shexp.weight":
-            yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
-
-        # Emit fused gate_up once both parts are present.
-        gu = gate_up_buf.get(layer)
-        if gu is not None and "gate" in gu and "up" in gu:
-            # Determine if this is a mixed-quant group (unlikely but check).
-            types = [
-                quant_map.get((layer, "ffn_gate_shexp.weight")),
-                quant_map.get((layer, "ffn_up_shexp.weight")),
-            ]
-            if len(set(types)) == 1:
-                # Uniform quant: fuse via torch.cat along dim 0.
-                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
-                    [gu["gate"], gu["up"]], dim=0
-                )
-            else:
-                # Mixed quant: emit GGUFMergedLinear format.
-                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_0", gu["gate"]
-                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_1", gu["up"]
-            del gate_up_buf[layer]
 
     # Verify no fusion buffers are incomplete.
     assert not qkv_buf, f"incomplete full-attn qkv groups: {sorted(qkv_buf)}"
