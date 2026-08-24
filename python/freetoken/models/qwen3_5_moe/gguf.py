@@ -336,6 +336,50 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
 # Raw w would centre near 0.0X; these centre near 1, i.e. already 1+w.
 
 
+
+# --------------------------------------------------------------------------------------
+# V-head order: llama.cpp writes TILED, FreeToken (like HF) wants GROUPED
+# --------------------------------------------------------------------------------------
+# When num_k_heads != num_v_heads, llama.cpp's converter reorders every tensor that indexes
+# the V-head dimension (conversion/qwen.py, _LinearAttentionVReorderBase) so ggml_repeat can
+# replace an interleaved repeat:
+#
+#   HF / FreeToken (grouped by K head):  [G0_v0, G0_v1, G1_v0, G1_v1, ...]
+#   GGUF            (tiled for ggml):    [G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]
+#
+# FreeToken's GDN pairs K head k with V heads [k*R, (k+1)*R), i.e. grouped -- the safetensors
+# loader applies no reorder because HF is already grouped. So a GGUF checkpoint must be
+# un-tiled on load or every K/V pairing in all 30 GDN layers is wrong. That is invisible to
+# shape, dtype and magnitude checks: activations stay healthy and the text is nonsense.
+#
+# Ornith: num_k_heads=16, num_v_heads=32 -> num_v_per_k=2, head_v_dim=128.
+
+
+def _ungroup_v(t: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int):
+    """Tiled -> grouped along ``dim``: the inverse of llama.cpp's _reorder_v_heads.
+
+    The forward transform views the axis as [K, R, D] and swaps K/R. The inverse is the same
+    operation with the two counts exchanged: view as [R, K, D] and swap back.
+    """
+    shape = list(t.shape)
+    if dim < 0:
+        dim += len(shape)
+    view = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    out = t.reshape(*view)
+    perm = list(range(len(view)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return out.permute(*perm).contiguous().reshape(*shape)
+
+
+def _ungroup_packed_rows(packed: torch.Tensor, num_k_heads: int, num_v_per_k: int, head_dim: int):
+    """Un-tile whole ROWS of a packed [out, row_bytes] tensor.
+
+    Safe on quantized data: each output row is an independent run of blocks over the input
+    dim, so permuting rows never splits a block. (Permuting COLUMNS would -- see ssm_out.)
+    """
+    return _ungroup_v(packed, 0, num_k_heads, num_v_per_k, head_dim)
+
+
 def _to_bf16(t) -> torch.Tensor:
     """A (1 + weight) norm: dequantize then add 1, matching weight.py's load-time shift."""
     return _to_bf16(t) + 1.0
@@ -416,6 +460,14 @@ def iter_gguf_weights(
         else 8192
     )
     gdn_conv_kernel = gdn_group.conv_kernel_dim if gdn_group else 4
+    # V-head un-tiling geometry (see _ungroup_v). Only needed when the GDN has fewer K
+    # heads than V heads, which is exactly when llama.cpp reorders.
+    _vK = gdn_group.num_key_heads if gdn_group else 0
+    _vN = gdn_group.num_value_heads if gdn_group else 0
+    _vD = gdn_group.value_head_dim if gdn_group else 0
+    _vR = (_vN // _vK) if _vK else 1
+    _untile = bool(_vK and _vN and _vK != _vN)
+    _qk_rows = 2 * gdn_group.num_key_heads * gdn_group.key_head_dim if gdn_group else 0
 
     # Scan quant types once to determine which fusion groups are mixed-quant.
     quant_map = _scan_quant_types(model_path)
@@ -493,6 +545,8 @@ def iter_gguf_weights(
             # gate collapses to zero in all 30 GDN layers -- healthy activation magnitudes,
             # incoherent text. Invert the transform so -exp(A_log) reproduces the stored A.
             a = _to_f32(t)
+            if _untile:
+                a = _ungroup_v(a, 0, _vK, _vR, 1)
             if not bool((a < 0).all()):
                 raise ValueError(
                     f"{name}: expected llama.cpp's pre-transformed A = -exp(A_log) (all "
@@ -502,13 +556,21 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.A_log", torch.log(-a)
             continue
         if suffix == "ssm_dt.bias":
-            yield f"{base}.linear_attn.dt_bias", _to_f32(t)
+            dt = _to_f32(t)
+            if _untile:
+                dt = _ungroup_v(dt, 0, _vK, _vR, 1)
+            yield f"{base}.linear_attn.dt_bias", dt
             continue
         if suffix == "ssm_conv1d.weight":
             # F32 in the file, but _DepthwiseConv1d allocates at the model dtype: gdn.py
             # exempts only A_log / dt_bias from the downcast, so this one is bf16. Reshape
             # to [conv_dim, 1, kernel] -- gdn.py's _conv_weight() does .squeeze(1).
-            w = _to_bf16(t).reshape(gdn_attn_qkv_size, 1, gdn_conv_kernel)
+            w = _to_bf16(t).reshape(gdn_attn_qkv_size, gdn_conv_kernel)
+            if _untile:
+                # channels are [q | k | v]; only the V block is tiled
+                qk, v = w[:_qk_rows], w[_qk_rows:]
+                w = torch.cat([qk, _ungroup_v(v, 0, _vK, _vR, _vD)], dim=0)
+            w = w.reshape(gdn_attn_qkv_size, 1, gdn_conv_kernel)
             yield f"{base}.linear_attn.conv1d.weight", w
             continue
         if suffix == "attn_q_norm.weight":
@@ -585,15 +647,38 @@ def iter_gguf_weights(
         # and out_proj
         else:
             if suffix == "attn_qkv.weight":
-                in_proj_buf.setdefault(layer, {})["qkv"] = t.packed()
+                w = t.packed()
+                if _untile:
+                    # rows are [q | k | v]; only the V rows are tiled. Row permutation is
+                    # safe on packed data -- each row is its own run of blocks.
+                    w = torch.cat(
+                        [w[:_qk_rows], _ungroup_packed_rows(w[_qk_rows:], _vK, _vR, _vD)], dim=0
+                    )
+                in_proj_buf.setdefault(layer, {})["qkv"] = w
             elif suffix == "attn_gate.weight":
-                in_proj_buf.setdefault(layer, {})["gate"] = t.packed()
-            elif suffix == "ssm_beta.weight":
-                in_proj_buf.setdefault(layer, {})["beta"] = t.packed()
-            elif suffix == "ssm_alpha.weight":
-                in_proj_buf.setdefault(layer, {})["alpha"] = t.packed()
+                w = t.packed()
+                if _untile:
+                    w = _ungroup_packed_rows(w, _vK, _vR, _vD)
+                in_proj_buf.setdefault(layer, {})["gate"] = w
+            elif suffix in ("ssm_beta.weight", "ssm_alpha.weight"):
+                w = t.packed()
+                if _untile:
+                    # one row per V head -> head_dim 1
+                    w = _ungroup_packed_rows(w, _vK, _vR, 1)
+                in_proj_buf.setdefault(layer, {})[
+                    "beta" if suffix.startswith("ssm_beta") else "alpha"
+                ] = w
             elif suffix == "ssm_out.weight":
-                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+                # out_proj consumes the V dimension along its COLUMNS, and llama.cpp tiled
+                # those columns. A column permutation cannot be done on packed data -- a
+                # 128-wide head straddles the 256-element quant blocks -- so this one tensor
+                # is dequantized to dense bf16. Cost: out*in*2 bytes per GDN layer
+                # (2048*4096*2 = 16 MiB, ~503 MiB over 30 layers). convert_qwen35_to_gguf
+                # therefore leaves linear_attn.out_proj as a dense Linear.
+                w = _to_bf16(t)
+                if _untile:
+                    w = _ungroup_v(w, 1, _vK, _vR, _vD)
+                yield f"{base}.linear_attn.out_proj.weight", w
             else:
                 continue  # unmapped for GDN layers
 
@@ -731,7 +816,10 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
                 ],
                 has_bias=False,
             )
-            swap_linear(layer.linear_attn, "out_proj", qt(layer_idx, "ssm_out.weight"))
+            # linear_attn.out_proj is deliberately NOT swapped: its columns index the
+            # V-head dimension, which llama.cpp tiled, and un-tiling columns needs dense
+            # values (a 128-wide head straddles the quant blocks). iter_gguf_weights yields
+            # it as dense bf16 ".weight", so the constructed Linear must stay dense.
 
         # Shared expert: gate|up fuse when they share a type (they do in every quant level
         # seen so far); down is independent and does vary (Q4_K on IQ3_M's first layers).
