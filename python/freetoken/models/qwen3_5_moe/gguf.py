@@ -36,13 +36,23 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
+# Verify that LinearGatedDeltaGroupConfig is available for isinstance checks
+# (imported above in the config module import)
+
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
 )
-from freetoken.models.gguf.dequant import GGML_NAME, dequantize
+from freetoken.models.gguf.dequant import (
+    GGML_IQ3_S,
+    GGML_NAME,
+    GGML_Q4_K,
+    GGML_Q6_K,
+    dequantize,
+    row_bytes,
+)
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -56,6 +66,29 @@ def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
     if val is None and default is None:
         raise ValueError(f"GGUF {shim.model_path}: missing required key {_ARCH}.{key}")
     return val
+
+
+def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] | None:
+    """``(gate_up, down)`` ggml types of the routed-expert banks, or None if not uniform.
+
+    The offload slot pool is one allocation per bank shared by every layer, and
+    ``moe_vec.cuh`` addresses it as ``expert * nrows * (ncols / qk)`` with no padding
+    allowance -- so a bank whose type varies by layer cannot be served. We return None
+    rather than raising here because ``parse_gguf_config`` also runs for metadata-only
+    inspection; ``expert_banks._gguf_banks`` is where the load actually fails, with the
+    offending layers named. (llama.cpp's *_M mixes hit this: Ornith IQ3_M splits
+    ffn_down_exps across Q4_K and IQ3_S, while IQ3_S / IQ3_XXS are uniform.)
+    """
+    from .gguf_experts import gguf_expert_types
+
+    try:
+        types = gguf_expert_types(model_path, num_layers)
+    except Exception:
+        return None
+    gate_up, down = set(types["gate_up"]), set(types["down"])
+    if len(gate_up) != 1 or len(down) != 1:
+        return None
+    return (next(iter(gate_up)), next(iter(down)))
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -157,6 +190,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         image_token_id=None,
         attention_groups=groups,
         expert_quant="gguf",
+        gguf_expert_types=_uniform_expert_types(shim.model_path, num_layers),
         weight_block_size=None,
         attn_quant="gguf",
         dense_quant="gguf",
@@ -240,9 +274,399 @@ def gguf_name_to_freetoken(name: str, num_layers: int) -> str | None:
     return f"model.layers.{layer}.{mapped}"
 
 
+# --------------------------------------------------------------------------------------
+# Weight loading: GGUF tensor names -> FreeToken qwen35moe module params.
+# --------------------------------------------------------------------------------------
+
+
+def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
+    """Scan GGUF tensor table once and return {(layer, suffix): ggml_type}.
+
+    This allows us to detect which groups are mixed-quant without hardcoding.
+    Quant levels (IQ2_*, IQ3_XXS, IQ3_M) may mix differently.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    quant_types = {}
+    for t in iter_gguf_tensors(model_path):
+        if not t.name.startswith("blk."):
+            continue
+        _, idx, suffix = t.name.split(".", 2)
+        layer = int(idx)
+        quant_types[(layer, suffix)] = t.ggml_type
+    return quant_types
+
+
+def _to_bf16(t) -> torch.Tensor:
+    """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
+    flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
+    return flat.reshape(t.shape)
+
+
+def _to_f32(t) -> torch.Tensor:
+    """Dequantize a GgufTensor (F32/F16/Q*) to a dense float32 tensor of its torch shape."""
+    flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32)
+    return flat.reshape(t.shape)
+
+
+def _require_tp1(what: str) -> None:
+    """GGUF quant layers / expert banks are not sharded; reject TP>1 with a clear
+    error instead of failing later on a confusing shape mismatch."""
+    from freetoken.distributed import get_tp_info
+
+    if get_tp_info().size > 1:
+        raise NotImplementedError(
+            f"qwen35moe GGUF {what} currently supports TP=1 only "
+            "(GGUF quant layers and expert banks are not tensor-parallel sharded)."
+        )
+
+
+def iter_gguf_weights(
+    model_path: str,
+    device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield (param_name, tensor) for every non-expert qwen35moe param.
+
+    Quantized projections (attention qkv/o, linear_attn in/out, shared-MLP gate_up/down)
+    stay in their native packed block layout and are yielded as ``.qweight`` (uint8) or
+    ``.qweight_<i>`` for mixed-quant groups; norms and gates dequantize to bf16. q/k/v,
+    attn_qkv/gate/beta/alpha, and gate/up are fused by concatenating packed rows or
+    materializing parts separately (GGUFMergedLinear for mixed quants). Routed experts
+    are served from the offload cache (asserts the offload contract like the other MoE
+    models).
+
+    A_log and dt_bias stay float32 (gdn.py keeps recurrence-gating params in fp32).
+    conv1d.weight stays float32 and is reshaped to [conv_dim, 1, kernel].
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.utils import cached_load_hf_config
+
+    assert not include_moe_experts, (
+        "qwen35moe GGUF stores experts as IQ3_S and only supports the offload backend; "
+        "experts are loaded into the offload cache via the expert-bank loader."
+    )
+    assert include_non_moe
+    _require_tp1("weight loading")
+
+    # Parse config to determine which layers are full-attention vs GDN.
+    config = parse_gguf_config(cached_load_hf_config(model_path))
+    full_layer_ids = {
+        lid
+        for lid in range(config.num_layers)
+        if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
+    }
+
+    # Get GDN group to extract attn_qkv_size and conv_kernel for conv1d reshape.
+    gdn_group = None
+    for group in config.attention_groups:
+        if isinstance(group, LinearGatedDeltaGroupConfig):
+            gdn_group = group
+            break
+    # attn_qkv_size = q + k + v = num_k_heads*state_size*2 + num_v_heads*state_size
+    gdn_attn_qkv_size = (
+        2 * gdn_group.num_key_heads * gdn_group.key_head_dim + gdn_group.num_value_heads * gdn_group.value_head_dim
+        if gdn_group
+        else 8192
+    )
+    gdn_conv_kernel = gdn_group.conv_kernel_dim if gdn_group else 4
+
+    # Scan quant types once to determine which fusion groups are mixed-quant.
+    quant_map = _scan_quant_types(model_path)
+
+    # Per-layer fusion buffers: layer -> {slot: packed[out, row_bytes]}.
+    qkv_buf: dict[int, dict[str, torch.Tensor]] = {}  # full-attn qkv
+    in_proj_buf: dict[int, dict[str, torch.Tensor]] = {}  # GDN in_proj (qkv+gate+beta+alpha)
+    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}  # shared_expert gate_up
+
+    def layer_of(name: str) -> int:
+        return int(name.split(".")[1])
+
+    for t in iter_gguf_tensors(model_path):
+        name = t.name
+        layer = layer_of(name) if name.startswith("blk.") else None
+
+        # Global tensors
+        if name == "token_embd.weight":
+            yield "model.embed_tokens.qweight", t.packed()  # IQ3_S packed table
+            continue
+        if name == "output_norm.weight":
+            yield "model.norm.weight", _to_bf16(t)
+            continue
+        if not name.startswith("blk."):
+            continue
+
+        # Skip block 40 (NextN/MTP, dropped) and nextn.* tensors.
+        if layer >= config.num_layers:
+            continue
+        if "nextn." in name:
+            continue
+
+        # Skip routed-expert stacks (offload banks).
+        if any(name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
+            continue
+
+        suffix = name.split(".", 2)[2]  # after "blk.N."
+        base = f"model.layers.{layer}"
+
+        # Scalar/norm tensors: dequant to bf16 or stay F32.
+        # norms, mlp.gate, shared_expert_gate -> bf16
+        # A_log, dt_bias -> float32
+        # conv1d.weight -> float32, reshaped
+        if suffix == "attn_norm.weight":
+            yield f"{base}.input_layernorm.weight", _to_bf16(t)
+            continue
+        if suffix == "post_attention_norm.weight":
+            yield f"{base}.post_attention_layernorm.weight", _to_bf16(t)
+            continue
+        if suffix == "ffn_gate_inp.weight":
+            yield f"{base}.mlp.gate.weight", _to_bf16(t)
+            continue
+        if suffix == "ffn_gate_inp_shexp.weight":
+            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t)
+            continue
+        if suffix == "ssm_norm.weight":
+            yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
+            continue
+        if suffix == "ssm_a":
+            yield f"{base}.linear_attn.A_log", _to_f32(t)
+            continue
+        if suffix == "ssm_dt.bias":
+            yield f"{base}.linear_attn.dt_bias", _to_f32(t)
+            continue
+        if suffix == "ssm_conv1d.weight":
+            # F32, reshape to [conv_dim, 1, kernel] where conv_dim is attn_qkv output size
+            w = _to_f32(t)
+            w = w.reshape(gdn_attn_qkv_size, 1, gdn_conv_kernel)
+            yield f"{base}.linear_attn.conv1d.weight", w
+            continue
+        if suffix == "attn_q_norm.weight":
+            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
+            continue
+        if suffix == "attn_k_norm.weight":
+            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            continue
+
+        # Quantized projections: keep packed; fuse per layer.
+        # Full-attention: qkv from q, k, v
+        if layer in full_layer_ids:
+            if suffix == "attn_q.weight":
+                qkv_buf.setdefault(layer, {})["q"] = t.packed()
+            elif suffix == "attn_k.weight":
+                qkv_buf.setdefault(layer, {})["k"] = t.packed()
+            elif suffix == "attn_v.weight":
+                qkv_buf.setdefault(layer, {})["v"] = t.packed()
+            elif suffix == "attn_output.weight":
+                yield f"{base}.self_attn.o_proj.qweight", t.packed()
+            else:
+                continue  # unmapped for full-attn layers
+
+            # Emit fused qkv once all three parts are present.
+            slots = qkv_buf.get(layer)
+            if slots is not None and "q" in slots and "k" in slots and "v" in slots:
+                # Determine if this is a mixed-quant group.
+                types = [
+                    quant_map.get((layer, "attn_q.weight")),
+                    quant_map.get((layer, "attn_k.weight")),
+                    quant_map.get((layer, "attn_v.weight")),
+                ]
+                if len(set(types)) == 1:
+                    # Uniform quant: fuse via torch.cat along dim 0.
+                    yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
+                        [slots["q"], slots["k"], slots["v"]], dim=0
+                    )
+                else:
+                    # Mixed quant: emit GGUFMergedLinear format.
+                    yield f"{base}.self_attn.qkv_proj.qweight_0", slots["q"]
+                    yield f"{base}.self_attn.qkv_proj.qweight_1", slots["k"]
+                    yield f"{base}.self_attn.qkv_proj.qweight_2", slots["v"]
+                del qkv_buf[layer]
+
+        # GDN layers: in_proj from attn_qkv, attn_gate, ssm_beta, ssm_alpha
+        # and out_proj
+        else:
+            if suffix == "attn_qkv.weight":
+                in_proj_buf.setdefault(layer, {})["qkv"] = t.packed()
+            elif suffix == "attn_gate.weight":
+                in_proj_buf.setdefault(layer, {})["gate"] = t.packed()
+            elif suffix == "ssm_beta.weight":
+                in_proj_buf.setdefault(layer, {})["beta"] = t.packed()
+            elif suffix == "ssm_alpha.weight":
+                in_proj_buf.setdefault(layer, {})["alpha"] = t.packed()
+            elif suffix == "ssm_out.weight":
+                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+            else:
+                continue  # unmapped for GDN layers
+
+            # Emit fused in_proj once all four parts are present.
+            slots = in_proj_buf.get(layer)
+            if (
+                slots is not None
+                and "qkv" in slots
+                and "gate" in slots
+                and "beta" in slots
+                and "alpha" in slots
+            ):
+                # Determine if this is a mixed-quant group.
+                types = [
+                    quant_map.get((layer, "attn_qkv.weight")),
+                    quant_map.get((layer, "attn_gate.weight")),
+                    quant_map.get((layer, "ssm_beta.weight")),
+                    quant_map.get((layer, "ssm_alpha.weight")),
+                ]
+                if len(set(types)) == 1:
+                    # Uniform quant: fuse via torch.cat along dim 0.
+                    yield f"{base}.linear_attn.in_proj.qweight", torch.cat(
+                        [
+                            slots["qkv"],
+                            slots["gate"],
+                            slots["beta"],
+                            slots["alpha"],
+                        ],
+                        dim=0,
+                    )
+                else:
+                    # Mixed quant: emit GGUFMergedLinear format.
+                    yield f"{base}.linear_attn.in_proj.qweight_0", slots["qkv"]
+                    yield f"{base}.linear_attn.in_proj.qweight_1", slots["gate"]
+                    yield f"{base}.linear_attn.in_proj.qweight_2", slots["beta"]
+                    yield f"{base}.linear_attn.in_proj.qweight_3", slots["alpha"]
+                del in_proj_buf[layer]
+
+        # Shared expert gate_up: every layer gets this
+        if suffix == "ffn_gate_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["gate"] = t.packed()
+        elif suffix == "ffn_up_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["up"] = t.packed()
+        elif suffix == "ffn_down_shexp.weight":
+            yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
+
+        # Emit fused gate_up once both parts are present.
+        gu = gate_up_buf.get(layer)
+        if gu is not None and "gate" in gu and "up" in gu:
+            # Determine if this is a mixed-quant group (unlikely but check).
+            types = [
+                quant_map.get((layer, "ffn_gate_shexp.weight")),
+                quant_map.get((layer, "ffn_up_shexp.weight")),
+            ]
+            if len(set(types)) == 1:
+                # Uniform quant: fuse via torch.cat along dim 0.
+                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
+                    [gu["gate"], gu["up"]], dim=0
+                )
+            else:
+                # Mixed quant: emit GGUFMergedLinear format.
+                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_0", gu["gate"]
+                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_1", gu["up"]
+            del gate_up_buf[layer]
+
+    # Verify no fusion buffers are incomplete.
+    assert not qkv_buf, f"incomplete full-attn qkv groups: {sorted(qkv_buf)}"
+    assert not in_proj_buf, f"incomplete GDN in_proj groups: {sorted(in_proj_buf)}"
+    assert not gate_up_buf, f"incomplete shared_expert gate_up groups: {sorted(gate_up_buf)}"
+
+
+def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> None:
+    """In place: replace qwen35moe's dense projections + embedding with native GGUF ops.
+
+    Quantized in the checkpoint -> swapped: attention qkv/o (mixed-quant), linear_attn
+    in/out, shared-MLP gate_up/down, and the token embedding (IQ3_S, also the lm_head if
+    tied). Left as dense bf16 (F32 in the GGUF): all RMSNorms, the router gate
+    (ffn_gate_inp), the per-layer shared_expert_gate, conv1d.weight, A_log, dt_bias,
+    and the routed experts (served from the offload cache).
+
+    The per-layer quant types are read from the GGUF file, not hardcoded, to support
+    different quant levels (IQ3_M, IQ3_XXS, IQ2_*, etc.) which may mix differently.
+    """
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear, gguf_merged_or_plain
+
+    # Scan quant types to drive layer swaps.
+    quant_map = _scan_quant_types(model_path)
+
+    # Determine full-attention vs GDN layers.
+    full_layer_ids = {
+        lid
+        for lid in range(config.num_layers)
+        if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
+    }
+
+    def swap_linear(owner, attr, quant_type=GGML_Q4_K):
+        """Replace a dense Linear with GGUFLinear."""
+        lin = getattr(owner, attr)
+        out_features, in_features = lin.weight.shape
+        setattr(
+            owner,
+            attr,
+            GGUFLinear(in_features, out_features, quant_type, has_bias=lin.bias is not None),
+        )
+
+    inner = model.model
+    embed = GGUFEmbedding(
+        num_embeddings=config.vocab_size,
+        embedding_dim=config.hidden_size,
+        quant_type=GGML_IQ3_S,
+    )
+    inner.embed_tokens = embed
+
+    for layer_idx, layer in enumerate(inner.layers.op_list):
+        if layer_idx in full_layer_ids:
+            # Full-attention layer: qkv_proj (mixed quant), o_proj (Q4_K)
+            types = [
+                quant_map.get((layer_idx, "attn_q.weight"), GGML_IQ3_S),
+                quant_map.get((layer_idx, "attn_k.weight"), GGML_IQ3_S),
+                quant_map.get((layer_idx, "attn_v.weight"), GGML_Q4_K),
+            ]
+            output_sizes = [8192, 512, 512]
+            layer.self_attn.qkv_proj = gguf_merged_or_plain(
+                config.hidden_size, output_sizes, types, has_bias=False
+            )
+            swap_linear(layer.self_attn, "o_proj", GGML_Q4_K)
+        else:
+            # GDN layer: in_proj (mixed quant), out_proj (IQ3_S)
+            types = [
+                quant_map.get((layer_idx, "attn_qkv.weight"), GGML_Q4_K),
+                quant_map.get((layer_idx, "attn_gate.weight"), GGML_IQ3_S),
+                quant_map.get((layer_idx, "ssm_beta.weight"), GGML_IQ3_S),
+                quant_map.get((layer_idx, "ssm_alpha.weight"), GGML_IQ3_S),
+            ]
+            output_sizes = [8192, 4096, 32, 32]
+            layer.linear_attn.in_proj = gguf_merged_or_plain(
+                config.hidden_size, output_sizes, types, has_bias=False
+            )
+            swap_linear(layer.linear_attn, "out_proj", GGML_IQ3_S)
+
+        # Shared expert: gate_up_proj (IQ3_S, uniform), down_proj (Q4_K or IQ3_S).
+        gate_up_type = quant_map.get((layer_idx, "ffn_gate_shexp.weight"), GGML_IQ3_S)
+        down_type = quant_map.get((layer_idx, "ffn_down_shexp.weight"), GGML_Q4_K)
+
+        # gate_up is typically uniform IQ3_S, but use gguf_merged_or_plain for safety.
+        up_type = quant_map.get((layer_idx, "ffn_up_shexp.weight"), GGML_IQ3_S)
+        layer.mlp.shared_expert.gate_up_proj = gguf_merged_or_plain(
+            config.hidden_size,
+            [config.shared_expert_intermediate_size, config.shared_expert_intermediate_size],
+            [gate_up_type, up_type],
+            has_bias=False,
+        )
+        swap_linear(layer.mlp.shared_expert, "down_proj", down_type)
+
+    # lm_head: use output.weight quant type (Q6_K in Ornith).
+    if config.tie_word_embeddings:
+        # Tied head: reference the embedding's qweight.
+        from freetoken.models.gemma4.gguf import GGUFTiedLMHead
+
+        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+    else:
+        # Untied head: create a separate GGUFLinear (rare for qwen35moe).
+        swap_linear(model, "lm_head", GGML_Q6_K)
+
+
 __all__ = [
     "parse_gguf_config",
     "gguf_name_to_freetoken",
+    "iter_gguf_weights",
+    "convert_qwen35_to_gguf",
     "_FUSE",
     "_EXPERT_SUFFIXES",
 ]

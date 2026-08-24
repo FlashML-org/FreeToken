@@ -531,6 +531,24 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "gguf":
+            # Same MMVQ grouped GEMV as q4_0, but the two banks carry whatever ggml types
+            # the checkpoint chose (Ornith IQ3_S: both banks IQ3_S; the attention-side
+            # projections mix, but expert banks must be uniform -- see ModelConfig
+            # .gguf_expert_types for why the slot pool cannot hold two strides).
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf
+
+            gate_up, down = views
+            types = cache.gguf_expert_types
+            assert types is not None, (
+                "quant_format 'gguf' requires gguf_expert_types on the offload cache "
+                "(set from ModelConfig.gguf_expert_types at cache construction)"
+            )
+            t_gate_up, t_down = types
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                quant_type=t_gate_up, down_quant_type=t_down,
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

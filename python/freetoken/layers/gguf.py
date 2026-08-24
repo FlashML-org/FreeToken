@@ -9,6 +9,16 @@ input dim, the loader can concatenate the per-shard packed rows along dim 0 (the
 share an input dim, hence the same ``row_bytes``), so a fused layer is still one
 ``[out, row_bytes]`` qweight -- no per-shard padding bookkeeping needed.
 
+**Merged vs. plain fused projections**:
+
+When all output parts share the same quant type (the common case in gemma4), a plain
+``GGUFLinear`` with concatenated packed rows is valid and efficient -- one kernel launch
+dequantizes and multiplies. When parts use different quant types (as in Ornith's IQ3_M
+checkpoint, where qkv_proj mixes IQ3_S and Q4_K), row_bytes differs per part, so torch.cat
+would produce garbage. ``GGUFMergedLinear`` instead materializes the output of each part
+separately via ``fused_mul_mat_gguf`` and concatenates the results along dim=-1 (equivalent
+to the GEMM because all parts read the same input: ``cat([x @ W1.T, x @ W2.T]) == x @ cat([W1, W2], 0).T``).
+
 **Matmul dispatch strategy** (4-tier, per fused_mul_mat_gguf):
 
 1. **Unquantized (F32, F16, BF16)**: straight torch matmul ``x @ qweight.T``.
@@ -99,6 +109,92 @@ class GGUFLinear(BaseOP):
         return out
 
 
+class GGUFMergedLinear(BaseOP):
+    """Merged linear projection with parts that have different quant types.
+
+    Used when fusing output-parallel projections (qkv, gate_up) whose parts use different
+    quantization types. Unlike GGUFLinear (which concatenates packed rows along dim 0 and
+    requires all parts to share row_bytes), GGUFMergedLinear materializes the output of
+    each part separately via fused_mul_mat_gguf, then concatenates the results.
+
+    Mathematically equivalent to a single GEMM, since all parts read the same input x:
+    cat([x @ W1.T, x @ W2.T]) == x @ cat([W1, W2], 0).T
+    (source: llama.cpp's iq*_m mixed-quant strategy).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        output_sizes: list[int],
+        quant_types: list[int],
+        has_bias: bool = False,
+    ):
+        """Initialize a merged linear projection.
+
+        Args:
+            in_features: Input feature dimension (shared by all parts).
+            output_sizes: List of output sizes for each part; must all be > 0.
+            quant_types: List of GGML quant types, one per part; must match output_sizes length.
+            has_bias: Whether to allocate a bias term.
+
+        Raises:
+            ValueError: If output_sizes and quant_types lengths do not match, or if any output_size <= 0.
+            NotImplementedError: If any quant_type is not supported (not in MMVQ_TYPES or GGML_UNQUANTIZED).
+        """
+        if len(output_sizes) != len(quant_types):
+            raise ValueError(
+                f"output_sizes length {len(output_sizes)} != quant_types length {len(quant_types)}"
+            )
+        if not all(o > 0 for o in output_sizes):
+            raise ValueError(f"all output_sizes must be > 0, got {output_sizes}")
+
+        # Validate each quant type is supported.
+        for qt in quant_types:
+            if qt not in MMVQ_TYPES and qt not in GGML_UNQUANTIZED:
+                raise NotImplementedError(
+                    f"quant type {GGML_NAME.get(qt, qt)} not in MMVQ_TYPES or GGML_UNQUANTIZED"
+                )
+
+        self.in_features = in_features
+        self.output_sizes = output_sizes
+        self.out_features = sum(output_sizes)
+        self._quant_types = quant_types
+        self.part_names = []
+
+        # Allocate packed weight buffers: one named tensor per part (qweight_0, qweight_1, ...).
+        # Named (not underscore-prefixed) so they are discovered by state_dict.
+        for i, (out_size, qt) in enumerate(zip(output_sizes, quant_types)):
+            name = f"qweight_{i}"
+            self.part_names.append(name)
+            setattr(
+                self,
+                name,
+                torch.empty(out_size, row_bytes(in_features, qt), dtype=torch.uint8),
+            )
+
+        self.bias = torch.empty(self.out_features) if has_bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: compute each part's output and concatenate along dim=-1.
+
+        Args:
+            x: Input tensor of shape [..., in_features].
+
+        Returns:
+            Tensor of shape [..., out_features] with parts concatenated along dim=-1.
+        """
+        parts = []
+        for name, qt in zip(self.part_names, self._quant_types):
+            qweight = getattr(self, name)
+            part_out = fused_mul_mat_gguf(x, qweight, qt)
+            parts.append(part_out)
+
+        out = torch.cat(parts, dim=-1)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.
 
@@ -136,4 +232,46 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+def gguf_merged_or_plain(
+    in_features: int,
+    output_sizes: list[int],
+    quant_types: list[int],
+    has_bias: bool = False,
+) -> GGUFLinear | GGUFMergedLinear:
+    """Choose between GGUFLinear (uniform quant types) and GGUFMergedLinear (mixed types).
+
+    When all output parts share the same quant type (the uniform case, common in gemma4),
+    return a GGUFLinear with concatenated packed rows -- valid and cheaper since row_bytes
+    is identical per part (one kernel launch instead of N).
+
+    When quant types differ (the mixed case, produced by llama.cpp's IQ*_M / Q*_K_M),
+    return a GGUFMergedLinear to avoid torch.cat garbage from misaligned row_bytes.
+
+    Args:
+        in_features: Input feature dimension.
+        output_sizes: List of output sizes for each part.
+        quant_types: List of GGML quant types, one per part.
+        has_bias: Whether to allocate a bias term.
+
+    Returns:
+        GGUFLinear if all quant types are identical, else GGUFMergedLinear.
+    """
+    if len(set(quant_types)) == 1:
+        # Uniform case: all parts use the same quant type.
+        # Concatenate packed rows (they share row_bytes) into a single [sum(output_sizes), row_bytes] weight.
+        out_features = sum(output_sizes)
+        qt = quant_types[0]
+        lin = GGUFLinear(in_features, out_features, qt, has_bias=has_bias)
+        return lin
+    else:
+        # Mixed case: parts use different quant types.
+        return GGUFMergedLinear(in_features, output_sizes, quant_types, has_bias=has_bias)
+
+
+__all__ = [
+    "GGUFLinear",
+    "GGUFMergedLinear",
+    "GGUFEmbedding",
+    "fused_mul_mat_gguf",
+    "gguf_merged_or_plain",
+]
