@@ -300,6 +300,15 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Explicit sparse-MoE layer set for hybrid mixer-only architectures.  None keeps the
+    # conventional contiguous [first_k_dense_replace, num_layers) layout.
+    moe_layer_ids: tuple[int, ...] | None = None
+    # Routed-expert input/output width when it differs from the residual-stream hidden size
+    # (Nemotron-H projects 4096 -> 1024 around its experts).
+    expert_hidden_size: int | None = None
+    expert_gated: bool = True
+    # Opaque Nemotron-H mixer geometry / per-module quantization metadata.
+    nemotron_h_args: Any | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -312,6 +321,8 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
+        if self.moe_layer_ids is not None:
+            return len(self.moe_layer_ids)
         return self.num_layers - self.first_k_dense_replace
 
     @property

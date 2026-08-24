@@ -292,6 +292,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = None
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -329,6 +330,53 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert (size, pages, overlap) == expected
+
+
+def test_engine_auto_moe_reserves_explicit_kv_geometry(monkeypatch):
+    import freetoken.engine.cache_budget as budget
+    from freetoken.engine.engine import Engine
+
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 8, 25, True
+
+    monkeypatch.setattr(budget, "resolve_moe_cache_auto", fake_resolve)
+
+    class StubModelConfig:
+        num_experts = 4
+        num_moe_layers = 2
+
+        @staticmethod
+        def linear_attention_group():
+            return None
+
+    class StubConfig:
+        memory_ratio = 0.9
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 32
+        num_page_override = 25
+        model_config = StubModelConfig()
+
+    class StubPool:
+        @staticmethod
+        def kv_cost(_config):
+            return 10, 0, 16, 0
+
+    class StubBanks:
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(4, 2, dtype=torch.float16)],
+            "down": [torch.zeros(4, 2, dtype=torch.float16)],
+        }
+
+    engine = Engine.__new__(Engine)
+    engine._baseline_free = 10_000
+    engine._weights_bytes = 1_000
+    engine._pool_cls = StubPool
+    assert engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks()) == (8, 25, True)
+    assert captured["kv_reserve_tokens"] == 25 * 16
 
 
 # ---------------------------------------------------------------------------

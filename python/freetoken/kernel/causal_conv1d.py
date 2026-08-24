@@ -22,6 +22,7 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
@@ -33,7 +34,7 @@ def causal_conv1d_varlen(
         )
 
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state, bias=bias
         )
 
     from sgl_kernel import causal_conv1d_fwd
@@ -41,7 +42,7 @@ def causal_conv1d_varlen(
     if x.stride(-1) != 1:
         x = x.contiguous()
     causal_conv1d_fwd(
-        x, weight, None, conv_states,
+        x, weight, bias, conv_states,
         cu_seqlens.to(torch.int32), cache_indices.to(torch.int32),
         has_initial_state, True, _PAD_SLOT_ID,
     )
@@ -53,6 +54,7 @@ def causal_conv1d_decode(
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
     weight: torch.Tensor,           # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Single-token (decode) causal conv update with silu; shifts+appends the new
     token into ``conv_state[conv_state_indices]`` in place and returns silu(conv)."""
@@ -63,13 +65,15 @@ def causal_conv1d_decode(
             causal_conv1d_decode as triton_causal_conv1d_decode,
         )
 
-        return triton_causal_conv1d_decode(x, conv_state, weight, conv_state_indices)
+        return triton_causal_conv1d_decode(
+            x, conv_state, weight, conv_state_indices, bias=bias
+        )
 
     from sgl_kernel import causal_conv1d_update
 
     x = x.unsqueeze(-1)
     causal_conv1d_update(
-        x, conv_state, weight, None, True, None,
+        x, conv_state, weight, bias, True, None,
         conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
     )
     return x.squeeze(-1)

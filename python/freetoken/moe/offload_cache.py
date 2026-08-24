@@ -153,6 +153,10 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # Allow non-pinned layers to keep GPU expert compute by gathering each
+        # decode step's misses through a bounded pinned host/device staging pair.
+        # The engine enables this before set_bank_sources and disables CUDA graphs.
+        self.pageable_gpu = False
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -263,6 +267,18 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        # Lazily allocated by _copy_missing_pageable. Capacity follows the largest
+        # miss set observed (decode is normally batch=1/top-k sized), not E or the
+        # 59+ GiB source banks. Metadata buffers are pinned so one D2H fence obtains
+        # the device-produced LRU plan before the CPU gather.
+        self._pageable_stage_capacity = 0
+        self._pageable_host_staging: list[torch.Tensor] = []
+        self._pageable_device_staging: list[torch.Tensor] = []
+        self._pageable_stage_src_indices: torch.Tensor | None = None
+        self._pageable_stage_src_ptrs: torch.Tensor | None = None
+        self._pageable_num_host: torch.Tensor | None = None
+        self._pageable_src_host: torch.Tensor | None = None
+        self._pageable_dst_host: torch.Tensor | None = None
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -302,7 +318,10 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address. Normally they
+        must be routed to ``cpu_layer_ids``; with ``pageable_gpu`` they instead use
+        bounded decode staging and still compute on GPU. Prefill overlap remains
+        incompatible because it requires direct registered source addresses.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -316,7 +335,7 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            if not self.pageable_gpu and not unpinned <= self.cpu_layer_ids:
                 raise ValueError(
                     f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
                     f"cpu_layer_ids: a layer without a device address can only decode on "
@@ -1037,12 +1056,133 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def _ensure_pageable_stage(self, capacity: int, layer_id: int) -> None:
+        """Allocate bounded pinned+device rows for pageable GPU miss staging."""
+        if capacity <= self._pageable_stage_capacity:
+            return
+        # Geometric growth avoids reallocating when consecutive decode steps have
+        # slightly different miss counts. Never size this from num_experts: Nemotron's
+        # six-bank row is ~3 MiB, while bs=1 needs at most top-k rows.
+        capacity = 1 << max(0, (capacity - 1).bit_length())
+        host, device = [], []
+        for per_layer, _cache in self.banks:
+            source = per_layer[layer_id]
+            host.append(
+                torch.empty(
+                    (capacity, *source.shape[1:]),
+                    dtype=source.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            )
+            device.append(
+                torch.empty(
+                    (capacity, *source.shape[1:]),
+                    dtype=source.dtype,
+                    device=self.device,
+                )
+            )
+        self._pageable_host_staging = host
+        self._pageable_device_staging = device
+        # The fused copy binding requires src/dst index tensors to have identical
+        # static lengths even though num_indices gates the active prefix.
+        # Keep the index vector the same static length as evict_slots.  ``capacity``
+        # is rounded up geometrically and may exceed that length near a non-power-of-two
+        # cache ceiling; num_indices still limits reads to the live staged rows.
+        self._pageable_stage_src_indices = torch.arange(
+            self.evict_slots.numel(), dtype=torch.int32, device=self.device
+        )
+        self._pageable_stage_src_ptrs = torch.tensor(
+            [x.data_ptr() for x in device], dtype=torch.int64, device=self.device
+        )
+        self._pageable_stage_capacity = capacity
+        total = sum(x.numel() * x.element_size() for x in host)
+        logger.info(
+            f"pageable GPU expert staging ready: capacity={capacity} rows, "
+            f"pinned_host={total / 2**20:.1f} MiB, device={total / 2**20:.1f} MiB"
+        )
+
+    def _copy_missing_pageable(self, layer_id: int) -> None:
+        """Gather pageable expert rows into a small pinned buffer, then GPU slots.
+
+        ``ensure_experts`` produces the LRU copy plan on-device. Copying that tiny
+        plan to pinned host memory introduces one stream fence for an overflow layer;
+        afterwards CPU ``index_select`` performs the RAM gather, H2D copies enqueue
+        on the current stream, and one fused D2D scatter places rows in their LRU slots.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError("pageable GPU expert staging requires CUDA")
+
+        # Allocate metadata on the first call, then fetch the full small plan arrays.
+        # Their maximum is cache_size (a few KiB), avoiding a second sync after n is known.
+        if self._pageable_num_host is None:
+            self._pageable_num_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
+            self._pageable_src_host = torch.empty(
+                self.src_indices.numel(), dtype=torch.int32, pin_memory=True
+            )
+            self._pageable_dst_host = torch.empty(
+                self.evict_slots.numel(), dtype=torch.int32, pin_memory=True
+            )
+        stream = torch.cuda.current_stream(self.device)
+        self._pageable_num_host.copy_(self.num_indices, non_blocking=True)
+        self._pageable_src_host.copy_(self.src_indices, non_blocking=True)
+        self._pageable_dst_host.copy_(self.evict_slots, non_blocking=True)
+        stream.synchronize()
+        n = int(self._pageable_num_host[0])
+        if n == 0:
+            return
+        if n > self.src_indices.numel():
+            raise RuntimeError(f"invalid pageable expert miss count {n}")
+        self._ensure_pageable_stage(n, layer_id)
+
+        src_ids = self._pageable_src_host[:n].long()
+        for (per_layer, _cache), host_stage, device_stage in zip(
+            self.banks, self._pageable_host_staging, self._pageable_device_staging
+        ):
+            source = per_layer[layer_id]
+            torch.index_select(source, 0, src_ids, out=host_stage[:n])
+            device_stage[:n].copy_(host_stage[:n], non_blocking=True)
+
+        # All current in-tree fixed-row formats use the fused plan. Variable-row
+        # GGUF needs per-layer strides and is deliberately rejected until it has a
+        # corresponding staging descriptor.
+        if self._variable_bank_rows or not self._copy_fused_ok:
+            from freetoken.kernel import fast_index_copy_jit
+
+            if self._variable_bank_rows:
+                raise NotImplementedError(
+                    "--moe-pageable-gpu does not yet support variable-size expert rows"
+                )
+            for (_per_layer, cache), stage in zip(self.banks, self._pageable_device_staging):
+                fast_index_copy_jit(
+                    cache,
+                    self.evict_slots,
+                    stage,
+                    self._pageable_stage_src_indices,
+                    self.num_indices,
+                )
+            return
+
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._pageable_stage_src_ptrs,
+            self._copy_feat_bytes,
+            self.evict_slots,
+            self._pageable_stage_src_indices,
+            self.num_indices,
+        )
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
+                if self.pageable_gpu:
+                    self._copy_missing_pageable(layer_id)
+                    return
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "

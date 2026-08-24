@@ -71,10 +71,20 @@ inline bf16_t f32_to_bf16(float f) {
 // MiniMax-M3): gate/up are combined jointly with the runtime alpha/limit
 // scalars, so it is handled in the do_pass1 epilogue (act_apply never sees it;
 // the mxfp4 kernel additionally fuses its own copy of the same math).
-enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2, ACT_SWIGLUOAI = 3 };
+enum ActKind {
+  ACT_SILU = 0,
+  ACT_GELU = 1,
+  ACT_GELU_TANH = 2,
+  ACT_SWIGLUOAI = 3,
+  ACT_RELU2 = 4,
+};
 
 inline float act_apply(int act, float x) {
   if (act == ACT_SILU) return x / (1.0f + std::exp(-x));
+  if (act == ACT_RELU2) {
+    const float y = std::max(0.0f, x);
+    return y * y;
+  }
   if (act == ACT_GELU)
     return 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752440f));
   // gelu_tanh
@@ -1477,16 +1487,17 @@ struct CpuMoeExecutor {
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
                          const float* xas) {
+    const int up_rows = act == ACT_RELU2 ? I : 2 * I;
     if (fmt == WF_BF16) {
-      const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
+      const bf16_t* w = gate_up_l + ((size_t)e * up_rows + row) * H;
       return dot(w, x, H);
     }
     if (fmt == WF_Q4_0) {
       const uint8_t* w =
-          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+          gu_packed_l + ((size_t)e * up_rows + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
-    const size_t r = (size_t)e * (2 * I) + row;
+    const size_t r = (size_t)e * up_rows + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
                      fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas);
@@ -1605,23 +1616,28 @@ struct CpuMoeExecutor {
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool relu2 = act == ACT_RELU2;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
       float gate =
           gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
-      float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
-      if (swigluoai) {
-        // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
-        // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
-        if (gate > lim) gate = lim;
-        if (up > lim) up = lim;
-        else if (up < -lim) up = -lim;
-        const float glu = gate / (1.0f + std::exp(-gate * alpha));
-        g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+      if (relu2) {
+        g_row[i] = f32_to_bf16(act_apply(act, gate));
       } else {
-        g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+        float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i,
+                             x_row, xe, xo, xi8, xas) * w_in;
+        if (swigluoai) {
+          // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
+          // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+          const float glu = gate / (1.0f + std::exp(-gate * alpha));
+          g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+        } else {
+          g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+        }
       }
     }
   }
@@ -2143,8 +2159,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
   // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI
-  // accepts id 3 without error and silently computes the wrong activation
+  // accepts a newer id without error and silently computes the wrong activation
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
-  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_RELU2); });
 }

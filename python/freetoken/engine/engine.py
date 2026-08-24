@@ -517,6 +517,16 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        # ``--num-tokens`` is resolved to num_page_override before model load.  An
+        # explicit KV geometry is a hard floor for the joint auto plan, not merely
+        # something allocated after experts greedily consume a budget that reserved
+        # only the default 8K tokens.  The latter overcommitted Ornith 200K by about
+        # 1.1 GiB and starved prefill kernels of all transient workspace.
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if config.num_page_override is not None:
+            kv_reserve_tokens = max(
+                kv_reserve_tokens, config.num_page_override * page_tokens
+            )
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -527,7 +537,7 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
@@ -551,8 +561,21 @@ class Engine:
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        pageable_gpu_layer_ids: frozenset[int] = frozenset()
+        if config.moe_pageable_gpu:
+            if config.moe_backend != "offload":
+                raise ValueError("--moe-pageable-gpu requires --moe-backend offload")
+            if cpu_layer_ids:
+                raise ValueError(
+                    "--moe-pageable-gpu cannot be combined with non-zero "
+                    "--moe-cpu-layers"
+                )
+            pageable_gpu_layer_ids = _auto_pageable_gpu_layers(
+                config, config.model_config.num_moe_layers
+            )
         if (
             not cpu_layer_ids
+            and not config.moe_pageable_gpu
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes() is not None
@@ -567,8 +590,9 @@ class Engine:
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
+        unpinned_layer_ids = cpu_layer_ids | pageable_gpu_layer_ids
         split_residency = (
-            bool(cpu_layer_ids)
+            bool(unpinned_layer_ids)
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes() is not None
         )
@@ -589,8 +613,8 @@ class Engine:
         if split_residency and config.moe_prefill_overlap:
             # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
             logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "MoE split residency: disabling prefill overlap "
+                "(unpinned layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
@@ -604,11 +628,14 @@ class Engine:
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
 
-                requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
-                    else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
-                ]
+                requested_residency = []
+                for i in range(config.model_config.num_moe_layers):
+                    if i in pageable_gpu_layer_ids:
+                        requested_residency.append(HostResidency.PAGEABLE.value)
+                    elif i in cpu_layer_ids:
+                        requested_residency.append(HostResidency.LOCKED.value)
+                    else:
+                        requested_residency.append(HostResidency.PINNED.value)
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
@@ -656,6 +683,7 @@ class Engine:
             cache.gguf_expert_types = config.model_config.gguf_expert_types
             cache.expert_hidden_size = config.model_config.hidden_size
             cache.expert_intermediate_size = config.model_config.moe_intermediate_size
+            cache.pageable_gpu = config.moe_pageable_gpu
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
@@ -1180,7 +1208,7 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
-    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai", "relu2",
 )
 
 
@@ -1246,6 +1274,40 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
     return ids
 
 
+def _auto_pageable_gpu_layers(
+    config: EngineConfig, num_moe_layers: int
+) -> frozenset[int]:
+    """Select the layers that cannot fit under the host pin quota.
+
+    Unlike :func:`_auto_cpu_layers`, these layers still decode on the GPU. Their
+    selected cache misses take a pageable -> pinned staging -> VRAM route, so only
+    the layers that overflow the quota pay the extra RAM copy.
+    """
+    from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+    if not bank_bytes:
+        return frozenset()
+    budget = _pin_budget_bytes()
+    if budget is None or bank_bytes <= budget:
+        logger.info_rank0(
+            "--moe-pageable-gpu: expert banks fit the CUDA pin budget; keeping every "
+            "layer on the direct pinned RAM -> GPU path"
+        )
+        return frozenset()
+    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
+    head = (n + 1) // 2
+    ids = frozenset(range(head)) | frozenset(
+        range(num_moe_layers - (n - head), num_moe_layers)
+    )
+    logger.info_rank0(
+        f"--moe-pageable-gpu: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
+        f"{budget / 2**30:.2f} GiB; {n} head+tail MoE layers use pageable staging "
+        f"and GPU compute ({sorted(ids)})"
+    )
+    return ids
+
+
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
@@ -1253,6 +1315,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "moe_pageable_gpu": False,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
@@ -1295,6 +1358,16 @@ def _adjust_config(config: EngineConfig):
                 f"{getattr(model_config, 'model_type', 'model')} is a dense model (no routed "
                 f"experts); ignoring MoE settings: {', '.join(dropped)}"
             )
+
+    if config.moe_pageable_gpu:
+        # Decode staging reads the device-produced LRU copy plan back to the host,
+        # gathers pageable rows into a small pinned buffer, then resumes GPU work.
+        # Those host operations cannot be replayed from a CUDA graph.
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.info_rank0(
+            "--moe-pageable-gpu: disabling CUDA graphs (pageable miss staging is eager)"
+        )
 
     if single_stream_only:
         # The model runs one sequence at a time: it collapses the batch to one row and the
@@ -1529,6 +1602,12 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
+        )
+
+    if is_moe and config.moe_pageable_gpu and config.moe_backend != "offload":
+        raise ValueError(
+            "--moe-pageable-gpu requires --moe-backend offload; it is an "
+            "all-GPU-compute alternative to CPU/hybrid decode"
         )
 
     if is_moe:

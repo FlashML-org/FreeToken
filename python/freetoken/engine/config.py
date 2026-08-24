@@ -48,6 +48,11 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # WSL fallback for expert banks that exceed the CUDA host-registration quota.
+    # Overflow layers stay pageable in RAM; decode gathers each step's misses through
+    # a small pinned staging buffer and still executes every expert on the GPU.
+    # This path is eager-only because the CPU gather cannot be CUDA-graph captured.
+    moe_pageable_gpu: bool = False
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

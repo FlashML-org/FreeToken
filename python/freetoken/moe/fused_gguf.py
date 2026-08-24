@@ -6,8 +6,8 @@ IQ1_S or IQ2_XXS, down IQ3_XXS or IQ4_XS). Because per-expert byte sizes then
 differ across layers, the banks are FLAT padded slots -- ``[num_slots,
 stride_bytes]`` uint8 with each expert's real payload in the leading bytes --
 and the kernels read them via ``expert_stride_bytes``. Geometry (quant type,
-output rows) rides in per-call arguments; MMVQ serves prefill and decode like
-the q4_0 path.
+output rows) rides in per-call arguments. Decode uses the low-latency MMVQ
+kernel; sufficiently large prefills use the grouped MMQ kernel.
 """
 
 from __future__ import annotations
@@ -32,6 +32,12 @@ _MAX_GRID_Z = 65535
 # ~1 GiB in one shot and fault asynchronously, so cap rows well below the grid limit.
 _MAX_ROWS_IN_FLIGHT = 16384
 
+# MMQ has alignment/setup overhead and its donated kernel is not safe for every
+# tiny routed batch.  On the RTX 2000 Ada used for the Qwen3.5 GGUF bring-up it
+# is already faster at 32 input tokens (Q4_K top-8: 0.61 ms vs 0.71 ms) and the
+# advantage grows to 3.1x at 2K.  Keep decode and short tails on MMVQ.
+_MMQ_MIN_TOKENS = 32
+
 
 def _moe_vec_chunked(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride):
     from freetoken.kernel.gguf import ggml_moe_a8_vec
@@ -50,6 +56,39 @@ def _moe_vec_chunked(x, weight, topk_ids, top_k, quant_type, rows, tokens, strid
             )
         )
     return torch.cat(outs, dim=0)
+
+
+def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride):
+    """Choose grouped MMQ for prefill and MMVQ for decode/small tails.
+
+    ``ggml_moe_a8`` reads experts using ``weight.stride(0)``.  A mixed-GGUF
+    bank is uint8 ``[experts, padded_slot_bytes]``, so that stride is exactly
+    the byte stride expected by the donated kernel even though the real packed
+    payload occupies only the beginning of each slot.
+    """
+    if tokens >= _MMQ_MIN_TOKENS:
+        from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
+        from freetoken.moe.fused import moe_align_block_size
+
+        block_size = ggml_moe_get_block_size(int(quant_type))
+        if block_size:
+            sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, block_size, weight.shape[0]
+            )
+            return ggml_moe_a8(
+                x,
+                weight,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                int(quant_type),
+                rows,
+                top_k,
+                tokens,
+            )
+    return _moe_vec_chunked(
+        x, weight, topk_ids, top_k, quant_type, rows, tokens, stride
+    )
 
 
 def fused_experts_gguf(
@@ -107,7 +146,7 @@ def fused_experts_gguf(
     if gate_up_type == GGML_BF16 or down_type == GGML_BF16:
         raise ValueError("mixed BF16/quantized projections within one expert layer are unsupported")
 
-    gate_up = _moe_vec_chunked(
+    gate_up = _moe_matmul(
         hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_type),
         gate_up_rows, num_tokens, gate_up_q.shape[1],
     )
@@ -116,7 +155,7 @@ def fused_experts_gguf(
     # top_k=1 call over num_tokens*top_k "tokens". topk_ids must flatten the same
     # way (row-major [num_tokens, top_k] -> contiguous [num_tokens*top_k, 1]).
     flat_ids = topk_ids.reshape(-1, 1)
-    out = _moe_vec_chunked(
+    out = _moe_matmul(
         inter, down_q, flat_ids, 1, int(down_type),
         down_rows, num_tokens * top_k, down_q.shape[1],
     )

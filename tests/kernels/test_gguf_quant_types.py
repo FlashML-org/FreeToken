@@ -127,6 +127,24 @@ def test_mmq_matches_linear(qtype):
     assert (got - ref).abs().max() <= tol
 
 
+@pytest.mark.parametrize("qtype", [GGML_Q4_K, GGML_Q5_K])
+def test_dense_gguf_prefill_uses_dequantized_cublas_result(qtype):
+    from freetoken.kernel.gguf import ggml_dequantize
+    from freetoken.layers.gguf import fused_mul_mat_gguf
+
+    block = BLOCK_SHAPE[qtype][0]
+    rows, cols, batch = 32, 2 * block, 32
+    raw = _packed_rows(qtype, rows=rows * (cols // block), seed=qtype + 70)
+    raw = np.ascontiguousarray(raw.reshape(rows, -1))
+    packed = torch.from_numpy(raw).cuda()
+    x = _randn((batch, cols), seed=qtype + 71)
+
+    got = fused_mul_mat_gguf(x, packed, qtype)
+    dense = ggml_dequantize(packed, qtype, rows, cols, x.dtype)
+    expected = x @ dense.T
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "qtype", [GGML_Q3_K, GGML_Q4_K, GGML_IQ2_S, GGML_IQ2_XXS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_XS]
 )
@@ -170,3 +188,41 @@ def test_moe_vec_expert_stride_padded_bank(qtype):
     ref = ggml_moe_a8_vec(x, dense, topk_ids, top_k, qtype, rows, 1)
     got = ggml_moe_a8_vec(x, flat, topk_ids, top_k, qtype, rows, 1, stride)
     torch.testing.assert_close(got, ref, rtol=0.0, atol=0.0)
+
+
+def test_moe_mmq_skips_capacity_block_after_live_prefix():
+    """The align buffers have spare capacity beyond ``num_tokens_post_padded``.
+
+    A launch block can start exactly at the live-prefix boundary.  It must return
+    before reading the intentionally invalid spare entries; otherwise the old
+    strict-``>`` guard uses -1 as an activation/output offset and faults.
+    """
+    from freetoken.kernel.gguf import ggml_moe_a8
+
+    qtype = GGML_Q4_K
+    cols, rows = BLOCK_SHAPE[qtype][0], 32
+    raw = _packed_rows(qtype, rows=rows, seed=91)
+    packed = torch.from_numpy(np.ascontiguousarray(raw.reshape(1, rows, -1))).cuda()
+    x = _randn((1, cols), seed=92)
+    # MMQ_X_Q4_K == 4.  The first block is the entire live aligned prefix;
+    # the second block exists only because the buffers have spare capacity.
+    sorted_ids = torch.tensor(
+        [0, 1, 1, 1, -1, -1, -1, -1], dtype=torch.int32, device="cuda"
+    )
+    expert_ids = torch.zeros((2,), dtype=torch.int32, device="cuda")
+    num_tokens_post_padded = torch.tensor([4], dtype=torch.int32, device="cuda")
+
+    got = ggml_moe_a8(
+        x,
+        packed,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        qtype,
+        rows,
+        1,
+        1,
+    )
+    torch.cuda.synchronize()
+    assert got.shape == (1, rows)
+    assert torch.isfinite(got).all()

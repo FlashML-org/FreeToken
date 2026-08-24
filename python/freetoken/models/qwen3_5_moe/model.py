@@ -108,6 +108,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+        from .gguf import convert_qwen3_5_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen3_5_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

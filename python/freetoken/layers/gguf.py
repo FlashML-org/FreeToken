@@ -55,6 +55,14 @@ _DEQUANT = {
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
 
+# The donated GGUF MMQ kernel does not use tensor cores.  For real prefill
+# batches it is much faster to dequantize the comparatively small dense weight
+# once and hand the matrix product to cuBLAS.  On sm_89 with Ornith's largest
+# Q6_K projection the crossover is 32 rows (0.40 ms vs 0.64 ms) and at 8192
+# rows it is 6.1 ms vs 132 ms.  This is transient -- packed weights remain the
+# persistent representation, so long-context KV/expert capacity is unchanged.
+_DEQUANT_GEMM_MIN_ROWS = 32
+
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type."""
@@ -72,6 +80,13 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
+        if x.shape[0] >= _DEQUANT_GEMM_MIN_ROWS:
+            block, type_size = BLOCK_SHAPE[qweight_type]
+            in_features = qweight.shape[1] // type_size * block
+            weight = ggml_dequantize(
+                qweight, qweight_type, out_features, in_features, x.dtype
+            )
+            return x @ weight.T
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _DEQUANT:
         block, type_size = BLOCK_SHAPE[qweight_type]

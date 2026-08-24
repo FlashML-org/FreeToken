@@ -164,6 +164,52 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
     assert rel < 3e-2, f"nvfp4 bs={bs} rel err {rel.item()}"
 
 
+def test_cpu_decode_nvfp4_ungated_relu2_matches_dequant_reference():
+    """Nemotron-H's single up projection (no gate half) and ReLU^2 epilogue."""
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(2718)
+    L, E, H, I, top_k, bs = 2, 8, 256, 128, 2, 3
+    cache = _make_nvfp4_cache(L, E, H, I, seed=19)
+    # The helper creates conventional [gate;up] rows; Nemotron stores just one I-row
+    # projection. Keep the first half and make every per-layer view contiguous.
+    for name in ("gate_up_packed", "gate_up_scale", "gate_up_global"):
+        cache.bank_sources[name] = [
+            tensor[:, :I].contiguous() for tensor in cache.bank_sources[name]
+        ]
+
+    dev = torch.device("cuda")
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="relu2",
+        apply_router_weight_on_input=False, num_threads=4, max_tokens=bs, device=dev,
+    )
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
+    weights = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    actual = ex.decode(1, hidden, weights, ids).float()
+    torch.cuda.synchronize()
+
+    banks = cache.bank_sources
+    slots = torch.arange(E, device=dev, dtype=torch.int32)
+    up = dequant_nvfp4(
+        banks["gate_up_packed"][1].to(dev), banks["gate_up_scale"][1].to(dev),
+        banks["gate_up_global"][1].to(dev), slots, dtype=torch.bfloat16,
+    ).float()
+    down = dequant_nvfp4(
+        banks["down_packed"][1].to(dev), banks["down_scale"][1].to(dev),
+        banks["down_global"][1].to(dev), slots, dtype=torch.bfloat16,
+    ).float()
+    reference = torch.zeros(bs, H, device=dev)
+    for token in range(bs):
+        for route in range(top_k):
+            expert = int(ids[token, route])
+            act = torch.relu(up[expert] @ hidden[token].float()).square().bfloat16().float()
+            reference[token] += float(weights[token, route]) * (down[expert] @ act)
+    rel = (actual - reference).abs().max() / (reference.abs().max() + 1e-6)
+    assert rel < 3e-2, f"nvfp4 relu2 relative error {rel.item()}"
+
+
 @pytest.mark.parametrize("bs", [1, 4])
 def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
     """MiniMax-M3's swigluoai routed experts on the CPU executor (ActKind 3 through

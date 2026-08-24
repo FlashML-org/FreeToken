@@ -729,6 +729,28 @@ def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
         )
 
 
+def test_set_bank_sources_pageable_gpu_accepts_unpinned_gpu_layer():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    cache.pageable_gpu = True
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.PINNED.value, HostResidency.PAGEABLE.value],
+    )
+
+    assert cache.cpu_layer_ids == frozenset()
+    assert cache._unpinned_layers == frozenset({1})
+
+
 def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
     # prefill overlap DMAs from registered banks; a LOCKED layer cannot feed it
     from freetoken.moe.host_banks import HostResidency

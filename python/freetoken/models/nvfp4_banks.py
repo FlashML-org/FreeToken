@@ -22,6 +22,12 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
+    # Conventional MoEs concatenate gate|up (2I rows). Nemotron-H has one ungated
+    # up projection (I rows) followed by ReLU^2.
+    gated: bool = True
+    # Optional ModelConfig attribute holding the expert input/output width.  The
+    # residual hidden_size remains unchanged for the rest of the model.
+    hidden_size_attr: str | None = None
 
 
 def _num_moe_layers(config) -> int:
@@ -44,7 +50,7 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
-def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
+def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int, *, gated: bool = True):
     """6 NVFP4 source banks, one ``[E, ...]`` tensor per layer (independent allocations),
     unpinned (pin-after-fill): register only after fill to skip cudaHostAlloc's slow
     commit. Caller fills each layer's ``.tensor`` then pins it (per-layer, via
@@ -53,9 +59,9 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
 
     fp8 = torch.float8_e4m3fn
     return alloc_layer_banks({
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 16), fp8),
-        "gate_up_global": ((E, 2 * I), torch.float16),
+        "gate_up_packed": ((E, (2 if gated else 1) * I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, (2 if gated else 1) * I, H // 16), fp8),
+        "gate_up_global": ((E, (2 if gated else 1) * I), torch.float16),
         "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), fp8),
         "down_global": ((E, H), torch.float16),
@@ -92,7 +98,7 @@ def load_nvfp4_expert_source_banks(
         weight_map = json.load(f)["weight_map"]
 
     E = config.num_experts
-    H = config.hidden_size
+    H = getattr(config, spec.hidden_size_attr) if spec.hidden_size_attr else config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
 
@@ -133,7 +139,7 @@ def load_nvfp4_expert_source_banks(
                 globals_map[key] = f.get_tensor(name).to(torch.float16)
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, gated=spec.gated)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -144,7 +150,8 @@ def load_nvfp4_expert_source_banks(
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
     def _load(sink) -> int:
-        tracker = LayerCompletionTracker(E * 6, _hb, sink)
+        tensors_per_expert = 6 if spec.gated else 4
+        tracker = LayerCompletionTracker(E * tensors_per_expert, _hb, sink)
         placed = 0
         for shard in tqdm(sorted(weight_shards), desc=f"Loading {spec.desc}", disable=not primary):
             path = os.path.join(folder, shard)
@@ -160,7 +167,10 @@ def load_nvfp4_expert_source_banks(
                         if role == "gate":
                             gate_up_packed[bank_layer_id][expert, :I] = tensor
                         elif role == "up":
-                            gate_up_packed[bank_layer_id][expert, I:] = tensor
+                            if spec.gated:
+                                gate_up_packed[bank_layer_id][expert, I:] = tensor
+                            else:
+                                gate_up_packed[bank_layer_id][expert] = tensor
                         elif role == "down":
                             down_packed[bank_layer_id][expert] = tensor
                         else:
@@ -171,8 +181,12 @@ def load_nvfp4_expert_source_banks(
                             gate_up_scale[bank_layer_id][expert, :I] = tensor
                             gate_up_global[bank_layer_id][expert, :I] = global_scale
                         elif role == "up":
-                            gate_up_scale[bank_layer_id][expert, I:] = tensor
-                            gate_up_global[bank_layer_id][expert, I:] = global_scale
+                            if spec.gated:
+                                gate_up_scale[bank_layer_id][expert, I:] = tensor
+                                gate_up_global[bank_layer_id][expert, I:] = global_scale
+                            else:
+                                gate_up_scale[bank_layer_id][expert] = tensor
+                                gate_up_global[bank_layer_id][expert] = global_scale
                         elif role == "down":
                             down_scale[bank_layer_id][expert] = tensor
                             down_global[bank_layer_id][expert] = global_scale
@@ -189,7 +203,7 @@ def load_nvfp4_expert_source_banks(
         with PinPipeline() as pins:
             placed = _load(pins)
 
-    expected = num_layers * E * 6
+    expected = num_layers * E * (6 if spec.gated else 4)
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
     return {
         "gate_up_packed": gate_up_packed,
@@ -223,7 +237,7 @@ def load_nvfp4_expert_source_banks_parallel(
         weight_map = json.load(f)["weight_map"]
 
     E = config.num_experts
-    H = config.hidden_size
+    H = getattr(config, spec.hidden_size_attr) if spec.hidden_size_attr else config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
 
@@ -257,7 +271,7 @@ def load_nvfp4_expert_source_banks_parallel(
                 )
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, gated=spec.gated)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -269,7 +283,8 @@ def load_nvfp4_expert_source_banks_parallel(
 
     # Pass 2: bulk weight/weight_scale via the common parallel reader; place by name.
     def _load(sink) -> int:
-        tracker = LayerCompletionTracker(E * 6, _hb, sink)
+        tensors_per_expert = 6 if spec.gated else 4
+        tracker = LayerCompletionTracker(E * tensors_per_expert, _hb, sink)
         placed = 0
         for name, tensor in iter_expert_tensors_parallel(
             folder, lambda n: n in weight_info, workers=workers, chunk=chunk
@@ -284,7 +299,10 @@ def load_nvfp4_expert_source_banks_parallel(
                 if role == "gate":
                     gate_up_packed[bank_layer_id][expert, :I] = tensor
                 elif role == "up":
-                    gate_up_packed[bank_layer_id][expert, I:] = tensor
+                    if spec.gated:
+                        gate_up_packed[bank_layer_id][expert, I:] = tensor
+                    else:
+                        gate_up_packed[bank_layer_id][expert] = tensor
                 else:
                     down_packed[bank_layer_id][expert] = tensor
             else:
@@ -293,8 +311,12 @@ def load_nvfp4_expert_source_banks_parallel(
                     gate_up_scale[bank_layer_id][expert, :I] = tensor
                     gate_up_global[bank_layer_id][expert, :I] = g
                 elif role == "up":
-                    gate_up_scale[bank_layer_id][expert, I:] = tensor
-                    gate_up_global[bank_layer_id][expert, I:] = g
+                    if spec.gated:
+                        gate_up_scale[bank_layer_id][expert, I:] = tensor
+                        gate_up_global[bank_layer_id][expert, I:] = g
+                    else:
+                        gate_up_scale[bank_layer_id][expert] = tensor
+                        gate_up_global[bank_layer_id][expert] = g
                 else:
                     down_scale[bank_layer_id][expert] = tensor
                     down_global[bank_layer_id][expert] = g
@@ -308,7 +330,7 @@ def load_nvfp4_expert_source_banks_parallel(
         with PinPipeline() as pins:
             placed = _load(pins)
 
-    expected = num_layers * E * 6
+    expected = num_layers * E * (6 if spec.gated else 4)
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
     return {
         "gate_up_packed": gate_up_packed,

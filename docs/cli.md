@@ -68,6 +68,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
+| `--moe-pageable-gpu` | off | On WSL pin-quota overflow, stage selected misses through a bounded pinned buffer so all expert math remains on GPU (disables CUDA graphs and prefill overlap) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
@@ -153,4 +154,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

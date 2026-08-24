@@ -15,7 +15,13 @@ from .reader import gguf_architecture, load_gguf_metadata
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 # laguna ships a plain gpt2-style BPE (tokenizer.ggml.model = "gpt2"); transformers
 # has no "laguna" converter, so route it to the gpt2 one.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "laguna": "gpt2"}
+_TOKENIZER_ARCH = {
+    "gemma4": "gemma4_text",
+    "laguna": "gpt2",
+    # Qwen3.5-MoE retains Qwen3's tokenizer; only the model architecture label
+    # changed in llama.cpp. Transformers has no qwen35moe converter key.
+    "qwen35moe": "qwen3_moe",
+}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -50,7 +56,10 @@ def load_gguf_tokenizer(model_path: str):
         tokenizer_object=fast,
         bos_token=tok_for("bos_token_id", "<bos>"),
         eos_token=turn_end or tok_for("eos_token_id", "<eos>"),
-        unk_token=tok_for("unknown_token_id", "<unk>"),
+        # Qwen has no unknown token. Adding a synthetic <unk> would create id
+        # ``vocab_size`` (one beyond the embedding table) for genuinely unknown
+        # input, turning a tokenizer fallback into an out-of-bounds lookup.
+        unk_token=None if arch == "qwen35moe" else tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
     chat_template = meta.get("tokenizer.chat_template")

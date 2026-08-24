@@ -464,7 +464,9 @@ def bank_bytes_estimate(model_config) -> int | None:
     per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     layers = getattr(model_config, "num_moe_layers", None)
     experts = getattr(model_config, "num_experts", None)
-    hidden = getattr(model_config, "hidden_size", None)
+    hidden = getattr(model_config, "expert_hidden_size", None) or getattr(
+        model_config, "hidden_size", None
+    )
     inter = getattr(model_config, "moe_intermediate_size", None)
     if fmt == "laguna_int4" and all((experts, hidden, inter)):
         from freetoken.models.gguf.dequant import GGML_BF16, GGML_Q4_0, row_bytes
@@ -486,6 +488,11 @@ def bank_bytes_estimate(model_config) -> int | None:
             )
     if per_expert is None or not all((layers, experts, hidden, inter)):
         return None
+    if fmt == "nvfp4" and not getattr(model_config, "expert_gated", True):
+        # One up matrix (I x H), not gate|up (2I x H).
+        one_up = inter * (hidden // 2 + hidden // 16 + 2)
+        down = hidden * (inter // 2 + inter // 16 + 2)
+        return layers * experts * (one_up + down)
     return layers * experts * per_expert(hidden, inter)
 
 

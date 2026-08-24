@@ -148,6 +148,10 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        # Nemotron-3 Super ships the Qwen3-Coder XML tool grammar
+        # (<tool_call><function=...><parameter=...>) in its chat template.
+        if any(tag in marker for tag in ("nemotron-3", "nemotron_3", "nemotronh")):
+            return "qwen3_coder"
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
@@ -185,6 +189,9 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        # Nemotron-3 Super's generation prompt opens an implicit <think> block.
+        if any(tag in marker for tag in ("nemotron-3", "nemotron_3", "nemotronh")):
+            return "qwen3"
         if "deepseek" in marker and any(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
@@ -572,6 +579,18 @@ def parse_args(
             "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
             "layers when the banks exceed the pin budget, none otherwise); '0' "
             "forces all layers on GPU."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-pageable-gpu",
+        action="store_true",
+        default=ServerArgs.moe_pageable_gpu,
+        help=(
+            "On hosts with a CUDA pinning quota (notably WSL), keep expert-bank "
+            "overflow layers pageable and stage only routed cache misses through a "
+            "small pinned buffer. All expert math remains on GPU, at the cost of "
+            "eager decode and an extra RAM copy for overflow layers."
         ),
     )
 

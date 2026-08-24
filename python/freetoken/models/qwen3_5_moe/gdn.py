@@ -218,7 +218,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
-        return self.out_proj.forward(out)
+        out = self.out_proj.forward(out)
+        return out
 
 
 __all__ = ["Qwen3_5GatedDeltaNet"]

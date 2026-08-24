@@ -66,6 +66,7 @@ _ACT_IDS = {
     "gelu_pytorch_tanh": 2,
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
+    "relu2": 4,
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
@@ -170,6 +171,8 @@ class CpuMoeExecutor:
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
+        if activation == "relu2" and fmt != "nvfp4":
+            raise NotImplementedError("CPU ReLU^2 experts currently require native NVFP4 banks")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
@@ -194,7 +197,9 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        ptrs, (self.H, self.I) = self._resolve_banks(
+            cache.bank_sources, fmt, activation=activation
+        )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -335,7 +340,9 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
+    def _resolve_banks(
+        self, banks: dict, fmt: str, *, activation: str
+    ) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
@@ -382,14 +389,15 @@ class CpuMoeExecutor:
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
         assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
         assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
-        I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
-        assert gup[0].shape[1] == 2 * I
+        I = int(dnp[0].shape[2] * 2)
+        expected_up_rows = I if activation == "relu2" else 2 * I
+        assert gup[0].shape[1] == expected_up_rows
         assert H % 16 == 0 and I % 16 == 0, (H, I)
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
-        assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
+        assert tuple(gus[0].shape[1:]) == (expected_up_rows, H // 16), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 16), (dns[0].shape, H, I)
-        assert tuple(gug[0].shape[1:]) == (2 * I,) and tuple(dng[0].shape[1:]) == (H,)
+        assert tuple(gug[0].shape[1:]) == (expected_up_rows,) and tuple(dng[0].shape[1:]) == (H,)
         ptrs = dict(
             gate_up_ptr=self._make_table(gup).data_ptr(),
             down_ptr=self._make_table(dnp).data_ptr(),

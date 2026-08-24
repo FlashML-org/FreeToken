@@ -19,6 +19,9 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "laguna": "LagunaGGUFForCausalLM",
+    # llama.cpp's name for Qwen3.5-MoE.  Ornith-1.5-35B-A3B is a text-only
+    # fine-tune of this architecture (40 decoder layers plus one MTP layer).
+    "qwen35moe": "Qwen3_5MoeGGUFForConditionalGeneration",
 }
 
 

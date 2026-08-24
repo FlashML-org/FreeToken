@@ -426,6 +426,7 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32
     cache_indices: torch.Tensor,      # [batch] int32
     has_initial_state: torch.Tensor,  # [batch] bool
+    bias: torch.Tensor | None = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     max_seq_len: Optional[int] = None,
@@ -478,7 +479,7 @@ def causal_conv1d_varlen(
     _causal_conv1d_fwd_tiled_kernel[grid](
         x,
         weight,
-        None,
+        bias,
         conv_states,
         cache_indices,
         has_initial_state,
@@ -499,7 +500,7 @@ def causal_conv1d_varlen(
         stride_o_dim,
         stride_o_token,
         pad_slot_id,
-        HAS_BIAS=False,
+        HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         HAS_INITIAL_STATES=has_initial_state is not None,
@@ -522,6 +523,7 @@ def causal_conv1d_decode(
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
     weight: torch.Tensor,           # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32
+    bias: torch.Tensor | None = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
@@ -550,7 +552,7 @@ def causal_conv1d_decode(
     _causal_conv1d_update_kernel[grid](
         x,
         weight,
-        None,
+        bias,
         conv_state,
         conv_state_indices,
         out,
@@ -572,7 +574,7 @@ def causal_conv1d_decode(
         stride_o_dim,
         stride_o_token,
         pad_slot_id,
-        HAS_BIAS=False,
+        HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
@@ -607,13 +609,12 @@ def causal_conv1d_fn(
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with fused silu; conv_states updated
     in place; returns a fresh output tensor. Adapts the vendored-op signature to the
-    tuned causal_conv1d_varlen. ``bias`` must be None (the tuned kernel is bias-free).
+    tuned causal_conv1d_varlen.
 
     query_start_loc: (batch+1) int32 cumulative seqlens.
     seq_lens_cpu: host-side per-request lengths (a Python list) -> batch / max_seq_len
         without a device->host sync.
     """
-    assert bias is None, "tuned triton causal_conv1d_fn does not support bias"
     batch = len(seq_lens_cpu)
     max_seq_len = int(max(seq_lens_cpu)) if batch else 0
     return causal_conv1d_varlen(
@@ -623,6 +624,7 @@ def causal_conv1d_fn(
         query_start_loc,
         cache_indices,
         has_initial_state,
+        bias=bias,
         activation=activation,
         pad_slot_id=pad_slot_id,
         max_seq_len=max_seq_len,
@@ -648,7 +650,6 @@ def causal_conv1d_update(
     Accepts x as (batch, dim) or (batch, dim, 1) and returns the matching rank
     (kernel/causal_conv1d.py passes the 3D form and squeezes the result).
     """
-    assert bias is None, "tuned triton causal_conv1d_update does not support bias"
     assert cache_seqlens is None, "circular-buffer cache_seqlens not supported"
     if isinstance(activation, bool):
         activation = "silu" if activation else None
@@ -663,6 +664,7 @@ def causal_conv1d_update(
         conv_state,
         weight,
         conv_state_indices,
+        bias=bias,
         activation=activation,
         pad_slot_id=pad_slot_id,
     )  # [batch, dim]

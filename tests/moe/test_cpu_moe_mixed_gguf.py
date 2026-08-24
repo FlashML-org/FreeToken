@@ -6,6 +6,68 @@ import pytest
 import torch
 
 
+def test_mixed_gguf_prefill_dispatches_to_grouped_mmq(monkeypatch):
+    import freetoken.kernel.gguf as kernel
+    import freetoken.moe.fused as fused
+    import freetoken.moe.fused_gguf as mod
+
+    calls = []
+    sentinel = torch.empty(1)
+    monkeypatch.setattr(kernel, "ggml_moe_get_block_size", lambda _qtype: 4)
+    monkeypatch.setattr(
+        fused,
+        "moe_align_block_size",
+        lambda ids, block, experts: (
+            calls.append(("align", block, experts)) or torch.empty(1, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        kernel,
+        "ggml_moe_a8",
+        lambda *args: calls.append(("mmq", args[-2], args[-1])) or sentinel,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_moe_vec_chunked",
+        lambda *args: calls.append(("mmvq", args[-3], args[-2])) or sentinel,
+    )
+
+    x = torch.empty(32, 64)
+    weight = torch.empty(256, 1024, dtype=torch.uint8)
+    ids = torch.zeros(32, 8, dtype=torch.int32)
+    got = mod._moe_matmul(x, weight, ids, 8, 12, 128, 32, 1024)
+
+    assert got is sentinel
+    assert calls == [("align", 4, 256), ("mmq", 8, 32)]
+
+
+def test_mixed_gguf_decode_stays_on_mmvq(monkeypatch):
+    import freetoken.moe.fused_gguf as mod
+
+    calls = []
+    sentinel = torch.empty(1)
+    monkeypatch.setattr(
+        mod,
+        "_moe_vec_chunked",
+        lambda *args: calls.append((args[3], args[4])) or sentinel,
+    )
+    got = mod._moe_matmul(
+        torch.empty(1, 64),
+        torch.empty(256, 1024, dtype=torch.uint8),
+        torch.zeros(1, 8, dtype=torch.int32),
+        8,
+        12,
+        128,
+        1,
+        1024,
+    )
+
+    assert got is sentinel
+    assert calls == [(8, 12)]
+
+
 def test_mixed_gguf_cpu_executor_builds_zero_copy_views_and_dispatches(monkeypatch):
     import freetoken.moe.cpu_executor as mod
     from freetoken.models.gguf.dequant import GGML_BF16, GGML_Q4_0, row_bytes

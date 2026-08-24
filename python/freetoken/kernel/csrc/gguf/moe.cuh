@@ -43,6 +43,15 @@ static __device__ __forceinline__ void moe_q(
 
   const auto col_dst_0 = blockIdx.y * mmq_x;
 
+  // ``sorted_token_ids`` is capacity-sized, while num_tokens_post_padded is the
+  // live aligned prefix.  The launch grid is built from that capacity and can
+  // therefore contain one block beginning exactly at the end of the live prefix.
+  // Reject it before reading its uninitialized token/expert entries.  The old
+  // strict-``>`` check ran that block and could use a negative garbage token id as
+  // an input/output offset (observed as an illegal access in Qwen3.5-MoE's 128-token
+  // prefill warmup).
+  if (col_dst_0 >= num_tokens_post_padded[0]) return;
+
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
@@ -50,7 +59,6 @@ static __device__ __forceinline__ void moe_q(
 
   const int exp_idx = expert_ids[blockIdx.y];
   if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
