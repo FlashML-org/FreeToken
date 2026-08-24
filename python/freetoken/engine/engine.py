@@ -296,13 +296,19 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
-        from freetoken.gpu_select import bind_assigned_gpu
-
-        self.device = bind_assigned_gpu(config.tp_info.rank)
+        # --- OR-switch device resolution (cpu-device branch) -------------------
+        # Prefer CUDA, fall back to CPU so the engine boots on GPU-less hardware.
+        # Resolves the upstream main change (bind_assigned_gpu) which hard-requires CUDA.
+        from freetoken.engine.device_switch import resolve_device, make_stream, guard_cuda
+        self.device = resolve_device(config.tp_info.rank)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        self.stream = make_stream(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.set_stream(self.stream)
+        self._backend_tag = guard_cuda()
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
