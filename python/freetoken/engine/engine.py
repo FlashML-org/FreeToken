@@ -491,7 +491,6 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
-            gguf_expert_types=banks.gguf_expert_types,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
