@@ -23,6 +23,13 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+# K-quants: the "_M"/"_S" mixtures a q4_K_M / q6_K llama GGUF is built from. Q4_K/Q5_K
+# are the packed layouts the borrowed ggml CUDA kernels dequantize on the fly (the CPU
+# reference dequant below only implements the ones a load actually materializes on host:
+# F32/F16 norms and Q4_0/Q6_K); the block metadata here is what row_bytes / GGUFLinear
+# need to size the packed buffers.
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +40,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +51,8 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -143,6 +154,8 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",

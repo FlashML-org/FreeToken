@@ -22,6 +22,8 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -29,12 +31,15 @@ from freetoken.models.gguf.dequant import (
 
 from .base import BaseOP
 
-# ggml type groups for kernel dispatch (subset we build kernels for).
+# ggml type groups for kernel dispatch (subset we build kernels for). The borrowed ggml
+# CUDA kernels dispatch on the ggml type at runtime (mmvq.cuh/mmq.cuh cover Q4_0/Q8_0 and
+# the K-quants Q4_K/Q5_K/Q6_K), so the Q4_K/Q6_K mixture of a q4_K_M llama GGUF runs
+# natively -- no bf16 copy of the projection weights.
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6

@@ -12,8 +12,9 @@ from typing import Any
 
 from .reader import gguf_architecture, load_gguf_metadata
 
-# GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+# GGUF architecture -> transformers GGUF tokenizer-converter key. (llama's converter key
+# is just "llama"; listed explicitly even though it equals the arch and would fall through.)
+_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "llama": "llama"}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -23,6 +24,12 @@ def load_gguf_tokenizer(model_path: str):
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
     conv_arch = _TOKENIZER_ARCH.get(arch, arch)
+    # A single architecture can ship different tokenizers: Llama-2 uses SentencePiece
+    # ("llama"), Llama-3 uses byte-BPE ("gpt2"/tiktoken). transformers' llama converter
+    # mangles the byte-BPE one (drops spaces, mis-splits tokens), so trust the GGUF's own
+    # declared tokenizer model and route byte-BPE to the gpt2 converter.
+    if conv_arch == "llama" and meta.get("tokenizer.ggml.model") == "gpt2":
+        conv_arch = "gpt2"
     tok_dict: dict[str, Any] = {
         k[len("tokenizer.ggml.") :]: v
         for k, v in meta.items()

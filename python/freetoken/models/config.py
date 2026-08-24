@@ -284,6 +284,12 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # Native-GGUF dense projections: {freetoken_module_base -> ggml_type} for every packed
+    # weight (attention q/k/v/o, MLP gate/up/down, token embedding). Unlike gemma4's pure
+    # Q4_0 GGUFs, a q4_K_M checkpoint mixes per-tensor K-quant types (Q4_K projections with
+    # Q6_K on some attn_v/ffn_down), so the module-swap can't hardcode one type -- it reads
+    # each tensor's type from here. Set by a GGUF parse_config; None for safetensors models.
+    gguf_quant_types: dict[str, int] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
