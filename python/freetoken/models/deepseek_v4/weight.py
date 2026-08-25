@@ -368,7 +368,7 @@ def _place_dsfp4(
 
 def load_dsfp4_expert_sources_parallel(
     model_path: str, args: DeepseekV4Args, *, workers: int = 8, chunk: int = 8 << 20,
-    layer_sink=None,
+    prefetch: int = 2, layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel path: same banks as load_dsfp4_expert_sources, filled from the common
     chunked multi-threaded O_DIRECT reader instead of serial per-shard safe_open.
@@ -388,7 +388,9 @@ def load_dsfp4_expert_sources_parallel(
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)
         placed = 0
-        for name, t in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
+        for name, t in iter_expert_tensors_parallel(
+            model_path, _is_expert, workers=workers, chunk=chunk, prefetch=prefetch
+        ):
             layer = _place_dsfp4(banks, _expert_key(name, args), t, I, i_lo)
             tracker.note(layer)
             placed += 1

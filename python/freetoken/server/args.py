@@ -507,6 +507,15 @@ def parse_args(
             "low-memory reclaimable read (slower); 'parallel' forces the fast read."
         ),
     )
+    parser.add_argument(
+        "--expert-prefetch",
+        type=_positive_int,
+        default=ServerArgs.expert_prefetch,
+        help=(
+            "Whole checkpoint shards queued ahead of placement by parallel expert "
+            "loading (default: 2). Use 1 on host-memory-constrained TP deployments."
+        ),
+    )
 
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(

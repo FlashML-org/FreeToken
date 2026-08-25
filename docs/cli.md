@@ -82,6 +82,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
+| `--expert-load` / `--expert-prefetch` | auto / 2 | Expert-bank reader; parallel prefetch controls whole shards queued ahead of placement (use 1 to reduce TP host-RAM peak) |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
