@@ -3,7 +3,7 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = ["setuptools>=77", "torch>=2.13,<2.14", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -51,13 +51,14 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
-    # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
-    # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
+    # floor: 2.13 contains the SM89 row-wise FP8 hang fix.
+    # ceiling: sglang-kernel 0.4.6.post1 is built against the PyTorch 2.13 ABI.
+    # PyPI's torch 2.13.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
+    "torch>=2.13,<2.14",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
-    "triton==3.6.0; platform_system == 'Linux'",
+    "triton==3.7.1; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 
@@ -76,7 +77,7 @@ dev = ["pytest>=6.0"]
 # `freetoken[accel]` for the full native fast path.
 fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
-sgl = ["sglang-kernel==0.4.5"]
+sgl = ["sglang-kernel==0.4.6.post1"]
 accel = ["freetoken[fi,sgl]"]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
@@ -85,7 +86,7 @@ accel = ["freetoken[fi,sgl]"]
 # in a dedicated environment when you specifically need the Marlin path.
 
 # uv-only provenance pins — pip ignores this section and resolves from PyPI, which
-# works: PyPI's torch 2.11.0 and sglang-kernel 0.4.5 are the same cu130 builds these
+# works: PyPI's torch 2.13.0 and sglang-kernel 0.4.6.post1 are the cu130 builds these
 # indexes serve. `explicit = true` scopes each index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
