@@ -314,6 +314,20 @@ def test_decode_triton_attention_matches_reference(
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
+def test_decode_launch_config_selects_ornith_int4_tuning_only():
+    from freetoken.kernel.triton.attention import decode_launch_config
+
+    assert decode_launch_config(
+        quant_name="int4", head_dim=256, num_q_heads=16, num_kv_heads=2
+    ) == (32, 16, 8)
+    assert decode_launch_config(
+        quant_name=None, head_dim=256, num_q_heads=16, num_kv_heads=2
+    ) == (8, 32, 4)
+    assert decode_launch_config(
+        quant_name="int4", head_dim=256, num_q_heads=24, num_kv_heads=4
+    ) == (8, 32, 4)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), [(24, 4), (20, 4), (28, 4)])
 def test_decode_triton_attention_non_pow2_group(num_q_heads: int, num_kv_heads: int):

@@ -46,9 +46,24 @@ def fused_topk(
 
     from freetoken.kernel.backend import is_triton_kernels_installed
 
-    # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
-    # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
+    # Renormalized routing has an in-tree one-program-per-token Triton kernel (originally
+    # added for GPT-OSS, but mathematically generic): softmax over the selected logits is
+    # exactly softmax-over-all -> top-k -> renormalize. Use it for Qwen/Ornith too instead
+    # of materializing the full probability matrix through several Torch launches.
     if not is_triton_kernels_installed():
+        if (
+            renormalize
+            and gating_output.is_cuda
+            and gating_output.shape[-1] <= 1024
+        ):
+            from freetoken.kernel.moe_impl import gpt_oss_fused_routing
+
+            topk_weights, topk_ids = gpt_oss_fused_routing(gating_output, topk)
+            if num_token_non_padded is not None:
+                indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+                topk_ids[indices >= num_token_non_padded, :] = -1
+            return topk_weights, topk_ids
+
         global _warned_torch_topk
         if not _warned_torch_topk:
             _warned_torch_topk = True

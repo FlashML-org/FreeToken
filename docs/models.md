@@ -56,7 +56,11 @@ work too.
   --moe-backend offload --moe-cache-size 5000 --max-prefill-length 8192
   --memory-ratio 0.95`. On the RTX 2000 Ada/WSL test host, cold 32K TTFT was
   51.1 s at 8K chunks versus 54.6 s at 16K; `--moe-prefill-hit-d2d` was slower
-  on this stack and should remain disabled.
+  on this stack and should remain disabled. Install the optional SGLang kernel
+  (`freetoken[sgl]`) for faster expert-route alignment. With the sm_89 INT4
+  attention tuning, progressive-context decode measured 40.7 tok/s at 65K,
+  39.1 at 100K, 35.3 at 140K, and 33.7 at 170K; the 140K-to-170K extension
+  reached first token in 113.4 s.
 - Nemotron 3 Super uses its native hybrid Mamba-2 / full-attention / latent-MoE
   architecture. The NVFP4 release needs about 60 GiB of host RAM for expert banks and
   10.3 GiB of resident GPU weights. FreeToken currently serves one concurrent Nemotron
