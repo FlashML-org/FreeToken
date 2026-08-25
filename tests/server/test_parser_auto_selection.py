@@ -79,6 +79,27 @@ def test_only_the_families_without_a_tool_format_get_the_generic_fallback():
     assert fell_through == NO_DEDICATED_TOOL_FORMAT
 
 
+def test_laguna_uses_poolside_v1_for_reasoning_and_tools():
+    assert _inferred("LagunaGGUFForCausalLM") == ("poolside_v1", "poolside_v1")
+
+
+def test_explicit_poolside_choices_are_accepted():
+    config = _Config({"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--tool-call-parser",
+                "poolside_v1",
+                "--reasoning-parser",
+                "poolside_v1",
+            ]
+        )
+    assert args.tool_call_parser == "poolside_v1"
+    assert args.reasoning_parser == "poolside_v1"
+
+
 def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     """The cascade matches substrings in order, so the specific arm has to come first: a bare
     ``"qwen" -> qwen25`` reached earlier would swallow every later Qwen and lose its tool format."""

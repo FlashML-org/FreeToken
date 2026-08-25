@@ -75,6 +75,9 @@ CALL_BLOCKS = {
     "glm47": (
         "<tool_call>read<arg_key>filePath</arg_key><arg_value>/tmp/test_calc.py</arg_value></tool_call>"
     ),
+    "poolside_v1": (
+        "<tool_call>read<arg_key>filePath</arg_key><arg_value>/tmp/test_calc.py</arg_value></tool_call>"
+    ),
     "gemma4": '<|tool_call>call:read{filePath:<|"|>/tmp/test_calc.py<|"|>}<tool_call|>',
     "minimax": (
         '<minimax:tool_call><invoke name="read"><parameter name="filePath">'
@@ -107,6 +110,7 @@ MARKUP_MARKERS = {
     "qwen25": ["<tool_call>", "</tool_call>"],
     "qwen3_coder": ["<tool_call>", "<function="],
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
+    "poolside_v1": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
     "minimax": ["<minimax:tool_call>", "<invoke"],
     "minimax_m3": ["]<]minimax[>[", "<invoke"],
@@ -124,6 +128,7 @@ REASONING_FAMILIES = {
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
     "qwen": ("qwen25", "qwen3", "", "</think>"),
     "glm4.7": ("glm47", "glm", "", "</think>"),
+    "laguna": ("poolside_v1", "poolside_v1", "", "</think>"),
     "minimax-m2": ("minimax", "minimax", "", "</think>"),
     # M3 adaptive mode: the model opens <mm:think> itself (enabled mode pre-opens it
     # in the template; the parser then runs with force_reasoning=True instead).
@@ -428,6 +433,9 @@ ARGS_STREAMING_BLOCKS = {
     "glm47": (
         f"<tool_call>read<arg_key>filePath</arg_key><arg_value>{LONG_VALUE}</arg_value></tool_call>"
     ),
+    "poolside_v1": (
+        f"<tool_call>read<arg_key>filePath</arg_key><arg_value>{LONG_VALUE}</arg_value></tool_call>"
+    ),
     "gemma4": f'<|tool_call>call:read{{filePath:<|"|>{LONG_VALUE}<|"|>}}<tool_call|>',
     "minimax": (
         f'<minimax:tool_call><invoke name="read"><parameter name="filePath">{LONG_VALUE}'
@@ -664,7 +672,7 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 
 @pytest.mark.parametrize(
     "family",
-    ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
+    ["qwen25", "qwen3_coder", "glm47", "poolside_v1", "gemma4", "minimax", "minimax_m3",
      "deepseekv32", "gpt_oss", "muse_glimmer"],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
