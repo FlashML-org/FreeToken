@@ -304,11 +304,24 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        # Paged KV storage dtype (may be fp8 via --kv-dtype); queries/activations stay self.dtype.
+        self.kv_dtype = config.resolved_kv_dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        # fp8 KV cache is implemented for the full-attention (MHA) pool only: the fp8 store-quantize
+        # lives in MHAKVCache.store_kv, and other pools (SWA/MLA/DSA/...) would byte-copy bf16 into
+        # fp8 slabs and corrupt KV. Reject the unsupported combination up front with a clear error.
+        if self.kv_dtype != self.dtype:
+            from freetoken.kvcache.mha_pool import MHAKVCache
+
+            if self._pool_cls is not MHAKVCache:
+                raise NotImplementedError(
+                    f"--kv-dtype {self.kv_dtype} (fp8 KV cache) is only supported for full-attention "
+                    f"(MHA) models; this model uses {self._pool_cls.__name__}."
+                )
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -347,7 +360,7 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=self.kv_dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -381,9 +394,23 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
+        # Query/activation dtype for attention (the fp8-KV path needs it distinct from the KV
+        # storage dtype); backends read it off the global context in their constructors.
+        self.ctx.compute_dtype = self.dtype
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        # The fp8 dequant-on-read (q_data_type bf16 / kv_data_type fp8 in plan()) lives in the
+        # FlashInfer backend; other backends would read the fp8 slabs as bf16. Require fi for fp8 KV.
+        if self.kv_dtype != self.dtype:
+            from freetoken.attention.fi import FlashInferBackend
+
+            if not isinstance(self.attn_backend, FlashInferBackend):
+                raise NotImplementedError(
+                    f"--kv-dtype {self.kv_dtype} (fp8 KV cache) requires the FlashInfer (fi) "
+                    f"attention backend; resolved backend is {type(self.attn_backend).__name__} "
+                    f"(pass --attention-backend fi)."
+                )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 

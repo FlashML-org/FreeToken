@@ -127,6 +127,13 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        # fp8 KV cache: quantize the incoming bf16 k/v to the pool dtype here (scale 1.0 --
+        # post-RoPE k/v magnitudes sit well inside e4m3/e5m2 range), so store_cache stays a
+        # same-width byte copy and the fp8 attention kernels dequantize on read.
+        buf_dtype = self._kv_buffer.dtype
+        if k.dtype != buf_dtype:
+            k = k.to(buf_dtype)
+            v = v.to(buf_dtype)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
