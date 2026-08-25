@@ -6,13 +6,24 @@ if TYPE_CHECKING:
     import torch
 
 
+def _triton_importable() -> bool:
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
         from flashinfer import silu_and_mul
-    else:
+    elif _triton_importable():
         from freetoken.kernel.triton.activation import silu_and_mul
+    else:
+        from freetoken.kernel.torch_fallback import silu_and_mul
 
     return silu_and_mul(x, out=out)
 
@@ -22,8 +33,10 @@ def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
     if is_flashinfer_installed():
         from flashinfer import gelu_and_mul
-    else:
+    elif _triton_importable():
         from freetoken.kernel.triton.activation import gelu_and_mul
+    else:
+        from freetoken.kernel.torch_fallback import gelu_and_mul
 
     return gelu_and_mul(x, out=out)
 
@@ -34,8 +47,10 @@ def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
     if is_flashinfer_installed():
         from flashinfer import gelu_tanh_and_mul
-    else:
+    elif _triton_importable():
         from freetoken.kernel.triton.activation import gelu_tanh_and_mul
+    else:
+        from freetoken.kernel.torch_fallback import gelu_tanh_and_mul
 
     return gelu_tanh_and_mul(x, out=out)
 

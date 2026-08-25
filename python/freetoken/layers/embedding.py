@@ -111,6 +111,13 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
+        if batch.is_prefill:
+            try:
+                from freetoken.models.qwen3 import probe_state as _ps
+                if _ps.PROBE_LAYERS and batch.positions is not None:
+                    _ps.record_lmhead(batch.positions[-1:], logits[-1:])
+            except Exception:
+                pass
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

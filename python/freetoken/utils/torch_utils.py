@@ -21,6 +21,18 @@ def torch_dtype(dtype: torch.dtype):
 
 
 def nvtx_annotate(name: str, layer_id_field: str | None = None):
+    # NVTX profiling is CUDA-only. On a CPU-only build (no NVIDIA toolkit) return a
+    # pass-through decorator so annotated functions run un-instrumented.
+    if not _cuda_available():
+        def decorator(fn):
+            @functools.wraps(fn)
+            def wrapper(self, *args, **kwargs):
+                return fn(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
     import torch.cuda.nvtx as nvtx
 
     def decorator(fn):
@@ -35,3 +47,12 @@ def nvtx_annotate(name: str, layer_id_field: str | None = None):
         return wrapper
 
     return decorator
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False

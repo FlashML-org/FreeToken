@@ -18,7 +18,9 @@ class BatchSamplingArgs:
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+    return torch.tensor(
+        data, dtype=dtype, pin_memory=(device.type == "cuda")
+    ).to(device, non_blocking=True)
 
 
 def sample_impl(
@@ -32,7 +34,13 @@ def sample_impl(
     if is_flashinfer_installed():
         import flashinfer.sampling as sampling
     else:
-        import freetoken.kernel.triton.sampling as sampling
+        try:
+            import triton  # noqa: F401
+
+            import freetoken.kernel.triton.sampling as sampling
+        except ModuleNotFoundError:
+            # CPU-only / no-GPU fallback: pure-torch sampling ops.
+            import freetoken.kernel.torch_sampling as sampling
 
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if top_k is None and top_p is None:
@@ -74,7 +82,6 @@ class Sampler:
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        with torch.cuda.nvtx.range("Sampler"):
-            if args.temperatures is None:  # greedy sampling
-                return torch.argmax(logits, dim=-1)
-            return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+        if args.temperatures is None:  # greedy sampling
+            return torch.argmax(logits, dim=-1)
+        return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)

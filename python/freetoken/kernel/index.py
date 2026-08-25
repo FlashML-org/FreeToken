@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING, Tuple
 
+import torch
 from .utils import KernelConfig, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -45,6 +46,21 @@ def indexing(
     output: torch.Tensor | None = None,
     vocab_range: Tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
+    # CPU-only fallback: the default index kernel is a CUDA-only JIT extension
+    # (tvm_ffi.load_inline compiles index.cu and needs a CUDA arch). On a GPU-less
+    # box we gather rows with plain torch, which is correct and dependency-free.
+    if not torch.cuda.is_available():
+        if vocab_range is not None:
+            start, _length = vocab_range
+            local = (indices - start).clamp_min_(0)
+            out = weights.index_select(0, local)
+        else:
+            out = weights.index_select(0, indices)
+        if output is not None:
+            output.copy_(out)
+            return output
+        return out
+
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 

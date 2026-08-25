@@ -88,6 +88,19 @@ def _determine_cuda_graph_bs(
 
 
 def get_free_memory(device: torch.device) -> int:
+    """Free device memory in bytes.
+
+    CUDA path uses ``torch.cuda.mem_get_info``. CPU path estimates free RAM via
+    ``psutil`` (falling back to a conservative 8 GiB if psutil is unavailable) so
+    the engine can run graph-free on CPU-only hardware.
+    """
+    if device.type == "cpu" or not torch.cuda.is_available():
+        try:
+            import psutil
+
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            return 8 * (1 << 30)
     return torch.cuda.mem_get_info(device)[0]
 
 
@@ -132,6 +145,12 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        if self.device.type == "cpu" or not torch.cuda.is_available():
+            # CPU-only path: no CUDA graphs. Decode runs eager (graph replay disabled).
+            self.max_graph_bs = 0
+            self.graph_bs_list = []
+            logger.info_rank0("CUDA graph capture skipped on CPU device; running eager decode.")
+            return
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 

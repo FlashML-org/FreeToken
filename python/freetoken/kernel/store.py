@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
+import torch
 from .utils import KernelConfig, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -34,6 +35,22 @@ def store_cache(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> None:
+    # CPU-only fallback: the store kernel is a CUDA-only JIT extension. On a
+    # GPU-less box we scatter k/v into the paged cache rows with plain indexing,
+    # which is numerically identical for the dense decode/append path.
+    if not torch.cuda.is_available():
+        # `k_cache`/`v_cache` arrive as [num_slots, num_heads, head_dim] (the
+        # page_size==1 storage view). The incoming `k`/`v` are flat
+        # [num_new_tokens, num_heads*head_dim] (qkv split keeps the head dim
+        # flattened), so reshape into [num_new_tokens, num_heads, head_dim] and
+        # write each token's block to its slot via plain advanced indexing on
+        # dim-0. This keeps the head dimension correctly separated (the earlier
+        # flatten-and-scatter variant collapsed every head onto head-0).
+        nh, hd = k_cache.shape[1], k_cache.shape[2]
+        k_cache[indices] = k.view(-1, nh, hd)
+        v_cache[indices] = v.view(-1, nh, hd)
+        return
+
     num_tokens = k_cache.shape[0]
     k_cache = k_cache.view(num_tokens, -1)
     v_cache = v_cache.view(num_tokens, -1)

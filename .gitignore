@@ -220,6 +220,9 @@ __marimo__/
 kernels_exp/
 refs/
 
+# Local model weights (torch safetensors) — large binaries, never commit
+_test_models/
+
 benchmarks/cross_framework
 
 # Local git worktrees

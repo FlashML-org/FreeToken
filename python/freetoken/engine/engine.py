@@ -142,7 +142,10 @@ def _resolve_auto_attention_backend(
             ("trtllm", is_sm100_family()),
             ("fa,fi", is_sm90_family()),
             ("fi", True),
-            ("triton", True),
+            # triton is the CUDA default; skip it when there is no CUDA device so the
+            # CPU-only ``torch`` backend (pure-torch SDPA) is selected instead.
+            ("triton", torch.cuda.is_available()),
+            ("torch", not torch.cuda.is_available()),
         ]
     for name, arch_ok in candidates:
         if not arch_ok:
@@ -183,7 +186,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
+                for name in ("fa", "fi", "trtllm", "triton", "torch", "dsa", "dsv4_sparse", "m3_sparse")
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -719,8 +722,8 @@ class Engine:
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
-        torch.cuda.synchronize(self.device)
         if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
