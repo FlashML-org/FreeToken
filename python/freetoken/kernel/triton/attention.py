@@ -11,6 +11,42 @@ _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
 
 
+def decode_launch_config(
+    *, quant_name: str | None, head_dim: int, num_q_heads: int, num_kv_heads: int
+) -> tuple[int, int, int]:
+    """Return ``(kv_splits, block_n, num_warps)`` for grouped decode attention.
+
+    Quantized caches are dequantized before each tensor-core dot and need more
+    parallel KV partitions than the bf16 path to fill a consumer Ada GPU.  The
+    Ornith/Qwen3.5 geometry was swept through 200K on sm_89. Q4_0 uses 32-token
+    tiles and 32 partitions, cutting a 200K full-attention layer from 2.42 ms to
+    0.92 ms. Q8_0 is faster with 64-token tiles and 64 partitions, cutting the
+    corresponding layer from 2.48 ms to 1.16 ms. Keep the prior conservative
+    launch for other shapes until they have measured configurations.
+    """
+    if (
+        quant_name == "int4"
+        and head_dim == 256
+        and num_q_heads == 16
+        and num_kv_heads == 2
+    ):
+        # BLOCK_N=16 is not safe for the packed-byte loader at this geometry on
+        # Triton 3.6/sm_89; it silently corrupts attention output. BLOCK_N=32 has
+        # a numerical regression test and is also the fastest correct 200K launch.
+        return 32, 32, 4
+    if (
+        quant_name in {"q8_0", "quant8"}
+        and head_dim == 256
+        and num_q_heads == 16
+        and num_kv_heads == 2
+    ):
+        # The backend sees the public name (q8_0) while the low-level kernel
+        # infers quant8 from the cache tensors. Accept both so CUDA-graph scratch
+        # is allocated for all 64 splits and the kernel can actually select them.
+        return 64, 64, 4
+    return _MAX_KV_SPLITS, 32, 4
+
+
 @triton.jit
 def _load_kv(
     ptr,
@@ -48,26 +84,52 @@ def _load_kv(
     query's dtype) and fed to the tensor cores like the bf16 path does.
     """
     if QUANT and EPB == 2:
-        # Nibble-packed int4: uint8 byte per element pair; low nibble = even element,
-        # high nibble = odd element (each sign-offset into [0, 14] by MAX_MAG == 7).
-        packed = tl.load(ptr + base + elem // EPB, mask=mask, other=0)
-        # Nibble extraction via integer arithmetic: Triton's ``&``/``>>`` are not
-        # defined on block tensors, but ``%``/``//`` are.
-        lo = (packed % 16).to(tl.float32)
-        hi = (packed // 16).to(tl.float32)
-        vals = tl.where((elem % EPB) == 0, lo, hi)
+        # Nibble-packed GGML Q4_0: uint8 byte per element pair; low nibble = even
+        # element, high nibble = odd element, and value = (nibble - 8) * signed scale.
+        # Build a byte-sized tile and interleave its nibbles after the load.  The old
+        # logical-element tile addressed ``elem // 2`` and therefore fetched every byte
+        # twice.  Keeping packed space until unpack halves KV load instructions/traffic.
+        if D_ON_ROWS:
+            nb_p: tl.constexpr = scale_offsets.shape[0]
+            n_p: tl.constexpr = scale_offsets.shape[1]
+            packed_d: tl.constexpr = nb_p * QBLOCK // EPB
+            packed_elem = tl.arange(0, packed_d)[:, None]
+            packed_mask = tl.broadcast_to(
+                scale_mask[:, None, :], (nb_p, QBLOCK // EPB, n_p)
+            ).reshape(packed_d, n_p)
+        else:
+            n_p: tl.constexpr = scale_offsets.shape[0]
+            nb_p: tl.constexpr = scale_offsets.shape[1]
+            packed_d: tl.constexpr = nb_p * QBLOCK // EPB
+            packed_elem = tl.arange(0, packed_d)[None, :]
+            packed_mask = tl.broadcast_to(
+                scale_mask[:, :, None], (n_p, nb_p, QBLOCK // EPB)
+            ).reshape(n_p, packed_d)
+        packed = tl.load(ptr + base + packed_elem, mask=packed_mask, other=0)
+        # Triton 3.6 lowers the integer bit operations directly; unlike modulo and
+        # division they do not introduce integer arithmetic on every KV element.
+        lo = (packed & 15).to(tl.float32)
+        hi = (packed >> 4).to(tl.float32)
+        if D_ON_ROWS:
+            vals = tl.interleave(lo.trans(), hi.trans()).trans()
+        else:
+            vals = tl.interleave(lo, hi)
         # Masked lanes must read as 0 (like the ``other=0.0`` loads in the element path),
         # not as the -7 bias, or they would poison the dot when head_dim is not a power
         # of two and BLOCK_D probes past D.
-        vals = tl.where(mask, vals - 7.0, 0.0)
+        if D_ON_ROWS:
+            logical_mask = tl.broadcast_to(
+                scale_mask[:, None, :], (nb_p, QBLOCK, n_p)
+            ).reshape(nb_p * QBLOCK, n_p)
+        else:
+            logical_mask = tl.broadcast_to(
+                scale_mask[:, :, None], (n_p, nb_p, QBLOCK)
+            ).reshape(n_p, nb_p * QBLOCK)
+        vals = tl.where(logical_mask, vals - 8.0, 0.0)
         scale = tl.load(scale_ptr + scale_offsets, mask=scale_mask, other=0.0)
         if D_ON_ROWS:
-            nb_p: tl.constexpr = scale.shape[0]
-            n_p: tl.constexpr = scale.shape[1]
             wide = tl.broadcast_to(scale[:, None, :], (nb_p, QBLOCK, n_p)).reshape(nb_p * QBLOCK, n_p)
         else:
-            n_p: tl.constexpr = scale.shape[0]
-            nb_p: tl.constexpr = scale.shape[1]
             wide = tl.broadcast_to(scale[:, :, None], (n_p, nb_p, QBLOCK)).reshape(n_p, nb_p * QBLOCK)
         return (vals * wide.to(tl.float32)).to(out_dtype)
 
@@ -574,6 +636,17 @@ def decode_paged_attention(
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     group = num_q_heads // num_kv_heads
+    quant_name = "int4" if quant and epb == 2 else ("quant8" if quant else None)
+    preferred_splits, block_n, num_warps = decode_launch_config(
+        quant_name=quant_name,
+        head_dim=head_dim,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    # Direct kernel callers and older capture buffers may provide less scratch;
+    # retain correctness and use every split they made available. The backend
+    # allocates the preferred capacity for new captures.
+    launch_splits = min(preferred_splits, max_kv_splits)
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
@@ -583,7 +656,7 @@ def decode_paged_attention(
     block_dv = triton.next_power_of_2(head_dim)
 
     _decode_grouped_stage1_kernel[
-        (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
+        (batch, triton.cdiv(num_q_heads, valid_block_h), launch_splits)
     ](
         q,
         k_cache,
@@ -617,7 +690,7 @@ def decode_paged_attention(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        BLOCK_N=32,
+        BLOCK_N=block_n,
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
@@ -627,7 +700,7 @@ def decode_paged_attention(
         QUANT=quant,
         QBLOCK=qblock,
         EPB=epb,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     _decode_stage2_kernel[(batch, num_q_heads)](
@@ -646,7 +719,7 @@ def decode_paged_attention(
         attn_lse.stride(2),
         o.stride(0),
         o.stride(1),
-        MAX_KV_SPLITS=max_kv_splits,
+        MAX_KV_SPLITS=launch_splits,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=block_dv,
         DV=head_dim,
@@ -1049,6 +1122,11 @@ def extend_paged_attention(
     block_m, block_n = _select_extend_tile(
         head_dim, block_d, _optin_smem_bytes(q.device.index)
     )
+    # On sm_89 the consumer-safe 64x32 tile for D=256 still has room for a
+    # second software-pipeline stage.  It halves cold-chunk time (68 -> 35 ms
+    # per Ornith full-attention layer at 8K) and remains ~10% faster once an
+    # 8K quantized prefix is present. Larger-D fallback tiles stay at one stage.
+    num_stages = 2 if (head_dim, block_m, block_n) == (256, 64, 32) else 1
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
         assert k_extend is not None and v_extend is not None
@@ -1100,7 +1178,7 @@ def extend_paged_attention(
             QBLOCK=qblock,
             EPB=epb,
             num_warps=8,
-            num_stages=1,
+            num_stages=num_stages,
         )
         return o
 
@@ -1141,7 +1219,7 @@ def extend_paged_attention(
         QBLOCK=qblock,
         EPB=epb,
         num_warps=8,
-        num_stages=1,
+        num_stages=num_stages,
     )
     return o
 

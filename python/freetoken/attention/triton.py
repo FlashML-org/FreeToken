@@ -87,7 +87,6 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.capture: TritonCaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.max_kv_splits = 8
         self.prefill_tile_min_q = 128
         self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
         kv_groups = getattr(config, "kv_cache_group_specs", lambda: ())()
@@ -95,6 +94,16 @@ class TritonAttentionBackend(BaseAttnBackend):
             (group.head_dim for group in kv_groups),
             default=int(getattr(config, "head_dim", 1)),
         )
+        from freetoken.kernel.triton.attention import decode_launch_config
+
+        quant = getattr(self.kvcache, "quant", None)
+        quant_name = getattr(quant, "name", None) if getattr(quant, "enabled", False) else None
+        self.max_kv_splits = decode_launch_config(
+            quant_name=quant_name,
+            head_dim=self.max_head_dim,
+            num_q_heads=self.num_q_heads,
+            num_kv_heads=int(getattr(config, "num_kv_heads", 1)),
+        )[0]
 
     def _ensure_decode_scratch(
         self,

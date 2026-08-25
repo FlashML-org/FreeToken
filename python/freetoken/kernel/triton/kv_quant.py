@@ -64,18 +64,24 @@ def _store_kv_quant_kernel(
             sc_ptr = vs_ptr if is_v else ks_ptr
 
             x = tl.load(src_ptr + tok * stride_kt + head * stride_kh + pair_offs).to(tl.float32)
-            amax = tl.max(tl.abs(x), axis=2)  # [NBLOCK, BLOCK // 2]
-            amax = tl.max(amax, axis=1)  # [NBLOCK]
-            scale = tl.where(amax > 0, amax / MAX_MAG, 1.0)
+            flat_x = x.reshape(NBLOCK, BLOCK)
+            abs_x = tl.abs(flat_x)
+            amax = tl.max(abs_x, axis=1)  # [NBLOCK]
+            # Match GGML Q4_0 exactly, including its first-element tie break for
+            # equally large positive and negative extrema.
+            extreme_idx = tl.argmax(abs_x, axis=1, tie_break_left=True)
+            block_idx = tl.arange(0, BLOCK)[None, :]
+            extreme = tl.sum(
+                tl.where(block_idx == extreme_idx[:, None], flat_x, 0.0), axis=1
+            )
+            scale = tl.where(amax > 0, extreme / -8.0, 1.0)
             scale = scale.to(sc_ptr.dtype.element_ty).to(tl.float32)
-            # Element-wise quantize: half away from zero, clamp to [-MAX_MAG, MAX_MAG].
+            # GGML reference truncates x / d + 8.5 into the unsigned nibble range.
+            # The value is nonnegative here, so floor is equivalent to truncation.
             q = tl.math.div_rn(x, scale[:, None, None])
-            q = tl.where(q >= 0, tl.floor(q + 0.5), tl.ceil(q - 0.5))
-            q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
-            # Bias into [0, 2*MAX_MAG] (= [0, 14]), then low nibble = even (index 0),
-            # high nibble = odd (index 1). Triton has no integer indexing, so split the
-            # last axis (size 2) into its two lanes. Pack arithmetically: even + odd*16.
-            q = (q + MAX_MAG).to(tl.int8)
+            q = tl.minimum(tl.maximum(tl.floor(q + 8.5), 0.0), 15.0).to(tl.int8)
+            # Low nibble = even (index 0), high nibble = odd (index 1). Triton has no
+            # integer indexing, so split the last axis and pack arithmetically.
             even, odd = tl.split(q)
             packed = even + odd * 16
             tl.store(

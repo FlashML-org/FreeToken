@@ -33,6 +33,7 @@ def test_resolve_and_scale_shape():
     assert resolve_kv_quant("auto") is NONE
     assert resolve_kv_quant("q8_0") is Q8_0
     assert resolve_kv_quant("int4") is INT4
+    assert resolve_kv_quant("q4_0") is INT4
     assert Q8_0.scale_shape((7, 4, 256)) == (7, 4, 8)
     with pytest.raises(ValueError, match="not a multiple"):
         Q8_0.scale_shape((7, 4, 100))
@@ -61,12 +62,14 @@ def test_reference_roundtrip_error_is_within_the_scheme_envelope(spec):
     assert err.mean() <= amax.mean() * bound * 0.5
 
 
-def test_int4_packs_signed_nibbles_in_element_order():
-    x = torch.tensor([-7.0, -6.0, -1.0, 0.0, 1.0, 6.0, 7.0, 0.0] * 4).view(1, 1, BLOCK)
+def test_int4_matches_ggml_q4_0_codes_in_element_order():
+    x = torch.tensor([-8.0, -7.0, -1.0, 0.0, 1.0, 6.0, 7.0, 0.0] * 4).view(1, 1, BLOCK)
     packed, scales = INT4.quantize(x)
 
-    # scale=1 gives v + 7 codes. Low nibble is the even logical element, high nibble odd.
-    assert packed[0, 0, :4].tolist() == [0x10, 0x76, 0xD8, 0x7E]
+    # The negative extreme selects scale=1; code = value + 8. Low nibble is the even
+    # logical element and high nibble is the odd logical element.
+    assert scales.item() == 1.0
+    assert packed[0, 0, :4].tolist() == [0x10, 0x87, 0xE9, 0x8F]
     torch.testing.assert_close(INT4.dequantize(packed, scales), x)
 
 
@@ -157,7 +160,7 @@ def test_store_kernel_handles_an_all_zero_head(spec):
     vs = torch.empty_like(ks)
     store_kv_quant(kc, ks, vc, vs, indices, k, v, spec)
 
-    # Zero must dequantize back to zero. int4 encodes 0 as the offset nibble (0x77),
+    # Zero must dequantize back to zero. int4 encodes 0 as the offset nibble (0x88),
     # not 0x00, so compare the DEQUANTIZED values, not the raw packed bytes.
     assert (spec.dequantize(kc[0].float(), ks[0]).abs() == 0).all()
     assert torch.isfinite(ks[0]).all() and (ks[0] > 0).all()
@@ -239,6 +242,38 @@ def test_decode_attention_over_quantized_pool(spec, head_dim):
 
     got = decode_paged_attention(q=q, k_cache=kq, v_cache=vq, k_scale=ks, v_scale=vs, **kw)
     want = decode_paged_attention(q=q, k_cache=k_deq, v_cache=v_deq, **kw)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@cuda_only
+def test_ornith_q4_tuned_decode_matches_dequantized_oracle():
+    """Exercise the exact launch selected in production for Ornith.
+
+    The former BLOCK_N=16 tuning passed generic 8-head tests but silently corrupted
+    packed Q4 attention at Ornith's 16-query-head/2-KV-head geometry.
+    """
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    slots, q_heads, kv_heads, head_dim = 67, 16, 2, 256
+    q = _kv(1, q_heads, head_dim, seed=81)
+    k = _kv(slots, kv_heads, head_dim, seed=82)
+    v = _kv(slots, kv_heads, head_dim, seed=83)
+    kq, ks, vq, vs, k_deq, v_deq = _quantized_pool(INT4, k, v)
+    indptr = torch.tensor([0, slots], device="cuda", dtype=torch.int32)
+    indices = torch.arange(slots, device="cuda", dtype=torch.int32)
+    q_pos = torch.tensor([slots - 1], device="cuda", dtype=torch.int32)
+
+    def run(k_cache, v_cache, splits, k_scale=None, v_scale=None):
+        logits = torch.empty(1, q_heads, splits, head_dim, device="cuda", dtype=torch.float32)
+        lse = torch.empty(1, q_heads, splits, device="cuda", dtype=torch.float32)
+        nsplits = torch.full((1,), splits, device="cuda", dtype=torch.int32)
+        return decode_paged_attention(
+            q, k_cache, v_cache, indptr, indices, q_pos, logits, lse, nsplits,
+            splits, head_dim**-0.5, k_scale=k_scale, v_scale=v_scale,
+        )
+
+    got = run(kq, vq, 32, ks, vs)
+    want = run(k_deq, v_deq, 8)
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
 
