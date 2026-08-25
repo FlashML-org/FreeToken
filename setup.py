@@ -9,6 +9,14 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
 ROOT = Path(__file__).parent
+# All extension sources MUST be relative to ROOT. setuptools>=77's build_py runs
+# assert_relative() on every source path; an absolute path (str(ROOT / "..."))
+# raises DistutilsSetupError: "setup script specifies an absolute path". Relative
+# paths are the correct, portable form and keep the CPU build reproducible on
+# modern setuptools (incl. GitHub's free ubuntu-latest runners).
+SRC = ROOT / "python" / "freetoken" / "kernel" / "csrc"
+STUB_DIR = str(SRC / "cpu_moe")
+
 
 # --- CPU-only build path ---------------------------------------------------
 # When FREETOKEN_CPU_ONLY=1 we build the pure-C++ extensions WITHOUT the CUDA
@@ -32,13 +40,16 @@ def _toolchain_ok() -> bool:
         return CPU_ONLY  # tolerate nvcc mismatch only on the CPU-only path
 
 
-def _cpu_ext(name: str, sources: list[str], extra: list[str]) -> CppExtension:
-    """Build a C++ extension with the stub cuda header, no cudart, no nvcc."""
-    stub_dir = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "cpu_moe")
+def _cpu_ext(name: str, rel_source: str, extra: list[str]) -> CppExtension:
+    """Build a C++ extension with the stub cuda header, no cudart, no nvcc.
+
+    `rel_source` is relative to setup.py (e.g. "python/freetoken/.../x.cpp") so
+    setuptools never sees an absolute path (assert_relative would reject it).
+    """
     return CppExtension(
         name=name,
-        sources=sources,
-        include_dirs=[stub_dir],
+        sources=[rel_source],
+        include_dirs=[STUB_DIR],
         extra_compile_args=["-O3", "-std=c++17", "-pthread", "-DFREETOKEN_CPU_ONLY"]
         + extra,
         # No libraries= (no cudart); the stub header provides the symbols.
@@ -50,12 +61,12 @@ if CPU_ONLY:
     ext_modules = [
         _cpu_ext(
             "freetoken.kernel._pinned_tensor",
-            [str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "pinned_tensor.cpp")],
+            "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             extra=[],
         ),
         _cpu_ext(
             "freetoken.kernel._cpu_moe",
-            [str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "cpu_moe" / "cpu_moe_ext.cpp")],
+            "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
             extra=[],
         ),
     ]
@@ -81,7 +92,7 @@ else:
     ext_modules = [
         CppExtension(
             name="freetoken.kernel._pinned_tensor",
-            sources=[str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "pinned_tensor.cpp")],
+            sources=["python/freetoken/kernel/csrc/pinned_tensor.cpp"],
             include_dirs=_cuda_include_dirs,
             library_dirs=_cuda_library_dirs,
             libraries=["cudart"],
@@ -89,7 +100,7 @@ else:
         ),
         CppExtension(
             name="freetoken.kernel._cpu_moe",
-            sources=[str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "cpu_moe" / "cpu_moe_ext.cpp")],
+            sources=["python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp"],
             include_dirs=_cuda_include_dirs,
             library_dirs=_cuda_library_dirs,
             libraries=["cudart"],
