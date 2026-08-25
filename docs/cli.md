@@ -41,7 +41,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard the model over; one scheduler process per rank, rank `i` on `cuda:i` |
+| `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard the model over; one scheduler process per rank, mapped in `--gpu` order (default: rank `i` on `cuda:i`) |
 | `--distributed-timeout` | 1800 | Seconds a TP collective waits before failing; sized for the per-rank skew in weight-load time |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
