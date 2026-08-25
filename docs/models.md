@@ -53,6 +53,10 @@ Constraints for DeepSeek-V4: N must divide `o_groups` (8), so N is 1, 2, 4 or 8.
 The KV pool is replicated, so its cost per GPU does not fall with N; the weights
 and the expert banks do.
 
+DeepSeek-V4 TP currently loads the original safetensors checkpoint. An FTW
+conversion records the TP=1 dense and expert-bank layout and is rejected for
+`N > 1` instead of failing later with rank-local shape mismatches.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

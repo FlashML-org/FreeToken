@@ -1095,6 +1095,16 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
     the DSV4 decode batch size.
     """
+    if config.tp_info.size > 1:
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "DeepSeek-V4 tensor parallelism currently requires the original "
+                "safetensors checkpoint. FTW stores the TP=1 dense weights and expert "
+                "banks, so it cannot be replayed into rank-local DSV4 shapes; use the "
+                "raw checkpoint or run with --tp-size 1."
+            )
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
