@@ -314,12 +314,18 @@ def test_decode_triton_attention_matches_reference(
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
-def test_decode_launch_config_selects_ornith_int4_tuning_only():
+def test_decode_launch_config_selects_ornith_quantized_tuning_only():
     from freetoken.kernel.triton.attention import decode_launch_config
 
     assert decode_launch_config(
         quant_name="int4", head_dim=256, num_q_heads=16, num_kv_heads=2
-    ) == (32, 16, 8)
+    ) == (32, 32, 4)
+    assert decode_launch_config(
+        quant_name="q8_0", head_dim=256, num_q_heads=16, num_kv_heads=2
+    ) == (64, 64, 4)
+    assert decode_launch_config(
+        quant_name="quant8", head_dim=256, num_q_heads=16, num_kv_heads=2
+    ) == (64, 64, 4)
     assert decode_launch_config(
         quant_name=None, head_dim=256, num_q_heads=16, num_kv_heads=2
     ) == (8, 32, 4)

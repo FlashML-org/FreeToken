@@ -16,12 +16,13 @@ def decode_launch_config(
 ) -> tuple[int, int, int]:
     """Return ``(kv_splits, block_n, num_warps)`` for grouped decode attention.
 
-    Packed INT4 is dequantized before each tensor-core dot and needs substantially
-    more parallel KV partitions than the bf16 path to fill a consumer Ada GPU.  The
-    Ornith/Qwen3.5 geometry was exhaustively swept at 1K--170K on sm_89. After
-    byte-once nibble unpacking, 32 splits, 16-token tiles and 8 warps cut a 170K
-    layer from the original 8.8 ms to 0.95 ms. Keep the prior conservative launch
-    for other shapes until they have their own measured configuration.
+    Quantized caches are dequantized before each tensor-core dot and need more
+    parallel KV partitions than the bf16 path to fill a consumer Ada GPU.  The
+    Ornith/Qwen3.5 geometry was swept through 200K on sm_89. Q4_0 uses 32-token
+    tiles and 32 partitions, cutting a 200K full-attention layer from 2.42 ms to
+    0.92 ms. Q8_0 is faster with 64-token tiles and 64 partitions, cutting the
+    corresponding layer from 2.48 ms to 1.16 ms. Keep the prior conservative
+    launch for other shapes until they have measured configurations.
     """
     if (
         quant_name == "int4"
@@ -29,7 +30,20 @@ def decode_launch_config(
         and num_q_heads == 16
         and num_kv_heads == 2
     ):
-        return 32, 16, 8
+        # BLOCK_N=16 is not safe for the packed-byte loader at this geometry on
+        # Triton 3.6/sm_89; it silently corrupts attention output. BLOCK_N=32 has
+        # a numerical regression test and is also the fastest correct 200K launch.
+        return 32, 32, 4
+    if (
+        quant_name in {"q8_0", "quant8"}
+        and head_dim == 256
+        and num_q_heads == 16
+        and num_kv_heads == 2
+    ):
+        # The backend sees the public name (q8_0) while the low-level kernel
+        # infers quant8 from the cache tensors. Accept both so CUDA-graph scratch
+        # is allocated for all 64 splits and the kernel can actually select them.
+        return 64, 64, 4
     return _MAX_KV_SPLITS, 32, 4
 
 
@@ -70,8 +84,8 @@ def _load_kv(
     query's dtype) and fed to the tensor cores like the bf16 path does.
     """
     if QUANT and EPB == 2:
-        # Nibble-packed int4: uint8 byte per element pair; low nibble = even element,
-        # high nibble = odd element (each sign-offset into [0, 14] by MAX_MAG == 7).
+        # Nibble-packed GGML Q4_0: uint8 byte per element pair; low nibble = even
+        # element, high nibble = odd element, and value = (nibble - 8) * signed scale.
         # Build a byte-sized tile and interleave its nibbles after the load.  The old
         # logical-element tile addressed ``elem // 2`` and therefore fetched every byte
         # twice.  Keeping packed space until unpack halves KV load instructions/traffic.
@@ -111,7 +125,7 @@ def _load_kv(
             logical_mask = tl.broadcast_to(
                 scale_mask[:, :, None], (n_p, nb_p, QBLOCK)
             ).reshape(n_p, nb_p * QBLOCK)
-        vals = tl.where(logical_mask, vals - 7.0, 0.0)
+        vals = tl.where(logical_mask, vals - 8.0, 0.0)
         scale = tl.load(scale_ptr + scale_offsets, mask=scale_mask, other=0.0)
         if D_ON_ROWS:
             wide = tl.broadcast_to(scale[:, None, :], (nb_p, QBLOCK, n_p)).reshape(nb_p * QBLOCK, n_p)

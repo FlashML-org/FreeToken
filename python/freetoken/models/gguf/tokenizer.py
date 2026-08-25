@@ -12,6 +12,45 @@ from typing import Any
 
 from .reader import gguf_architecture, load_gguf_metadata
 
+
+# llama.cpp / GGUF token type values (gguf.TokenType).  CONTROL tokens are true
+# special tokens, while USER_DEFINED tokens must participate in the added-token
+# matcher without being removed by ``skip_special_tokens``.  The latter distinction
+# matters for Qwen3.5: markers such as ``<think>`` and ``<tool_call>`` are type 4 and
+# the byte-level BPE otherwise splits them into ordinary punctuation/word tokens even
+# though their complete strings are present in the base vocabulary.
+_GGUF_TOKEN_CONTROL = 3
+_GGUF_TOKEN_USER_DEFINED = 4
+
+
+def _register_gguf_added_tokens(tokenizer, tokens: list[str], token_types: list[int] | None) -> None:
+    """Restore GGUF CONTROL/USER_DEFINED matching semantics on a fast tokenizer.
+
+    Transformers' Qwen GGUF converter currently hard-codes only ``<|endoftext|>``,
+    ``<|im_start|>`` and ``<|im_end|>``.  Newer Qwen-family checkpoints carry more
+    USER_DEFINED tokens in the GGUF table; merely putting those strings in a BPE
+    vocabulary does not make the tokenizer match them atomically.
+    """
+    if not token_types or len(token_types) != len(tokens):
+        return
+
+    from tokenizers import AddedToken
+
+    control = [
+        AddedToken(token, normalized=False, special=True)
+        for token, token_type in zip(tokens, token_types)
+        if int(token_type) == _GGUF_TOKEN_CONTROL
+    ]
+    user_defined = [
+        AddedToken(token, normalized=False, special=False)
+        for token, token_type in zip(tokens, token_types)
+        if int(token_type) == _GGUF_TOKEN_USER_DEFINED
+    ]
+    if control:
+        tokenizer.add_special_tokens({"additional_special_tokens": control})
+    if user_defined:
+        tokenizer.add_tokens(user_defined)
+
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 # laguna ships a plain gpt2-style BPE (tokenizer.ggml.model = "gpt2"); transformers
 # has no "laguna" converter, so route it to the gpt2 one.
@@ -62,6 +101,7 @@ def load_gguf_tokenizer(model_path: str):
         unk_token=None if arch == "qwen35moe" else tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
+    _register_gguf_added_tokens(tokenizer, tokens, tok_dict.get("token_type"))
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:
         tokenizer.chat_template = chat_template

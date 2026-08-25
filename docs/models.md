@@ -50,17 +50,19 @@ work too.
   floor: `--max-running-requests 1 --max-seq-len-override 200000 --num-tokens 200000
   --kv-cache-dtype int4 --moe-cache-size 256 --disable-moe-prefill-overlap
   --swa-full-tokens-ratio 0.006 --memory-ratio 0.95`.
-- For Ornith Q4_K_M at 200K on a 16 GB GPU, use one request, INT4 KV, 5,000
+- For Ornith Q4_K_M at 200K on a 16 GB GPU, use one request, Q4_0 KV, 5,000
   expert slots, and the default 8K prefill chunks: `--max-running-requests 1
-  --max-seq-len-override 200000 --num-tokens 200000 --kv-cache-dtype int4
+  --max-seq-len-override 200000 --num-tokens 200000 --kv-cache-dtype q4_0
   --moe-backend offload --moe-cache-size 5000 --max-prefill-length 8192
   --memory-ratio 0.95`. On the RTX 2000 Ada/WSL test host, cold 32K TTFT was
   51.1 s at 8K chunks versus 54.6 s at 16K; `--moe-prefill-hit-d2d` was slower
   on this stack and should remain disabled. Install the optional SGLang kernel
-  (`freetoken[sgl]`) for faster expert-route alignment. With the sm_89 INT4
-  attention tuning, progressive-context decode measured 40.7 tok/s at 65K,
-  39.1 at 100K, 35.3 at 140K, and 33.7 at 170K; the 140K-to-170K extension
-  reached first token in 113.4 s.
+  (`freetoken[sgl]`) for faster expert-route alignment. FreeToken's Q4_0 path matches
+  llama.cpp's block quantizer and is validated with normal answers, OpenAI tool calls,
+  and a 55.6K-token Claude Code Bash-tool round trip. The sm_89 attention tuning reduces
+  a synthetic 200K full-attention layer from 2.42 ms to 0.92 ms; the live 55.9K decode
+  ran at 36--48 tok/s after warmup. A coherent 169.9K-token live generation completed
+  in 425.8 s of prefill and decoded at 27--35 tok/s. `int4` remains an alias for `q4_0`.
 - Nemotron 3 Super uses its native hybrid Mamba-2 / full-attention / latent-MoE
   architecture. The NVFP4 release needs about 60 GiB of host RAM for expert banks and
   10.3 GiB of resident GPU weights. FreeToken currently serves one concurrent Nemotron

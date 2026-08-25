@@ -8,11 +8,11 @@ channels, and a block of 32 keeps an outlier from stretching the scale of the wh
 head.
 
 The 8-bit schemes store one element per byte; ``int4`` stores two signed values in each
-``uint8`` byte. All share the store kernel and the dequant path in the attention kernels;
-the format only changes payload layout and the divisor mapping a block's max-abs onto its
-representable range. The scale varies along ``head_dim``, the reduction dimension of
-``q @ k``, so attention dequantizes before the dot. This saves storage bandwidth, not
-tensor-core compute.
+``uint8`` byte using llama.cpp/GGML Q4_0 scale selection. All share the store kernel and
+the dequant path in the attention kernels; the format only changes payload layout and
+the divisor mapping a block's extreme onto its representable range. The scale varies
+along ``head_dim``, the reduction dimension of ``q @ k``, so attention dequantizes
+before the dot. This saves storage bandwidth, not tensor-core compute.
 """
 
 from __future__ import annotations
@@ -102,6 +102,22 @@ class KVQuantSpec:
         """
         assert self.enabled, "quantize() on an unquantized spec"
         blocks = x.float().unflatten(-1, (x.shape[-1] // BLOCK, BLOCK))
+        if self.packed:
+            # Match GGML Q4_0. The signed value with the greatest magnitude selects a
+            # possibly-negative scale; codes 0..15 then represent (code - 8) * scale.
+            # This uses all 16 nibble values and preserves the block's largest-magnitude
+            # element exactly, unlike the former symmetric [-7, 7] scheme.
+            extreme = blocks.gather(
+                -1, blocks.abs().argmax(dim=-1, keepdim=True)
+            ).squeeze(-1)
+            scales = torch.where(extreme != 0, extreme / -8.0, torch.ones_like(extreme))
+            scales = scales.to(SCALE_DTYPE)
+            q = torch.floor(blocks / scales.float().unsqueeze(-1) + 8.5).clamp_(0, 15)
+            q = q.flatten(-2).to(torch.uint8)
+            even = q[..., 0::2]
+            odd = q[..., 1::2]
+            return even | (odd << 4), scales
+
         amax = blocks.abs().amax(dim=-1)
         scales = torch.where(amax > 0, amax / self.max_magnitude, torch.ones_like(amax))
         # Round the scale to its stored precision BEFORE dividing, so quantize and
@@ -113,15 +129,6 @@ class KVQuantSpec:
             # half-to-even and would disagree on ties.
             q = torch.where(q >= 0, (q + 0.5).floor(), (q - 0.5).ceil())
             q = q.clamp_(-self.max_magnitude, self.max_magnitude)
-        if self.packed:
-            # Two signed int4 per byte: value v -> nibble v + max_magnitude, so the
-            # even element (low nibble) and odd element (high nibble) interleave.
-            q = q.flatten(-2)
-            q = (q + self.max_magnitude).to(torch.uint8)
-            even = q[..., 0::2]
-            odd = q[..., 1::2]
-            packed = even | (odd << 4)
-            return packed, scales
         return q.flatten(-2).to(self.storage_dtype), scales
 
     def dequantize(self, q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -137,7 +144,7 @@ class KVQuantSpec:
             blocks = codes.unflatten(-1, (nblock, BLOCK // self.elements_per_byte))
             values = torch.stack([blocks & 0x0F, blocks >> 4], dim=-1)
             values = values.reshape(*blocks.shape[:-1], BLOCK).float()
-            values = values - self.max_magnitude
+            values = values - 8.0
         else:
             values = q.float().unflatten(-1, (q.shape[-1] // BLOCK, BLOCK))
         return (values * scales.float().unsqueeze(-1)).flatten(-2)
@@ -147,13 +154,15 @@ class KVQuantSpec:
 Q8_0 = KVQuantSpec(name="q8_0", storage_dtype=torch.int8, max_magnitude=127.0)
 # e4m3: 4-bit exponent, 3-bit mantissa, max finite magnitude 448.
 FP8_E4M3 = KVQuantSpec(name="fp8_e4m3", storage_dtype=torch.float8_e4m3fn, max_magnitude=448.0)
-# signed int4, two per byte: a block's max-abs maps to 7.
+# GGML Q4_0, two values per byte: a block's signed extreme selects a scale and all
+# 16 codes represent [-8, 7] times that (possibly negative) scale.
 INT4 = KVQuantSpec(
-    name="int4", storage_dtype=torch.uint8, max_magnitude=7.0, elements_per_byte=2
+    name="int4", storage_dtype=torch.uint8, max_magnitude=8.0, elements_per_byte=2
 )
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
 _BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, INT4)}
+_BY_NAME["q4_0"] = INT4
 KV_CACHE_DTYPES = tuple(_BY_NAME)
 
 

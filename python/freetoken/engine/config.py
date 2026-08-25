@@ -86,8 +86,8 @@ class EngineConfig:
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
     # KV element storage (--kv-cache-dtype): "auto" keeps the compute dtype; q8_0 and
-    # fp8_e4m3 store 8 bits, while int4 packs two signed values per byte. Every quantized
-    # scheme carries a per-block scale. Resolved by the pools and cost model.
+    # fp8_e4m3 store 8 bits, while int4/q4_0 use GGML Q4_0 with two values per byte.
+    # Every quantized scheme carries a per-block scale. Resolved by the pools and cost model.
     kv_cache_dtype: str = "auto"
 
     @cached_property
