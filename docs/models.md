@@ -34,7 +34,8 @@ for them; other checkpoints of the same architectures work too.
 ## Tensor parallelism
 
 `ft serve --tensor-parallel-size N` shards the model over N GPUs on one host. One
-scheduler process runs per rank, and rank `i` uses `cuda:i`.
+scheduler process runs per rank. By default rank `i` uses `cuda:i`; an explicit
+`--gpu` list maps its `i`th entry to rank `i`.
 
 DeepSeek-V4 shards:
 

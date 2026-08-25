@@ -94,3 +94,24 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_tp_gpu_list_and_distributed_timeout_reach_server_args():
+    config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--tp-size",
+                "4",
+                "--gpu",
+                "3,1,0,2",
+                "--distributed-timeout",
+                "900",
+            ]
+        )
+
+    assert args.tp_info.size == 4
+    assert args.gpu == ("3", "1", "0", "2")
+    assert args.distributed_timeout == 900
