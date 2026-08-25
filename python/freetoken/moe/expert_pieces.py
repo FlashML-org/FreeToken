@@ -8,6 +8,7 @@ their ``_scale`` / ``_global`` companions, or an already fused ``gate_up``). The
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable, Iterable, Iterator
 
 import torch
@@ -38,7 +39,8 @@ def _model_hook(spec, name: str):
 
 
 def iter_expert_pieces(
-    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20
+    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
+    prefetch: int = 2,
 ) -> Iterator[Piece]:
     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
 
@@ -47,11 +49,14 @@ def iter_expert_pieces(
     experts come from the family's stacked ``iter_weights`` and NVFP4 experts from its
     ``nvfp4_expert_spec``. The reader is resolved here, before any bank is allocated, so a
     missing parallel reader raises ``NotImplementedError`` while a serial fallback is still cheap.
+    ``prefetch`` bounds the whole shards a family's parallel reader queues ahead of placement; it
+    reaches only the family hooks that declare it.
     """
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:
-        pieces = hook(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
+        extra = {"prefetch": prefetch} if "prefetch" in inspect.signature(hook).parameters else {}
+        pieces = hook(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk, **extra)
         if pieces is not None:
             return pieces
     if kind is QuantKind.NONE:

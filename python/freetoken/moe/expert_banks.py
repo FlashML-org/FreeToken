@@ -192,23 +192,27 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, prefetch=2) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
     if dummy:
         return build_expert_banks(method, num_layers, None, device=device, dummy=True)
     pieces = iter_expert_pieces(
-        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,
+        prefetch=prefetch,
     )
     return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
 
 
-def _host_ram_fits_parallel(model_path: str) -> bool:
-    """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
-    extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
-    i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
+def _host_ram_fits_parallel(model_path: str, prefetch: int = 2) -> bool:
+    """Best-effort: can free host RAM hold banks plus the parallel read-ahead?
+
+    The consumer retains its current whole-shard buffer while the bounded queue
+    holds up to ``prefetch`` more, so transient residency is at most
+    ``(prefetch + 1) * largest_shard``. Unknown inputs conservatively keep the
+    fast path. Uses MemAvailable, which includes reclaimable page cache.
+    """
     avail = None
     try:
         with open("/proc/meminfo") as f:
@@ -229,7 +233,7 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
     sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))]
     if not sizes:
         return True
-    return avail > sum(sizes) + max(sizes)
+    return avail > sum(sizes) + (prefetch + 1) * max(sizes)
 
 
 def ftw_bank_bytes(model_path: str) -> int | None:
@@ -283,6 +287,7 @@ def load_expert_banks(
     parallel: bool | None = None,
     workers: int = 8,
     chunk: int = _PARALLEL_CHUNK,
+    prefetch: int = 2,
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
@@ -337,9 +342,9 @@ def load_expert_banks(
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
-        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
-        # bypass this by forcing ``parallel`` explicitly.)
-        if parallel and not _host_ram_fits_parallel(model_path):
+        # free RAM can't cover the banks + the bounded shard read-ahead. (--expert-load
+        # serial/parallel bypass this by forcing ``parallel`` explicitly.)
+        if parallel and not _host_ram_fits_parallel(model_path, prefetch):
             logger.warning_rank0(
                 "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
                 "override with --expert-load parallel)"
@@ -354,7 +359,7 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
+            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, prefetch)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 
     with requested_residency(layer_residency) as residency_plan:

@@ -109,9 +109,15 @@ def test_tp_gpu_list_and_distributed_timeout_reach_server_args():
                 "3,1,0,2",
                 "--distributed-timeout",
                 "900",
+                "--expert-load",
+                "parallel",
+                "--expert-prefetch",
+                "1",
             ]
         )
 
     assert args.tp_info.size == 4
     assert args.gpu == ("3", "1", "0", "2")
     assert args.distributed_timeout == 900
+    assert args.expert_load == "parallel"
+    assert args.expert_prefetch == 1

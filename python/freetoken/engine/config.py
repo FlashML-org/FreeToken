@@ -33,10 +33,14 @@ class EngineConfig:
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
-    # experts in parallel but falls back to serial when free RAM can't cover the banks + the
-    # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
-    # low-memory reclaimable read; "parallel" forces the fast read.
+    # experts in parallel but falls back to serial when free RAM can't cover the banks +
+    # bounded (non-reclaimable) whole-shard read-ahead; "serial" forces the low-memory
+    # reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # Whole checkpoint shards queued ahead of placement by parallel expert
+    # readers. One preserves I/O/placement overlap with lower peak host RAM;
+    # larger values can smooth uneven shard-placement time on roomy hosts.
+    expert_prefetch: int = 2
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

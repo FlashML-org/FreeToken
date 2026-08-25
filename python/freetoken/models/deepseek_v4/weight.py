@@ -224,7 +224,10 @@ def shard_expert_piece(role: str, t: torch.Tensor, *, rank: int, tp_size: int) -
     return t.narrow(axis, rank * step, step).clone(memory_format=torch.contiguous_format)
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20,
+    prefetch: int = 2,
+):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
@@ -269,7 +272,9 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         return sharded()
 
     if parallel:
-        tensors = iter_expert_tensors_parallel(model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk)
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk, prefetch=prefetch
+        )
         return per_expert_pieces(_cut(tensors), locate, tensors_per_expert=6)
 
     def _serial():
