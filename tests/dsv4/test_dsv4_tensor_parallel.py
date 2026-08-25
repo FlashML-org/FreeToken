@@ -18,7 +18,7 @@ import torch
 import freetoken.distributed.info as info_mod
 from freetoken.distributed import DistributedInfo
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
-from freetoken.models.deepseek_v4.weight import _expert_bank_specs
+from freetoken.models.deepseek_v4.weight import _expert_bank_specs, _place_dsfp4
 
 # o_groups=8 bounds the split: a rank must own whole output groups.
 TP_SIZES = (2, 4, 8)
@@ -148,3 +148,84 @@ def test_a_split_that_does_not_divide_o_groups_fails_loudly(args):
     _set_tp(16)  # o_groups == 8, so a rank cannot own a whole group
     with pytest.raises(ValueError, match="o_groups"):
         validate_tp(args)
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_expert_loader_places_exact_rank_slice(rank):
+    """The bank contents, not only their shapes, must tile the packed I axis."""
+
+    full_i, local_i, hidden = 128, 32, 64
+    i_lo = rank * local_i
+    e8m0 = torch.float8_e8m0fnu
+
+    def payload(shape, offset, dtype=torch.int8):
+        raw = (torch.arange(torch.Size(shape).numel(), dtype=torch.int64) + offset) % 251
+        return raw.to(torch.uint8).reshape(shape).view(dtype)
+
+    w1 = payload((full_i, hidden // 2), 1)
+    w3 = payload((full_i, hidden // 2), 17)
+    w2 = payload((hidden, full_i // 2), 33)
+    s1 = payload((full_i, hidden // 32), 49, e8m0)
+    s3 = payload((full_i, hidden // 32), 65, e8m0)
+    s2 = payload((hidden, full_i // 32), 81, e8m0)
+    banks = {
+        "gate_up_packed": [torch.zeros(1, 2 * local_i, hidden // 2, dtype=torch.uint8)],
+        "gate_up_scale": [torch.zeros(1, 2 * local_i, hidden // 32, dtype=e8m0)],
+        "down_packed": [torch.zeros(1, hidden, local_i // 2, dtype=torch.uint8)],
+        "down_scale": [torch.zeros(1, hidden, local_i // 32, dtype=e8m0)],
+    }
+
+    for proj, kind, tensor in (
+        ("w1", "weight", w1),
+        ("w3", "weight", w3),
+        ("w2", "weight", w2),
+        ("w1", "scale", s1),
+        ("w3", "scale", s3),
+        ("w2", "scale", s2),
+    ):
+        _place_dsfp4(banks, (0, 0, proj, kind), tensor, local_i, i_lo)
+
+    assert torch.equal(
+        banks["gate_up_packed"][0][0, :local_i],
+        w1.view(torch.uint8)[i_lo:i_lo + local_i],
+    )
+    assert torch.equal(
+        banks["gate_up_packed"][0][0, local_i:],
+        w3.view(torch.uint8)[i_lo:i_lo + local_i],
+    )
+    assert torch.equal(
+        banks["down_packed"][0][0],
+        w2.view(torch.uint8)[:, i_lo // 2:(i_lo + local_i) // 2],
+    )
+    assert torch.equal(
+        banks["gate_up_scale"][0][0, :local_i].view(torch.uint8),
+        s1[i_lo:i_lo + local_i].view(torch.uint8),
+    )
+    assert torch.equal(
+        banks["gate_up_scale"][0][0, local_i:].view(torch.uint8),
+        s3[i_lo:i_lo + local_i].view(torch.uint8),
+    )
+    assert torch.equal(
+        banks["down_scale"][0][0].view(torch.uint8),
+        s2[:, i_lo // 32:(i_lo + local_i) // 32].view(torch.uint8),
+    )
+
+
+def test_serial_expert_loader_does_not_slice_pre_sliced_rows_twice():
+    full_i, local_i, hidden, i_lo = 128, 32, 64, 64
+    full = torch.arange(full_i * (hidden // 2), dtype=torch.int64)
+    full = (full % 251).to(torch.uint8).reshape(full_i, hidden // 2).view(torch.int8)
+    rank_rows = full[i_lo:i_lo + local_i]
+    bank = torch.zeros(1, 2 * local_i, hidden // 2, dtype=torch.uint8)
+    banks = {"gate_up_packed": [bank]}
+
+    _place_dsfp4(
+        banks,
+        (0, 0, "w1", "weight"),
+        rank_rows,
+        local_i,
+        i_lo,
+        rows_ready=True,
+    )
+
+    assert torch.equal(bank[0, :local_i], rank_rows.view(torch.uint8))
