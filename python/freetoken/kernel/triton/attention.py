@@ -18,7 +18,9 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
+def _select_extend_tile(
+    head_dim: int, block_d: int, smem_optin: int, pre_ampere: bool = False
+) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
@@ -31,12 +33,35 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
     def fits(block_m: int, block_n: int) -> bool:
+        if pre_ampere:
+            # Turing stages materially more through shared memory than Ampere+ for the
+            # same tile: mma.sync m16n8k8 tiles differently from m16n8k16. Measured from
+            # triton's own OutOfResources reports on an sm_75 Quadro RTX 6000:
+            #   (128,64)@256 -> 196608   (64,64)@256 -> 131072   (64,32)@256 -> 98304
+            #   (128,64)@128 -> 98304
+            # against a 65536 limit. The Ampere+ estimate below under-predicts these by up
+            # to 2x, which is why a head_dim-256 model picked (64,32) and still died.
+            # The same tiles on sm_89 measure 114688 for (128,64)@256, so this bound is
+            # deliberately NOT applied there: it would shrink tiles that actually fit.
+            return (block_m + block_n) * block_d * 4 <= smem_optin
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
     if head_dim <= 128:
-        return 128, 64
-    if head_dim <= 256:
+        # Guarded like every other branch. Unguarded this returned (128,64) unconditionally,
+        # which needs 96KB at block_d 128 -- fine on sm_80/sm_89, fatal on a 64KB Turing
+        # card, where warmup died with OutOfResources: Required 98304, limit 65536.
         return (128, 64) if fits(128, 64) else (64, 32)
+    if head_dim <= 256:
+        if fits(128, 64):
+            return 128, 64
+        # Turing needs rungs below (64,32); Ampere+ keeps its original two-way choice so
+        # behaviour there is unchanged.
+        if pre_ampere:
+            for cand in ((64, 32), (32, 32), (32, 16)):
+                if fits(*cand):
+                    return cand
+            return 16, 16
+        return 64, 32
     if head_dim <= 384:
         return (32, 64) if fits(32, 64) else (32, 32)
     return (32, 64) if fits(32, 64) else (16, 16)
@@ -799,7 +824,8 @@ def extend_paged_attention(
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
+        head_dim, block_d, _optin_smem_bytes(q.device.index),
+        pre_ampere=torch.cuda.get_device_capability(q.device.index)[0] < 8,
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
