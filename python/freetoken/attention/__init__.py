@@ -97,6 +97,19 @@ def create_triton_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "torch",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL}),
+        # Debugging/eager ground-truth backend; no package/arch requirements.
+    ),
+)
+def create_torch_backend(config: ModelConfig):
+    from .torch import TorchAttentionBackend
+
+    return TorchAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv4_sparse",
     BackendInfo(supported_types=frozenset({AttnType.DSV4})),
 )

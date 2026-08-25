@@ -48,20 +48,15 @@ def _pdl_supported() -> bool:
 
 @triton.jit
 def _fast_tanh(x):
-    # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
-    return tl.inline_asm_elementwise(
-        "tanh.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+    # tanh.approx.f32 is a CUDA PTX intrinsic; libdevice.tanh is portable (maps to
+    # tanhf on both CUDA and AMD).
+    return libdevice.tanh(x)
 
 
 @triton.jit
 def _fast_ex2(x):
-    # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
-    return tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+    # ex2.approx.f32 is CUDA-only; libdevice.exp2 is portable.
+    return libdevice.exp2(x)
 
 
 @triton.jit
@@ -133,10 +128,18 @@ def _act_and_mul(
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
-    _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
-    )
+    # ``launch_pdl`` (Hopper griddepcontrol) is CUDA-only; ROCm triton rejects the
+    # kwarg, so only pass it on a PDL-capable (sm_90+) device.
+    if pdl:
+        _act_and_mul_kernel[grid](
+            o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=True, launch_pdl=True,
+            BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        )
+    else:
+        _act_and_mul_kernel[grid](
+            o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=False,
+            BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        )
     return out
 
 

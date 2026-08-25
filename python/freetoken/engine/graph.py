@@ -132,6 +132,18 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # Inc-8 parity: on ROCm, honour the Inc-1 graph-gate result. If capture is not
+        # viable on this AMD card, skip graphs entirely so decode uses the kernel-launch
+        # path (correct, just not graph-accelerated) rather than erroring mid-capture.
+        from freetoken.utils.arch import is_rocm
+        from freetoken.utils.graph_gate import graph_capture_status
+
+        if is_rocm() and graph_capture_status() == "fail":
+            logger.info_rank0(
+                "AMD ROCm build: HIP graph capture gate FAILED on this device; "
+                "using the kernel-launch decode path (CUDA graphs disabled)."
+            )
+            return None
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -187,7 +199,9 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        # ``self.graph_map`` is empty when graphs were skipped (ROCm graph-gate fail or
+        # disabled); decode must then fall back to the kernel-launch path.
+        return bool(self.graph_map) and batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

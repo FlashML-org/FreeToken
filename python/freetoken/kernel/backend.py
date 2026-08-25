@@ -10,6 +10,14 @@ from __future__ import annotations
 import functools
 import importlib.util
 
+from freetoken.utils.arch import is_rocm
+
+
+# NVIDIA-only optional native packages: even if an importable copy is present on a ROCm
+# torch build (e.g. a stray CUDA wheel), they must not be used -- the runtime falls back
+# to the portable Triton kernels. Treated as unavailable on ROCm.
+_CUDA_ONLY_PACKAGES = frozenset({"flashinfer", "sgl_kernel", "triton_kernels"})
+
 
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
@@ -21,13 +29,32 @@ def _importable(name: str) -> bool:
         return False
 
 
+def is_native_cuda_available() -> bool:
+    """True when the current torch build is CUDA and a CUDA-capable device is present.
+    False on ROCm and CPU builds. Used to gate NVIDIA-native ops/paths."""
+    from freetoken.utils.arch import device_kind
+
+    if device_kind() != "cuda":
+        return False
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 @functools.cache
 def is_flashinfer_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("sgl_kernel")
 
 
@@ -39,6 +66,8 @@ def is_triton_kernels_installed() -> bool:
     source tree and has no Windows wheel. It is also not one of the six ops
     ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
     """
+    if is_rocm():
+        return False
     return _importable("triton_kernels")
 
 

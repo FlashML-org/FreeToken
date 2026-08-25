@@ -45,6 +45,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF qwen3.5-moe experts: gate_up native Q4_K [L*E, 2I, row_bytes(H,Q4_K)],
+    # down re-quantized to Q8_0 [L*E, H, row_bytes(I,Q8_0)] (a uniform format the cache
+    # can hold; the source GGUF down is Q5_K/Q6_K, both >= ... 8-bit >= source precision).
+    "gguf": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -83,6 +87,8 @@ _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + ((2 * I // 128) * (H // 128) + (H // 128) * (I // 128)) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    # gate_up Q4_K row_bytes(H, Q4_K)=H//256*144; down Q8_0 row_bytes(I, Q8_0)=I//32*34.
+    "gguf": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 32) * 34,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),

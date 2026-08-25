@@ -10,6 +10,13 @@
 #define GGML_CUDA_DMMV_X 32
 #define GGML_CUDA_MMV_Y 1
 
+#if defined(USE_ROCM)
+// ROCm shim: the vendored GGUF launchers (moe.cuh/mmvq.cuh/...) take a CUDA-style
+// stream parameter. Map the CUDA stream type to HIP so those signatures compile
+// unmodified under USE_ROCM. The including .cu pulls in hip/hip_runtime.h first.
+using cudaStream_t = hipStream_t;
+#endif
+
 // Data Structures
 // QK = number of values after dequantization
 // QR = QK / number of values before dequantization

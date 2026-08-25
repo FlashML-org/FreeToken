@@ -1,0 +1,70 @@
+name: ROCm (AMD) correctness smoke
+
+# ROCm CI job: compiles the AOT kernel cache for the RX 7000 (gfx1100) target on a
+# ROCm torch install and runs a torch-free correctness smoke plus the AMD unit tests.
+# Gated on a self-hosted runner that has ROCm torch + hipcc. The primary NVIDIA release
+# flow is release.yml; this job is additive and must not gate NVIDIA releases.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rocm-smoke:
+    runs-on: [self-hosted, linux, amd, rocm]
+    timeout-minutes: 60
+    env:
+      FREETOKEN_DISABLE_JIT: "1"
+      FREETOKEN_KERNEL_CACHE_GFX: "gfx1100"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ROCm toolchain
+        run: |
+          set -e
+          command -v hipcc || ls /opt/rocm/bin/hipcc
+          "${PYTHON:-python3}" -c "import torch.version as v; print('torch hip:', v.hip)"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -e "python[rocm]"
+
+      - name: Compile AOT kernel cache for gfx1100
+        run: |
+          FREETOKEN_KERNEL_CACHE_VERBOSE=1 python -m pip wheel ./freetoken-kernel-cache -w dist/cache-rocm
+
+      - name: Install prebuilt kernel cache
+        run: |
+          whl="$(find dist/cache-rocm -name 'freetoken_kernel_cache-*.whl' | head -1)"
+          python -m pip install --force-reinstall "$whl"
+
+      - name: Torch-free AMD unit tests
+        run: |
+          python -m pytest \
+            tests/utils/test_device_kind.py \
+            tests/kernels/test_toolchain_hip.py \
+            tests/kernels/test_backend_rocm.py \
+            tests/kernels/test_cache_rocm_pairing.py \
+            tests/moe/test_nvfp4_to_mxfp4.py \
+            -q
+
+      - name: Hardware correctness smoke (serves on RX 7000)
+        run: |
+          # Functional path only -- flashinfer/sgl/trtllm are NVIDIA-only and must not
+          # be selected. AUTO backend must resolve to triton; NVFP4 auto -> triton.
+          python - <<'PY'
+          from freetoken.utils.arch import is_rocm, is_gfx_arch_ge
+          from freetoken.moe.nvfp4_backends import select_nvfp4_backend
+          import torch
+          assert is_rocm(), "expected a ROCm torch build"
+          assert is_gfx_arch_ge(1100), "expected gfx1100-class device (RX 7000)"
+          print("NVFP4 auto ->", select_nvfp4_backend(torch.device("cuda"), 768, "auto"))
+          PY
+
+      - name: Serve smoke
+        run: |
+          FREETOKEN_DEVICE=cuda python -m freetoken.serve --help >/dev/null \
+            && echo "freetoken CLI loads on ROCm"

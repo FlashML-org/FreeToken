@@ -142,11 +142,18 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # PDL only on the contiguous (decode-replay) path: on the strided qk-norm's
     # 32k-CTA prefill grids the per-CTA gdc_wait poll costs more than it hides.
     pdl = contig and is_sm90_supported()
-    _rmsnorm_kernel[(A, B)](
-        out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
-        num_warps=_num_warps(A * B), num_stages=1,
-    )
+    if pdl:
+        _rmsnorm_kernel[(A, B)](
+            out, input, weight, eps, H, sxa, sxb, soa, sob,
+            CONTIG=True, ENABLE_PDL=True, launch_pdl=True, GEMMA=gemma,
+            num_warps=_num_warps(A * B), num_stages=1,
+        )
+    else:
+        _rmsnorm_kernel[(A, B)](
+            out, input, weight, eps, H, sxa, sxb, soa, sob,
+            CONTIG=contig, ENABLE_PDL=False, GEMMA=gemma,
+            num_warps=_num_warps(A * B), num_stages=1,
+        )
     return out
 
 
@@ -170,11 +177,18 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     _, _, sra, srb = _leading(residual)
     contig = input.ndim == 2 and input.is_contiguous() and residual.is_contiguous()
     pdl = contig and is_sm90_supported()
-    _fused_add_rmsnorm_kernel[(A, B)](
-        input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
-        num_warps=_num_warps(A * B), num_stages=1,
-    )
+    if pdl:
+        _fused_add_rmsnorm_kernel[(A, B)](
+            input, residual, weight, eps, H, sxa, sxb, sra, srb,
+            CONTIG=True, ENABLE_PDL=True, launch_pdl=True, GEMMA=gemma,
+            num_warps=_num_warps(A * B), num_stages=1,
+        )
+    else:
+        _fused_add_rmsnorm_kernel[(A, B)](
+            input, residual, weight, eps, H, sxa, sxb, sra, srb,
+            CONTIG=contig, ENABLE_PDL=False, GEMMA=gemma,
+            num_warps=_num_warps(A * B), num_stages=1,
+        )
 
 
 def fused_add_rmsnorm(input, residual, weight, eps: float = 1e-6, enable_pdl: bool = False):

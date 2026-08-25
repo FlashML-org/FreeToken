@@ -15,7 +15,7 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import align_ceil, device_kind, init_logger, is_rocm, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -50,6 +50,11 @@ def _flashinfer_available() -> bool:
 
 
 def _sgl_flash_attn_available() -> bool:
+    from freetoken.utils.arch import is_rocm
+
+    # sgl_kernel is NVIDIA-only; never select it on ROCm even if a stray copy is importable.
+    if is_rocm():
+        return False
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
@@ -101,6 +106,14 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
 
 
 def _backend_requirements_met(name: str) -> bool:
+    # On ROCm (AMD) only the portable backends exist: flashinfer/sgl/trtllm (and anything
+    # sm_100-gated) are NVIDIA-only, so short-circuit before probing them at all.
+    from freetoken.utils.arch import is_rocm
+
+    if is_rocm():
+        return all(not i.requires_flashinfer and not i.requires_sgl_kernel
+                   and not i.requires_sm100 for i in
+                   [attention_backend_info(p) for p in name.split(",")])
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
     infos = [attention_backend_info(part) for part in name.split(",")]
@@ -202,6 +215,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     # explicit --attention-backend choices.
     for part in backend_parts:
         info = attention_backend_info(part)
+        from freetoken.utils.arch import is_rocm
+
+        if is_rocm() and (info.requires_flashinfer or info.requires_sgl_kernel or info.requires_sm100):
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} is NVIDIA-only and "
+                f"unavailable on this ROCm (AMD) build; use --attention-backend triton."
+            )
         if info.requires_flashinfer and not _flashinfer_available():
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
@@ -298,6 +318,7 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        logger.info_rank0(f"device_kind={device_kind()} backend={self.device}")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -1010,6 +1031,9 @@ def _ensure_expandable_segments() -> None:
     is respected and left untouched.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        return
+    if is_rocm():
+        # expandable_segments is a CUDA allocator setting with no ROCm analogue; skip it.
         return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")

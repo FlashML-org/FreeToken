@@ -683,6 +683,25 @@ def parse_args(
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
+    # ROCm (AMD) has no NVIDIA-native NVFP4/Marlin path. Reject NVIDIA-only NVFP4 backends
+    # at parse time with a clean error, and warn for the resident fused MoE backend (the
+    # offload/cpu/hybrid family is the supported AMD path).
+    from freetoken.utils.arch import is_rocm
+
+    if is_rocm():
+        nvfp4 = kwargs.get("nvfp4_backend")
+        if nvfp4 in ("marlin", "flashinfer"):
+            raise SystemExit(
+                f"--nvfp4-backend {nvfp4} is NVIDIA-only and unavailable on ROCm/AMD; "
+                f"use --nvfp4-backend triton (inline-dequant) or auto."
+            )
+        if kwargs.get("moe_backend") == "fused":
+            logger = init_logger(__name__)
+            logger.warning(
+                "--moe-backend fused relies on NVIDIA-native fused GEMM; on ROCm/AMD the "
+                "supported family is offload/hybrid/cpu (the triton/offload path)."
+            )
+
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")

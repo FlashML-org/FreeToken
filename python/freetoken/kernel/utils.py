@@ -40,6 +40,32 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
         cc = max(arch_list, key=_rank).rstrip("a").replace(".", "")
         flags = flags + [f"-gencode=arch=compute_{cc},code=compute_{cc}"]
     return flags
+
+
+def _rocm_cflags(extra: List[str]) -> List[str]:
+    """HIP/ROCm flags for a kernel build. Adds the ``USE_HIP``/``USE_ROCM`` defines so the
+    shared ``.cu``/``.cuh`` sources compile their HIP branches (llama.cpp-style). When
+    ``TVM_FFI_ROCM_ARCH_LIST`` (e.g. "gfx1100") is set (AOT cache build), we pin
+    ``--offload-arch``; otherwise hipcc targets the local GPU."""
+    flags = DEFAULT_CFLAGS + ["-DUSE_HIP=1", "-DUSE_ROCM=1"] + list(extra)
+    arch_list = os.getenv("TVM_FFI_ROCM_ARCH_LIST", "").split()
+    if arch_list:
+        flags = flags + [f"--offload-arch={arch_list[0]}"]
+    return flags
+
+
+def _arch_flags(extra: List[str]) -> List[str]:
+    """GPU kernel build flags for the active backend: HIP flags on ROCm torch, else CUDA."""
+    try:
+        from freetoken.kernel._toolchain import is_rocm_torch
+
+        if is_rocm_torch():
+            return _rocm_cflags(extra)
+    except Exception:
+        pass
+    return _cuda_cflags(extra)
+
+
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
 
@@ -86,6 +112,20 @@ def _build_stamps(segments: List[str]) -> set[str]:
     return {s for s in segments if re.fullmatch(r"g[0-9a-f]{7,40}", s)}
 
 
+def _build_stamps(local_segments: List[str]) -> List[str]:
+    """The `g<sha>` commit-stamp tokens of a local version segment list
+    (``["cu130", "g3f01615"]`` -> ``["g3f01615"]``)."""
+    return [s for s in local_segments if s.startswith("g")]
+
+
+def _arch_tags(local_segments: List[str]) -> List[str]:
+    """The backend-tag tokens of a local segment list (``cu130`` or ``rocm``). A cache
+    wheel and runtime wheel must carry the SAME backend tag -- a ``+rocm`` cache is
+    meaningless to a ``+cu130`` runtime (the fatbin is gfx SASS vs sm SASS) and vice
+    versa. Returns the tags (usually one, e.g. ``["cu130"]`` or ``["rocm"]``)."""
+    return [s for s in local_segments if s.startswith("cu") or s.startswith("rocm")]
+
+
 def _kernel_cache_version_ok(cache_version: str, runtime_version: str) -> bool:
     """Same release -- and, when both sides carry a `g<sha>` stamp, the same build.
 
@@ -93,14 +133,24 @@ def _kernel_cache_version_ok(cache_version: str, runtime_version: str) -> bool:
     `.g<sha>`), so the old string-prefix test cannot pair a stamped runtime with its
     cache; and comparing the stamps rejects a runtime/cache pair from two different
     builds, which bare release numbers (both `0.1.1`) could never detect. Either side
-    may lack a stamp (dev builds) -- then only the release part is compared."""
+    may lack a stamp (dev builds) -- then only the release part is compared.
+
+    The backend arch tag (`cu130` vs `rocm`) must also match when both sides carry one:
+    a prebuilt kernel-cache fatbin is SASS for a specific backend family, so a CUDA
+    runtime must never load a ROCm cache (or vice versa)."""
     cache_base, cache_local = _version_parts(cache_version)
     runtime_base, runtime_local = _version_parts(runtime_version)
     if cache_base != runtime_base:
         return False
     cache_stamps = _build_stamps(cache_local)
     runtime_stamps = _build_stamps(runtime_local)
-    return not (cache_stamps and runtime_stamps and cache_stamps != runtime_stamps)
+    if cache_stamps and runtime_stamps and cache_stamps != runtime_stamps:
+        return False
+    cache_arch = _arch_tags(cache_local)
+    runtime_arch = _arch_tags(runtime_local)
+    if cache_arch and runtime_arch and cache_arch != runtime_arch:
+        return False
+    return True
 
 
 def _kernel_cache_dir() -> pathlib.Path | None:
@@ -127,7 +177,8 @@ def _kernel_cache_dir() -> pathlib.Path | None:
                 f"{package_version!r} does not match freetoken version {runtime_version!r}"
             )
         cache_cuda = re.search(r"\+cu(\d{2,})", package_version)
-        if cache_cuda is not None:
+        cache_rocm = re.search(r"\+rocm", package_version)
+        if cache_cuda is not None and cache_rocm is None:
             from freetoken.kernel._toolchain import torch_cuda_major
 
             cache_major = int(cache_cuda.group(1)[:-1])
@@ -201,9 +252,16 @@ def load_aot(
         return prebuilt
 
     if cuda_files:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import (
+            check_hip_matches_torch,
+            check_nvcc_matches_torch,
+            is_rocm_torch,
+        )
 
-        check_nvcc_matches_torch()
+        if is_rocm_torch():
+            check_hip_matches_torch()
+        else:
+            check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load
 
@@ -222,7 +280,7 @@ def load_aot(
         cpp_files=cpp_files,
         cuda_files=cuda_files,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
+        extra_cuda_cflags=_arch_flags(extra_cuda_cflags),
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
@@ -247,9 +305,16 @@ def load_jit(
         return prebuilt
 
     if cuda_files or cuda_wrappers:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import (
+            check_hip_matches_torch,
+            check_nvcc_matches_torch,
+            is_rocm_torch,
+        )
 
-        check_nvcc_matches_torch()
+        if is_rocm_torch():
+            check_hip_matches_torch()
+        else:
+            check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load_inline
 
@@ -277,7 +342,7 @@ def load_jit(
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
+        extra_cuda_cflags=_arch_flags(extra_cuda_cflags),
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,

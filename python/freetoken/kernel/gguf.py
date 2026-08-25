@@ -51,16 +51,28 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
-    host_cxx = _host_compiler()
-    if host_cxx is not None:
-        # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
-        # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
-        # default (CXX unset -> g++) can be a gcc too new for the torch headers.
-        cxx_path = shutil.which(host_cxx) or host_cxx
-        extra_cuda_cflags += ["-ccbin", cxx_path]
-        os.environ["CXX"] = cxx_path
-        os.environ["CC"] = _c_compiler_for(cxx_path)
+    if torch.version.hip is not None:
+        # ROCm: hipcc (torch.utils.cpp_extension picks it up), pass the HIP defines so
+        # the kernels compile their HIP branches; drop the CUDA-only -ccbin/flag logic.
+        # Explicit --offload-arch (plus PYTORCH_ROCM_ARCH) prevents torch from auto-
+        # emitting ~14 gfx arches, which would multiply build time per arch.
+        os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx1100")
+        extra_cuda_cflags = [
+            "-O3", "--offload-arch=gfx1100", "-DUSE_HIP=1", "-DUSE_ROCM=1",
+        ]
+        os.environ.pop("CXX", None)
+        os.environ.pop("CC", None)
+    else:
+        extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+        host_cxx = _host_compiler()
+        if host_cxx is not None:
+            # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
+            # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
+            # default (CXX unset -> g++) can be a gcc too new for the torch headers.
+            cxx_path = shutil.which(host_cxx) or host_cxx
+            extra_cuda_cflags += ["-ccbin", cxx_path]
+            os.environ["CXX"] = cxx_path
+            os.environ["CC"] = _c_compiler_for(cxx_path)
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
@@ -69,7 +81,7 @@ def _module():
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
         extra_cuda_cflags=extra_cuda_cflags,
-        verbose=True,
+        verbose=False,
     )
 
 

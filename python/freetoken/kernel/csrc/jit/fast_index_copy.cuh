@@ -34,40 +34,64 @@ inline constexpr auto get_mem_package() {
 }
 
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+#if defined(USE_HIP)
+    return *src;
+#else
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+#if defined(USE_HIP)
+    return *src;
+#else
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+#if defined(USE_HIP)
+    return *src;
+#else
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
+#endif
 }
 
 __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#if defined(USE_HIP)
+    *dst = value;
+#else
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#if defined(USE_HIP)
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#if defined(USE_HIP)
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#endif
 }
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
@@ -75,7 +99,10 @@ __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
     while (atomicAdd(flag, 0) > 0) {
-#if __CUDA_ARCH__ >= 700
+#if defined(USE_HIP)
+        // HIP has no __nanosleep; busy-wait (functional parity).
+        (void)sleep_ns;
+#elif __CUDA_ARCH__ >= 700
         __nanosleep(sleep_ns);
 #endif
         sleep_ns = sleep_ns < 2048 ? (sleep_ns << 1) : 2048;
@@ -134,6 +161,16 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 // process (set at engine launch).
 inline bool host_ptr_identity() {
     static const bool identity = [] {
+#if defined(USE_HIP)
+        int device = 0;
+        if (hipGetDevice(&device) != hipSuccess) {
+            return false;  // fail closed: translate (and surface errors), don't assume identity
+        }
+        int uva = 0, reg = 0;
+        hipDeviceGetAttribute(&uva, hipDeviceAttributeUnifiedAddressing, device);
+        hipDeviceGetAttribute(&reg, hipDeviceAttributeCanUseHostPointerForRegisteredMem, device);
+        return uva == 1 && reg == 1;
+#else
         int device = 0;
         if (cudaGetDevice(&device) != cudaSuccess) {
             return false;  // fail closed: translate (and surface errors), don't assume identity
@@ -142,11 +179,23 @@ inline bool host_ptr_identity() {
         cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
         cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
         return uva == 1 && reg == 1;
+#endif
     }();
     return identity;
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
+#if defined(USE_HIP)
+    if (dev.device_type == kDLROCM || host_ptr_identity()) {
+        return ptr;
+    }
+    void* mapped = nullptr;
+    const auto err = hipHostGetDevicePointer(&mapped, ptr, 0);
+    host::RuntimeCheck(err == hipSuccess,
+        "fast_index_copy: host tensor must be pinned+mapped (hipHostGetDevicePointer: ",
+        hipGetErrorString(err), ")");
+    return mapped;
+#else
     if (dev.device_type == kDLCUDA || host_ptr_identity()) {
         return ptr;
     }
@@ -156,6 +205,7 @@ inline void* device_alias(void* ptr, DLDevice dev) {
         "fast_index_copy: host tensor must be pinned+mapped (cudaHostGetDevicePointer: ",
         cudaGetErrorString(err), ")");
     return mapped;
+#endif
 }
 
 struct IndexKernelParams {
@@ -344,12 +394,12 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(dst);
 
         TensorMatcher({L})
