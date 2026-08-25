@@ -868,3 +868,22 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_skip_bank_lock_leaves_cpu_layer_pageable(monkeypatch):
+    """A shared OS/CUDA lock quota can reserve locking for GPU-fetch layers."""
+    import freetoken.moe.host_banks as hb
+
+    def unexpected_lock(addr, nbytes):
+        raise AssertionError("FREETOKEN_SKIP_BANK_LOCK must bypass mlock")
+
+    monkeypatch.setattr(hb, "_os_lock", unexpected_lock)
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_LOCK", "1")
+    labels = [hb.HostResidency.LOCKED.value]
+    banks = {"gate_up": [hb.HostBank((4,), torch.uint8)]}
+
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+
+    assert plan.actual == {0: hb.HostResidency.PAGEABLE.value}
+    assert banks["gate_up"][0].residency == hb.HostResidency.PAGEABLE

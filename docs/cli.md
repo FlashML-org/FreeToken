@@ -90,6 +90,10 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+On hosts where OS-locked and CUDA-registered memory share one quota, combine
+`--moe-cpu-layers` with `FREETOKEN_SKIP_BANK_LOCK=1`. CPU-only layer banks then
+remain pageable instead of consuming the quota needed by GPU-fetch layers.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
