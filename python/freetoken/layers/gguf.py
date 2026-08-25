@@ -109,6 +109,37 @@ class GGUFLinear(BaseOP):
         return out
 
 
+class GGUFLMHead(GGUFLinear):
+    """LM head over a native GGUF ``output.weight`` (untied embeddings).
+
+    Identical to ``GGUFLinear`` except that during prefill it keeps only the last position
+    of each sequence, exactly as ``ParallelLMHead`` (layers/embedding.py) and
+    ``GGUFTiedLMHead`` (models/gemma4/gguf.py) already do.
+
+    This is not an optimization, it is a memory correctness issue. Logits are
+    [tokens, vocab], so on a large-vocabulary model the full-prefill tensor is enormous:
+    Ornith-1.5's vocab is 248,320, which in bf16 is 486 KiB of logits PER TOKEN. A
+    1,800-token prompt therefore asks for a single 894 MB allocation, which is more than the
+    free VRAM left on an 8 GB card after weights and caches, and prefill dies with
+    "CUDA driver error: device not ready" while decode is completely unaffected. Only the
+    last position of each sequence is ever sampled, so every other row was computed and
+    thrown away.
+
+    The dense path never hit this because ``ParallelLMHead`` slices; the bug appears only
+    when a GGUF checkpoint has untied embeddings and the head is swapped for a generic
+    quantized Linear, which has no reason to know it is the head.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return super().forward(x)
+
+
 class GGUFMergedLinear(BaseOP):
     """Merged linear projection with parts that have different quant types.
 

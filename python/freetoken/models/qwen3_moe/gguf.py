@@ -463,7 +463,16 @@ def convert_qwen3moe_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
 
         model.lm_head = GGUFTiedLMHead(embed, qt(-1, "token_embd.weight"))
     else:
-        swap_linear(model, "lm_head", qt(-1, "output.weight"))
+        # NOT swap_linear: a plain GGUFLinear would compute logits for every prefill
+        # position, and [tokens, vocab] is the largest tensor in the model. See GGUFLMHead.
+        from freetoken.layers.gguf import GGUFLMHead
+
+        head = model.lm_head
+        out_features, in_features = head.weight.shape
+        model.lm_head = GGUFLMHead(
+            in_features, out_features, qt(-1, "output.weight"),
+            has_bias=head.bias is not None,
+        )
 
 
 __all__ = [
