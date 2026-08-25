@@ -12,6 +12,8 @@ CPU-only: shapes are read off a meta-device build, so no weights and no GPU.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -229,3 +231,17 @@ def test_serial_expert_loader_does_not_slice_pre_sliced_rows_twice():
     )
 
     assert torch.equal(bank[0, :local_i], rank_rows.view(torch.uint8))
+
+
+def test_tp_rejects_ftw_tp1_layout_before_model_setup(tmp_path):
+    from freetoken.checkpoint.ftw import INDEX_NAME
+    from freetoken.engine.engine import _adjust_dsv4_config
+
+    (tmp_path / INDEX_NAME).write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        tp_info=SimpleNamespace(size=4),
+    )
+
+    with pytest.raises(ValueError, match="FTW stores the TP=1"):
+        _adjust_dsv4_config(config, lambda _name, _value: None)
