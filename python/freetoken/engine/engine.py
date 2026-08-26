@@ -10,6 +10,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -311,10 +312,11 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
-        _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
+        from freetoken.gpu_select import bind_assigned_gpu
+
+        self.device = bind_assigned_gpu(config.tp_info.rank)
+        _adjust_config(config)
         logger.info_rank0(f"device_kind={device_kind()} backend={self.device}")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -667,8 +669,10 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
-        fraction = load_hybrid_fetch_fraction(cache.quant_format, gpu_name=gpu_name)
+        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        fraction = load_hybrid_fetch_fraction(
+            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+        )
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -1009,6 +1013,14 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
+    """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
+    if not torch.cuda.is_available():
+        return None, None
+    ident = gpu_identity(torch.cuda.current_device() if index is None else index)
+    return ident["name"], ident["uuid"]
 
 
 def _ensure_expandable_segments() -> None:
@@ -1379,8 +1391,8 @@ def _adjust_config(config: EngineConfig):
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
         from freetoken.moe.bench_profile import load_backend_recommendation
 
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
+        gpu_name, gpu_uuid = _profile_gpu()
+        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")

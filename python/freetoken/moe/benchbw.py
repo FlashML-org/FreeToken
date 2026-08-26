@@ -21,13 +21,15 @@ the CPU, so they always resolve to ``offload``.
 The hybrid-vs-offload choice is dtype-dominated, so the default is a **per-dtype tuning bench**
 (``--dtype``): one bench per expert format against a canonical geometry -- the minimal set the
 runtime backend pick matches on. ``--model`` additionally benches specific model geometries for
-per-model detail. Results are written to a JSON file (default ``$XDG_CACHE_HOME/freetoken/
-benchbw.json``) so the choice is reproducible.
+per-model detail. Results are written to a JSON file per GPU (default ``$XDG_CACHE_HOME/
+freetoken/benchbw/<gpu-uuid>.json``) so the choice is reproducible and a multi-GPU box keeps
+one profile per card.
 
     ft bench bw                              # per-dtype tuning bench (default: all formats)
     ft bench bw --dtype nvfp4,bf16           # only these formats
     ft bench bw --model qwen3.6-moe          # per-model detail instead
     ft bench bw --dtype all --model all      # both
+    ft bench bw --gpu GPU-2f3a...            # bench a specific GPU (UUID or nvidia-smi index)
 """
 
 from __future__ import annotations
@@ -47,6 +49,12 @@ from types import SimpleNamespace
 
 import torch
 
+from freetoken.gpu_select import (
+    assign_gpu,
+    bind_assigned_gpu,
+    gpu_identity,
+    single_gpu_arg,
+)
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
 from freetoken.utils import init_logger
@@ -134,11 +142,11 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
 }
 
 
-def default_out_path() -> str:
+def default_out_path(gpu_uuid: str | None = None) -> str:
     # Single source of truth with the (torch-free) reader the engine consults.
     from freetoken.moe.bench_profile import default_profile_path
 
-    return default_profile_path()
+    return default_profile_path(gpu_uuid)
 
 
 def _cgroup_mem_headroom() -> int | None:
@@ -696,12 +704,17 @@ def run_benchbw(
             "benchbw needs a CUDA device to measure PCIe bandwidth (both offload and "
             "hybrid serve experts to the GPU)."
         )
+    if torch.cuda.device_count() == 0:
+        raise RuntimeError(
+            f"no CUDA device visible (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r})."
+        )
     if not 0 <= device_index < torch.cuda.device_count():
         raise RuntimeError(
-            f"--device {device_index} out of range (found {torch.cuda.device_count()} CUDA devices)."
+            f"device_index {device_index} out of range (found {torch.cuda.device_count()} CUDA devices)."
         )
     device = torch.device("cuda", device_index)
     torch.cuda.set_device(device)
+    gpu = gpu_identity(device_index)
 
     # Machine-parseable progress on stdout (opt-in), so the daemon/Desktop can stream feedback
     # while the bench runs -- mirrors ft checkpoint's FTCONVERT lines. `done`/`total` count the
@@ -766,7 +779,8 @@ def run_benchbw(
         "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
         "host": socket.gethostname(),
-        "gpu": {"index": device_index, "name": torch.cuda.get_device_name(device)},
+        # index is the CUDA ordinal the bench ran on; uuid keys the profile file
+        "gpu": {"index": device_index, "name": gpu["name"], "uuid": gpu["uuid"]},
         "cpu": {"physical_cores": len(physical_core_cpus()), "threads_used": cpu["threads"]},
         "threshold": threshold,
         "ceilings": {
@@ -780,9 +794,11 @@ def run_benchbw(
         "workloads": workloads_out,
     }
 
-    out_path = os.path.expanduser(out_path or default_out_path())
+    out_path = os.path.expanduser(out_path or default_out_path(gpu["uuid"]))
     _atomic_write_json(out_path, result)
     result["out_path"] = out_path
+    if prog_on:
+        print(f"FTBENCH_OUT {out_path}", flush=True)
     return result
 
 
@@ -927,10 +943,12 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                    help=f"CPU MoE ISA: 'auto' (default, best), 'all', or a subset of "
                         f"{list(_ISA_TIERS)} to sweep (kernel caps down to hw support)")
     p.add_argument("-o", "--out", default=None,
-                   help=f"JSON output path (default {default_out_path()})")
+                   help=f"JSON output path (default {default_out_path('<gpu-uuid>')})")
     p.add_argument("--threshold", type=_positive_float, default=2.0,
                    help="recommend hybrid when CPU BW > threshold x PCIe BW (default 2.0)")
-    p.add_argument("--device", type=_nonneg_int, default=0, help="CUDA device index (default 0)")
+    p.add_argument("--gpu", type=single_gpu_arg, default=None,
+                   help="GPU to bench: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or an "
+                        "nvidia-smi index (default: the first visible GPU)")
     p.add_argument("--cpu-threads", type=_nonneg_int, default=0,
                    help="CPU worker threads (0 = one per physical core)")
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
@@ -942,6 +960,13 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                    help="fast_index_copy gather passes to time")
     ns = p.parse_args(argv)
 
+    # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
+    try:
+        assign_gpu(ns.gpu)
+        device_index = bind_assigned_gpu().index
+    except (ValueError, RuntimeError) as e:
+        p.error(str(e))
+
     models = ns.model or ()
     dtypes = ns.dtype
     # Default (no selection): the full per-dtype tuning bench -- the minimal set the runtime
@@ -951,7 +976,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
 
     try:
         result = run_benchbw(
-            out_path=ns.out, threshold=ns.threshold, device_index=ns.device, models=models,
+            out_path=ns.out, threshold=ns.threshold, device_index=device_index, models=models,
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,

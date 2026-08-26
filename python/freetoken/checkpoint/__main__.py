@@ -1,7 +1,7 @@
 """CLI: convert an HF safetensors checkpoint to a FreeToken Weight (FTW) checkpoint.
 
     ft checkpoint --model <hf_dir> --out <ftw_dir> \
-        [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8]
+        [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--gpu <uuid-or-index>]
 
 The output dir is self-contained: point the server's ``--model`` at it to load via the FTW
 fast path (auto-detected).
@@ -13,6 +13,8 @@ import argparse
 import time
 
 import torch
+
+from freetoken.gpu_select import assign_gpu, bind_assigned_gpu, single_gpu_arg
 
 from .convert import convert_checkpoint
 
@@ -27,15 +29,24 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--moe-backend", default="offload",
                    help="offload (experts -> banks) or e.g. triton (experts stay dense)")
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
-    p.add_argument("--device", default=None, help="CUDA device for repack (default cuda:0)")
+    p.add_argument("--gpu", type=single_gpu_arg, default=None,
+                   help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
+                        "an nvidia-smi index (default: the first visible GPU)")
     ns = p.parse_args(argv)
+
+    # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
+    try:
+        assign_gpu(ns.gpu)
+        device = f"cuda:{bind_assigned_gpu().index}"
+    except (ValueError, RuntimeError) as e:
+        p.error(str(e))
 
     shard_limit = int(ns.shard_gib * (1 << 30))
     shard_limit -= shard_limit % 4096  # keep aligned
     t = time.perf_counter()
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
-        moe_backend=ns.moe_backend, shard_limit=shard_limit, device=ns.device,
+        moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

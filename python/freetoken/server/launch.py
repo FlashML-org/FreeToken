@@ -59,6 +59,13 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
 
+    # published (not bound) here: the engine binds it after the allocator setup
+    from freetoken.gpu_select import set_assigned_gpu
+
+    # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
+    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
+    set_assigned_gpu(targets[args.tp_info.rank])
+
     import torch
     from freetoken.scheduler import Scheduler
 
@@ -90,7 +97,10 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             try:
                 from freetoken.kvcache.cache_status import compute_cache_status_meta
 
-                ack_queue.put(("meta", compute_cache_status_meta(scheduler.engine)))
+                meta = compute_cache_status_meta(scheduler.engine)
+                # the parent must not touch CUDA to learn this
+                meta["gpus"] = scheduler.gpus
+                ack_queue.put(("meta", meta))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
@@ -126,6 +136,19 @@ def launch_server(
         prog=prog,
     )
     logger = init_logger(__name__, "initializer")
+
+    if server_args.gpu:
+        # resolve here so a typo is one clear error before any worker spawns
+        from freetoken.gpu_select import resolve_gpu_uuids
+
+        try:
+            server_args = replace(server_args, gpu_assigned=resolve_gpu_uuids(server_args.gpu))
+        except ValueError as exc:
+            raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
+        logger.info(
+            f"--gpu {','.join(server_args.gpu)} -> "
+            f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
+        )
 
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp

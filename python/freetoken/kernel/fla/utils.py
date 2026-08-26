@@ -271,13 +271,13 @@ is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
 is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in torch.cuda.get_device_name(0)
+    "NVIDIA H" in torch.cuda.get_device_name(torch.cuda.current_device())
     or torch.cuda.get_device_capability()[0] >= 9
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
-is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
+is_tf32_supported = is_nvidia and torch.cuda.get_device_capability()[0] >= 8
 is_gather_supported = hasattr(triton.language, "gather")
 
 
@@ -309,8 +309,10 @@ class Backend(Enum):
 
 
 @lru_cache(maxsize=None)
-def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
+def check_shared_mem(arch: str = "none", tensor_idx: "int | None" = None) -> bool:
     try:
+        if tensor_idx is None:
+            tensor_idx = device_torch_lib.current_device()
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]
         return max_shared_memory >= Backend.get_shared_memory(arch)

@@ -28,7 +28,7 @@ import triton.language as tl
 
 from freetoken.kernel.triton.autotune_cache import autotune_cache_kwargs
 
-_NUM_SM = torch.cuda.get_device_properties(0).multi_processor_count
+_NUM_SM = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 _MIN_CHUNK = 4096  # do not split a row finer than this
 
 

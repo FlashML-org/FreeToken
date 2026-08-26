@@ -862,6 +862,11 @@ class ServeManager:
         with self._cond:
             return self._child.pid if self._child is not None else None
 
+    def serve_args(self) -> list[str]:
+        """Engine args of the running (or last started) serve."""
+        with self._cond:
+            return list(self._args)
+
     def status(self) -> dict:
         with self._cond:
             child = self._child

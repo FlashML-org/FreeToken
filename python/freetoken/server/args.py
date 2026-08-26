@@ -39,6 +39,10 @@ class ServerArgs(SchedulerConfig):
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
+    # --gpu entries in TP-rank order, empty = not given
+    gpu: tuple[str, ...] = ()
+    # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
+    gpu_assigned: "tuple[str, ...] | None" = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -108,6 +112,11 @@ def parse_args(
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
+
+    def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
+        from freetoken.gpu_select import gpu_arg
+
+        return gpu_arg(value)
 
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
@@ -225,6 +234,16 @@ def parse_args(
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=_lazy_gpu_arg,
+        default=ServerArgs.gpu,
+        help=(
+            "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a GPU "
+            "UUID (GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index"
+        ),
     )
 
     parser.add_argument(
@@ -627,6 +646,15 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    # reject a too-long list here with a clear reason, not as a dead rank later
+    if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
+        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
+            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+        parser.error(
+            f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
+            f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+        )
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

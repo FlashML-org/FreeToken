@@ -292,10 +292,14 @@ class PinPipeline:
     def __init__(self) -> None:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
+        # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
+        self._device = torch.cuda.current_device() if torch.cuda.is_available() else None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
         while True:
             item = self._q.get()
             if item is None:
