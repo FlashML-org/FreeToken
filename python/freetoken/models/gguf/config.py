@@ -25,6 +25,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     # config's expert_count is absent so moe_enabled comes out False.
     "qwen35": "Qwen35GGUFForCausalLM",
     "qwen3moe": "Qwen3MoeGGUFForCausalLM",
+    "deepseek4": "DeepseekV4GGUFForCausalLM",
 }
 
 
