@@ -1,14 +1,17 @@
 """qwen3_5_moe dense-pass normalization for mixed-precision NVFP4 exports.
 
-unsloth/Qwen3.8-27B-NVFP4 keeps some dense projections (GDN ``in_proj_*``) as
-weight-only FP8 instead of bf16. The dense pass used to feed the raw e4m3 tensor
-straight into ``ct_bf16_fuse``, whose ``torch.cat`` dies on fp8/bf16 promotion:
+unsloth/Qwen3.8-27B-NVFP4 keeps some dense projections as weight-only FP8 instead of
+bf16. The dense pass used to feed the raw e4m3 tensor straight into ``ct_bf16_fuse``,
+whose ``torch.cat`` dies on fp8/bf16 promotion:
 
     RuntimeError: Promotion for Float8 Types is not supported, attempted to promote
     Float8_e4m3fn and BFloat16
 
-The pass now normalizes fp8 ``.weight`` tensors to bf16 first (W8A16 dequant with a
-per-tensor scale, broadcast with a block scale, exact cast without a scale).
+The pass now keeps scaled fp8 linears native where the model built fp8 linears (W8A16:
+fp8 weight + per-row fp32 scale, fused q/k/v -> qkv_proj, in_proj_qkv/z -> in_proj_qkvz,
+gate/up -> gate_up_proj, o_proj / GDN out_proj / down_proj / lm_head singletons) and
+dequantizes the remainder to bf16 first (W8A16 dequant with a per-tensor scale,
+broadcast with a block scale, exact cast without a scale).
 """
 
 import torch
@@ -175,6 +178,34 @@ def test_scalar_scale_still_broadcasts():
 
     out = _per_row_scale(torch.tensor([2.0]), 3)
     assert torch.equal(out, torch.full((3,), 2.0, dtype=torch.float32))
+
+
+def test_fp8_mlp_gate_up_fusion_local_map():
+    """The mixed layout extends the fp8 fusion map locally (dense-MLP gate/up stay native
+    W8A16 instead of dequantizing to bf16): fp8 weights + concatenated per-row fp32
+    scales, no input_scale (acts are None)."""
+    from freetoken.models.qwen3_5_moe.weight import _PT_FP8_FUSE, _pt_fp8_fuse
+
+    O, IN = 4, 8
+    base = "model.layers.56.mlp"
+    local_map = {**_PT_FP8_FUSE, ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj")}
+    w = {p: torch.randn(O, IN).to(torch.float8_e4m3fn) for p in (".gate_proj", ".up_proj")}
+    s = {p: torch.full((O, 1), 0.5, dtype=torch.bfloat16) for p in w}
+    buf: dict = {}
+    completed: list[tuple[str, torch.Tensor]] = []
+    for part in (".gate_proj", ".up_proj"):
+        emit = _pt_fp8_fuse(base + part, w[part], s[part], None, buf, local_map)
+        if emit:
+            completed.extend(emit)
+    assert len(completed) == 2  # weight + weight_scale (no input_scale: acts are None)
+    (key_w, fused_w), (key_s, fused_s) = completed
+    assert key_w == base + ".gate_up_proj.weight"
+    assert fused_w.dtype == torch.float8_e4m3fn
+    assert fused_w.shape == (O * 2, IN)
+    assert key_s == base + ".gate_up_proj.weight_scale"
+    assert fused_s.dtype == torch.float32
+    assert fused_s.shape == (O * 2,)
+    assert not buf
 
 
 def test_fp8_native_qkv_fusion_per_row_scales():

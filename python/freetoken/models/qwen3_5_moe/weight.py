@@ -349,16 +349,23 @@ def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
     scale = scale.to(torch.float32)
     if scale.numel() == 1:
         return scale.reshape(1).expand(rows)
+    if scale.numel() != rows:
+        raise ValueError(
+            f"per-row scale must have {rows} elements, got {scale.numel()} (shape {tuple(scale.shape)})"
+        )
     return scale.reshape(rows)
 
 
-def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
+def _pt_fp8_fuse(base: str, weight: torch.Tensor, scale: torch.Tensor,
                  act_scale: torch.Tensor | None, buf: dict,
                  fuse_map: dict[str, tuple[str, ...]] | None = None,
-                 ) -> list[tuple[str, torch.Tensor]] | list | None:
-    """Buffer an fp8 fusion part ``(weight, scalar, act_scale)``; once all parts arrive emit
+                 ) -> list[tuple[str, torch.Tensor]] | None:
+    """Buffer an fp8 fusion part ``(weight, scale, act_scale)``; once all parts arrive emit
     the concatenated ``(.weight fp8, .weight_scale per-row fp32)`` plus the shared
     ``.input_scale``. ``[]`` while incomplete, ``None`` if ``base`` is not an fp8 fusion part.
+
+    ``scale`` is the part's ``.weight_scale``: a calibrated scalar (modelopt) or a per-row
+    ``[O, 1]``/``[O]`` vector (unsloth's mixed exports) -- normalized per row downstream.
 
     The fused parts all read the *same* activation, so modelopt calibrates one activation
     range for all of them and their ``input_scale`` values come out bit-identical (verified on
@@ -369,7 +376,7 @@ def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
             if base.endswith(part):
                 key = base[: -len(part)] + fused_suffix
                 slots = buf.setdefault(key, {})
-                slots[idx] = (weight, scalar, act_scale)
+                slots[idx] = (weight, scale, act_scale)
                 if len(slots) < len(parts):
                     return []
                 del buf[key]
@@ -739,6 +746,11 @@ def _iter_weights_compressed_tensors(
                                     _per_row_scale(scale, tensor.shape[0]).contiguous(),
                                 )
                                 continue
+                        # Unscaled fp8 dequantizes to bf16. Note: an *unscaled* fp8
+                        # q/k/v or in_proj_qkv/z in the fp8-split layout (no real export
+                        # has this: unsloth scales every fp8 part) would dequant into the
+                        # bf16 group instead of the model's native-fp8 linears and fail at
+                        # load with a missing key -- loud, not a silent dequant.
                         tensor = _fp8_weight_to_bf16(tensor, scale)
                     # bf16 parts (and dequantized fp8) feed the bf16 fusions: q/k/v ->
                     # qkv_proj, gate/up -> gate_up_proj (NVFP4 layout map), plus the
