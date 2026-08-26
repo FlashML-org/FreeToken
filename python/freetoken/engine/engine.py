@@ -490,7 +490,11 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(
+                config.kv_reserve_tokens,
+                min_reserve,
+                (config.num_page_override or 0) * page_tokens,
+            ),
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
