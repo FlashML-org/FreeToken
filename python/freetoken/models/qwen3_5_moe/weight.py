@@ -87,6 +87,33 @@ def _dequant_fp8_weight(weight: torch.Tensor, weight_scale: torch.Tensor) -> tor
     return weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
 
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _fp8_weight_to_bf16(tensor: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+    """Normalize a dense weight stored as fp8 to bf16 before the bf16 fusion/passthrough.
+
+    Mixed NVFP4 exports (e.g. unsloth/Qwen3.8-27B-NVFP4) keep some dense projections
+    (GDN ``in_proj_*``) as weight-only FP8 instead of bf16; without this, the raw e4m3
+    tensor reaches ``ct_bf16_fuse`` and ``torch.cat`` dies on fp8/bf16 promotion.
+    A per-tensor ``.weight_scale`` makes this a W8A16 dequant (:func:`_dequant_fp8_weight`);
+    a per-row ``[O, 1]`` scale (unsloth's mixed exports) or block ``[O, IN//g]`` scale is
+    broadcast over its group; without a scale sibling the fp8 values are the (rounded)
+    weights themselves, so the cast is exact."""
+    if scale is not None:
+        if scale.numel() == 1:
+            return _dequant_fp8_weight(tensor, scale)
+        # Per-row [O, 1] or block [O, IN//g] scale. fp8 values and the (bf16-stored)
+        # scale are exact in bf16, so a bf16 multiply rounds once -- the same result the
+        # fp32 path produced before its final cast -- without materializing an fp32
+        # copy (a per-row lm_head scale would otherwise transiently double the memory).
+        if scale.shape[-1] == 1:  # per-output-row: pure broadcast, no repeat materialized
+            return tensor.to(torch.bfloat16) * scale.to(torch.bfloat16)
+        group = tensor.shape[-1] // scale.shape[-1]
+        return tensor.to(torch.bfloat16) * scale.to(torch.bfloat16).repeat_interleave(group, dim=-1)
+    return tensor.to(torch.bfloat16)
+
+
 def _dequant_nvfp4_weight(
     weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor
 ) -> torch.Tensor:
@@ -180,12 +207,15 @@ def iter_weights(
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
     if _compressed_tensors_nvfp4(hf_config):
-        # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
-        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        # Dense compressed-tensors (e.g. Qwen3.6-27B NVFP4; unsloth's mixed NVFP4+FP8
+        # export): attn (q/k/v/o, GDN out_proj) + dense MLP W4A16 native where the
+        # checkpoint stores them packed; FP8 attention/GDN parts stay native W8A16 when
+        # the model built the fp8-split GDN (attn_quant=="fp8_pertensor"); lm_head, norms bf16.
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
+            attn_fp8=config.attn_quant == "fp8_pertensor",
         )
         return
     if config.expert_quant == "fp8_block":
@@ -311,13 +341,21 @@ _PT_BF16_FUSE: dict[str, tuple[str, ...]] = {
 }
 
 
-def _per_row_scale(scalar: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-tensor scalar -> per-output-row fp32 vector ``[rows]`` (exact broadcast)."""
-    return scalar.reshape(1).to(torch.float32).expand(rows)
+def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Scalar or per-output-row scale -> per-output-row fp32 vector ``[rows]``.
+
+    A scalar (modelopt's calibrated per-tensor scale) is an exact broadcast; a per-row
+    ``[rows]``/``[rows, 1]`` scale (unsloth's mixed exports) is used verbatim."""
+    scale = scale.to(torch.float32)
+    if scale.numel() == 1:
+        return scale.reshape(1).expand(rows)
+    return scale.reshape(rows)
 
 
 def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
-                 act_scale: torch.Tensor | None, buf: dict):
+                 act_scale: torch.Tensor | None, buf: dict,
+                 fuse_map: dict[str, tuple[str, ...]] | None = None,
+                 ) -> list[tuple[str, torch.Tensor]] | list | None:
     """Buffer an fp8 fusion part ``(weight, scalar, act_scale)``; once all parts arrive emit
     the concatenated ``(.weight fp8, .weight_scale per-row fp32)`` plus the shared
     ``.input_scale``. ``[]`` while incomplete, ``None`` if ``base`` is not an fp8 fusion part.
@@ -326,7 +364,7 @@ def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
     range for all of them and their ``input_scale`` values come out bit-identical (verified on
     Qwen3.8-27B-NVFP4: q/k/v all 0.2053571492, GDN qkv/z both 0.1121651828). Taking the max is
     therefore exact here, and stays correct if a future checkpoint lets them drift."""
-    for fused_suffix, parts in _PT_FP8_FUSE.items():
+    for fused_suffix, parts in (fuse_map if fuse_map is not None else _PT_FP8_FUSE).items():
         for idx, part in enumerate(parts):
             if base.endswith(part):
                 key = base[: -len(part)] + fused_suffix
@@ -564,16 +602,21 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, attn_fp8: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
+    """Dense pass for a compressed-tensors checkpoint (dense Qwen3.x, e.g. Qwen3.6-27B
+    NVFP4, unsloth's mixed NVFP4+FP8 export).
 
     Keeps the NVFP4 attention (q/k/v/o, GDN out_proj) and dense MLP (gate/up/down) native
     (W4A16) -- ``.weight`` (uint8) + ``.weight_scale`` (fp8 block) + ``.weight_global`` (fp16
     per-row) -- when ``nvfp4``; otherwise dequantizes each to bf16. q/k/v -> ``qkv_proj``, dense gate/up -> ``gate_up_proj`` (output-dim concat).
-    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; ``conv1d``/``A_log``/``dt_bias``/
-    gated ``norm`` pass through (fp32 for A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and
-    embeddings are bf16. The model is dense (no routed experts), so there is no experts pass."""
+    With ``attn_fp8`` (unsloth's mixed layout) the attention/GDN projections are kept native
+    FP8 (W8A16) instead: q/k/v -> ``qkv_proj`` and in_proj_qkv/z -> ``in_proj_qkvz`` (fp8 +
+    per-row fp32 scale), o_proj / GDN out_proj singletons, in_proj_b/a -> bf16 ``in_proj_ba``
+    (matching the model's fp8-split GDN); without it GDN ``in_proj_{qkv,z,b,a}`` stay bf16 ->
+    fused ``in_proj``. ``conv1d``/``A_log``/``dt_bias``/gated ``norm`` pass through (fp32 for
+    A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and embeddings are bf16. The model is
+    dense (no routed experts), so there is no experts pass."""
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
     if not include_non_moe:
@@ -582,11 +625,30 @@ def _iter_weights_compressed_tensors(
     tp_info = get_tp_info()
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
+    fp8_buf: dict[str, dict[int, tuple]] = {}
+    # The GDN in_proj fusion follows the model layout: the fp8-split GDN (unsloth's mixed
+    # layout) builds in_proj_qkvz (fp8) + in_proj_ba (bf16); the plain layout fuses all
+    # four parts into one bf16 in_proj. The mixed layout also stores some dense-MLP
+    # layers fp8 (native W8A16 gate_up fusion) that the modelopt pass never sees, so the
+    # fp8 fusion map is extended locally rather than mutating the shared one.
+    in_proj_fuse = _PT_BF16_FUSE if attn_fp8 else _CT_BF16_FUSE
+    fp8_fuse = (
+        {**_PT_FP8_FUSE, ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj")}
+        if attn_fp8
+        else _PT_FP8_FUSE
+    )
+    # Native-fp8 singletons of the mixed layout (o_proj / GDN out_proj / dense-MLP
+    # down_proj / lm_head): fp8 weight + per-row fp32 scale, no dequant.
+    fp8_singletons = (
+        (".self_attn.o_proj", ".linear_attn.out_proj", ".mlp.down_proj", "lm_head")
+        if attn_fp8
+        else (".self_attn.o_proj", ".linear_attn.out_proj")
+    )
 
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
-        emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_BF16_FUSE)
+        emit = _ct_bf16_fuse(base, tensor, bf16_buf, in_proj_fuse)
         if emit is not None:
             yield from emit
             return
@@ -645,7 +707,47 @@ def _iter_weights_compressed_tensors(
                     continue
 
                 if name.endswith(".weight"):
-                    yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
+                    tensor = reader.get_tensor(raw_name)
+                    base = name[: -len(".weight")]
+                    if tensor.dtype in _FP8_DTYPES:
+                        # Mixed exports (unsloth) store some dense projections as weight-only
+                        # FP8 rather than bf16. In the fp8 attention layout everything
+                        # scaled stays native FP8 (W8A16): the fused q/k/v -> qkv_proj,
+                        # in_proj_qkv/z -> in_proj_qkvz, dense-MLP gate/up -> gate_up_proj
+                        # (each part's per-row scale concatenated), the o_proj / GDN
+                        # out_proj / dense-MLP down_proj / lm_head singletons. Unscaled fp8
+                        # dequantizes to bf16 -- the bf16 fusion's torch.cat dies on raw
+                        # fp8/bf16 promotion. The scale sibling is skipped globally by
+                        # this pass, so this is its only consumer.
+                        raw_base = raw_name[: -len(".weight")]
+                        scale_name = raw_base + ".weight_scale"
+                        has_scale = reader.has(scale_name)
+                        scale = reader.get_tensor(scale_name) if has_scale else None
+                        if attn_fp8 and has_scale:
+                            emit = _pt_fp8_fuse(base, tensor, scale, None, fp8_buf, fp8_fuse)
+                            if emit is not None:
+                                # The fp8 fusion owns this part (buffered `[]` or just
+                                # completed): it must never also reach the bf16 side, or
+                                # the group completes on the fp8 side while the bf16 side
+                                # is left short one part (incomplete bf16 fusion assert).
+                                yield from emit
+                                continue
+                            if base.endswith(fp8_singletons):
+                                yield base + ".weight", tensor
+                                yield (
+                                    base + ".weight_scale",
+                                    _per_row_scale(scale, tensor.shape[0]).contiguous(),
+                                )
+                                continue
+                        tensor = _fp8_weight_to_bf16(tensor, scale)
+                    # bf16 parts (and dequantized fp8) feed the bf16 fusions: q/k/v ->
+                    # qkv_proj, gate/up -> gate_up_proj (NVFP4 layout map), plus the
+                    # layout's in_proj form; singletons / norms pass through.
+                    emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_NVFP4_FUSE)
+                    if emit is None:
+                        yield from _emit_bf16_weight(name, tensor)
+                    else:
+                        yield from emit
                     continue
 
                 # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).
@@ -655,6 +757,7 @@ def _iter_weights_compressed_tensors(
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
+    assert not fp8_buf, f"Incomplete fp8 fusions: {list(fp8_buf.keys())}"
 
 
 def iter_weights_parallel(

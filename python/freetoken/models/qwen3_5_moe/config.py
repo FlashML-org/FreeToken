@@ -68,6 +68,77 @@ def _expert_quant(hf_config: Any) -> str:
 _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
+def _compressed_linear_storage(
+    hf_config: Any,
+) -> tuple[str, str, dict[int, str] | None, bool]:
+    """Per-module dense-linear storage sniffed from the checkpoint's
+    ``model.safetensors.index.json`` weight_map:
+    ``(attention storage, dense-MLP fallback, per-layer dense-MLP overrides, lm_head
+    is fp8)``.
+
+    The attention storage is ``"nvfp4"`` (packed q/k/v/o + GDN out_proj linears),
+    ``"fp8"`` (weight + scale siblings, e.g. unsloth's mixed export), or ``"none"``
+    (bf16). The fallback is ``"nvfp4"`` when at least one dense-MLP layer is packed,
+    else ``"none"``. The override map gives the storage of dense-MLP layers that are
+    not packed NVFP4 (``"fp8"`` keeps them native W8A16; ``"bf16"`` dequantizes at
+    load); ``None`` means every dense-MLP layer follows the fallback. When the index
+    is unavailable (a hub id before download, or a single-file checkpoint) assume
+    the official dense-NVFP4 layout (all packed, no overrides, bf16 lm_head).
+    """
+    import json
+    import os
+    import re
+
+    path = getattr(hf_config, "name_or_path", None)
+    if not isinstance(path, str) or not os.path.isdir(path):
+        return "nvfp4", "nvfp4", None, False
+    index = os.path.join(path, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        return "nvfp4", "nvfp4", None, False
+    with open(index, encoding="utf-8") as f:
+        weight_map = json.load(f).get("weight_map", {})
+    keys = set(weight_map)
+    attn_suffix_re = re.compile(r"\.(?:self_attn\.(?:q|k|v|o)_proj|linear_attn\.out_proj)\.")
+    attn_bases = set()
+    for k in keys:
+        if attn_suffix_re.search(k) and k.endswith((".weight", ".weight_packed")):
+            attn_bases.add(k.rsplit(".", 1)[0])
+    attn_packed = any(b + ".weight_packed" in keys for b in attn_bases)
+    attn_fp8 = any(b + ".weight_scale" in keys for b in attn_bases)
+    attn = "nvfp4" if attn_packed else ("fp8" if attn_fp8 else "none")
+    # Per-layer dense-MLP storage (order-independent): packed -> nvfp4, any scale
+    # sibling -> fp8 (native W8A16), bare weight -> bf16. lm_head: fp8 when it ships a
+    # scale sibling.
+    mlp_key_re = re.compile(
+        r"\.layers\.(\d+)\.mlp\.(?:gate|up|down)_proj\.(weight_packed|weight_scale|weight)$"
+    )
+    packed_layers: set[int] = set()
+    scaled_layers: set[int] = set()
+    plain_layers: set[int] = set()
+    for k in keys:
+        mm = mlp_key_re.search(k)
+        if mm:
+            layer = int(mm.group(1))
+            suffix = mm.group(2)
+            if suffix == "weight_packed":
+                packed_layers.add(layer)
+            elif suffix == "weight_scale":
+                scaled_layers.add(layer)
+            else:
+                plain_layers.add(layer)
+    lmhead_fp8 = any(k == "lm_head.weight_scale" or k.endswith(".lm_head.weight_scale") for k in keys)
+    # No mlp.{gate,up,down}_proj keys at all: routed-expert MoE naming (shared_expert /
+    # experts) -- keep the native assumption with no per-layer overrides.
+    if not (packed_layers or scaled_layers or plain_layers):
+        return attn, "nvfp4", None, lmhead_fp8
+    all_layers = packed_layers | scaled_layers | plain_layers
+    overrides = {
+        layer: ("fp8" if layer in scaled_layers else "bf16")
+        for layer in all_layers - packed_layers
+    }
+    return attn, "nvfp4" if packed_layers else "none", overrides or None, lmhead_fp8
+
+
 def _lm_head_quant(hf_config: Any) -> str:
     """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
     the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
@@ -182,10 +253,21 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # Mixed compressed-tensors exports (unsloth's dynamic per-module quant) store the
+    # attention projections as weight-only FP8 (per-row scale) and some dense-MLP layers
+    # as FP8: keep each group in its native storage (W8A16 attention, W4A16 packed MLP
+    # layers, bf16 dequant for the rest) instead of dequantizing everything to bf16.
+    dense_mlp_storage: dict[int, str] | None = None
     if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
-        dense_quant = "nvfp4"
-        lm_head_quant = "none"
+        attn_storage, dense_quant, dense_mlp_storage, lmhead_fp8 = _compressed_linear_storage(hf_config)
+        attn_quant = (
+            "fp8_pertensor" if attn_storage == "fp8"
+            else "nvfp4" if attn_storage == "nvfp4"
+            else "none"
+        )
+        # unsloth's mixed export stores lm_head as weight-only FP8 (per-row scale): keep
+        # it native W8A16 (halves the ~2.5 GB bf16 lm_head); official layouts are bf16.
+        lm_head_quant = "fp8_pertensor" if lmhead_fp8 else "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -257,6 +339,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
+        dense_mlp_storage=dense_mlp_storage,
     )
 
 

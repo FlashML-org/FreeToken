@@ -267,6 +267,11 @@ class ModelConfig:
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
     # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
     lm_head_quant: str = "none"
+    # Per-layer override of the dense-MLP storage for mixed compressed-tensors exports
+    # (unsloth: most layers packed NVFP4, a few FP8 layers). Keys are layer ids; the value
+    # replaces dense_quant for that layer's dense MLP at construction ("nvfp4" native W4A16
+    # / "bf16" dequant-at-load). None = every dense-MLP layer follows dense_quant.
+    dense_mlp_storage: dict[int, str] | None = None
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
