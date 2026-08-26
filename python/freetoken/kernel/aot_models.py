@@ -175,6 +175,15 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=("fp8_block",),
     ),
     AotModel(
+        name="Qwen/Qwen3.8-Flash-Next-FP8",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=("fp8_block",),
+    ),
+    AotModel(
         name="nvidia/Qwen3.6-35B-A3B-NVFP4",
         architecture="Qwen3_5MoeForConditionalGeneration",
         hidden_size=2048,

@@ -88,9 +88,9 @@ using mem_package_t = decltype(get_mem_package<kUnit>());
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
 __always_inline __device__ auto load_vec(const void* __restrict__ src) {
     using Package = mem_package_t<kUnit>;
-    constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
-    constexpr auto kLoopCount = kBytes / kBytesPerLoop;
-    static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
+    static_assert(kBytes % sizeof(Package) == 0, "kBytes must contain whole memory packages");
+    constexpr auto kPackageCount = kBytes / sizeof(Package);
+    constexpr auto kLoopCount = (kPackageCount + kThreads - 1) / kThreads;
 
     const auto src_packed = static_cast<const Package*>(src);
     const auto lane_id = threadIdx.x % kThreads;
@@ -99,7 +99,9 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 #pragma unroll kLoopCount
     for (std::size_t i = 0; i < kLoopCount; ++i) {
         const auto j = i * kThreads + lane_id;
-        vec.data[i] = load_nc(src_packed + j);
+        if (j < kPackageCount) {
+            vec.data[i] = load_nc(src_packed + j);
+        }
     }
 
     return vec;
@@ -108,9 +110,9 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
 __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
     using Package = mem_package_t<kUnit>;
-    constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
-    constexpr auto kLoopCount = kBytes / kBytesPerLoop;
-    static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
+    static_assert(kBytes % sizeof(Package) == 0, "kBytes must contain whole memory packages");
+    constexpr auto kPackageCount = kBytes / sizeof(Package);
+    constexpr auto kLoopCount = (kPackageCount + kThreads - 1) / kThreads;
     static_assert(std::is_same_v<Tp, device::device_vec<Package, kLoopCount>>);
 
     const auto dst_packed = static_cast<Package*>(dst);
@@ -119,7 +121,9 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 #pragma unroll kLoopCount
     for (std::size_t i = 0; i < kLoopCount; ++i) {
         const auto j = i * kThreads + lane_id;
-        details::store_nc(dst_packed + j, vec.data[i]);
+        if (j < kPackageCount) {
+            details::store_nc(dst_packed + j, vec.data[i]);
+        }
     }
 }
 

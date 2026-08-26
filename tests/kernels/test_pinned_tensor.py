@@ -4,6 +4,15 @@ import pytest
 import torch
 
 
+def test_fast_index_copy_worker_geometry_supports_qwen4_scale_rows():
+    from freetoken.kernel.aot_models import aggregate_fast_index_copy_feature_sizes
+    from freetoken.kernel.fast_index_copy import default_worker_args
+
+    assert default_worker_args(400)[:2] == (8, 400)
+    assert default_worker_args(200)[:2] == (16, 200)
+    assert {200, 400} <= set(aggregate_fast_index_copy_feature_sizes())
+
+
 def test_pinned_extension_uses_packaged_module_not_runtime_jit(monkeypatch):
     import torch.utils.cpp_extension as cpp_extension
 
@@ -65,6 +74,25 @@ def test_fast_index_copy_accepts_exact_pinned_cpu_source():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output.cpu(), source[[5, 2, 0]])
+
+
+@pytest.mark.parametrize("row_bytes", [200, 400])
+def test_fast_index_copy_accepts_non_128_byte_rows(row_bytes):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fast index copy")
+
+    from freetoken.kernel import copy_to_pinned_tensor, fast_index_copy_jit
+
+    values = (torch.arange(6 * row_bytes, dtype=torch.int32) % 251).to(torch.uint8)
+    source = copy_to_pinned_tensor(values.reshape(6, row_bytes))
+    output = torch.empty((3, row_bytes), dtype=torch.uint8, device="cuda")
+    dst_indices = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    src_indices = torch.tensor([5, 2, 0], dtype=torch.int32, device="cuda")
+
+    fast_index_copy_jit(output, dst_indices, source, src_indices)
+    torch.cuda.synchronize()
+
+    assert torch.equal(output.cpu(), source[[5, 2, 0]])
 
 
 def test_fast_index_copy_skip_env_noops_without_jit(monkeypatch):

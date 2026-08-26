@@ -61,7 +61,11 @@ def _jit_fast_index_copy_module(
 
 def _default_worker_threads(feature_size: int) -> int:
     if feature_size <= 1024:
-        return 8
+        if feature_size % 16 == 0:
+            return 8
+        if feature_size % 8 == 0:
+            return 16
+        return 32
     if feature_size <= 2048:
         return 16
     return 32

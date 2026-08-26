@@ -245,6 +245,22 @@ def test_hybrid_linear_opt_out_rejects_backend(monkeypatch):
         _adjust_config(config)
 
 
+def test_model_runtime_capabilities_force_safe_cache_and_graph(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("linear_hybrid", attention_backend="auto")
+    object.__setattr__(config, "cache_type", "radix")
+    config.model_config.requires_naive_cache = True
+    config.model_config.supports_cuda_graph = False
+
+    _adjust_config(config)
+
+    assert config.cache_type == "naive"
+    assert config.cuda_graph_bs == []
+    assert config.cuda_graph_max_bs == 0
+
+
 def test_trtllm_page_size_coercion_is_part_aware(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 
