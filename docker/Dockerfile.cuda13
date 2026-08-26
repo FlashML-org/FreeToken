@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+ARG UV_VERSION=0.9.3
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+FROM ${CUDA_IMAGE}
+
+ARG INSTALL_CUDA_COMPAT=0
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+ENV CUDA_HOME=/usr/local/cuda \
+    DEBIAN_FRONTEND=noninteractive \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    MAX_JOBS=8 \
+    PATH=/opt/freetoken/.venv/bin:${PATH} \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ninja-build \
+        python3 \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/freetoken
+COPY pyproject.toml uv.lock setup.py README.md LICENSE ./
+COPY python ./python
+
+# The frozen lock keeps torch/CUDA and native-kernel versions reproducible.
+# Ampere uses FlashInfer for paged attention; the remaining kernels are Triton.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra fi --no-editable
+
+RUN if [ "${INSTALL_CUDA_COMPAT}" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends cuda-compat-13-0 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+EXPOSE 1919
+ENTRYPOINT ["ft"]
+CMD ["--help"]

@@ -188,7 +188,10 @@ def parse_args(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
             return "deepseekv32"
-        if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
+        if any(
+            tag in marker
+            for tag in ("qwen3", "qwen3.5", "qwen3_5", "qwen4_exp", "qwen4exp")
+        ):
             return "qwen3"
         if "glm" in marker:
             return "glm"
