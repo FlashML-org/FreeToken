@@ -115,6 +115,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait for the spawned server to become ready",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
+    p.add_argument(
+        "--extra-args",
+        default="",
+        help="extra flags passed verbatim to the server (e.g. '--kv-reserve-tokens 2048 --max-seq-len-override 4096')",
+    )
     return p.parse_args(argv)
 
 
@@ -193,6 +198,9 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
         cmd += ["--moe-cache-rate", str(args.cache_rate)]
     else:
         cmd.append("--moe-cache-auto")
+    if getattr(args, "extra_args", ""):
+        import shlex as _shlex
+        cmd += _shlex.split(args.extra_args)
     return cmd
 
 

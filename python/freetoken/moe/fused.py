@@ -18,13 +18,18 @@ def _torch_fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
+    scoring: str = "softmax",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-torch softmax router matching triton_kernels.topk (Windows fallback).
+    """Pure-torch router matching triton_kernels.topk (Windows fallback).
 
-    Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
-    selected weights to sum to 1 -- the standard fused-MoE routing convention.
+    Softmax (default) or sigmoid (Qwen3-Next ``scoring_func="sigmoid"``) over all
+    experts, select the top-k, and (when ``renormalize``) rescale the selected
+    weights to sum to 1 -- the standard fused-MoE routing convention.
     """
-    probs = torch.softmax(gating_output.float(), dim=-1)
+    if scoring == "sigmoid":
+        probs = torch.sigmoid(gating_output.float())
+    else:
+        probs = torch.softmax(gating_output.float(), dim=-1)
     topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -41,8 +46,14 @@ def fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
+    scoring: str = "softmax",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    # Sigmoid scoring has no triton_kernels counterpart: always take the torch path
+    # (which also covers the non-power-of-2 topk case, e.g. Qwen3-Next's 10).
+    if scoring != "softmax":
+        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded, scoring)
 
     from freetoken.kernel.backend import is_triton_kernels_installed
 
@@ -60,9 +71,15 @@ def fused_topk(
                 "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
                 "install triton_kernels to restore the fused router."
             )
-        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
+        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded, scoring)
 
     from triton_kernels.topk import topk as triton_kernels_topk
+
+    # triton_kernels' _topk_forward uses tl.arange(0, N_EXPTS_ACT) which requires
+    # topk to be a power of 2 (e.g. 8 for Qwen3.5). Models with non-power-of-2 topk
+    # (e.g. Qwen3-Next's 10) hit a Triton compilation error; fall back to pure-torch.
+    if topk & (topk - 1) != 0:
+        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded, scoring)
 
     logits = gating_output.float()
     softmax_first = not renormalize
@@ -434,12 +451,14 @@ class FusedMoe(BaseMoeBackend):
         renormalize: bool,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        scoring: str = "softmax",
     ) -> torch.Tensor:
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
             topk=topk,
             renormalize=renormalize,
+            scoring=scoring,
         )
         return fused_experts_impl(
             hidden_states,

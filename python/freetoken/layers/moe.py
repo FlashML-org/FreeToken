@@ -38,6 +38,7 @@ class MoELayer(BaseOP):
         apply_router_weight_on_input: bool = False,
         allocate_experts: bool = True,
         weight_format: str = "bf16",
+        scoring: str = "softmax",
     ):
         super().__init__()
 
@@ -53,6 +54,8 @@ class MoELayer(BaseOP):
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.weight_format = weight_format
+        # Router scoring function: "softmax" (Qwen3.5/3.6) or "sigmoid" (Qwen3-Next).
+        self.scoring = scoring
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         if allocate_experts:
             self._alloc_resident_experts(intermediate_size_per_partition)
@@ -176,6 +179,7 @@ class MoELayer(BaseOP):
                 gating_output=router_logits,
                 topk=self.top_k,
                 renormalize=self.renormalize,
+                scoring=self.scoring,
             )
             return self._maybe_all_reduce(
                 self._resident_gemm(hidden_states, topk_weights, topk_ids)
@@ -190,6 +194,7 @@ class MoELayer(BaseOP):
             renormalize=self.renormalize,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            **({"scoring": self.scoring} if self.scoring != "softmax" else {}),
         )
         return self._maybe_all_reduce(final_hidden_states)
 
@@ -261,6 +266,7 @@ class OffloadMoELayer(MoELayer):
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
+            scoring=self.scoring,
         )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
@@ -274,6 +280,7 @@ class OffloadMoELayer(MoELayer):
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
+            scoring=self.scoring,
         )
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
@@ -631,6 +638,9 @@ def make_moe_layer(
     else:
         kwargs["weight_format"] = weight_format
     layer = layer_cls(**kwargs)
+    # Router scoring (Qwen3-Next uses sigmoid): set post-construction so every layer
+    # class (resident + offload) takes it without signature changes.
+    layer.scoring = getattr(config, "moe_scoring_func", "softmax")
     for name, value in (extra_attrs or {}).items():
         setattr(layer, name, value)
     return layer

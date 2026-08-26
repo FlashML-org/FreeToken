@@ -25,7 +25,7 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
-from .config import _compressed_tensors_nvfp4, parse_config
+from .config import _compressed_tensors_nvfp4, _is_ct_storage, parse_config
 
 # Expert weights are stored pre-fused per layer: experts.gate_up_proj / experts.down_proj.
 _PACKED_EXPERT_PATTERN = re.compile(
@@ -38,7 +38,7 @@ _PACKED_EXPERT_PATTERN = re.compile(
 # head's ``mtp.layers.N.mlp.experts.*`` tensors (served text-only, dropped).
 _NVFP4_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_EXPERT_KEY_RE = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
@@ -170,6 +170,51 @@ def _try_fuse(
     return None
 
 
+# Qwen3-Next modelopt checkpoints ship the pre-fused GDN input projections in HF's
+# interleaved layout (Qwen3NextGatedDeltaNet.fix_query_key_value_ordering): per k-head
+# group the raw rows are [q_g | k_g | v_pair | z_pair] (qkvz) and [b_pair | a_pair] (ba).
+# The engine's GDN instead splits contiguous [q|k|v|z] / [b|a] blocks, so the rows must
+# be de-interleaved at load time -- otherwise q/k/v/z (and b/a) are silently scrambled.
+def _gdn_split_reorder(name: str, tensor: torch.Tensor, g) -> torch.Tensor:
+    nk, nv, hd = g.num_key_heads, g.num_value_heads, g.key_head_dim
+    ratio = nv // nk
+    tail = tensor.shape[1:]
+    rows = tensor.shape[0]
+    if ".linear_attn.in_proj_qkvz." in name:
+        grouped_rows = nk * (2 + 2 * ratio) * hd
+        if rows == grouped_rows:
+            # full weight: one row per logical output row
+            grouped = tensor.view(nk, 2 + 2 * ratio, hd, *tail)
+            take = lambda sl: grouped[:, sl].reshape(-1, *tail)
+        elif grouped_rows % rows == 0 and grouped_rows // rows == hd:
+            # per-128-output-row block scale (fp8 weight_scale_inv): each scale row
+            # covers exactly one head_dim-sized chunk of the interleaved layout
+            grouped = tensor.view(nk, 2 + 2 * ratio, *tail)
+            take = lambda sl: grouped[:, sl].reshape(-1, *tail)
+        else:
+            raise ValueError(
+                f"cannot de-interleave {name}: {rows} rows vs {grouped_rows} logical rows"
+            )
+        return torch.cat(
+            [
+                take(0),                 # q (all k-heads)
+                take(1),                 # k
+                take(slice(2, 2 + ratio)),   # v (all v-heads)
+                take(slice(2 + ratio, None)),  # z
+            ],
+            dim=0,
+        )
+    if ".linear_attn.in_proj_ba." in name:
+        if rows != 2 * nv:
+            raise ValueError(f"cannot de-interleave {name}: {rows} rows vs {2 * nv}")
+        grouped = tensor.view(nk, 2, ratio, *tail)
+        return torch.cat(
+            [grouped[:, 0].reshape(-1, *tail), grouped[:, 1].reshape(-1, *tail)],
+            dim=0,
+        )
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -178,8 +223,38 @@ def iter_weights(
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
-    config = parse_config(hf_config)
-    if _compressed_tensors_nvfp4(hf_config):
+    config = parse_config(hf_config, model_path)
+    try:
+        g = config.linear_attention_group()
+    except Exception:
+        g = None
+    # Only the pre-fused split layout (probed at parse time) needs the de-interleave;
+    # fused in_proj checkpoints (Qwen3.6) and unfused parts pass through unchanged.
+    reorder = g is not None and getattr(g, "in_proj_split", False)
+    for name, tensor in _iter_weights_flat(
+        model_path, device,
+        include_moe_experts=include_moe_experts, include_non_moe=include_non_moe,
+    ):
+        if reorder and (
+            ".linear_attn.in_proj_qkvz." in name or ".linear_attn.in_proj_ba." in name
+        ):
+            tensor = _gdn_split_reorder(name, tensor, g)
+        yield name, tensor
+
+
+def _iter_weights_flat(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    hf_config = cached_load_hf_config(model_path)
+    config = parse_config(hf_config, model_path)
+    # Gate on the storage format: modelopt-quantized NVFP4 checkpoints (Qwen3-Next) share
+    # the compressed-tensors config style but store modelopt scales and a pre-fused GDN
+    # in_proj -- they take the pure-NVFP4 path below.
+    if _compressed_tensors_nvfp4(hf_config) and _is_ct_storage(model_path):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
         yield from _iter_weights_compressed_tensors(
@@ -715,10 +790,10 @@ _FP8_FUSIONS: dict[str, tuple[str, ...]] = {
 }
 _FP8_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
 
-# Routed-expert checkpoint key (per-expert, un-fused). ``mtp.layers...`` is excluded by the
+# Routed-expert checkpoint key (per-expert, un-fused). The optional `language_model.` anchor
 # ``model.language_model.`` anchor, so the parallel reader only sees the real experts.
 _FP8_EXPERT_RE = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
 )
 
@@ -790,7 +865,7 @@ def _iter_weights_fp8(
         # Resident (non-offload) experts: build the stacked fp8 banks once via the shared
         # parallel reader (pageable host -- the engine copies the per-layer slices to GPU),
         # then yield per-layer views into the Fp8ResidentMoE buffers.
-        config = parse_config(cached_load_hf_config(model_path))
+        config = parse_config(cached_load_hf_config(model_path), model_path)
         if not config.is_moe:
             return  # dense checkpoint: no routed experts to build as resident banks
         L, E, H, I, dense = _moe_dims(config)
@@ -976,7 +1051,7 @@ def _build_fp8_expert_banks(
                 for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not primary):
                     layer = dense + li
                     for e in range(E):
-                        p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+                        p = f"model.layers.{layer}.mlp.experts.{e}"
                         for proj in ("gate", "up", "down"):
                             for kind in ("weight", "weight_scale_inv"):
                                 key = f"{p}.{proj}_proj.{kind}"
@@ -1030,7 +1105,7 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
                 gu_rows = torch.empty(E, 2 * I, H, dtype=torch.bfloat16, device=device)
                 dn_rows = torch.empty(E, H, I, dtype=torch.bfloat16, device=device)
                 for e in range(E):
-                    p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+                    p = f"model.layers.{layer}.mlp.experts.{e}"
                     gu_rows[e, :I] = _deq(f"{p}.gate_proj")
                     gu_rows[e, I:] = _deq(f"{p}.up_proj")
                     dn_rows[e] = _deq(f"{p}.down_proj")

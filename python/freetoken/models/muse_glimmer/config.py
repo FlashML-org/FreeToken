@@ -35,7 +35,7 @@ def _group_rope_theta(text: Any, layer_ids: tuple[int, ...], default: float) -> 
     return thetas.pop()
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     text = _text_config(hf_config)
 
     head_dim = getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads

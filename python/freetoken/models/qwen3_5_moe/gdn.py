@@ -53,7 +53,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        attn_quant: str = "none", in_proj_split: bool = False,
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -77,13 +77,21 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # Modelopt NVFP4 checkpoints with the pre-fused split layout (Qwen3-Next) keep
+        # in_proj_qkvz/in_proj_ba bf16: same two-GEMM path as fp8, but a bf16 qkvz GEMM.
+        self._split = self._fp8 or in_proj_split
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
-            )
+        if self._split:
+            if self._fp8:
+                ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
+                self.in_proj_qkvz = ColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
+            else:
+                self.in_proj_qkvz = LinearColParallelMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
@@ -161,7 +169,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._split:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

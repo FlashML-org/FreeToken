@@ -38,7 +38,7 @@ def _rope_config(hf_config: Any, head_dim: int) -> RotaryConfig:
     )
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     head_dim = getattr(hf_config, "head_dim", None) or (
         hf_config.hidden_size // hf_config.num_attention_heads
     )

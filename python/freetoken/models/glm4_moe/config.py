@@ -16,7 +16,7 @@ def _rope_params(hf_config: Any) -> dict:
     return params
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     """Parse a HuggingFace ``Glm4MoeConfig`` (GLM-4.5/4.6/4.7) into FreeToken's
     :class:`ModelConfig`.
 

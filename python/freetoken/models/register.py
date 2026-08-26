@@ -65,6 +65,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Qwen3-Next (model_type qwen3_next): Gated DeltaNet + MoE with FP8 block quantization.
+    # Same architecture family as Qwen3.5 MoE (linear_attn + full_attn interleaving, MoE
+    # experts) -- reuses the qwen3_5_moe package. Weights are flat (model.layers.*, no
+    # language_model prefix), block-fp8 (e4m3 + weight_scale_inv, 128x128 blocks).
+    "Qwen3NextForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+    ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
     # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered

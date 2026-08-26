@@ -58,7 +58,7 @@ def _log_mode_once(key: str, message: str) -> None:
     init_logger(__name__).info(message)
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     text = _text_config(hf_config)
 
     num_layers = text.num_hidden_layers

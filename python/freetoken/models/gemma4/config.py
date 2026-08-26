@@ -97,7 +97,7 @@ def _attn_geometry(cfg: Any, layer_type: str, *, is_full: bool) -> tuple[int, in
     )
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     cfg, top_architectures, top_cfg = _text_config(hf_config)
     rope_params = cfg.rope_parameters
     swa_type, full_type = "sliding_attention", "full_attention"

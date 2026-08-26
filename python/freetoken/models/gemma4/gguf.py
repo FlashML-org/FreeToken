@@ -48,7 +48,7 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     return full_head_dim // 4
 
 
-def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+def parse_gguf_config(shim: "GgufConfigShim", model_path: str | None = None) -> ModelConfig:
     m = shim.metadata
 
     def g(key: str):

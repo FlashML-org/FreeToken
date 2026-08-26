@@ -158,6 +158,9 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     value_head_dim: int
     conv_kernel_dim: int
     output_gate: bool
+    # Checkpoint ships the GDN input projection pre-fused as bf16 ``in_proj_qkvz`` +
+    # ``in_proj_ba`` (Qwen3-Next modelopt NVFP4) instead of the four unfused parts.
+    in_proj_split: bool = False
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,9 @@ class ModelConfig:
     model_type: str
     architectures: list[str]
     moe_backend: str = "fused"
+    # Router scoring function: "softmax" (default, Qwen3.5/3.6) or "sigmoid"
+    # (Qwen3-Next ``scoring_func``). Read by make_moe_layer -> fused_topk.
+    moe_scoring_func: str = "softmax"
     # ----- optional, model-specific extensions (default keeps other models intact) -----
     moe_enabled: bool = False
     # Weight quantization of the MoE experts only. "none" keeps the default BF16

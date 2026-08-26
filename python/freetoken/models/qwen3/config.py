@@ -5,7 +5,7 @@ from typing import Any
 from freetoken.models.config import ModelConfig, RotaryConfig
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     num_kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads)
     head_dim = (
         getattr(hf_config, "head_dim", None)

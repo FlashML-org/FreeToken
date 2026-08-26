@@ -18,7 +18,7 @@ def _rope_params(hf_config: Any) -> dict:
     return params
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     head_dim = (
         getattr(hf_config, "head_dim", None)
         or hf_config.hidden_size // hf_config.num_attention_heads

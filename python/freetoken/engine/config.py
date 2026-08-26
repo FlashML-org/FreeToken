@@ -89,7 +89,7 @@ class EngineConfig:
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        return parse_config(self.hf_config, self.model_path)
 
     @property
     def max_seq_len(self) -> int:

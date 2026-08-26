@@ -20,7 +20,7 @@ from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, Rotar
 from .args import load_args
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     model_path = getattr(hf_config, "_name_or_path", None) or getattr(
         hf_config, "name_or_path", None
     )

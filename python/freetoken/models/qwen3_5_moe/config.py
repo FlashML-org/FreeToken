@@ -9,6 +9,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_compressed_tensors_nvfp4,
 )
+from freetoken.models.loader import iter_weight_files
 
 
 def _quant_accessor(hf_config: Any):
@@ -18,6 +19,38 @@ def _quant_accessor(hf_config: Any):
     if quant is None:
         return None
     return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+
+
+def _is_ct_storage(model_path: str | None) -> bool:
+    """Whether the checkpoint stores compressed-tensors packed FP4 (``weight_packed`` +
+    ``weight_global_scale``). Modelopt-quantized NVFP4 checkpoints (nvidia Qwen3-Next-*-NVFP4)
+    advertise a compressed-tensors style config (``config_groups``/``ignore``) but store
+    modelopt two-level scales (``weight_scale``/``weight_scale_2``) instead -- probe the
+    first shard. Defaults to True (legacy ct path) when undeterminable."""
+    if model_path is None:
+        return True
+    import safetensors
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            return any(k.endswith((".weight_packed", ".weight_global_scale")) for k in f.keys())
+    return True
+
+
+def _gdn_split_layout(model_path: str | None) -> bool:
+    """Whether the checkpoint ships the GDN input projection pre-fused as bf16
+    ``in_proj_qkvz`` + ``in_proj_ba`` (Qwen3-Next modelopt NVFP4 layout) instead of the
+    four unfused ``in_proj_{qkv,z,b,a}`` parts (Qwen3.5 ct-NVFP4 / bf16 layout)."""
+    if model_path is None:
+        return False
+    import safetensors
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            if any(k.endswith(".linear_attn.in_proj_qkvz.weight") for k in keys):
+                return True
+            if any(k.endswith(".linear_attn.in_proj_qkv.weight") for k in keys):
+                return False
+    return False
 
 
 def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
@@ -60,6 +93,14 @@ def _expert_quant(hf_config: Any) -> str:
                     return "nvfp4"
                 if "fp8" in expert_algo:
                     return "fp8"
+    # compressed-tensors style config (config_groups + ignore): every Linear target with
+    # fp4 group weights is NVFP4. nvidia Qwen3-Next-*-NVFP4 advertises this config format
+    # while storing modelopt two-level scales; its routed experts are Linear, not ignored.
+    groups = get("config_groups") or {}
+    for spec in (groups.values() if isinstance(groups, dict) else []):
+        w = (spec or {}).get("weights") or {}
+        if w and str(w.get("type", "")).lower() == "float" and w.get("num_bits") == 4:
+            return "nvfp4"
     return "none"
 
 
@@ -136,7 +177,38 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def _shared_expert_quant(hf_config: Any, model_path: str | None) -> str:
+    """Whether the checkpoint stores the MoE ``shared_expert`` MLP as packed NVFP4.
+
+    The nvidia/modelopt ``NVFP4`` MoE checkpoints (e.g. Qwen3.5-122B-A10B-NVFP4) ship the
+    routed experts as packed FP4 but leave ``shared_expert`` bf16 -- the model's ``ignore``
+    list explicitly excludes ``model.language_model.layers.*.mlp.shared_expert*`` from
+    quantization. The earlier unconditional ``dense_quant = "nvfp4"`` assumption broke
+    ``load_state_dict`` on those checkpoints: the NVFP4 dense kernels try to pop a
+    ``weight_scale`` that the bf16 shared_expert does not carry (KeyError).
+
+    Detection mirrors weight.py's ``.weight_scale_2`` probe: NVFP4 linears always carry a
+    paired ``weight_scale_2`` alongside ``.weight``. We scan the shards in order and, for
+    the first one carrying any shared_expert gate weight, check for that suffix. Returns
+    ``"nvfp4"`` when the shared_expert is quantized, ``"none"`` when it is bf16, and
+    ``"nvfp4"`` (the legacy assumption) when ``model_path`` is None so existing callers
+    behave unchanged.
+    """
+    if model_path is None:
+        return "nvfp4"
+    needle = ".mlp.shared_expert.gate_proj.weight_scale_2"
+    import safetensors
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            if any("mlp.shared_expert.gate_proj.weight" in k for k in keys):
+                if any(k.endswith(needle) for k in keys):
+                    return "nvfp4"
+                return "none"
+    return "none"
+
+
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
     head_dim = (
@@ -176,13 +248,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # NVFP4. The lm_head is detected separately (only the mixed checkpoint quantizes it).
     # MoE-NVFP4 keeps the shared_expert dense MLP native FP4 (expert_quant=="nvfp4"); a dense
     # (non-MoE) modelopt checkpoint instead tags the bare .mlp.{gate,up,down}_proj as NVFP4.
-    dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
+    dense_quant = _shared_expert_quant(hf_config, model_path) if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
     lm_head_quant = _lm_head_quant(hf_config)
 
     # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
-    if _compressed_tensors_nvfp4(hf_config):
+    # Gate on the actual storage format: modelopt-quantized NVFP4 checkpoints (Qwen3-Next)
+    # share the compressed-tensors config style but keep q/k/v bf16 and store two-level
+    # scales, so they take the modelopt paths (attn dequant-at-load, _shared_expert_quant).
+    if _compressed_tensors_nvfp4(hf_config) and _is_ct_storage(model_path):
         attn_quant = "nvfp4"
         dense_quant = "nvfp4"
         lm_head_quant = "none"
@@ -219,6 +294,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         value_head_dim=text.linear_value_head_dim,
         conv_kernel_dim=text.linear_conv_kernel_dim,
         output_gate=True,
+        in_proj_split=_gdn_split_layout(model_path),
     )
     # Order groups by their first layer id for deterministic iteration.
     groups = tuple(
@@ -245,6 +321,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         moe_intermediate_size=getattr(text, "moe_intermediate_size", 0),
         shared_expert_intermediate_size=getattr(text, "shared_expert_intermediate_size", 0),
         norm_topk_prob=bool(getattr(text, "norm_topk_prob", False)),
+        moe_scoring_func=str(getattr(text, "scoring_func", None) or "softmax"),
         moe_enabled=moe_enabled,
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),

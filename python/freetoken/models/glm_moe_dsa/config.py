@@ -50,7 +50,7 @@ def _dsa_on(args, num_layers: int) -> bool:
     )
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
+def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     args = load_args(hf_config)
     # Latent-KV MLA: the paged pool stores a single "head" = ckv (kv_lora_rank) | kpe
     # (qk_rope_head_dim); the model absorbs kv_b into Q/O and attends with flashinfer MLA.
