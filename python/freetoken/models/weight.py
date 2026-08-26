@@ -90,6 +90,9 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
+    if prefetch < 1:
+        raise ValueError(f"expert prefetch must be >= 1, got {prefetch}")
+
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)

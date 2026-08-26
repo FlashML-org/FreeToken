@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 
@@ -15,6 +16,7 @@ from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
 from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+from .parallel import div_tp, tp_size
 
 
 class Attention(nn.Module):
@@ -26,21 +28,39 @@ class Attention(nn.Module):
     ``window_pool[L]`` / ``cmp_pool[L]`` inside the kernel -- no per-forward staging slab. Both
     prefill and decode use the same paged kernel."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, compress_ratio: int | None = None):
+        # ``compress_ratio`` overrides the per-layer table. The dSpark draft layers pass 0:
+        # their checkpoint ships no compressor or indexer weights, because a draft block
+        # attends only over the sliding window the target already filled.
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.window_size = args.window_size
-        self.compress_ratio = args.compress_ratios[layer_id]
+        self.compress_ratio = (
+            args.compress_ratios[layer_id] if compress_ratio is None else compress_ratio
+        )
         self.eps = args.norm_eps
+        # dSpark draft layers set this. A drafted BLOCK is proposed at once, so each of
+        # its queries may see the whole block, not just the positions before it -- that
+        # is what makes the proposal semi-autoregressive instead of five serial steps.
+        # Expressed through the sparse top-k: the causal cutoff moves from "my own
+        # position" to "the end of my block". Context positions precede the block, so
+        # they stay visible either way and need no special case.
+        self.non_causal = False
+
+        # Head parallelism: a rank owns whole o_groups, and therefore whole heads. The
+        # per-group head width (wo_a_k) is a property of one group, so it does NOT shard.
+        self.tp_size = tp_size()
+        self.n_heads = div_tp(args.n_heads, "n_heads")
+        self.n_groups = div_tp(args.o_groups, "o_groups")
+        self._comm = DistributedCommunicator() if self.tp_size > 1 else None
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False)
+        # wq_a / wkv / kv_norm stay replicated: the MLA latent KV is shared by every head.
         self.wq_a = Linear(self.dim, self.q_lora_rank, kind="fp8")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
@@ -48,8 +68,9 @@ class Attention(nn.Module):
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
         wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
+        wo_a_k = args.n_heads * self.head_dim // args.o_groups
         self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
+        # Row-parallel: each rank consumes its own groups and contributes a partial sum.
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
         self.softmax_scale = self.head_dim ** -0.5
 
@@ -99,10 +120,16 @@ class Attention(nn.Module):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
+        # Under TP, ``o`` holds only this rank's heads, so the grouped einsum and wo_b
+        # produce a PARTIAL sum over the full output dim. One all-reduce completes it --
+        # the single attention-side collective per block.
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b(o)
+        o = self.wo_b(o)
+        if self._comm is not None:
+            o = self._comm.all_reduce(o)
+        return o
 
     def _prefill_segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
@@ -119,6 +146,13 @@ class Attention(nn.Module):
         slots = self.attn.window_slots_of(ti, start_pos, end)
         self.attn.store_window(kv_seg, self.layer_id, slots)
 
+        if self.non_causal and start_pos == 0:
+            # A draft block always continues an existing context, so it never takes the
+            # cold path. Refuse rather than silently emit a causal grid.
+            raise ValueError(
+                "dSpark non-causal attention needs a resumed segment (start_pos > 0); "
+                "the drafter is not meant to run a cold prompt"
+            )
         if start_pos == 0:
             win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
             # natural width min(n, win); the caller pads to the batch-uniform width
@@ -128,9 +162,15 @@ class Attention(nn.Module):
             # prefix plus the new tokens, causal-masked to -1 past its own position.
             w_lo = max(0, start_pos - win + 1)
             ws_pool = self.attn.window_slots_of(ti, w_lo, end)
-            abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
-            cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
-            win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
+            # One implementation of the masking rule, shared with the tests that pin it.
+            # Non-causal (dSpark draft layers) gives every query in the block the SAME
+            # window, ending at the block's last position, so a drafted query sees the
+            # whole block plus the context before it.
+            from .dspark import window_cols_for_block
+
+            win_cols = window_cols_for_block(
+                start_pos, n, win, self.non_causal, device=device
+            ).unsqueeze(0)
             win_global = self.attn.win_cols_to_global(win_cols, ws_pool)
 
         if not ratio:
@@ -148,6 +188,21 @@ class Attention(nn.Module):
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
             self.compressor(x_seg, 0, slots, ti=ti)
+        elif self.non_causal or start_pos % self.P != 0:
+            # A speculative block starts wherever generation reached, which is mid-page
+            # 127 times out of 128. The compressor's EXTEND path cannot serve that: it
+            # reduces tokens with ``start_pos // ratio`` arithmetic and asserts
+            # 128-alignment, because it seeds the carry from a matched tail PAGE.
+            #
+            # Its per-token path has no such assumption -- it reads the carry from the
+            # previous token's slot, advances it, and writes it to this token's slot,
+            # which is exactly what vLLM's save_partial_states kernel does (one program
+            # per token, ape chosen by position % compress_ratio, no alignment anywhere).
+            # So drive the compressor per token and leave attention and MoE batched:
+            # the compressor is cheap next to the expert fetch this block exists to
+            # amortize.
+            self._advance_compressor_per_token(x_seg, start_pos, n, slots, tail_ws, ti)
+            blocks = self._compress_topk_extend(n, start_pos, end, 0, device, 1)
         else:
             blocks = (
                 self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
@@ -156,6 +211,27 @@ class Attention(nn.Module):
             )
             self.compressor(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
         return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
+
+    def _advance_compressor_per_token(
+        self, x_seg, start_pos: int, n: int, slots: torch.Tensor, tail_ws: int | None,
+        ti: int,
+    ) -> None:
+        """Walk the compressor one token at a time across an unaligned segment.
+
+        Each step reads the carry from the PREVIOUS token's window slot and writes the
+        advanced carry to this token's -- the same movement a decode step makes, so no
+        block-boundary arithmetic is involved and any ``start_pos`` is valid.
+        """
+        device = x_seg.device
+        rows = torch.zeros(1, dtype=torch.int64, device=device)
+        prev = torch.full((1,), tail_ws if tail_ws is not None else int(slots[0]),
+                          dtype=slots.dtype, device=device)
+        for t in range(n):
+            cur = slots[t:t + 1]
+            pos_t = torch.full((1,), start_pos + t, dtype=torch.int64, device=device)
+            # ti, not the decode snapshot: this runs inside a prefill, where none exists.
+            self.compressor.decode_step(x_seg[:, t], pos_t, prev, cur, rows, ti=ti)
+            prev = cur
 
     def forward_ragged(self, x, segments, flat_positions):
         """Ragged batched prefill (cu_seqlens). ``x`` is [1, T, dim] -- the requests' NEW token

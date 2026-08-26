@@ -930,6 +930,23 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
 
+    # Before anything slow. Loading takes ~90s, and a log that opens part-way through it
+    # cannot answer what the run was configured as -- which is the first question asked
+    # of every one of these logs.
+    from freetoken.utils.banner import print_banner
+
+    # Every field via getattr: these kwargs are evaluated BEFORE print_banner's own
+    # try/except, so one wrong attribute name here takes the whole server down at
+    # startup. A banner must not be able to do that.
+    print_banner(
+        model_path=getattr(config, "model_path", None),
+        tp_size=getattr(getattr(config, "tp_info", None), "size", 1) or 1,
+        dspark=bool(getattr(config, "speculative_dspark", False)),
+        moe_backend=getattr(config, "moe_backend", None),
+        host=getattr(config, "server_host", None),
+        port=getattr(config, "server_port", None),
+    )
+
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
     # Always surface the effective default sampling (model-recommended where available,

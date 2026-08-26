@@ -17,6 +17,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 
 from __future__ import annotations
 
+import glob
 import os
 import threading
 import time
@@ -88,8 +89,61 @@ def compiled_extension_supports(activation: str) -> bool:
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
+def _tp_core_share(cores: list[int]) -> list[int]:
+    """This rank's slice of ``cores`` when several TP ranks share one host.
+
+    Every rank sees the same affinity mask, so without this each rank pins its whole
+    worker pool to the SAME physical cores: N ranks then oversubscribe those cores N
+    times and the spin-barrier collapses. Ranks take contiguous blocks rather than
+    striding, which keeps one rank's threads on one socket.
+
+    A leftover from an uneven split stays unused: giving it to some ranks and not
+    others would desynchronize the per-layer CPU expert compute that every rank
+    finishes before the same collective.
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    if info is None or info.size <= 1:
+        return cores
+    # ``cores`` is already filtered by this process's affinity. When the engine has bound
+    # each rank to a NUMA node, that mask is ONE node's cpus and only the ranks on that
+    # node compete for them -- dividing by the full TP size would hand each rank a
+    # fraction of a fraction and leave most of the socket idle.
+    from freetoken.utils.numa import placement as numa_placement
+
+    placed = numa_placement()
+    siblings, index = (
+        (placed[2], placed[3]) if placed is not None else (info.size, info.rank)
+    )
+    per = len(cores) // siblings
+    if per < 1:  # fewer cores than ranks: let the OS schedule them
+        return cores
+    return cores[index * per: (index + 1) * per]
+
+
+def _smt_siblings_of(cores: list[int]) -> list[int]:
+    """Every logical CPU that shares a physical core with one of ``cores``."""
+    out: list[int] = []
+    for cpu in cores:
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                spec = f.read().strip()
+        except OSError:
+            out.append(cpu)
+            continue
+        for part in spec.split(","):
+            if "-" in part:
+                lo, hi = part.split("-")
+                out.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                out.append(int(part))
+    return sorted(set(out))
+
+
 def physical_core_cpus() -> list[int]:
-    """One logical CPU per physical core, restricted to this process's affinity.
+    """One logical CPU per physical core, restricted to this process's affinity and,
+    under tensor parallelism, to this rank's share of them.
 
     MoE decode is memory-bandwidth-bound, so SMT siblings only contend for the
     same core's load ports without adding bandwidth. Picking one logical CPU per
@@ -112,7 +166,7 @@ def physical_core_cpus() -> list[int]:
         if key not in seen:
             seen.add(key)
             reps.append(cpu)
-    return reps or allowed or [0]
+    return _tp_core_share(reps or allowed or [0])
 
 
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
@@ -127,12 +181,10 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     reps = physical_core_cpus()
     if requested and requested > 0:
         n = int(requested)
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except AttributeError:
-            allowed = list(range(os.cpu_count() or 1))
-        # physical-core reps first, then the rest of the logical CPUs.
-        order = reps + [c for c in allowed if c not in set(reps)]
+        # physical-core reps first, then the SMT siblings OF THOSE CORES. Taking the
+        # siblings of this rank's own cores (rather than the rest of the affinity mask)
+        # keeps an explicit thread count from spilling onto another TP rank's cores.
+        order = reps + [c for c in _smt_siblings_of(reps) if c not in set(reps)]
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
@@ -310,9 +362,16 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
-        logger.info_rank0(
-            f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+        # Per-rank, not rank0-only: this pool sits on the decode critical path, and the
+        # way its core split goes wrong is ranks landing on each other's cores. That is
+        # only visible when every rank says where it went.
+        from freetoken.distributed import try_get_tp_info
+
+        info = try_get_tp_info()
+        who = f"rank{info.rank}/{info.size}" if info is not None else "single"
+        logger.info(
+            f"NUMA {who}: CPU MoE pool threads={nthreads} on cores "
+            f"{core_ids[0]}..{core_ids[-1]} | isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )

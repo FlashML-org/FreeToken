@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+import glob
 import os
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -9,9 +10,18 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    get_tp_info,
+    set_tp_info,
+)
+from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
+from freetoken.utils.numa import numa_nodes
+from freetoken.utils.numa import placement as numa_placement
+from freetoken.utils.numa import resolve_placement
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
@@ -246,8 +256,18 @@ def _make_dummy_weight_state_dict(
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
     for key, param in model_state.items():
-        if param.dtype in fp8_dtypes:
+        if e8m0 is not None and param.dtype == e8m0:
+            # e8m0 is a bare exponent code (value = 2^(code-127)), so 127 is scale 1.0.
+            # It reports is_floating_point, but there is no normal_ kernel for it -- and a
+            # RANDOM exponent would scale a block by up to 2^127 anyway, so 1.0 is both the
+            # only fillable value and the only sane one. Without this a --dummy-weight run
+            # of any block-scaled model dies with "normal_kernel_cuda not implemented".
+            t = torch.empty(param.shape, dtype=param.dtype, device=device)
+            t.view(torch.uint8).fill_(127)
+            state_dict[key] = t
+        elif param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
@@ -290,11 +310,97 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _bind_rank_to_numa_node(tp_info) -> None:
+    """Pin this rank to one NUMA node BEFORE it allocates anything.
+
+    The host expert banks are anonymous mmaps, so their pages land on whichever node
+    first TOUCHES them -- the loader's threads. Unbound, those threads scatter across
+    every socket, so a rank's banks end up interleaved and the CPU MoE pool, pinned to
+    one socket's cores, reads much of its experts across the interconnect. That is the
+    critical path: the hybrid backend computes most of each decode step's expert misses
+    there.
+
+    Binding first makes first-touch place a rank's banks on the node that will read
+    them, which also puts every socket's memory controller to work instead of one.
+    No-op on a single-node host.
+    """
+    # Resolve BEFORE the bind: binding narrows the affinity mask to one node, after
+    # which the topology looks single-node and the answer would be lost.
+    nodes = numa_nodes()
+    placement = resolve_placement(tp_info.rank, tp_info.size)
+    if placement is None:
+        # Say WHY nothing happened, so "no NUMA lines" is never ambiguous between
+        # "single socket" and "the binding silently did not run".
+        logger.info_rank0(
+            f"NUMA: not placing ranks ({len(nodes)} usable node(s), "
+            f"tp_size={tp_info.size}) -- nothing to spread"
+        )
+        return
+    node, cpus, siblings, index = placement
+    try:
+        os.sched_setaffinity(0, cpus)
+    except (AttributeError, OSError) as exc:  # not Linux, or a restricted cpuset
+        logger.warning(
+            f"NUMA rank{tp_info.rank}: could not pin to node {node} ({exc}); "
+            "expert banks may land on a remote node and decode will be slower"
+        )
+        return
+    # EVERY rank reports, not just rank 0. A placement bug shows up as ranks disagreeing
+    # with each other -- and that is invisible if only one of them speaks. This is
+    # exactly how a real bug hid here: the bind said "2 ranks on this node" while the
+    # thread split said 4, and only rank 0 was logging.
+    logger.info(
+        f"NUMA rank{tp_info.rank}/{tp_info.size}: node {node} of {len(nodes)} | "
+        f"cpus {cpus[0]}..{cpus[-1]} ({len(cpus)}) | "
+        f"{siblings} rank(s) here, I am #{index} | banks first-touch local"
+    )
+
+
+def _share_cpu_threads_across_ranks(tp_size: int) -> None:
+    """Split the machine's CPU threads across the TP ranks, before any tensor work.
+
+    torch sizes its intra-op pool from the WHOLE machine, and every rank does the same,
+    so N ranks each start a machine-sized pool and oversubscribe every core N times.
+    Measured on a 40-core / 80-thread host at TP=4: 117 threads per rank, 468 in total,
+    ~6x the hardware, all of it contending through the weight load -- which is thread-
+    bound (host-side copies into the expert banks), not disk-bound. The NVMe sat at
+    187 MB/s while the CPU ran at 92% user.
+
+    The engine already narrows threads once the pinned CPU MoE pool exists; this covers
+    everything BEFORE that, the weight load included. Honour an explicit OMP_NUM_THREADS.
+    """
+    if tp_size <= 1 or os.environ.get("OMP_NUM_THREADS"):
+        return
+    # Count what this rank may actually run on, not what the machine has. After the NUMA
+    # bind above, the affinity mask is one node -- dividing the whole machine by tp_size
+    # would under-count every rank by the number of nodes.
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = os.cpu_count() or tp_size
+    placed = numa_placement()
+    siblings = placed[2] if placed is not None else tp_size
+    per_rank = max(1, allowed // siblings)
+    if per_rank < torch.get_num_threads():
+        torch.set_num_threads(per_rank)
+        from freetoken.distributed import get_tp_info
+
+        logger.info(
+            f"NUMA rank{get_tp_info().rank}/{tp_size}: torch intra-op threads "
+            f"{torch.get_num_threads()} | {allowed} cpus visible | "
+            f"{siblings} rank(s) share them"
+        )
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
+        # Bind BEFORE any allocation: the expert banks land on the node that
+        # first touches them, and that must be the node whose cores will read them.
+        _bind_rank_to_numa_node(config.tp_info)
+        _share_cpu_threads_across_ranks(config.tp_info.size)
 
         from freetoken.gpu_select import bind_assigned_gpu
 
@@ -325,6 +431,19 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
+        # What the parameters declare vs what the load actually cost. Every byte of the gap
+        # is resident-but-unaccounted (staging buffers, per-layer scratch) and comes straight
+        # out of the MoE-cache + KV budget, so surface it instead of leaving it to arithmetic
+        # on the cache-sizing line.
+        declared = sum(t.numel() * t.element_size() for t in self.model.state_dict().values())
+        logger.info_rank0(
+            f"Weights: {mem_GB(declared)} declared by parameters, "
+            f"{mem_GB(self._weights_bytes)} measured on device "
+            f"(torch allocator holds {mem_GB(torch.cuda.memory_allocated(self.device))} live, "
+            f"{mem_GB(torch.cuda.memory_reserved(self.device))} reserved; "
+            f"peak {mem_GB(torch.cuda.max_memory_reserved(self.device))}). "
+            "A gap between 'reserved' and 'measured' is held OUTSIDE the allocator."
+        )
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -333,6 +452,11 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # Speculative accounting: acceptance rate is the one number that says whether
+        # speculation is paying for itself, and it cannot be inferred from tokens/s.
+        self._spec_accepted = 0
+        self._spec_drafted = 0
+        self.spec_threshold = float(ENV.DSPARK_CONFIDENCE_THRESHOLD.value)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -513,14 +637,51 @@ class Engine:
         # cpu/hybrid both read experts on the CPU, so banks load in the native (CPU-readable)
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
-        cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        n_moe = config.model_config.num_moe_layers
+        cpu_layer_ids = _resolve_cpu_layers(config, n_moe)
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes() is not None
         ):
-            cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
+            cpu_layer_ids = _auto_cpu_layers(config, n_moe)
+        # The drafter's MoE layers are the tail of the sequence (see the model's
+        # _iter_offload_moe_layers). Keep them on the GPU whatever the CPU plan says: the
+        # draft is a hard serial dependency of every block -- the verify cannot start
+        # until it finishes -- so a draft layer on the CPU pool adds the engine's slowest
+        # path to each block, and it is 3 layers against the target's 43.
+        # Read the drafter's layer count from dsv4_args, NOT from extra_moe_layers.
+        # extra_moe_layers is patched onto model_config later than this (parse_config
+        # runs before the flag exists), so it is still 0 here even though
+        # num_moe_layers already counts the drafter's layers -- which made this whole
+        # path silently inert the first time it was written.
+        dsv4 = getattr(config.model_config, "dsv4_args", None)
+        n_draft = 0
+        if getattr(dsv4, "dspark_enabled", False):
+            n_draft = int(getattr(dsv4, "n_draft_layers", 0) or 0)
+        if not n_draft:
+            n_draft = int(getattr(config.model_config, "extra_moe_layers", 0) or 0)
+        draft_layer_ids = frozenset(range(n_moe - n_draft, n_moe)) if n_draft else frozenset()
+        if draft_layer_ids:
+            # Always report it. The exclusion below is a no-op under --moe-backend
+            # hybrid (nothing is assigned to the CPU up front), so its absence from the
+            # log says nothing about whether the drafter's layers were identified at
+            # all -- and if extra_moe_layers is still 0 here, this whole path is inert
+            # and the drafter shares the capped fetch with the target.
+            logger.info_rank0(
+                f"dSpark: draft MoE layers {min(draft_layer_ids)}..{max(draft_layer_ids)} "
+                f"of {n_moe} fetch uncapped on the GPU (serial with every block)"
+            )
+            if cpu_layer_ids & draft_layer_ids:
+                cpu_layer_ids = cpu_layer_ids - draft_layer_ids
+        elif getattr(dsv4, "dspark_enabled", False):
+            logger.warning_rank0(
+                "dSpark is on but no draft MoE layers were identified "
+                f"(extra_moe_layers={n_draft}): the drafter's layers will share the "
+                "target's capped fetch and can be computed on the CPU pool, in series "
+                "with every block"
+            )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -579,6 +740,7 @@ class Engine:
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
+                prefetch=config.expert_prefetch,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
@@ -625,6 +787,8 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+        cache.cpu_layer_ids = cpu_layer_ids
+        cache.draft_layer_ids = draft_layer_ids
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -688,7 +852,18 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        #
+        # A dSpark verify carries block_size ROWS per request, not one: the last
+        # committed token plus the drafted block. max_tokens sizes the C++ pool's
+        # per-task scratch, so a pool built for one row per request would be handed
+        # block_size times that and overrun it.
+        rows_per_req = 1
+        dsv4 = getattr(config.model_config, "dsv4_args", None)
+        if getattr(dsv4, "dspark_enabled", False):
+            rows_per_req = max(1, int(getattr(dsv4, "dspark_block_size", 1) or 1))
+        max_tokens = max(
+            config.max_running_req * rows_per_req, config.cuda_graph_max_bs or 0, 1
+        )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -912,6 +1087,201 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
 
+    def _finish_speculative(
+        self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        """Keep the prefix of each block the target agrees with, and collapse the rest.
+
+        The verify pass scored every drafted position, so ``logits[j]`` is the target's
+        own prediction for the token after position j. Acceptance is a PREFIX: scan in
+        order, stop at the first disagreement, and take the target's token there. That
+        is what makes speculation invisible in the output -- the emitted sequence is
+        exactly what the target alone would have produced.
+
+        Each request keeps a different amount, so the state is fixed up per request:
+        ``input_ids`` truncates to the accepted prefix, the bonus token is appended, and
+        ``cached_len`` / ``device_len`` move to match the KV the verify actually wrote.
+        """
+        from freetoken.models.deepseek_v4.dspark import (
+            accepted_prefix,
+            draft_width,
+            rejection_accept,
+            sampling_probs,
+        )
+
+        k = batch.spec_block
+        sp = batch.reqs[0].sampling_params
+        greedy = sp.is_greedy
+        # Acceptance reads one logits row per position of every block. Getting fewer
+        # means the verify scored only each request's LAST token -- the default for a
+        # prefill -- and the failure would otherwise surface as an opaque IndexError
+        # inside the sampler, several frames from the cause.
+        expected = (1 + k) * len(batch.reqs)
+        if logits.shape[0] != expected:
+            raise RuntimeError(
+                f"speculative verify produced {logits.shape[0]} logits rows, expected "
+                f"{expected} ({1 + k} per request x {len(batch.reqs)}). The forward must "
+                "pass logit_indices covering every drafted position."
+            )
+        # Not self.sampler: a speculative batch has 1+k ROWS per request while the
+        # sampling args are sized per REQUEST.
+        target_cpu = logits.argmax(dim=-1).to("cpu", non_blocking=False).to(torch.int32)
+        p = None if greedy else sampling_probs(
+            logits.cpu(), sp.temperature, sp.top_p, sp.top_k
+        )
+        q = None if greedy else batch.draft_probs.cpu()
+        confidence = batch.draft_confidence
+
+        emitted: list[torch.Tensor] = []
+        any_rejected = False
+        release_tail = getattr(batch, "release_tail", None)
+        off = 0
+        for i, req in enumerate(batch.reqs):
+            span = 1 + k                       # this request's rows in the flat batch
+            start = req.device_len - k         # where the block began
+            proposed = req.input_ids[start:start + k]
+            width = k
+            if confidence is not None:
+                width = draft_width(
+                    confidence[off + 1:off + span], self.spec_threshold, k
+                )
+            # A block emits n_acc accepted tokens PLUS the bonus token, so it can carry
+            # up to width+1 past `start`. Nothing upstream clamps that to the request's
+            # output budget: a block that starts with 2 tokens left would write 6, run
+            # off the end of _ids_buf, and leave device_len past max_device_len -- where
+            # remain_len goes negative, can_decode never turns False, and the request
+            # decodes forever instead of finishing on "length".
+            budget = req.max_device_len - start - 1
+            width = max(0, min(width, budget))
+            if greedy:
+                n_acc, bonus = accepted_prefix(
+                    proposed[:width], target_cpu[off:off + width + 1]
+                )
+            else:
+                # Sampled: accept with probability min(1, p(x)/q(x)) and resample from
+                # the residual on rejection, so the emitted token stays exactly
+                # p-distributed. An argmax comparison here would bias towards the mode.
+                n_acc, bonus = rejection_accept(
+                    proposed[:width],
+                    q[off:off + width],
+                    p[off:off + width + 1],
+                )
+            if n_acc < width:
+                any_rejected = True
+            keep = start + n_acc
+            req.input_ids = req._ids_buf[:keep]
+            req.append_host(torch.tensor([bonus], dtype=req.input_ids.dtype))
+            # Hand back the pages and SWA slots of the positions this block did not
+            # keep, BEFORE device_len drops past them. allocate_paged sized itself from
+            # the full block width, and nothing else walks a range above the request's
+            # current length -- so what is not released here is leaked until the next
+            # idle integrity check fails, far from the cause.
+            if release_tail is not None:
+                release_tail(req, keep + 1)
+            req.cached_len, req.device_len = keep, keep + 1
+            emitted.append(
+                torch.cat([proposed[:n_acc], torch.tensor([bonus], dtype=torch.int32)])
+            )
+            self._spec_accepted += n_acc
+            self._spec_drafted += width
+            off += span
+
+        # Undo the carry the verify advanced across positions this block did not keep.
+        # The compressor's state is a reduction over the tokens seen, not a function of
+        # the KV, so a stranded carry cannot be rebuilt -- the request would simply
+        # continue from state that saw tokens it never emitted.
+        snap = getattr(batch, "carry_snapshot", None)
+        if any_rejected and snap is not None:
+            snap.restore()
+
+        # The reply path reads one token per request; hand it the LAST emitted token and
+        # let the scheduler read the rest off req.input_ids, which already holds them.
+        last = torch.tensor([int(e[-1]) for e in emitted], dtype=torch.int32)
+        batch.spec_emitted = emitted
+        gpu = last.to(self.device, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(self.stream)
+        return ForwardOutput(gpu, last, done)
+
+    def _snapshot_carry(self, batch: Batch):
+        """Save the compressor carry a rejected block would strand, or None.
+
+        Only the page each request is currently in can be stranded: a rejection in a
+        LATER page leaves the surviving page untouched, and the abandoned pages take
+        their ring blocks with them.
+        """
+        from freetoken.models.deepseek_v4.rollback import CarrySnapshot
+
+        layers = getattr(self.model, "_transformer", None)
+        if layers is None or not batch.reqs:
+            return None
+        try:
+            slots = torch.stack([
+                self.attn_backend.window_slots_of(r.table_idx, r.cached_len - 1, r.cached_len)
+                .reshape(())
+                for r in batch.reqs
+            ])
+            return CarrySnapshot(
+                self.attn_backend, [b.attn for b in layers.layers], slots
+            )
+        except Exception as exc:  # a snapshot is an optimization for correctness, not
+            # a correctness requirement on its own -- but say so, loudly, rather than
+            # silently running without the ability to undo a rejection.
+            logger.warning_rank0(f"dSpark: no carry snapshot this step ({exc})")
+            return None
+
+    def draft_into_batch(self, batch: Batch) -> torch.Tensor | None:
+        """Fill a speculative batch's placeholder positions with the drafter's proposal.
+
+        Called on a batch the scheduler has already prepared and extended: its segments
+        cover ``1 + k`` positions per request, ``allocate_paged`` has given every layer
+        -- target and draft alike -- slots at those positions, and the token ids past the
+        first are the checkpoint's noise placeholder.
+
+        The draft runs first and writes the DRAFT layers' KV; the verify forward that
+        follows runs over the same positions and writes the TARGET layers' KV. The two
+        never collide, because the draft layers' ids continue past the target's.
+
+        Returns the confidence per position, or None when the model cannot draft yet.
+        """
+        from freetoken.models.deepseek_v4.dspark import sampling_probs
+
+        drafter = getattr(self.model, "draft", None)
+        if drafter is None:
+            return None
+        # Snapshot the compressor carry BEFORE anything advances it. The verify pass
+        # walks the compressor across the whole block; if the block is then partly
+        # rejected, the carry the next real step must read has already been overwritten
+        # in place, and nothing else can rebuild it.
+        batch.carry_snapshot = self._snapshot_carry(batch)
+        with self.ctx.forward_batch(batch):
+            # Give the draft layers KV for the positions the target has committed since
+            # the last step. Without it they attend over a stale window and propose
+            # badly -- which reads as a weak drafter, not a missing call.
+            catch_up = getattr(self.model, "catch_up_draft_context", None)
+            if catch_up is not None:
+                catch_up(batch)
+            out = drafter()
+        if out is None:
+            return None
+        draft_logits, confidence = out
+        # q must be the distribution the sampler would DRAW from, not the raw softmax:
+        # the ratio test compares q against a target p shaped the same way.
+        sp = batch.reqs[0].sampling_params
+        q = sampling_probs(draft_logits, sp.temperature, sp.top_p, sp.top_k)
+        # Draft by SAMPLING from q, not by taking its argmax. Speculative sampling's
+        # guarantee assumes the proposal was drawn from q; an argmax proposal is not,
+        # and the acceptance probabilities would no longer preserve p.
+        proposed = (
+            q.argmax(dim=-1) if sp.is_greedy
+            else torch.multinomial(q, 1).squeeze(-1)
+        )
+        # Position i's logits predict i+1, so the proposal for the block's positions
+        # 1..k is proposed[0..k-1]; the last entry predicts past the block and is dropped.
+        batch.input_ids[1:] = proposed[:-1].to(batch.input_ids.dtype)
+        batch.draft_probs = q
+        return confidence
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
@@ -923,6 +1293,9 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+
+        if batch.speculative:
+            return self._finish_speculative(batch, logits, args)
 
         for req in batch.reqs:
             req.complete_one()
@@ -1046,9 +1419,44 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
     the DSV4 decode batch size.
     """
+    if config.tp_info.size > 1:
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "DeepSeek-V4 tensor parallelism currently requires the original "
+                "safetensors checkpoint. FTW stores the TP=1 dense weights and expert "
+                "banks, so it cannot be replayed into rank-local DSV4 shapes; use the "
+                "raw checkpoint or run with --tp-size 1."
+            )
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    # dSpark is opt-in: the drafter's routed experts enlarge both the host expert banks
+    # and the GPU slot cache, so a run that will not speculate must not pay for them.
+    if getattr(config, "speculative_dspark", False):
+        if not model_config.dsv4_args.has_dspark:
+            raise ValueError(
+                "--speculative-dspark: this checkpoint ships no dSpark drafter "
+                "(needs mtp.* weights with dspark_block_size > 1 in inference/config.json)"
+            )
+        from freetoken.models.deepseek_v4.args import set_dspark_enabled
+
+        model_config.dsv4_args.dspark_enabled = True
+        set_dspark_enabled(True)  # so the weight reader builds the same model
+        # parse_config already ran, before the flag existed, so its extra_moe_layers is
+        # still 0. The expert banks would then build n_layers + n_draft entries while
+        # the offload cache was sized for n_layers, and the two assert against each
+        # other AFTER the full expert load -- five minutes to learn it.
+        # frozen dataclass -- same in-place idiom the offload-cache sizing uses below.
+        object.__setattr__(
+            model_config, "extra_moe_layers", model_config.dsv4_args.n_draft_layers
+        )
+        logger.info_rank0(
+            f"dSpark drafter enabled: {model_config.dsv4_args.n_draft_layers} draft layers, "
+            f"block size {model_config.dsv4_args.dspark_block_size}, "
+            f"target layers {model_config.dsv4_args.dspark_target_layer_ids}"
+        )
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
     # a runtime rebuild pins an absolute window via swa_num_pages_override instead.
     # DSV4's KV page IS the P-token window page (window == radix reuse granularity == lcm of
@@ -1211,6 +1619,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "expert_prefetch": 2,
 }
 
 

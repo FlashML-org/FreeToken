@@ -250,6 +250,9 @@ class ModelConfig:
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist
     # for layers ``[first_k_dense_replace, num_layers)``.
     first_k_dense_replace: int = 0
+    # MoE blocks beyond the target stack that still need expert banks and offload-cache
+    # slots -- a speculative drafter's layers, indexed after the target's.
+    extra_moe_layers: int = 0
     # Always-on shared expert(s) added to every MoE layer's output (GLM-4: 1).
     n_shared_experts: int = 0
     # Selected-expert weights are multiplied by this after renormalization (GLM-4: 2.5).
@@ -302,8 +305,13 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+
+        ``extra_moe_layers`` covers MoE blocks that are NOT part of the target stack --
+        today a speculative drafter's layers, which own routed experts of their own and
+        are indexed after the target's. The expert banks and the offload cache must agree
+        on this count, so it lives beside ``num_layers`` rather than being re-derived.
         """
-        return self.num_layers - self.first_k_dense_replace
+        return self.num_layers - self.first_k_dense_replace + self.extra_moe_layers
 
     @property
     def is_multimodal(self) -> bool:

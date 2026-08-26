@@ -134,6 +134,9 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # MoE layer ids belonging to the dSpark drafter. They are kept off the CPU pool
+    # and fetched without a cap -- see _fetch_fraction_for.
+    draft_layer_ids: frozenset = frozenset()
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -827,8 +830,41 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch,
+            self._fetch_fraction_for(layer_id, expert_ids),
         )
+
+    def _fetch_fraction_for(self, layer_id: int, expert_ids: torch.Tensor) -> float:
+        """The fetch fraction, corrected for how many tokens this step carries.
+
+        ``hybrid_fetch_fraction`` balances PCIe against the CPU pool for a ONE-token
+        decode: fetch pcie_bw/cpu_bw of the misses and both sides finish together.
+
+        A speculative verify breaks that balance, because the two sides scale
+        differently with the token count T. Fetching an expert moves the same bytes
+        whether 1 or T tokens route to it -- the cost is flat in T. The CPU pool pays
+        per (expert, token) pair, so its side of the step grows with T. Holding the
+        1-token fraction fixed therefore leaves the GPU idle while the CPU does T times
+        the work, which is what makes a wider block cost nearly T times a single step
+        instead of amortizing.
+
+        Re-balancing moves the split point by exactly T. This is the difference between
+        speculation being free and speculation being pointless on an offload MoE.
+        """
+        # The drafter's layers fetch everything. They are 3 of 46, they run on the
+        # critical path of EVERY block, and nothing overlaps them -- the target's
+        # verify cannot start until the draft is done. Leaving a draft expert to the
+        # CPU pool puts the slowest path in the engine in series with every block,
+        # to save a fetch that is a rounding error against the target's 43 layers.
+        if layer_id in self.draft_layer_ids:
+            return 1.0
+        frac = self.hybrid_fetch_fraction
+        if frac <= 0.0:
+            return frac
+        n_tokens = int(expert_ids.shape[0]) if expert_ids.dim() > 1 else 1
+        if n_tokens <= 1:
+            return frac
+        return min(1.0, frac * n_tokens)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

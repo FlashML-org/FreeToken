@@ -221,6 +221,18 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         that have slid out of the window translate to -1)."""
         return self.pool.translate_full_to_window(self.pool.full_loc_map[ti, lo:hi])
 
+    def window_slots_at(self, rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Window slots for SCATTERED ``(row, position)`` pairs, one per token.
+
+        ``window_slots_of`` covers one request's contiguous range. A flat batch spans
+        several requests, and its tokens arrive as parallel row/position vectors, so the
+        same lookup is a gather rather than a slice. Positions that have slid out of the
+        window translate to -1, exactly as they do there.
+        """
+        return self.pool.translate_full_to_window(
+            self.pool.full_loc_map[rows.long(), positions.long()]
+        )
+
     def win_cols_to_global(self, win_cols: torch.Tensor, slot_lut: torch.Tensor) -> torch.Tensor:
         """Per-query window columns (or -1) -> GLOBAL window-pool slots via ``slot_lut``."""
         g = slot_lut[win_cols.clamp_min(0)]
