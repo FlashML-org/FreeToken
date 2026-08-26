@@ -41,12 +41,23 @@ import torch
 from freetoken.models.gguf.dequant import (
     BLOCK_SHAPE,
     DEQUANT_TYPES,
+    GGML_BF16,
+    GGML_F16,
+    GGML_F32,
     GGML_NAME,
     GGML_UNQUANTIZED,
     MMQ_TYPES,
     MMVQ_TYPES,
     row_bytes,
 )
+
+# ggml type -> the dtype its raw bytes represent. Only the unquantized types appear here;
+# everything else goes through a dequant kernel.
+_UNQUANTIZED_DTYPE = {
+    GGML_F32: torch.float32,
+    GGML_F16: torch.float16,
+    GGML_BF16: torch.bfloat16,
+}
 
 from .base import BaseOP
 
@@ -73,7 +84,22 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
     if qweight_type in GGML_UNQUANTIZED:
-        return x @ qweight.T
+        # GGUFLinear/GGUFEmbedding store every type in a uint8 buffer of row_bytes width,
+        # including the unquantized ones, where "packed" just means the raw F32/F16/BF16
+        # bytes. Those must be reinterpreted before the matmul: multiplying the byte view
+        # directly gives an in_features of row_bytes (2x too wide for F16) and fails with
+        # "mat1 and mat2 shapes cannot be multiplied". A checkpoint only reaches this path
+        # when it stores a projection unquantized -- Apodex-1.1-mini ships output.weight as
+        # F16, which is how this surfaced; models whose lm_head is Q6_K never hit it.
+        w = qweight
+        if w.dtype == torch.uint8:
+            w = w.view(_UNQUANTIZED_DTYPE[qweight_type])
+        # Cast the ACTIVATION, not the weight. Converting the weight would copy the whole
+        # matrix on every call -- about 1 GB per forward for a 248k-vocab lm_head -- and
+        # allocating that during CUDA graph capture fails outright. x is [tokens, hidden],
+        # so casting it is negligible, and computing in the stored precision is what
+        # llama.cpp does for these tensors anyway.
+        return (x.to(w.dtype) @ w.T).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in MMQ_TYPES:
