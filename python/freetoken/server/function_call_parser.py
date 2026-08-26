@@ -1255,6 +1255,9 @@ class Glm47Detector(BaseFormatDetector):
     ):
         raw = value.strip()
         if self._preserve_string_whitespace:
+            schema = param_config.get(key, {})
+            if isinstance(schema, dict) and "type" in schema:
+                return self._convert_param_value(raw, key, param_config, func_name)
             try:
                 return json.loads(raw)
             except (json.JSONDecodeError, ValueError):

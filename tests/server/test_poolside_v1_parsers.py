@@ -138,6 +138,7 @@ def _schema_tools() -> list[Tool]:
                             "enum_only": {"enum": ["a", "b"]},
                             "typeless": {},
                             "integer": {"type": "integer"},
+                            "number": {"type": "number"},
                             "boolean": {"type": "boolean"},
                             "object": {"type": "object"},
                             "array": {"type": "array"},
@@ -189,6 +190,45 @@ def test_poolside_v1_exact_string_schema_semantics_one_char_streaming() -> None:
         fragments.extend(call.parameters for call in calls)
     parser.finish_stream()
     assert json.loads("".join(fragments)) == EXPECTED_SCHEMA_ARGS
+
+
+def _glm_coercion_block() -> str:
+    return (
+        "<tool_call>typed"
+        "<arg_key>integer</arg_key><arg_value>1.0</arg_value>"
+        "<arg_key>number</arg_key><arg_value>1e3</arg_value>"
+        "<arg_key>boolean</arg_key><arg_value>TRUE</arg_value>"
+        "<arg_key>object</arg_key><arg_value>{'x': 1}</arg_value>"
+        "</tool_call>"
+    )
+
+
+EXPECTED_GLM_COERCIONS = {
+    "integer": "1.0",
+    "number": 1000,
+    "boolean": True,
+    "object": {"x": 1},
+}
+
+
+def test_poolside_v1_non_string_schema_uses_glm_coercion_non_stream() -> None:
+    parser = FunctionCallParser(_schema_tools(), tool_call_parser="poolside_v1")
+    result = parser.parse_non_stream(_glm_coercion_block())
+    args = json.loads(result.calls[0].parameters)
+    assert args == EXPECTED_GLM_COERCIONS
+    assert type(args["number"]) is int
+
+
+def test_poolside_v1_non_string_schema_uses_glm_coercion_streaming() -> None:
+    parser = FunctionCallParser(_schema_tools(), tool_call_parser="poolside_v1")
+    fragments: list[str] = []
+    for char in _glm_coercion_block():
+        _visible, calls = parser.parse_stream_chunk(char)
+        fragments.extend(call.parameters for call in calls)
+    parser.finish_stream()
+    args = json.loads("".join(fragments))
+    assert args == EXPECTED_GLM_COERCIONS
+    assert type(args["number"]) is int
 
 
 def test_poolside_v1_preserves_escaped_source_under_one_char_streaming() -> None:
