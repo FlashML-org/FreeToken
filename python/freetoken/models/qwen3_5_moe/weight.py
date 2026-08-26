@@ -37,6 +37,56 @@ _PACKED_EXPERT_PATTERN = re.compile(
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP
 # head's ``mtp.layers.N.mlp.experts.*`` tensors (served text-only, dropped).
 _NVFP4_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+
+# Original (un-quantized) Qwen3-Next checkpoints store each routed expert as separate
+# gate/up/down tensors per expert (``model.layers.N.mlp.experts.E.<proj>.weight``). Under
+# offload they are packed here into the whole-layer ``experts.gate_up_proj`` /
+# ``experts.down_proj`` sources the banks loader expects (include_moe_experts=True); the
+# dense pass drops them like the NVFP4 per-expert tensors.
+_BF16_EXPERT_PART_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<idx>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+
+class _Bf16ExpertPacker:
+    """Packs plain-bf16 per-expert parts (``...experts.E.<proj>.weight``) into the
+    whole-layer stacked ``experts.gate_up_proj`` / ``experts.down_proj`` sources the
+    bank builder expects: fuse gate|up per expert, stack all ``num_experts`` experts
+    per layer. Non-expert names pass straight through, so a stream can be routed
+    through :meth:`feed` unconditionally."""
+
+    def __init__(self, num_experts: int) -> None:
+        self._num_experts = num_experts
+        self._parts: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        self._layers: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def feed(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        m = _BF16_EXPERT_PART_RE.match(name)
+        if m is None:
+            return [(name, tensor)]
+        layer, idx = int(m["layer"]), int(m["idx"])
+        slots = self._parts.setdefault((layer, idx), {})
+        slots[m["proj"]] = tensor
+        if len(slots) < 3:
+            return []
+        del self._parts[(layer, idx)]
+        self._layers.setdefault(layer, {})[idx] = (
+            torch.cat([slots["gate_proj"], slots["up_proj"]], dim=0),
+            slots["down_proj"],
+        )
+        if len(self._layers[layer]) < self._num_experts:
+            return []
+        done = self._layers.pop(layer)
+        ordered = [done[i] for i in range(self._num_experts)]
+        prefix = f"model.layers.{layer}.mlp.experts"
+        return [
+            (prefix + ".gate_up_proj", torch.stack([g for g, _ in ordered], dim=0)),
+            (prefix + ".down_proj", torch.stack([d for _, d in ordered], dim=0)),
+        ]
+
+    def leftovers(self) -> tuple[list, list]:
+        """Incomplete keys at end of stream: (partial experts, partial layers)."""
+        return sorted(self._parts), sorted(self._layers)
 _NVFP4_EXPERT_KEY_RE = re.compile(
     r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
@@ -296,6 +346,7 @@ def _iter_weights_flat(
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    bf16_packer = _Bf16ExpertPacker(config.num_experts)
 
     for file in tqdm(
         iter_weight_files(model_path),
@@ -308,7 +359,13 @@ def _iter_weights_flat(
                 # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
                 # not the dense pass. bf16-base stacked experts (experts.gate_up_proj) have no
                 # ``.mlp.experts.<int>.`` so they are unaffected and still hit _PACKED_EXPERT.
-                if _NVFP4_EXPERT_RE.search(raw_name):
+                if _NVFP4_EXPERT_RE.search(raw_name) and (
+                    not raw_name.endswith(".weight")
+                    or raw_name.removesuffix(".weight") + ".weight_scale" in keyset
+                ):
+                    # modelopt-quantized per-expert tensor (or its scale): handled by
+                    # load_nvfp4_expert_source_banks, never this dense pass. A plain
+                    # bf16 per-expert .weight (no scale sibling) falls through below.
                     continue
                 # Standalone modelopt scales are consumed with their .weight, never yielded.
                 if raw_name.endswith(_SCALE_SUFFIXES):
@@ -316,6 +373,12 @@ def _iter_weights_flat(
 
                 name = _rename(raw_name)
                 if name is None:
+                    continue
+
+                if _BF16_EXPERT_PART_RE.match(name) is not None:
+                    if not include_moe_experts:
+                        continue  # routed experts live in the offload banks, not here
+                    yield from bf16_packer.feed(name, f.get_tensor(raw_name))
                     continue
 
                 is_expert = _PACKED_EXPERT_PATTERN.match(name) is not None
@@ -365,6 +428,9 @@ def _iter_weights_flat(
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
+    parts, layers = bf16_packer.leftovers()
+    assert not parts, f"Incomplete per-expert parts: {parts[:5]}..."
+    assert not layers, f"Incomplete per-expert layers: {layers}"
 
 
 # ======================================================================================
@@ -742,8 +808,9 @@ def iter_weights_parallel(
     chunk: int = 8 << 20,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """experts-only parallel read via the common chunked multi-threaded O_DIRECT reader.
-    Qwen3.5 stores experts pre-fused/pre-stacked per layer (already ``[E, ...]``), so no
-    merge/stack -- just rename and yield; bank builder places by name as the serial path."""
+    Pre-fused/pre-stacked Qwen3.5 layers pass through renamed; plain-bf16 per-expert
+    checkpoints (original Qwen3-Next) get the same fuse+stack packing as the serial path
+    via ``_Bf16ExpertPacker``, so both layouts land in the banks byte-identically."""
     assert include_moe_experts and not include_non_moe, (
         "qwen3_5_moe parallel reader is experts-only (used by load_moe_expert_sources)"
     )
@@ -752,14 +819,26 @@ def iter_weights_parallel(
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
 
+    config = parse_config(cached_load_hf_config(model_path))
+    packer = _Bf16ExpertPacker(config.num_experts)
+
     def _is_expert(raw_name: str) -> bool:
         name = _rename(raw_name)
-        return name is not None and _PACKED_EXPERT_PATTERN.match(name) is not None
+        return name is not None and (
+            _PACKED_EXPERT_PATTERN.match(name) is not None
+            or _BF16_EXPERT_PART_RE.match(name) is not None
+        )
 
     for raw_name, tensor in iter_expert_tensors_parallel(
         model_path, _is_expert, workers=workers, chunk=chunk
     ):
-        yield _rename(raw_name), tensor
+        # Pre-packed layers pass through the packer unchanged; plain bf16 per-expert
+        # parts get fused and stacked per layer exactly like the serial path.
+        yield from packer.feed(_rename(raw_name), tensor)
+
+    parts, layers = packer.leftovers()
+    assert not parts, f"Incomplete per-expert parts: {parts[:5]}..."
+    assert not layers, f"Incomplete per-expert layers: {layers}"
 
 
 # ======================================================================================
