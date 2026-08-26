@@ -141,6 +141,12 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            or "qwen3_6" in marker
+            or "qwen3.6" in marker
+            # Qwen3-Coder and the 3.5/3.6 hybrid family share the XML invoke-block
+            # grammar (<function=name><parameter=k>v); plain "qwen" (2.x) uses the
+            # older JSON form. A bare "qwen3" marker stays JSON (qwen25) unless it's
+            # a coder variant.
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
