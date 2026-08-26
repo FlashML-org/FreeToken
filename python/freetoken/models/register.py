@@ -107,6 +107,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    "LagunaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
