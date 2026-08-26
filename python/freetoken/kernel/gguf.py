@@ -56,9 +56,10 @@ def _module():
         # the kernels compile their HIP branches; drop the CUDA-only -ccbin/flag logic.
         # Explicit --offload-arch (plus PYTORCH_ROCM_ARCH) prevents torch from auto-
         # emitting ~14 gfx arches, which would multiply build time per arch.
-        os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx1100")
+        gfx = os.getenv("FREETOKEN_KERNEL_CACHE_GFX", "gfx1100")
+        os.environ.setdefault("PYTORCH_ROCM_ARCH", gfx)
         extra_cuda_cflags = [
-            "-O3", "--offload-arch=gfx1100", "-DUSE_HIP=1", "-DUSE_ROCM=1",
+            "-O3", f"--offload-arch={gfx}", "-DUSE_HIP=1", "-DUSE_ROCM=1",
         ]
         os.environ.pop("CXX", None)
         os.environ.pop("CC", None)

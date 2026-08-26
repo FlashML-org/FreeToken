@@ -444,10 +444,6 @@ def iter_gguf_weights(
 # --------------------------------------------------------------------------------------
 
 
-def _q8_0_down_row_bytes(I: int) -> int:
-    return row_bytes(I, GGML_Q8_0)
-
-
 def load_gguf_expert_sources(
     model_path: str, config: ModelConfig, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:

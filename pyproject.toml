@@ -80,9 +80,9 @@ fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
 # ROCm (AMD) install: the NVIDIA-only fi/sgl/Marlin packages are NOT pulled in. torch must
-# come from the ROCm wheel index (e.g. `pip install torch==2.11.0+rocm6.2` from
-# https://download.pytorch.org/whl/rocm6.2) so the native extensions build against the HIP
-# runtime; this extra pins the rest. See docs/install.md (AMD section, Inc 9).
+# come from the ROCm wheel index (e.g. `pip install torch==2.11.0+rocm7.2` from
+# https://download.pytorch.org/whl/rocm7.2) so the native extensions build against the HIP
+# runtime; this extra pins the rest. See docs/install-amd.md.
 rocm = [
     "triton==3.6.0; platform_system == 'Linux'",
 ]

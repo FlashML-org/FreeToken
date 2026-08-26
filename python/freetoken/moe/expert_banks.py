@@ -259,15 +259,12 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
             "(not safetensors), so the common reader doesn't apply."
         )
     if dummy:
-        from freetoken.models.weight import dummy_q4_0_moe_expert_sources
-
         raise NotImplementedError("gguf expert banks have no dummy path; load the real GGUF")
     from freetoken.models.weight import load_gguf_moe_expert_sources
 
-    sink = None if dummy else layer_sink
-    sources = load_gguf_moe_expert_sources(model_path, model_config, layer_sink=sink)
+    sources = load_gguf_moe_expert_sources(model_path, model_config, layer_sink=layer_sink)
     return ExpertBanks(
-        "gguf", {name: sources[name] for name in _BANK_SCHEMAS["gguf"]}, streamed=sink is not None
+        "gguf", {name: sources[name] for name in _BANK_SCHEMAS["gguf"]}, streamed=layer_sink is not None
     )
 
 

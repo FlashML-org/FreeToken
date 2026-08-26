@@ -106,17 +106,14 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
 
 
 def _backend_requirements_met(name: str) -> bool:
+    infos = [attention_backend_info(part) for part in name.split(",")]
     # On ROCm (AMD) only the portable backends exist: flashinfer/sgl/trtllm (and anything
     # sm_100-gated) are NVIDIA-only, so short-circuit before probing them at all.
-    from freetoken.utils.arch import is_rocm
-
     if is_rocm():
         return all(not i.requires_flashinfer and not i.requires_sgl_kernel
-                   and not i.requires_sm100 for i in
-                   [attention_backend_info(p) for p in name.split(",")])
+                   and not i.requires_sm100 for i in infos)
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
-    infos = [attention_backend_info(part) for part in name.split(",")]
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():

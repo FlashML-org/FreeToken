@@ -62,26 +62,11 @@ _FP4_CODES = (
 _FP4_TABLE = _np.asarray(_FP4_CODES, dtype=_np.float32)
 # Magnitudes sorted ascending for the nearest-code search.
 _FP4_SORT = _np.asarray(sorted(abs(v) for v in _FP4_CODES[1:8]), dtype=_np.float32)
-_FP4_SORT_SIGN = _np.asarray([1.0 if i < 4 else -1.0 for i in range(len(_FP4_SORT))],
-                             dtype=_np.float32)
 
 
 def fp4_e2m1_table() -> Sequence[float]:
     """The 16 e2m1 values keyed by 4-bit code (index == code)."""
     return list(_FP4_CODES)
-
-
-def _nearest_e2m1_codes(values: _np.ndarray) -> _np.ndarray:
-    """Nearest e2m1 *code* for each fp32 ``values`` (signed, including 0/NaN)."""
-    a = _np.abs(values)
-    diff = _np.abs(a[..., None] - _FP4_SORT)  # [..., 7]
-    idx = diff.argmin(axis=-1)
-    mag = _FP4_SORT[idx]
-    neg = _np.signbit(values)
-    code = (idx + 1).astype(_np.uint8)  # _FP4_SORT[i] == table[i+1]; positive codes 1..7
-    out = _np.where(neg, code | 0x8, code)
-    # Magnitudes below the smallest representable value (0.5) round to +0.
-    return _np.where(mag < 0.25, 0, out)
 
 
 def e8m0_scale_and_codes(values: _np.ndarray, block: int = 32) -> tuple[_np.ndarray, _np.ndarray]:
@@ -183,6 +168,10 @@ def convert_nvfp4_to_mxfp4(
     # Dequantize NVFP4 to fp32, move K to the last axis.
     K2 = packed.shape[-1]
     K = K2 * 2
+    assert K % block == 0, (
+        f"NVFP4 K={K} is not a multiple of the MXFP4 block ({block}); "
+        "cannot convert without truncating weights"
+    )
     codes = np.stack([packed & 0x0F, (packed >> 4)], axis=-1).reshape(
         *packed.shape[:-1], K
     )
@@ -192,9 +181,8 @@ def convert_nvfp4_to_mxfp4(
 
     # Requantize to per-`block` e8m0 + e2m1.
     flat = f32.reshape(-1, K)
-    # pad to a multiple of block for the reshape (K is a multiple of 32 in practice)
     n_blocks = K // block
-    flat_b = flat[:, : n_blocks * block].reshape(-1, block)
+    flat_b = flat.reshape(-1, block)
     scale_codes, mxfp4_codes = e8m0_scale_and_codes(flat_b, block=block)
     out_codes = mxfp4_codes.reshape(flat.shape[0], n_blocks * block)
 

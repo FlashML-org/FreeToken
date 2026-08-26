@@ -6,12 +6,10 @@
 #
 #   ./mirror-hf-configs.sh <hf-repo-id> [gguf-file]
 #
-#   ./mirror-hf-configs.sh Qwen/Qwen3.6-35B-A3B
-#   ./mirror-hf-configs.sh Qwen/Qwen3.6-35B-A3B /media/smk/Shared/Models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+#   ./mirror-hf-configs.sh Qwen/Qwen3.6-35B-A3B /path/to/model.gguf
 #
-# With no gguf argument, defaults to $FT_MODEL, else the single *.gguf in
-# /media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models or /media/smk/Shared/Models
-# matching the repo's basename, else errors.
+# With no gguf argument, uses $FT_MODEL if set; otherwise errors. The GGUF must be
+# passed explicitly (or via FT_MODEL) -- no implicit model-directory search.
 #
 # Files fetched (when they exist upstream):
 #   chat_template.jinja     — read by FreeToken's GGUF loader (overrides embedded)
@@ -29,12 +27,7 @@ if [ "$#" -ge 1 ]; then
     GGUF="$1"
 else
     GGUF="${FT_MODEL:-}"
-    if [ -z "$GGUF" ]; then
-        base="$(basename "${REPO_ID##*:}")"
-        cand="$(find /media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models /media/smk/Shared/Models -maxdepth 1 -iname "*${base%%-*}*.gguf" 2>/dev/null | head -1)"
-        [ -n "$cand" ] || { echo "ERROR: no gguf found; pass one explicitly" >&2; exit 1; }
-        GGUF="$cand"
-    fi
+    [ -n "$GGUF" ] || { echo "ERROR: no gguf file given; pass one explicitly or set FT_MODEL" >&2; exit 1; }
 fi
 [ -f "$GGUF" ] || { echo "ERROR: not a file: $GGUF" >&2; exit 1; }
 

@@ -132,7 +132,7 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
-        # Inc-8 parity: on ROCm, honour the Inc-1 graph-gate result. If capture is not
+        # ROCm parity: honour the graph-capture gate result. If capture is not
         # viable on this AMD card, skip graphs entirely so decode uses the kernel-launch
         # path (correct, just not graph-accelerated) rather than erroring mid-capture.
         from freetoken.utils.arch import is_rocm

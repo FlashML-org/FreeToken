@@ -6,7 +6,7 @@ recovered via HIP ports where safe. This page covers installing and running on R
 
 > Status: **experimental.** The default and best-tested path remains CUDA. AMD brings up a
 > correct functional path (Triton attention + offload/CPU MoE + portable quant) and is
-> recovering performance via the HIP kernel ports. See `.plans/amd-gpu-support/plan.md`.
+> recovering performance via the HIP kernel ports.
 
 ## Requirements
 
@@ -41,10 +41,10 @@ and their backends are rejected with a clean error if requested.
 | Feature | On AMD | Notes |
 | --- | --- | --- |
 | Attention | `--attention-backend triton` | flashinfer/fa/trtllm are NVIDIA-only and rejected |
-| MoE | `--moe-backend offload / cpu / hybrid` | offload needs pinned host memory (Inc 3) |
+| MoE | `--moe-backend offload / cpu / hybrid` | offload needs pinned host memory |
 | Quant | BF16, MXFP4, GGUF (Q4_K/Q8_0), Triton inline-dequant NVFP4 | Marlin INT4 / native NVFP4 SASS unavailable |
 | NVFP4 checkpoints with no MXFP4 variant | converted to MXFP4 on load (auto) | `--nvfp4-backend auto` → triton/MXFP4 |
-| CUDA graphs (decode) | HIP graph capture **if** the Inc-1 gate passes | otherwise kernel-launch decode |
+| CUDA graphs (decode) | HIP graph capture **if** the capture probe passes | otherwise kernel-launch decode |
 | Multi-GPU (RCCL) | out of scope (single-GPU milestone) | |
 
 ## CLI behavior on AMD

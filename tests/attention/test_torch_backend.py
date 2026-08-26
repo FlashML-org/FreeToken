@@ -1,4 +1,4 @@
-"""The debug ``"torch"`` attention backend (Inc 4 of fix-attention).
+"""The debug ``"torch"`` attention backend.
 
 Verifies (a) the backend is registered and selectable, and (b) its pure-PyTorch
 GQA attention math (with causal masking and the per-head output gate) matches

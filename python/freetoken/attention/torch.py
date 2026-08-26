@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
+import os
 import torch
 
 from freetoken.core import Batch, get_global_ctx
@@ -64,10 +65,8 @@ class TorchAttentionBackend(BaseAttnBackend):
                 self.num_kv_heads = int(getattr(spec, "num_kv_heads", self.num_kv_heads))
                 break
         # Debugging: contiguous (per-request) cache instead of the paged pool, to
-        # isolate cache addressing from the attention compute (Inc 5).
+        # isolate cache addressing from the attention compute.
         self._contig: dict[tuple[int, int], list] = {}
-        import os
-
         self._use_contig = os.environ.get("FT_DEBUG_CONTIG_CACHE") == "1"
 
     def _build_metadata(self, batch: Batch) -> TorchMetadata:

@@ -13,12 +13,6 @@ import importlib.util
 from freetoken.utils.arch import is_rocm
 
 
-# NVIDIA-only optional native packages: even if an importable copy is present on a ROCm
-# torch build (e.g. a stray CUDA wheel), they must not be used -- the runtime falls back
-# to the portable Triton kernels. Treated as unavailable on ROCm.
-_CUDA_ONLY_PACKAGES = frozenset({"flashinfer", "sgl_kernel", "triton_kernels"})
-
-
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
     # (broken parent package, or a meta_path finder that blocks the name); treat

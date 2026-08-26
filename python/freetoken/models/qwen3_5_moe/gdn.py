@@ -77,7 +77,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._gguf = expert_quant == "gguf"
-        self._fp8 = self._block_fp8 or self._pertensor_fp8 or self._gguf
+        # "Split" projection layout (qkv|z + ba as two GEMMs): used by the fp8 paths
+        # and by GGUF (native-quant qkv|z + dense bf16 ba). The fused 4-way in_proj is
+        # only for the plain bf16 case.
+        self._split_proj = self._block_fp8 or self._pertensor_fp8 or self._gguf
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._block_fp8 or self._pertensor_fp8:
@@ -171,7 +174,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._split_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

@@ -1,10 +1,10 @@
 """HIP/CUDA graph-capture parity probe.
 
-The Inc-1 hard gate: whether ``torch.cuda.graph`` graph capture works on the target
-GPU is the single highest-informational-risk assumption for AMD (ROCm) support.
-This module probes it once and records a PASS/FAIL + device result that the rest
-of the plan (Inc 8) reads. On CUDA it is expected to PASS; on ROCm it may fail on
-some consumer cards, in which case Inc 8 must use the kernel-launch decode path.
+Whether ``torch.cuda.graph`` graph capture works on the target GPU is the single
+highest-informational-risk assumption for AMD (ROCm) support. This module probes it
+once and records a PASS/FAIL + device result that the engine reads when deciding
+whether to use CUDA-graph decode. On CUDA it is expected to PASS; on ROCm it may
+fail on some consumer cards, in which case decode must use the kernel-launch path.
 
 The result is cached to disk under the user cache dir so it survives across runs,
 and keyed by device kind + device name so a change of GPU invalidates it.
@@ -83,7 +83,6 @@ def probe_graph_capture() -> dict:
     # The child probes both an elementwise op (capturable on both backends) and a GEMM
     # (hipBLASLt on ROCm), which is what a real decode forward would run. The GEMM is
     # the discriminating case: on this ROCm build it fatally aborts -> child exit != 0.
-    import json as _json
     import subprocess as _subprocess
     import sys as _sys
 
@@ -105,7 +104,7 @@ def probe_graph_capture() -> dict:
             "detail": f"fatal during capture: {detail[:240]}",
         }
     try:
-        data = _json.loads(child.stdout)
+        data = json.loads(child.stdout)
     except Exception:
         return {
             "device_kind": _device_kind(),
@@ -177,7 +176,7 @@ def run_graph_gate() -> dict:
 @lru_cache(maxsize=1)
 def graph_capture_status() -> str:
     """Cached graph-capture status: ``"pass"``, ``"fail"``, or ``"unknown"`` (no device /
-    probe unavailable). Inc 8 reads this to pick HIP-graph vs kernel-launch decode."""
+    probe unavailable). The graph runner reads this to pick HIP-graph vs kernel-launch decode."""
     try:
         result = run_graph_gate()
         if result["ok"]:

@@ -106,12 +106,6 @@ def _version_parts(version: str) -> Tuple[str, List[str]]:
     return base, local.split(".") if local else []
 
 
-def _build_stamps(segments: List[str]) -> set[str]:
-    """The `g<sha>` commit-stamp tokens of a local version segment list
-    (stamped by scripts/build-release-wheels.sh)."""
-    return {s for s in segments if re.fullmatch(r"g[0-9a-f]{7,40}", s)}
-
-
 def _build_stamps(local_segments: List[str]) -> List[str]:
     """The `g<sha>` commit-stamp tokens of a local version segment list
     (``["cu130", "g3f01615"]`` -> ``["g3f01615"]``)."""

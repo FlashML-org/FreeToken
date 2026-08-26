@@ -82,8 +82,7 @@ inline auto
 HIP_CHECK(::hipError_t error,
           std::source_location location = std::source_location::current())
     -> void {
-  if (error != ::hipSuccess) {
-    [[unlikely]];
+  if (error != ::hipSuccess) [[unlikely]] {
     ::host::panic(location, "HIP error: ", ::hipGetErrorString(error));
   }
 }
@@ -98,8 +97,7 @@ inline auto
 CUDA_CHECK(::cudaError_t error,
            std::source_location location = std::source_location::current())
     -> void {
-  if (error != ::cudaSuccess) {
-    [[unlikely]];
+  if (error != ::cudaSuccess) [[unlikely]] {
     ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }

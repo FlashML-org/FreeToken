@@ -31,7 +31,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-$REPO/.venv-rocm/bin/python}"
 
-MODEL="${FT_MODEL:-/media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
+MODEL="${FT_MODEL:-}"
 HOST="${FT_HOST:-127.0.0.1}"
 PORT="${FT_PORT:-1920}"
 ATNN="${FT_ATTN:-triton}"        # triton | torch
@@ -94,6 +94,7 @@ server_pids() {
 }
 
 start() {
+    [ -n "$MODEL" ] || die "no model configured: set FT_MODEL=/path/to/model.gguf"
     if [ -n "$(server_pids)" ]; then
         echo "A server is already running (pid $(server_pids | tr '\n' ' ')). Use 'stop' first."
         exit 1
