@@ -23,8 +23,11 @@ _TOKENIZER_ARCH = {
     "qwen35moe": "qwen2",
     "qwen35": "qwen2",
     "qwen3moe": "qwen2",
-    # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries.
-    "deepseek4": "llama",
+    # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries. The llama
+    # converter is sentencepiece-shaped and encodes a space as U+2581; a GPT2 BPE
+    # vocab uses the Ġ prefix instead, so that mapping silently DROPS every space on
+    # detokenization ("ThecapitalcityofFranceisParis"). qwen2 is the GPT2-BPE entry.
+    "deepseek4": "qwen2",
 }
 
 # Per-arch chat/stop tokens, in preference order: the first one present in the vocab

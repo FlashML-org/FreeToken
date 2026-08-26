@@ -47,6 +47,9 @@ _ARCH = "deepseek4"
 # fluent text.
 _GATING = {1: "softmax", 2: "sigmoid", 4: "sqrtsoftplus"}
 
+# ggml type -> the dtype its raw bytes represent (unquantized types only).
+_UNQ_DTYPE = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
+
 
 def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
     """One ``deepseek4.*`` metadata value. No default means the key is mandatory."""
@@ -288,8 +291,17 @@ class GGUFLinearNN(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.layers.gguf import fused_mul_mat_gguf
 
-        out = fused_mul_mat_gguf(x, self.weight, self._quant_type)
-        return out if self.bias is None else out + self.bias
+        # fused_mul_mat_gguf takes [tokens, in_features] and treats dim 0 as the batch, so
+        # leading dims must be folded and restored. F.linear -- which this replaces --
+        # accepts any number of leading dims, and deepseek_v4 relies on that: its attention
+        # passes 3-D tensors, and collapsing one silently reshapes q so the sparse-attention
+        # kernel's `b, m, h, d = q.shape` unpack fails.
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1]) if x.dim() != 2 else x
+        out = fused_mul_mat_gguf(flat, self.weight, self._quant_type)
+        if self.bias is not None:
+            out = out + self.bias
+        return out if x.dim() == 2 else out.view(*shape[:-1], out.shape[-1])
 
 
 class GGUFEmbeddingNN(torch.nn.Module):
@@ -313,12 +325,22 @@ class GGUFEmbeddingNN(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.gguf import ggml_dequantize
+        from freetoken.models.gguf.dequant import GGML_UNQUANTIZED
 
         flat = x.flatten()
         rows = self.weight.index_select(0, flat)
-        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim,
-                            torch.bfloat16)
+        if self._quant_type in GGML_UNQUANTIZED:
+            # Unquantized types are raw value bytes in the uint8 buffer; there is no
+            # dequant kernel for them (ggml_dequantize rejects type 1 outright), so the
+            # gathered rows are reinterpreted instead. DeepSeek-V4 ships token_embd as F16.
+            from freetoken.models.deepseek_v4.gguf import _UNQ_DTYPE
+
+            y = rows.view(_UNQ_DTYPE[self._quant_type]).to(torch.bfloat16)
+        else:
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim,
+                                torch.bfloat16)
         return y.view(*x.shape, self.embedding_dim)
 
 
