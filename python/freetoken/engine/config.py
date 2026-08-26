@@ -24,10 +24,14 @@ class EngineConfig:
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
-    # experts in parallel but falls back to serial when free RAM can't cover the banks + the
-    # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
-    # low-memory reclaimable read; "parallel" forces the fast read.
+    # experts in parallel but falls back to serial when free RAM can't cover the banks +
+    # bounded (non-reclaimable) whole-shard read-ahead; "serial" forces the low-memory
+    # reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # Whole checkpoint shards queued ahead of placement by parallel expert
+    # readers. One preserves I/O/placement overlap with lower peak host RAM;
+    # larger values can smooth uneven shard-placement time on roomy hosts.
+    expert_prefetch: int = 2
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -72,8 +76,23 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    # Collective timeout for the TP process group. The FIRST collective is the post-load
+    # free-memory all-reduce, and ranks reach it minutes apart on a large MoE checkpoint
+    # (each reads its own expert shards, at its own speed), so a short timeout kills the
+    # server during a healthy startup rather than protecting it. Sized for that load skew;
+    # lower it with --distributed-timeout if a hung rank should fail faster.
+    distributed_timeout: float = 1800.0
     use_dummy_weight: bool = False
+    # DeepSeek-V4 only: build the checkpoint's dSpark drafter for block speculative
+    # decoding. Reaches the model through dsv4_args.dspark_enabled (_adjust_dsv4_config).
+    speculative_dspark: bool = False
+    # Experimental, request-local DSpark circuit breaker. 0 disables it. Once at least
+    # dspark_fallback_min_drafted proposals have been measured below this acceptance
+    # rate, use ordinary target decode for dspark_fallback_steps steps, then probe the
+    # drafter again. This is based on observed acceptance, not prompt classification.
+    dspark_fallback_acceptance: float = 0.0
+    dspark_fallback_min_drafted: int = 32
+    dspark_fallback_steps: int = 64
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages

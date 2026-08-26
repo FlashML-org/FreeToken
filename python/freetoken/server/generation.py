@@ -490,6 +490,19 @@ def _record_generation(
     )
 
 
+def _acks(state, uid, request):
+    """The ack stream, watching the client when both sides support it.
+
+    getattr, not a bare call: a caller may pass a state that predates the watcher (the
+    test fakes do), and a missing disconnect check should cost the abort optimisation,
+    not the request.
+    """
+    watch = getattr(state, "wait_for_ack_watching_client", None)
+    if request is not None and watch is not None:
+        return watch(uid, request)
+    return state.wait_for_ack(uid)
+
+
 async def generate_events(
     uid: int, spec: GenSpec, state: Any, *, source: str | None = None
 ) -> AsyncIterator[GenEvent]:
@@ -521,7 +534,7 @@ async def generate_events(
 
 
 async def generate_full(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, request: Any = None
 ) -> GenResult:
     """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
     a `GenerationError` as a failed row."""
@@ -529,7 +542,7 @@ async def generate_full(
     result: GenResult | None = None
     error: str | None = None
     try:
-        result = await _generate_full_impl(uid, spec, state)
+        result = await _generate_full_impl(uid, spec, state, request)
         return result
     except GenerationError as exc:
         error = str(exc)
@@ -647,6 +660,8 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    # Streaming: a disconnect is already caught at the transport layer by
+    # stream_with_cancellation, which sees the write into a dead socket.
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -738,7 +753,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     )
 
 
-async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
+async def _generate_full_impl(
+    uid: int, spec: GenSpec, state: Any, request: Any = None
+) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
@@ -747,7 +764,10 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     cached_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
-    async for ack in state.wait_for_ack(uid):
+    # Watch the client. A non-streaming request awaits the whole completion, so a
+    # caller that hangs up otherwise leaves the GPUs generating to max_tokens for an
+    # answer nobody will read -- with the queue behind it waiting on that work.
+    async for ack in _acks(state, uid, request):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta

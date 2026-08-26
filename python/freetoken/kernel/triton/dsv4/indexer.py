@@ -117,7 +117,7 @@ def indexer_logits(
 
 @triton.jit
 def _indexer_decode_logits_kernel(
-    q_ptr, w_ptr, pool_ptr, snap_ptr, valid_ptr, out_ptr,
+    q_ptr, w_ptr, pool_ptr, snap_ptr, rows_ptr, valid_ptr, out_ptr,
     N_STAGE, RATIO,
     stride_qb, stride_qh, stride_qd,
     stride_wb, stride_wh,
@@ -156,8 +156,11 @@ def _indexer_decode_logits_kernel(
     h_mask = offs_h < H
 
     # block b -> its compressed row: full_loc(b * RATIO) // RATIO off the decode snapshot.
+    # There may be several query rows per request (DSpark target verification), so
+    # pid_b is a QUERY row and rows_ptr maps it to the corresponding SNAPSHOT row.
     # Masked-off lanes read snapshot column 0 and are dropped by ``t_mask`` below.
-    snap = tl.load(snap_ptr + pid_b * stride_sb + (offs_t * RATIO) * stride_sw,
+    snap_row = tl.load(rows_ptr + pid_b)
+    snap = tl.load(snap_ptr + snap_row * stride_sb + (offs_t * RATIO) * stride_sw,
                    mask=t_mask, other=0)
     rows = tl.maximum(snap, 0) // RATIO
 
@@ -179,8 +182,9 @@ def indexer_decode_logits(
     q: torch.Tensor,          # [B, H, D]  bf16, one query per request
     weights: torch.Tensor,    # [B, H]
     idx_pool: torch.Tensor,   # [R, D]     bf16, this layer's paged indexer keys
-    full_snap: torch.Tensor,  # [B, W]     int64, the decode full-loc snapshot
-    valid: torch.Tensor,      # [B]        live compressed block count per row
+    full_snap: torch.Tensor,  # [R, W]     int64, one snapshot row per request
+    rows: torch.Tensor,       # [Q]        query row -> snapshot row
+    valid: torch.Tensor,      # [Q]        live compressed block count per query
     n_stage: int,             # static staged width (the buffer the top-k scans)
     ratio: int,
     out: torch.Tensor | None = None,
@@ -199,6 +203,7 @@ def indexer_decode_logits(
     """
     B, H, D = q.shape
     assert weights.shape == (B, H), (weights.shape, (B, H))
+    assert rows.shape == (B,), (rows.shape, (B,))
     assert idx_pool.shape[1] == D, (idx_pool.shape, D)
     assert D == triton.next_power_of_2(D), f"index_head_dim must be pow2, got {D}"
 
@@ -209,7 +214,7 @@ def indexer_decode_logits(
 
     BLOCK_T = 64
     _indexer_decode_logits_kernel[(B, triton.cdiv(n_stage, BLOCK_T))](
-        q, weights, idx_pool, full_snap, valid, out,
+        q, weights, idx_pool, full_snap, rows, valid, out,
         n_stage, ratio,
         q.stride(0), q.stride(1), q.stride(2),
         weights.stride(0), weights.stride(1),

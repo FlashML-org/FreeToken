@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -69,6 +70,23 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     import torch
     from freetoken.scheduler import Scheduler
 
+    # The parent stops workers with p.terminate(), i.e. SIGTERM, whose default action is
+    # to kill the process outright. scheduler.shutdown() then never runs: the rank's
+    # collectives are never torn down, its multiprocessing primitives are never released
+    # -- the parent's "leaked semaphore objects" warning -- and a rank caught mid-forward
+    # dies loudly enough to look like a crash rather than a requested stop.
+    #
+    # Turning it into KeyboardInterrupt routes SIGTERM into the graceful path that ^C
+    # already uses, so there is one shutdown path rather than two.
+    def _terminate(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _terminate)
+        except (ValueError, OSError):
+            pass  # not the main thread of this process; the parent's SIGKILL backstop covers it
+
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
 
@@ -80,6 +98,19 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler = Scheduler(args)
             scheduler.sync_all_ranks()
+            # All final serving allocations now exist (host expert banks, GPU caches,
+            # CUDA graphs). Every rank contributes its real placement before rank 0
+            # sends the ready ack, so the log maps the loaded model rather than merely
+            # describing the workstation's hardware.
+            scheduler.engine.log_distribution_summary()
+        except KeyboardInterrupt:
+            # A stop during the ~90s load. KeyboardInterrupt is a BaseException, so it
+            # slips past the handler below and prints a traceback from wherever the
+            # loader happened to be -- which reads as a crash, and is what a stopped
+            # load looked like before this. There is nothing built yet to shut down.
+            if args.tp_info.is_primary():
+                init_logger(__name__).info("Stopped during load; nothing to shut down.")
+            return
         except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the
             # parent only as a dead process -> a generic "exited during load". Push the real
@@ -114,11 +145,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
         try:
             scheduler.run_forever()
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as stop:
             logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
+                logger.info("Scheduler exiting gracefully (%s)...", stop or "interrupt")
             scheduler.shutdown()
 
 

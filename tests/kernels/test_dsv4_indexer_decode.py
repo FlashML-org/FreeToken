@@ -41,10 +41,10 @@ def _build(positions, n_stage, seed=0):
     return q, w, snap, valid
 
 
-def _reference(q, w, pool, snap, valid, n_stage):
+def _reference(q, w, pool, snap, valid, n_stage, row_map=None):
     """fp32 ground truth: sum_h relu(q_h . k_t) * w_h over the live blocks, -inf past them."""
     b = q.shape[0]
-    rows = torch.arange(b, device=q.device)
+    rows = torch.arange(b, device=q.device) if row_map is None else row_map
     blk = torch.arange(n_stage, device=q.device)
     live = blk[None, :] < valid[:, None]
     at = snap[rows[:, None], (blk * RATIO)[None, :]]
@@ -55,7 +55,8 @@ def _reference(q, w, pool, snap, valid, n_stage):
 
 def _check(pool, positions, n_stage, seed=0):
     q, w, snap, valid = _build(positions, n_stage, seed)
-    got = indexer_decode_logits(q, w, pool, snap, valid, n_stage, RATIO).float()
+    rows = torch.arange(q.shape[0], dtype=torch.int64, device=q.device)
+    got = indexer_decode_logits(q, w, pool, snap, rows, valid, n_stage, RATIO).float()
     ref = _reference(q, w, pool, snap, valid, n_stage)
     assert torch.equal(torch.isfinite(got), torch.isfinite(ref)), "live/-inf column set differs"
     live = torch.isfinite(ref)
@@ -98,12 +99,27 @@ def test_per_row_valid(pool):
         assert torch.isinf(got[i, v:]).all()
 
 
+def test_multiple_queries_share_one_request_snapshot(pool):
+    """DSpark verifies anchor+gamma query rows against one snapshot row per request."""
+    n_stage = 256
+    q, w, _, _ = _build([400] * 6, n_stage, seed=17)
+    _, _, snap, _ = _build([400], n_stage, seed=19)
+    rows = torch.zeros(6, dtype=torch.int64, device=q.device)
+    valid = torch.tensor([1, 7, 19, 41, 73, 100], dtype=torch.int64, device=q.device)
+    got = indexer_decode_logits(q, w, pool, snap, rows, valid, n_stage, RATIO).float()
+    ref = _reference(q, w, pool, snap, valid, n_stage, row_map=rows)
+    assert torch.equal(torch.isfinite(got), torch.isfinite(ref))
+    live = torch.isfinite(ref)
+    torch.testing.assert_close(got[live], ref[live], **TOL)
+
+
 def test_cuda_graph_follows_valid(pool):
     """A captured graph must read the bound from device memory, not from capture time."""
     n_stage = 2048
     q, w, snap, valid = _build([800], n_stage)
     out = torch.empty((1, n_stage), dtype=pool.dtype, device="cuda")
-    call = lambda: indexer_decode_logits(q, w, pool, snap, valid, n_stage, RATIO)
+    rows = torch.arange(q.shape[0], dtype=torch.int64, device=q.device)
+    call = lambda: indexer_decode_logits(q, w, pool, snap, rows, valid, n_stage, RATIO)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):

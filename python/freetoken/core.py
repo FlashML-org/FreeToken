@@ -89,6 +89,22 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def complete_n(self, n: int) -> None:
+        """Advance by ``n`` accepted tokens instead of one.
+
+        A speculative step emits a whole block, and each request in a batch keeps a
+        DIFFERENT amount of it -- whatever prefix the target agreed with. So the advance
+        is per request, not per batch.
+
+        ``cached_len`` moves to where the step started, not to ``device_len - 1``: every
+        token of the accepted prefix is now cached history, and the next step extends
+        from the end of it.
+        """
+        if n < 1:
+            raise ValueError(f"a step must advance by at least one token, got {n}")
+        self.cached_len = self.device_len
+        self.device_len += n
+
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
         m = n + next_token.numel()
@@ -133,6 +149,33 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # Speculative block state. A verify step rides the PREFILL path (1+k tokens per
+    # request resuming from its own position), so the phase alone cannot distinguish
+    # it from a real prefill -- these say so explicitly.
+    speculative: bool = field(default=False, init=False)
+    spec_block: int = field(default=0, init=False)
+    # GraphRunner sets this only while the target verify graph is capturing/replaying.
+    # It selects DSV4's fixed-shape, device-addressed verify implementation; the eager
+    # prefill implementation remains the fallback when no verify graph is available.
+    spec_verify_decode: bool = field(default=False, init=False)
+    draft_confidence: torch.Tensor | None = field(default=None, init=False)
+    # Per-request accepted tokens from a speculative step: the reply path emits one
+    # token per request, so the rest of each block is read from here.
+    spec_emitted: List[torch.Tensor] | None = field(default=None, init=False)
+    # The draft distribution q for this block, kept so acceptance can run the
+    # p/q ratio test rather than an argmax comparison.
+    draft_probs: torch.Tensor | None = field(default=None, init=False)
+    # Tokens produced by the paper's sequential Markov stage, [requests * gamma].
+    # They stay on GPU through verification; only the accepted prefix is copied back.
+    draft_tokens: torch.Tensor | None = field(default=None, init=False)
+    # Per-token compressor partial states produced by a speculative target verify.
+    # FreeToken's compressor ring is page-addressed, so later tokens in the same page
+    # overwrite earlier states.  This journal is the engine-native equivalent of
+    # vLLM's save_partial_states: acceptance selects the state at the last valid row.
+    spec_carry_states: dict | None = field(default=None, init=False)
+    # Returns a rejected block's unused pages/SWA slots. Supplied by the scheduler,
+    # which owns the cache manager and is what inflated device_len to the block width.
+    release_tail: object | None = field(default=None, init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()

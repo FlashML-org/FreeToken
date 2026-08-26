@@ -88,6 +88,8 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        self._speculative = _speculative_config(config)
+        self._warned_non_greedy = False
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
@@ -228,6 +230,33 @@ class Scheduler(SchedulerIOMixin):
         # table_idx can have its freshly copied prompt clobbered by the prior occupant's
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
+        # Speculation cannot be overlapped as written. The loop below schedules and
+        # LAUNCHES batch N+1 before _process_last_data applies batch N's tokens. Plain
+        # decode survives that because complete_one() pre-advances device_len by exactly
+        # one -- the token count is known before the forward runs, which is why
+        # device_len legitimately leads the buffer by one.
+        #
+        # A speculative block contributes 1..k+1 tokens and the count is only known
+        # AFTER its verify. Overlapped, N+1 is scheduled as though nothing was accepted,
+        # so it re-drafts positions N already consumed. Measured directly:
+        #
+        #   draft ctx: 5 rows, positions 18..22   <- block N
+        #   draft ctx: 5 rows, positions 18..22   <- N+1, same positions, same proposals
+        #   draft ctx: 5 rows, positions 20..24   <- then a jump of two
+        #
+        # which duplicates tokens in the reply and makes the acceptance figure
+        # meaningless.
+        #
+        # vLLM overlaps and corrects for this by threading num_rejected into the next
+        # step's input preparation (valid_ctx_end = ctx_end - num_rejected in its
+        # dflash kernel). Without that correction the only correct option is to drain
+        # first, which costs the overlap but not the answer.
+        if self._speculative is not None and last_data is not None:
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -246,8 +275,10 @@ class Scheduler(SchedulerIOMixin):
         # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
-        self._process_last_data(last_data)
-        self._flush_abort_acks()
+        # None when the speculative drain above already handled it.
+        if last_data is not None:
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -334,37 +365,75 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
+                spec_emitted = getattr(batch, "spec_emitted", None)
+                if spec_emitted is not None:
+                    # A speculative step already wrote the accepted block into
+                    # req.input_ids and moved the counters, so this must NOT append
+                    # again. The block is reported to the client as a unit; the EOS and
+                    # stop checks below run on its final token, and any earlier EOS is
+                    # caught by the trimming the detokenizer already does.
+                    block = spec_emitted[i]
+                    reply_tokens = block
+                    next_token = int(block[-1].item())
+                else:
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    reply_tokens = None
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                # A speculative step emits a whole accepted block. Every token needs its
+                # own stop check: an EOS at block position 2 must end the request there,
+                # not after position 5 -- otherwise the client receives text generated
+                # past the end of the reply.
+                block = (
+                    [int(t) for t in reply_tokens]
+                    if reply_tokens is not None
+                    else [next_token]
                 )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
+                block_start = req.input_ids.numel() - len(block)
+                finished = False
+                visible_tokens: list[int] = []
+                finish_reason = None
+                matched_stop = None
+                for pos, tok in enumerate(block):
+                    visible_len = block_start + pos + 1
+                    hit_length = not req.can_decode and pos == len(block) - 1
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and tok in self.eos_token_ids
+                    )
+                    matched_stop = (
+                        self._match_stop_str(req, end_len=visible_len)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        tok == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = visible_len
+                    visible_tokens.append(tok)
+                    if finished:
+                        break  # drop the rest of the block: it is past the reply's end
+                # vLLM carries all newly accepted speculative ids in one engine
+                # output and advances its incremental detokenizer sequentially. Do
+                # the same here. Sending one DetokenizeMsg per token in a single
+                # BatchTokenizerMsg made the old batched decoder append cumulative
+                # prefixes ("pres" + "presidencia" + ...).
+                next_token = visible_tokens[-1]
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
                         next_token=next_token,
                         finished=finished,
+                        token_ids=visible_tokens if len(visible_tokens) > 1 else None,
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
@@ -417,17 +486,20 @@ class Scheduler(SchedulerIOMixin):
         )
         self.send_result(reply)
 
-    def _match_stop_str(self, req: Req) -> str | None:
+    def _match_stop_str(self, req: Req, end_len: int | None = None) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
         only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        N chars spans at most N tokens) to keep the per-step cost small. ``end_len``
+        makes a speculative block visible one token at a time: looking at the already-
+        appended whole block would let a stop in token 5 terminate the reply at token 1."""
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end_len = len(req.input_ids) if end_len is None else end_len
+        if end_len <= prompt_len:
             return None
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        tail_start = max(prompt_len, end_len - (max_chars + 1))
+        tail = self.tokenizer.decode(req.input_ids[tail_start:end_len].tolist())
         for s in stop_strs:
             if s in tail:
                 return s
@@ -806,10 +878,19 @@ class Scheduler(SchedulerIOMixin):
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if batch.is_decode or getattr(batch, "speculative", False):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            # A DSpark verify is phase="prefill" but its fixed-shape target graph uses
+            # the same device-addressed snapshot contract.
+            if getattr(batch, "speculative", False):
+                batch.active_table_idx = torch.tensor(
+                    [r.table_idx for r in batch.padded_reqs],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                batch.active_table_idx = input_mapping[0].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -836,9 +917,61 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        self._maybe_make_speculative(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _maybe_make_speculative(self, batch: Batch) -> None:
+        """Turn a decode batch into a speculative block, in place.
+
+        A verify step is not a special kind of forward -- it is a PREFILL of ``1 + k``
+        tokens per request, each resuming from its own position. The engine already
+        builds exactly that from ``extend_len`` and ``cached_len``, so extending the
+        requests and flipping the phase is the whole change: allocation, positions, the
+        compressor carry and the per-position logits all follow.
+
+        The extra ``k`` tokens are the checkpoint's noise placeholder. Slots depend on
+        POSITIONS, not on token values, so ``allocate_paged`` can hand out every layer's
+        slots before the drafter has decided what the tokens are; ``_forward`` fills
+        them in immediately afterwards.
+        """
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and speculation must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it.
+        spec = getattr(self, "_speculative", None)
+        if not hasattr(self, "_warned_non_greedy"):
+            self._warned_non_greedy = False
+        if spec is None or not batch.is_decode:
+            return
+        should_speculate = getattr(
+            getattr(self, "engine", None), "should_speculate", None
+        )
+        if should_speculate is not None and any(
+            not should_speculate(req) for req in batch.reqs
+        ):
+            return
+        gamma = spec.block_size
+        if gamma < 1:
+            return
+        for req in batch.reqs:
+            # Room for gamma proposals AND the bonus token; equality fits exactly.
+            # A request with less room decodes normally rather than being truncated.
+            if req.remain_len < gamma + 1:
+                return
+        # The target verify has anchor + gamma proposal rows.  The drafter takes the
+        # first gamma of those rows -- anchor + gamma-1 masks -- exactly as DSpark's
+        # sample-from-anchor layout specifies.
+        noise = torch.full((gamma,), spec.noise_token_id, dtype=self.token_pool.dtype)
+        for req in batch.reqs:
+            req.append_host(noise)
+            req.device_len += gamma
+        batch.phase = "prefill"
+        batch.speculative = True
+        batch.spec_block = gamma
+        # device_len now covers the whole block, so allocate_paged will size for it.
+        # Acceptance keeps only a prefix and must give the rest back through this.
+        batch.release_tail = self.cache_manager.release_speculative_tail
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -868,10 +1001,57 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if getattr(batch, "speculative", False):
+            # Draft BEFORE the verify forward, over the same prepared batch: the draft
+            # replaces this batch's placeholder token ids in place, so the verify that
+            # follows scores the drafter's actual proposal.
+            batch.draft_confidence = self.engine.draft_into_batch(batch)
+            self.engine.adapt_speculative_batch(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if getattr(batch, "speculative", False):
+            # output_mapping was prepared before acceptance, when device_len still
+            # pointed past the whole gamma-wide verify span.  A rejection moves each
+            # request's live bonus position independently; writing through the stale
+            # mapping leaves noise at the next cycle's anchor.  Rebuild the tiny mapping
+            # from the post-acceptance frontiers.
+            rows = torch.tensor(
+                [req.table_idx for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            positions = torch.tensor(
+                [req.device_len - 1 for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.token_pool[rows, positions] = forward_output.next_tokens_gpu
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+class _SpeculativeConfig(NamedTuple):
+    block_size: int
+    noise_token_id: int
+
+
+def _speculative_config(config) -> "_SpeculativeConfig | None":
+    """The run's speculative settings, or None when it will not speculate.
+
+    Reads the MODEL's own numbers rather than taking a block size on the command line:
+    dSpark's block width and noise token are properties of the checkpoint, and a run
+    that used different ones would put the drafter off its training distribution.
+    """
+    args = getattr(config.model_config, "dsv4_args", None)
+    if args is None or not getattr(args, "dspark_enabled", False):
+        return None
+    if not args.has_dspark:
+        return None
+    return _SpeculativeConfig(
+        block_size=args.dspark_block_size,
+        noise_token_id=args.dspark_noise_token_id,
+    )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

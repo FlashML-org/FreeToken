@@ -367,6 +367,30 @@ class FrontendManager:
             asyncio.create_task(self.abort_user(uid))
             raise
 
+    async def wait_for_ack_watching_client(self, uid: int, request):
+        """``wait_for_ack``, but abort the generation when the client goes away.
+
+        Streaming responses already notice a disconnect, because yielding a chunk into a
+        dead socket is observable. A non-streaming request awaits the whole completion
+        and never looks, so a client that hangs up leaves the GPUs generating to
+        max_tokens for nobody -- and the queue behind it waiting on work whose answer
+        will be discarded.
+
+        ``request`` may be None for callers with no HTTP request in scope (offline,
+        internal); then this is exactly ``wait_for_ack``.
+        """
+        try:
+            async for ack in self.wait_for_ack(uid):
+                if request is not None and await request.is_disconnected():
+                    logger.info("Client disconnected for user %s; aborting", uid)
+                    raise asyncio.CancelledError
+                yield ack
+        except asyncio.CancelledError:
+            # create_task, not await: the caller is unwinding, and abort_user sleeps
+            # before it sends. Mirrors stream_with_cancellation.
+            asyncio.create_task(self.abort_user(uid))
+            raise
+
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
@@ -929,6 +953,23 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
+
+    # Before anything slow. Loading takes ~90s, and a log that opens part-way through it
+    # cannot answer what the run was configured as -- which is the first question asked
+    # of every one of these logs.
+    from freetoken.utils.banner import print_banner
+
+    # Every field via getattr: these kwargs are evaluated BEFORE print_banner's own
+    # try/except, so one wrong attribute name here takes the whole server down at
+    # startup. A banner must not be able to do that.
+    print_banner(
+        model_path=getattr(config, "model_path", None),
+        tp_size=getattr(getattr(config, "tp_info", None), "size", 1) or 1,
+        dspark=bool(getattr(config, "speculative_dspark", False)),
+        moe_backend=getattr(config, "moe_backend", None),
+        host=getattr(config, "server_host", None),
+        port=getattr(config, "server_port", None),
+    )
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)

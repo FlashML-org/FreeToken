@@ -16,6 +16,7 @@ three places and nothing else.
 from __future__ import annotations
 
 import glob
+import inspect
 import os
 import threading
 from dataclasses import dataclass, field
@@ -252,7 +253,7 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
-def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, prefetch=2) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
@@ -267,7 +268,8 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
 
         banks = load_dsfp4_expert_sources_parallel(
-            model_path, args, workers=workers, chunk=chunk, layer_sink=sink
+            model_path, args, workers=workers, chunk=chunk, prefetch=prefetch,
+            layer_sink=sink,
         )
     else:
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
@@ -304,7 +306,7 @@ _PROVIDERS = {
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, prefetch=2) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
@@ -313,8 +315,6 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
     materialize-and-write path (``ExpertBanks.streamed`` reports which happened)."""
     setup = _model_setup_override(model_config)
     if setup is not None:
-        import inspect
-
         params = inspect.signature(setup).parameters
         supports_parallel = "parallel" in params
         if parallel and not supports_parallel:
@@ -326,6 +326,8 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
         kw = dict(device=device, dtype=dtype, dummy=dummy)
         if supports_parallel:
             kw.update(parallel=parallel, workers=workers, chunk=chunk)
+        if "prefetch" in params:
+            kw["prefetch"] = prefetch
         if "decode_target" in params:
             kw["decode_target"] = decode_target
         if "layer_sink" in params and layer_sink is not None:
@@ -338,18 +340,23 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             f"no expert-bank provider for expert_quant={expert_quant!r} "
             f"(known: {sorted(_PROVIDERS)})"
         )
-    return _PROVIDERS[expert_quant](
+    provider = _PROVIDERS[expert_quant]
+    extra = {"prefetch": prefetch} if "prefetch" in inspect.signature(provider).parameters else {}
+    return provider(
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
+        layer_sink=layer_sink, **extra,
     )
 
 
-def _host_ram_fits_parallel(model_path: str) -> bool:
-    """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
-    extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
-    i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
+def _host_ram_fits_parallel(model_path: str, prefetch: int = 2) -> bool:
+    """Best-effort: can free host RAM hold banks plus the parallel read-ahead?
+
+    The consumer retains its current whole-shard buffer while the bounded queue
+    holds up to ``prefetch`` more, so transient residency is at most
+    ``(prefetch + 1) * largest_shard``. Unknown inputs conservatively keep the
+    fast path. Uses MemAvailable, which includes reclaimable page cache.
+    """
     avail = None
     try:
         with open("/proc/meminfo") as f:
@@ -370,7 +377,7 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
     sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))]
     if not sizes:
         return True
-    return avail > sum(sizes) + max(sizes)
+    return avail > sum(sizes) + (prefetch + 1) * max(sizes)
 
 
 def ftw_bank_bytes(model_path: str) -> int | None:
@@ -415,6 +422,7 @@ def load_expert_banks(
     parallel: bool | None = None,
     workers: int = 8,
     chunk: int = _PARALLEL_CHUNK,
+    prefetch: int = 2,
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
@@ -431,6 +439,7 @@ def load_expert_banks(
 
     ``parallel`` overrides the slow-path auto-pick: ``None`` = auto (production), ``True`` /
     ``False`` = force parallel / serial (used by the loader benchmark and the converter).
+    ``prefetch`` bounds whole shards queued ahead of placement by supporting parallel readers.
 
     ``layer_sink`` (the converter only): forwarded to whichever provider is picked; a
     provider only engages it (and reports ``ExpertBanks.streamed=True``) for its own
@@ -465,9 +474,9 @@ def load_expert_banks(
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
-        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
-        # bypass this by forcing ``parallel`` explicitly.)
-        if parallel and not _host_ram_fits_parallel(model_path):
+        # free RAM can't cover the banks + the bounded shard read-ahead. (--expert-load
+        # serial/parallel bypass this by forcing ``parallel`` explicitly.)
+        if parallel and not _host_ram_fits_parallel(model_path, prefetch):
             logger.warning_rank0(
                 "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
                 "override with --expert-load parallel)"
@@ -483,13 +492,13 @@ def load_expert_banks(
     with requested_residency(layer_residency) as residency_plan:
         try:
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                        decode_target, layer_sink)
+                                        decode_target, layer_sink, prefetch)
         except NotImplementedError as exc:
             if not parallel:
                 raise
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                        decode_target, layer_sink)
+                                        decode_target, layer_sink, prefetch)
     return _echo_residency(banks, layer_residency, residency_plan)
 
 

@@ -80,7 +80,7 @@ def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
     idx_b = _index_bytes(args)
 
     total = 0
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
+    for ratio in args.layer_compress_ratios:
         # Window tier exists on EVERY layer (all-sliding), scaled by swa_ratio.
         total += round(swa_ratio * P) * kv_b
         if ratio == 0:
@@ -107,7 +107,7 @@ def dsv4_kv_unit_bytes(args, P: int = 128) -> int:
     kv_b = _kv_bytes(args)
     idx_b = _index_bytes(args)
     per_page = P * _INT64_BYTES  # full_to_window map: one int64 slot per full token
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
+    for ratio in args.layer_compress_ratios:
         if ratio == 0:
             continue
         per_page += (P // ratio) * kv_b  # compressed KV
@@ -122,7 +122,7 @@ def dsv4_window_unit_bytes(args, P: int = 128) -> int:
     ``state_slots = n_win_pages * ring_size``). Independent of ``swa_ratio`` -- the ratio only sets
     how many window tokens exist, not the per-token cost. This is ``swa_bytes_per_token``."""
     kv_b = _kv_bytes(args)
-    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    ratios = args.layer_compress_ratios
     per_page = len(ratios) * P * kv_b  # window KV: P slots per page, every layer
     for ratio in ratios:
         if ratio == 0:
@@ -174,7 +174,7 @@ def dsv4_pool_sizes(
     state_slots: list[int | None] = []
     ring_sizes: list[int | None] = []
     idx_state_slots: list[int | None] = []
-    for ratio in tuple(args.compress_ratios)[: args.n_layers]:
+    for ratio in args.layer_compress_ratios:
         if ratio == 0:
             cmp_blocks.append(None)
             idx_blocks.append(None)
@@ -213,7 +213,7 @@ def dsv4_pool_bytes(sizes: DSV4PoolSizes, args, n_scratch: int = 1) -> int:
     +1 ring scratch row, +1 mapping sentinel row)."""
     kv_b = _kv_bytes(args)
     idx_b = _index_bytes(args)
-    ratios = tuple(args.compress_ratios)[: args.n_layers]
+    ratios = args.layer_compress_ratios
 
     total = len(ratios) * sizes.n_win_slots * kv_b  # window pool, every layer
     total += (sizes.full_token + 1) * _INT64_BYTES  # full_to_window (+ sentinel row)

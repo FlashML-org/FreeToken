@@ -29,6 +29,12 @@ class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     next_token: int
     finished: bool
+    # A speculative verify can accept several tokens in one engine step. Keep
+    # ``next_token`` as the final token for wire/backward compatibility, while
+    # carrying the complete ordered block here. This mirrors vLLM's
+    # EngineCoreOutput.new_token_ids contract and lets the detokenizer advance
+    # through the block exactly once.
+    token_ids: list[int] | None = None
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
     # and everything after it from the final output.

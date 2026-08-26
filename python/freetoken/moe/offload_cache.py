@@ -134,7 +134,6 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
-
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
@@ -827,8 +826,23 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch,
+            self._fetch_fraction_for(layer_id, expert_ids),
         )
+
+    def _fetch_fraction_for(self, layer_id: int, expert_ids: torch.Tensor) -> float:
+        """Return Equation 4's measured split, unchanged for every exact MoE layer.
+
+        FreeToken defines ``m`` as the number of missing experts in the current layer
+        and chooses ``q* = m * B_PCIe / B_Host``.  ``ensure_experts_hybrid`` already
+        deduplicates the routes of the whole token batch to obtain that ``m`` before it
+        applies this fraction.  Scaling the ratio again by the token count double-counts
+        the wider batch and can collapse a speculative verify into pure PCIe fetching.
+
+        ``layer_id`` and ``expert_ids`` remain arguments because the cache-control call
+        site has this interface; neither changes the hardware bandwidth ratio.
+        """
+        return self.hybrid_fetch_fraction
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
