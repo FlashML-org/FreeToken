@@ -411,8 +411,21 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            moe_stats=self._moe_stats_snapshot(),
         )
         self.send_result(reply)
+
+    def _moe_stats_snapshot(self) -> dict | None:
+        """Per-window MoE cache hit/miss stats for the decode log line, or None when
+        stats collection is off (the default). Reads device counters once per call;
+        the status reporter only calls this every decode_log_interval steps."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not getattr(cache, "collect_stats", False):
+            return None
+        try:
+            return cache.decode_miss_stats()
+        except Exception:
+            return None
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes

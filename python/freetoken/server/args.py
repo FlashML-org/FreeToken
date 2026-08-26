@@ -586,6 +586,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Capture MoE cache hit/miss counters into the decode graph and print them "
+            "in the decode log line (moe hit/miss/fetch/cpu). Off by default; the "
+            "device-side accumulation is captured into the CUDA graph."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",

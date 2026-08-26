@@ -7,7 +7,7 @@ import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
-    from freetoken.core import Batch
+    from freetoken.core import Batch, Req
 
 
 @dataclass
@@ -15,6 +15,36 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    # True when at least one request carries a presence/frequency penalty; the sampler
+    # then lowers each request's logits over its generated tokens before sampling.
+    apply_penalties: bool = False
+
+
+def apply_penalties(
+    logits: torch.Tensor,
+    reqs: List["Req"],
+) -> None:
+    """Apply OpenAI presence/frequency penalties to ``logits`` in place (row per req).
+
+    For a token ``t`` the request already generated, its score is lowered by
+    ``presence_penalty`` plus ``frequency_penalty * count(t)``. The prompt is excluded
+    (only ``input_ids[req.prompt_len:]`` counts), so the penalty grows with the
+    generation itself -- positive values push the model away from repeating itself,
+    which breaks reasoning loops; negative values nudge it toward repetition.
+    """
+    for i, req in enumerate(reqs):
+        sp = req.sampling_params
+        pp, fp = sp.presence_penalty, sp.frequency_penalty
+        if not pp and not fp:
+            continue
+        gen = req.input_ids[req.prompt_len :]
+        if gen.numel() == 0:
+            continue
+        uniq, counts = torch.unique(gen, return_counts=True)
+        vals = torch.full_like(counts, pp, dtype=torch.float32) + fp * counts.to(
+            torch.float32
+        )
+        logits[i, uniq.to(logits.device)] -= vals.to(logits.device)
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -57,7 +87,10 @@ class Sampler:
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
-        if all(p.is_greedy for p in params):
+        apply_penalties = any(
+            p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 for p in params
+        )
+        if all(p.is_greedy for p in params) and not apply_penalties:
             return BatchSamplingArgs(temperatures=None)
 
         MIN_P = MIN_T = 1e-6
@@ -70,11 +103,20 @@ class Sampler:
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p)
+        return BatchSamplingArgs(
+            temperatures,
+            top_k=top_k,
+            top_p=top_p,
+            apply_penalties=apply_penalties,
+        )
 
     @nvtx_annotate("Sampler")
-    def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
+    def sample(
+        self, logits: torch.Tensor, args: BatchSamplingArgs, batch: Batch
+    ) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.apply_penalties:
+                apply_penalties(logits, batch.reqs)
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)

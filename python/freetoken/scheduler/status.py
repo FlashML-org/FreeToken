@@ -34,6 +34,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        moe_stats: dict | None = None,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -55,6 +56,7 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                moe_stats=moe_stats,
             )
 
     def _report_prefill(
@@ -101,6 +103,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        moe_stats: dict | None = None,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
@@ -121,11 +124,30 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
+            f"{_moe_msg(moe_stats)}"
         )
 
 
 def _usage_ratio(used: int, total: int) -> float:
     return used / total if total > 0 else 0.0
+
+
+def _moe_msg(stats: dict | None) -> str:
+    """MoE cache hit/miss summary for the decode log line (empty when stats are off)."""
+    if not stats:
+        return ""
+    miss = stats.get("miss_rate")
+    fetch = stats.get("fetch_rate")
+    cpu = stats.get("cpu_per_layer")
+    hit = (1.0 - miss) if miss is not None else None
+    parts = [f"moe hit: {hit:.3f}" if hit is not None else "moe hit: n/a"]
+    if miss is not None:
+        parts.append(f"miss: {miss:.3f}")
+    if fetch is not None:
+        parts.append(f"fetch: {fetch:.3f}")
+    if cpu is not None:
+        parts.append(f"cpu: {cpu:.3f}")
+    return ", " + ", ".join(parts)
 
 
 def _mamba_msg(mamba_slots: tuple[int, int] | None) -> str:

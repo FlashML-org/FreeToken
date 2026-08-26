@@ -36,16 +36,50 @@ HOST="${FT_HOST:-127.0.0.1}"
 PORT="${FT_PORT:-1920}"
 ATNN="${FT_ATTN:-triton}"        # triton | torch
 MOE_BACKEND="${FT_MOE:-offload}" # offload required for K-quant experts
-# VS Code / Copilot injects a large chat context, so the KV cache must be bigger than
-# the tiny 8K the MoE-auto cache leaves. --num-tokens sizes the KV cache in tokens;
-# --moe-cache-size limits the GPU expert cache so KV has room (fewer slots = slower decode).
-# Hybrid arch: only 10/40 layers are full attention (2 kv heads x 256 dim) ->
-# ~20 KiB/token bf16, i.e. 128k ~= 2.7 GiB, full native 256k ~= 5.4 GiB.
+# radix = cross-request GDN-state prefix reuse (default); naive = no prefix reuse.
+# Suspect for long-context degradation: radix GDN-state reuse corrupting later requests.
+CACHE_TYPE="${FT_CACHE_TYPE:-radix}"
+# MoE cache hit/miss stats in the decode log line (--moe-collect-stats).
+MOE_STATS="${FT_MOE_STATS:-1}"
+# Disable the two-buffer prefill MoE overlap (diagnostic: race check).
+PREFILL_OVERLAP="${FT_PREFILL_OVERLAP:-1}"
+# MoE layers computed on the CPU executor (diagnostic: '0' = all-GPU, no CPU path).
+CPU_LAYERS="${FT_CPU_LAYERS:-}"
+# --num-tokens sizes the KV cache in tokens (hybrid arch: only 10/40 layers are full
+# attention, 2 kv heads x 256 dim -> ~20 KiB/token bf16; 128k ~= 2.7 GiB).
+# The GPU expert-slot cache is sized by FT_MOE_CACHE:
+#   auto    -> --moe-cache-auto: the engine derives slot bytes from the real expert
+#              tensors and fills all free VRAM AFTER reserving kv-reserve-tokens for KV.
+#              --kv-reserve-tokens MUST equal --num-tokens here: with an explicit
+#              --num-tokens the engine skips auto's own KV-half plan (num_page_override
+#              is set), so without a matching reservation greedy expert fill would eat
+#              VRAM the pinned KV still needs -> late CUDA OOM.
+#   <int>   -> fixed --moe-cache-size N slots (legacy behavior).
+# Headroom: the engine may use FT_MEMORY_RATIO of free VRAM for weights+KV+experts
+# combined (default here 0.80, upstream default 0.9). The remainder absorbs prefill
+# transients -- the MoE overlap double-buffer alone needs ~3.8 GiB at this model's
+# batch shapes; 0.9 left only ~2 GiB and OOM'd mid-prefill under VS Code payloads.
+MEMORY_RATIO="${FT_MEMORY_RATIO:-0.80}"
+# --max-prefill-length caps chunked-prefill chunk size (engine default 8192). The lm_head
+# materializes logits for EVERY chunk token: an 8192-token chunk spikes ~3.8 GiB
+# transiently -- enough to OOM on VS Code-sized prompts even with healthy headroom.
+# 4096 halves the spike; long prompts just prefill in more chunks.
+PREFILL_CHUNK="${FT_PREFILL_CHUNK:-4096}"
 KV_TOKENS="${FT_KV_TOKENS:-131072}"
-MOE_CACHE="${FT_MOE_CACHE:-2048}"
+# Default max output tokens for requests that omit max_tokens. The reasoning model
+# sometimes needs more room to finish its reasoning before answering; the engine
+# default is 32k. Copilot sends its own max_tokens, which we cannot override, but
+# other clients inherit this.
+MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
+MOE_CACHE="${FT_MOE_CACHE:-auto}"
 LOG="${FT_LOG:-/tmp/serve_qwen_moe.log}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Map FT_MOE_CACHE to argv. Only the auto path carries --kv-reserve-tokens:
+# with a fixed size the CLI already validates fit against the pinned KV.
+# NOTE: validation must run in THIS shell (no process substitution), or die()
+# would only exit a subshell and the launch would continue unvalidated.
 
 # Guard against the exact failure mode VS Code caused before: if this file ever
 # gets saved with CRLF endings, every argument silently grows a trailing \r.
@@ -70,19 +104,36 @@ start() {
     local -a SERVE_ARGS=(
         "--model" "$MODEL"
         "--moe-backend" "$MOE_BACKEND"
+        "--cache-type" "$CACHE_TYPE"
+        $( [ "$MOE_STATS" = 1 ] && echo "--moe-collect-stats" )
+        $( [ "$PREFILL_OVERLAP" = 0 ] && echo "--disable-moe-prefill-overlap" )
+        $( [ -n "$CPU_LAYERS" ] && echo "--moe-cpu-layers" "$CPU_LAYERS" )
         "--attention-backend" "$ATNN"
-        "--moe-cache-size" "$MOE_CACHE"
         "--num-tokens" "$KV_TOKENS"
+        "--memory-ratio" "$MEMORY_RATIO"
+        "--max-prefill-length" "$PREFILL_CHUNK"
+        "--max-output-tokens" "$MAX_OUTPUT"
         "--host" "$HOST"
         "--port" "$PORT"
     )
+    case "$MOE_CACHE" in
+        auto)
+            SERVE_ARGS+=("--moe-cache-auto" "--kv-reserve-tokens" "$KV_TOKENS")
+            ;;
+        ''|*[!0-9]*)
+            die "FT_MOE_CACHE='$MOE_CACHE' is invalid: use 'auto' or a slot count"
+            ;;
+        *)
+            SERVE_ARGS+=("--moe-cache-size" "$MOE_CACHE")
+            ;;
+    esac
 
     echo "Launching FreeToken server"
     echo "  model   : $MODEL"
     echo "  listen  : $HOST:$PORT"
     echo "  attn    : $ATNN"
     echo "  moe     : $MOE_BACKEND"
-    echo "  kv      : $KV_TOKENS tokens (gpu moe cache: $MOE_CACHE slots)"
+    echo "  kv      : $KV_TOKENS tokens (gpu moe cache: ${MOE_CACHE}${MOE_CACHE:+ }$( [ "$MOE_CACHE" = auto ] && echo "kv-reserve $KV_TOKENS" || echo slots))"
     echo "  python  : $PY"
     echo "  log     : $LOG"
 
@@ -141,6 +192,13 @@ status() {
         echo "RUNNING (pid $(echo "$pids" | tr '\n' ' ')) on $HOST:$PORT"
     else
         echo "NOT RUNNING"
+    fi
+    # Surface the auto-resolved expert-cache split so users don't have to read
+    # engine log lines; only present when FT_MOE_CACHE=auto booted the server.
+    if [ -f "$LOG" ]; then
+        local resolved
+        resolved="$(grep -o -- '--moe-cache-auto resolved moe_cache_size=[0-9]* num_pages=[0-9]*' "$LOG" | tail -1)"
+        [ -n "$resolved" ] && echo "moe cache: ${resolved//--moe-cache-auto resolved /}"
     fi
     [ -f "$LOG" ] && echo "--- last 5 log lines ($LOG) ---" && tail -5 "$LOG"
 }
