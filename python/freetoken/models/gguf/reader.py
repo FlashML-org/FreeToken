@@ -175,6 +175,19 @@ def gguf_tensor_names(model_path: str) -> set[str]:
     return {t.name for t in _reader(model_path).tensors}
 
 
+def gguf_tensor_type(model_path: str, name: str) -> int | None:
+    """The ggml quant type of one tensor, or ``None`` if the file has no such tensor.
+
+    Quant choices are per-tensor in GGUF and differ between publishers (e.g. Google's
+    QAT release stores ``token_embd.weight`` as Q6_K, Unsloth's as Q4_0), so layer
+    construction reads the type off the file instead of assuming one.
+    """
+    for t in _reader(model_path).tensors:
+        if t.name == name:
+            return int(t.tensor_type)
+    return None
+
+
 __all__ = [
     "is_gguf_path",
     "FTW_METADATA_GGUF",
@@ -186,4 +199,5 @@ __all__ = [
     "gguf_architecture",
     "iter_gguf_tensors",
     "gguf_tensor_names",
+    "gguf_tensor_type",
 ]
