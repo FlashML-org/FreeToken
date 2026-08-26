@@ -1650,6 +1650,13 @@ struct CpuMoeExecutor {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q6_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
     }
+    // Anything that reaches here is assumed NVFP4 and dereferences the scale/global
+    // pointers, which are null for formats that do not have them (the GGUF banks pass 0).
+    // Falling through with an unhandled format therefore segfaults inside the worker
+    // thread rather than reporting anything useful, so reject it here instead.
+    TORCH_CHECK(fmt == WF_NVFP4 || fmt == WF_DSFP4,
+                "cpu_moe gemm1_dot: unhandled weight_format ", fmt,
+                " (handled: bf16=0, nvfp4=1, mxfp4=2, dsfp4=3, q4_0=4, q4_k=5, q6_k=6)");
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),

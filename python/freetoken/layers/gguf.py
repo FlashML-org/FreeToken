@@ -280,7 +280,12 @@ class GGUFEmbedding(BaseOP):
 
         flat = x.flatten()
         rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
-        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+        if self._quant_type in GGML_UNQUANTIZED:
+            # Raw value bytes, not blocks: there is no dequant kernel for the unquantized
+            # types (ggml_dequantize rejects type 1), so reinterpret the gathered rows.
+            y = rows.view(_UNQUANTIZED_DTYPE[self._quant_type]).to(torch.bfloat16)
+        else:
+            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
