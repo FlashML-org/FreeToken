@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from freetoken.server.api_models import Tool
 from freetoken.server.function_call_parser import FunctionCallParser
+from freetoken.server.generation import GenSpec, _split_reasoning
 from freetoken.server.reasoning_parser import ReasoningParser
 
 TOOLS: list[Tool] = [
@@ -58,6 +60,30 @@ def test_poolside_v1_reasoning_stream_marker_can_split_across_chunks() -> None:
     content_parts.append(content)
     assert "".join(reasoning_parts) == "Need the file."
     assert "".join(content_parts) == "Answer."
+
+
+def _poolside_state() -> SimpleNamespace:
+    return SimpleNamespace(config=SimpleNamespace(reasoning_parser="poolside_v1"))
+
+
+def test_poolside_v1_default_generation_matches_implicit_open_template() -> None:
+    spec = GenSpec(messages=[], sampling_params=None)
+    reasoning, content = _split_reasoning(
+        "Need the file.</think>Answer.", spec, _poolside_state()
+    )
+    assert reasoning == "Need the file."
+    assert content == "Answer."
+
+
+def test_poolside_v1_explicit_thinking_disable_keeps_visible_content() -> None:
+    spec = GenSpec(
+        messages=[],
+        sampling_params=None,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    reasoning, content = _split_reasoning("Answer.", spec, _poolside_state())
+    assert reasoning == ""
+    assert content == "Answer."
 
 
 def test_poolside_v1_tool_non_stream_preserves_string_whitespace() -> None:
