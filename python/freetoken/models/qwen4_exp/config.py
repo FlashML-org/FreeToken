@@ -80,6 +80,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
     quant = hf_config.quantization_config
+    if not isinstance(quant, dict):
+        quant = quant.to_dict()
     block_size = tuple(int(value) for value in quant["weight_block_size"])
     if quant.get("quant_method") != "fp8" or block_size != (128, 128):
         raise ValueError("Qwen4-Exp currently requires the official 128x128 FP8 checkpoint")
@@ -100,7 +102,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         num_experts_per_tok=int(text.num_experts_per_tok),
         moe_intermediate_size=int(text.moe_intermediate_size),
         shared_expert_intermediate_size=int(text.shared_expert_intermediate_size),
-        norm_topk_prob=bool(text.norm_topk_prob),
+        norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         model_type=str(hf_config.model_type),
         architectures=list(hf_config.architectures),
         moe_enabled=True,

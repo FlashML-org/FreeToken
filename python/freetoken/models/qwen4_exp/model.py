@@ -25,7 +25,9 @@ from freetoken.layers import (
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
 from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
-from freetoken.utils import download_hf_weight, nvtx_annotate
+from freetoken.utils import download_hf_weight, init_logger, nvtx_annotate
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -173,16 +175,25 @@ def build_ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
-def _tokens_for_ngram_forward(req, current_ids: torch.Tensor) -> torch.Tensor:
+def _tokens_for_ngram_forward(
+    req,
+    current_ids: torch.Tensor,
+    *,
+    start: int = 0,
+) -> torch.Tensor:
     """Return request history through ``device_len`` without mutating the request.
 
     Under overlap scheduling the next decode starts before the previous sampled token is
     appended to ``req.input_ids``.  That token is already present in ``batch.input_ids``;
     splice only the missing suffix from there so PLE sees the same history in overlap and
-    non-overlap modes.
+    non-overlap modes. ``start`` lets decode retain only the short suffix needed by the
+    n-gram hash instead of copying and re-hashing the complete request on every token.
     """
+    if not 0 <= start <= req.device_len:
+        raise ValueError(f"Qwen4-Exp PLE history start {start} is outside [0, {req.device_len}]")
     host_len = min(req.input_ids.numel(), req.device_len)
-    tokens = req.input_ids[:host_len].to(dtype=torch.long, device="cpu")
+    host_start = min(start, host_len)
+    tokens = req.input_ids[host_start:host_len].to(dtype=torch.long, device="cpu")
     missing = req.device_len - host_len
     if missing:
         if missing > current_ids.numel():
@@ -190,8 +201,20 @@ def _tokens_for_ngram_forward(req, current_ids: torch.Tensor) -> torch.Tensor:
                 f"Qwen4-Exp PLE history is missing {missing} tokens, "
                 f"but the forward only carries {current_ids.numel()}"
             )
-        tokens = torch.cat([tokens, current_ids[-missing:].to(dtype=torch.long, device="cpu")])
+        inflight = current_ids[-missing:]
+        if start > host_len:
+            inflight = inflight[start - host_len :]
+        tokens = torch.cat([tokens, inflight.to(dtype=torch.long, device="cpu")])
     return tokens
+
+
+def _preload_ple_enabled() -> bool:
+    return os.getenv("FREETOKEN_QWEN4_PLE_PRELOAD", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class _HostNGramEmbedding(BaseOP):
@@ -258,10 +281,22 @@ class _HostNGramEmbedding(BaseOP):
             ).__enter__()
             handles[weight_map[scale_key]] = scale_handle
 
-        self._handles = list(handles.values())
+        preload = _preload_ple_enabled()
+        if preload:
+            total_gib = sum(shard.numel() * shard.element_size() for shard in shards) / (1 << 30)
+            logger.info_rank0(
+                f"Preloading {total_gib:.2f} GiB of Qwen4-Exp PLE into host RAM "
+                "(FREETOKEN_QWEN4_PLE_PRELOAD=1)"
+            )
+            shards = [shard.clone() for shard in shards]
+            logger.info_rank0("Qwen4-Exp PLE preload complete")
+        self._handles = [] if preload else list(handles.values())
         self._shards = shards
         self._shard_ends = torch.tensor([shard.shape[0] for shard in shards]).cumsum(0)
-        self._scale = scale_handle.get_tensor(scale_key).reshape(())
+        self._scale = scale_handle.get_tensor(scale_key).reshape(()).clone()
+        if preload:
+            for handle in handles.values():
+                handle.__exit__(None, None, None)
         self._host_constants = (
             self.layer_multipliers.cpu(),
             self.ngram_heads_vocab_sizes.cpu(),
@@ -286,12 +321,16 @@ class _HostNGramEmbedding(BaseOP):
         token_offset = 0
         for req in reqs:
             length = req.extend_len
-            tokens = req.input_ids
+            history_start = max(0, req.cached_len - (self.ngram_size - 1))
             if current_ids is not None:
                 tokens = _tokens_for_ngram_forward(
-                    req, current_ids[token_offset : token_offset + length]
+                    req,
+                    current_ids[token_offset : token_offset + length],
+                    start=history_start,
                 )
                 token_offset += length
+            else:
+                tokens = req.input_ids[history_start : req.device_len]
             all_ids = build_ngram_ids(
                 tokens,
                 ngram_size=self.ngram_size,
@@ -301,7 +340,11 @@ class _HostNGramEmbedding(BaseOP):
                 vocab_sizes=vocab_sizes,
                 offsets=offsets,
             )
-            pieces.append(all_ids[req.cached_len : req.device_len])
+            pieces.append(
+                all_ids[
+                    req.cached_len - history_start : req.device_len - history_start
+                ]
+            )
         if current_ids is not None and token_offset != current_ids.numel():
             raise RuntimeError(
                 f"Qwen4-Exp PLE consumed {token_offset} decode tokens, "

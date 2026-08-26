@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import torch
 
 from freetoken.models.qwen4_exp.config import parse_config
-from freetoken.models.qwen4_exp.model import _tokens_for_ngram_forward, build_ngram_ids
+from freetoken.models.qwen4_exp.model import (
+    _preload_ple_enabled,
+    _tokens_for_ngram_forward,
+    build_ngram_ids,
+)
 from freetoken.models.qwen4_exp.weight import _rename, _try_fuse
 from freetoken.models.register import get_model_spec
 
@@ -145,3 +149,42 @@ def test_ngram_history_does_not_duplicate_drained_token():
     tokens = _tokens_for_ngram_forward(req, torch.tensor([7], device="cpu"))
 
     assert tokens.tolist() == [4, 5, 6, 7]
+
+
+def test_ngram_history_can_select_only_required_suffix():
+    req = SimpleNamespace(input_ids=torch.tensor([4, 5, 6]), device_len=5)
+
+    tokens = _tokens_for_ngram_forward(
+        req,
+        torch.tensor([7, 8], device="cpu"),
+        start=2,
+    )
+
+    assert tokens.tolist() == [6, 7, 8]
+    assert _tokens_for_ngram_forward(req, torch.tensor([7, 8]), start=4).tolist() == [8]
+
+
+def test_incremental_ngram_hash_matches_full_history():
+    tokens = torch.tensor([10, 99, 4, 5, 6, 7])
+    kwargs = {
+        "ngram_size": 3,
+        "heads_per_ngram": 1,
+        "eos_token_id": 99,
+        "multipliers": torch.tensor([3, 5, 7]),
+        "vocab_sizes": torch.tensor([101, 103]),
+        "offsets": torch.tensor([0, 101]),
+    }
+
+    full = build_ngram_ids(tokens, **kwargs)
+    history_start = 3
+    incremental = build_ngram_ids(tokens[history_start:], **kwargs)
+
+    assert torch.equal(incremental[2], full[5])
+
+
+def test_qwen4_ple_preload_is_opt_in(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_QWEN4_PLE_PRELOAD", raising=False)
+    assert not _preload_ple_enabled()
+
+    monkeypatch.setenv("FREETOKEN_QWEN4_PLE_PRELOAD", "true")
+    assert _preload_ple_enabled()

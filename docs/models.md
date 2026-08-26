@@ -39,6 +39,11 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Multimodal checkpoints are served text-only.
+- Qwen3.8 Flash Next natively supports 262,144 tokens, but this integration
+  intentionally caps total sequence length at 2,048 tokens. Within that range,
+  dense causal attention is exactly equivalent to the checkpoint's QSA
+  selection because every visible token remains inside its 2,048-token budget.
+  Sparse QSA beyond that exact dense prefix is not implemented yet.
 - Qwen3.8 Flash Next requires an offload-family MoE backend. FreeToken
   automatically disables CUDA graphs and selects the naive cache because PLE
   performs host-side gathers and owns per-request convolution state. The FP8
