@@ -288,6 +288,34 @@ class FrontendManager:
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
 
+
+    def fail_pending_generations(self, message: str) -> None:
+        """Resolve every in-flight generation as failed (worker death): inject an error ack
+        so wait_for_ack yields it and handlers raise GenerationError instead of hanging
+        forever with the request slot leaked."""
+        loop = self._loop
+        if loop is None:
+            return  # listener never started -> no pending generations
+
+        def _resolve_all() -> None:
+            for uid in list(self.event_map):
+                self.ack_map[uid].append(
+                    UserReply(
+                        uid=uid,
+                        incremental_output="",
+                        finished=True,
+                        error=message,
+                        error_code="backend_died",
+                    )
+                )
+                self.event_map[uid].set()
+
+        try:
+            loop.call_soon_threadsafe(_resolve_all)
+        except RuntimeError:
+            # Loop already closed (shutdown racing the crash): nothing left to wake.
+            pass
+
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
         when a worker death latches a fatal error: no CacheRebuildReply will ever arrive, so a
@@ -996,6 +1024,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # Same for in-flight generations: without this the HTTP handlers wait forever on
+        # wait_for_ack (no timeout), leak their request slots, and every subsequent request
+        # is silently rejected. Inject an error ack so they finish with a clean error.
+        _GLOBAL_STATE.fail_pending_generations(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:
