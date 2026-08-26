@@ -164,6 +164,14 @@ def iter_weights(
         if isinstance(config.attention_group_for_layer(layer_id), FullAttentionGroupConfig)
         and config.attention_group_for_layer(layer_id).k_eq_v
     }
+    # E-series KV-shared layers carry only q_proj (no k/v). Their q_proj must NOT be merged
+    # into a fused qkv_proj (there is nothing to merge with) -- it loads as a standalone
+    # LinearReplicated. num_kv_shared_layers == 0 leaves this empty (no behavior change).
+    kv_shared_layers = {
+        layer_id
+        for layer_id in range(config.num_layers)
+        if config.is_kv_shared_layer(layer_id)
+    }
     merge_buf: dict[str, dict[str, torch.Tensor]] = {}
     gateup_buf: dict[str, dict[str, tuple]] = {}
     for file in tqdm(
@@ -212,10 +220,37 @@ def iter_weights(
                     )
                     continue
 
+                # E-series per-layer-embedding table (~4.7 GB) is kept in host RAM: load it
+                # straight to CPU so it never transiently allocates VRAM (the engine's
+                # cpu_offloaded_weight_keys keeps it there; the model gathers on the host).
+                if name.endswith("embed_tokens_per_layer.weight"):
+                    with safetensors.safe_open(file, framework="pt", device="cpu") as fcpu:
+                        yield name, fcpu.get_tensor(raw_name)
+                    continue
+
+                # E-series KV-shared layers: the checkpoint still ships k/v proj + k_norm for
+                # these layers, but the model reuses another layer's K/V and has no such
+                # weights -> drop them (and yield q_proj standalone, below).
+                if kv_shared_layers and ".self_attn." in name:
+                    lm = _LAYER_INDEX_PATTERN.search(name)
+                    if lm is not None and int(lm.group(1)) in kv_shared_layers and (
+                        ".self_attn.k_proj" in name
+                        or ".self_attn.v_proj" in name
+                        or ".self_attn.k_norm" in name
+                    ):
+                        continue
+
                 tensor = f.get_tensor(raw_name)
                 if is_vision or is_expert:
                     yield name, tensor
                     continue
+
+                # KV-shared layers: q_proj is standalone (no k/v to fuse with).
+                if kv_shared_layers and ".self_attn.q_proj" in name:
+                    lm = _LAYER_INDEX_PATTERN.search(name)
+                    if lm is not None and int(lm.group(1)) in kv_shared_layers:
+                        yield name, tensor
+                        continue
 
                 info = merge_info(name)
                 if info is None:

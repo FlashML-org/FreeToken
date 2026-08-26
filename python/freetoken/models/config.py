@@ -269,10 +269,27 @@ class ModelConfig:
     output_multiplier: float | None = None
     vision_config: Any | None = None
     image_token_id: int | None = None
+    # ----- Gemma-4 E-series (PLE) extensions (default keeps other models intact) -----
+    # Per-Layer Embeddings: an auxiliary embedding + per-layer projection that injects a
+    # token/context-dependent residual into every decoder layer (Gemma-4 E2B/E4B). 0 = off.
+    per_layer_hidden_size: int = 0
+    per_layer_vocab_size: int = 0
+    # KV-layer sharing: the last ``num_kv_shared_layers`` layers carry no K/V projections and
+    # reuse the K/V states of the last non-shared layer of the same attention type. 0 = off.
+    num_kv_shared_layers: int = 0
+    # Double-wide MLP: KV-shared layers use 2x intermediate_size (E2B). Applies only to the
+    # KV-shared layers, mirroring transformers' Gemma4TextMLP.
+    use_double_wide_mlp: bool = False
     attention_groups: Tuple[AttentionGroupConfig, ...] = ()
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # Native-GGUF dense projections: {freetoken_module_base -> ggml_type} for every packed
+    # weight (attention q/k/v/o, MLP gate/up/down, token embedding). Unlike gemma4's pure
+    # Q4_0 GGUFs, a q4_K_M checkpoint mixes per-tensor K-quant types (Q4_K projections with
+    # Q6_K on some attn_v/ffn_down), so the module-swap can't hardcode one type -- it reads
+    # each tensor's type from here. Set by a GGUF parse_config; None for safetensors models.
+    gguf_quant_types: dict[str, int] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
@@ -365,6 +382,33 @@ class ModelConfig:
 
     def is_swa_layer(self, layer_id: int) -> bool:
         return isinstance(self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig)
+
+    def first_kv_shared_layer_idx(self) -> int:
+        """First layer index in the KV-shared tail (Gemma-4 E-series). Equals num_layers
+        (i.e. no shared layers) when num_kv_shared_layers == 0."""
+        if self.num_kv_shared_layers <= 0:
+            return self.num_layers
+        return self.num_layers - self.num_kv_shared_layers
+
+    def is_kv_shared_layer(self, layer_id: int) -> bool:
+        """True for E-series layers that carry no K/V projections and reuse another
+        layer's K/V states (the last ``num_kv_shared_layers`` layers)."""
+        return self.num_kv_shared_layers > 0 and layer_id >= self.first_kv_shared_layer_idx()
+
+    def is_kv_source_layer(self, layer_id: int) -> bool:
+        """True for the last non-shared layer of each attention type -- the layer whose
+        K/V the shared layers of that type reuse. No-op unless KV sharing is enabled."""
+        if self.num_kv_shared_layers <= 0:
+            return False
+        first_shared = self.first_kv_shared_layer_idx()
+        if layer_id >= first_shared:
+            return False
+        my_name = self.attention_group_for_layer(layer_id).name
+        # source == the highest-index non-shared layer sharing this layer's group name
+        for other in range(first_shared - 1, layer_id, -1):
+            if self.attention_group_for_layer(other).name == my_name:
+                return False
+        return True
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return isinstance(

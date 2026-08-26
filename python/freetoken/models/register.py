@@ -21,6 +21,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.llama",
         "LlamaForCausalLM",
     ),
+    # GGUF (native Q4_K/Q6_K) dense llama: same model classes, GGUF config + weight loaders.
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "Qwen2ForCausalLM": ModelSpec(
         "freetoken.models.qwen2",
         "Qwen2ForCausalLM",

@@ -180,6 +180,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         embedding_scale=float(cfg.hidden_size) ** 0.5,
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
+        # Gemma-4 E-series (E2B/E4B): Per-Layer Embeddings + KV-layer sharing + double-wide MLP.
+        # These keys are absent on the dense/MoE Gemma-4 line, so getattr defaults keep it off.
+        per_layer_hidden_size=int(getattr(cfg, "hidden_size_per_layer_input", 0) or 0),
+        per_layer_vocab_size=int(getattr(cfg, "vocab_size_per_layer_input", 0) or 0),
+        num_kv_shared_layers=int(getattr(cfg, "num_kv_shared_layers", 0) or 0),
+        use_double_wide_mlp=bool(getattr(cfg, "use_double_wide_mlp", False)),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",

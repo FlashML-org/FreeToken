@@ -273,14 +273,19 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    cpu_offload_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
+        # A model may keep specific (large, rarely-touched) weights in host RAM -- e.g. the
+        # Gemma-4 E-series per-layer-embedding table (~4.7 GB). Those stay on CPU so they never
+        # consume VRAM; the model's forward gathers from them on the host.
+        dst = torch.device("cpu") if key in cpu_offload_keys else device
         expected = model_state.get(key)
         if expected is None:
-            state_dict[key] = weight.to(device=device)
+            state_dict[key] = weight.to(device=dst)
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            state_dict[key] = weight.to(device=dst, dtype=expected.dtype)
     return state_dict
 
 
@@ -304,6 +309,8 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        # Paged KV storage dtype (may be fp8 via --kv-dtype); queries/activations stay self.dtype.
+        self.kv_dtype = config.resolved_kv_dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
@@ -347,7 +354,7 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=self.kv_dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -381,6 +388,9 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
+        # Query/activation dtype for attention (the fp8-KV path needs it distinct from the KV
+        # storage dtype); backends read it off the global context in their constructors.
+        self.ctx.compute_dtype = self.dtype
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
@@ -407,13 +417,25 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # A model may forbid CUDA graphs when its forward does a host-side gather that capture
+        # cannot record (e.g. Gemma-4 E-series with FREETOKEN_GEMMA4_PLE_CPU=1). Force graphs
+        # off rather than crashing during capture on the default flags.
+        graph_bs = config.cuda_graph_bs
+        graph_max_bs = config.cuda_graph_max_bs
+        if not getattr(self.model, "supports_cuda_graph", True) and graph_max_bs != 0:
+            logger.info_rank0(
+                "CUDA graphs disabled: the model's forward uses a host-resident weight "
+                "gather that graph capture cannot record."
+            )
+            # Mirror `--cuda-graph-max-bs 0` (bs=None so _determine_cuda_graph_bs yields []).
+            graph_bs, graph_max_bs = None, 0
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=graph_bs,
+            cuda_graph_max_bs=graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -458,6 +480,9 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
+        cpu_offload_keys = frozenset(
+            getattr(self.model, "cpu_offloaded_weight_keys", lambda: ())()
+        )
         return _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
@@ -466,6 +491,7 @@ class Engine:
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
             ),
             device=self.device,
+            cpu_offload_keys=cpu_offload_keys,
         )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:

@@ -114,21 +114,39 @@ class Gemma4DenseMLP(BaseOP):
     ``post_feedforward_layernorm.``) resolves the dense checkpoint unchanged. The gated
     MLP is bf16, or W4A16 NVFP4 when the checkpoint quantizes the dense MLP."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        intermediate_size: int | None = None,
+        apply_scalar: bool = True,
+    ):
+        # E-series double-wide MLP (KV-shared layers): 2x intermediate. `apply_scalar=False`
+        # lets the decoder run the Per-Layer-Embedding step before the per-layer scale.
+        if intermediate_size is not None and intermediate_size != config.intermediate_size:
+            import dataclasses
+
+            mlp_cfg = dataclasses.replace(config, intermediate_size=intermediate_size)
+        else:
+            mlp_cfg = config
         self.shared_mlp = (
-            _Nvfp4GatedMLP(config)
+            _Nvfp4GatedMLP(mlp_cfg)
             if getattr(config, "dense_quant", "none") == "nvfp4"
-            else GatedMLP(config)
+            else GatedMLP(mlp_cfg)
         )
         self.post_feedforward_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_scalar = torch.empty(1)
+        self._apply_scalar = apply_scalar
 
     def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         h = self.shared_mlp.forward(pre_ff)
         h = self.post_feedforward_layernorm.forward(h)
-        return (x + h) * self.layer_scalar
+        out = x + h
+        if self._apply_scalar:
+            out = out * self.layer_scalar
+        return out
 
 
 __all__ = [

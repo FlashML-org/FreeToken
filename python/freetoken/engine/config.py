@@ -58,6 +58,11 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    # KV-cache storage dtype (--kv-dtype). None -> use the model/activation ``dtype`` (bf16).
+    # fp8 (e4m3/e5m2) halves KV bytes/token, ~doubling the token budget that fits in memory,
+    # at some attention precision cost. Read via ``resolved_kv_dtype``; only the paged MHA/SWA
+    # KV slabs switch dtype -- queries stay in ``dtype`` and the fp8 kernels dequantize on read.
+    kv_dtype: torch.dtype | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -90,6 +95,12 @@ class EngineConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
         return parse_config(self.hf_config)
+
+    @property
+    def resolved_kv_dtype(self) -> torch.dtype:
+        """Storage dtype for the paged KV cache: the explicit ``--kv-dtype`` if set, else the
+        model dtype. Queries always stay in ``dtype``; this only sizes/quantizes the KV slabs."""
+        return self.kv_dtype if self.kv_dtype is not None else self.dtype
 
     @property
     def max_seq_len(self) -> int:

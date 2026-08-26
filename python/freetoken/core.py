@@ -173,6 +173,9 @@ class Context:
     moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
+    # Query/activation dtype (bf16). Distinct from kv_cache.dtype under fp8 KV; the engine
+    # sets it before building the attention backend, which reads it for plan()'s q_data_type.
+    compute_dtype: torch.dtype = field(init=False, default=torch.bfloat16)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
