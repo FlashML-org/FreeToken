@@ -233,3 +233,7 @@ benchmarks/cross_framework
 python/freetoken/kernel/csrc/gguf/*.hip
 python/freetoken/kernel/csrc/gguf/*_hip.cuh
 python/freetoken/kernel/csrc/gguf/ggml-common_hip.h
+
+# local session junk
+nohup.out
+.plans/

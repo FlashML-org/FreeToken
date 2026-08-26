@@ -1,0 +1,19 @@
+{
+    // Prevent VS Code from re-introducing CRLF endings into the serve script —
+    // CRLF was what broke the backslash-newline continuations before.
+    "files.eol": "\n",
+    "files.associations": {
+        "*.sh": "shellscript"
+    },
+    "[shellscript]": {
+        "files.eol": "\n",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": false
+    },
+    "terminal.integrated.env.linux": {
+        "PYTHONPATH": "${workspaceFolder}/python"
+    },
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv-rocm/bin/python",
+    "python.testing.pytestEnabled": true,
+    "python.testing.pytestArgs": ["tests"]
+}
