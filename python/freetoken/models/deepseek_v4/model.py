@@ -223,6 +223,20 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._transformer = Transformer(self._args)
         self._bound = False
 
+        # A GGUF checkpoint carries native block-quantized weights, so the dense/fp8
+        # projections have to be swapped for GGUF ops before load_state_dict runs -- that
+        # walks named_parameters() and demands a key for every one, so an unswapped
+        # fp8 Linear asks for a .scale no GGUF tensor can fill. Mirrors gemma4/model.py
+        # and qwen3_5_moe/model.py.
+        from .gguf import convert_deepseek4_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            assert config.gguf_model_path is not None, (
+                "expert_quant=='gguf' but ModelConfig.gguf_model_path is unset; the "
+                "per-tensor ggml types can only be read from the file"
+            )
+            convert_deepseek4_to_gguf(self, config, model_path=config.gguf_model_path)
+
     def _ensure_bound(self) -> None:
         if self._bound:
             return

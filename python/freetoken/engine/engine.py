@@ -10,7 +10,6 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -295,11 +294,10 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
-
-        from freetoken.gpu_select import bind_assigned_gpu
-
-        self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+
+        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -611,6 +609,7 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
+                gguf_expert_types=banks.gguf_expert_types,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
@@ -651,10 +650,8 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
+        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
+        fraction = load_hybrid_fetch_fraction(cache.quant_format, gpu_name=gpu_name)
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -997,14 +994,6 @@ class Engine:
         destroy_distributed()
 
 
-def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
-    """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
-    if not torch.cuda.is_available():
-        return None, None
-    ident = gpu_identity(torch.cuda.current_device() if index is None else index)
-    return ident["name"], ident["uuid"]
-
-
 def _ensure_expandable_segments() -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -1155,6 +1144,21 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt == "gguf":
+        # "gguf" is a container tag, not a layout: the checkpoint picks a ggml type per
+        # tensor and the concrete CPU format has to be recovered from the bank types.
+        # Testing the tag against _WFMT_IDS answers False for EVERY GGUF checkpoint, which
+        # silently disables the automatic residency split on hosts where CUDA pinning is
+        # quota-capped (WSL caps it near half of RAM). The symptom is not a clear refusal
+        # but cudaHostRegister failing partway through the banks.
+        from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+
+        types = getattr(model_config, "gguf_expert_types", None)
+        if not types:
+            return False
+        gate_up, down = int(types[0]), int(types[1])
+        # one weight_format serves both banks, so mixed types cannot run on the CPU path
+        return gate_up == down and gate_up in _GGML_TO_CPU_FMT
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
@@ -1370,8 +1374,8 @@ def _adjust_config(config: EngineConfig):
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
         from freetoken.moe.bench_profile import load_backend_recommendation
 
-        gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")

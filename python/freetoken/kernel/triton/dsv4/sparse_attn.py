@@ -39,11 +39,82 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_H = 16
+_BLOCK_H_LARGE, _BLOCK_H_SMALL = 16, 8
+BLOCK_H = _BLOCK_H_LARGE
 # The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
 # a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
 # consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)
-BLOCK_T = 32
+#
+# 32 does NOT fit every card. Turing (sm_75) caps shared memory at 64KB per block, and the
+# same launch there reports Required: 100416 -- the tile scales with the head dim, which is
+# 512 on DeepSeek-V4, so the figure above is not a universal constant. Halving the KV tile
+# halves the staged bytes and costs iterations, not correctness.
+_BLOCK_T_LARGE, _BLOCK_T_SMALL = 32, 16
+
+
+def _tile_plan(device_index: int | None = None, head_dim: int = 512) -> tuple[int, int, int]:
+    """(BLOCK_H, BLOCK_T, num_stages) that fit this device's opt-in shared memory.
+
+    The dominant cost is NOT the KV tile: the kernel holds q and acc as [BLOCK_H, D] in
+    fp32, which at BLOCK_H=16 and head_dim 512 is 16*512*4*2 = 65536 B on its own -- exactly
+    a Turing block's entire budget, before a single KV byte. That is why shrinking BLOCK_T
+    alone leaves the requirement stuck at 66624. BLOCK_H is what has to come down on a 64KB
+    card; halving it costs head-parallelism, not correctness.
+    """
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        optin = int(getattr(props, "shared_memory_per_block_optin", 0))
+    except Exception:
+        optin = 0
+
+    if optin >= 102400:
+        return _BLOCK_H_LARGE, _BLOCK_T_LARGE, 2
+
+    # fp32 q + acc, the fixed floor, then the staged KV tile on top
+    for block_h in (_BLOCK_H_LARGE, _BLOCK_H_SMALL):
+        for block_t, stages in ((_BLOCK_T_LARGE, 2), (_BLOCK_T_SMALL, 2), (_BLOCK_T_SMALL, 1)):
+            need = 2 * block_h * head_dim * 4 + stages * block_t * head_dim * 2
+            if need <= optin:
+                return block_h, block_t, stages
+    return _BLOCK_H_SMALL, _BLOCK_T_SMALL, 1
+
+
+def _unused_block_t(device_index: int | None = None) -> int:
+    """(BLOCK_T, num_stages) that fit this device's opt-in shared memory.
+
+    num_stages=2 double-buffers the KV tile, so it roughly doubles the staged bytes. On a
+    64KB card the small tile alone still lands at 66624 B -- about 1KB over -- so the tight
+    path also drops to a single stage. That costs pipelining, not correctness, and is a
+    smaller loss than halving the tile again to BLOCK_T=8.
+    """
+    block_t = _block_t(device_index)
+    if block_t == _BLOCK_T_LARGE:
+        return block_t, 2
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        optin = int(getattr(props, "shared_memory_per_block_optin", 0))
+    except Exception:
+        optin = 0
+    return block_t, (2 if optin >= 98304 else 1)
+
+
+def _block_t(device_index: int | None = None) -> int:
+    """KV tile width that fits this device's opt-in shared memory.
+
+    Queried per device rather than hardcoded: the budget is 64KB on sm_75, ~99KB on sm_89
+    and sm_120, and ~164KB on sm_80/sm_90. Falling back to the small tile when the budget
+    is unknown is the safe direction -- a tile that does not fit fails the launch outright.
+    """
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+    except Exception:
+        return _BLOCK_T_SMALL
+    optin = int(getattr(props, "shared_memory_per_block_optin", 0))
+    # measured requirement at BLOCK_T=32 with head_dim 512; leave the margin triton needs
+    return _BLOCK_T_LARGE if optin >= 102400 else _BLOCK_T_SMALL
+
+
+BLOCK_T = _BLOCK_T_LARGE
 MAX_SPLITS = 32
 MIN_TILES_PER_SPLIT = 4
 
@@ -330,7 +401,8 @@ def sparse_attn_paged(
             n_splits,
         )
 
-    grid = (m, b, triton.cdiv(h, BLOCK_H))
+    block_h, block_t, n_stages = _tile_plan(q.device.index, d)
+    grid = (m, b, triton.cdiv(h, block_h))
     _sparse_attn_paged_kernel[grid](
         q, window_pool, cmp_pool, o, sink, idx, cnt,
         float(softmax_scale),
@@ -342,11 +414,11 @@ def sparse_attn_paged(
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
-        BLOCK_H=BLOCK_H,
-        BLOCK_T=BLOCK_T,
+        BLOCK_H=block_h,
+        BLOCK_T=block_t,
         HAS_COUNTS=has_counts,
         num_warps=8,
-        num_stages=2,
+        num_stages=n_stages,
     )
     return o
 
@@ -355,7 +427,8 @@ def _sparse_attn_paged_splitk(
     q, window_pool, cmp_pool, sink, idx, cnt, o,
     b, m, h, d, topk, n_window, softmax_scale, has_counts, stride_nb, stride_nm, n_splits,
 ):
-    head_blocks = triton.cdiv(h, BLOCK_H)
+    block_h, block_t, n_stages = _tile_plan(q.device.index, d)
+    head_blocks = triton.cdiv(h, block_h)
     mid_o = torch.empty((b, m, h, n_splits, d), dtype=torch.float32, device=q.device)
     mid_lse = torch.empty((b, m, h, n_splits), dtype=torch.float32, device=q.device)
 
@@ -371,12 +444,12 @@ def _sparse_attn_paged_splitk(
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
-        BLOCK_H=BLOCK_H,
-        BLOCK_T=BLOCK_T,
+        BLOCK_H=block_h,
+        BLOCK_T=block_t,
         HAS_COUNTS=has_counts,
         NUM_SPLITS=n_splits,
         num_warps=8,
-        num_stages=2,
+        num_stages=n_stages,
     )
     _sparse_attn_splitk_merge_kernel[(m, b, h)](
         mid_o, mid_lse, o, sink,
