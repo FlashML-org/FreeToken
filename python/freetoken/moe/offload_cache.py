@@ -1162,6 +1162,7 @@ class OffloadMoeCache:
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
             transferred_by_layer = self.stat_fetched_layer.tolist()
+            fetched = int(self.stat_fetched.item())
         else:
             if self._geometry_pools:
                 lru_stats = torch.stack(
@@ -1178,7 +1179,7 @@ class OffloadMoeCache:
                 ]
             else:
                 transferred_by_layer = [0] * self.num_layers
-        fetched = int(self.stat_fetched.item())
+            fetched = sum(transferred_by_layer)
         bytes_h2d = 0
         if self.bank_sources:
             payload_bytes_by_layer = [
@@ -1225,6 +1226,7 @@ class OffloadMoeCache:
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
+            fetched = self.stat_fetched_layer.tolist()
         else:
             lru_stats = self.lru_stats
             if self._geometry_pools:
@@ -1233,7 +1235,15 @@ class OffloadMoeCache:
                 ).sum(0)
             cols = lru_stats.t().tolist()
             active, missing, steps = cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.CALLS]
-        fetched = self.stat_fetched_layer.tolist()
+            if self.decode_target == "gpu":
+                fetched = missing
+            elif self.decode_target == "cpu":
+                fetched = [
+                    0 if layer_id in self.cpu_layer_ids else rows
+                    for layer_id, rows in enumerate(missing)
+                ]
+            else:
+                fetched = [0] * self.num_layers
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]

@@ -263,8 +263,12 @@ def test_geometry_decode_routes_lru_and_copies_into_selected_pool():
     assert stats["hit_rows"] == 0
     assert stats["bytes_h2d"] == (32 + 16) + (64 + 32)
     assert stats["miss_rate"] == 1.0
+    assert stats["fetched_per_layer"] == 1.0
+    assert stats["cpu_per_layer"] == 0.0
+    assert stats["fetch_rate"] == 1.0
     per_layer = cache.decode_miss_stats_per_layer()["per_layer"]
     assert [entry["steps"] for entry in per_layer] == [1, 1]
+    assert [entry["fetched_per_step"] for entry in per_layer] == [1.0, 1.0]
 
     cache.materialize_layer(1)
     cache.copy_missing()
@@ -306,13 +310,21 @@ def test_decode_stats_count_gpu_transfers_in_mixed_cpu_mode():
     cache.lru_stats[0, Stat.ACTIVE] = 2
     cache.lru_stats[0, Stat.MISS] = 1
     cache.lru_stats[0, Stat.CALLS] = 1
+    cache.lru_stats[1, Stat.ACTIVE] = 3
+    cache.lru_stats[1, Stat.MISS] = 2
+    cache.lru_stats[1, Stat.CALLS] = 1
 
     stats = cache.decode_miss_stats()
 
-    assert stats["requested_rows"] == 2
-    assert stats["miss_rows"] == 1
-    assert stats["hit_rows"] == 1
+    assert stats["requested_rows"] == 5
+    assert stats["miss_rows"] == 3
+    assert stats["hit_rows"] == 2
     assert stats["bytes_h2d"] == (6 + 4) * 2
+    assert stats["fetched_per_layer"] == 0.5
+    assert stats["cpu_per_layer"] == 1.0
+    assert stats["fetch_rate"] == pytest.approx(1 / 3)
+    per_layer = cache.decode_miss_stats_per_layer()["per_layer"]
+    assert [entry["fetched_per_step"] for entry in per_layer] == [1.0, 0.0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
