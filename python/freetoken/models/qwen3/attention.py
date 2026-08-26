@@ -7,6 +7,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, LinearOProj, LinearQKVMerged, RMSNorm
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
+from . import probe_state as _ps
 
 if TYPE_CHECKING:
     import torch
@@ -71,7 +72,15 @@ class Qwen3Attention(BaseOP):
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+        if _ps.PROBE_LAYERS and _ps.CURRENT_POSITIONS is not None and _ps.CURRENT_PHASE == "prefill":
+            _ps.record_pre_rope(_ps.CURRENT_POSITIONS, q.detach().float().cpu().numpy(), k.detach().float().cpu().numpy())
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        if _ps.PROBE_LAYERS and _ps.CURRENT_PHASE == "prefill":
+            _ps.record_attn_positions(ctx.batch.positions, _ps.CURRENT_PHASE)
+        if _ps.PROBE_LAYERS and _ps.CURRENT_POSITIONS is not None and _ps.CURRENT_PHASE == "prefill":
+            qn = q.detach().float().cpu().numpy()  # (seq, NQ*head_dim)
+            kn = k.detach().float().cpu().numpy()  # (seq, NK*head_dim)
+            _ps.record_rope(_ps.CURRENT_POSITIONS, qn, kn)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self.o_proj.forward(o.view(-1, self.qo_attn_dim))

@@ -4,7 +4,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, NamedTuple, Optional, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -15,7 +15,14 @@ from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+# offload_cache pulls in flashlib (triton-dependent) at module load; only import
+# it when the offload MoE backend is actually selected (GPU path). CPU-only
+# serves use --moe-backend cpu and never touch it. OR-switch friendly.
+try:
+    from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+except Exception:  # pragma: no cover - flashlib/triton absent on CPU-only build
+    OffloadMoeCache = None  # type: ignore
+    attach_offload_moe_cache = None  # type: ignore
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -135,7 +142,10 @@ def _resolve_auto_attention_backend(
             ("trtllm", is_sm100_family()),
             ("fa,fi", is_sm90_family()),
             ("fi", True),
-            ("triton", True),
+            # triton is the CUDA default; skip it when there is no CUDA device so the
+            # CPU-only ``torch`` backend (pure-torch SDPA) is selected instead.
+            ("triton", torch.cuda.is_available()),
+            ("torch", not torch.cuda.is_available()),
         ]
     for name, arch_ok in candidates:
         if not arch_ok:
@@ -176,7 +186,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
+                for name in ("fa", "fi", "trtllm", "triton", "torch", "dsa", "dsv4_sparse", "m3_sparse")
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -287,7 +297,7 @@ def _materialize_loaded_weight_state_dict(
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
+    copy_done_event: Optional[torch.cuda.Event]
 
 
 class Engine:
@@ -296,13 +306,19 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
-        from freetoken.gpu_select import bind_assigned_gpu
-
-        self.device = bind_assigned_gpu(config.tp_info.rank)
+        # --- OR-switch device resolution (cpu-device branch) -------------------
+        # Prefer CUDA, fall back to CPU so the engine boots on GPU-less hardware.
+        # Resolves the upstream main change (bind_assigned_gpu) which hard-requires CUDA.
+        from freetoken.engine.device_switch import resolve_device, make_stream, guard_cuda
+        self.device = resolve_device(config.tp_info.rank)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        self.stream = make_stream(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.set_stream(self.stream)
+        self._backend_tag = guard_cuda()
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -706,9 +722,10 @@ class Engine:
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
@@ -854,7 +871,8 @@ class Engine:
             ),
         )
 
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
         # off free memory, which is far smaller now that the caches are resident (post-cache
         # free << startup pre-load free), so re-deriving it here would silently drop large
@@ -867,7 +885,8 @@ class Engine:
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
-        self.graph_runner.destroy_cuda_graphs()
+        if torch.cuda.is_available():
+            self.graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -913,7 +932,8 @@ class Engine:
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
+        if torch.cuda.is_available():
+            assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -930,8 +950,11 @@ class Engine:
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
+        if torch.cuda.is_available():
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+        else:
+            copy_done_event = None
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
@@ -955,9 +978,13 @@ class Engine:
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
-        started = torch.cuda.Event(enable_timing=True)
-        ended = torch.cuda.Event(enable_timing=True)
-        started.record(self.stream)
+        if torch.cuda.is_available():
+            started = torch.cuda.Event(enable_timing=True)
+            ended = torch.cuda.Event(enable_timing=True)
+        else:
+            started = ended = None
+        if torch.cuda.is_available() and started is not None:
+            started.record(self.stream)
         try:
             for length in warmup_lens:
                 dummy_row[:length] = torch.arange(
@@ -985,14 +1012,17 @@ class Engine:
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
         ended.record(self.stream)
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        elapsed = (started.elapsed_time(ended) / 1000.0) if torch.cuda.is_available() else 0.0
         logger.info_rank0(
             f"Prefill warmup complete for lengths {warmup_lens} "
-            f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
+            f"in {elapsed:.3f} s"
         )
 
     def shutdown(self) -> None:
-        self.graph_runner.destroy_cuda_graphs()
+        if torch.cuda.is_available():
+            self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1024,7 +1054,8 @@ def _ensure_expandable_segments() -> None:
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        if torch.cuda.is_available():
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return

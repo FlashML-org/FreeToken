@@ -84,6 +84,19 @@ def create_fa_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "torch",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
+        consumes_attn_spec=True,
+    ),
+)
+def create_torch_cpu_backend(config: ModelConfig):
+    from .torch_cpu import TorchCPUAttentionBackend
+
+    return TorchCPUAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "triton",
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),

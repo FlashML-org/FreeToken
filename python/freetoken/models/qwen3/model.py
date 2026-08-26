@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -13,6 +14,9 @@ from .attention import Qwen3Attention as Qwen3Attn
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+from . import probe_state as _ps
 
 
 class Qwen3DecoderLayer(BaseOP):
@@ -35,6 +39,8 @@ class Qwen3DecoderLayer(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
+        if _ps.PROBE_LAYERS and _ps.CURRENT_POSITIONS is not None:
+            _ps.record_layer(self._layer_id, _ps.CURRENT_POSITIONS, x)
         x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
         x = self.mlp.forward(x)
@@ -56,10 +62,29 @@ class Qwen3Model(BaseOP):
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        positions = getattr(batch, "positions", None)
+        if _ps.PROBE_LAYERS:
+            _ps.reset_if_new_request(positions)
+            _ps.CURRENT_PHASE = "prefill" if getattr(batch, "is_prefill", False) else "decode"
+            if positions is not None:
+                _ps.record_forward_meta(_ps.CURRENT_PHASE, positions)
+                _ps.CURRENT_POSITIONS = positions
         x = self.embed_tokens.forward(input_ids)
+        if _ps.PROBE_LAYERS and positions is not None:
+            _ps.record_embedding(positions, x)
+            if _ps.CURRENT_PHASE == "prefill":
+                _ps.record_input_ids(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+        if _ps.PROBE_LAYERS:
+            try:
+                _ps.finalize("/tmp/ft_probe.npz")
+            except Exception:
+                pass
+            _ps.CURRENT_POSITIONS = None
         return self.norm.forward(x, residual)[0]
 
 

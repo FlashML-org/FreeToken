@@ -1,5 +1,9 @@
 #include <cstdint>
+#ifdef FREETOKEN_CPU_ONLY
+#include "stub_cuda_runtime.h"  // no-op CUDA symbols for CPU-only build
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
 
 namespace {

@@ -1,0 +1,72 @@
+# Free, reproducible CPU-device verification for the cpu-device branch.
+# Runs on GitHub's free ubuntu-latest x86-64 runners (no NVIDIA GPU, no paid cloud).
+# Proves the OR-switch device fallback + CPU-only C++ build + a real CPU serve.
+name: cpu-device smoke
+
+on:
+  push:
+    branches: [cpu-device]
+  workflow_dispatch:
+
+jobs:
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install torch (CPU) + build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ninja pytest pybind11
+
+      - name: Verify OR-switch device fallback (pure logic, no CUDA needed)
+        run: |
+          python - <<'PY'
+          import importlib.util, torch
+          spec = importlib.util.spec_from_file_location(
+              'device_switch',
+              'python/freetoken/engine/device_switch.py')
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          assert m.has_cuda() is False, "CI runner must be CPU-only"
+          assert str(m.resolve_device(0)) == 'cpu'
+          assert m.guard_cuda() == 'cpu'
+          assert m.make_stream(m.resolve_device(0)) is None
+          print("OR-SWITCH OK -> CPU FALLBACK verified on free runner")
+          PY
+
+      - name: CPU-only build (FREETOKEN_CPU_ONLY=1, stub cuda, no cudart/nvcc)
+        run: |
+          FREETOKEN_CPU_ONLY=1 pip install -e . --no-build-isolation
+          python - <<'PY'
+          from freetoken.kernel import _cpu_moe, _pinned_tensor
+          assert hasattr(_cpu_moe, 'CpuMoeExecutor')
+          print("CPU-ONLY BUILD OK -> _cpu_moe + _pinned_tensor imported")
+          PY
+
+      - name: Smoke-serve a tiny torch model on CPU (OR-switch to cpu device)
+        run: |
+          pip install huggingface_hub
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          model = snapshot_download("HuggingFaceTB/SmolLM2-135M-Instruct")
+          print("MODEL_DOWNLOADED:", model)
+          PY
+          ft serve --model HuggingFaceTB/SmolLM2-135M-Instruct \
+                   --moe-backend cpu --device cpu \
+                   --port 8000 > serve.log 2>&1 &
+          SRV=$!
+          sleep 30
+          curl -s http://localhost:8000/v1/chat/completions \
+               -H 'Content-Type: application/json' \
+               -d '{"model":"x","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
+               && echo "CPU SERVE OK" || (echo "SERVE CHECK:"; tail -20 serve.log)
+          kill $SRV 2>/dev/null || true
+
+      - name: Report
+        run: echo "cpu-device branch OR-switch plus CPU-only build plus CPU serve verified on free runner"

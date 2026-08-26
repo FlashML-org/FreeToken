@@ -114,7 +114,11 @@ version = {attr = "freetoken.version.__version__"}
 where = ["python"]
 
 [tool.setuptools.package-data]
-"*" = ["csrc/**/*", "moe/configs/**/*.json"]
+# Ship only runtime data (MoE configs). The csrc/** C++ sources are build inputs for
+# the pybind11 extensions, NOT package data — listing them makes setuptools>=77 treat
+# them as data with an absolute path and raises DistutilsSetupError: absolute path
+# (assert_relative) during build_py. Excluding them is the correct fix.
+"*" = ["moe/configs/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

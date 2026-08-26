@@ -9,6 +9,15 @@ import torch
 from .base import StateLessOP
 
 
+def _triton_importable() -> bool:
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 class RotaryEmbedding(StateLessOP):
     def __init__(
         self,
@@ -63,8 +72,12 @@ class RotaryEmbedding(StateLessOP):
 
         if is_flashinfer_installed():
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
-        else:
+        elif _triton_importable():
             from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
+        else:
+            from freetoken.kernel.torch_fallback import (
+                apply_rope_with_cos_sin_cache_inplace,
+            )
 
         self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 

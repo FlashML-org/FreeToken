@@ -5,14 +5,25 @@ import torch
 from .base import BaseOP
 
 
+def _triton_importable() -> bool:
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 class RMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import is_flashinfer_installed
 
         if is_flashinfer_installed():
             from flashinfer import rmsnorm
-        else:
+        elif _triton_importable():
             from freetoken.kernel.triton.norm import rmsnorm
+        else:
+            from freetoken.kernel.torch_fallback import rmsnorm
 
         self.eps = eps
         self.weight = torch.empty(size)
@@ -153,8 +164,10 @@ class RMSNormFused(BaseOP):
 
         if is_flashinfer_installed():
             from flashinfer import fused_add_rmsnorm, rmsnorm
-        else:
+        elif _triton_importable():
             from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
+        else:
+            from freetoken.kernel.torch_fallback import fused_add_rmsnorm, rmsnorm
 
         self.eps = eps
         self.weight = torch.empty(size)

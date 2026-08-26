@@ -3,9 +3,19 @@ from __future__ import annotations
 import os
 
 import torch
-import triton
-import triton.language as tl
-from flashlib.kernels.slot_cache import lru_ensure
+
+# triton + flashlib.lru_ensure are only used by the GPU offload MoE backend.
+# Guard the import so the module (and the whole package) loads on a CPU-only
+# build without triton / NVIDIA toolkit. The offload functions only run on a
+# GPU box where triton is installed; they raise a clear error otherwise.
+try:
+    import triton
+    import triton.language as tl
+    from flashlib.kernels.slot_cache import lru_ensure
+except Exception:  # pragma: no cover - triton/flashlib absent on CPU-only build
+    triton = None  # type: ignore
+    tl = None  # type: ignore
+    lru_ensure = None  # type: ignore
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
