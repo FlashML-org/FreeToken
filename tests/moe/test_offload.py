@@ -34,6 +34,465 @@ def _make_layer_and_cache():
     return layer, cache
 
 
+@pytest.mark.parametrize(
+    "quant_format",
+    ["bf16", "nvfp4_marlin", "nvfp4_b12x", "ds_fp4", "q4_0"],
+)
+def test_non_gguf_sources_reject_per_layer_shape_changes_even_with_equal_numel(
+    quant_format,
+):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format=quant_format,
+        prefill_overlap=False,
+    )
+    names = cache.bank_schema
+    sources = {}
+    for name in names:
+        sources[name] = [
+            torch.zeros((2, 2, 3), dtype=torch.uint8),
+            torch.zeros((2, 3, 2), dtype=torch.uint8),
+        ]
+
+    with pytest.raises(ValueError, match="uniform per-layer shapes"):
+        cache.set_bank_sources(sources)
+
+
+def test_non_gguf_sources_reject_noncontiguous_rows():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format="bf16",
+    )
+    noncontiguous = torch.zeros((2, 3, 2), dtype=torch.bfloat16).transpose(1, 2)
+    assert noncontiguous.shape == (2, 2, 3)
+    assert not noncontiguous.is_contiguous()
+    sources = {
+        "gate_up": [
+            torch.zeros((2, 2, 3), dtype=torch.bfloat16),
+            noncontiguous,
+        ],
+        "down": [
+            torch.zeros((2, 2, 3), dtype=torch.bfloat16),
+            torch.zeros((2, 2, 3), dtype=torch.bfloat16),
+        ],
+    }
+
+    with pytest.raises(ValueError, match="contiguous"):
+        cache.set_bank_sources(sources)
+
+
+def test_gguf_sources_require_contiguous_2d_uint8_rows():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        prefill_overlap=False,
+    )
+    bad_rank = {
+        "gate_up": [torch.zeros((2, 2, 4), dtype=torch.uint8) for _ in range(2)],
+        "down": [torch.zeros((2, 8), dtype=torch.uint8) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="2-D contiguous uint8"):
+        cache.set_bank_sources(bad_rank)
+
+    bad_dtype = {
+        "gate_up": [torch.zeros((2, 8), dtype=torch.int8) for _ in range(2)],
+        "down": [torch.zeros((2, 8), dtype=torch.uint8) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="2-D contiguous uint8"):
+        cache.set_bank_sources(bad_dtype)
+
+
+def test_gguf_geometry_pools_carve_disjoint_exact_width_views():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=8,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        prefill_overlap=False,
+        geometry_pool_top_k=1,
+        geometry_pool_max_batch=1,
+    )
+    sources = {
+        "gate_up": [
+            torch.zeros((2, 4), dtype=torch.uint8),
+            torch.zeros((2, 8), dtype=torch.uint8),
+        ],
+        "down": [
+            torch.zeros((2, 2), dtype=torch.uint8),
+            torch.zeros((2, 4), dtype=torch.uint8),
+        ],
+    }
+    cache.set_bank_sources(sources)
+
+    q_views = cache.bank_views(layer_id=0)
+    b_views = cache.bank_views(layer_id=1)
+    assert q_views[0].shape[1:] == (4,)
+    assert q_views[1].shape[1:] == (2,)
+    assert b_views[0].shape[1:] == (8,)
+    assert b_views[1].shape[1:] == (4,)
+    sizes = cache.geometry_pool_sizes()
+    assert sizes[0] >= 1 and sizes[1] >= 1
+    for bank_index, arena in enumerate(cache.bank_caches.values()):
+        arena_start = arena.data_ptr()
+        arena_end = arena_start + arena.numel() * arena.element_size()
+        ranges = []
+        for views in (q_views, b_views):
+            view = views[bank_index]
+            start = view.data_ptr()
+            end = start + view.numel() * view.element_size()
+            assert arena_start <= start < end <= arena_end
+            ranges.append((start, end))
+        assert ranges[0][1] <= ranges[1][0] or ranges[1][1] <= ranges[0][0]
+
+    old_arena_ptr = cache.bank_caches["gate_up"].data_ptr()
+    old_sizes = cache.geometry_pool_sizes()
+    cache.rebuild(10)
+    assert cache.bank_sources["gate_up"] is not None
+    assert cache.bank_caches["gate_up"].data_ptr() != old_arena_ptr
+    assert cache.geometry_pool_sizes()[0] >= old_sizes[0]
+    assert (
+        cache.bank_views(layer_id=0)[0].untyped_storage().data_ptr()
+        == cache.bank_caches["gate_up"].untyped_storage().data_ptr()
+    )
+
+
+def test_heterogeneous_sources_use_compact_host_rows_and_max_gpu_stride():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        prefill_overlap=True,
+    )
+    small_gu = torch.arange(2 * 16, dtype=torch.uint8).view(2, 16)
+    large_gu = torch.arange(2 * 32, dtype=torch.uint8).view(2, 32)
+    small_dn = torch.arange(2 * 8, dtype=torch.uint8).view(2, 8)
+    large_dn = torch.arange(2 * 16, dtype=torch.uint8).view(2, 16)
+    sources = {
+        "gate_up": [small_gu, large_gu],
+        "down": [small_dn, large_dn],
+    }
+
+    cache.set_bank_sources(sources)
+
+    assert cache.bank_sources["gate_up"][0].shape == (2, 16)
+    assert cache.bank_sources["gate_up"][1].shape == (2, 32)
+    assert cache.bank_caches["gate_up"].shape == (4, 32)
+    assert cache.bank_caches["down"].shape == (4, 16)
+    assert cache.has_heterogeneous_rows
+
+    cache.prefetch_prefill_layer(0)
+    gate_buffer, down_buffer = cache.wait_prefill_layer(0)
+    assert torch.equal(gate_buffer[:, :16], small_gu)
+    assert torch.equal(down_buffer[:, :8], small_dn)
+
+    cache.release_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    gate_buffer, down_buffer = cache.wait_prefill_layer(1)
+    assert torch.equal(gate_buffer, large_gu)
+    assert torch.equal(down_buffer, large_dn)
+
+    cache.rebuild(6)
+    assert cache.bank_caches["gate_up"].shape == (6, 32)
+    assert cache.bank_caches["down"].shape == (6, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_geometry_decode_routes_lru_and_copies_into_selected_pool():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def pinned(rows: int, cols: int, offset: int) -> torch.Tensor:
+        values = (torch.arange(rows * cols, dtype=torch.int32) + offset) % 251
+        return values.to(torch.uint8).view(rows, cols).pin_memory()
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cuda"),
+        quant_format="gguf",
+        geometry_pool_top_k=1,
+        geometry_pool_max_batch=1,
+    )
+    sources = {
+        "gate_up": [pinned(4, 32, 0), pinned(4, 64, 17)],
+        "down": [pinned(4, 16, 33), pinned(4, 32, 49)],
+    }
+    cache.set_bank_sources(sources)
+    cache.collect_stats = True
+
+    pools = [cache._geometry_pool_for_layer[layer_id] for layer_id in range(2)]
+    for layer_id in range(2):
+        ids = torch.tensor([2], dtype=torch.int32, device="cuda")
+        cache.ensure_experts(layer_id, ids)
+        cache.copy_missing()
+        torch.cuda.synchronize()
+        slot = int(ids.item())
+        gate, down = cache.bank_views(layer_id=layer_id)
+        assert torch.equal(gate[slot].cpu(), sources["gate_up"][layer_id][2])
+        assert torch.equal(down[slot].cpu(), sources["down"][layer_id][2])
+        assert int(pools[layer_id].slot_for_id[layer_id, 2].item()) == slot
+        other = pools[1 - layer_id]
+        assert int(other.slot_for_id[layer_id, 2].item()) == -1
+
+    stats = cache.decode_miss_stats()
+    assert stats["layer_calls"] == 2
+    assert stats["requested_rows"] == 2
+    assert stats["miss_rows"] == 2
+    assert stats["hit_rows"] == 0
+    assert stats["bytes_h2d"] == (32 + 16) + (64 + 32)
+    assert stats["miss_rate"] == 1.0
+    per_layer = cache.decode_miss_stats_per_layer()["per_layer"]
+    assert [entry["steps"] for entry in per_layer] == [1, 1]
+
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    prefill_gate, prefill_down = cache.bank_views(cache.num_experts, layer_id=1)
+    assert torch.equal(prefill_gate.cpu(), sources["gate_up"][1])
+    assert torch.equal(prefill_down.cpu(), sources["down"][1])
+    assert all(torch.all(pool.slot_for_id == -1) for pool in pools)
+
+    ids = torch.tensor([2], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(0, ids)
+    assert int(pools[0].num_indices.item()) == 1
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    slot = int(ids.item())
+    assert torch.equal(
+        cache.bank_views(layer_id=0)[0][slot].cpu(), sources["gate_up"][0][2]
+    )
+
+
+def test_decode_stats_count_gpu_transfers_in_mixed_cpu_mode():
+    from flashlib.kernels.slot_cache import Stat
+
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.zeros((4, 6), dtype=torch.bfloat16) for _ in range(2)],
+        "down": [torch.zeros((4, 4), dtype=torch.bfloat16) for _ in range(2)],
+    }
+    cache.set_bank_sources(sources)
+    cache.lru_stats[0, Stat.ACTIVE] = 2
+    cache.lru_stats[0, Stat.MISS] = 1
+    cache.lru_stats[0, Stat.CALLS] = 1
+
+    stats = cache.decode_miss_stats()
+
+    assert stats["requested_rows"] == 2
+    assert stats["miss_rows"] == 1
+    assert stats["hit_rows"] == 1
+    assert stats["bytes_h2d"] == (6 + 4) * 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_heterogeneous_unaligned_rows_fail_during_setup():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cuda"),
+        quant_format="gguf",
+    )
+    sources = {
+        "gate_up": [
+            torch.zeros((4, 30), dtype=torch.uint8, pin_memory=True),
+            torch.zeros((4, 64), dtype=torch.uint8, pin_memory=True),
+        ],
+        "down": [
+            torch.zeros((4, 16), dtype=torch.uint8, pin_memory=True),
+            torch.zeros((4, 32), dtype=torch.uint8, pin_memory=True),
+        ],
+    }
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        cache.set_bank_sources(sources)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("disable_uniform_fused_copy", [False, True])
+def test_heterogeneous_copy_missing_uses_source_payload_and_destination_stride(
+    monkeypatch, disable_uniform_fused_copy
+):
+    import freetoken.moe.offload_cache as offload_cache_module
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(
+        offload_cache_module, "_FUSED_COPY", not disable_uniform_fused_copy
+    )
+
+    def pinned(rows: int, cols: int, offset: int) -> torch.Tensor:
+        t = torch.empty((rows, cols), dtype=torch.uint8, pin_memory=True)
+        values = (torch.arange(rows * cols, dtype=torch.int32) + offset) % 251
+        t.copy_(values.to(torch.uint8).view(rows, cols))
+        return t
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cuda"),
+        quant_format="gguf",
+    )
+    gu0, gu1 = pinned(4, 32, 0), pinned(4, 64, 17)
+    dn0, dn1 = pinned(4, 16, 33), pinned(4, 32, 49)
+    cache.set_bank_sources({"gate_up": [gu0, gu1], "down": [dn0, dn1]})
+    for bank in cache.bank_caches.values():
+        bank.fill_(0xEE)
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache.evict_slots[:2] = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    cache.src_indices[:2] = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
+    cache.num_indices.fill_(2)
+
+    cache.copy_missing()
+    torch.cuda.synchronize()
+
+    gate_cache = cache.bank_caches["gate_up"]
+    down_cache = cache.bank_caches["down"]
+    assert torch.equal(gate_cache[3, :32].cpu(), gu0[2])
+    assert torch.equal(gate_cache[1, :32].cpu(), gu0[0])
+    assert torch.all(gate_cache[[1, 3], 32:] == 0xEE)
+    assert torch.equal(down_cache[3, :16].cpu(), dn0[2])
+    assert torch.equal(down_cache[1, :16].cpu(), dn0[0])
+    assert torch.all(down_cache[[1, 3], 16:] == 0xEE)
+
+
+def test_decode_requests_geometry_bank_views_for_its_layer(monkeypatch):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    _init_tp()
+    seen = {}
+
+    class FakeCache:
+        decode_target = "gpu"
+
+        @staticmethod
+        def is_cpu_layer(layer_id):
+            return False
+
+        @staticmethod
+        def ensure_experts(layer_id, expert_ids):
+            return None
+
+        @staticmethod
+        def copy_missing():
+            return None
+
+        @staticmethod
+        def alphas_for_slots(layer_id):
+            return None
+
+        @staticmethod
+        def bank_views(*args, **kwargs):
+            seen.update(kwargs)
+            return ()
+
+    layer = OffloadMoELayer(3, 4, 1, 8, 4)
+    layer.offload_cache = FakeCache()
+    expected = torch.zeros((1, 8))
+    monkeypatch.setattr(layer, "_expert_gemm", lambda *args, **kwargs: expected)
+
+    result = layer._decode_routed(
+        torch.zeros((1, 8)),
+        torch.ones((1, 1)),
+        torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+    assert result is expected
+    assert seen == {"layer_id": 3}
+
+
+def test_gguf_bf16_layer_reinterprets_padded_slots_for_dense_kernel(monkeypatch):
+    import freetoken.layers.moe as moe_module
+    import freetoken.moe.fused_gguf as fused_gguf_module
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=2,
+        top_k=1,
+        hidden_size=4,
+        intermediate_size=3,
+    )
+    layer.gguf_gate_up_type = 30
+    layer.gguf_down_type = 30
+    layer.gguf_gate_up_rows = 6
+    layer.gguf_down_rows = 4
+    gate_up = torch.arange(2 * 6 * 4, dtype=torch.float32).to(torch.bfloat16)
+    down = torch.arange(2 * 4 * 3, dtype=torch.float32).to(torch.bfloat16)
+    views = (
+        gate_up.view(torch.uint8).reshape(2, -1),
+        down.view(torch.uint8).reshape(2, -1),
+    )
+    captured = {}
+    expected = torch.randn(1, 4)
+
+    def fake_dense(*args):
+        captured["gate_up"] = args[1]
+        captured["down"] = args[2]
+        return expected
+
+    def fail_gguf(*args, **kwargs):
+        raise AssertionError(
+            "BF16 GGUF layers must not enter the quantized MMVQ kernel"
+        )
+
+    monkeypatch.setattr(moe_module, "fused_experts_impl", fake_dense)
+    monkeypatch.setattr(fused_gguf_module, "fused_experts_gguf", fail_gguf)
+    cache = OffloadMoeCache(1, 2, 2, torch.device("cpu"), quant_format="gguf")
+
+    out = layer._expert_gemm(
+        cache,
+        torch.randn(1, 4),
+        torch.ones(1, 1),
+        torch.zeros(1, 1, dtype=torch.int32),
+        views=views,
+        n=2,
+        alphas=None,
+        is_prefill=True,
+    )
+
+    assert out is expected
+    assert captured["gate_up"].shape == (2, 6, 4)
+    assert captured["down"].shape == (2, 4, 3)
+    assert captured["gate_up"].dtype == torch.bfloat16
+    assert captured["down"].dtype == torch.bfloat16
+
+
 def test_dummy_expert_sources_use_moe_layer_count(monkeypatch):
     from types import SimpleNamespace
 

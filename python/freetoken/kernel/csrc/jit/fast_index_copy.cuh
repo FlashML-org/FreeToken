@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cassert>
 #include <tvm/ffi/object.h>
 
 namespace device {
@@ -558,5 +559,181 @@ struct MultiIndexCopyKernel {
             : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank>;
         LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
                      device.unwrap())(kernel, params);
+    }
+};
+
+
+// Multi-bank copy with independent payload, destination stride, and source stride.
+// This is required when compact per-layer host rows feed a max-stride GPU slot cache.
+struct MultiStridedIndexCopyParams {
+    const int64_t* __restrict__ dst_ptrs;
+    const int64_t* __restrict__ src_ptrs;
+    const int64_t* __restrict__ copy_bytes;
+    const int64_t* __restrict__ dst_row_strides;
+    const int64_t* __restrict__ src_row_strides;
+    const void* __restrict__ dst_indices;
+    const void* __restrict__ src_indices;
+    const int64_t* __restrict__ valid_length;
+    int64_t length;
+    int num_banks;
+};
+
+template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank>
+__global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi_strided(
+    const __grid_constant__ MultiStridedIndexCopyParams p
+) {
+    const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
+    if (b >= p.num_banks) {
+        return;
+    }
+    const int blk = static_cast<int>(blockIdx.x % kBlocksPerBank);
+    const auto* src = reinterpret_cast<const uint8_t*>(p.src_ptrs[b]);
+    auto* dst = reinterpret_cast<uint8_t*>(p.dst_ptrs[b]);
+    const int64_t bytes = p.copy_bytes[b];
+    const int64_t dst_stride = p.dst_row_strides[b];
+    const int64_t src_stride = p.src_row_strides[b];
+    const int64_t requested = p.valid_length ? p.valid_length[0] : p.length;
+    const int64_t n = requested < 0 ? 0 : (requested > p.length ? p.length : requested);
+    if (bytes <= 0 || (bytes & 15) != 0 || bytes > src_stride || bytes > dst_stride) {
+        return;
+    }
+    const int64_t units = bytes >> 4;
+    const int64_t total = n * units;
+    const auto* di = static_cast<const IdType*>(p.dst_indices);
+    const auto* si = static_cast<const IdType*>(p.src_indices);
+    const int64_t grid_stride = static_cast<int64_t>(kBlocksPerBank) * kNumThreads;
+    for (int64_t u = static_cast<int64_t>(blk) * kNumThreads + threadIdx.x;
+         u < total; u += grid_stride) {
+        const int64_t row = u / units;
+        const int64_t col = (u - row * units) << 4;
+        const int64_t pd = static_cast<int64_t>(di[row]);
+        const int64_t ps = static_cast<int64_t>(si[row]);
+        const uint4 v = *reinterpret_cast<const uint4*>(src + ps * src_stride + col);
+        *reinterpret_cast<uint4*>(dst + pd * dst_stride + col) = v;
+    }
+}
+
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+struct MultiStridedIndexCopyKernel {
+    static void run(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptrs,
+        tvm::ffi::TensorView copy_bytes,
+        tvm::ffi::TensorView dst_row_strides,
+        tvm::ffi::TensorView src_row_strides,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
+    ) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto B = SymbolicSize{"num_banks"};
+        auto L = SymbolicSize{"indices length"};
+        auto ptr_dtype = SymbolicDType{};
+        auto indices_dtype = SymbolicDType{};
+        auto num_indices_dtype = SymbolicDType{};
+
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_ptrs).verify(src_ptrs).verify(copy_bytes)
+            .verify(dst_row_strides).verify(src_row_strides);
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_indices).verify(src_indices);
+
+        const int64_t* valid_length = nullptr;
+        if (num_indices.has_value()) {
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+                .verify(num_indices.value());
+            valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
+        }
+
+        const int num_banks = static_cast<int>(B.unwrap());
+        const auto params = MultiStridedIndexCopyParams{
+            static_cast<const int64_t*>(dst_ptrs.data_ptr()),
+            static_cast<const int64_t*>(src_ptrs.data_ptr()),
+            static_cast<const int64_t*>(copy_bytes.data_ptr()),
+            static_cast<const int64_t*>(dst_row_strides.data_ptr()),
+            static_cast<const int64_t*>(src_row_strides.data_ptr()),
+            dst_indices.data_ptr(),
+            src_indices.data_ptr(),
+            valid_length,
+            static_cast<int64_t>(L.unwrap()),
+            num_banks,
+        };
+        const auto use_int32 = indices_dtype.unwrap().bits == 32;
+        const auto kernel = use_int32
+            ? fast_index_copy_multi_strided<int32_t, kNumThreads, kBlocksPerBank>
+            : fast_index_copy_multi_strided<int64_t, kNumThreads, kBlocksPerBank>;
+        LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
+                     device.unwrap())(kernel, params);
+    }
+};
+
+
+// Whole compact GGUF layer -> padded slot cache without a payload-sized CUDA
+// staging allocation. ``src_ptr`` is the UVA device alias of registered host
+// memory, not necessarily the host virtual address.
+struct StridedRowsCopyParams {
+    uint8_t* __restrict__ dst;
+    const uint8_t* __restrict__ src;
+    int64_t rows;
+    int64_t copy_bytes;
+    int64_t dst_stride;
+    int64_t src_stride;
+};
+
+template <std::size_t kNumThreads>
+__global__ __launch_bounds__(kNumThreads) void fast_copy_strided_rows(
+    const __grid_constant__ StridedRowsCopyParams p
+) {
+    const int64_t units = p.copy_bytes >> 4;
+    const int64_t total = p.rows * units;
+    const int64_t step = static_cast<int64_t>(gridDim.x) * kNumThreads;
+    for (int64_t u = static_cast<int64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
+         u < total; u += step) {
+        const int64_t row = u / units;
+        const int64_t col = (u - row * units) << 4;
+        const uint4 v = *reinterpret_cast<const uint4*>(p.src + row * p.src_stride + col);
+        *reinterpret_cast<uint4*>(p.dst + row * p.dst_stride + col) = v;
+    }
+}
+
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+struct StridedRowsCopyKernel {
+    static void run(
+        tvm::ffi::TensorView dst,
+        int64_t src_ptr,
+        int64_t src_stride,
+        int64_t copy_bytes,
+        int64_t rows
+    ) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto R = SymbolicSize{"rows"};
+        auto D = SymbolicSize{"destination stride"};
+        TensorMatcher({R, D}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(dst);
+        assert(rows == static_cast<int64_t>(R.unwrap()));
+        assert(copy_bytes > 0 && (copy_bytes & 15) == 0);
+        assert(src_stride >= copy_bytes && (src_stride & 15) == 0);
+        const int64_t dst_stride = static_cast<int64_t>(D.unwrap());
+        assert(dst_stride >= copy_bytes && (dst_stride & 15) == 0);
+        assert(src_ptr != 0 && (src_ptr & 15) == 0);
+        assert((reinterpret_cast<uintptr_t>(dst.data_ptr()) & 15) == 0);
+
+        const auto params = StridedRowsCopyParams{
+            static_cast<uint8_t*>(dst.data_ptr()),
+            reinterpret_cast<const uint8_t*>(src_ptr),
+            rows,
+            copy_bytes,
+            dst_stride,
+            src_stride,
+        };
+        const int64_t total_units = rows * (copy_bytes >> 4);
+        const int64_t wanted = (total_units + kNumThreads - 1) / kNumThreads;
+        const int64_t capped = wanted < static_cast<int64_t>(kBlocksPerBank)
+            ? wanted : static_cast<int64_t>(kBlocksPerBank);
+        const auto blocks = static_cast<std::size_t>(capped < 1 ? 1 : capped);
+        LaunchKernel(blocks, kNumThreads, device.unwrap())(
+            fast_copy_strided_rows<kNumThreads>, params
+        );
     }
 };

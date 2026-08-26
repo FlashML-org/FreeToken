@@ -420,19 +420,19 @@ def convert_laguna_to_gguf(model, config: ModelConfig) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _expert_bank_geometry(config: ModelConfig):
-    """Uniform flat-slot strides across MoE layers: max payload bytes, 64B aligned."""
+def _expert_bank_geometry(config: ModelConfig) -> list[tuple[int, int]]:
+    """Compact flat-slot strides per MoE layer, each 64-byte aligned."""
     from freetoken.models.gguf.dequant import row_bytes
 
     assert config.gguf_expert_types, "laguna expert banks need gguf_expert_types"
     H, I = config.hidden_size, config.moe_intermediate_size
-    gu_pay = {gu: 2 * I * row_bytes(H, gu) for gu, _ in config.gguf_expert_types}
-    dn_pay = {dn: H * row_bytes(I, dn) for _, dn in config.gguf_expert_types}
-
     def align(n: int) -> int:
         return (n + 63) // 64 * 64
 
-    return align(max(gu_pay.values())), align(max(dn_pay.values()))
+    return [
+        (align(2 * I * row_bytes(H, gu)), align(H * row_bytes(I, dn)))
+        for gu, dn in config.gguf_expert_types
+    ]
 
 
 def load_gguf_expert_sources(
@@ -440,15 +440,13 @@ def load_gguf_expert_sources(
 ) -> dict[str, list[torch.Tensor]]:
     """Per-MoE-layer host banks of the routed experts' native packed bytes.
 
-    Each bank is one flat ``[E, stride]`` uint8 tensor per MoE layer (bank index =
-    layer_id - first_k_dense_replace): every expert's real payload occupies the
-    leading bytes of its padded slot, so all layers share one shape and the ggml
-    MoE kernels read them via ``expert_stride_bytes``. Mirrors the q4_0 loader's
-    pin pipeline / layer_sink streaming contract.
+    Each bank is one compact flat ``[E, stride]`` uint8 tensor per MoE layer (bank
+    index = layer_id - first_k_dense_replace). The GPU slot cache chooses the maximum
+    per-bank stride, while host RAM stores only each layer's real packed payload.
     """
     from freetoken.models.gguf.dequant import row_bytes
     from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline
 
     _require_tp1("expert banks")
     types = config.gguf_expert_types
@@ -456,13 +454,11 @@ def load_gguf_expert_sources(
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     L = len(types)  # MoE layers only
-    gu_stride, dn_stride = _expert_bank_geometry(config)
-
-    specs = {
-        "gate_up": ((E, gu_stride), torch.uint8),
-        "down": ((E, dn_stride), torch.uint8),
+    geometry = _expert_bank_geometry(config)
+    hb = {
+        "gate_up": [HostBank((E, gu_stride), torch.uint8) for gu_stride, _ in geometry],
+        "down": [HostBank((E, dn_stride), torch.uint8) for _, dn_stride in geometry],
     }
-    hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
 
@@ -516,15 +512,16 @@ def load_gguf_expert_sources(
 
 def dummy_gguf_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
     """Random banks shaped like ``load_gguf_expert_sources`` output."""
-    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+    from freetoken.moe.host_banks import HostBank, pin_banks
 
     E = config.num_experts
     L = len(config.gguf_expert_types or ())
     assert L, "laguna dummy expert banks need gguf_expert_types"
-    gu_stride, dn_stride = _expert_bank_geometry(config)
-    hb = alloc_layer_banks(
-        {"gate_up": ((E, gu_stride), torch.uint8), "down": ((E, dn_stride), torch.uint8)}, L
-    )
+    geometry = _expert_bank_geometry(config)
+    hb = {
+        "gate_up": [HostBank((E, gu_stride), torch.uint8) for gu_stride, _ in geometry],
+        "down": [HostBank((E, dn_stride), torch.uint8) for _, dn_stride in geometry],
+    }
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     for t in banks["gate_up"] + banks["down"]:
         t.random_(0, 256)

@@ -14,7 +14,7 @@ import torch
 import gguf
 
 import freetoken.distributed.info as di
-from freetoken.models.gguf.dequant import GGML_Q8_0, row_bytes
+from freetoken.models.gguf.dequant import GGML_BF16, GGML_Q8_0, row_bytes
 
 # Tiny geometry: 4 layers (full at 0), heads 4 full / 6 swa, kv 2, head_dim 32.
 L, H, FF = 4, 64, 96
@@ -102,6 +102,7 @@ def tiny_gguf(tmp_path_factory):
             quant(p + "ffn_gate_shexp.weight", SHI, H)
             quant(p + "ffn_up_shexp.weight", SHI, H)
             quant(p + "ffn_down_shexp.weight", H, SHI)
+            expert_type = gguf.GGMLQuantizationType.BF16 if i == L - 1 else q8
             for role, rows, cols in (
                 ("ffn_gate_exps", I, H),
                 ("ffn_up_exps", I, H),
@@ -110,8 +111,10 @@ def tiny_gguf(tmp_path_factory):
                 data = rng.standard_normal((E, rows, cols)).astype(np.float32)
                 w.add_tensor(
                     p + role + ".weight",
-                    gguf.quants.quantize(data.reshape(E * rows, cols), q8).reshape(E, rows, -1),
-                    raw_dtype=q8,
+                    gguf.quants.quantize(
+                        data.reshape(E * rows, cols), expert_type
+                    ).reshape(E, rows, -1),
+                    raw_dtype=expert_type,
                 )
     w.write_header_to_file()
     w.write_kv_data_to_file()
@@ -140,7 +143,9 @@ def test_config_and_expert_types(tiny_gguf):
     assert cfg.num_layers == L and cfg.num_qo_heads == 6
     assert cfg.gguf_embed_quant == GGML_Q8_0
     assert cfg.expert_quant == "gguf" and cfg.moe_weight_format == "gguf"
-    assert cfg.gguf_expert_types == ((GGML_Q8_0, GGML_Q8_0),) * (L - 1)
+    assert cfg.gguf_expert_types == (
+        ((GGML_Q8_0, GGML_Q8_0),) * (L - 2) + ((GGML_BF16, GGML_BF16),)
+    )
 
 
 def test_iter_weights_complete_and_fused(tiny_gguf):
@@ -179,10 +184,13 @@ def test_expert_bank_loader(tiny_gguf):
 
     cfg = _config(tiny_gguf)
     banks = load_gguf_expert_sources(tiny_gguf, cfg)
-    gu_s, dn_s = _expert_bank_geometry(cfg)
+    geometry = _expert_bank_geometry(cfg)
     assert len(banks["gate_up"]) == L - 1 and len(banks["down"]) == L - 1
-    for t in banks["gate_up"]:
-        assert t.shape == (E, gu_s) and t.dtype == torch.uint8
+    for layer_id, (gu_s, dn_s) in enumerate(geometry):
+        assert banks["gate_up"][layer_id].shape == (E, gu_s)
+        assert banks["down"][layer_id].shape == (E, dn_s)
+        assert banks["gate_up"][layer_id].dtype == torch.uint8
+    assert banks["gate_up"][0].shape[1] < banks["gate_up"][-1].shape[1]
     # payload bytes decode to the source values via gguf-py
     half = I * row_bytes(H, GGML_Q8_0)
     blob = banks["gate_up"][0][:, : 2 * half]
