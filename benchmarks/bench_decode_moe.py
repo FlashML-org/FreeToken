@@ -112,6 +112,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1800,
         help="seconds to wait for the spawned server to become ready",
     )
+    p.add_argument(
+        "--max-context",
+        type=int,
+        default=None,
+        help="server --max-seq-len-override AND --num-tokens, for a full-context run "
+        "(e.g. a long-context Ornith/Laguna session); default keeps the prior "
+        "8192 + --decode sizing with the server's own --num-tokens default",
+    )
+    p.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="server --kv-cache-dtype (auto|q8_0|fp8_e4m3|int4|q4_0); default leaves the "
+        "server's own default (auto, unquantized) in place",
+    )
+    p.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=None,
+        help="server --max-prefill-length; default leaves the server's own default chunk size",
+    )
+    p.add_argument(
+        "--prefill-hit-d2d",
+        action="store_true",
+        help="pass --moe-prefill-hit-d2d to the server (off by default, matching the server default)",
+    )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
     return p.parse_args(argv)
 
@@ -172,17 +197,28 @@ def free_port() -> int:
 
 
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
+    max_seq_len = args.max_context if args.max_context is not None else 8192 + args.decode
     cmd = [
         sys.executable, "-m", "freetoken.cli", "serve",
         "--model", args.model,
         "--host", "127.0.0.1", "--port", str(port),
         "--moe-backend", backend,
         "--max-running-requests", "1",
-        "--max-seq-len-override", str(8192 + args.decode),
+        "--max-seq-len-override", str(max_seq_len),
         "--memory-ratio", str(args.mem_ratio),
         "--cuda-graph-max-bs", "0" if args.no_graph else "1",
         "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]
+    # Every flag below is opt-in and omitted unless passed, so a bare invocation keeps
+    # the server's own defaults exactly as before this option set existed.
+    if args.max_context is not None:
+        cmd += ["--num-tokens", str(args.max_context)]
+    if args.kv_cache_dtype is not None:
+        cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
+    if args.prefill_chunk is not None:
+        cmd += ["--max-prefill-length", str(args.prefill_chunk)]
+    if args.prefill_hit_d2d:
+        cmd.append("--moe-prefill-hit-d2d")
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
@@ -309,6 +345,9 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         f"[bench] model={args.model}\n"
         f"[bench] backend={backend} cache={args.cache or args.cache_rate or 'auto'} "
         f"mem_ratio={args.mem_ratio} decode={args.decode} graph={not args.no_graph}\n"
+        f"[bench] max_context={args.max_context or f'{8192 + args.decode} (default)'} "
+        f"kv_cache_dtype={args.kv_cache_dtype or 'auto (default)'} "
+        f"prefill_chunk={args.prefill_chunk or 'default'} prefill_hit_d2d={args.prefill_hit_d2d}\n"
         f"[bench] sampling={sampling} <- {sampling_src}\n"
         f"[bench] server log: {log_path}",
         flush=True,

@@ -37,6 +37,17 @@ _MAX_ROWS_IN_FLIGHT = 16384
 # is already faster at 32 input tokens (Q4_K top-8: 0.61 ms vs 0.71 ms) and the
 # advantage grows to 3.1x at 2K.  Keep decode and short tails on MMVQ.
 _MMQ_MIN_TOKENS = 32
+# On sm_120 (RTX 5080, Ornith blk.0 banks E=256 top-8) grouped MMQ already wins
+# at 16 tokens (0.314 vs 0.324 ms) and pulls away from there (0.382 vs 0.475 at
+# 24), so prefill tail chunks switch over earlier.
+_MMQ_MIN_TOKENS_SM120 = 16
+
+
+def mmq_min_tokens(compute_capability: tuple[int, int] | None) -> int:
+    """Token count from which grouped MMQ beats chunked MMVQ for routed experts."""
+    if compute_capability is not None and compute_capability >= (12, 0):
+        return _MMQ_MIN_TOKENS_SM120
+    return _MMQ_MIN_TOKENS
 
 
 def _moe_vec_chunked(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride):
@@ -58,15 +69,70 @@ def _moe_vec_chunked(x, weight, topk_ids, top_k, quant_type, rows, tokens, strid
     return torch.cat(outs, dim=0)
 
 
-def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride):
+# mm_ids_helper in the int8-MMA extension keeps one 4-byte record per token in
+# shared memory; stay safely under the ~99KB sm_120 opt-in limit.
+_MMA_MAX_TOKENS = 16384
+
+# Below this the DP4A grouped MMQ wins: with E=256 top-8 the per-expert row
+# count is tiny and mul_mat_q's per-expert MMA tiles waste work (sm_120,
+# Ornith geometry: 256 tokens mma 1.64 vs dp4a 1.48 ms; 320 tokens 1.55 vs
+# 1.76; 8192 tokens 9.1 vs 38.5 -- the full-prefill-chunk regime is the win).
+_MMA_MOE_MIN_TOKENS = 320
+
+
+def _use_mma_moe(quant_type, stride, x, capability) -> bool:
+    """Upstream int8-MMA grouped MMQ: sm_120-gated, Q4_K/Q6_K slots only.
+
+    The slot byte stride must be a multiple of the quant block size so the
+    kernel can address experts in whole blocks (true for Ornith's banks, where
+    payloads are already 64-byte aligned).
+    """
+    if capability is None or capability < (12, 0):
+        return False
+    from freetoken.kernel.gguf import mma_mmq_supported
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE
+
+    if not mma_mmq_supported(int(quant_type)):
+        return False
+    if stride % BLOCK_SHAPE[int(quant_type)][1] != 0:
+        return False
+    from freetoken.layers.gguf import _mma_mmq_ok
+
+    return _mma_mmq_ok()
+
+
+def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride, *, broadcast=True):
     """Choose grouped MMQ for prefill and MMVQ for decode/small tails.
+
+    ``broadcast=True``: ``x[tokens, in]`` shared by each token's top_k experts
+    (gate/up). ``broadcast=False``: ``x[tokens*top_k, in]`` with row
+    ``t*top_k + k`` belonging to ``topk_ids[t][k]`` (down).
 
     ``ggml_moe_a8`` reads experts using ``weight.stride(0)``.  A mixed-GGUF
     bank is uint8 ``[experts, padded_slot_bytes]``, so that stride is exactly
     the byte stride expected by the donated kernel even though the real packed
     payload occupies only the beginning of each slot.
     """
-    if tokens >= _MMQ_MIN_TOKENS:
+    from freetoken.layers.gguf import _device_capability
+
+    capability = _device_capability(x.device.index) if x.is_cuda else None
+    if (
+        _MMA_MOE_MIN_TOKENS <= tokens <= _MMA_MAX_TOKENS
+        and _use_mma_moe(quant_type, stride, x, capability)
+    ):
+        from freetoken.kernel.gguf import ggml_moe_a8_mma
+
+        out = ggml_moe_a8_mma(
+            x, weight, topk_ids.contiguous(), top_k, int(quant_type),
+            rows, tokens, stride, broadcast,
+        )
+        return out.to(x.dtype)
+    if not broadcast:
+        # The DP4A/vec kernels take per-slot rows as a flat top_k=1 call.
+        topk_ids = topk_ids.reshape(-1, 1)
+        tokens = tokens * top_k
+        top_k = 1
+    if tokens >= mmq_min_tokens(capability):
         from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
         from freetoken.moe.fused import moe_align_block_size
 
@@ -151,13 +217,12 @@ def fused_experts_gguf(
         gate_up_rows, num_tokens, gate_up_q.shape[1],
     )
     inter = act_fn(gate_up)
-    # Down pass: one selected-expert row per (token, k) -- already flat, so it's a
-    # top_k=1 call over num_tokens*top_k "tokens". topk_ids must flatten the same
-    # way (row-major [num_tokens, top_k] -> contiguous [num_tokens*top_k, 1]).
-    flat_ids = topk_ids.reshape(-1, 1)
+    # Down pass: one selected-expert row per (token, k). _moe_matmul flattens to
+    # a top_k=1 call for the DP4A/vec kernels (row-major [num_tokens, top_k] ->
+    # contiguous [num_tokens*top_k, 1]); the MMA path keeps the 2-D ids.
     out = _moe_matmul(
-        inter, down_q, flat_ids, 1, int(down_type),
-        down_rows, num_tokens * top_k, down_q.shape[1],
+        inter, down_q, topk_ids, top_k, int(down_type),
+        down_rows, num_tokens, down_q.shape[1], broadcast=False,
     )
     out = out.reshape(num_tokens, top_k, down_rows) * topk_weights.reshape(
         num_tokens, top_k, 1

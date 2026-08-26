@@ -128,9 +128,14 @@ def test_mmq_matches_linear(qtype):
 
 
 @pytest.mark.parametrize("qtype", [GGML_Q4_K, GGML_Q5_K])
-def test_dense_gguf_prefill_uses_dequantized_cublas_result(qtype):
+def test_dense_gguf_prefill_uses_dequantized_cublas_result(qtype, monkeypatch):
+    import freetoken.layers.gguf as layers_gguf
     from freetoken.kernel.gguf import ggml_dequantize
     from freetoken.layers.gguf import fused_mul_mat_gguf
+
+    # On sm_120 Q4_K/Q6_K prefill dispatches to int8-MMA MMQ instead (different
+    # rounding; covered by test_gguf_mma). This test validates the dequant path.
+    monkeypatch.setattr(layers_gguf, "_use_mma_mmq", lambda qt, cc: False)
 
     block = BLOCK_SHAPE[qtype][0]
     rows, cols, batch = 32, 2 * block, 32

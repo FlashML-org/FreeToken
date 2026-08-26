@@ -27,5 +27,28 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_ornith_attention.py`** — synthetic (no checkpoint): Ornith's exact attention
+geometry (16 query heads, 2 KV heads, head_dim 256 — the GQA shape `decode_launch_config`
+tunes packed-int4/Q4_0 decode for) through the production Triton kernels directly
+(`decode_paged_attention` / `paged_attention` / `extend_paged_attention`, no server).
+Sweeps decode context length x batch size x the `max_kv_splits` scratch ceiling, plus
+representative prefill (fresh chunk) and extend (cached prefix + new chunk) cases, over
+one or more `--kv-quant` pool formats (`int4`/`q4_0`, `q8_0`, `fp8_e4m3`, `bf16`). Every
+quantized case is checked against the same kernel fed the pool's dequantized values
+before it is timed — the correctness gate `test_ornith_q4_tuned_decode_matches_dequantized_oracle`
+pins at unit scale, exercised here at benchmark scale.
+
+```bash
+python benchmarks/bench_ornith_attention.py
+python benchmarks/bench_ornith_attention.py --decode-lengths 8192 32768 131072 200000 \
+    --kv-quant int4 q8_0 --batch-sizes 1 4 16 --json out.jsonl
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
+
+`bench_decode_moe.py` also accepts `--max-context` (full-context `--max-seq-len-override`
++ `--num-tokens`), `--kv-cache-dtype`, `--prefill-chunk` (`--max-prefill-length`), and
+`--prefill-hit-d2d`, for reproducing the long-context configurations in `docs/models.md`
+(e.g. Ornith Q4_0 at 200K) through the real serving path — all optional, defaults
+unchanged when omitted.

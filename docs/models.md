@@ -63,6 +63,21 @@ work too.
   a synthetic 200K full-attention layer from 2.42 ms to 0.92 ms; the live 55.9K decode
   ran at 36--48 tok/s after warmup. A coherent 169.9K-token live generation completed
   in 425.8 s of prefill and decoded at 27--35 tok/s. `int4` remains an alias for `q4_0`.
+- On Blackwell (sm_120, e.g. RTX 5080 16 GB) the same command serves the **full
+  262,144-token window**: `--attention-backend triton --max-seq-len-override 262144
+  --num-tokens 262144 --kv-cache-dtype q4_0 --max-running-requests 1
+  --moe-backend offload --moe-cache-auto --max-prefill-length 8192`. Pass the
+  backend explicitly: sm_120 auto-resolves to FlashInfer, which cannot read the
+  quantized KV pool. The attention launch tables are
+  architecture-aware: the sm_120 Q4_0 decode launch (64 splits, 64-token tiles)
+  runs a synthetic 262K full-attention layer in 0.36 ms versus 0.82 ms with the
+  sm_89 tuning, and the extend/prefill kernels drop to 4 warps (1.12x on long-Q4
+  prefix extension, 2x on cold chunks). BLOCK_N=16 silently corrupts the packed
+  Q4 loader on sm_120 exactly as on sm_89 and stays excluded. On sm_120 the
+  Q4_K/Q6_K GGUF matmuls (dense prefill and large routed-expert batches) run on
+  llama.cpp's int8-tensor-core MMQ (vendored under `kernel/csrc/gguf_mmq/`,
+  JIT-built on first use): ~13x over the DP4A kernels and ~1.3x over transient
+  dequant+cuBLAS at 8K-token chunks, with the same lossless packed weights.
 - Nemotron 3 Super uses its native hybrid Mamba-2 / full-attention / latent-MoE
   architecture. The NVFP4 release needs about 60 GiB of host RAM for expert banks and
   10.3 GiB of resident GPU weights. FreeToken currently serves one concurrent Nemotron

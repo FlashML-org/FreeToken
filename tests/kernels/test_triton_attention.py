@@ -318,8 +318,13 @@ def test_decode_launch_config_selects_ornith_quantized_tuning_only():
     from freetoken.kernel.triton.attention import decode_launch_config
 
     assert decode_launch_config(
-        quant_name="int4", head_dim=256, num_q_heads=16, num_kv_heads=2
+        quant_name="int4", head_dim=256, num_q_heads=16, num_kv_heads=2,
+        compute_capability=(8, 9),
     ) == (32, 32, 4)
+    assert decode_launch_config(
+        quant_name="int4", head_dim=256, num_q_heads=16, num_kv_heads=2,
+        compute_capability=(12, 0),
+    ) == (64, 64, 8)
     assert decode_launch_config(
         quant_name="q8_0", head_dim=256, num_q_heads=16, num_kv_heads=2
     ) == (64, 64, 4)

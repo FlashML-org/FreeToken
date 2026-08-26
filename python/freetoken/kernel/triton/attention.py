@@ -12,17 +12,19 @@ _MIN_BLOCK_KV = 32
 
 
 def decode_launch_config(
-    *, quant_name: str | None, head_dim: int, num_q_heads: int, num_kv_heads: int
+    *,
+    quant_name: str | None,
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    compute_capability: tuple[int, int] | None = None,
 ) -> tuple[int, int, int]:
     """Return ``(kv_splits, block_n, num_warps)`` for grouped decode attention.
 
     Quantized caches are dequantized before each tensor-core dot and need more
-    parallel KV partitions than the bf16 path to fill a consumer Ada GPU.  The
-    Ornith/Qwen3.5 geometry was swept through 200K on sm_89. Q4_0 uses 32-token
-    tiles and 32 partitions, cutting a 200K full-attention layer from 2.42 ms to
-    0.92 ms. Q8_0 is faster with 64-token tiles and 64 partitions, cutting the
-    corresponding layer from 2.48 ms to 1.16 ms. Keep the prior conservative
-    launch for other shapes until they have measured configurations.
+    parallel KV partitions than the bf16 path. The Ornith/Qwen3.5 geometry has
+    measured launch configurations for consumer Ada and Blackwell; other shapes
+    keep the conservative fallback.
     """
     if (
         quant_name == "int4"
@@ -30,6 +32,10 @@ def decode_launch_config(
         and num_q_heads == 16
         and num_kv_heads == 2
     ):
+        if compute_capability is not None and compute_capability >= (12, 0):
+            # RTX 5080 / Triton 3.6: 64 splits and 64-token tiles are 57% faster
+            # than the sm_89 launch at 262K (0.356 vs 0.822 ms per layer).
+            return 64, 64, 8
         # BLOCK_N=16 is not safe for the packed-byte loader at this geometry on
         # Triton 3.6/sm_89; it silently corrupts attention output. BLOCK_N=32 has
         # a numerical regression test and is also the fastest correct 200K launch.
@@ -642,6 +648,7 @@ def decode_paged_attention(
         head_dim=head_dim,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
+        compute_capability=torch.cuda.get_device_capability(q.device),
     )
     # Direct kernel callers and older capture buffers may provide less scratch;
     # retain correctness and use every split they made available. The backend
@@ -1127,6 +1134,11 @@ def extend_paged_attention(
     # per Ornith full-attention layer at 8K) and remains ~10% faster once an
     # 8K quantized prefix is present. Larger-D fallback tiles stay at one stage.
     num_stages = 2 if (head_dim, block_m, block_n) == (256, 64, 32) else 1
+    # Swept on RTX 5080 (sm_120): 4 warps beat 8 at the consumer (64, 32) D=256
+    # tile for both extend kernels (2.01x cold prefill, 1.12x long-Q4-prefix
+    # extension); sm_89 measured faster with 8. BLOCK_N=16 corrupts the packed
+    # loader in the extend kernels too and must never be selected here.
+    num_warps = 4 if torch.cuda.get_device_capability(q.device) >= (12, 0) else 8
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
         assert k_extend is not None and v_extend is not None
@@ -1177,7 +1189,7 @@ def extend_paged_attention(
             QUANT=quant,
             QBLOCK=qblock,
             EPB=epb,
-            num_warps=8,
+            num_warps=num_warps,
             num_stages=num_stages,
         )
         return o
@@ -1218,7 +1230,7 @@ def extend_paged_attention(
         QUANT=quant,
         QBLOCK=qblock,
         EPB=epb,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=num_stages,
     )
     return o

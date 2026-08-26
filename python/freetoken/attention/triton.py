@@ -98,11 +98,17 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         quant = getattr(self.kvcache, "quant", None)
         quant_name = getattr(quant, "name", None) if getattr(quant, "enabled", False) else None
+        capability = (
+            torch.cuda.get_device_capability(self.device)
+            if self.device.type == "cuda"
+            else None
+        )
         self.max_kv_splits = decode_launch_config(
             quant_name=quant_name,
             head_dim=self.max_head_dim,
             num_q_heads=self.num_q_heads,
             num_kv_heads=int(getattr(config, "num_kv_heads", 1)),
+            compute_capability=capability,
         )[0]
 
     def _ensure_decode_scratch(

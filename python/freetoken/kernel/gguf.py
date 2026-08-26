@@ -73,6 +73,59 @@ def _module():
     )
 
 
+_CSRC_MMQ = pathlib.Path(__file__).parent / "csrc" / "gguf_mmq"
+
+# Upstream int8-MMA mul_mat_q is only instantiated for these ggml types
+# (Q4_K=12, Q6_K=14 -- Ornith's dense projection types).
+_MMA_TYPES = frozenset({12, 14})
+
+
+@functools.cache
+def _mma_module():
+    """Upstream llama.cpp int8-tensor-core MMQ (csrc/gguf_mmq), sm_75+ hardware.
+
+    Vendored verbatim from llama.cpp master (see mmq_ext.cu header). Separate
+    extension so the sibling b2899 DP4A module and its build cache are
+    untouched; compiled lazily the first time the MMA path is selected.
+    """
+    from torch.utils.cpp_extension import load
+
+    extra_cuda_cflags = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "--use_fast_math",
+        # llama.cpp relies on the implicit half<->float conversions that
+        # torch's default nvcc flags disable.
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    ]
+    host_cxx = _host_compiler()
+    if host_cxx is not None:
+        cxx_path = shutil.which(host_cxx) or host_cxx
+        extra_cuda_cflags += ["-ccbin", cxx_path]
+        os.environ["CXX"] = cxx_path
+        os.environ["CC"] = _c_compiler_for(cxx_path)
+
+    return load(
+        name="freetoken_gguf_mmq",
+        sources=[
+            str(_CSRC_MMQ / "mmq_ext.cu"),
+            str(_CSRC_MMQ / "quantize.cu"),
+            str(_CSRC_MMQ / "mmid.cu"),
+        ],
+        extra_include_paths=[str(_CSRC_MMQ)],
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=True,
+    )
+
+
+def mma_mmq_supported(quant_type: int) -> bool:
+    """Whether the int8-MMA MMQ extension covers ``quant_type``."""
+    return quant_type in _MMA_TYPES
+
+
 # ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----
 
 
@@ -95,6 +148,36 @@ def ggml_mul_mat_a8(
 ) -> torch.Tensor:
     """MMQ: large-batch quantized matmul. ``row`` = output features."""
     return _module().ggml_mul_mat_a8(weight, x, quant_type, row)
+
+
+def ggml_mul_mat_a8_mma(
+    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """Upstream int8-MMA MMQ (Q4_K/Q6_K). Returns fp32 ``[tokens, row]``."""
+    return _mma_module().ggml_mul_mat_a8_mma(weight, x, quant_type, row)
+
+
+def ggml_moe_a8_mma(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+    expert_stride_bytes: int = 0,
+    broadcast: bool = True,
+) -> torch.Tensor:
+    """Upstream int8-MMA grouped expert matmul over flat padded slots.
+
+    ``broadcast=True``: ``x[tokens, in]`` shared by each token's top_k experts
+    (gate/up). ``broadcast=False``: ``x[tokens*top_k, in]`` with row
+    ``t*top_k + k`` belonging to ``topk_ids[t][k]`` (down). Returns fp32
+    ``[tokens*top_k, row]`` in that same row order.
+    """
+    return _mma_module().ggml_moe_a8_mma(
+        x, weight, topk_ids, top_k, quant_type, row, tokens, expert_stride_bytes, broadcast
+    )
 
 
 def ggml_moe_a8(
@@ -144,6 +227,9 @@ __all__ = [
     "ggml_dequantize",
     "ggml_mul_mat_vec_a8",
     "ggml_mul_mat_a8",
+    "ggml_mul_mat_a8_mma",
+    "ggml_moe_a8_mma",
+    "mma_mmq_supported",
     "ggml_moe_a8",
     "ggml_moe_a8_vec",
     "ggml_moe_get_block_size",
