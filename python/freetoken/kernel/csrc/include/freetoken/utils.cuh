@@ -32,6 +32,20 @@ inline hipError_t cudaFuncSetAttribute(const void *func, hipFuncAttribute attr,
 constexpr hipFuncAttribute cudaFuncAttributeMaxDynamicSharedMemorySize =
     hipFuncAttributeMaxDynamicSharedMemorySize;
 
+inline hipError_t cudaGetDevice(int *device) { return hipGetDevice(device); }
+inline hipError_t cudaDeviceGetAttribute(int *value, hipDeviceAttribute_t attr,
+                                         int device) {
+  return hipDeviceGetAttribute(value, attr, device);
+}
+inline hipError_t cudaHostGetDevicePointer(void **devPtr, void *hostPtr,
+                                           unsigned int flags) {
+  return hipHostGetDevicePointer(devPtr, hostPtr, flags);
+}
+constexpr hipDeviceAttribute_t cudaDevAttrUnifiedAddressing =
+    hipDeviceAttributeUnifiedAddressing;
+constexpr hipDeviceAttribute_t cudaDevAttrCanUseHostPointerForRegisteredMem =
+    hipDeviceAttributeCanUseHostPointerForRegisteredMem;
+
 // CUDA-only kernel-parameter annotation (passes large by-value params via constant
 // memory instead of copying them into local/generic memory first); HIP has no
 // equivalent attribute, so this just falls back to an ordinary by-value parameter.
