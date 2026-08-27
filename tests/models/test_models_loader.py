@@ -6,6 +6,17 @@ from types import SimpleNamespace
 import torch
 
 
+def test_drop_page_cache_is_a_noop_without_posix_fadvise(tmp_path, monkeypatch):
+    from freetoken.models import loader
+
+    path = tmp_path / "weights.safetensors"
+    path.write_bytes(b"weights")
+    monkeypatch.delattr(loader.os, "posix_fadvise", raising=False)
+    monkeypatch.delattr(loader.os, "POSIX_FADV_DONTNEED", raising=False)
+
+    loader.drop_page_cache(str(path))
+
+
 def test_shard_tensor_splits_vocab_with_ceil_partition():
     from freetoken.models.loader import shard_tensor
 

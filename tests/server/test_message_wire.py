@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -18,6 +20,7 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
@@ -122,3 +125,24 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_multidimensional_bfloat16_tensor_survives_backend_wire() -> None:
+    pixels = torch.arange(24, dtype=torch.float32).reshape(3, 8).to(torch.bfloat16)
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+        mm_pixel_values=pixels,
+        mm_image_grid_thw=torch.tensor([[1, 2, 4]], dtype=torch.int64),
+        mm_token_type_ids=torch.tensor([0, 1, 1], dtype=torch.int32),
+    )
+
+    out = BaseBackendMsg.decoder(msg.encoder())
+
+    assert isinstance(out, UserMsg)
+    assert out.mm_pixel_values.dtype == torch.bfloat16
+    assert out.mm_pixel_values.shape == (3, 8)
+    assert torch.equal(out.mm_pixel_values, pixels)
+    assert torch.equal(out.mm_image_grid_thw, msg.mm_image_grid_thw)
+    assert torch.equal(out.mm_token_type_ids, msg.mm_token_type_ids)

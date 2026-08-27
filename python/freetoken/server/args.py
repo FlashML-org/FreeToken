@@ -48,15 +48,39 @@ class ServerArgs(SchedulerConfig):
     def share_tokenizer(self) -> bool:
         return self.num_tokenizer == 0
 
+    def _zmq_addr(self, channel: int) -> str:
+        if os.name == "nt":
+            # libzmq does not implement ipc:// on Windows.  Keep every internal
+            # socket on loopback, after the HTTP port and the distributed port.
+            port = self.server_port + 2 + channel
+            if port > 65535:
+                raise ValueError(
+                    f"server port {self.server_port} leaves no room for internal ports"
+                )
+            return f"tcp://127.0.0.1:{port}"
+        return f"ipc:///tmp/freetoken_{channel}{self._unique_suffix}"
+
+    @property
+    def zmq_backend_addr(self) -> str:
+        return self._zmq_addr(0)
+
+    @property
+    def zmq_detokenizer_addr(self) -> str:
+        return self._zmq_addr(1)
+
+    @property
+    def zmq_scheduler_broadcast_addr(self) -> str:
+        return self._zmq_addr(2)
+
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return self._zmq_addr(3)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = self._zmq_addr(4)
         assert result != self.zmq_detokenizer_addr
         return result
 

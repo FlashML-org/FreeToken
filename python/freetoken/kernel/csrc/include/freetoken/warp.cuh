@@ -1,7 +1,9 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
+#ifndef _WIN32
 #include <sys/cdefs.h>
+#endif
 
 #include <cstddef>
 

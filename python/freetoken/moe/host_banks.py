@@ -147,7 +147,29 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        madvise = getattr(self._buf, "madvise", None)
+        dontneed = getattr(mmap, "MADV_DONTNEED", None)
+        if madvise is not None and dontneed is not None:
+            madvise(dontneed)
+            return
+        if os.name == "nt":
+            # Windows does not expose mmap.madvise. The streaming converter is
+            # finished with this bank, including every tensor alias kept in its
+            # source lists. Reset that shared Tensor object, then close the pagefile
+            # mapping so each completed layer releases physical memory immediately.
+            self.tensor.set_(torch.empty(0, dtype=self.tensor.dtype))
+            buf = self._buf
+            try:
+                buf.close()
+            except BufferError:
+                # A backend-specific repacked view can still export the mapping.
+                # Correctness does not depend on discarding it; Windows can reclaim
+                # the pages under pressure and process exit releases the mapping.
+                return
+            try:
+                _LIVE_BUFFERS.remove(buf)
+            except ValueError:
+                pass
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
@@ -172,6 +194,10 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
+    if os.name == "nt":
+        _windows_lock(addr, nbytes)
+        return
+
     global _os_locked_total
     import resource
 
@@ -193,6 +219,64 @@ def _os_lock(addr: int, nbytes: int) -> None:
             f"mlock({nbytes / 2**30:.1f} GiB): {os.strerror(err)} "
             f"(RLIMIT_MEMLOCK / `ulimit -l` caps OS-locked bytes; raise it or "
             f"shrink --moe-cpu-layers)",
+        )
+    _os_locked_total += nbytes
+
+
+def _windows_lock(addr: int, nbytes: int) -> None:
+    """Keep a host-bank range resident with ``VirtualLock`` on native Windows.
+
+    Windows limits ``VirtualLock`` to the process working-set floor. Grow that
+    floor before locking each completed bank. This does not consume CUDA's WDDM
+    registered-memory quota and does not create a GPU device address, so these
+    banks remain CPU-executor-only exactly like Linux ``mlock`` banks.
+    """
+    global _os_locked_total
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    process = kernel32.GetCurrentProcess()
+
+    kernel32.GetProcessWorkingSetSize.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.GetProcessWorkingSetSize.restype = wintypes.BOOL
+    kernel32.SetProcessWorkingSetSize.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    kernel32.SetProcessWorkingSetSize.restype = wintypes.BOOL
+    kernel32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    kernel32.VirtualLock.restype = wintypes.BOOL
+
+    current_min = ctypes.c_size_t()
+    current_max = ctypes.c_size_t()
+    if not kernel32.GetProcessWorkingSetSize(
+        process, ctypes.byref(current_min), ctypes.byref(current_max)
+    ):
+        err = ctypes.get_last_error()
+        raise OSError(err, f"GetProcessWorkingSetSize: {ctypes.FormatError(err)}")
+
+    reserve = 256 << 20
+    want = _os_locked_total + nbytes + reserve
+    new_min = max(current_min.value, want)
+    new_max = max(current_max.value, new_min + reserve)
+    if not kernel32.SetProcessWorkingSetSize(process, new_min, new_max):
+        err = ctypes.get_last_error()
+        raise OSError(
+            err,
+            f"SetProcessWorkingSetSize({new_min / 2**30:.1f} GiB minimum): "
+            f"{ctypes.FormatError(err)}",
+        )
+    if not kernel32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+        err = ctypes.get_last_error()
+        raise OSError(
+            err,
+            f"VirtualLock({nbytes / 2**30:.1f} GiB): {ctypes.FormatError(err)}",
         )
     _os_locked_total += nbytes
 

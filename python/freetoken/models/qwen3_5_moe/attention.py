@@ -60,10 +60,11 @@ class Qwen3_5Attention(BaseOP):
         )
         self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
 
-    def _project(self, x: torch.Tensor):
+    def _project(self, x: torch.Tensor, positions: torch.Tensor | None = None):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        if positions is None:
+            positions = get_global_ctx().batch.positions
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)

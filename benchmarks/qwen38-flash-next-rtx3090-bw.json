@@ -1,0 +1,50 @@
+{
+  "version": 4,
+  "timestamp": "2026-08-26T18:36:33-04:00",
+  "epoch": 1787783793,
+  "gpu": {
+    "index": 0,
+    "name": "NVIDIA GeForce RTX 3090"
+  },
+  "cpu": {
+    "physical_cores": 32,
+    "threads_used": 32
+  },
+  "threshold": 2.0,
+  "ceilings": {
+    "cpu_stream_read_gbs": 46.31,
+    "pcie_linear_h2d_gbs": 12.31,
+    "pcie_linear_d2h_gbs": 13.16
+  },
+  "dtypes": {},
+  "dtype_kernels": {},
+  "workloads": {
+    "qwen3.8-flash-next": {
+      "model": {
+        "name": "qwen3.8-flash-next",
+        "hidden": 2560,
+        "inter": 640,
+        "experts": 512,
+        "top_k": 10
+      },
+      "kernels": {
+        "nvfp4": {
+          "expert_bytes": 2772480,
+          "synth_experts": 512,
+          "cpu_moe_gbs": 0.19,
+          "cpu_moe_isa": "avx2+vnni(nvfp4-w4a8)",
+          "isa_sweep": null,
+          "pcie_gather_gbs": 9.73,
+          "cpu_moe_overlap_gbs": 0.13,
+          "pcie_gather_overlap_gbs": 9.68,
+          "ratio": 0.02,
+          "recommended": "offload",
+          "note": null
+        }
+      },
+      "recommended_moe_backend": {
+        "nvfp4": "offload"
+      }
+    }
+  }
+}

@@ -29,7 +29,13 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         * config.dtype.itemsize
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2
+    index_bytes = spec.index_head_dim * spec.num_index_layers * 2
+    if spec.attn_type.value == "qsa":
+        index_bytes *= spec.index_num_kv_heads
+        if index_bytes % spec.index_compress_ratio:
+            raise ValueError("QSA index bytes must divide evenly by its compression ratio")
+        index_bytes //= spec.index_compress_ratio
+    return per_token + index_bytes
 
 
 class BaseKVCachePool(ABC):

@@ -97,6 +97,9 @@ class KVCacheGroupSpec:
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
+    index_num_kv_heads: int = 1
+    index_compress_ratio: int = 1
+    index_token_budget: int = 0
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
@@ -148,6 +151,28 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
 
 
 @dataclass(frozen=True)
+class QSAAttentionGroupConfig(BaseAttentionGroupConfig):
+    """Qwen compressed sparse-attention group.
+
+    Full K/V remains paged at token resolution. The indexer keeps one BF16
+    key per ``index_compress_ratio`` tokens, then selects
+    ``index_token_budget`` original tokens for exact sparse GQA.
+    """
+
+    kind: ClassVar[Literal["qsa"]] = "qsa"
+    cache_kind: ClassVar[Literal["qsa_paged"]] = "qsa_paged"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    index_num_heads: int
+    index_num_kv_heads: int
+    index_head_dim: int
+    index_token_budget: int
+    index_compress_ratio: int
+
+
+@dataclass(frozen=True)
 class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     kind: ClassVar[Literal["linear_gated_delta"]] = "linear_gated_delta"
     cache_kind: ClassVar[Literal["linear_state"]] = "linear_state"
@@ -177,6 +202,7 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
 
 AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
+    | QSAAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
@@ -387,6 +413,8 @@ class ModelConfig:
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
             return AttnType.DSV4
+        if isinstance(group, QSAAttentionGroupConfig):
+            return AttnType.QSA
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -415,6 +443,22 @@ class ModelConfig:
                         index_head_dim=group.index_head_dim,
                         num_index_layers=group.num_index_layers,
                         attn_type=_full_group_attn_type(group),
+                    )
+                )
+            elif isinstance(group, QSAAttentionGroupConfig):
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=None,
+                        index_head_dim=group.index_head_dim,
+                        num_index_layers=len(group.layer_ids),
+                        index_num_kv_heads=group.index_num_kv_heads,
+                        index_compress_ratio=group.index_compress_ratio,
+                        index_token_budget=group.index_token_budget,
+                        attn_type=AttnType.QSA,
                     )
                 )
             elif isinstance(group, SWAAttentionGroupConfig):

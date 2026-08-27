@@ -868,3 +868,25 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_os_lock_dispatches_to_virtual_lock_on_windows(monkeypatch):
+    import freetoken.moe.host_banks as hb
+
+    calls = []
+    monkeypatch.setattr(hb.os, "name", "nt")
+    monkeypatch.setattr(hb, "_windows_lock", lambda addr, nbytes: calls.append((addr, nbytes)))
+    hb._os_lock(0x1000, 8192)
+    assert calls == [(0x1000, 8192)]
+
+
+def test_host_bank_release_is_portable() -> None:
+    import freetoken.moe.host_banks as hb
+
+    bank = hb.HostBank((4096,), torch.uint8)
+    alias = bank.tensor
+    bank.tensor.fill_(1)
+    bank.release()
+    if hb.os.name == "nt":
+        assert alias.numel() == 0
+        assert bank._buf.closed

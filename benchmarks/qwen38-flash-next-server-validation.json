@@ -1,0 +1,32 @@
+{
+  "date": "2026-08-26",
+  "platform": "Windows, NVIDIA RTX 3090",
+  "model": "Qwen3.8-Flash-Next NVFP4 FTW",
+  "served_model_name": "qwen3.8-flash-next-nvfp4",
+  "context_length": 262144,
+  "kv_cache_gib": 6.19,
+  "api": {
+    "health": "passed",
+    "models": "passed",
+    "chat_completions_text": {
+      "expected": "FREETOKEN_SERVER_OK",
+      "actual": "FREETOKEN_SERVER_OK",
+      "prompt_tokens": 21,
+      "completion_tokens": 6
+    },
+    "chat_completions_vision": {
+      "image": "assets/desktop-console.png",
+      "resolution": "2920x1944",
+      "expected": "FreeToken Desktop",
+      "actual": "FreeToken Desktop",
+      "prompt_tokens": 5589,
+      "completion_tokens": 6,
+      "reported_prefill_tokens_per_second": 143.53
+    }
+  },
+  "notes": [
+    "OpenAI image_url data URI input passed through the multiprocess server.",
+    "Pixel transport uses BF16 because the vision patch projection converts pixels to BF16 before its first operation.",
+    "The validation server was stopped after the checks."
+  ]
+}

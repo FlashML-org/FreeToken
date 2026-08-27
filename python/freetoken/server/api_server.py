@@ -59,6 +59,25 @@ _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
+def windows_selector_loop_factory(use_subprocess: bool = False) -> asyncio.AbstractEventLoop:
+    """Return the Windows loop required by pyzmq.asyncio.
+
+    Uvicorn 0.36 and later bypasses the global event-loop policy and creates a
+    Proactor loop directly on Windows.  pyzmq needs ``add_reader``, which only
+    the Selector loop provides without an optional Tornado dependency.
+    """
+    del use_subprocess
+    return asyncio.SelectorEventLoop()
+
+
+def _uvicorn_loop() -> str:
+    return (
+        "freetoken.server.api_server:windows_selector_loop_factory"
+        if os.name == "nt"
+        else "auto"
+    )
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -897,7 +916,9 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=host, port=port, access_log=False, loop=_uvicorn_loop())
+    )
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -929,6 +950,12 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
+
+    if os.name == "nt":
+        # pyzmq.asyncio needs add_reader/add_writer.  Python's default Windows
+        # Proactor loop does not provide them unless Tornado is installed.
+        # Select the native compatible loop before Uvicorn creates its loop.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
@@ -1037,4 +1064,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop=_uvicorn_loop())

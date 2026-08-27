@@ -37,6 +37,7 @@ import math
 import mmap
 import os
 import re
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -53,7 +54,6 @@ ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)
 DEFAULT_SHARD_LIMIT = 8 << 30  # 8 GiB; must be a multiple of ALIGN
 _SHARD_FMT = "freetoken-{:05d}.ftw"
 _DEFAULT_CHUNK = 8 << 20
-_BANK_CONCURRENCY = 4
 _ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
@@ -261,7 +261,10 @@ class FTWReader:
                 if entry is None:
                     fd = os.open(os.path.join(self.dir, file), os.O_RDONLY)
                     try:
-                        m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                        if sys.platform == "win32":
+                            m = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+                        else:
+                            m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
                     finally:
                         os.close(fd)  # the mapping keeps its own reference to the file
                     try:
@@ -276,10 +279,21 @@ class FTWReader:
         for fd in self._fds.values():
             os.close(fd)
         self._fds.clear()
-        for m, mv in self._maps.values():
+        self.drop_maps()
+
+    def drop_maps(self) -> None:
+        """Close cached source mappings after all active reads have finished.
+
+        Windows counts touched file mappings in the process working set.  Keeping
+        every FTW shard mapped while also filling the 60+ GiB pinned destination
+        bank can exhaust RAM and force paging.  Streaming callers use this method
+        between entries so only the current source shard stays mapped.
+        """
+        maps = self._maps
+        self._maps = {}
+        for m, mv in maps.values():
             mv.release()
             m.close()
-        self._maps.clear()
 
     def _pieces(self, global_off: int, nbytes: int):
         """Yield (file, file_off, dest_off, length) covering [global_off, +nbytes),
@@ -382,6 +396,8 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
             for e in entries:
                 buf = _transient_buffer(e["nbytes"])
                 reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
+                if sys.platform == "win32":
+                    reader.drop_maps()
                 dt = _dtype_of(e["dtype"])
                 t = torch.frombuffer(buf, dtype=dt, count=e["nbytes"] // _elsize(dt))
                 if not _put((e["name"], t.view(*e["shape"]) if e["shape"] else t, buf, e["nbytes"])):
@@ -568,12 +584,27 @@ def load_ftw_banks(
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
-            with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
-                futures = [ex.submit(_read_alpha, e) for e in alpha_entries]
-                futures += [ex.submit(_read_row, job) for job in row_jobs]
-                futures += [ex.submit(_read_layer, job) for job in layer_jobs]
-                for f in futures:
-                    f.result()
+            if sys.platform == "win32":
+                # Windows has no O_DIRECT path.  Stream one physically ordered
+                # entry at a time and unmap its source shard immediately.  The
+                # previous four-entry queue retained touched source mappings while
+                # the 63+ GiB pinned destination stayed resident, which drove a
+                # 128 GiB system into paging.  read_into still uses its inner copy
+                # pool, and PinPipeline still overlaps registration with reads.
+                jobs = [(e["global_off"], _read_alpha, e) for e in alpha_entries]
+                jobs += [(job[2], _read_row, job) for job in row_jobs]
+                jobs += [(job[2]["global_off"], _read_layer, job) for job in layer_jobs]
+                for _off, read, job in sorted(jobs, key=lambda item: item[0]):
+                    read(job)
+                    reader.drop_maps()
+            else:
+                ordered_layer_jobs = sorted(layer_jobs, key=lambda job: job[2]["global_off"])
+                with ThreadPoolExecutor(min(16, max(n_jobs, 1))) as ex:
+                    futures = [ex.submit(_read_alpha, e) for e in alpha_entries]
+                    futures += [ex.submit(_read_row, job) for job in row_jobs]
+                    futures += [ex.submit(_read_layer, job) for job in ordered_layer_jobs]
+                    for f in futures:
+                        f.result()
     finally:
         bar.close()
         reader.close()

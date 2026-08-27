@@ -61,6 +61,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .bsa_pool import BSAKVCache
 
         return BSAKVCache
+    if AttnType.QSA in types:
+        from .qsa_pool import QSAKVCache
+
+        return QSAKVCache
     from .mha_pool import MHAKVCache
 
     return MHAKVCache
@@ -172,6 +176,24 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
+        )
+
+    if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.QSA:
+        from .qsa_pool import QSAKVCache
+
+        spec = kv_specs[0]
+        return QSAKVCache(
+            num_kv_heads=spec.num_kv_heads,
+            num_layers=model_config.num_layers,
+            head_dim=spec.head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            index_num_kv_heads=spec.index_num_kv_heads,
+            index_head_dim=spec.index_head_dim,
+            compress_ratio=spec.index_compress_ratio,
+            layer_ids=spec.layer_ids,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

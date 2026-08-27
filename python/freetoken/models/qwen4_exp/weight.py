@@ -10,6 +10,8 @@ from tqdm import tqdm
 
 from freetoken.models.qwen3_5_moe.weight import (
     iter_weights_parallel,
+    load_nvfp4_expert_sources,
+    load_nvfp4_expert_sources_parallel,
     setup_offload_expert_banks,
 )
 
@@ -34,10 +36,12 @@ _FUSIONS = {
 
 
 def _rename(raw_name: str) -> str | None:
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
-    if ".self_attn.indexer." in raw_name:
-        return None
+    if raw_name.startswith("model.visual."):
+        return "visual." + raw_name[len("model.visual.") :]
+    if raw_name.startswith("visual."):
+        return raw_name
     if ".ple.ple_embedding.ngram_embedding." in raw_name:
         return None
     if raw_name.startswith("model.language_model."):
@@ -101,4 +105,10 @@ def iter_weights(
         raise RuntimeError(f"Incomplete Qwen4-Exp projection fusions: {sorted(buffers)}")
 
 
-__all__ = ["iter_weights", "iter_weights_parallel", "setup_offload_expert_banks"]
+__all__ = [
+    "iter_weights",
+    "iter_weights_parallel",
+    "load_nvfp4_expert_sources",
+    "load_nvfp4_expert_sources_parallel",
+    "setup_offload_expert_banks",
+]

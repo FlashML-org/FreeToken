@@ -128,6 +128,8 @@ def _resolve_auto_attention_backend(
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
         candidates.append(("m3_sparse", True))
+    if AttnType.QSA in required:
+        candidates.append(("qsa", True))
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
@@ -176,7 +178,10 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
+                for name in (
+                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse",
+                    "m3_sparse", "qsa",
+                )
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -1166,12 +1171,55 @@ def _cpu_moe_executor_viable(model_config) -> bool:
 def _pin_budget_bytes() -> int | None:
     """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere."""
+    Native Windows and WSL both use WDDM-backed CUDA, which caps registered host
+    memory near half of physical RAM and shares that pool across processes. Keep
+    20% headroom by budgeting 40%. ``FREETOKEN_PIN_BUDGET_GB`` overrides this on
+    every platform."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         return int(float(env) * 2**30)
-    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
+
+    if os.name == "nt":
+        total = _windows_total_physical_memory()
+        return int(total * 0.4) if total is not None else None
+
+    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():
         return None
     return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+
+
+def _windows_total_physical_memory() -> int | None:
+    """Return native-Windows physical RAM through ``GlobalMemoryStatusEx``.
+
+    This stays stdlib-only because the server must make the pin-budget decision
+    before optional monitoring packages are available. ``None`` is a defensive
+    fallback for an unexpected Win32 API failure; callers then retain the old
+    explicit-override behavior through ``FREETOKEN_PIN_BUDGET_GB``.
+    """
+    if os.name != "nt":
+        return None
+
+    import ctypes
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+    try:
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    except (AttributeError, OSError):
+        return None
+    return int(status.ullTotalPhys) if ok else None
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
@@ -1315,11 +1363,11 @@ def _adjust_config(config: EngineConfig):
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
-    if AttnType.BSA in required_attn_types and _dtype is not None and _dtype.itemsize != 2:
+    if required_attn_types & {AttnType.BSA, AttnType.QSA} and _dtype is not None and _dtype.itemsize != 2:
         # Reject at config time: the BSA pool's own assert only fires after the
         # model is resident (and not at all under `python -O`).
         raise ValueError(
-            f"--dtype {config.dtype}: block-sparse attention serves 16-bit "
+            f"--dtype {config.dtype}: sparse attention serves 16-bit "
             "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
             "or float16."
         )

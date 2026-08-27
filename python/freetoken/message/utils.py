@@ -32,10 +32,13 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        tensor = self.detach().to(device="cpu").contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        # A byte view supports every torch dtype, including bfloat16, which NumPy
+        # cannot represent directly on all supported versions.
+        serialized["buffer"] = tensor.view(torch.uint8).numpy().tobytes()
+        serialized["dtype"] = str(tensor.dtype)
+        serialized["shape"] = list(tensor.shape)
         return serialized
 
     # normal type
@@ -68,10 +71,12 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        shape = tuple(data.get("shape", ()))
+        torch_dtype = getattr(torch, dtype_str)
+        raw = torch.from_numpy(np.frombuffer(buffer, dtype=np.uint8).copy())
+        tensor = raw.view(torch_dtype)
+        return tensor.reshape(shape) if "shape" in data else tensor
 
     cls = cls_map.get(type_name)
     if cls is None:

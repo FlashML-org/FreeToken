@@ -4,9 +4,22 @@ The comparator lives in freetoken.kernel.utils; this pins the matrix for the sta
 version scheme (runtime `0.1.1+g<sha>`, cache `0.1.1+cu130.g<sha>`) introduced by
 scripts/build-release-wheels.sh."""
 
+from pathlib import Path
+
 import pytest
 
-from freetoken.kernel.utils import _kernel_cache_version_ok
+from freetoken.kernel.utils import _kernel_cache_version_ok, _prebuilt_library_path
+
+
+@pytest.mark.parametrize(
+    ("platform", "suffix"),
+    [("win32", ".dll"), ("linux", ".so")],
+)
+def test_prebuilt_library_path_uses_platform_suffix(platform: str, suffix: str) -> None:
+    name = "freetoken__store_1024_128_1_false"
+    assert _prebuilt_library_path(Path("cache"), name, platform=platform) == (
+        Path("cache") / name / f"{name}{suffix}"
+    )
 
 
 @pytest.mark.parametrize(

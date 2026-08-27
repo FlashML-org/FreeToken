@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -64,6 +65,53 @@ _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".ftw")  # .ftw: a nested FTW, not 
 _SKIP_NAMES = ("model.safetensors.index.json",)  # indexes shards the FTW replaces
 # .freetoken_expert_cache: the legacy per-bank cache (can be tens of GB of stale .bin)
 _SKIP_DIRS = (".git", ".cache", ".freetoken_expert_cache")
+_QWEN4_PLE_FRAGMENT = ".ple.ple_embedding.ngram_embedding."
+
+
+def _copy_host_mapped_weights(model_path: str, out_dir: str) -> list[str]:
+    """Preserve large CPU-mapped weights that are intentionally absent from FTW.
+
+    Qwen4-Exp PLE tables are random-access host embeddings.  They must remain
+    memory-mapped safetensors instead of being copied into resident RAM or GPU
+    weights.  Copy only the shards named by those keys and write a small index
+    that contains only the preserved host weights.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return []
+    with open(index_path, encoding="utf-8") as index_file:
+        index = json.load(index_file)
+    source_map = index.get("weight_map", {})
+    weight_map = {
+        name: filename
+        for name, filename in source_map.items()
+        if _QWEN4_PLE_FRAGMENT in name
+    }
+    if not weight_map:
+        return []
+
+    copied: list[str] = []
+    total_size = 0
+    for rel in sorted(set(weight_map.values())):
+        src = os.path.join(model_path, rel)
+        if not os.path.isfile(src):
+            raise FileNotFoundError(f"host-mapped checkpoint shard is missing: {src}")
+        dst = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(rel)
+        total_size += os.path.getsize(src)
+
+    slim_index = {
+        "metadata": {"total_size": total_size, "freetoken_host_mapped_only": True},
+        "weight_map": weight_map,
+    }
+    dst_index = os.path.join(out_dir, "model.safetensors.index.json")
+    with open(dst_index, "w", encoding="utf-8") as index_file:
+        json.dump(slim_index, index_file, indent=2, sort_keys=True)
+        index_file.write("\n")
+    copied.append("model.safetensors.index.json")
+    return copied
 
 
 def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
@@ -100,6 +148,7 @@ def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
             copied.append(rel)
+    copied.extend(_copy_host_mapped_weights(model_path, out_dir))
     return copied
 
 

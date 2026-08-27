@@ -145,6 +145,29 @@ def test_chat_request_accepts_tool_messages_and_assistant_tool_calls():
     assert req.messages[0].tool_calls[0].function.arguments == '{"city":"Paris"}'
 
 
+def test_chat_request_preserves_image_parts_for_multimodal_worker():
+    req = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "Read the title"},
+                ],
+            }
+        ],
+        max_tokens=8,
+    )
+
+    content = chat_request_to_genspec(req, {}).messages[0]["content"]
+
+    assert isinstance(content, list)
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[1] == {"type": "text", "text": "Read the title"}
+
+
 def test_chat_request_reasoning_replay_field_aliases():
     # Any replay field name in -> both template-read field names out.
     for field in ("reasoning_content", "reasoning", "thinking"):

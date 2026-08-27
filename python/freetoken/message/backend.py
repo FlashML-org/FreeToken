@@ -37,6 +37,17 @@ class UserMsg(BaseBackendMsg):
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
+    # Online multimodal requests carry processor outputs from the CPU tokenizer
+    # worker to the GPU scheduler. The scheduler turns these into mm_embeds before
+    # admission. Pixel rows are BF16 because the vision patch projection casts to
+    # its BF16 weights immediately; this halves local transport without changing
+    # the model input.
+    mm_pixel_values: torch.Tensor | None = None
+    mm_image_grid_thw: torch.Tensor | None = None
+    mm_token_type_ids: torch.Tensor | None = None
+    # Optional CPU [3, prompt_tokens] Qwen multimodal RoPE coordinates.
+    mrope_position_ids: torch.Tensor | None = None
+    mrope_position_delta: int = 0
 
 
 @dataclass

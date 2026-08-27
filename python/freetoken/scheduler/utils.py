@@ -18,6 +18,8 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    mrope_position_ids: torch.Tensor | None = None
+    mrope_position_delta: int = 0
 
     @property
     def input_len(self) -> int:

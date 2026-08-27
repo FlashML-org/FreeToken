@@ -474,6 +474,36 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    @torch.inference_mode()
+    def _prepare_multimodal_request(self, msg: UserMsg) -> None:
+        """Convert online Qwen processor outputs into vision embeddings and mRoPE."""
+        grid = msg.mm_image_grid_thw
+        token_types = msg.mm_token_type_ids
+        if grid is None or token_types is None:
+            raise ValueError("Qwen image input needs image_grid_thw and mm_token_type_ids")
+        model = self.engine.model
+        if not hasattr(model, "encode_images"):
+            raise ValueError(f"{type(model).__name__} does not support image inputs")
+
+        msg.mm_embeds = model.encode_images(
+            msg.mm_pixel_values.to(self.device), grid.to(self.device)
+        )
+        from freetoken.models.qwen4_exp.mrope import build_mrope_positions
+
+        vision_config = self.config.model_config.vision_config
+        if vision_config is None:
+            raise ValueError("model vision configuration is not loaded")
+        msg.mrope_position_ids, msg.mrope_position_delta = build_mrope_positions(
+            msg.input_ids,
+            token_types,
+            grid,
+            int(vision_config.spatial_merge_size),
+        )
+        # Release the large CPU transport tensor before prefill.
+        msg.mm_pixel_values = None
+        msg.mm_image_grid_thw = None
+        msg.mm_token_type_ids = None
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -489,6 +519,15 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.mm_pixel_values is not None:
+                try:
+                    self._prepare_multimodal_request(msg)
+                except Exception as exc:  # noqa: BLE001 - fail this request, not the server
+                    logger.warning_rank0("Image processing failed for request %d: %s", msg.uid, exc)
+                    self.send_result(
+                        [ErrorReplyMsg(uid=msg.uid, error=f"could not encode image: {exc}")]
+                    )
+                    return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -781,6 +820,7 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        batch.rope_positions = _make_rope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -888,6 +928,38 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """Build packed three-axis positions when a batch contains Qwen VL input."""
+    if not any(req.mrope_position_ids is not None for req in batch.padded_reqs):
+        return None
+    needed_size = sum(req.extend_len for req in batch.padded_reqs)
+    host = torch.empty((3, needed_size), dtype=torch.int64, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        start, end = int(req.cached_len), int(req.device_len)
+        length = end - start
+        if not length:
+            continue
+        prompt_positions = req.mrope_position_ids
+        prompt_len = 0 if prompt_positions is None else int(prompt_positions.shape[1])
+        prompt_stop = min(end, prompt_len)
+        copied = max(prompt_stop - start, 0)
+        if copied:
+            host[:, offset : offset + copied].copy_(
+                prompt_positions[:, start:prompt_stop]
+            )
+        generated_start = start + copied
+        if generated_start < end:
+            generated = torch.arange(
+                generated_start,
+                end,
+                dtype=torch.int64,
+            ).add_(int(req.mrope_position_delta))
+            host[:, offset + copied : offset + length].copy_(generated.expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

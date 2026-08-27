@@ -188,9 +188,12 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize OpenAI-shaped messages for the chat template.
+
+    Text-only part lists are flattened for broad template compatibility. Image
+    parts stay structured so multimodal templates can insert their image tokens
+    and the tokenizer worker can load the corresponding pixels.
+    """
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +201,10 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        if any(_is_image_part(part) for part in content):
+            m["content"] = [_normalize_content_part(part) for part in content]
+        else:
+            m["content"] = _flatten_text_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -230,6 +236,23 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
+def _is_image_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    return part.get("type") in {"image", "image_url"} or "image" in part or "image_url" in part
+
+
+def _normalize_content_part(part: Any) -> dict[str, Any]:
+    if not isinstance(part, dict):
+        raise ValueError("Message content parts must be objects")
+    ptype = part.get("type")
+    if ptype == "text":
+        return {"type": "text", "text": part.get("text") or ""}
+    if _is_image_part(part):
+        return dict(part)
+    raise ValueError(f"Unsupported content part type: {ptype}")
+
+
 def _flatten_text_parts(parts: list[Any]) -> str:
     texts: list[str] = []
     for part in parts:
@@ -237,7 +260,7 @@ def _flatten_text_parts(parts: list[Any]) -> str:
         if ptype == "text":
             texts.append((part.get("text") if isinstance(part, dict) else None) or "")
         else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
+            raise ValueError(f"Unsupported content part type: {ptype}")
     return "".join(texts)
 
 

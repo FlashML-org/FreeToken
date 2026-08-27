@@ -40,11 +40,12 @@ class LLM(Scheduler):
         self.pending_requests: List[Tuple[List[int] | str, SamplingParams]] = []
         self.status_map: Dict[int, RequestStatus] = {}
         self.mm_embeds_map: Dict[int, torch.Tensor] = {}
+        self.mrope_map: Dict[int, Tuple[torch.Tensor, int]] = {}
         self.counter = 0
 
     @torch.inference_mode()
     def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
+        self, pixel_values: torch.Tensor, image_metadata: torch.Tensor
     ) -> torch.Tensor:
         """Run the vision tower + projector on processor outputs, returning the
         ``[num_image_tokens, hidden]`` soft-token embeddings (on device)."""
@@ -52,7 +53,7 @@ class LLM(Scheduler):
         if not hasattr(model, "encode_images"):
             raise RuntimeError(f"{type(model).__name__} does not support image inputs")
         return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
+            pixel_values.to(self.device), image_metadata.to(self.device)
         )
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
@@ -78,6 +79,12 @@ class LLM(Scheduler):
                     input_ids=input_ids,
                     sampling_params=sampling_params,
                     mm_embeds=self.mm_embeds_map.get(uid),
+                    mrope_position_ids=(
+                        self.mrope_map[uid][0] if uid in self.mrope_map else None
+                    ),
+                    mrope_position_delta=(
+                        self.mrope_map[uid][1] if uid in self.mrope_map else 0
+                    ),
                 )
             )
             self.status_map[uid] = RequestStatus(
@@ -112,12 +119,14 @@ class LLM(Scheduler):
 
         ``mm_inputs`` (optional) is aligned with ``prompts``; each entry is either
         ``None`` (text-only) or a dict with ``pixel_values`` ``[N, P, 3*patch**2]`` and
-        ``image_position_ids`` ``[N, P, 2]`` from the HF processor. For multimodal
+        either ``image_position_ids`` (Gemma) or ``image_grid_thw`` (Qwen) from
+        the HF processor. For multimodal
         prompts pass token-id ``prompts`` containing ``image_token_id`` placeholders.
         """
         self.pending_requests = []
         self.status_map = {}
         self.mm_embeds_map = {}
+        self.mrope_map = {}
         self.counter = 0
         if isinstance(sampling_params, SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
@@ -126,9 +135,30 @@ class LLM(Scheduler):
         if mm_inputs is not None:
             for uid, mm in enumerate(mm_inputs):
                 if mm is not None:
+                    metadata = mm.get("image_grid_thw", mm.get("image_position_ids"))
+                    if metadata is None:
+                        raise ValueError(
+                            "multimodal input needs image_grid_thw or image_position_ids"
+                        )
                     self.mm_embeds_map[uid] = self.encode_images(
-                        mm["pixel_values"], mm["image_position_ids"]
+                        mm["pixel_values"], metadata
                     )
+                    if "image_grid_thw" in mm:
+                        mm_types = mm.get("mm_token_type_ids")
+                        if mm_types is None:
+                            raise ValueError(
+                                "Qwen multimodal input needs mm_token_type_ids from the processor"
+                            )
+                        from freetoken.models.qwen4_exp.mrope import build_mrope_positions
+
+                        prompt_ids = self._tokenize_one(prompts[uid])
+                        merge_size = int(self.config.model_config.vision_config.spatial_merge_size)
+                        self.mrope_map[uid] = build_mrope_positions(
+                            prompt_ids,
+                            mm_types,
+                            mm["image_grid_thw"],
+                            merge_size,
+                        )
             torch.cuda.synchronize(self.device)
         try:
             self.run_forever()

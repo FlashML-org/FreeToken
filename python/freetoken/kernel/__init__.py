@@ -1,3 +1,17 @@
+import os as _os
+
+
+_installed_kernel_dir = _os.environ.get("FREETOKEN_INSTALLED_KERNEL_DIR")
+if (
+    _installed_kernel_dir
+    and _os.path.isdir(_installed_kernel_dir)
+    and _installed_kernel_dir not in __path__
+):
+    # A source checkout can reuse the matching native extensions from an
+    # installed FreeToken runtime.  Spawned server workers import this package
+    # again, so the path must be applied here instead of only in a launcher.
+    __path__.append(_installed_kernel_dir)
+
 from .index import indexing
 from .fast_index_copy import fast_index_copy_jit, update_copy_flag_jit
 from .moe_impl import (

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import functools
+import sys
+import warnings
 from typing import TYPE_CHECKING, Tuple
+
+import torch
 
 from .utils import KernelConfig, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi import Module
 
 DEFAULT_INDEX_KERNEL_CONFIG = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
+_TORCH_FALLBACK_KEYS: set[tuple[int, int]] = set()
 
 
 @functools.cache
@@ -49,6 +53,33 @@ def indexing(
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 
     element_size = weights.shape[1] * weights.element_size()
-    module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))
-    module.launch(weights, indices, output, vocab_range)
+    num_splits = num_splits_for(element_size)
+    key = (element_size, num_splits)
+    module = None
+    if key not in _TORCH_FALLBACK_KEYS:
+        try:
+            module = _jit_index_module(element_size, num_splits=num_splits)
+        except RuntimeError as exc:
+            if sys.platform != "win32":
+                raise
+            _TORCH_FALLBACK_KEYS.add(key)
+            warnings.warn(
+                f"Falling back to torch.index_select for {element_size}-byte embedding rows "
+                f"because the Windows CUDA index kernel is unavailable: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if module is not None:
+        module.launch(weights, indices, output, vocab_range)
+        return output
+
+    if vocab_range is None:
+        torch.index_select(weights, 0, indices.to(torch.int64), out=output)
+        return output
+
+    start, length = vocab_range
+    valid = (indices >= start) & (indices < start + length)
+    local_indices = (indices - start).clamp(0, max(0, length - 1)).to(torch.int64)
+    torch.index_select(weights, 0, local_indices, out=output)
+    output.masked_fill_(~valid[:, None], 0)
     return output

@@ -55,10 +55,16 @@ def iter_weight_files(model_path: str) -> list[str]:
 
 def drop_page_cache(path: str) -> None:
     """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        # Windows has no POSIX page-cache advisory API.  The hint is optional;
+        # skipping it is correct and lets the serial expert loader run there.
+        return
     try:
         fd = os.open(path, os.O_RDONLY)
         try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            posix_fadvise(fd, 0, 0, dontneed)
         finally:
             os.close(fd)
     except OSError:

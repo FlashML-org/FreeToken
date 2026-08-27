@@ -113,6 +113,9 @@ class Workload:
 # Preset workloads. Dims from the model configs / benchmarks/bench_offload_cache_copy.py.
 # E/top_k/H/I are what drive the per-expert byte size and thus the bandwidths.
 WORKLOADS: dict[str, Workload] = {
+    "qwen3.8-flash-next": Workload(
+        "qwen3.8-flash-next", 2560, 640, 512, 10, ("nvfp4",)
+    ),
     "qwen3.6-moe": Workload("qwen3.6-moe", 2048, 512, 256, 8, ("bf16", "nvfp4", "fp8_block")),
     "qwen3-30b": Workload("qwen3-30b", 2048, 768, 128, 8, ("bf16",)),
     "gemma4-26b": Workload("gemma4-26b", 2816, 704, 128, 8, ("bf16",), activation="gelu_tanh"),

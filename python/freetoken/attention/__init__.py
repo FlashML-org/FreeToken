@@ -132,6 +132,22 @@ def create_m3_sparse_backend(config: ModelConfig):
     return M3SparseAttnBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa",
+    BackendInfo(
+        supported_types=frozenset({AttnType.QSA}),
+        # A 64-token full page becomes a 16-row compressed page at ratio 4.
+        # Keeping both page sizes aligned makes full_row // ratio exact.
+        page_sizes=(64,),
+        hybrid_linear_ok=True,
+    ),
+)
+def create_qsa_backend(config: ModelConfig):
+    from .qsa import QSAAttnBackend
+
+    return QSAAttnBackend(config)
+
+
 def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 

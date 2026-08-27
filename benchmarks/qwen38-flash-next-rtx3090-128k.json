@@ -1,0 +1,19 @@
+{
+  "date": "2026-08-26",
+  "platform": "Windows, NVIDIA RTX 3090",
+  "model": "Qwen3.8-Flash-Next NVFP4 FTW",
+  "context_length": 131072,
+  "kv_cache_gib": 3.09,
+  "moe_cache_size": 2048,
+  "gpu_used_by_load_gib": 19.974,
+  "prompt_tokens": 37,
+  "output_tokens": 127,
+  "overall_output_tokens_per_second": 3.574,
+  "steady_decode_tokens_per_second": 5.791,
+  "moe_cache_miss_rate": 0.1651,
+  "notes": [
+    "This result uses a short text prompt and a single request.",
+    "Steady decode excludes model load, prefill, and time to first token.",
+    "The 128K KV allocation permits a 2048-slot expert cache on a 24 GiB GPU."
+  ]
+}

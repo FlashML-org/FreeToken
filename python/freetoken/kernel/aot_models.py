@@ -129,6 +129,16 @@ _NVFP4_FORMATS = ("nvfp4", "nvfp4_marlin", "nvfp4_b12x")
 SUPPORTED_MODELS: tuple[AotModel, ...] = (
     # ---- MoE checkpoints (offload expert banks) ----
     AotModel(
+        name="Qwen/Qwen3.8-Flash-Next",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=("nvfp4",),
+        aliases=("RadixArk/Qwen3.8-Flash-Next-NVFP4",),
+    ),
+    AotModel(
         name="Qwen/Qwen3-30B-A3B",
         architecture="Qwen3MoeForCausalLM",
         hidden_size=2048,

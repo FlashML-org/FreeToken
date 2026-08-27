@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(_WIN32) && !defined(__always_inline)
+#define __always_inline __forceinline__
+#endif
+
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>

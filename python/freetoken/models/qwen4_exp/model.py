@@ -21,6 +21,8 @@ from freetoken.layers import (
     VocabParallelEmbedding,
     make_moe_layer,
     silu_and_mul,
+    StateLessOP,
+    get_rope,
 )
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
@@ -31,6 +33,108 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
     from .args import Qwen4ExpArgs
+
+
+class _Qwen4MRoPE(StateLessOP):
+    """Partial, interleaved temporal/height/width RoPE for Qwen4-Exp."""
+
+    def __init__(self, config: ModelConfig):
+        rotary = config.rotary_config
+        self._base = get_rope(
+            head_dim=rotary.head_dim,
+            rotary_dim=rotary.rotary_dim,
+            max_position=rotary.max_position,
+            base=rotary.base,
+        )
+        self.mrope_section = tuple(config.qwen4_args.mrope_section)
+
+    @property
+    def head_size(self) -> int:
+        return self._base.head_size
+
+    @property
+    def rotary_dim(self) -> int:
+        return self._base.rotary_dim
+
+    @property
+    def is_neox(self) -> bool:
+        return self._base.is_neox
+
+    @property
+    def _cos_sin_cache(self) -> torch.Tensor:
+        return self._base._cos_sin_cache
+
+    @_cos_sin_cache.setter
+    def _cos_sin_cache(self, value: torch.Tensor) -> None:
+        self._base._cos_sin_cache = value
+
+    def apply_inplace(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_size: int | None = None,
+    ) -> None:
+        head_size = self.head_size if head_size is None else int(head_size)
+        if positions.ndim == 1:
+            self._base.apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=head_size,
+                cos_sin_cache=self._cos_sin_cache,
+                is_neox=self.is_neox,
+            )
+            return
+        if query.is_cuda:
+            from freetoken.kernel.triton.rope import (
+                apply_mrope_with_cos_sin_cache_inplace,
+            )
+
+            apply_mrope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=head_size,
+                cos_sin_cache=self._cos_sin_cache,
+                mrope_section=self.mrope_section,
+                is_neox=self.is_neox,
+            )
+            return
+
+        # CPU reference path for exact unit tests and configuration checks.
+        if positions.ndim != 2 or positions.shape != (3, query.shape[0]):
+            raise ValueError(
+                f"MRoPE positions must have shape (3, {query.shape[0]}), got "
+                f"{tuple(positions.shape)}"
+            )
+        half = self.rotary_dim // 2
+        pair = torch.arange(half, device=positions.device)
+        axis = torch.zeros(half, dtype=torch.long, device=positions.device)
+        axis[(pair % 3 == 1) & (pair < self.mrope_section[1] * 3)] = 1
+        axis[(pair % 3 == 2) & (pair < self.mrope_section[2] * 3)] = 2
+        selected = positions.long().transpose(0, 1)[:, axis]
+        dim = pair.view(1, -1).expand_as(selected)
+        cos = self._cos_sin_cache[:, :half][selected, dim]
+        sin = self._cos_sin_cache[:, half:][selected, dim]
+        for tensor in (query, key):
+            heads = tensor.shape[1] // head_size
+            view = tensor.view(tensor.shape[0], heads, head_size)
+            first = view[..., :half].float().clone()
+            second = view[..., half : self.rotary_dim].float().clone()
+            view[..., :half].copy_((first * cos[:, None] - second * sin[:, None]).to(view.dtype))
+            view[..., half : self.rotary_dim].copy_(
+                (second * cos[:, None] + first * sin[:, None]).to(view.dtype)
+            )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.apply_inplace(positions, query, key)
+        return query, key
 
 
 class _GroupedRMSNorm(BaseOP):
@@ -115,11 +219,12 @@ class _SharedExpert(BaseOP):
 
 class _SparseMoE(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
+        weight_format = "fp8_block" if config.expert_quant == "fp8_block" else "bf16"
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
             renormalize=bool(config.norm_topk_prob),
-            weight_format="fp8_block",
+            weight_format=weight_format,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(config)
@@ -171,6 +276,31 @@ def build_ngram_ids(
         heads = torch.remainder(mixed.unsqueeze(-1), sizes)
         blocks.append(heads + offsets[start:stop])
     return torch.cat(blocks, dim=-1)
+
+
+def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch.Tensor:
+    """Return the complete host token history visible to this forward.
+
+    The overlap scheduler advances ``device_len`` before it drains the prior
+    sampled token to ``req.input_ids``. During decode, that one current token is
+    already present in ``batch.input_ids``. Join it to the committed host prefix
+    so PLE hashes the same history as a non-overlapped forward.
+    """
+    host_len = req.input_ids.numel()
+    if host_len >= req.device_len:
+        return req.input_ids[: req.device_len]
+    if host_len != req.cached_len:
+        raise RuntimeError(
+            "Qwen4-Exp PLE host history has an unexpected gap: "
+            f"host={host_len}, cached={req.cached_len}, device={req.device_len}"
+        )
+    if forwarded_ids is None or forwarded_ids.numel() != req.extend_len:
+        actual = 0 if forwarded_ids is None else forwarded_ids.numel()
+        raise RuntimeError(
+            "Qwen4-Exp PLE needs the current forwarded tokens: "
+            f"got {actual}, expected {req.extend_len}"
+        )
+    return torch.cat((req.input_ids[: req.cached_len], forwarded_ids.to(device="cpu")))
 
 
 class _HostNGramEmbedding(BaseOP):
@@ -259,9 +389,20 @@ class _HostNGramEmbedding(BaseOP):
         reqs = batch.padded_reqs if batch.is_decode else batch.reqs
         multipliers, vocab_sizes, offsets = self._host_constants
         pieces = []
+        forwarded_host = None
+        forwarded_offset = 0
         for req in reqs:
+            extend_len = req.extend_len
+            forwarded = None
+            if req.input_ids.numel() < req.device_len:
+                if forwarded_host is None:
+                    forwarded_host = batch.input_ids.detach().to(device="cpu")
+                forwarded = forwarded_host[
+                    forwarded_offset : forwarded_offset + extend_len
+                ]
+            tokens = _ple_request_tokens(req, forwarded)
             all_ids = build_ngram_ids(
-                req.input_ids,
+                tokens,
                 ngram_size=self.ngram_size,
                 heads_per_ngram=self.heads_per_ngram,
                 eos_token_id=self.eos_token_id,
@@ -270,6 +411,7 @@ class _HostNGramEmbedding(BaseOP):
                 offsets=offsets,
             )
             pieces.append(all_ids[req.cached_len : req.device_len])
+            forwarded_offset += extend_len
         result = torch.cat(pieces, dim=0)
         if result.shape[0] != batch.input_ids.numel():
             raise RuntimeError(
@@ -367,6 +509,93 @@ class _PLELayer(BaseOP):
         return gated + self._short_conv(normalized)
 
 
+class _QSAIndexer(BaseOP):
+    """Qwen4-Exp's weight-free four-head compressed-key indexer."""
+
+    def __init__(self, config: ModelConfig, rotary):
+        args: Qwen4ExpArgs = config.qwen4_args
+        self.num_q_heads = args.indexer_n_heads
+        self.num_kv_heads = args.indexer_kv_heads
+        self.head_dim = args.indexer_head_dim
+        self.q_dim = self.num_q_heads * self.head_dim
+        self.k_dim = self.num_kv_heads * self.head_dim
+        self.index_qk_proj = LinearReplicated(
+            config.hidden_size, self.q_dim + self.k_dim, has_bias=False
+        )
+        self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.rotary = rotary
+        if self.rotary.rotary_dim > self.head_dim:
+            raise ValueError(
+                f"QSA index head {self.head_dim} is smaller than rotary dim "
+                f"{self.rotary.rotary_dim}"
+            )
+
+    def _apply_rope(self, tensor: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if tensor.numel() == 0:
+            return tensor
+        shape = tensor.shape
+        flat = tensor.reshape(shape[0], -1).contiguous()
+        # The shared RoPE object was built for 256-wide main heads.  Call its
+        # kernel with the 128-wide QSA head size instead of using forward(),
+        # which would interpret the fused index-query row with the wrong stride.
+        dummy_key = torch.zeros(
+            shape[0], self.head_dim, dtype=tensor.dtype, device=tensor.device
+        )
+        self.rotary.apply_inplace(
+            positions=positions,
+            query=flat,
+            key=dummy_key,
+            head_size=self.head_dim,
+        )
+        return flat.view(shape)
+
+    def project(self, hidden: torch.Tensor, positions: torch.Tensor):
+        qk = self.index_qk_proj.forward(hidden)
+        q_raw, k_raw = torch.split(qk, (self.q_dim, self.k_dim), dim=-1)
+        q = q_raw.view(-1, self.num_q_heads, self.head_dim).contiguous()
+        k = k_raw.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        q = self.q_layernorm.forward(q)
+        q = self._apply_rope(q, positions)
+        return q, k
+
+    def normalize_compressed_keys(
+        self, keys: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        keys = self.k_layernorm.forward(keys.contiguous())
+        return self._apply_rope(keys, positions)
+
+
+class Qwen4ExpAttention(Qwen3_5Attention):
+    def __init__(self, config: ModelConfig, layer_id: int):
+        super().__init__(config, layer_id)
+        self.rotary = _Qwen4MRoPE(config)
+        # Qwen4 stores centered q/k norm weights (effective scale is 1 + w).
+        self.q_norm = GemmaPlusOneRMSNorm(config.head_dim, config.rms_norm_eps)
+        self.k_norm = GemmaPlusOneRMSNorm(config.head_dim, config.rms_norm_eps)
+        self.indexer = _QSAIndexer(config, self.rotary)
+
+    @nvtx_annotate("QSA")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ctx = get_global_ctx()
+        rope_positions = ctx.batch.rope_positions
+        if rope_positions is None:
+            rope_positions = ctx.batch.positions
+        q, k, v, gate = self._project(x, rope_positions)
+        index_q, index_k = self.indexer.project(x, rope_positions)
+        output = ctx.attn_backend.qsa_forward(
+            q,
+            k,
+            v,
+            index_q,
+            index_k,
+            self.indexer,
+            self.layer_id,
+            ctx.batch,
+        )
+        return self._combine(output, gate)
+
+
 class Qwen4ExpDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self._layer_id = layer_id
@@ -393,12 +622,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 config.qwen4_args.output_gate_type,
             )
         else:
-            self.self_attn = Qwen3_5Attention(dense_config, layer_id)
-            # Qwen4 stores centered q/k norm weights (effective scale is 1 + w).
-            # Keep the raw checkpoint values and add one in fp32 inside the kernel.
-            head_dim = config.head_dim
-            self.self_attn.q_norm = GemmaPlusOneRMSNorm(head_dim, config.rms_norm_eps)
-            self.self_attn.k_norm = GemmaPlusOneRMSNorm(head_dim, config.rms_norm_eps)
+            self.self_attn = Qwen4ExpAttention(dense_config, layer_id)
         self.mlp = _SparseMoE(config, layer_id)
         self.ple = (
             _PLELayer(config, layer_id)
@@ -432,6 +656,7 @@ class Qwen4ExpModel(BaseOP):
         )
         self.hyper_connection_mixer = _GatedResidual(config, combine=False)
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         for layer in self.layers.op_list:
@@ -439,7 +664,18 @@ class Qwen4ExpModel(BaseOP):
                 layer.ple.load_host_weights(model_path, dummy=dummy)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = self.embed_tokens.forward(input_ids)
+        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
+        if mm_embeds is not None and self._image_token_id is not None:
+            mask = input_ids == self._image_token_id
+            slots = int(mask.sum().item())
+            if slots != mm_embeds.shape[0]:
+                raise ValueError(
+                    f"image-token slots ({slots}) do not match vision features "
+                    f"({mm_embeds.shape[0]})"
+                )
+            hidden = hidden.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(hidden.dtype))
+        hidden = hidden.repeat(1, self.hc_count)
         for layer in self.layers.op_list:
             hidden = layer.forward(hidden)
         return self.hyper_connection_mixer.forward(hidden)
@@ -454,7 +690,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
+        if config.is_multimodal:
+            from .vision import Qwen4VisionModel
+
+            self.visual = Qwen4VisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not hasattr(self, "visual"):
+            raise RuntimeError("Qwen4-Exp vision weights are not loaded")
+        return self.visual.forward(pixel_values, image_grid_thw)
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.model.load_host_weights(model_path, dummy=dummy)

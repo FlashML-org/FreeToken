@@ -10,7 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from freetoken.engine.engine import _parse_cpu_layers_spec as parse
+from freetoken.engine.engine import _pin_budget_bytes as pin_budget
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
+from freetoken.engine import engine as engine_module
 
 L = 40
 
@@ -59,6 +61,20 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("offload", None), L) == frozenset()
     # non-offload backend ignores the spec (validation lives in _adjust_config)
     assert resolve(_cfg("fused", "8"), L) == frozenset()
+
+
+def test_pin_budget_native_windows(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    monkeypatch.setattr(engine_module.os, "name", "nt")
+    monkeypatch.setattr(engine_module, "_windows_total_physical_memory", lambda: 128 << 30)
+    assert pin_budget() == int((128 << 30) * 0.4)
+
+
+def test_pin_budget_env_overrides_platform(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "47.5")
+    monkeypatch.setattr(engine_module.os, "name", "nt")
+    monkeypatch.setattr(engine_module, "_windows_total_physical_memory", lambda: 1)
+    assert pin_budget() == int(47.5 * 2**30)
 
 
 if __name__ == "__main__":
