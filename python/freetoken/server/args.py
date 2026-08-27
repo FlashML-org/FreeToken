@@ -15,6 +15,8 @@ from freetoken.utils import init_logger
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    ssl_certfile: str | None = None
+    ssl_keyfile: str | None = None
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -302,6 +304,20 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=ServerArgs.ssl_certfile,
+        help="PEM certificate chain for HTTPS. Requires --ssl-keyfile.",
+    )
+
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=ServerArgs.ssl_keyfile,
+        help="PEM private key for HTTPS. Requires --ssl-certfile.",
     )
 
     parser.add_argument(
@@ -642,6 +658,10 @@ def parse_args(
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     kwargs["shell_mode"] = run_shell
+    if bool(kwargs["ssl_certfile"]) != bool(kwargs["ssl_keyfile"]):
+        parser.error("--ssl-certfile and --ssl-keyfile must be provided together")
+    if run_shell and kwargs["ssl_certfile"]:
+        parser.error("TLS is not supported with --shell-mode")
     if run_shell:
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
@@ -649,6 +669,9 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    for tls_path in ("ssl_certfile", "ssl_keyfile"):
+        if kwargs[tls_path] and kwargs[tls_path].startswith("~"):
+            kwargs[tls_path] = os.path.expanduser(kwargs[tls_path])
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (
