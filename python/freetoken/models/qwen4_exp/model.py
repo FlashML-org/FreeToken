@@ -30,6 +30,7 @@ from freetoken.utils import download_hf_weight, init_logger, nvtx_annotate
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
 
     from .args import Qwen4ExpArgs
@@ -237,6 +238,8 @@ class _HostNGramEmbedding(BaseOP):
         self._scale = torch.tensor(1.0, dtype=torch.bfloat16)
         self._host_constants: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._dummy = False
+        self._graph_output: torch.Tensor | None = None
+        self._device_scale: torch.Tensor | None = None
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         if dummy:
@@ -357,7 +360,7 @@ class _HostNGramEmbedding(BaseOP):
             )
         return result
 
-    def forward(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _lookup(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self._dummy:
             token_count = get_global_ctx().batch.input_ids.numel()
             return torch.zeros(token_count, self.embedding_dim, device=device, dtype=dtype)
@@ -376,8 +379,34 @@ class _HostNGramEmbedding(BaseOP):
             rows = self._shards[shard_id].index_select(0, local_ids)
             output.index_copy_(0, positions, rows)
         fp8 = output.to(device=device, non_blocking=True).view(torch.float8_e4m3fn)
-        embedded = fp8.to(dtype) * self._scale.to(device=device, dtype=dtype)
+        if (
+            self._device_scale is None
+            or self._device_scale.device != device
+            or self._device_scale.dtype != dtype
+        ):
+            self._device_scale = self._scale.to(device=device, dtype=dtype)
+        embedded = fp8.to(dtype) * self._device_scale
         return embedded.view(-1, self.embedding_dim)
+
+    def prepare_cuda_graph_capture(
+        self, token_count: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        if self._graph_output is None or self._graph_output.shape[0] < token_count:
+            self._graph_output = torch.zeros(
+                token_count, self.embedding_dim, device=device, dtype=dtype
+            )
+
+    def prepare_cuda_graph_replay(self, device: torch.device, dtype: torch.dtype) -> None:
+        assert self._graph_output is not None
+        embedded = self._lookup(device, dtype)
+        self._graph_output[: embedded.shape[0]].copy_(embedded)
+
+    def forward(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        batch = get_global_ctx().batch
+        if batch.cuda_graph_capture:
+            assert self._graph_output is not None
+            return self._graph_output[: batch.input_ids.numel()]
+        return self._lookup(device, dtype)
 
 
 class _DepthwiseConv(BaseOP):
@@ -401,27 +430,64 @@ class _PLELayer(BaseOP):
         self.conv1d = _DepthwiseConv(hc_size, args.ple_conv_kernel_size)
         self.dilation = args.ngram_size
         self.state_len = (args.ple_conv_kernel_size - 1) * self.dilation
-        self._conv_states: dict[int, torch.Tensor] = {}
+        self._conv_state_pool: torch.Tensor | None = None
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.ple_embedding.load_host_weights(model_path, dummy=dummy)
 
+    def _ensure_conv_state_pool(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        linear_pool = get_global_ctx().linear_state_pool
+        if linear_pool is None:
+            raise RuntimeError("Qwen4-Exp PLE requires a linear-state pool")
+        num_slots = linear_pool.conv_states.shape[1]
+        expected = (num_slots, self.hc_count * self.hidden_size, self.state_len)
+        if (
+            self._conv_state_pool is None
+            or self._conv_state_pool.shape != expected
+            or self._conv_state_pool.device != device
+            or self._conv_state_pool.dtype != dtype
+        ):
+            self._conv_state_pool = torch.zeros(expected, device=device, dtype=dtype)
+        return self._conv_state_pool
+
+    def prepare_cuda_graph_capture(self, token_count: int) -> None:
+        device = self.conv1d.weight.device
+        dtype = self.conv1d.weight.dtype
+        self.ple_embedding.prepare_cuda_graph_capture(token_count, device, dtype)
+        self._ensure_conv_state_pool(device, dtype)
+
+    def prepare_cuda_graph_replay(self) -> None:
+        self.ple_embedding.prepare_cuda_graph_replay(
+            self.conv1d.weight.device, self.conv1d.weight.dtype
+        )
+
     def _short_conv(self, hidden: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
         reqs = batch.padded_reqs if batch.is_decode else batch.reqs
+        state_pool = self._ensure_conv_state_pool(hidden.device, hidden.dtype)
+        if batch.cuda_graph_capture:
+            assert batch.linear_table_idx is not None
+            slots = batch.linear_table_idx.long()
+            state = state_pool.index_select(0, slots)
+            combined = torch.cat([state, hidden.unsqueeze(-1)], dim=-1)
+            convolved = F.conv1d(
+                combined,
+                self.conv1d.weight,
+                groups=self.conv1d.weight.shape[0],
+                dilation=self.dilation,
+            )
+            state_pool.index_copy_(0, slots, combined[..., -self.state_len :])
+            return F.silu(convolved).squeeze(-1)
+
         outputs = []
         offset = 0
         weight = self.conv1d.weight
         for req in reqs:
             length = req.extend_len
             current = hidden[offset : offset + length].transpose(0, 1).unsqueeze(0)
-            state = self._conv_states.get(req.table_idx)
+            state = state_pool[req.table_idx].unsqueeze(0)
             if req.cached_len == 0:
-                state = current.new_zeros(1, current.shape[1], self.state_len)
-            elif state is None:
-                raise RuntimeError(
-                    "Qwen4-Exp PLE state cannot resume a radix prefix; serve with --cache-type naive"
-                )
+                state.zero_()
             combined = torch.cat([state, current], dim=-1)
             convolved = F.conv1d(
                 combined,
@@ -430,7 +496,7 @@ class _PLELayer(BaseOP):
                 dilation=self.dilation,
             )
             outputs.append(F.silu(convolved).squeeze(0).transpose(0, 1))
-            self._conv_states[req.table_idx] = combined[..., -self.state_len :].detach()
+            state_pool[req.table_idx].copy_(combined[0, :, -self.state_len :])
             offset += length
         return torch.cat(outputs, dim=0)
 
@@ -518,6 +584,16 @@ class Qwen4ExpModel(BaseOP):
             if layer.ple is not None:
                 layer.ple.load_host_weights(model_path, dummy=dummy)
 
+    def prepare_cuda_graph_capture(self, token_count: int) -> None:
+        for layer in self.layers.op_list:
+            if layer.ple is not None:
+                layer.ple.prepare_cuda_graph_capture(token_count)
+
+    def prepare_cuda_graph_replay(self) -> None:
+        for layer in self.layers.op_list:
+            if layer.ple is not None:
+                layer.ple.prepare_cuda_graph_replay()
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
         for layer in self.layers.op_list:
@@ -538,6 +614,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.model.load_host_weights(model_path, dummy=dummy)
+
+    def prepare_cuda_graph_capture(self, batch: Batch) -> None:
+        self.model.prepare_cuda_graph_capture(batch.input_ids.numel())
+
+    def prepare_cuda_graph_replay(self, batch: Batch) -> None:
+        self.model.prepare_cuda_graph_replay()
 
     def forward(self) -> torch.Tensor:
         hidden = self.model.forward(get_global_ctx().batch.input_ids)

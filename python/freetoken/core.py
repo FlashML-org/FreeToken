@@ -125,6 +125,9 @@ class Batch:
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
+    # True only for the static dummy batch while CUDA graphs are captured. Models
+    # with host-prepared inputs use this to bind stable device buffers into the graph.
+    cuda_graph_capture: bool = field(default=False, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read

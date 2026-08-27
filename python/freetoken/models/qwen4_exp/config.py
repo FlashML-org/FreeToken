@@ -82,9 +82,23 @@ def parse_config(hf_config: Any) -> ModelConfig:
     quant = hf_config.quantization_config
     if not isinstance(quant, dict):
         quant = quant.to_dict()
-    block_size = tuple(int(value) for value in quant["weight_block_size"])
-    if quant.get("quant_method") != "fp8" or block_size != (128, 128):
-        raise ValueError("Qwen4-Exp currently requires the official 128x128 FP8 checkpoint")
+    method = str(quant.get("quant_method") or "").lower()
+    algo = str(quant.get("quant_algo") or method).lower()
+    if method == "fp8":
+        block_size = tuple(int(value) for value in quant["weight_block_size"])
+        if block_size != (128, 128):
+            raise ValueError(f"Qwen4-Exp only supports 128x128 block-FP8, got {block_size}")
+        expert_quant = "fp8_block"
+    elif "fp4" in algo:
+        # ModelOpt NVFP4 checkpoints use packed routed experts while leaving the
+        # shared expert and other resident text weights in BF16.
+        block_size = None
+        expert_quant = "nvfp4"
+    else:
+        raise ValueError(
+            "Qwen4-Exp requires a 128x128 block-FP8 or ModelOpt NVFP4 checkpoint, "
+            f"got quant_method={method!r}, quant_algo={algo!r}"
+        )
 
     return ModelConfig(
         num_layers=int(text.num_hidden_layers),
@@ -106,10 +120,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type=str(hf_config.model_type),
         architectures=list(hf_config.architectures),
         moe_enabled=True,
-        expert_quant="fp8_block",
+        expert_quant=expert_quant,
         weight_block_size=block_size,
-        # Only routed experts and PLE are FP8 in the official checkpoint. All
-        # attention, hyper-connection, and shared-expert projections stay BF16.
+        # Only routed experts and PLE are quantized in the supported checkpoints.
+        # Attention, hyper-connections, and shared-expert projections stay BF16.
         attn_quant="none",
         dense_quant="none",
         lm_head_quant="none",
@@ -119,9 +133,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         qwen4_args=qwen4_args,
         # PLE keeps per-request dilated-convolution state outside the generic
-        # radix cache and performs mmap-backed CPU gathers during every forward.
+        # radix cache, so prefix snapshots remain unsupported. Its host embedding
+        # lookup is staged into a stable device buffer before CUDA-graph replay.
         requires_naive_cache=True,
-        supports_cuda_graph=False,
+        supports_cuda_graph=True,
     )
 
 

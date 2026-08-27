@@ -16,12 +16,20 @@ from freetoken.utils import nvtx_annotate
 if TYPE_CHECKING:
     import torch
 
+    from freetoken.core import Batch
+
     from .config import ModelConfig
 
 
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
+
+    def prepare_cuda_graph_capture(self, batch: Batch) -> None:
+        """Prepare model-owned stable inputs before capturing a decode graph."""
+
+    def prepare_cuda_graph_replay(self, batch: Batch) -> None:
+        """Stage model-owned dynamic inputs before replaying a decode graph."""
 
 
 class GatedMLP(BaseOP):

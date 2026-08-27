@@ -46,19 +46,30 @@ def fused_topk(
 
     from freetoken.kernel.backend import is_triton_kernels_installed
 
+    fallback_reason = None
+    kernel_topk = topk
+    if not is_triton_kernels_installed():
+        fallback_reason = "triton_kernels is not installed"
+    elif topk & (topk - 1):
+        # triton_kernels.topk uses tl.arange(0, k), which requires a power-of-two
+        # range. Select the next power of two and discard the extra tail instead
+        # of routing Qwen's top_k=10 through the much slower multi-kernel fallback.
+        kernel_topk = 1 << (topk - 1).bit_length()
+        if kernel_topk > gating_output.shape[-1]:
+            fallback_reason = (
+                f"triton_kernels padded topk={kernel_topk} exceeds "
+                f"num_experts={gating_output.shape[-1]}"
+            )
+
     # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
     # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
-    if not is_triton_kernels_installed():
+    if fallback_reason is not None:
         global _warned_torch_topk
         if not _warned_torch_topk:
             _warned_torch_topk = True
-            # Once, not per call: this runs every MoE forward. On Linux a missing
-            # triton_kernels used to fail fast with ImportError; keep the misconfiguration
-            # visible without giving up the fallback that Windows needs.
             logger.warning_rank0(
-                "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
-                "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
+                f"fused_topk: {fallback_reason} -> pure-torch router fallback "
+                "(numerically equivalent, slower)."
             )
         return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 
@@ -70,7 +81,7 @@ def fused_topk(
         logits = torch.softmax(logits, dim=-1)
     sparse_topk = triton_kernels_topk(
         logits,
-        topk,
+        kernel_topk,
         apply_softmax=not softmax_first,
     )
     if hasattr(sparse_topk, "vals"):
@@ -78,6 +89,12 @@ def fused_topk(
         topk_ids = sparse_topk.indx
     else:
         topk_weights, topk_ids = sparse_topk[:2]
+    if kernel_topk != topk:
+        topk_weights = topk_weights[:, :topk]
+        topk_ids = topk_ids[:, :topk]
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.contiguous()
     topk_ids = topk_ids.to(torch.int32)
     if num_token_non_padded is not None:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)

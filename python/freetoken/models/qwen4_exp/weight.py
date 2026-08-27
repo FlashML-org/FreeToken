@@ -10,6 +10,8 @@ from tqdm import tqdm
 
 from freetoken.models.qwen3_5_moe.weight import (
     iter_weights_parallel,
+    load_nvfp4_expert_sources,
+    load_nvfp4_expert_sources_parallel,
     setup_offload_expert_banks,
 )
 
@@ -101,4 +103,10 @@ def iter_weights(
         raise RuntimeError(f"Incomplete Qwen4-Exp projection fusions: {sorted(buffers)}")
 
 
-__all__ = ["iter_weights", "iter_weights_parallel", "setup_offload_expert_banks"]
+__all__ = [
+    "iter_weights",
+    "iter_weights_parallel",
+    "load_nvfp4_expert_sources",
+    "load_nvfp4_expert_sources_parallel",
+    "setup_offload_expert_banks",
+]

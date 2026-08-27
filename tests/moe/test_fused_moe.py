@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -56,6 +59,42 @@ def test_fused_topk_accepts_triton_kernel_tuple_output():
     ref_weights = torch.softmax(ref_logits, dim=-1)
     torch.testing.assert_close(ids, ref_ids.to(torch.int32))
     torch.testing.assert_close(weights, ref_weights, rtol=2e-4, atol=2e-4)
+
+
+def test_fused_topk_pads_non_power_of_two_for_triton(monkeypatch):
+    import freetoken.moe.fused as fused
+
+    monkeypatch.setattr(
+        "freetoken.kernel.backend.is_triton_kernels_installed",
+        lambda: True,
+    )
+    called = {}
+
+    def fake_topk(logits, topk, *, apply_softmax):
+        called["topk"] = topk
+        values, ids = torch.topk(logits, topk, dim=-1)
+        if apply_softmax:
+            values = torch.softmax(values, dim=-1)
+        return SimpleNamespace(vals=values, indx=ids)
+
+    monkeypatch.setitem(sys.modules, "triton_kernels", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "triton_kernels.topk", SimpleNamespace(topk=fake_topk))
+    logits = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+    hidden_states = torch.zeros((2, 8))
+
+    weights, ids = fused.fused_topk(
+        hidden_states,
+        logits,
+        topk=10,
+        renormalize=True,
+    )
+
+    assert called["topk"] == 16
+    ref_weights, ref_ids = torch.topk(torch.softmax(logits, dim=-1), 10, dim=-1)
+    ref_weights = ref_weights / ref_weights.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(weights, ref_weights)
+    torch.testing.assert_close(ids, ref_ids.to(torch.int32))
+    assert weights.is_contiguous()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

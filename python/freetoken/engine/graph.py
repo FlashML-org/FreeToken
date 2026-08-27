@@ -112,6 +112,7 @@ class GraphRunner:
             free_memory=free_memory,
         )
         self.attn_backend = attn_backend
+        self.model = model
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -164,6 +165,8 @@ class GraphRunner:
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
+            batch.cuda_graph_capture = True
+            model.prepare_cuda_graph_capture(batch)
             # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
             # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
             # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
@@ -191,6 +194,7 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        self.model.prepare_cuda_graph_replay(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
