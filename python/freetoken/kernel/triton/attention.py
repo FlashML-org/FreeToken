@@ -34,13 +34,6 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
     if head_dim <= 128:
-        # The split extend/prefill kernel (separate cached + newly-computed KV loops
-        # live at once) exhausts this GPU's VGPR file at the 128x64 tile -- register
-        # pressure, not shared memory, is the binding constraint here, and this
-        # function was only ever tuned against the latter. Shrink unconditionally on
-        # ROCm rather than trying to model AMD's register budget per-arch.
-        if torch.version.hip is not None:
-            return 64, 32
         return 128, 64
     if head_dim <= 256:
         return (128, 64) if fits(128, 64) else (64, 32)
@@ -186,7 +179,6 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
-    USE_TL_DOT: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -245,18 +237,7 @@ def _decode_grouped_stage1_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
-            if USE_TL_DOT:
-                scores = tl.dot(q, k) * sm_scale
-            else:
-                # RDNA WMMA has no matrix-core instruction for M < 16, which this
-                # kernel's decode head-tile (BLOCK_H, often 4-8 real GQA heads
-                # padded to 16) hits reliably; the AMD Triton/LLVM backend fails
-                # instruction selection rather than falling back on its own. Sum
-                # of broadcast products is the plain-arithmetic equivalent of
-                # tl.dot -- slower, but sidesteps matrix-core lowering entirely.
-                scores = tl.sum(
-                    q.to(tl.float32)[:, :, None] * k.to(tl.float32)[None, :, :], axis=1
-                ) * sm_scale
+            scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
             v = tl.load(
@@ -268,13 +249,7 @@ def _decode_grouped_stage1_kernel(
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
-            if USE_TL_DOT:
-                pv = tl.dot(p.to(v.dtype), v)
-            else:
-                pv = tl.sum(
-                    p.to(tl.float32)[:, :, None] * v.to(tl.float32)[None, :, :], axis=1
-                )
-            acc = acc * alpha[:, None] + pv
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -467,7 +442,6 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
-        USE_TL_DOT=torch.version.hip is None,
         num_warps=4,
         num_stages=2,
     )
