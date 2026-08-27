@@ -22,7 +22,7 @@ from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 from triton.language import target_info
 
-from freetoken.utils.arch import is_rocm, is_sm90_supported
+from freetoken.utils.arch import is_sm90_supported
 
 SILU = 0
 GELU = 1
@@ -138,10 +138,11 @@ def _act_and_mul(
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
+    # The launch kwarg itself is CUDA/Hopper-only; HIP rejects it even when False.
+    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **pdl_kwargs,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
-        **({} if is_rocm() else {"launch_pdl": pdl}),
     )
     return out
 

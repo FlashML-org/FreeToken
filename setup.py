@@ -13,6 +13,10 @@ KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "includ
 
 
 def _check_toolchain() -> None:
+    if IS_ROCM:
+        # nvcc/CUDA-major checks below are meaningless on a ROCm torch build
+        # (torch.version.cuda is None there), so _toolchain.py's check is a no-op.
+        return
     path = ROOT / "python" / "freetoken" / "kernel" / "_toolchain.py"
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
@@ -41,14 +45,14 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
 
     for rocm_home in dict.fromkeys(candidates):
         include_dir = rocm_home / "include"
-        library_dir = rocm_home / "lib"
         if not (include_dir / "hip" / "hip_runtime.h").exists():
             continue
-        if (library_dir / "libamdhip64.so").exists():
-            return [str(include_dir)], [str(library_dir)], "amdhip64"
-        versioned = sorted(library_dir.glob("libamdhip64.so.*"))
-        if versioned:
-            return [str(include_dir)], [str(library_dir)], f":{versioned[-1].name}"
+        for library_dir in (rocm_home / "lib64", rocm_home / "lib"):
+            if (library_dir / "libamdhip64.so").exists():
+                return [str(include_dir)], [str(library_dir)], "amdhip64"
+            versioned = sorted(library_dir.glob("libamdhip64.so.*"))
+            if versioned:
+                return [str(include_dir)], [str(library_dir)], f":{versioned[-1].name}"
 
     searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
     raise RuntimeError(
@@ -60,8 +64,8 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
 def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     if CUDA_HOME is None:
         raise RuntimeError(
-            "CUDA_HOME is required to build freetoken.kernel._pinned_tensor "
-            "because it links against the CUDA runtime API."
+            "CUDA_HOME (or ROCM_HOME) is required to build freetoken.kernel._pinned_tensor "
+            "because it links against the CUDA/HIP runtime API."
         )
     cuda_home = Path(CUDA_HOME)
     library_dirs = [str(cuda_home / "lib64")]
