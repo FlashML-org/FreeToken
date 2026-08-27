@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import gc
 import math
 import os
@@ -1158,15 +1159,48 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
-def _pin_budget_bytes() -> int | None:
-    """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+@functools.lru_cache(maxsize=1)
+def _probe_wsl_pin_budget() -> int | None:
+    """Measured cumulative CUDA pin ceiling; None if unavailable."""
+    try:
+        import ctypes
+        if not torch.cuda.is_available():
+            return None
+        torch.zeros(1, device="cuda")  # warm the CUDA context
+        rt = ctypes.CDLL(f"libcudart.so.{(torch.version.cuda or '0').split('.')[0]}")
+        for fn in ("cudaHostAlloc", "cudaFreeHost", "cudaGetLastError"):
+            getattr(rt, fn).restype = ctypes.c_int
+        rt.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+        rt.cudaFreeHost.argtypes = [ctypes.c_void_p]
+    except Exception:
+        return None
+    chunk = 256 << 20  # small chunks get the most usable budget
+    max_probe = 8 << 30  # bound probe time/RAM on uncapped hosts
+    held: list[ctypes.c_void_p] = []
+    total = 0
+    try:
+        while total + chunk <= max_probe:
+            ptr = ctypes.c_void_p()
+            if rt.cudaHostAlloc(ctypes.byref(ptr), chunk, 0) != 0 or not ptr.value:
+                break  # hit the pin wall
+            ctypes.memset(ptr, 0, 1 << 20)  # fault pages, matching pin-after-fill banks
+            held.append(ptr)
+            total += chunk
+    finally:
+        for ptr in held:  # free the probe buffers so the real banks get the budget
+            rt.cudaFreeHost(ptr)
+    rt.cudaGetLastError()  # clear sticky error from the refused alloc or torch OOMs
+    return int(total * 0.8) if total else None
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere."""
+
+def _pin_budget_bytes() -> int | None:
+    """Bytes safe to cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+    WSL/WDDM caps near ~1 GiB; FREETOKEN_PIN_BUDGET_GB overrides anywhere."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         return int(float(env) * 2**30)
     if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
         return None
-    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+    return _probe_wsl_pin_budget()
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
