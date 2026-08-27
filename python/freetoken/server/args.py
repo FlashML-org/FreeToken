@@ -534,6 +534,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Log MoE expert-cache miss rate and routing skew during decode. Counters are "
+            "captured into the decode CUDA graph, so this can only be chosen at startup, "
+            "and it costs a little decode throughput -- it is a diagnostic, not a default."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

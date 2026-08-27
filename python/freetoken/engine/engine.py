@@ -30,6 +30,11 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+# Decode steps between --moe-collect-stats reports. Reading the counters costs a host sync,
+# so the window is coarse; it is short enough that a normal-length reply still produces a
+# few reports rather than one at the very end.
+MOE_STATS_INTERVAL = 256
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -332,6 +337,7 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
+        self._moe_stats_step = 0
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
@@ -628,6 +634,12 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        # The routing histogram rides the same switch: on its own the miss rate says how
+        # often we fetch, but not whether a smarter policy could have avoided the fetch.
+        # decode_routing_stats turns it into an oracle hit rate -- the ceiling any policy
+        # holding this many slots could reach on the observed routing -- which is the number
+        # worth having before anyone rewrites eviction.
+        cache.collect_decode_freq = config.moe_collect_stats
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -932,7 +944,62 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if self.moe_offload_cache is not None and self.moe_offload_cache.collect_stats and batch.is_decode:
+            self._moe_stats_step += 1
+            if self._moe_stats_step >= MOE_STATS_INTERVAL:
+                self._moe_stats_step = 0
+                self._emit_moe_stats()
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _emit_moe_stats(self) -> None:
+        """Report one window of expert-cache behaviour, then reset the miss counters.
+
+        Accumulation is device-side and captured into the decode graph, so it is free to
+        leave running; reading it is not (the counters have to come back to the host), which
+        is why this only fires every MOE_STATS_INTERVAL decode steps. The routing histogram
+        is deliberately *not* reset -- the oracle bound wants the whole run's distribution,
+        not one window's.
+        """
+        cache = self.moe_offload_cache
+        agg = cache.decode_miss_stats()
+        if not agg["layer_calls"]:
+            return
+        parts = [
+            f"miss_rate={agg['miss_rate']:.3f}",
+            f"active/layer={agg['active_per_layer']:.1f}",
+            f"missing/layer={agg['missing_per_layer']:.1f}",
+        ]
+        if cache.decode_target == "hybrid":
+            # How the misses split: PCIe-fetched to the GPU vs handed to the CPU kernels.
+            parts.append(f"fetch_rate={agg['fetch_rate']:.3f}")
+            parts.append(f"cpu/layer={agg['cpu_per_layer']:.1f}")
+        logger.info_rank0(f"MoE cache ({MOE_STATS_INTERVAL} decode steps): " + ", ".join(parts))
+
+        per_layer = [L for L in cache.decode_miss_stats_per_layer()["per_layer"] if L["steps"]]
+        worst = sorted(per_layer, key=lambda L: -L["miss_rate"])[:5]
+        if worst:
+            logger.info_rank0(
+                "MoE cache worst layers: "
+                + ", ".join(f"L{L['layer']}={L['miss_rate']:.3f}" for L in worst)
+            )
+        routing = cache.decode_routing_stats()
+        if routing:
+            # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
+            # many slots per layer. If it sits near the realized hit rate, the cache is
+            # already doing as well as the routing allows and the win has to come from
+            # somewhere else (more slots, more bandwidth); if it sits far above, eviction
+            # policy is leaving something on the table.
+            logger.info_rank0(
+                "MoE routing: "
+                f"oracle_hit={routing['oracle_hit_at_slots']:.3f} "
+                f"(realized {1.0 - agg['miss_rate']:.3f}), "
+                f"slots/layer={routing['slots_per_layer']:.1f}, "
+                f"working_set={routing['working_set_mean']:.1f}"
+                f"/{routing['working_set_max']}, "
+                f"experts_for_90pct={routing['experts_for_90pct']:.1f}, "
+                f"norm_entropy={routing['norm_entropy']:.3f}"
+            )
+        cache.reset_stats()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
