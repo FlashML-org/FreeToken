@@ -47,6 +47,7 @@ dependencies = [
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
+    "Pillow>=11,<13",
     "prompt_toolkit>=3.0,<4",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
@@ -55,6 +56,7 @@ dependencies = [
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
     "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
     "triton==3.6.0; platform_system == 'Linux'",
@@ -91,6 +93,7 @@ accel = ["freetoken[fi,sgl]"]
 # which would otherwise shadow PyPI under uv's first-index strategy).
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
