@@ -83,10 +83,13 @@ def _module():
         # The minimal PyTorch ROCm SDK can omit Thrust while libtorch's HIP
         # headers include it.  Add a real system ROCm developer include only
         # when present, retaining the wheel-only build on complete installs.
+        # This must be a compiler flag, not ``extra_include_paths``: PyTorch's
+        # hipify pass recursively rewrites every extension include path and
+        # cannot write beneath the read-only system ROCm installation.
         hip_thrust_include = _hip_thrust_include()
         extra_include_paths = [str(_CSRC)]
         if hip_thrust_include is not None:
-            extra_include_paths.append(hip_thrust_include)
+            extra_cuda_cflags += ["-isystem", hip_thrust_include]
     else:
         extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
         host_cxx = _host_compiler()
