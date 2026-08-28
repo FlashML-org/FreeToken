@@ -47,6 +47,31 @@ Notes for the sm_70 build:
   headroom:
   `ft serve --model <dir> --memory-ratio 0.75` (default 0.9 OOMs).
 
+## Serving on 16 GiB Volta with large system prompts
+
+A 35B-class MoE on a V100-16GB with expert offload needs careful memory tuning
+once the client sends a large system prompt (e.g. agent harnesses that inject
+~8K tokens of runtime context into every request). Measured on
+Qwen3.6-35B-A3B-FP8 + r570:
+
+- `--memory-ratio 0.9` (default): OOMs on the 8K-token prefill (~2.3 GiB
+  headroom is not enough for the prefill activations).
+- `--memory-ratio 0.6`: fits the prefill but the smaller expert cache collapses
+  decode to ~0.1-0.4 tok/s (expert fetch thrash over PCIe).
+- **`--memory-ratio 0.75 --moe-cache-rate 0.2 --num-tokens 16384`**: ~4.1 GiB
+  free after init; the 8099-token system prompt prefills at ~800 tok/s without
+  OOM and decode stays at ~20 tok/s for normal prompts. This is the setting to
+  run under a client that always streams with a big system prompt.
+- `--moe-cache-rate` is a fraction of all experts (0.4 of the 30 GiB banks
+  alone OOMs at startup on 16 GiB); 0.2 is the practical ceiling here.
+- Streaming is OpenAI-compatible (progressive `data:` chunks and a terminal
+  `data: [DONE]`), verified against the OpenAI SDK client; the earlier "stream
+  hangs with one empty chunk" symptom was queue starvation, not the wire format.
+- OpenAI-compatible gateway clients (e.g. a DSH `llm-pi-ai` provider route)
+  must supply `api: openai-completions`, `baseURL: <host>:<port>/v1`, and an
+  `apiKeyEnv` credential — pi-ai's adapter requires a key string even when the
+  gateway ignores it.
+
 ## Method 1: Install from PyPI
 
 ```bash
