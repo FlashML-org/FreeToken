@@ -545,15 +545,48 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t top_k,
     int64_t type,
     int64_t row,
-    int64_t tokens) {
+    int64_t tokens,
+    bool output_fp32) {
+  // The normal public contract returns the same dtype as X.  The opt-in
+  // Q4_0 experiment below instead uses a FP32 temporary to match the output
+  // representation used by llama.cpp's HIP MMVQ path while retaining BF16 at
+  // the Python MoE boundary.  Keeping the decision here, next to allocation,
+  // prevents a mismatched pointer type from reaching a HIP kernel.
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  if (output_fp32) {
+    options = options.dtype(torch::kFloat);
+  }
   at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+
+  // The Q4_0 output scalar is independent of the scalar used to quantize X.
+  // Special-casing this branch avoids changing the other GGUF formats while
+  // allowing a HIP build to report whether an FP32 vector destination removes
+  // the register-pressure difference observed in the matched ROCm traces.
+  if (output_fp32 && type == 2) {
+    DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8_fp32_q4_0", [&] {
+      quantize_row_q8_1_cuda<scalar_t>(
+          (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+      moe_vec_q4_0_q8_1_cuda<float>(
+          (void*)W.data_ptr(),
+          (void*)quant_X.data_ptr(),
+          (float*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(),
+          top_k,
+          tokens,
+          col,
+          row,
+          quant_X.stride(0),
+          stream);
+    });
+    return Y;
+  }
+
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
     switch (type) {
