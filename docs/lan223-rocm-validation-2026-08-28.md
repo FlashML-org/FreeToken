@@ -165,6 +165,7 @@ prompt tokens and llama.cpp's reused 58.
 | FreeToken, final target-specific `gfx1151` GGUF extension plus graph capture | 55.44 | 263.6 ms | Validated shipping configuration; normal run-to-run variation |
 | FreeToken, experimental two-row Q4_0 MoE block | 55.30 | 291.6 ms | Rejected: slower with identical output hash |
 | FreeToken, experimental Q4_0 MoE two-block residency hint | 55.08 | 294.9 ms | Rejected: slower with identical output hash |
+| FreeToken, HIP Q4_0 MoE one-wave/two-row specialization | 55.89 median, 55.91 mean | 262.2 ms mean | Accepted: five independent API runs, identical output hash |
 | llama.cpp `b10141`, ROCm 10 HIP | 60.42 client, 58.88 internal | 128.6 ms | Matched reference |
 
 The graph configuration removes approximately 1.5 percent of the eager decode
@@ -172,6 +173,54 @@ cost, but FreeToken still trails llama.cpp by 7.8 percent using client TPS and
 by approximately 5.4 percent compared with llama.cpp's internal decode timing.
 The requested criterion of meeting or exceeding llama.cpp is therefore **not
 met** by the first configuration pass.
+
+### Accepted HIP Q4_0 one-wave/two-row MoE specialization
+
+The first two-row experiment did not reproduce llama.cpp's execution shape: it
+used two independent 32-thread waves.  Commit `d1de602` instead adds a ROCm-only
+Q4_0 kernel in which one 32-thread wave accumulates two adjacent output rows.
+It preserves FreeToken's flattened token/top-k route IDs, packed expert-bank
+layout, Q8_1 activation layout, and BF16 public output contract.  CUDA retains
+the established generic path.
+
+The dedicated LAN-223 microbenchmark uses the verified Gemma 4 26B A4B Q4_0
+geometry: 128 experts, top-k 8, hidden width 2816, intermediate width 704, and
+one decode token.  Five runs with 2,000 timed calls each measured a 73.509 us
+baseline median for the gate/up plus down pair and a 64.340 us candidate median,
+a 12.5 percent kernel-pair reduction.  ROCprof recorded a 32-thread wave, zero
+LDS and scratch allocation, and half the former row-block grid.  The compiler
+still allocated 48 VGPRs, so future work must target register pressure
+separately rather than claiming it was resolved by this change.
+
+The end-to-end gate was five independent loopback OpenAI-compatible API server
+runs, each using the exact Gemma GGUF SHA-256, offload backend, 0.50 memory
+ratio, HIP graph capture, greedy AIME-25 problem 0, and 128-token decode
+procedure.  All five emitted the original deterministic output SHA-1
+`abeee5e73e89` and retained 27.52 GiB server-reported VRAM use.
+
+| Metric | Five-run result |
+| --- | --- |
+| Decode TPS | 55.713 to 56.071 |
+| Decode TPS median / mean | **55.894 / 55.905** |
+| Decode ms/token median / mean | **17.891 / 17.887** |
+| TTFT mean | 262.2 ms |
+| Output SHA-1 | `abeee5e73e89` in every run |
+| Compared shipping configuration | 55.44 TPS single verified run |
+| Matched llama.cpp ROCm 10 reference | 60.42 client TPS |
+
+The candidate is accepted because it produces a repeatable FreeToken gain of
+approximately 0.8 percent over the prior shipping result while preserving the
+observable API result.  It remains approximately 7.5 percent below the
+matched llama.cpp client-TPS reference, so it is an incremental port
+improvement rather than completion of the performance objective.
+
+Artifacts are retained on LAN-223:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-microbench-20260828T231332Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-two-row-wave-20260828T231950Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-two-row-wave-20260828T231950Z/api-repeats-20260828T232646Z/
+```
 
 The best verified FreeToken command shape is:
 
