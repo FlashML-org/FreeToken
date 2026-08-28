@@ -65,14 +65,19 @@ def is_gfx12xx_family() -> bool:
     return arch is not None and arch.startswith("gfx120")
 
 
+# Descriptive alias used at optional-backend boundaries. Both names deliberately share
+# one functools cache so tests and runtime invalidation cannot disagree.
+is_rocm_runtime = is_rocm
+
+
 @functools.cache
 def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
-    if is_rocm():
-        return None
-    if not torch.cuda.is_available() or not torch.version.cuda:
+    # ROCm retains torch.cuda APIs, but neither CUDA SM feature checks nor the
+    # numeric capability ordering below are meaningful for an AMD GPU.
+    if is_rocm_runtime() or not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
 

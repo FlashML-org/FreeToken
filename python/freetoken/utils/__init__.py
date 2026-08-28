@@ -1,6 +1,7 @@
 from .arch import (
     is_arch_supported,
     is_rocm,
+    is_rocm_runtime,
     get_rocm_gfx_arch,
     is_gfx11xx_family,
     is_gfx12xx_family,
@@ -40,6 +41,7 @@ __all__ = [
     "init_logger",
     "is_arch_supported",
     "is_rocm",
+    "is_rocm_runtime",
     "get_rocm_gfx_arch",
     "is_gfx11xx_family",
     "is_gfx12xx_family",
