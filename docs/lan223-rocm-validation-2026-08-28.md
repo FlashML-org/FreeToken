@@ -164,6 +164,7 @@ prompt tokens and llama.cpp's reused 58.
 | FreeToken, HIP graph plus experimental `-ffast-math` GGUF extension | 55.65 | 261.6 ms | Rejected: no gain, despite matching output hash |
 | FreeToken, final target-specific `gfx1151` GGUF extension plus graph capture | 55.44 | 263.6 ms | Validated shipping configuration; normal run-to-run variation |
 | FreeToken, experimental two-row Q4_0 MoE block | 55.30 | 291.6 ms | Rejected: slower with identical output hash |
+| FreeToken, experimental Q4_0 MoE two-block residency hint | 55.08 | 294.9 ms | Rejected: slower with identical output hash |
 | llama.cpp `b10141`, ROCm 10 HIP | 60.42 client, 58.88 internal | 128.6 ms | Matched reference |
 
 The graph configuration removes approximately 1.5 percent of the eager decode
