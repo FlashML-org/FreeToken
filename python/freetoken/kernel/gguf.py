@@ -20,6 +20,43 @@ import shutil
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _hip_target_arch() -> str | None:
+    """Return the active AMD GPU target in ``gfxNNNN`` form when HIP exposes it.
+
+    PyTorch's extension builder otherwise emits code for every visible AMD target.
+    A one-GPU serving process only needs the active target, so preserving an explicit
+    user selection or deriving the target from the active device avoids unnecessary
+    JIT work and records the architecture in the extension build key.
+    """
+    explicit = os.environ.get("PYTORCH_ROCM_ARCH", "").strip()
+    if explicit:
+        return explicit.split(";", 1)[0].strip()
+    if not torch.cuda.is_available():
+        return None
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return str(arch).split(":", 1)[0] or None
+
+
+def _hip_gguf_cflags() -> list[str]:
+    """Build conservative HIP GGUF flags, with an explicit fast-math experiment.
+
+    ``-O3`` is the normal portable optimization level.  Fast math may improve an
+    AMD compile, but it can alter floating-point contraction and must therefore be
+    enabled only by ``FREETOKEN_HIP_GGUF_FAST_MATH=1`` while output equivalence is
+    benchmarked.  The architecture environment variable is set before PyTorch asks
+    hipcc to compile, which makes the cache target-specific without overriding a
+    deployment's explicit multi-target configuration.
+    """
+    target = _hip_target_arch()
+    if target and not os.environ.get("PYTORCH_ROCM_ARCH"):
+        os.environ["PYTORCH_ROCM_ARCH"] = target
+    flags = ["-O3"]
+    if os.environ.get("FREETOKEN_HIP_GGUF_FAST_MATH", "").strip().lower() in _TRUE_VALUES:
+        flags.append("-ffast-math")
+    return flags
 
 
 def _hip_thrust_include() -> str | None:
@@ -103,7 +140,7 @@ def _module():
         # Neither issue -ccbin works around applies under hipcc: it has no separate
         # nvcc-style host pass (its own bundled clang IS the host compiler), and
         # --expt-relaxed-constexpr is an nvcc-only flag hipcc/clang rejects outright.
-        extra_cuda_cflags = ["-O3"]
+        extra_cuda_cflags = _hip_gguf_cflags()
         # The minimal PyTorch ROCm SDK can omit Thrust while libtorch's HIP
         # headers include it.  Add a real system ROCm developer include only
         # when present, retaining the wheel-only build on complete installs.
