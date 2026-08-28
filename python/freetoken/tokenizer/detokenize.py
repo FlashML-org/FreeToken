@@ -91,6 +91,15 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # Fast path: no duplicate uids — batch decode all at once (original behavior).
+        # Slow path: duplicate uids (DFlash multi-token output) — decode per message
+        # so each msg's surr_offset sees the previous msg's update.
+        uids = [msg.uid for msg in msgs]
+        if len(uids) == len(set(uids)):
+            return self._detokenize_batch(msgs)
+        return self._detokenize_sequential(msgs)
+
+    def _detokenize_batch(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
@@ -116,7 +125,7 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
+            if len(new_text) > 0 and not new_text.endswith(""):
                 output_str = s.decoded_str + new_text
                 s.decoded_str = output_str
                 s.surr_offset = s.read_offset
@@ -135,6 +144,55 @@ class DetokenizeManager:
                     emit_end = len(output_str)
             elif msg.stop_strs:
                 # Hold back a trailing suffix that could still grow into a stop string.
+                emit_end = len(output_str) - _stop_prefix_holdback(output_str, msg.stop_strs)
+            else:
+                emit_end = len(output_str)
+            incremental_output = output_str[prev_sent:emit_end] if emit_end > prev_sent else ""
+            s.sent_offset = max(prev_sent, emit_end)
+            incremental_strs.append(incremental_output)
+            if msg.finished:
+                del self.decode_map[msg.uid]
+
+        return incremental_strs
+
+    def _detokenize_sequential(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        incremental_strs: List[str] = []
+        for msg in msgs:
+            if msg.uid not in self.decode_map:
+                self.decode_map[msg.uid] = DecodeStatus(
+                    decoded_ids=[],
+                    decoded_str="",
+                    read_offset=0,
+                    surr_offset=0,
+                    sent_offset=0,
+                )
+            s = self.decode_map[msg.uid]
+            if not (msg.finished and msg.next_token in self.eos_token_ids):
+                s.decoded_ids.append(msg.next_token)
+            read_str, surr_str = self.tokenizer.batch_decode(
+                [
+                    s.decoded_ids[s.surr_offset :],
+                    s.decoded_ids[s.surr_offset : s.read_offset],
+                ]
+            )
+            new_text = read_str[len(surr_str) :]
+            if len(new_text) > 0 and not new_text.endswith(""):
+                output_str = s.decoded_str + new_text
+                s.decoded_str = output_str
+                s.surr_offset = s.read_offset
+                s.read_offset = len(s.decoded_ids)
+            else:
+                new_text = find_printable_text(new_text)
+                output_str = s.decoded_str + new_text
+
+            prev_sent = s.sent_offset
+            if msg.finished:
+                if msg.matched_stop:
+                    cut = output_str.find(msg.matched_stop)
+                    emit_end = cut if cut >= 0 else len(output_str)
+                else:
+                    emit_end = len(output_str)
+            elif msg.stop_strs:
                 emit_end = len(output_str) - _stop_prefix_holdback(output_str, msg.stop_strs)
             else:
                 emit_end = len(output_str)

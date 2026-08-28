@@ -80,6 +80,10 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # DFlash speculative decoding
+    speculative_algorithm: str | None = None  # "dflash" or None
+    speculative_draft_model_path: str | None = None
+    speculative_dflash_block_size: int = 2
 
     @cached_property
     def hf_config(self):

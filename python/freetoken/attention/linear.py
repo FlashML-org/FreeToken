@@ -42,6 +42,13 @@ class FLAMetadata:
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
 
+    # DFlash accepted-boundary commit experiment. When set on a multi-token decode-shaped
+    # verify forward, GDN stores per-token boundary states here without mutating the live slot.
+    dflash_disable_state_update: bool = False
+    dflash_conv_states_buffer: torch.Tensor | None = None       # [T, layers, conv_dim, K-1]
+    dflash_recurrent_states_buffer: torch.Tensor | None = None  # [layers, T, heads, K, V]
+    dflash_recurrent_state_indices: torch.Tensor | None = None  # [layers] int32, usually arange
+
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D

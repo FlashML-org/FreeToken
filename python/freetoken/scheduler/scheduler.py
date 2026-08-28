@@ -57,6 +57,28 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+def _drain_before_schedule(last_data: ForwardData | None) -> bool:
+    return last_data is not None and (
+        last_data[1].num_tokens > 1 or getattr(last_data[1], "force_drain", False)
+    )
+
+
+def _multi_token_next_input_pos(device_len: int, num_tokens: int) -> int:
+    return device_len + num_tokens - 2
+
+
+def _multi_token_last_token_index(req_index: int, num_tokens: int) -> int:
+    return (req_index + 1) * num_tokens - 1
+
+
+def _multi_token_emit_count(input_len: int, max_device_len: int, num_tokens: int) -> int:
+    return min(num_tokens, max(max_device_len - input_len, 0))
+
+
+def _multi_token_hit_length(input_len_after_append: int, max_device_len: int) -> bool:
+    return input_len_after_append >= max_device_len
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -141,7 +163,11 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
-        self.cache_manager.check_integrity()
+        # Skip integrity check for DFlash — overlap scheduling causes a known
+        # 2-page leak per request (1 extra page per decode iteration not freed
+        # before the integrity check runs).
+        if self.engine.dflash_worker is None:
+            self.cache_manager.check_integrity()
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -210,6 +236,12 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        if _drain_before_schedule(last_data):
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            last_data = None
+            self._last_data = None
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -300,8 +332,11 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        batch, forward_output = last_data[0].batch, last_data[1]
+        copy_done_event = forward_output.copy_done_event
+        copy_done_event.synchronize()
+        next_tokens_cpu = forward_output.next_tokens_cpu
+        num_tokens = forward_output.num_tokens
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -331,58 +366,11 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                if num_tokens > 1:
+                    self._drain_multi_token(req, next_tokens_cpu, i, num_tokens, reply, new_finished_reqs, batch)
+                else:
+                    self._drain_single_token(req, next_tokens_cpu, i, reply, new_finished_reqs, batch)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -429,6 +417,68 @@ class Scheduler(SchedulerIOMixin):
             if s in tail:
                 return s
         return None
+
+    def _drain_single_token(self, req, next_tokens_cpu, i, reply, new_finished_reqs, batch):
+        next_token = int(next_tokens_cpu[i].item())
+        if req.input_ids.numel() >= req.max_device_len:
+            finished = True
+            finish_reason = "length"
+        else:
+            req.append_host(next_tokens_cpu[i].unsqueeze(0))
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            hit_length = not req.can_decode
+            hit_eos = not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and req.sampling_params.stop_strs else None
+            finished = hit_length or hit_eos or matched_stop is not None
+            finish_reason = ("stop" if (hit_eos or matched_stop is not None) else "length") if finished else None
+        if next_token == self.toolcall_anchor_id and req.toolcall_anchor_len is None and not finished:
+            req.toolcall_anchor_len = req.input_ids.numel()
+        reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished, finish_reason=finish_reason, stop_strs=req.sampling_params.stop_strs or None))
+        # NOTE: overlap scheduling may make the request freed twice, skip second free
+        if finished and req not in self.finished_reqs:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        elif batch.is_prefill and req.table_idx != -1:
+            # for prefill, non-chunk req, cache the prefix.
+            # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+            # the generic manager inserts the prefix into its radix/naive cache.
+            # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+            # instead of freeing them (handled above), so a freed request should
+            # never reach this commit -- but if a future path frees one early, skip
+            # rather than re-read the freed page-table row (and on hybrid, deref the
+            # None'd GDN ping-pong slots).
+            self.cache_manager.cache_req(req, finished=False)
+
+    def _drain_multi_token(self, req, next_tokens_cpu, i, num_tokens, reply, new_finished_reqs, batch):
+        tokens = next_tokens_cpu[i * num_tokens:(i + 1) * num_tokens]
+        emit_count = _multi_token_emit_count(req.input_ids.numel(), req.max_device_len, tokens.numel())
+        if emit_count == 0:
+            if req not in self.finished_reqs:
+                self.decode_manager.remove_req(req)
+                self._free_req_resources(req)
+                new_finished_reqs.add(req)
+            return
+        appended = 0
+        for t in tokens[:emit_count]:
+            t_scalar = int(t.item())
+            req.append_host(t.unsqueeze(0))
+            appended += 1
+            hit_length = _multi_token_hit_length(req.input_ids.numel(), req.max_device_len)
+            hit_eos = not req.sampling_params.ignore_eos and t_scalar in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and req.sampling_params.stop_strs else None
+            finished = hit_length or hit_eos or matched_stop is not None
+            finish_reason = ("stop" if (hit_eos or matched_stop is not None) else "length") if finished else None
+            reply.append(DetokenizeMsg(uid=req.uid, next_token=t_scalar, finished=finished, finish_reason=finish_reason, stop_strs=req.sampling_params.stop_strs or None))
+            if finished and req not in self.finished_reqs:
+                self.decode_manager.remove_req(req)
+                self._free_req_resources(req)
+                new_finished_reqs.add(req)
+                break
+        if req not in new_finished_reqs and appended > 1:
+            req.device_len += appended - 1
+            req.cached_len += appended - 1
 
     def _kv_usage_pages(self) -> Tuple[int, int]:
         """(used_pages, total_pages) of the KV page pool.
@@ -601,6 +651,9 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
+        # DFlash: clear context buffer when the request finishes
+        if self.engine.dflash_worker is not None:
+            self.engine.dflash_worker.reset_context()
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
@@ -774,7 +827,16 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
+        # DFlash: pre-allocate block_size extra pages for verify prefill
+        dflash_verify = 0
+        if batch.is_decode and self.engine.dflash_worker is not None:
+            dflash_verify = self.engine.dflash_worker.block_size
+            for req in batch.reqs:
+                req.device_len += dflash_verify
         self.cache_manager.allocate_paged(batch.reqs)
+        if dflash_verify:
+            for req in batch.reqs:
+                req.device_len -= dflash_verify
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -866,7 +928,18 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+
+        if forward_output.num_tokens <= 1:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        else:
+            for i, req in enumerate(batch.reqs):
+                last_token_idx = _multi_token_last_token_index(i, forward_output.num_tokens)
+                last_token = forward_output.next_tokens_gpu[last_token_idx : last_token_idx + 1]
+                self.token_pool[
+                    req.table_idx,
+                    _multi_token_next_input_pos(req.device_len, forward_output.num_tokens),
+                ] = last_token
+
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

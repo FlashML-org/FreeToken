@@ -561,6 +561,25 @@ def parse_args(
         ),
     )
 
+    # DFlash speculative decoding
+    parser.add_argument(
+        "--speculative-algorithm",
+        choices=["dflash"],
+        default=ServerArgs.speculative_algorithm,
+        help="Speculative decoding algorithm (dflash).",
+    )
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        default=ServerArgs.speculative_draft_model_path,
+        help="Path to the draft model for speculative decoding.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-block-size",
+        type=int,
+        default=ServerArgs.speculative_dflash_block_size,
+        help="Block size for DFlash (default 2).",
+    )
+
     parser.add_argument(
         "--enable-special-token-ckpt",
         action="store_true",

@@ -46,6 +46,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.capture: FACaptureData | None = None
+        self.dflash_target_verify_capture: dict[int, FACaptureData] = {}
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
@@ -150,6 +151,59 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)
+
+    def reset_capture(self) -> None:
+        super().reset_capture()
+        self.dflash_target_verify_capture = {}
+
+    def init_dflash_target_verify_capture_graph(
+        self,
+        max_seq_len: int,
+        verify_lens: List[int],
+    ) -> None:
+        assert not self.dflash_target_verify_capture, "DFlash target verify capture already initialized."
+        self.dflash_target_verify_capture = {
+            verify_len: FACaptureData.create(
+                1,
+                max_seq_len // self.page_size,
+                self.kvcache.device,
+            )
+            for verify_len in sorted(verify_lens)
+        }
+        for verify_len, capture in self.dflash_target_verify_capture.items():
+            capture.cu_seqlens_q.copy_(torch.tensor([0, verify_len], dtype=torch.int32, device=self.kvcache.device))
+            capture.cu_seqlens_k.copy_(torch.tensor([0, verify_len], dtype=torch.int32, device=self.kvcache.device))
+            capture.seq_lens[:1].fill_(verify_len)
+
+    def prepare_for_dflash_target_verify_capture(self, batch: Batch, verify_len: int) -> None:
+        assert batch.size == 1 and verify_len in self.dflash_target_verify_capture
+        capture = self.dflash_target_verify_capture[verify_len]
+        batch.attn_metadata = FAMetadata(
+            cu_seqlens_k=capture.cu_seqlens_k[:2],
+            cu_seqlens_q=capture.cu_seqlens_q[:2],
+            cache_seqlens=capture.seq_lens[:1],
+            max_seqlen_k=capture.page_table.size(1) * self.page_size,
+            max_seqlen_q=verify_len,
+            page_table=capture.page_table[:1, :],
+        )
+
+    def prepare_for_dflash_target_verify_replay(self, batch: Batch, verify_len: int) -> None:
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, FAMetadata)
+        assert verify_len in self.dflash_target_verify_capture
+        capture = self.dflash_target_verify_capture[verify_len]
+        table_len = metadata.page_table.size(1)
+        capture.seq_lens[:1].copy_(metadata.cache_seqlens[:1])
+        capture.cu_seqlens_k[:2].copy_(metadata.cu_seqlens_k[:2])
+        capture.page_table[:1, :table_len].copy_(metadata.page_table[:1, :table_len])
+        batch.attn_metadata = FAMetadata(
+            cu_seqlens_k=capture.cu_seqlens_k[:2],
+            cu_seqlens_q=capture.cu_seqlens_q[:2],
+            cache_seqlens=capture.seq_lens[:1],
+            max_seqlen_k=capture.page_table.size(1) * self.page_size,
+            max_seqlen_q=verify_len,
+            page_table=capture.page_table[:1, :],
+        )
 
 
 def _fa_sgl_impl(
