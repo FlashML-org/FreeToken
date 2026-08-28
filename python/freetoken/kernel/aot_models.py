@@ -75,13 +75,16 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
         # models/loader.py stream_moe_expert_sources: gate_up [E, 2I, H], down [E, H, I], bf16
         return {"gate_up": 2 * I * H * 2, "down": H * I * 2}
     if fmt == "fp8_block":
-        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block scales
+        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block
+        # scales, trailing scale dim 16B-padded (same helper as the loader)
+        from freetoken.moe.offload_cache import fp8_block_scale_pad
+
         B = 128
         return {
             "gate_up": 2 * I * H,
-            "gate_up_scale": (2 * I // B) * (H // B) * 2,
+            "gate_up_scale": (2 * I // B) * fp8_block_scale_pad(2 * I // B, H // B) * 2,
             "down": H * I,
-            "down_scale": (H // B) * (I // B) * 2,
+            "down_scale": (H // B) * fp8_block_scale_pad(H // B, I // B) * 2,
         }
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
@@ -182,6 +185,19 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=_NVFP4_FORMATS,
+    ),
+    AotModel(
+        # QSA compressed-sparse attention (12 of 48 layers): the QSAKVCache stores K/V
+        # through store_cache (2 kv heads x 256 head_dim), the compressed index-key slab
+        # and the pending ring write via the vendored qsa triton kernels. Hyper-connections
+        # carry the residual, so the embedding row indexing() sees is still hidden_size.
+        name="RadixArk/Qwen3.8-Flash-Next-NVFP4",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
     ),
     AotModel(
         name="google/gemma-4-26B-A4B-it",

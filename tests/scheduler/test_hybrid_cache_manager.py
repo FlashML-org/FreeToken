@@ -16,7 +16,7 @@ from freetoken.scheduler.cache import CacheManager
 def _pool(num_slots=16):
     g = LinearGatedDeltaGroupConfig(
         name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
     )
     return LinearStatePool(group=g, num_slots=num_slots, dtype=torch.bfloat16,
                            device=torch.device("cpu"), tp_size=1)
@@ -114,6 +114,43 @@ def test_rebuild_reclaims_donated_gdn_slots():
     assert pool.num_free_slots < pool.num_slots - 1   # a slot is now tree-owned
     cm.rebuild(64, pt)                            # idle rebuild discards the tree
     assert pool.num_free_slots == pool.num_slots - 1  # all GDN slots reclaimed (no leak)
+
+
+def test_prefill_chunk_ends_on_a_page_boundary():
+    """A hybrid chunk must end page-aligned: the snapshot commit skips any other boundary."""
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    pt = torch.zeros(4, 512, dtype=torch.int32)
+    cm = CacheManager(64, 64, pt, "hybrid_radix", linear_state_pool=pool)
+    assert cm.prefill_chunk_align == 64
+    tm = TableManager(max_running_reqs=4, page_table=pt)
+    pending = PendingReq(0, torch.arange(300, dtype=torch.int32), SamplingParams(max_tokens=1))
+
+    adder = PrefillAdder(token_budget=100, reserved_size=0, cache_manager=cm, table_manager=tm)
+    req = adder.try_add_one(pending)
+    assert isinstance(req, ChunkedReq) and req.extend_len == 64
+
+    # a budget below one page keeps the unaligned chunk rather than stalling the request
+    adder = PrefillAdder(token_budget=40, reserved_size=0, cache_manager=cm, table_manager=tm)
+    assert adder.try_add_one(pending).extend_len == 40
+
+
+def test_naive_cache_does_not_align_prefill_chunks():
+    """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
+    from freetoken.scheduler.prefill import PrefillAdder
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pt = torch.zeros(4, 512, dtype=torch.int32)
+    cm = CacheManager(64, 64, pt, "radix")
+    assert cm.prefill_chunk_align == 1
+    tm = TableManager(max_running_reqs=4, page_table=pt)
+    adder = PrefillAdder(token_budget=100, reserved_size=0, cache_manager=cm, table_manager=tm)
+    pending = PendingReq(0, torch.arange(300, dtype=torch.int32), SamplingParams(max_tokens=1))
+    assert adder.try_add_one(pending).extend_len == 100
 
 
 def test_pool_sizing_covers_4mr_floor():

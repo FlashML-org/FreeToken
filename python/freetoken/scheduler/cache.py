@@ -66,6 +66,13 @@ class CacheManager:
     supports_runtime_rebuild = True
     prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
 
+    @property
+    def prefill_chunk_align(self) -> int:
+        """Granularity a non-final prefill chunk should end on. A hybrid snapshot is donated only
+        at a page-aligned boundary, so at page_size>1 one unaligned chunk end costs every reuse
+        point for the rest of the prompt. 1 (no-op) everywhere else."""
+        return self.page_size if self.is_hybrid else 1
+
     def page_usage(self) -> tuple[int, int]:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""

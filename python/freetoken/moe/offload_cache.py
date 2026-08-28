@@ -77,11 +77,21 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
+def fp8_block_scale_pad(rows: int, cols: int) -> int:
+    """Trailing scale-bank dim padded so per-expert row bytes are 16B-aligned (fused copy)."""
+    while (rows * cols * 2) % 16:
+        cols += 1
+    return cols
+
+
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
-    "fp8_block": lambda H, I: 3 * I * H + ((2 * I // 128) * (H // 128) + (H // 128) * (I // 128)) * 2,
+    "fp8_block": lambda H, I: 3 * I * H + (
+        (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
+        + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
+    ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),

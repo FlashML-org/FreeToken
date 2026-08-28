@@ -41,6 +41,7 @@ class FLAMetadata:
     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
+    track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
@@ -55,7 +56,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     builder serves the eager scheduler path and direct-op test callers.
     """
     reqs = batch.padded_reqs
-    pin = {"device": "cpu", "pin_memory": True}
+    pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
 
     # GDN state slot per request: the hybrid-radix live slot (decoupled from table_idx) when
     # allocated, else table_idx (naive / force-naive GDN models keep the old keying).
@@ -77,7 +78,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
+    track = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),
@@ -86,24 +87,29 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
         fresh_state_indices=(
             fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
         ),
-        track_dst=track_dst, track_h_row=track_h_row, track_conv_src=track_conv_src,
+        **track,
     )
 
 
 def _build_track_metadata(reqs, cu_host, device, pin):
     """Hybrid-radix (extra_buffer): for each request that crosses a ×CHUNK boundary this
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
-    ping-pong slot. Returns (track_dst, track_h_row, track_conv_src) device int64 tensors, or
-    (None, None, None) when no request tracks (non-hybrid, or all extends < CHUNK+1)."""
+    ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
+    tracks (non-hybrid, or all extends < CHUNK+1)."""
+    empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
     if not any(r.mamba_ping_pong is not None for r in reqs):
-        return None, None, None
+        return empty
     from freetoken.core import get_global_ctx
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
     from freetoken.kernel.fla.index import prepare_chunk_offsets
 
     km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
+    assert km1 <= CHUNK_SIZE, (
+        f"conv history {km1} exceeds CHUNK_SIZE {CHUNK_SIZE}: the snapshot window "
+        "would reach before this forward's first token"
+    )
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
-    dst, h_row, conv_src = [], [], []
+    dst, h_row, conv_src, boundary_rows = [], [], [], []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
@@ -117,13 +123,18 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
         h_row.append(boh[i] + c)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
+        boundary_rows.append(off + c * CHUNK_SIZE)
         r.mamba_last_track_seqlen = boundary
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:
-        return None, None, None
+        return empty
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
-    return (to(dst, dtype=torch.int64), to(h_row, dtype=torch.int64),
-            to(conv_src, dtype=torch.int64))
+    return dict(
+        track_dst=to(dst, dtype=torch.int64),
+        track_h_row=to(h_row, dtype=torch.int64),
+        track_conv_src=to(conv_src, dtype=torch.int64),
+        track_boundary_row=to(boundary_rows, dtype=torch.int64),
+    )
 
 
 __all__ = ["FLAMetadata", "build_fla_metadata"]
