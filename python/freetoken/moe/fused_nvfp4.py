@@ -323,6 +323,29 @@ def fused_experts_nvfp4(
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
     materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
+    if torch.version.hip is not None:
+        # The grouped prefill kernel below currently trips an HSA memory-aperture
+        # violation on gfx1151.  The serial Triton kernel is already FreeToken's
+        # native inline-dequant implementation and accepts an arbitrary M, so it
+        # preserves HIP GPU inference and model results without materializing BF16
+        # experts.  It is intentionally slower for prompt prefill than the CUDA
+        # grouped kernel, but is safe until the grouped launch is ROCm-qualified.
+        return fused_experts_decode_nvfp4_serial(
+            hidden_states,
+            gate_up_packed,
+            gate_up_scale,
+            gate_up_global,
+            down_packed,
+            down_scale,
+            down_global,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+            act_alpha,
+            act_limit,
+        )
+
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
