@@ -148,6 +148,63 @@ Raw artifacts are retained only on LAN-223:
 /home/david/freetoken-amd/artifacts/freetoken-rocm10-gemma4-q4-tps/
 ```
 
+## AMD TPS optimization campaign
+
+The first configuration optimization pass used the same warm AIME-25 problem
+and a 128-token greedy completion for both FreeToken and the ROCm 10 HIP build
+of llama.cpp `b10141`.  Each runner received the identical user message, used
+a warm identical request before the measured request, and ran one stream at a
+time.  Both rendered 63 prompt tokens; FreeToken's measured request reused 62
+prompt tokens and llama.cpp's reused 58.
+
+| Runtime and candidate | Decode TPS | TTFT | Result |
+| --- | ---: | ---: | --- |
+| FreeToken, offload, eager | 54.89 | 267.9 ms | Baseline |
+| FreeToken, offload, HIP graph capture at batch size 1 | 55.73 | 259.3 ms | Best observed safe configuration |
+| FreeToken, HIP graph plus experimental `-ffast-math` GGUF extension | 55.65 | 261.6 ms | Rejected: no gain, despite matching output hash |
+| FreeToken, final target-specific `gfx1151` GGUF extension plus graph capture | 55.44 | 263.6 ms | Validated shipping configuration; normal run-to-run variation |
+| llama.cpp `b10141`, ROCm 10 HIP | 60.42 client, 58.88 internal | 128.6 ms | Matched reference |
+
+The graph configuration removes approximately 1.5 percent of the eager decode
+cost, but FreeToken still trails llama.cpp by 7.8 percent using client TPS and
+by approximately 5.4 percent compared with llama.cpp's internal decode timing.
+The requested criterion of meeting or exceeding llama.cpp is therefore **not
+met** by the first configuration pass.
+
+The best verified FreeToken command shape is:
+
+```bash
+export ROCM_PATH=/opt/rocm-10.0
+export HIP_PATH=/opt/rocm-10.0
+export TORCH_EXTENSIONS_DIR=/home/david/freetoken-amd/cache/torch_extensions
+
+ft serve --model-path /home/david/freetoken-amd/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf \
+  --attention-backend triton --moe-backend offload --moe-cache-auto \
+  --memory-ratio 0.50 --max-running-requests 1 --max-seq-len-override 8320 \
+  --cuda-graph-max-bs 1
+```
+
+The port now derives and exports `PYTORCH_ROCM_ARCH=gfx1151` before the GGUF
+extension is compiled when the operator did not set an explicit architecture.
+This avoids compiling for unnecessary visible targets and makes the extension
+cache target-specific.  It does not itself increase steady-state TPS because
+the original HIP build already selected `gfx1151` on this single-GPU host.
+
+The remaining gap is not an untested cache or residency setting: Gemma's GGUF
+adapter only supports the native Q4_0 offload implementation, and the automatic
+cache selected all 3,840 routed-expert slots.  Closing the gap requires a
+profile-guided improvement to the HIP GGUF decode kernels or another proven
+ROCm attention or quantized-linear implementation.  `rocprofv3` ROCm 10 is
+installed for that next phase.  A temporary high-performance DPM governor test
+could not be run because the non-root LAN-223 account cannot write
+`power_dpm_force_performance_level`; automatic mode was unchanged.
+
+Raw campaign artifacts are retained on LAN-223:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-optimization-2026-08-28/
+```
+
 ## GGUF extension reuse validation
 
 The first Gemma request after the original source change built the native HIP
