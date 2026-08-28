@@ -10,13 +10,6 @@
 #define GGML_CUDA_DMMV_X 32
 #define GGML_CUDA_MMV_Y 1
 
-// Keep the generic quantized matrix-vector launch at one row per block, but
-// let the routed-expert path process two independent rows.  The latter is the
-// dominant LAN-223 decode kernel and matches the rows-per-block strategy used
-// by the comparable llama.cpp MoE implementation.  Each row occupies its own
-// 32-lane thread-x group, so reductions and output addresses remain isolated.
-#define GGML_CUDA_MOE_MMV_Y 2
-
 // Data Structures
 // QK = number of values after dequantization
 // QR = QK / number of values before dequantization
