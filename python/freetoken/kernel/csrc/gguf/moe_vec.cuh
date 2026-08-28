@@ -2,14 +2,6 @@
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/moe_vec.cuh
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
-//
-// This header is the routed-expert-only specialization.  Temporarily select
-// the two-row launch geometry defined in ggml-common.h, then restore the
-// generic one-row setting after all MoE wrappers are declared below.  Keeping
-// the scope local avoids changing non-MoE quantized matrix-vector operations.
-#undef GGML_CUDA_MMV_Y
-#define GGML_CUDA_MMV_Y GGML_CUDA_MOE_MMV_Y
-
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void moe_vec_q(
     const void* __restrict__ vx,
@@ -419,7 +411,3 @@ static void moe_vec_iq3_s_q8_1_cuda(
   moe_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
 }
-
-// Restore the generic setting for headers included after this specialization.
-#undef GGML_CUDA_MMV_Y
-#define GGML_CUDA_MMV_Y 1
