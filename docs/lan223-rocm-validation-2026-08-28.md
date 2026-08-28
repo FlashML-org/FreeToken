@@ -288,6 +288,41 @@ register and throughput gap.  The next candidate must change a more material
 component: the Q4_0 vector-kernel execution structure, MoE expert dispatch,
 or intermediate BF16 output path.
 
+### Rejected Q4_0 FP32-intermediate candidate
+
+llama.cpp's HIP Q4 vector paths use an FP32 destination, while FreeToken's
+normal Q4_0 MoE path returns an activation-typed BF16 tensor after each vector
+product.  Commit `5bbe10f` added a deliberately opt-in experiment that used
+FP32 only for the two Q4_0 MoE vector-product temporaries, then converted the
+final MoE result back to the original BF16 public contract.  It was activated
+only with `FREETOKEN_GGUF_MOE_FP32_INTERMEDIATE=1`; normal launches stayed on
+the existing dtype-preserving path.  The target-host build-flag and opt-in
+contract tests passed before the full-model run.
+
+The first launch under this candidate used the literal placeholder `model`
+instead of the local GGUF path and exited during model resolution.  It did not
+reach HIP compilation, graph capture, or an API request.  The failed artifact
+is retained as a labelled harness error and is excluded from every comparison.
+The corrected launch used the exact Gemma GGUF checksum, offload backend,
+0.50 memory ratio, graph capture, greedy AIME-25 problem 0, and 128-token
+decode procedure used by the repaired baseline.
+
+| Candidate | Decode TPS | ms/token | TTFT | Output SHA-1 | Decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| Repaired BF16 baseline | 55.04 | 18.169 | 295.2 ms | `abeee5e73e89` | Reference |
+| FP32 intermediates | 55.11 | 18.144 | 292.6 ms | `ce247609d76c` | Rejected |
+
+The 0.14 percent TPS change is smaller than the observed run-to-run variation,
+does not close the gap to the 60.42 client TPS ROCm 10 llama.cpp reference,
+and changes the deterministic greedy response hash.  The candidate was
+therefore reverted and is not a shipping option.  Raw evidence remains on
+LAN-223 at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/fp32-intermediate-20260828T230126Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/fp32-intermediate-retry-20260828T230209Z/
+```
+
 It confirms the active device is `gfx1151`, PyTorch is
 `2.13.0+rocm10.0.0` with HIP `7.15.26333`, and `/opt/rocm` resolves to
 `/opt/rocm-10.0`.  It also records that the system package database retains
