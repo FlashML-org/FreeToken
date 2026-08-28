@@ -29,9 +29,18 @@ uv pip install -e . --python .venv-sm70/bin/python
 
 Notes for the sm_70 build:
 
-- Install the **base** package (no `[accel]`): flashinfer/sglang fused kernels
-  target sm_80+ and are not usable on Volta; the runtime falls back to the
-  pure-Triton kernels automatically.
+- Install the **base** package (**no `[accel]`**): flashinfer/sglang fused kernels
+  target sm_80+/sm_100+ and ship CUDA 13 builds only, so they are not usable on
+  Volta — if they are present the engine fails to load with `common_ops` /
+  `libnvrtc.so.13` / `no kernel image` errors. The runtime falls back to the
+  pure-Triton kernels automatically, which is what Volta uses.
+- If you upgraded an existing cu130 venv in place (e.g. a FreeToken Desktop
+  engine venv), also uninstall the accel native kernels and any leftover cu13
+  libs so the cu12 runtime is the one loaded:
+  `uv pip uninstall --python <venv>/bin/python sglang-kernel flashinfer-python`
+  and remove the lingering `nvidia/cu13` package dir under the venv site-packages.
+  The FreeToken Desktop engine venv (typically `~/.freetoken/venv` or
+  `~/.freetoken-cli/.venv`) needs the same treatment.
 - `freetoken_kernel_cache` (cu130) is skipped; JIT kernels compile on first use
   with the local nvcc.
 - On 16 GiB cards (V100-16GB), lower the serve memory ratio so requests have
