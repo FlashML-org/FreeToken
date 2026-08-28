@@ -105,3 +105,7 @@ pull request #241, preserving its commits and authorship.  It adds explicit
 Upstream review should receive a focused pull request containing code plus
 tests.  LAN-223 environment reports and benchmark artifacts belong in this
 fork unless the upstream maintainers request them.
+
+The completed 2026-08-28 native HIP validation, exact LAN-223 environment,
+API evidence, command shapes, and known limitations are documented in
+[`lan223-rocm-validation-2026-08-28.md`](lan223-rocm-validation-2026-08-28.md).
