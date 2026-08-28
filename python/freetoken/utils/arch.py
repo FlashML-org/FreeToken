@@ -5,11 +5,29 @@ from typing import Tuple
 
 
 @functools.cache
+def is_rocm_runtime() -> bool:
+    """Return whether the active PyTorch build uses AMD's HIP runtime.
+
+    PyTorch intentionally preserves the ``torch.cuda`` namespace on ROCm for
+    source compatibility.  Consequently, a Radeon architecture such as
+    ``gfx1151`` can be reported as a numeric capability that superficially
+    resembles a newer NVIDIA SM version.  Architecture gates in this module
+    control NVIDIA-only features such as Programmatic Dependent Launch, so
+    they must reject HIP before comparing those numeric values.
+    """
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
+@functools.cache
 def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
-    if not torch.cuda.is_available() or not torch.version.cuda:
+    # ROCm retains torch.cuda APIs, but neither CUDA SM feature checks nor the
+    # numeric capability ordering below are meaningful for an AMD GPU.
+    if is_rocm_runtime() or not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
 
