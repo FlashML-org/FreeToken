@@ -212,6 +212,46 @@ Raw campaign artifacts are retained on LAN-223:
 /home/david/freetoken-amd/artifacts/amd-optimization-2026-08-28/
 ```
 
+## Deep-investigation baseline and profiler repair
+
+The reproducible read-only baseline is captured by
+[`../scripts/lan223-capture-baseline.sh`](../scripts/lan223-capture-baseline.sh).
+The first baseline was written to:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/baseline-20260828T220753Z/
+```
+
+It confirms the active device is `gfx1151`, PyTorch is
+`2.13.0+rocm10.0.0` with HIP `7.15.26333`, and `/opt/rocm` resolves to
+`/opt/rocm-10.0`.  It also records that the system package database retains
+ROCm 7.2 development packages.  This alone does not prove an application
+runtime conflict, so library maps were collected before changing any host
+component.
+
+The maps show that the PyTorch wheel loads its own ROCm SDK, including LLVM 23
+and rocprofiler-sdk 1.3.5, from `_rocm_sdk_core` in the virtual environment.
+The host `rocprofv3` launch initially injected a second LLVM 23 and profiler
+SDK from `/opt/rocm-10.0`, causing `import torch` to abort with duplicate LLVM
+registration for `spirv-expand-step`.  The failure was reproduced with a
+minimal PyTorch import, so it is not caused by FreeToken.
+
+`scripts/lan223-rocprof-wheel-sdk.sh` repairs the launch path without editing
+the host installation.  It keeps the host `rocprofv3` front end but passes
+`--rocm-root` for the wheel's `_rocm_sdk_core`, making the profiler use the
+same library identities as PyTorch.  The repair was validated by profiling a
+small HIP allocation and reduction.  ROCm emitted `kernel_trace.csv` and
+`kernel_stats.csv` with the expected GPU dispatches.  Use this wrapper only
+for profiling, never for TPS scoring because tracing alters execution time.
+
+The first full FreeToken trace launch passed PyTorch import and model loading,
+then reached the GGUF JIT compiler.  The profiler environment is inherited by
+that compiler subprocess, so the run was stopped before a request was sent.
+The next trace must warm the GGUF extension unprofiled, then profile the
+already-built decode path, or explicitly prevent profiler injection into JIT
+child processes.  This avoids treating compile activity as token-generation
+performance.
+
 ## GGUF extension reuse validation
 
 The first Gemma request after the original source change built the native HIP
