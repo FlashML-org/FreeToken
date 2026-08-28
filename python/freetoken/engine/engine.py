@@ -423,7 +423,22 @@ class Engine:
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+            # ROCm's HIP graph and large-prompt warmup path is exercised by the first
+            # real request just like CUDA.  Do not force that optional precompile on
+            # HIP at server construction: current AMD Triton releases can reject the
+            # synthetic 80/128-token NVFP4 MoE launch before the API becomes ready.
+            # Inference itself remains native HIP and eager prefill still compiles on
+            # demand.  Operators may set this explicit opt-in for targeted testing.
+            should_warmup_prefill = torch.version.hip is None or os.environ.get(
+                "FREETOKEN_ROCM_PREFILL_WARMUP", ""
+            ).lower() in ("1", "true", "yes", "on")
+            if should_warmup_prefill:
+                self._warmup_prefill()
+            else:
+                logger.info_rank0(
+                    "Skipping optional Triton prefill warmup on ROCm; "
+                    "set FREETOKEN_ROCM_PREFILL_WARMUP=1 to enable it."
+                )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
