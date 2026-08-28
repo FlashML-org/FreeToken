@@ -66,6 +66,35 @@ NVFP4 prefill route selected for ROCm correctness.  Its approximately
 seven-minute cold initialization is expert-bank preparation and cache
 allocation, not inference time.
 
+## Same-model llama.cpp Vulkan comparison
+
+To compare the usable Strix Halo serving baseline rather than an unrelated
+model, the exact Gemma GGUF was served by llama.cpp Vulkan build `b10141`
+(`0d47ea742`) on a separate loopback port.  Both servers used one slot,
+8,192-token context, greedy sampling, and the same repeated scheduler prompt.
+The model SHA-256 was
+`3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d`.
+
+| Runtime | GPU backend | Prompt tokens | Completion tokens | TTFT | Client prompt TPS | Client output TPS | Runtime prompt TPS | Runtime output TPS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FreeToken | ROCm/HIP | 733 | 26 | 3.244 s | 226.0 | 44.8 | not exposed | not exposed |
+| llama.cpp `b10141` | Vulkan | 758, 7 template tokens cached | 128 | 0.855 s | 886.7 | 63.2 | 1,078.4 | 61.7 |
+
+For this isolated, single-request Gemma workload, llama.cpp Vulkan reached
+first output about 3.8 times sooner, delivered about 3.9 times the
+client-observed prompt rate, and delivered about 1.4 times the client-observed
+generation rate.  llama.cpp's internal timing excludes ordinary API and
+scheduler overhead, so its 1,078.4 prompt TPS and 61.7 output TPS must not be
+compared directly with FreeToken's client-observed rates.
+
+The completion lengths differ because llama.cpp exposed Gemma's reasoning
+stream and consumed the 128-token cap, whereas FreeToken's parser emitted the
+final concise answer and stopped at 26 tokens.  That makes the output-rate
+comparison useful as a warm streaming rate, but not a quality or exact
+end-to-end task comparison.  The raw llama.cpp evidence is retained under
+`/home/david/freetoken-amd/artifacts/llamacpp-vulkan-gemma4-q4-tps/` on
+LAN-223.
+
 ## GGUF extension reuse validation
 
 The first Gemma request after the original source change built the native HIP
