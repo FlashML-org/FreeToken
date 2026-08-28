@@ -56,6 +56,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repetitions", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260828)
+    parser.add_argument(
+        "--output-fp32",
+        action="store_true",
+        help="isolated Q4_0 destination-type probe; never enables it for model serving",
+    )
     parser.add_argument("--json", type=Path, help="write one JSON artifact")
     return parser.parse_args()
 
@@ -100,7 +105,13 @@ def main() -> int:
         x = torch.randn(args.vectors, cols, dtype=torch.bfloat16, device=device)
 
         def call() -> torch.Tensor:
-            return ggml_mul_mat_vec_a8(weight, x, int(GGML_Q4_0), rows)
+            return ggml_mul_mat_vec_a8(
+                weight,
+                x,
+                int(GGML_Q4_0),
+                rows,
+                output_fp32=args.output_fp32,
+            )
 
         for _ in range(args.warmup):
             result = call()
@@ -113,6 +124,7 @@ def main() -> int:
                 "cols": cols,
                 "vectors": args.vectors,
                 "output_shape": list(result.shape),
+                "output_dtype": str(result.dtype),
                 "average_us": _average_event_us(call, args.repetitions, device),
             }
         )
@@ -122,6 +134,7 @@ def main() -> int:
         "hip": torch.version.hip,
         "torch": torch.__version__,
         "quant_type": "Q4_0",
+        "output_fp32": args.output_fp32,
         "warmup": args.warmup,
         "repetitions": args.repetitions,
         "measurements": measurements,

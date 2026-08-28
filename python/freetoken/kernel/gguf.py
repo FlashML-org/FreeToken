@@ -190,10 +190,20 @@ def ggml_dequantize(
 
 
 def ggml_mul_mat_vec_a8(
-    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    quant_type: int,
+    row: int,
+    *,
+    output_fp32: bool = False,
 ) -> torch.Tensor:
-    """MMVQ: small-batch GEMV with on-the-fly dequant. ``row`` = output features."""
-    return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row)
+    """Run small-batch quantized GEMV; ``output_fp32`` is an isolated Q4 benchmark probe.
+
+    Normal inference leaves ``output_fp32`` false, preserving the output dtype
+    expected by GGUF layers.  The opt-in mode changes only Q4_0's destination
+    storage so LAN-223 profiling can compare register allocation with llama.cpp.
+    """
+    return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row, output_fp32)
 
 
 def ggml_mul_mat_a8(
