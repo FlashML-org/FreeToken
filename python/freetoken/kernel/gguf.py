@@ -229,18 +229,9 @@ def ggml_moe_a8_vec(
     quant_type: int,
     row: int,
     tokens: int,
-    output_fp32: bool = False,
 ) -> torch.Tensor:
-    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``.
-
-    ``output_fp32`` is an opt-in Q4_0 investigation mode.  It keeps activation
-    quantization in ``x.dtype`` but stores the HIP vector result in FP32 so the
-    caller can test llama.cpp-compatible intermediate precision.  The normal
-    path remains dtype-preserving and is the only shipping behavior.
-    """
-    return _module().ggml_moe_a8_vec(
-        x, weight, topk_ids, top_k, quant_type, row, tokens, output_fp32
-    )
+    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``."""
+    return _module().ggml_moe_a8_vec(x, weight, topk_ids, top_k, quant_type, row, tokens)
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:
