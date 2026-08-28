@@ -194,9 +194,16 @@ The remaining gap is not an untested cache or residency setting: Gemma's GGUF
 adapter only supports the native Q4_0 offload implementation, and the automatic
 cache selected all 3,840 routed-expert slots.  Closing the gap requires a
 profile-guided improvement to the HIP GGUF decode kernels or another proven
-ROCm attention or quantized-linear implementation.  `rocprofv3` ROCm 10 is
-installed for that next phase.  A temporary high-performance DPM governor test
-could not be run because the non-root LAN-223 account cannot write
+ROCm attention or quantized-linear implementation.  The available ROCm 10
+`rocprofv3` installation could not yet provide that kernel breakdown: attach
+mode reports that the PyTorch process has no `rocp-bg-attach` registration
+thread even when launched with `ROCP_TOOL_ATTACH=1`, while launch mode aborts
+before FreeToken starts with LLVM's duplicate `spirv-expand-step` option.  The
+full error evidence is retained in `rocprof-gfx1151*/` and
+`rocprof-launch-gfx1151-v2/` under the raw artifact directory.  This is a
+toolchain issue, not a FreeToken performance result, so no profiler-derived
+optimization claim is made here.  A temporary high-performance DPM governor
+test could not be run because the non-root LAN-223 account cannot write
 `power_dpm_force_performance_level`; automatic mode was unchanged.
 
 Raw campaign artifacts are retained on LAN-223:
