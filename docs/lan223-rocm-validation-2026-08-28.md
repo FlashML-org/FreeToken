@@ -46,6 +46,37 @@ same `gfx1151` device, 33 percent GPU utilization, 46 percent allocated VRAM,
 and a 40 C edge temperature.  The model uses the APU's shared-memory design;
 the tool's VRAM label is therefore only its standard telemetry label.
 
+## Warm single-request throughput
+
+The following measurements use one fixed 733-token prompt, greedy sampling,
+and a one-sentence answer that produced 26 completion tokens.  `TTFT` is the
+client-observed time to the first non-empty SSE text chunk.  Prompt throughput
+is the end-to-end prompt-token count divided by TTFT, so it includes normal
+API and scheduler overhead.  Output throughput is completion tokens divided
+by the interval from that first chunk through `[DONE]`.
+
+| Model | Prompt tokens | Completion tokens | TTFT | Prompt TPS | Generation interval | Output TPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.6-35B-A3B NVFP4 | 733 | 26 | 4.976 s | 147.3 | 0.899 s | 28.9 |
+| Gemma 4 26B A4B Q4_0 GGUF | 733 | 26 | 3.244 s | 226.0 | 0.581 s | 44.8 |
+
+These are warm, single-request measurements, not concurrency or maximum
+throughput claims.  The Qwen configuration uses the native Triton serial
+NVFP4 prefill route selected for ROCm correctness.  Its approximately
+seven-minute cold initialization is expert-bank preparation and cache
+allocation, not inference time.
+
+## GGUF extension reuse validation
+
+The first Gemma request after the original source change built the native HIP
+GGUF extension.  A subsequent complete server restart retained the existing
+Torch extension cache.  Its first API request returned HTTP 200 and Ninja
+reported `no work to do`, proving the compiled shared module was reused.
+Torch still runs a lightweight hipify and dependency check before loading the
+cached module; it did not run `hipcc` compilation or shared-library linking.
+See the persistent-cache operating procedure in
+[`amd-rocm-gfx1151.md`](amd-rocm-gfx1151.md#persistent-gguf-hip-jit-cache).
+
 ## Commands used
 
 Qwen was started in the isolated environment with this functional shape:
