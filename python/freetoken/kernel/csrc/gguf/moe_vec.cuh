@@ -3,11 +3,6 @@
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
-// The decode profile spends about forty percent of GPU kernel time here.  Ask
-// HIP to keep at least two 32-lane route blocks resident per compute unit so
-// independent expert rows can hide memory latency.  This does not alter the
-// calculation, tensor layout, or one-warp reduction semantics.
-__launch_bounds__(WARP_SIZE, 2)
 static __global__ void moe_vec_q(
     const void* __restrict__ vx,
     const void* __restrict__ vy,
