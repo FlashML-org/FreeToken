@@ -76,6 +76,27 @@ Use `hipcc --version`, `rocminfo`, and a small PyTorch HIP allocation before
 the FreeToken build.  Record outputs in `artifacts/environment/`, with secrets
 and access tokens removed.
 
+## Persistent GGUF HIP JIT cache
+
+The native Gemma GGUF extension is compiled once per combination of FreeToken
+source, PyTorch and HIP version, compiler flags, Python ABI, and GPU target.
+`torch.utils.cpp_extension` reuses the resulting shared object on later
+process starts.  Normal serving must not delete that cache.
+
+The default cache is `$HOME/.cache/torch_extensions/`.  For a deliberate,
+portable installation-specific location, set this before every `ft serve`
+launch and keep the directory across reboots and service restarts:
+
+```bash
+export TORCH_EXTENSIONS_DIR=/home/david/freetoken-amd/cache/torch_extensions
+mkdir -p "$TORCH_EXTENSIONS_DIR"
+```
+
+After an intentional FreeToken source or ROCm toolchain update, one rebuild is
+expected.  Deleting this directory is a recovery action only.  It was cleared
+during the original port investigation to force revised HIP sources to build;
+that development step is not part of normal operation.
+
 ## Required validation sequence
 
 1. Verify the host's `gfx1151` device, HIP runtime, PyTorch HIP build, and
