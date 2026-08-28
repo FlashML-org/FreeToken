@@ -249,6 +249,32 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-two-row-wave-api-20260828T234147Z/
 ```
 
+### Rejected dense Q4_0 FP32-output hypothesis
+
+llama.cpp's corresponding vector kernel stores FP32 values, whereas the
+FreeToken GGUF adapter normally returns the input dtype, BF16 for this Gemma
+run.  That difference was a plausible explanation for the profiler contrast:
+FreeToken's generic Q4_0 dense kernel reported 48 architectural VGPRs and the
+llama.cpp reference reported 24.  Commit `e77a44b` added a deliberately
+benchmark-only Q4_0 flag that changed only the destination tensor to FP32.
+It was never wired to the GGUF model layers, and a source guard ensured the
+normal serving call retained its BF16 contract.
+
+The result rejects that explanation.  In the first independent event run, the
+four exact Gemma projection geometries measured 18.28 us, 33.59 us, 18.16 us,
+and 35.98 us respectively.  The profiler trace showed the FP32 specialization
+still at **48 VGPRs**, 128 SGPRs, no LDS, and no scratch.  It therefore did not
+match llama.cpp's 24-VGPR code shape.  Its profile-run event values also showed
+no consistent gain.  The experiment was reverted in `203062f`; no public or
+model-serving API changed.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-fp32-output-20260828T234953Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-fp32-output-rocprof-20260828T235258Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
