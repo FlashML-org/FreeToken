@@ -378,17 +378,17 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -397,7 +397,7 @@ struct FastIndexCopyKernel {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
                 .with_dtype<int64_t>(num_indices_dtype)
-                .with_device<kDLCUDA>(device)
+                .with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
