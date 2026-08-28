@@ -22,6 +22,30 @@ import torch
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
 
 
+def _hip_thrust_include() -> str | None:
+    """Return a ROCm developer include directory that exposes ``thrust/complex.h``.
+
+    The PyTorch ROCm wheel bundles hipcc but may omit the header-only Thrust
+    dependency required by libtorch's HIP complex header.  Prefer explicitly
+    configured ROCm homes, then inspect the standard versioned installation
+    layout.  Returning ``None`` leaves hosts with a complete wheel toolchain
+    unchanged.
+    """
+    candidates = [
+        os.environ.get("ROCM_HOME"),
+        os.environ.get("ROCM_PATH"),
+        "/opt/rocm",
+    ]
+    candidates.extend(str(path) for path in sorted(pathlib.Path("/opt").glob("rocm-*"), reverse=True))
+    for root in candidates:
+        if not root:
+            continue
+        include = pathlib.Path(root) / "include"
+        if (include / "thrust" / "complex.h").is_file():
+            return str(include)
+    return None
+
+
 def _host_compiler() -> str | None:
     """A host compiler nvcc + libtorch headers accept.
 
@@ -56,6 +80,13 @@ def _module():
         # nvcc-style host pass (its own bundled clang IS the host compiler), and
         # --expt-relaxed-constexpr is an nvcc-only flag hipcc/clang rejects outright.
         extra_cuda_cflags = ["-O3"]
+        # The minimal PyTorch ROCm SDK can omit Thrust while libtorch's HIP
+        # headers include it.  Add a real system ROCm developer include only
+        # when present, retaining the wheel-only build on complete installs.
+        hip_thrust_include = _hip_thrust_include()
+        extra_include_paths = [str(_CSRC)]
+        if hip_thrust_include is not None:
+            extra_include_paths.append(hip_thrust_include)
     else:
         extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
         host_cxx = _host_compiler()
@@ -67,13 +98,14 @@ def _module():
             extra_cuda_cflags += ["-ccbin", cxx_path]
             os.environ["CXX"] = cxx_path
             os.environ["CC"] = _c_compiler_for(cxx_path)
+        extra_include_paths = [str(_CSRC)]
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        extra_include_paths=extra_include_paths,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )
