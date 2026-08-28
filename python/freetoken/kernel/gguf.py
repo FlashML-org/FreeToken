@@ -46,6 +46,30 @@ def _hip_thrust_include() -> str | None:
     return None
 
 
+def _hip_runtime_library_dir() -> str | None:
+    """Return a ROCm library directory that can satisfy ``-lamdhip64``.
+
+    Some PyTorch ROCm wheels ship ``libamdhip64.so.7`` but not the unversioned
+    linker name that ``torch.utils.cpp_extension`` emits.  A regular ROCm
+    installation supplies that linker name under its ``lib`` directory.  Keep
+    this discovery separate from the Thrust fallback so a host can provide one
+    dependency through the wheel and the other through its ROCm installation.
+    """
+    candidates = [
+        os.environ.get("ROCM_HOME"),
+        os.environ.get("ROCM_PATH"),
+        "/opt/rocm",
+    ]
+    candidates.extend(str(path) for path in sorted(pathlib.Path("/opt").glob("rocm-*"), reverse=True))
+    for root in candidates:
+        if not root:
+            continue
+        for lib_dir in (pathlib.Path(root) / "lib", pathlib.Path(root) / "lib64"):
+            if (lib_dir / "libamdhip64.so").is_file():
+                return str(lib_dir)
+    return None
+
+
 def _host_compiler() -> str | None:
     """A host compiler nvcc + libtorch headers accept.
 
@@ -87,9 +111,16 @@ def _module():
         # hipify pass recursively rewrites every extension include path and
         # cannot write beneath the read-only system ROCm installation.
         hip_thrust_include = _hip_thrust_include()
+        hip_runtime_library_dir = _hip_runtime_library_dir()
         extra_include_paths = [str(_CSRC)]
+        extra_ldflags: list[str] = []
         if hip_thrust_include is not None:
             extra_cuda_cflags += ["-isystem", hip_thrust_include]
+        if hip_runtime_library_dir is not None:
+            # The extension linker uses ``-lamdhip64``.  Add a real ROCm
+            # library directory only when the wheel SDK lacks its unversioned
+            # linker symlink, preserving self-contained wheel installations.
+            extra_ldflags += [f"-L{hip_runtime_library_dir}"]
     else:
         extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
         host_cxx = _host_compiler()
@@ -102,6 +133,7 @@ def _module():
             os.environ["CXX"] = cxx_path
             os.environ["CC"] = _c_compiler_for(cxx_path)
         extra_include_paths = [str(_CSRC)]
+        extra_ldflags = []
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
@@ -110,6 +142,7 @@ def _module():
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=extra_include_paths,
         extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=extra_ldflags,
         verbose=True,
     )
 
