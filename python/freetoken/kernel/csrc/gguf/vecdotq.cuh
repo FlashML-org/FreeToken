@@ -544,9 +544,16 @@ vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ b
 
 #pragma unroll
   for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
-    v[i] = get_int_from_uint8(bq4_0->qs, iqs + i);
-    u[2 * i + 0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
-    u[2 * i + 1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI4_0);
+    // Keep this Q4_0 load sequence in the same aligned form as the current
+    // llama.cpp HIP vector path.  `qs` in block_q4_0 is halfword aligned, so
+    // get_int_b2 loads the two adjacent halfwords that form one packed int.
+    // The Q8_1 quant bytes are int aligned, so get_int_b4 loads each packed
+    // four-byte group directly.  These expressions preserve the exact packed
+    // values used by the previous helpers while giving the AMD compiler the
+    // explicit alignment information needed to minimize register pressure.
+    v[i] = get_int_b2(bq4_0->qs, iqs + i);
+    u[2 * i + 0] = get_int_b4(bq8_1->qs, iqs + i);
+    u[2 * i + 1] = get_int_b4(bq8_1->qs, iqs + i + QI4_0);
   }
 
   return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, __half2float(bq4_0->d), bq8_1->ds);
