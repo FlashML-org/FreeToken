@@ -95,20 +95,12 @@ torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input
     int64_t type,
-    int64_t row,
-    bool output_fp32) {
+    int64_t row) {
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
-  // Production callers keep their input dtype output.  ``output_fp32`` is an
-  // explicitly opt-in, Q4_0-only benchmark probe used to measure whether the
-  // destination type changes HIP register allocation.  It must not silently
-  // change model-layer numerics or the public GGUF layer contract.
-  const bool q4_fp32_probe = output_fp32 && type == 2;
-  auto options = torch::TensorOptions()
-                     .dtype(q4_fp32_probe ? torch::kFloat32 : X.scalar_type())
-                     .device(W.device());
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
@@ -117,16 +109,8 @@ torch::Tensor ggml_mul_mat_vec_a8(
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
     switch (type) {
       case 2:
-        if (q4_fp32_probe) {
-          // The input still uses ``scalar_t`` during Q8_1 quantization.  Only
-          // the final GEMV store changes type, isolating the code-generation
-          // question from all production inference behavior.
-          mul_mat_vec_q4_0_q8_1_cuda<float>(
-              (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (float*)Y.data_ptr(), col, row, vecs, stream);
-        } else {
-          mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
-              (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        }
+        mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
       case 3:
         mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
