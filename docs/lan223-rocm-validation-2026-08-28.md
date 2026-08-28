@@ -95,6 +95,59 @@ end-to-end task comparison.  The raw llama.cpp evidence is retained under
 `/home/david/freetoken-amd/artifacts/llamacpp-vulkan-gemma4-q4-tps/` on
 LAN-223.
 
+## Same-model ROCm 10 and HIP comparison
+
+The Vulkan baseline above answers a practical deployment question, but it is
+not a backend-for-backend comparison.  This follow-up rebuilt the same
+llama.cpp source revision, `b10141` (`0d47ea742`), with HIP for `gfx1151` and
+ran it under the same ROCm 10 installation used by FreeToken.  The compiler
+was ROCm 10 HIP `7.15.26333` with AMD Clang 23.0.0.  At runtime, llama.cpp's
+`libamdhip64`, `libhipblas`, `librocblas`, `libamd_comgr`, and HSA runtime
+libraries all resolved from `/opt/rocm-10.0`, not the older ROCm installation.
+
+Both runners used the identical 14 GB Gemma 4 26B A4B Q4_0 GGUF, SHA-256
+`3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d`, one
+request at a time, an 8,192-token context, greedy sampling, `max_tokens: 128`,
+and a 48-times repeated scheduler prompt.  Each measurement used a distinct
+nonce, preventing prompt-cache reuse.  The token totals differ by one because
+the two runners tokenize and render Gemma's chat template differently.
+
+| Runtime | HIP and ROCm stack | Prompt tokens | Completion tokens | TTFT | Client prompt TPS | Client output TPS | Runtime prompt TPS | Runtime output TPS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FreeToken, steady state | PyTorch `2.13.0+rocm10.0.0`, HIP `7.15.26333`, native HIP GGUF extension | 772 | 20 | 2.863 s | 269.6 | 46.1 | not exposed | not exposed |
+| llama.cpp `b10141` | ROCm 10 HIP, `gfx1151` | 771 | 128 | 0.850 s | 906.6 | 58.3 | 1,011.6 | 56.2 |
+
+On this uncached, single-request workload, llama.cpp ROCm 10 reached first
+text about 3.4 times sooner, supplied about 3.4 times the client-observed
+prompt rate, and supplied about 1.3 times the client-observed output rate.
+llama.cpp's internal numbers exclude HTTP, SSE, and scheduling overhead and
+therefore are only comparable to another internal timing source, not directly
+to FreeToken's client values.
+
+The FreeToken request that triggered a fresh GGUF HIP extension build is kept
+as a separate cold-start measurement: 768 prompt tokens, 21 completion tokens,
+109.938 s TTFT, 6.99 client prompt TPS, and 27.47 client output TPS.  It
+contains HIP compilation and must not be presented as inference throughput.
+The subsequent steady-state run above was made after the extension completed,
+using a fresh nonce and no prompt cache hit.  FreeToken's extension compiler
+was `/opt/rocm-10.0/bin/hipcc` targeting `gfx1151`, and its runtime libraries
+came from the ROCm 10 PyTorch SDK packages.  Its existing JIT command also
+passed `/opt/rocm-7.2.4/include` as a supplemental include path.  That does not
+change the ROCm 10 compiler or loaded runtime libraries, but it prevents this
+FreeToken build from being described as a strictly ROCm 10-only header build.
+
+The llama.cpp response used all 128 allowed tokens because it exposed Gemma
+reasoning text.  FreeToken stopped after a concise 20-token answer.  This
+makes the output-rate comparison a useful streaming measurement, but it is
+not an exact answer-quality or equal-completion-length evaluation.
+
+Raw artifacts are retained only on LAN-223:
+
+```text
+/home/david/freetoken-amd/artifacts/llamacpp-rocm10-gemma4-q4-tps/
+/home/david/freetoken-amd/artifacts/freetoken-rocm10-gemma4-q4-tps/
+```
+
 ## GGUF extension reuse validation
 
 The first Gemma request after the original source change built the native HIP
