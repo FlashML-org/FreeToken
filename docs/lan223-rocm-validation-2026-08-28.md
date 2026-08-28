@@ -222,6 +222,33 @@ Artifacts are retained on LAN-223:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-two-row-wave-20260828T231950Z/api-repeats-20260828T232646Z/
 ```
 
+### Rejected dense Q4_0 one-wave/two-row specialization
+
+The dense Q4_0 vector path uses the same older one-row scheduling structure as
+the routed-expert path.  Commit `b4a53d1` applied the accepted one-wave/two-row
+pattern to that dense kernel, while leaving CUDA unchanged.  A new shape-aware
+microbenchmark covered the exact Gemma projection dimensions recovered from the
+GGUF: 2816x4096, 8192x2816, 4224x2816, and 10240x2816.  In isolation it reduced
+the measured GPU event time for every shape, including 10240x2816 from 41.34 us
+to 28.12 us.
+
+That synthetic gain did not survive the real graph-captured serving path.  The
+fixed loopback API workload compiled the candidate from a fresh HIP extension
+cache, returned the exact deterministic output SHA-1 `abeee5e73e89`, and used
+the same 27.52 GiB of server-reported VRAM, but measured only **54.71 TPS** or
+18.277 ms/token.  This is below the 55.89 TPS accepted MoE-specialization
+median and below the prior 55.04 TPS repaired baseline.  The dense candidate
+was therefore reverted.  It proves that isolated event timing alone is not an
+acceptance metric for graph-captured end-to-end decode.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-microbench-20260828T233506Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-two-row-wave-20260828T233930Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-two-row-wave-api-20260828T234147Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
