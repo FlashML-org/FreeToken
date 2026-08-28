@@ -20,7 +20,6 @@ import shutil
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
-_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _hip_target_arch() -> str | None:
@@ -41,22 +40,18 @@ def _hip_target_arch() -> str | None:
 
 
 def _hip_gguf_cflags() -> list[str]:
-    """Build conservative HIP GGUF flags, with an explicit fast-math experiment.
+    """Build conservative HIP GGUF flags for the active AMD GPU target.
 
-    ``-O3`` is the normal portable optimization level.  Fast math may improve an
-    AMD compile, but it can alter floating-point contraction and must therefore be
-    enabled only by ``FREETOKEN_HIP_GGUF_FAST_MATH=1`` while output equivalence is
-    benchmarked.  The architecture environment variable is set before PyTorch asks
-    hipcc to compile, which makes the cache target-specific without overriding a
-    deployment's explicit multi-target configuration.
+    The architecture environment variable is set before PyTorch asks hipcc to
+    compile, which makes the cache target-specific without overriding a deployment's
+    explicit multi-target configuration.  Keep floating-point flags conservative:
+    the native GGUF kernels must preserve model output, and unsupported aggressive
+    math flags belong only in isolated benchmark experiments.
     """
     target = _hip_target_arch()
     if target and not os.environ.get("PYTORCH_ROCM_ARCH"):
         os.environ["PYTORCH_ROCM_ARCH"] = target
-    flags = ["-O3"]
-    if os.environ.get("FREETOKEN_HIP_GGUF_FAST_MATH", "").strip().lower() in _TRUE_VALUES:
-        flags.append("-ffast-math")
-    return flags
+    return ["-O3"]
 
 
 def _hip_thrust_include() -> str | None:
