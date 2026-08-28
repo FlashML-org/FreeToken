@@ -224,6 +224,40 @@ The first baseline was written to:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/baseline-20260828T220753Z/
 ```
 
+### Test-checkout repair and revalidated shipping baseline
+
+During the follow-on investigation, the isolated LAN-223 source checkout was
+found at `61a1505`.  That commit contained the subsequently rejected
+two-block-residency Q4_0 MoE experiment.  The authoritative branch had already
+reverted that experiment at `b77825d` and documented the rejection at
+`222cbd3`.  Using the stale checkout for another benchmark would have made the
+result impossible to attribute to the branch under review.
+
+The checkout was clean, so it was repaired with a fast-forward only update to
+`origin/amd-rocm-gfx1151`, reaching `222cbd3`.  No production process,
+llama-swap configuration, or other LAN host was touched.  The next run used a
+new, dated `TORCH_EXTENSIONS_DIR`, forcing a fresh native HIP binary rather
+than reusing the binary compiled from the stale source.
+
+| Item | Revalidated value |
+| --- | --- |
+| Artifact directory | `/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/repaired-baseline-20260828T224642Z/` |
+| Source commit | `222cbd3` |
+| Model SHA-256 | `3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d` |
+| Extension build | Fresh ROCm 10 `hipcc`, `--offload-arch=gfx1151`, `-O3` |
+| API and workload | Loopback FreeToken API, greedy AIME-25 problem 0, one warm and one measured request |
+| Measured completion | 127 tokens, 126 decode intervals |
+| Client decode throughput | **55.04 TPS** or **18.169 ms/token** |
+| TTFT | 295.2 ms |
+| Event p50 / p99 | 18.454 ms / 19.509 ms |
+| Output SHA-1 | `abeee5e73e89`, identical to the earlier shipping-configuration run |
+| Post-run ROCm process check | No KFD PIDs |
+
+The single revalidation is consistent with the existing 55.44 TPS shipping
+baseline and remains below the 60.42 TPS matched llama.cpp reference.  It is a
+provenance repair, not a new performance claim and not a substitute for the
+planned repeated candidate measurements.
+
 It confirms the active device is `gfx1151`, PyTorch is
 `2.13.0+rocm10.0.0` with HIP `7.15.26333`, and `/opt/rocm` resolves to
 `/opt/rocm-10.0`.  It also records that the system package database retains
