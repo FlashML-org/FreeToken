@@ -11,24 +11,12 @@ materialized layer positions (prefill).
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from freetoken.models.gguf.dequant import GGML_Q4_0
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-
-
-def _use_fp32_intermediate() -> bool:
-    """Return whether the explicitly experimental Q4_0 FP32 path was requested.
-
-    The flag is deliberately strict and opt-in.  A normal service launch never
-    changes precision or throughput behavior merely because the environment
-    contains an unrelated truthy-looking value.
-    """
-    return os.environ.get("FREETOKEN_GGUF_MOE_FP32_INTERMEDIATE") == "1"
 
 
 def fused_experts_gguf_q4_0(
@@ -50,40 +38,16 @@ def fused_experts_gguf_q4_0(
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
     qt = int(GGML_Q4_0)
-    use_fp32_intermediate = _use_fp32_intermediate()
 
-    # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I].
-    # The opt-in temporary is only for an AMD HIP experiment.  It mirrors the
-    # FP32 vector destination used by llama.cpp without changing the public
-    # result dtype returned to the transformer layer.
-    gate_up = ggml_moe_a8_vec(
-        hidden_states,
-        gate_up_q,
-        topk_ids,
-        top_k,
-        qt,
-        n2,
-        num_tokens,
-        output_fp32=use_fp32_intermediate,
-    )
+    # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
+    gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(
-        inter,
-        down_q,
-        topk_ids,
-        1,
-        qt,
-        h,
-        num_tokens * top_k,
-        output_fp32=use_fp32_intermediate,
-    )
+    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )
-    # Preserve the original BF16 caller contract even when the temporary
-    # candidate computed its two quantized vector products in FP32.
-    return out.sum(dim=1).to(hidden_states.dtype)
+    return out.sum(dim=1)
 
 
 __all__ = ["fused_experts_gguf_q4_0"]
