@@ -258,6 +258,36 @@ baseline and remains below the 60.42 TPS matched llama.cpp reference.  It is a
 provenance repair, not a new performance claim and not a substitute for the
 planned repeated candidate measurements.
 
+### Rejected Q4_0 aligned-load candidate
+
+The matched traces showed FreeToken's Q4_0 vector kernels using 48 VGPRs per
+thread, while llama.cpp's corresponding generic Q4 vector kernel reported 24
+VGPRs.  Both used a 32-thread workgroup with zero LDS and scratch allocation.
+As a narrow, low-risk test, commit `b8de163` replaced only the Q4_0 packed-load
+helper expressions with the aligned `get_int_b2` and `get_int_b4` expressions
+used by the current llama.cpp HIP source.  The dot-product arithmetic, output
+type, data layout, model, workload, and launch geometry were otherwise
+unchanged.
+
+The target-host HIP build-configuration tests passed, the extension rebuilt
+for `gfx1151`, and the output SHA-1 remained `abeee5e73e89`.  However, the
+candidate measured 54.99 TPS or 18.185 ms/token, versus 55.04 TPS or 18.169
+ms/token for the immediately preceding repaired baseline.  That difference is
+well inside normal run variation and does not improve the runner.  The
+candidate was therefore reverted by `c1899a0`; it is not part of the shipping
+configuration.
+
+The raw candidate evidence is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-load-alignment-20260828T225237Z/
+```
+
+This eliminates aligned helper spelling as the explanation for the measured
+register and throughput gap.  The next candidate must change a more material
+component: the Q4_0 vector-kernel execution structure, MoE expert dispatch,
+or intermediate BF16 output path.
+
 It confirms the active device is `gfx1151`, PyTorch is
 `2.13.0+rocm10.0.0` with HIP `7.15.26333`, and `/opt/rocm` resolves to
 `/opt/rocm-10.0`.  It also records that the system package database retains
