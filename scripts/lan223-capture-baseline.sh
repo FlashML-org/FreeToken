@@ -27,6 +27,17 @@ llama_binary="${3:-}"
 # independent of the shell's starting directory.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Prefer an explicit virtual environment, then support FreeToken's LAN-223
+# layout where the environment is a sibling of the source checkout, and finally
+# support a conventional in-repository `.venv`.  Resolving this once prevents
+# later runtime probes from silently using the system Python.
+venv_python="${FREETOKEN_VENV:-}"
+if [[ -z "$venv_python" && -x "$(dirname "$repo_root")/.venv/bin/python" ]]; then
+  venv_python="$(dirname "$repo_root")/.venv/bin/python"
+elif [[ -z "$venv_python" && -x "$repo_root/.venv/bin/python" ]]; then
+  venv_python="$repo_root/.venv/bin/python"
+fi
+
 # Create the requested artifact directory without overwriting prior captures.
 mkdir -p "$output_dir"
 
@@ -78,11 +89,16 @@ capture_command performance-environment.txt bash -lc "env | LC_ALL=C sort | grep
 
 # Ask the exact FreeToken virtual environment which HIP runtime and device it
 # sees.  This detects a wheel whose embedded runtime differs from host ROCm.
-capture_command pytorch-runtime.txt "$repo_root/.venv/bin/python" -c "import json, torch; p=torch.cuda.get_device_properties(0); print(json.dumps({'torch':torch.__version__,'hip':torch.version.hip,'cuda_available':torch.cuda.is_available(),'device':p.name,'gcnArchName':getattr(p,'gcnArchName',None),'total_memory':p.total_memory}, indent=2, sort_keys=True))"
+if [[ -n "$venv_python" && -x "$venv_python" ]]; then
+  capture_command pytorch-runtime.txt "$venv_python" -c "import json, torch; p=torch.cuda.get_device_properties(0); print(json.dumps({'torch':torch.__version__,'hip':torch.version.hip,'cuda_available':torch.cuda.is_available(),'device':p.name,'gcnArchName':getattr(p,'gcnArchName',None),'total_memory':p.total_memory}, indent=2, sort_keys=True))"
+  capture_command python-ldd.txt ldd "$venv_python"
+else
+  printf 'FreeToken virtual-environment Python not found. FREETOKEN_VENV=%s\n' "${FREETOKEN_VENV:-}" >"$output_dir/pytorch-runtime.txt"
+  cp "$output_dir/pytorch-runtime.txt" "$output_dir/python-ldd.txt"
+fi
 
 # Record loaded-library resolution for the Python interpreter and rocprofv3.
 # This is the primary evidence for a mixed LLVM or ROCm profiler environment.
-capture_command python-ldd.txt ldd "$repo_root/.venv/bin/python"
 capture_command rocprof-ldd.txt ldd /opt/rocm/bin/rocprofv3
 
 # Hash optional comparison artifacts only when the caller supplied a readable
