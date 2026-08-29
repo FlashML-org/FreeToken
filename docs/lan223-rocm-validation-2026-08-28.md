@@ -222,6 +222,45 @@ Artifacts are retained on LAN-223:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-two-row-wave-20260828T231950Z/api-repeats-20260828T232646Z/
 ```
 
+### Rejected two-row MoE Q8 activation-reuse candidate
+
+The accepted HIP Q4_0 one-wave/two-row MoE kernel computes two adjacent output
+rows from the same Q8_1 activation block.  The generic dot helper loads the
+four packed Q8 activation words independently for each row.  Commit `684148d`
+tested a ROCm-only helper that loads those four words once and supplies them to
+both row dot products, while retaining the same Q4 nibble order, DP4A order,
+scales, BF16 public-output contract, and all CUDA code.
+
+The shape-accurate Gemma routed-expert microbenchmark improved from about
+64.34 us to **61.54 us per gate/up plus down pair**.  That local result did not
+translate to a material full-server result.  Five independent OpenAI-compatible
+API runs, each using the fixed 63-token prompt and 126 measured decode steps,
+all returned greedy output SHA-1 `abeee5e73e89`:
+
+| Run | Decode TPS | ms/token | TTFT | Event p50 / p99 |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 55.993 | 17.859 | 264.2 ms | 18.133 / 18.753 ms |
+| 2 | 55.970 | 17.867 | 262.1 ms | 18.171 / 18.853 ms |
+| 3 | 55.958 | 17.871 | 259.9 ms | 18.183 / 18.823 ms |
+| 4 | 56.012 | 17.853 | 260.8 ms | 18.086 / 18.990 ms |
+| 5 | 56.155 | 17.808 | 262.9 ms | 18.018 / 18.853 ms |
+| Aggregate | **56.018 mean, 55.993 median, 0.080 stddev** | 17.851 mean | 262.0 ms mean | 18.133 / 18.853 ms median |
+
+This is only 0.20 percent above the accepted 55.905 TPS mean, materially below
+the campaign's repeatable-improvement threshold and far below the 60.42 client
+TPS matched llama.cpp ROCm 10 reference.  The candidate was therefore reverted
+in `a237b12`; the accepted one-wave/two-row implementation remains active.
+The benchmark sequence also ended with no KFD GPU processes, confirming that
+the service was torn down cleanly.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/moe-q8-reuse-20260829T005332Z/microbench.json
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/moe-q8-reuse-20260829T005332Z/api-first.jsonl
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/moe-q8-reuse-20260829T005332Z/api-repeats.jsonl
+```
+
 ### Rejected dense Q4_0 one-wave/two-row specialization
 
 The dense Q4_0 vector path uses the same older one-row scheduling structure as
