@@ -552,6 +552,37 @@ vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ b
   return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, __half2float(bq4_0->d), bq8_1->ds);
 }
 
+#if defined USE_ROCM
+// HIP-only dense-GEMV variant of the Q4_0 x Q8_1 inner product.  The generic
+// helper above stages two packed Q4 words and four Q8 words in local arrays
+// before forwarding them to a template helper.  A decode lane always consumes
+// exactly those six words, so this variant keeps them as named scalars and
+// executes the same four DP4A instructions in the same order.  It is wired
+// only to the dense HIP launcher below, leaving CUDA and the separately tuned
+// routed-MoE kernel on their established code paths.  The intent is to give
+// the AMD register allocator shorter temporary lifetimes without changing the
+// numerical contract or packed GGUF layout.
+static __device__ __forceinline__ float
+vec_dot_q4_0_q8_1_hip_scalarized(const void* __restrict__ vbq,
+                                  const block_q8_1* __restrict__ bq8_1,
+                                  const int& iqs) {
+  const block_q4_0* bq4_0 = (const block_q4_0*)vbq;
+  const int v0 = get_int_from_uint8(bq4_0->qs, iqs);
+  const int v1 = get_int_from_uint8(bq4_0->qs, iqs + 1);
+  const int u0 = get_int_from_int8_aligned(bq8_1->qs, iqs);
+  const int u1 = get_int_from_int8_aligned(bq8_1->qs, iqs + QI4_0);
+  const int u2 = get_int_from_int8_aligned(bq8_1->qs, iqs + 1);
+  const int u3 = get_int_from_int8_aligned(bq8_1->qs, iqs + 1 + QI4_0);
+  int sumi = 0;
+  sumi = __dp4a(v0 & 0x0F0F0F0F, u0, sumi);
+  sumi = __dp4a((v0 >> 4) & 0x0F0F0F0F, u1, sumi);
+  sumi = __dp4a(v1 & 0x0F0F0F0F, u2, sumi);
+  sumi = __dp4a((v1 >> 4) & 0x0F0F0F0F, u3, sumi);
+  const float2 ds8f = __half22float2(bq8_1->ds);
+  return __half2float(bq4_0->d) * (sumi * ds8f.x - (8 * 2 / QI4_0) * ds8f.y);
+}
+#endif
+
 template <int mmq_y>
 static __device__ __forceinline__ void allocate_tiles_q4_0(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
   __shared__ int tile_x_qs[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
