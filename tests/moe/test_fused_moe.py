@@ -2,8 +2,8 @@ import pytest
 import torch
 
 
-def test_fused_topk_routes_rocm_through_vendored_triton(monkeypatch):
-    """HIP uses the in-tree Triton router instead of the slower PyTorch fallback."""
+def test_fused_topk_keeps_reference_router_on_rocm(monkeypatch):
+    """HIP retains the exact PyTorch router until end-to-end parity is proven."""
     from freetoken.kernel import backend
     from freetoken.moe import fused
 
@@ -12,9 +12,9 @@ def test_fused_topk_routes_rocm_through_vendored_triton(monkeypatch):
     calls = []
 
     monkeypatch.setattr(backend, "is_rocm_runtime", lambda: True)
-    monkeypatch.setattr(fused, "_torch_fused_topk", lambda *args: pytest.fail("unexpected torch fallback"))
     monkeypatch.setattr(
-        "freetoken.kernel.triton.moe_router.fused_topk_softmax",
+        fused,
+        "_torch_fused_topk",
         lambda logits, topk, renormalize, limit: (
             calls.append((logits, topk, renormalize, limit)) or (weights, ids)
         ),
