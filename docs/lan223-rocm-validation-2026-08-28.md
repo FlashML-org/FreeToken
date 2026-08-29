@@ -321,6 +321,41 @@ Its raw logs and result are retained at:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/rebased-current-main-api-retry-20260829T014741Z/
 ```
 
+### Rebased Qwen3.6 NVFP4 API revalidation
+
+The other MoE model retained in the isolated FreeToken inventory is
+`Qwen3.6-35B-A3B-NVFP4`.  It was revalidated after the upstream rebase through
+the same loopback OpenAI-compatible streaming API, using the native Triton
+NVFP4 expert path, graph batch size 1, automatic expert-cache sizing, a 0.35
+memory ratio, and greedy 128-token AIME decoding.  This exercised its complete
+21.8 GiB parallel expert-bank load, cache allocation, graph capture, warm
+request, measured request, and cleanup.
+
+| Check | Observed value |
+| --- | --- |
+| Resolved expert cache | 9,499 slots and 8,255 KV tokens |
+| Warm streamed API decode | 28.93 client TPS, 34.560 ms/token |
+| Warm TTFT | 404.7 ms |
+| Prompt and completion tokens | 54 and 127, respectively |
+| Output SHA-1 | `0acef4eab6f4` |
+| Server VRAM | 19.12 GiB |
+| Post-run process state | Server shut down; no serving process remained |
+
+As with the rebased Gemma validation, the response ended at 127 tokens and the
+harness recorded its explicit limit-warning rather than silently treating it as
+a 128-token result.  The API transaction and deterministic response succeeded.
+The server also reported that `triton_kernels` was absent and selected the
+numerically equivalent pure-PyTorch router fallback.  That is a documented
+performance limitation, not a functional failure.  A native ROCm-compatible
+fused-router installation must be independently verified before it can be
+considered an optimization.
+
+The raw evidence is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/rebased-current-main-qwen36-api-20260829T015240Z/
+```
+
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
 
 The first two-row experiment did not reproduce llama.cpp's execution shape: it

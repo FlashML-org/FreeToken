@@ -2,6 +2,39 @@ import pytest
 import torch
 
 
+def test_fused_topk_selects_vendored_triton_router_on_rocm(monkeypatch):
+    """HIP must use FreeToken's source-JIT router, never CUDA-only triton_kernels.
+
+    The sentinel keeps this dispatch test independent of a GPU and verifies the
+    production branch before the kernel-specific ROCm integration tests run.
+    """
+    from freetoken.kernel import backend
+    from freetoken.kernel.triton import moe_router
+    from freetoken.moe.fused import fused_topk
+
+    weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    ids = torch.tensor([[4, 9]], dtype=torch.int32)
+    calls = []
+
+    monkeypatch.setattr(backend, "is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        moe_router,
+        "fused_topk_softmax",
+        lambda logits, topk, renormalize, limit: (
+            calls.append((logits, topk, renormalize, limit)) or (weights, ids)
+        ),
+    )
+
+    got_weights, got_ids = fused_topk(
+        torch.empty((1, 3)), torch.empty((1, 16)), topk=2, renormalize=True
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1:] == (2, True, None)
+    assert got_weights is weights
+    assert got_ids is ids
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
