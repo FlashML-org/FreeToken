@@ -397,3 +397,27 @@ contains. It does not claim to precompile every Triton specialization or a
 GGUF kernel: Qwen3.6-35B-A3B-NVFP4 is a safetensors NVFP4 checkpoint, not a
 GGUF model, and Triton maintains its own architecture- and source-keyed
 persistent cache.
+
+### Rejected eight-wave FP8 GEMV candidate
+
+An eight-wave gfx1151 FP8 GEMV launch was screened because it produced the
+same isolated raw BF16 result hash as the one-wave baseline and reduced the
+microbenchmark median from 0.07703 ms to 0.07574 ms for the 8192 by 2048
+matrix. It passed the deterministic API quality gate with the required AIME
+SHA-1 `0acef4eab6f4`. That isolated result did not carry over to the actual
+Qwen decode workload: the fixed three-sample, 256-output-token scheduler test
+averaged 26.260 TPS with 0.0008 TPS standard deviation, compared with the
+strict-cache one-wave baseline of 28.018 TPS. This is a 6.3 percent regression.
+
+The eight-wave option was therefore removed from the accepted launcher and
+benchmark allowlists. The candidate artifacts are retained for reproducibility
+at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T121916Z/
+```
+
+This result demonstrates why raw tensor equality and a favorable isolated
+kernel timing are necessary but not sufficient acceptance conditions. The
+multi-layer MoE decode schedule has materially different occupancy and cache
+interaction from a single dense GEMV invocation.
