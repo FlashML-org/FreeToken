@@ -531,6 +531,16 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "q4_k_q5_k":
+            # Qwen Q4_K_M is a mixed GGUF recipe: routed gate/up rows are Q4_K
+            # while down rows are Q5_K.  The kernel reads both packed layouts
+            # directly and applies the two quant dispatches in sequence.
+            from freetoken.moe.fused_q4_k_q5_k import fused_experts_gguf_q4_k_q5_k
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_k_q5_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

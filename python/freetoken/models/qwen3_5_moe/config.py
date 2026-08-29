@@ -356,6 +356,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         architectures=["Qwen3_5MoeForConditionalGeneration"],
         vision_config=None,
         attention_groups=(linear_group, full_group),
+        # The Qwen3.6-35B-A3B Q4_K_M GGUF stores routed gate/up in Q4_K and
+        # routed down in Q5_K. The explicit tag selects the mixed bank provider.
+        expert_quant="q4_k_q5_k",
+        moe_weight_format="q4_k_q5_k",
     )
 
 

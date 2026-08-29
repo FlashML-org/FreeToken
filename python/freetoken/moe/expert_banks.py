@@ -252,6 +252,30 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _q4_k_q5_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    """Load Qwen's mixed Q4_K gate/up and Q5_K down GGUF expert banks."""
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q4_k_q5_k: the source is one GGUF file"
+        )
+    from freetoken.models.qwen3_5_moe.gguf import (
+        dummy_q4_k_q5_k_expert_sources,
+        load_q4_k_q5_k_expert_sources,
+    )
+
+    sink = None if dummy else layer_sink
+    sources = (
+        dummy_q4_k_q5_k_expert_sources(model_config)
+        if dummy
+        else load_q4_k_q5_k_expert_sources(model_path, model_config, layer_sink=sink)
+    )
+    return ExpertBanks(
+        "q4_k_q5_k",
+        {name: sources[name] for name in _BANK_SCHEMAS["q4_k_q5_k"]},
+        streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -301,6 +325,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "q4_k_q5_k": _q4_k_q5_k_banks,
 }
 
 

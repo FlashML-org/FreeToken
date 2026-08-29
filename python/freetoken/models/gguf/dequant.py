@@ -24,6 +24,7 @@ GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
 GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -39,6 +40,7 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     # the base GGML type Q4_K. Each super-block holds two fp16 scales, twelve packed
     # six-bit sub-scales, and 128 packed four-bit values.
     GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -49,6 +51,7 @@ GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
     GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -192,6 +195,7 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_NAME",
