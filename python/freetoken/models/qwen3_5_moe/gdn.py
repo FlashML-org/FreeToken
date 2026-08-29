@@ -30,7 +30,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, *, quant_config: QuantConfig | None = None,
-        prefix: str = "",
+        prefix: str = "", gguf_q8: bool = False,
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -49,16 +49,26 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
+        self._gguf_q8 = gguf_q8
         self._split_in_proj = (
-            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
+            self._gguf_q8
+            or (quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None)
         )
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split_in_proj:
-            self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
-            )
+            if self._gguf_q8:
+                from freetoken.layers.gguf import GGUFLinear
+                from freetoken.models.gguf.dequant import GGML_Q8_0
+
+                self.in_proj_qkvz = GGUFLinear(
+                    hidden_size, self.conv_dim + self.value_dim, GGML_Q8_0, has_bias=False
+                )
+            else:
+                self.in_proj_qkvz = LinearColParallelMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                    quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
+                )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",

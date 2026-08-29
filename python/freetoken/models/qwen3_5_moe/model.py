@@ -46,6 +46,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 layer_id=layer_id,
                 quant_config=config.quant,
                 prefix=f"{prefix}.linear_attn",
+                gguf_q8=getattr(config, "attn_quant", None) == "gguf_q8",
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id, prefix=f"{prefix}.self_attn")
@@ -100,14 +101,21 @@ class Qwen3_5Model(BaseOP):
 class Qwen3_5ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
-        )
+        from .gguf import convert_qwen3_5_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            # GGUF has its own packed embedding, dense Q8_0 projections and untied
+            # Q6_K output projection.  Install every replacement before loading state.
+            convert_qwen3_5_to_gguf(self, config)
+        else:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
         super().__init__()
 
     def forward(self) -> torch.Tensor:
