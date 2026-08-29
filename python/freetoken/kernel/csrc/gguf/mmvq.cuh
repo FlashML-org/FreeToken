@@ -59,8 +59,16 @@ static void mul_mat_vec_q4_0_q8_1_cuda(
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, nvecs, 1);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+#if defined USE_ROCM
+  // The scalarized helper is HIP-only and keeps the CUDA code object stable.
+  // It implements the same Q4_0/Q8_1 dot-product sequence with shorter-lived
+  // temporaries for an isolated gfx1151 dense-decode experiment.
+  mul_mat_vec_q<scalar_t, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1_hip_scalarized>
+      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+#else
   mul_mat_vec_q<scalar_t, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+#endif
 }
 
 template <typename scalar_t>
