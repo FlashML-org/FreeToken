@@ -167,7 +167,8 @@ prompt tokens and llama.cpp's reused 58.
 | FreeToken, experimental Q4_0 MoE two-block residency hint | 55.08 | 294.9 ms | Rejected: slower with identical output hash |
 | FreeToken, HIP Q4_0 MoE one-wave/two-row specialization | 55.89 median, 55.91 mean | 262.2 ms mean | Accepted: five independent API runs, identical output hash |
 | FreeToken, full 4,096-slot expert cache and pinned 8,320-token KV pool | 60.11 median, 58.61 mean | 260.3 ms mean | Accepted configuration; four of five runs at 60.06 to 60.20 TPS, one host-contention outlier at 52.50 TPS |
-| llama.cpp `b10141`, ROCm 10 HIP | 60.42 client, 58.88 internal | 128.6 ms | Matched reference |
+| llama.cpp `b10141`, ROCm 10 HIP, earlier matched reference | 60.42 client, 58.88 internal | 128.6 ms | Historical reference |
+| llama.cpp `b10141`, ROCm 10 HIP, current-host five-run control | 62.44 median, 62.13 mean client TPS | 111.5 ms mean | Same prompt, greedy decode, five fresh servers, requested 8,320-token context |
 
 The graph configuration removes approximately 1.5 percent of the eager decode
 cost.  The capacity-aware resident-expert configuration below then removes the
@@ -234,6 +235,48 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/full-expert-cache-4096-20260829T010740Z/
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/fixed-expert-cache-3840-control-20260829T011537Z/
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/full-cache-4096-context8320-20260829T012342Z/
+```
+
+### Current-host ROCm llama.cpp control
+
+The historical llama.cpp reference was useful for identifying the original
+gap, but it was not collected alongside the accepted 4,096-slot FreeToken
+configuration.  A new five-run control was therefore run immediately after
+that configuration investigation, without changing LAN-223, stopping any
+user process, or enabling a production service.  Each trial launched a fresh
+`llama-server` from the ROCm 10 `b10141` build with all layers on `gfx1151`,
+Flash Attention enabled, one parallel slot, and `-c 8320`.  The server reports
+an 8,448-token slot after its own request reserve is added.  This is a llama.cpp
+internal allocation detail; the requested application context target was
+8,320 tokens in both runners.
+
+Both runners used the same cached AIME-25 problem 0, a warmed streamed
+OpenAI-compatible `/v1/chat/completions` request, greedy sampling, and a
+128-token completion.  The metric in this table is client-observed decode
+throughput: `(completion_tokens - 1)` divided by elapsed time from the first
+to last SSE token event.  It includes HTTP and SSE delivery for both runners.
+
+| Runtime | Five client decode TPS | Mean | Median | Mean TTFT | p99 event gap median |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FreeToken, 4,096 experts, 8,320-token KV pool | 60.06, 52.50, 60.20, 60.11, 60.18 | 58.61 | 60.11 | 260.3 ms | 17.66 ms, excluding the host-stalled run 120.54 ms |
+| llama.cpp `b10141`, ROCm 10 HIP | 61.04, 62.03, 62.44, 62.57, 62.56 | 62.13 | 62.44 | 111.5 ms | 16.63 ms |
+
+llama.cpp leads FreeToken by 3.7 percent on median client decode TPS
+(`62.44 / 60.11 - 1`) and 5.7 percent on the unfiltered five-run mean
+(`62.13 / 58.61 - 1`).  It also has lower warm TTFT.  FreeToken produced the
+same deterministic output hash in every measured run; llama.cpp produced the
+same deterministic output hash in every one of its own runs.  The hashes are
+not compared across runtimes because their tokenizers and chat-template
+implementations differ.
+
+This is a close result for decode rate, but it does **not** meet the stated
+criterion of meeting or exceeding llama.cpp.  The remaining performance work
+is therefore directed at the HIP decode path and the source of the FreeToken
+tail stall, rather than a claim of parity.  The raw llama.cpp evidence is
+retained on LAN-223 at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/llamacpp-current-host-context8320-20260829T013730Z/
 ```
 
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
