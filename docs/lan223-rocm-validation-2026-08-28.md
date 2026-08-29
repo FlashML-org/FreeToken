@@ -571,9 +571,9 @@ export HIP_PATH=/opt/rocm-10.0
 export TORCH_EXTENSIONS_DIR=/home/david/freetoken-amd/cache/torch_extensions
 
 ft serve --model-path /home/david/freetoken-amd/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf \
-  --attention-backend triton --moe-backend offload --moe-cache-auto \
-  --memory-ratio 0.50 --max-running-requests 1 --max-seq-len-override 8320 \
-  --cuda-graph-max-bs 1
+  --attention-backend triton --moe-backend offload --moe-cache-size 4096 \
+  --num-tokens 8320 --memory-ratio 0.50 --max-running-requests 1 \
+  --max-seq-len-override 8320 --cuda-graph-max-bs 1
 ```
 
 The port now derives and exports `PYTORCH_ROCM_ARCH=gfx1151` before the GGUF
@@ -583,20 +583,26 @@ cache target-specific.  It does not itself increase steady-state TPS because
 the original HIP build already selected `gfx1151` on this single-GPU host.
 
 The remaining gap is not an untested cache or residency setting: Gemma's GGUF
-adapter only supports the native Q4_0 offload implementation, and the automatic
-cache selected all 3,840 routed-expert slots.  Closing the gap requires a
-profile-guided improvement to the HIP GGUF decode kernels or another proven
-ROCm attention or quantized-linear implementation.  The available ROCm 10
-`rocprofv3` installation could not yet provide that kernel breakdown: attach
-mode reports that the PyTorch process has no `rocp-bg-attach` registration
-thread even when launched with `ROCP_TOOL_ATTACH=1`, while launch mode aborts
-before FreeToken starts with LLVM's duplicate `spirv-expand-step` option.  The
-full error evidence is retained in `rocprof-gfx1151*/` and
-`rocprof-launch-gfx1151-v2/` under the raw artifact directory.  This is a
-toolchain issue, not a FreeToken performance result, so no profiler-derived
-optimization claim is made here.  A temporary high-performance DPM governor
-test could not be run because the non-root LAN-223 account cannot write
-`power_dpm_force_performance_level`; automatic mode was unchanged.
+adapter only supports the native Q4_0 offload implementation, and the accepted
+configuration keeps all 4,096 routed-expert slots resident while retaining a
+verified 8,320-token KV pool.  Closing the gap requires a profile-guided
+improvement to the HIP GGUF decode kernels or another proven ROCm attention or
+quantized-linear implementation.
+
+The initial direct `rocprofv3` attempts did fail because the host profiler
+injected a second LLVM and rocprofiler SDK beside the SDK bundled with the
+PyTorch ROCm wheel.  That historical failure is retained in
+`rocprof-gfx1151*/` and `rocprof-launch-gfx1151-v2/` under the raw artifact
+directory.  It was subsequently repaired by
+[`scripts/lan223-rocprof-wheel-sdk.sh`](../scripts/lan223-rocprof-wheel-sdk.sh),
+which directs the host profiler front end to the wheel's matching SDK.  The
+repaired launch produced FreeToken kernel traces, including the active
+`moe_vec_q4_0_hip_two_rows` kernel.  Traces are diagnostic evidence only and
+are never used as TPS scoring because profiling changes execution timing.
+
+A temporary high-performance DPM governor test could not be run because the
+non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
+automatic mode was unchanged.
 
 Raw campaign artifacts are retained on LAN-223:
 
