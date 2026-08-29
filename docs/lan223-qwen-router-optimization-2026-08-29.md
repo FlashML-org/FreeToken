@@ -319,3 +319,30 @@ and exit code are retained at:
 ```text
 /home/david/freetoken-amd/artifacts/qwen-copy-bench-20260829T114800Z/
 ```
+
+### Live clock and power-state verification
+
+The service process is configured for the native ROCm 10 HIP runtime and its
+CPU host was already in the Linux `performance` governor. Idle sensor readings
+reported the expected 600 MHz shader clock, which is not suitable evidence for
+a decode-performance diagnosis. A fixed 256-token, three-sample API workload
+therefore ran on the unchanged loopback service while ROCm SMI collected one
+sample per second.
+
+The workload completed all three samples at 28.270 mean output TPS with a
+0.014 TPS standard deviation. During its steady portion, GPU utilization was
+100 percent in 24 samples, shader clocks reached and held the 2.9 GHz state,
+memory clock remained at 1.0 GHz, and package graphics power was typically
+about 70 to 90 W, with a 114 W peak sample. The service continued to report
+`status: ok` after the workload.
+
+This excludes an inactive CPU governor, idle shader state, or obvious
+power-state failure as the explanation for the present decode ceiling. It is
+consistent with the isolated kernel counters: decode is actively executing at
+the device's performance state and the dense FP8 memory unit is already near
+saturation. Hardware clock forcing is therefore not a justified safe
+optimization. Reproducible workload and sensor artifacts are retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-live-telemetry-20260829T050800Z/
+```
