@@ -316,6 +316,8 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): hc / KDA / MLA-DSA / MoE / split.
+    glm5_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -329,12 +331,22 @@ class ModelConfig:
 
     @property
     def num_moe_layers(self) -> int:
-        """Number of layers that own a sparse MoE block (and offload-cache expert slots).
+        """Number of layers served from the OFFLOAD expert cache (host banks + slots).
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
-        only store experts for the trailing layers; everything else has all layers MoE.
+        only store experts for the trailing layers. GLM-5.3's hotness-driven split
+        additionally keeps ``glm5_args.resident_layer_ids`` fully on the GPU as model
+        weights -- those layers own no host bank and no cache slots, so every consumer
+        of this count (bank builder, offload cache, cost estimates) excludes them.
         """
-        return self.num_layers - self.first_k_dense_replace
+        n = self.num_layers - self.first_k_dense_replace
+        g5 = getattr(self, "glm5_args", None)
+        if g5 is not None:
+            n -= sum(
+                1 for l in g5.resident_layer_ids
+                if self.first_k_dense_replace <= l < self.num_layers
+            )
+        return n
 
     @property
     def is_multimodal(self) -> bool:
