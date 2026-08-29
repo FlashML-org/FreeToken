@@ -48,7 +48,7 @@ case "${FP8_GEMV_BLOCK_N}" in
     *) echo "invalid FREETOKEN_FP8_GEMV_BLOCK_N: ${FP8_GEMV_BLOCK_N}" >&2; exit 2 ;;
 esac
 case "${FP8_GEMV_NUM_WARPS}" in
-    1|2) ;;
+    1|2|4) ;;
     *) echo "invalid FREETOKEN_FP8_GEMV_NUM_WARPS: ${FP8_GEMV_NUM_WARPS}" >&2; exit 2 ;;
 esac
 case "${FP8_GEMV_SCALE_ACTIVATION}" in

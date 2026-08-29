@@ -58,16 +58,16 @@ if _GEMV_BLOCK_N not in (16, 32):
         "(quality-gated gfx1151 candidate)"
     )
 
-# One Wave32 is the validated baseline.  A two-wave dispatch is the only other
-# deliberately bounded candidate because it can improve latency hiding on
-# gfx1151 without changing the output tile or split-K policy.  It still has to
+# One Wave32 is the validated baseline. Two and four waves are deliberately
+# bounded candidates because they can improve memory-level parallelism on
+# gfx1151 without changing the output tile or split-K policy. They still have to
 # pass the same raw-output and model-level gates because Triton may lower a
 # reduction differently when the launch wave count changes.
 _GEMV_NUM_WARPS = int(os.environ.get("FREETOKEN_FP8_GEMV_NUM_WARPS", "1"))
-if _GEMV_NUM_WARPS not in (1, 2):
+if _GEMV_NUM_WARPS not in (1, 2, 4):
     raise ValueError(
-        "FREETOKEN_FP8_GEMV_NUM_WARPS must be 1 (validated baseline) or 2 "
-        "(quality-gated gfx1151 candidate)"
+        "FREETOKEN_FP8_GEMV_NUM_WARPS must be 1 (validated baseline), 2, or 4 "
+        "(quality-gated gfx1151 candidates)"
     )
 
 # ROCm must emulate e4m3 weight conversion.  The optional candidate decodes a
