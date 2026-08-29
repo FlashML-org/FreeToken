@@ -333,6 +333,25 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         output_gate="silu",
     )
 
+    # Q4_K_M is a recipe, not one homogeneous tensor type.  The exact Qwen
+    # control has Q6_K down experts in a small set of late layers.  Read the
+    # tensor table when available, while allowing metadata-only converter tests
+    # to exercise the architecture parser without a 22 GiB model file.
+    q6_down_layers: tuple[int, ...] = ()
+    try:
+        from freetoken.models.gguf.dequant import GGML_Q6_K
+        from freetoken.models.gguf.reader import iter_gguf_tensors
+
+        q6_down_layers = tuple(
+            int(t.name.split(".")[1])
+            for t in iter_gguf_tensors(shim.model_path)
+            if t.name.startswith("blk.")
+            and t.name.endswith("ffn_down_exps.weight")
+            and t.ggml_type == GGML_Q6_K
+        )
+    except FileNotFoundError:
+        pass
+
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -360,6 +379,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         # routed down in Q5_K. The explicit tag selects the mixed bank provider.
         expert_quant="q4_k_q5_k",
         moe_weight_format="q4_k_q5_k",
+        gguf_q6_down_layer_ids=q6_down_layers,
         # Dense Q8_0 projections use the native GGUF operator pair.  This is distinct
         # from modelopt FP8: qkv|z remains packed GGUF while b|a stays F32.
         attn_quant="gguf_q8",
