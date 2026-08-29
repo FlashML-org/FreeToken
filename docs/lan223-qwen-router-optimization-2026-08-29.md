@@ -497,3 +497,26 @@ quality result, and scheduler samples, are retained at:
 ```text
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T131629Z/
 ```
+
+### Native-library replacement screen
+
+The Qwen checkpoint carries calibrated `input_scale` tensors, so a W8A8
+hipBLASLt replacement was investigated as a possible way to replace the
+memory-bound W8A16 dense decode kernel. LAN-223 is running ROCm 10.0 with
+hipBLASLt 1.4 and PyTorch `2.13.0+rocm10.0.0`, but the route is not available
+for this model and GPU. PyTorch's native `_scaled_mm` call on gfx1151 rejects
+the operation before dispatch, reporting that it is supported only on CUDA
+compute capability 8.9 or 9.0 devices, or ROCm MI300-class devices. This is a
+runtime capability gate, not a FreeToken configuration error.
+
+The installed hipBLASLt 1.4 headers also expose `HIP_R_8F_E5M3_EXT` but not an
+OCP E4M3 matrix data type. Qwen's dense weights are OCP E4M3, so directly
+calling that ABI would require a representation conversion and would no longer
+be a like-for-like W8A8 replacement. A BF16 conversion would double weight
+traffic in the already memory-bound decode path. Neither alternative is an
+acceptable serving optimization or a valid quality-preserving AMD port.
+
+The conclusion is deliberately limited to this ROCm 10, PyTorch 2.13, and
+gfx1151 environment. The result keeps the verified native Triton W8A16 route
+as the active path and directs follow-up work toward custom kernels that retain
+the checkpoint's OCP E4M3 bytes and its exact output contract.
