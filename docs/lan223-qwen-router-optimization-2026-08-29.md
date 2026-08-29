@@ -421,3 +421,21 @@ This result demonstrates why raw tensor equality and a favorable isolated
 kernel timing are necessary but not sufficient acceptance conditions. The
 multi-layer MoE decode schedule has materially different occupancy and cache
 interaction from a single dense GEMV invocation.
+
+### Rejected FP8 GEMV pipeline-depth screen
+
+The next quality-safe dense FP8 candidate was an explicit Triton pipeline depth
+for the existing 16-row, one-wave, fixed split-K GEMV. Pipeline depth changes
+software scheduling but not the arithmetic, output-row tile, K chunks, or
+split-K reduction tree. All five tested depths produced the same raw BF16 SHA-1
+`0aca8b9e38ebfaa91893366a175970f1c45599b9` on the Qwen-shaped 8192 by 2048
+screen.
+
+The initial 200-iteration pass made stage 2 look marginally favorable, with a
+0.07698 ms median versus 0.07734 ms for stage 3. A new, longer 500-iteration
+paired measurement reversed that apparent advantage: stage 3 measured 0.07689
+ms median versus 0.07704 ms for stage 2, while their means were effectively
+identical at 0.07702 ms. Stages 1, 4, and 5 were slower in the initial screen.
+The small difference is ordinary device-timing variation, not a defensible
+end-to-end improvement. The staging override was removed without a model
+reload, preserving the established default Triton pipeline policy.
