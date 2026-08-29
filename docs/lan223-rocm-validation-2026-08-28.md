@@ -352,6 +352,38 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-route-group8-20260829T001802Z/
 ```
 
+### Rejected Triton GQA attention eight-warp candidate
+
+Gemma's sliding decode attention has 16 query heads, 8 KV heads, a 256-wide
+head dimension, and a 1,024-token sliding window.  The HIP production path
+uses a 16-head padded tile, 32-token KV blocks, and four Triton warps.  A
+shape-accurate benchmark tested head tiles of 2, 4, and 8, a 64-token KV
+block, and two or eight warps.  All tile and 64-token-block alternatives were
+slower.  Eight warps was faster in isolation: 39.51 us versus 41.87 us for
+sliding attention, and 49.84 us versus 93.17 us for Gemma's 2-KV-head,
+512-wide full-attention geometry.
+
+That microbenchmark win did not survive the full serving workload.  An
+otherwise identical graph-captured loopback OpenAI-compatible API run with
+eight warps returned the expected deterministic SHA-1 `abeee5e73e89`, but
+measured **53.76 TPS**, 18.600 ms/token, 281.2 ms TTFT, and 20.227 ms p99
+event latency.  This is below the accepted five-run 55.91 TPS mean.  The
+production override was removed, so normal HIP serving remains at four warps;
+the benchmark-only probe parameters remain available for future controlled
+research.  This result is a second independent example of why isolated GPU
+event timings cannot be used as a serving-performance acceptance criterion.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gqa-attention-blockh2-20260829T002315Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gqa-attention-blockh4-8-20260829T002334Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gqa-attention-blockn64-20260829T002442Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gqa-attention-warps2-8-20260829T002459Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gqa-attention-global-warps8-20260829T002558Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/attention-warps8-api-20260829T002618Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
