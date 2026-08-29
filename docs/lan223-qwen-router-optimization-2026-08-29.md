@@ -626,3 +626,71 @@ The complete high-policy evidence is retained at:
 ```text
 /home/david/freetoken-amd/artifacts/qwen-dpm-high-20260829T220224Z/
 ```
+
+### Same-base-model ROCm 10 llama.cpp control
+
+LAN-223's original llama-swap Qwen control was `Qwen3.6-27B-Q4_K_M`, which is
+not the model served by FreeToken and cannot establish same-model Qwen parity.
+For a controlled comparison, the isolated directory
+`models/controls/qwen36-35b-a3b-unsloth-a483e9e6/` now contains
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` from
+`unsloth/Qwen3.6-35B-A3B-GGUF` revision
+`a483e9e6cbd595906af30beda3187c2663a1118c`. The downloaded file is
+22,134,528,992 bytes; Hugging Face Xet recorded completed-file SHA-256
+`d0f6c2fa907594b8a8322531f188c7c12708db507df3402a18391db1f38eec50`.
+
+The control used the existing ROCm 10 llama.cpp `b10141` binary at commit
+`0d47ea742`, AMD Clang 23, full GPU offload, Flash Attention, one slot, an
+8,192-token context, Q8 KV cache, loopback port 1921, and normal GPU `auto`
+policy. `scripts/lan223/run_qwen_llamacpp_rocm_control.sh` starts this server
+only for the run, delegates to the same fixed Qwen scheduler harness as
+FreeToken, saves raw server and client evidence, and terminates the temporary
+server through an `EXIT` trap. It never changes llama-swap or the production
+llama.cpp route.
+
+The full Q4 GGUF needs 20.58 GiB of device allocation, so it cannot coexist
+with the live FreeToken Qwen service, which deliberately retains about 19.45
+GiB free. The authorized comparison therefore ran the full-GPU servers
+sequentially. FreeToken was restored immediately afterward with the strict
+no-JIT recovery script and passed the required AIME SHA-1 `0acef4eab6f4`.
+
+| Runtime | GPU policy | Model representation | Client output TPS samples | Mean output TPS | Median output TPS | Mean client input TPS | Mean TTFT |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| FreeToken | `auto` | NVIDIA NVFP4 checkpoint through native HIP Triton | 28.147, 28.150, 28.162 | 28.153 | 28.150 | 2913.096 | 416.255 ms |
+| FreeToken | `high`, temporary policy screen | Same NVIDIA NVFP4 checkpoint | 28.353, 28.362, 28.349 | 28.355 | 28.353 | 2957.942 | 409.835 ms |
+| llama.cpp ROCm 10 | `auto` | Base-model Q4_K_M GGUF | 49.221, 49.245, 49.235 | 49.234 | 49.235 | 20146.536 | 60.160 ms |
+
+Each row used the same 1,212-token request prompt, greedy decoding,
+`ignore_eos=true`, warmup request, three scored requests, and 256-token server
+generation cap. llama.cpp emitted 256 tokenizer-counted text tokens in every
+scored request. The FreeToken client tokenizer counted 251 emitted text tokens
+for the same cap because its OpenAI stream parser and Qwen reasoning handling
+do not expose every server-side generation token as user text. The output TPS
+metric therefore compares client-visible fixed-length streams closely, but is
+not an exact token-level arithmetic comparison.
+
+Under this protocol, llama.cpp is 74.88 percent faster than FreeToken's
+accepted `auto` output-TPS baseline and 73.64 percent faster than the temporary
+FreeToken `high` policy screen. llama.cpp's input TPS is not directly
+comparable: after warmup it reports the full 1,212 request tokens in API usage
+while its slot log shows only four newly evaluated prompt tokens due to prefix
+cache reuse. Its 20,146.536 client input-TPS figure is therefore a warm cache
+accounting result, not an uncached-prefill advantage of that magnitude.
+
+This is a same-base-model hardware and protocol control, but it is not a
+like-for-like weight-format result. Q4_K_M GGUF and NVIDIA NVFP4 differ in
+quantization layout, loader, and kernel path. The result proves that current
+FreeToken Qwen does not meet the requested "match or exceed llama.cpp" target
+on this practical ROCm 10 control. It does not prove an architecture-level
+deficit independent of quantization. The raw control bundle is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen35b-llamacpp-rocm10-20260829T222546Z/
+```
+
+The post-control FreeToken recovery bundle, including deterministic quality
+evidence, is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T222712Z/
+```
