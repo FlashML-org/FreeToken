@@ -795,6 +795,31 @@ evidence is retained at:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q6-rdna4-eightwaves-api-20260829T023720Z/
 ```
 
+### Current host-interference qualifier
+
+A read-only LAN-223 health capture at 2026-08-29T02:41:15Z found no GPU reset,
+thermal problem, or active FreeToken server.  The Radeon 8060S was idle at
+30 C after the test.  It did, however, identify two pre-existing user-owned
+filesystem scans in uninterruptible `D` state: one scanning `/home/david`,
+`/mnt`, and `/data` for large GGUF or SafeTensors files, and one scanning
+`/home/david` and `/media/david` for Gemma GGUF files.  At capture time they
+had been alive for approximately 8.8 and 6.1 hours respectively.
+
+The same capture reported I/O full-pressure at 0.61 percent over ten seconds
+and retained kernel warnings that `kfd_process_wq_release` and
+`svm_range_deferred_list_work` had exceeded their CPU workqueue budget.  These
+facts do not prove that a particular FreeToken result is invalid, but they
+provide a concrete explanation for occasional multi-millisecond dispatch
+outliers and the isolated 52.50 TPS baseline run.  They can affect both
+FreeToken and llama.cpp under a matched test.
+
+No process priority, service state, kernel option, ROCm installation, or
+hardware component was changed by this investigation.  Any decision to stop
+or otherwise alter the two user-owned scans requires explicit operator
+authorization.  Until then, accepted performance claims remain based on
+multiple clean launches and retain raw tail-latency data rather than hiding
+the interference.
+
 A temporary high-performance DPM governor test could not be run because the
 non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
 automatic mode was unchanged.
