@@ -166,13 +166,75 @@ prompt tokens and llama.cpp's reused 58.
 | FreeToken, experimental two-row Q4_0 MoE block | 55.30 | 291.6 ms | Rejected: slower with identical output hash |
 | FreeToken, experimental Q4_0 MoE two-block residency hint | 55.08 | 294.9 ms | Rejected: slower with identical output hash |
 | FreeToken, HIP Q4_0 MoE one-wave/two-row specialization | 55.89 median, 55.91 mean | 262.2 ms mean | Accepted: five independent API runs, identical output hash |
+| FreeToken, full 4,096-slot expert cache and pinned 8,320-token KV pool | 60.11 median, 58.61 mean | 260.3 ms mean | Accepted configuration; four of five runs at 60.06 to 60.20 TPS, one host-contention outlier at 52.50 TPS |
 | llama.cpp `b10141`, ROCm 10 HIP | 60.42 client, 58.88 internal | 128.6 ms | Matched reference |
 
 The graph configuration removes approximately 1.5 percent of the eager decode
-cost, but FreeToken still trails llama.cpp by 7.8 percent using client TPS and
-by approximately 5.4 percent compared with llama.cpp's internal decode timing.
-The requested criterion of meeting or exceeding llama.cpp is therefore **not
-met** by the first configuration pass.
+cost.  The capacity-aware resident-expert configuration below then removes the
+dominant configuration gap without changing the model, server API, or HIP
+kernel arithmetic.  Its uncontended median is within 0.51 percent of the
+60.42 client-TPS llama.cpp reference, but its five-run arithmetic mean remains
+below that reference because one run experienced external host stalls.  The
+criterion of meeting or exceeding llama.cpp is therefore not yet claimed as a
+fully repeatable mean result.
+
+### Accepted full-expert-cache and fixed-KV configuration
+
+The original automatic offload configuration sized 3,840 GPU expert slots and
+then assigned the remaining memory budget to a very large KV pool.  That pool
+is not required by the fixed 8,320-token operating target and lowered the
+observed decode rate.  A fixed expert-cache configuration leaves the same
+native Q4_0 GGUF, HIP extension, graph-captured decode, OpenAI-compatible API,
+and `offload` backend intact while making the capacity choices explicit:
+
+```bash
+python benchmarks/bench_decode_moe.py \
+  --model /home/david/freetoken-amd/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf \
+  --backend offload --cache 4096 --num-token-override 8320 \
+  --mem-ratio 0.50 --decode 128 --greedy
+```
+
+`4096` is the complete 32-layer by 128-expert cache domain.  A 3,840-slot
+control preserved the fixed KV allocation but produced two severe decode-tail
+events, confirming that leaving any of the 4,096 slots uncached can still
+exercise the miss path.  The explicit 4,096-slot configuration was therefore
+retained.  The new benchmark option maps `--num-token-override` to the public
+server flag `--num-tokens`, so experiments can pin KV capacity without a
+private wrapper.
+
+Five independent API runs used the fixed 63-token AIME request, 126 measured
+decode steps, greedy sampling, `0.50` memory ratio, and the deterministic
+output SHA-1 `abeee5e73e89`:
+
+| Run | Decode TPS | ms/token | TTFT | Event p50 / p99 |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 60.063 | 16.649 | 259.7 ms | 16.929 / 17.841 ms |
+| 2 | 52.499 | 19.048 | 261.4 ms | 16.928 / 120.541 ms |
+| 3 | 60.203 | 16.610 | 259.6 ms | 16.855 / 17.657 ms |
+| 4 | 60.114 | 16.635 | 260.3 ms | 16.937 / 17.619 ms |
+| 5 | 60.183 | 16.616 | 260.6 ms | 16.876 / 17.522 ms |
+| Aggregate | **58.613 mean, 60.114 median** | 17.112 mean | 260.3 ms mean | 16.928 / 17.657 ms median |
+
+The four normal runs are within 60.063 to 60.203 TPS and have p99 latency at
+or below 17.841 ms.  The one low-throughput run kept the same output, VRAM,
+TTFT, and p50 latency, but had isolated 120.541 ms decode events.  Kernel logs
+recorded `kfd_process_wq_release` holding CPU for more than 10 ms and the host
+showed full I/O pressure.  Read-only inspection also found two long-running,
+blocked user-owned filesystem scans.  They were not stopped by this campaign.
+This is host contention evidence, not a FreeToken numerical or API failure.
+
+Capacity was tested through the public OpenAI-compatible API, not merely at
+startup.  A request with 7,619 prompt tokens plus one completion token ran
+inside the pinned 8,320-token pool, returned exactly `OK`, and completed in
+22.352 seconds.  The server then exited cleanly with no KFD processes.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/full-expert-cache-4096-20260829T010740Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/fixed-expert-cache-3840-control-20260829T011537Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/full-cache-4096-context8320-20260829T012342Z/
+```
 
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
 
