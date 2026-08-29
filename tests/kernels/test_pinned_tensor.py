@@ -86,6 +86,22 @@ def test_fast_index_copy_skip_env_noops_without_jit(monkeypatch):
     torch.testing.assert_close(output, torch.full_like(output, -1.0))
 
 
+def test_fused_copy_grid_selection_is_bounded_to_cached_variants(monkeypatch):
+    """Only explicit AOT grid widths may be selected by the service environment."""
+
+    import freetoken.kernel.fast_index_copy as fast_index_copy
+
+    monkeypatch.delenv(fast_index_copy.FUSED_COPY_BLOCKS_PER_BANK_ENV, raising=False)
+    assert fast_index_copy.fused_copy_blocks_per_bank() == 8
+
+    monkeypatch.setenv(fast_index_copy.FUSED_COPY_BLOCKS_PER_BANK_ENV, "64")
+    assert fast_index_copy.fused_copy_blocks_per_bank() == 64
+
+    monkeypatch.setenv(fast_index_copy.FUSED_COPY_BLOCKS_PER_BANK_ENV, "16")
+    with pytest.raises(ValueError, match="must be 8 or 64"):
+        fast_index_copy.fused_copy_blocks_per_bank()
+
+
 def test_aot_catalog_excludes_legacy_rows_without_full_vector_transactions():
     """AOT must not ask HIP to compile templates rejected by their static assertion."""
 

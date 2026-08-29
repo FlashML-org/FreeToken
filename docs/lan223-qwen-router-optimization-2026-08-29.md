@@ -468,3 +468,32 @@ path remains the more valuable target. The two diagnostic artifact roots are:
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T124643Z/
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T125511Z/
 ```
+
+### Rejected 64-block fused expert-copy candidate
+
+The production fused expert-cache copy helper was also screened with the real
+Qwen3.6-35B-A3B-NVFP4 six-bank layout. Both candidate grids use precompiled
+gfx1151 HIP modules, run with `FREETOKEN_DISABLE_JIT=1`, and were required to
+copy every selected source row byte-for-byte into its requested cache slot
+before a timing sample was recorded. With one missing expert, widening from
+eight to 64 blocks per bank reduced median copy time from 0.01872 ms to
+0.01812 ms. With eight missing experts, it reduced the median from 0.07984 ms
+to 0.05982 ms, increasing the measured copy rate from 177.9 GB/s to 237.5
+GB/s.
+
+That isolated improvement preserved deterministic model output: the 64-block
+server returned the required AIME SHA-1 `0acef4eab6f4`, with 28.582 output TPS
+on that quality request. It did not improve the fixed three-sample scheduler
+workload. The end-to-end result was 28.070 TPS mean, 28.078 TPS median, and
+0.016 TPS standard deviation, below the fresh default eight-block result of
+28.153 TPS mean. The larger launch grid is therefore rejected as the serving
+default. The code retains an explicitly bounded `8|64` diagnostic selection so
+future cache changes can be remeasured without a new JIT specialization, but
+the launcher defaults to the accepted eight-block grid.
+
+The full candidate artifacts, including exact-copy microbenchmark data, AIME
+quality result, and scheduler samples, are retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T131629Z/
+```

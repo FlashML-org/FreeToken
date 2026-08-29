@@ -26,6 +26,7 @@ readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
 readonly FP8_GEMV_NUM_WARPS="${FREETOKEN_FP8_GEMV_NUM_WARPS:-1}"
 readonly FP8_GEMV_SCALE_ACTIVATION="${FREETOKEN_FP8_GEMV_SCALE_ACTIVATION:-0}"
 readonly MOE_COLLECT_STATS="${FREETOKEN_MOE_COLLECT_STATS:-0}"
+readonly FUSED_COPY_BLOCKS_PER_BANK="${FREETOKEN_FUSED_COPY_BLOCKS_PER_BANK:-8}"
 readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/${RUN_ID}"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
@@ -67,6 +68,10 @@ case "${MOE_COLLECT_STATS}" in
     0|1) ;;
     *) echo "invalid FREETOKEN_MOE_COLLECT_STATS: ${MOE_COLLECT_STATS}" >&2; exit 2 ;;
 esac
+case "${FUSED_COPY_BLOCKS_PER_BANK}" in
+    8|64) ;;
+    *) echo "invalid FREETOKEN_FUSED_COPY_BLOCKS_PER_BANK: ${FUSED_COPY_BLOCKS_PER_BANK}" >&2; exit 2 ;;
+esac
 mkdir -p "${ARTIFACT_DIR}"
 
 # These variables select the native ROCm toolchain and retain the existing HIP
@@ -94,6 +99,10 @@ export FREETOKEN_FP8_GEMV_BLOCK_N="${FP8_GEMV_BLOCK_N}"
 # one bounded variable rather than an implicit, inherited shell setting.
 export FREETOKEN_FP8_GEMV_NUM_WARPS="${FP8_GEMV_NUM_WARPS}"
 export FREETOKEN_FP8_GEMV_SCALE_ACTIVATION="${FP8_GEMV_SCALE_ACTIVATION}"
+# Both fused-copy grid widths are precompiled into the strict gfx1151 cache.
+# The default eight blocks is the established service baseline; sixty-four is
+# an isolated, quality-gated copy-path candidate.
+export FREETOKEN_FUSED_COPY_BLOCKS_PER_BANK="${FUSED_COPY_BLOCKS_PER_BANK}"
 
 # Cache counters are opt-in because their atomic updates are diagnostic work.
 # The default leaves the verified performance service unchanged, while an
