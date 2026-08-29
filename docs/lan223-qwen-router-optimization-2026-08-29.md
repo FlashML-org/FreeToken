@@ -370,6 +370,12 @@ ROCm 10 build produced all 80 valid catalog modules for gfx1151:
 /home/david/freetoken-amd/cache/kernel-cache-rocm-gfx1151-d6ee8cef479c/
 ```
 
+`scripts/lan223/verify_rocm_kernel_cache.py` then loaded every one of those 80
+modules with `FREETOKEN_DISABLE_JIT=1`. This verifies ABI-compatible loading
+through the installed Python, TVM FFI, ROCm 10 and HIP runtime, which a shared
+object file count alone cannot prove. The verifier neither starts a model nor
+modifies the cache.
+
 The strict cache launch completed the normal serial NVFP4 expert-bank load,
 then passed the AIME output gate with the required SHA-1 `0acef4eab6f4` at
 28.504 output TPS, 399.99 ms TTFT, and 36.62 ms p99 stream-event gap. It
