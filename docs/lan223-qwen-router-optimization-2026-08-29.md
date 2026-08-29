@@ -178,19 +178,51 @@ until it has a saved exact-hash response and an unprofiled TPS result.
 
 ### Quality-preserving but inconclusive output-row candidate
 
-The gfx1151 candidate changed the dense FP8 GEMV output-row tile from 16 to
-32, while retaining split-K and all arithmetic that determines each output
-value. All three AIME responses matched the required SHA-1 exactly.
+The first gfx1151 candidate changed the dense FP8 GEMV output-row tile from 16
+to 32. Its three AIME responses matched the required SHA-1 exactly, but a
+post-run source audit found that the old automatic split-K calculation was
+derived from the output-row tile. The candidate therefore also changed the K
+partition, despite being intended as a row-only experiment.
 
 | Tile | Output SHA-1 | Output TPS samples | Mean output TPS | Decision |
 | --- | --- | --- | ---: | --- |
 | 16 baseline | `0acef4eab6f4` | 26.786, 28.422, 28.431 | 27.880 | Validated baseline |
-| 32 candidate | `0acef4eab6f4` | 28.677, 26.867, 28.683 | 28.075 | Quality preserved, speedup inconclusive |
+| 32 first candidate | `0acef4eab6f4` | 28.677, 26.867, 28.683 | 28.075 | Prompt gate passed, arithmetic scope corrected afterward |
 
 The candidate mean is 0.7 percent higher than the earlier baseline mean, but
 the 26.867 TPS sample had a 114.51 ms p99 stream-event gap and the immediate
 post-reboot tile-16 validation measured 28.596 TPS. This is within normal
 measurement variation, not evidence of a repeatable throughput improvement.
-The candidate is therefore not made the default. The launcher restricts tile
-values to `16` and `32`, records the selection explicitly, and restores the
-validated 16-row policy for normal isolated serving.
+More importantly, the inadvertent split-K coupling means this candidate cannot
+establish a row-only quality claim. It is not the default. The implementation
+now derives split-K from the validated 16-row reference tile even when a
+different output-row tile is requested, then the corrected candidate must be
+retested from scratch.
+
+### Corrected HIP kernel screen
+
+After decoupling split-K from the output-row tile, the isolated microbenchmark
+used deterministic synthetic tensors at Qwen's real `[N, 2048]` shapes. It
+warms each compiled kernel, records 100 native HIP event timings, and hashes
+the raw BF16 result buffer. Every compared row below has the same output hash
+as its tile-16 baseline for that shape. This is a kernel-level numerical check,
+not a replacement for the end-to-end AIME gate.
+
+| Shape | Candidate | Baseline median | Candidate median | Result |
+| --- | --- | ---: | ---: | --- |
+| `[8192, 2048]` | 32 output rows, fixed split-K | 0.0764 ms | 0.0779 ms | Slower |
+| `[4096, 2048]` | 32 output rows, fixed split-K | 0.0392 ms | 0.0396 ms | Slower |
+| `[2048, 2048]` | 32 output rows, fixed split-K | 0.0325 ms | 0.0330 ms | Slower |
+| `[8192, 2048]` | two waves, 16 output rows | 0.0764 ms | 0.0765 ms | No material gain |
+| `[8192, 2048]` | activation-side exact FP8 scale | 0.0764 ms | 0.0766 ms | No material gain |
+
+The activation-scale candidate decodes each FP8 byte as an exact fp16 value
+divided by 256, then applies the compensating exact power-of-two scale once to
+the FP32 activation. It was bit-identical in the screen but did not lower
+latency. It remains disabled. All of these variants are rejected from default
+serving because the target is a repeatable end-to-end TPS gain with unchanged
+quality, not merely a different kernel that happens to pass one output check.
+
+The current source passed the native focused regression suite after these
+experiments: `22 passed, 11 skipped` in
+`tests/kernels/test_fp8_pertensor_linear.py` on LAN-223.

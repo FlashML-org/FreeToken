@@ -31,6 +31,7 @@ from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native,
     e4m3_native_cx,
+    e4m3_u8_to_f16,
     e4m3_u8_to_f32,
 )
 
@@ -42,10 +43,10 @@ _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float
 _USE_REF = os.environ.get("FREETOKEN_DEBUG_FP8_REF") == "1"
 
 # The baseline emits sixteen independent output rows per split-K CTA.  Radeon
-# gfx1151 executes Wave32, so a thirty-two-row CTA is a quality-preserving
-# occupancy candidate: it changes only which independent output rows share a
-# launch, never the K chunks, per-row accumulation, partial buffer layout, or
-# final split-K reduction order.  Keep the compact allowlist deliberately
+# gfx1151 executes Wave32, so a thirty-two-row CTA is an occupancy candidate.
+# The launch tile must not influence the split-K policy: otherwise changing
+# output rows per CTA would silently change the K partition and numerical
+# reduction grouping. Keep the compact allowlist deliberately
 # narrow because arbitrary tile sizes would create undocumented kernels and
 # make performance evidence impossible to compare across runs.  The setting is
 # read once at module import, which is safe because it is a compile-time Triton
@@ -57,6 +58,26 @@ if _GEMV_BLOCK_N not in (16, 32):
         "(quality-gated gfx1151 candidate)"
     )
 
+# One Wave32 is the validated baseline.  A two-wave dispatch is the only other
+# deliberately bounded candidate because it can improve latency hiding on
+# gfx1151 without changing the output tile or split-K policy.  It still has to
+# pass the same raw-output and model-level gates because Triton may lower a
+# reduction differently when the launch wave count changes.
+_GEMV_NUM_WARPS = int(os.environ.get("FREETOKEN_FP8_GEMV_NUM_WARPS", "1"))
+if _GEMV_NUM_WARPS not in (1, 2):
+    raise ValueError(
+        "FREETOKEN_FP8_GEMV_NUM_WARPS must be 1 (validated baseline) or 2 "
+        "(quality-gated gfx1151 candidate)"
+    )
+
+# ROCm must emulate e4m3 weight conversion.  The optional candidate decodes a
+# weight as its exact fp16 value divided by 256 and applies the compensating
+# exact power-of-two scale once to the BF16 activation.  This reduces repeated
+# weight-side scale operations without changing the FP32 accumulator contract.
+# It is off by default because compiler lowering must be verified by raw-output
+# hashes and the full deterministic model-quality gate.
+_GEMV_SCALE_ACTIVATION = os.environ.get("FREETOKEN_FP8_GEMV_SCALE_ACTIVATION") == "1"
+
 
 # ======================================================================================
 # Decode (M==1) split-K GEMV: raw fp8 x bf16 reduction in fp32, per-row scale at reduce.
@@ -65,7 +86,7 @@ if _GEMV_BLOCK_N not in (16, 32):
 def _gemv_splitk_kernel(
     a_ptr, w_ptr, part_ptr, N, K, n_kb, kb_per,
     stride_ak, stride_wn, stride_wk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SCALE_ACTIVATION: tl.constexpr,
 ):
     """Each (pid_n, pid_k) computes the partial sum over ``kb_per`` BLOCK_K chunks for a
     BLOCK_N slice of outputs. ``kb_per`` ceil-tiles K so K only needs to be a multiple of
@@ -82,16 +103,25 @@ def _gemv_splitk_kernel(
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
             a = tl.load(a_ptr + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
+            # Scaling BF16 inputs by 256 is an exact exponent adjustment in
+            # fp32.  Do it once per K element only for the quality-gated ROCm
+            # candidate; CUDA native e4m3 uses its normal direct conversion.
+            if SCALE_ACTIVATION and not e4m3_native_cx():
+                a *= 256.0
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                     mask=n_mask[:, None] & k_mask[None, :], other=0.0,
                 ).to(tl.float32)
             else:
-                w = e4m3_u8_to_f32(tl.load(
+                raw_w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                     mask=n_mask[:, None] & k_mask[None, :], other=0,
-                ))
+                )
+                if SCALE_ACTIVATION:
+                    w = e4m3_u8_to_f16(raw_w).to(tl.float32)
+                else:
+                    w = e4m3_u8_to_f32(raw_w)
             acc += tl.sum(w * a[None, :], axis=1)
     tl.store(part_ptr + pid_k * stride_pk + offs_n * stride_pn, acc, mask=n_mask)
 
@@ -116,20 +146,23 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     N, K = weight.shape
     BLOCK_K = 128
     n_kb = triton.cdiv(K, BLOCK_K)
-    # This output-row tile leaves every row's arithmetic untouched.  It may
-    # only alter hardware occupancy and memory-transaction coalescing, so all
-    # non-baseline values still require the full deterministic model-quality
+    # This output-row tile may alter hardware occupancy and memory-transaction
+    # coalescing.  The reference tile below deliberately holds split-K fixed,
+    # so it cannot also alter a row's K partition or final reduction order.
+    # All non-baseline values still require the full deterministic model-quality
     # gate before they can become a default.
     BLOCK_N = _GEMV_BLOCK_N
     n_tiles = triton.cdiv(N, BLOCK_N)
-    split_k = max(1, min(1536 // n_tiles, n_kb))
+    baseline_n_tiles = triton.cdiv(N, 16)
+    split_k = max(1, min(1536 // baseline_n_tiles, n_kb))
     split_k = 1 << (split_k.bit_length() - 1)  # pow2 -> stable reduction order
     kb_per = triton.cdiv(n_kb, split_k)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
     _gemv_splitk_kernel[(n_tiles, split_k)](
         a, weight, part, N, K, n_kb, kb_per,
         a.stride(0), weight.stride(0), weight.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SCALE_ACTIVATION=_GEMV_SCALE_ACTIVATION,
+        num_warps=_GEMV_NUM_WARPS,
     )
     out = torch.empty(N, dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](

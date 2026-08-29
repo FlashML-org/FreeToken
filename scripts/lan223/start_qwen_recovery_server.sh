@@ -17,6 +17,8 @@ readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
 readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
 readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
 readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
+readonly FP8_GEMV_NUM_WARPS="${FREETOKEN_FP8_GEMV_NUM_WARPS:-1}"
+readonly FP8_GEMV_SCALE_ACTIVATION="${FREETOKEN_FP8_GEMV_SCALE_ACTIVATION:-0}"
 readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/${RUN_ID}"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
@@ -45,6 +47,14 @@ case "${FP8_GEMV_BLOCK_N}" in
     16|32) ;;
     *) echo "invalid FREETOKEN_FP8_GEMV_BLOCK_N: ${FP8_GEMV_BLOCK_N}" >&2; exit 2 ;;
 esac
+case "${FP8_GEMV_NUM_WARPS}" in
+    1|2) ;;
+    *) echo "invalid FREETOKEN_FP8_GEMV_NUM_WARPS: ${FP8_GEMV_NUM_WARPS}" >&2; exit 2 ;;
+esac
+case "${FP8_GEMV_SCALE_ACTIVATION}" in
+    0|1) ;;
+    *) echo "invalid FREETOKEN_FP8_GEMV_SCALE_ACTIVATION: ${FP8_GEMV_SCALE_ACTIVATION}" >&2; exit 2 ;;
+esac
 mkdir -p "${ARTIFACT_DIR}"
 
 # These variables select the native ROCm toolchain and retain the existing HIP
@@ -60,6 +70,11 @@ export ROCM_HOME="/opt/rocm-10.0"
 # quality-gated gfx1151 candidate), so an accidental shell value cannot create
 # an untracked Triton specialization.
 export FREETOKEN_FP8_GEMV_BLOCK_N="${FP8_GEMV_BLOCK_N}"
+# Keep every additional kernel specialization explicit in the artifact's
+# launch environment. This makes a subsequent quality failure attributable to
+# one bounded variable rather than an implicit, inherited shell setting.
+export FREETOKEN_FP8_GEMV_NUM_WARPS="${FP8_GEMV_NUM_WARPS}"
+export FREETOKEN_FP8_GEMV_SCALE_ACTIVATION="${FP8_GEMV_SCALE_ACTIVATION}"
 
 # FreeToken's MoE offload path requires the in-tree pinned-tensor extension.
 # A clean git worktree does not contain generated shared objects, so verify the
@@ -85,7 +100,9 @@ fi
 # to zero because ROCm correctness takes priority; the bounded override enables
 # an isolated batch-size experiment without changing the baseline command. The
 # FP8 row-tile override changes neither split-K partitioning nor reduction order
-# and is only used with a separately saved deterministic quality result.
+# and is only used with a separately saved deterministic quality result. Wave
+# count and activation scaling are likewise disabled defaults and require their
+# own raw-output plus model-level quality evidence before any promotion.
 nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --model-path "${MODEL_DIR}" \
     --served-model-name qwen3.6-35b-a3b-nvfp4-amd \

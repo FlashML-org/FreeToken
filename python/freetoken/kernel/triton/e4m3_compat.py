@@ -97,6 +97,21 @@ def e4m3_native_cx():
 
 
 @jit
+def e4m3_u8_to_f16(v):
+    """Decode an e4m3 byte to the exact fp16 value divided by 256.
+
+    The e4m3 exponent and mantissa fit losslessly in fp16 after the bit-field
+    placement below.  Callers that can move the compensating power-of-two scale
+    onto an activation use this primitive to avoid multiplying every decoded
+    weight by 256.  The caller must preserve FP32 accumulation and apply the
+    reciprocal scaling exactly once, otherwise this is not numerically
+    equivalent to :func:`e4m3_u8_to_f32`.
+    """
+    h = ((v & 0x80).to(tl.uint16) << 8) | ((v & 0x7F).to(tl.uint16) << 7)
+    return h.to(tl.float16, bitcast=True)
+
+
+@jit
 def e4m3_u8_to_f32(v):
     """Decode e4m3 bits (uint8) to fp32: place exp+mantissa in the fp16 field
     (exact, incl. e4m3 subnormals) and rescale by 2^(15-7). NaN codes -> +-480."""
