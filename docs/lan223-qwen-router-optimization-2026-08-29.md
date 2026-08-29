@@ -380,6 +380,12 @@ current-main validation. The startup artifact is retained at:
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T120405Z/
 ```
 
+Its fixed 256-token scheduler workload also completed three of three scored
+samples at 28.018 mean output TPS, with a 28.017 median and 0.007 TPS standard
+deviation. This is consistent with the preceding quality-gated runs and shows
+that enforcing the reusable C++ and HIP cache changes startup compilation
+behavior, not steady-state decode arithmetic or output quality.
+
 This cache eliminates FreeToken's C++ and HIP helper JIT for the catalog it
 contains. It does not claim to precompile every Triton specialization or a
 GGUF kernel: Qwen3.6-35B-A3B-NVFP4 is a safetensors NVFP4 checkpoint, not a
