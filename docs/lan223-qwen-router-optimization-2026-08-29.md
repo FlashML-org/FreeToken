@@ -47,6 +47,16 @@ Triton rows are retained as performance evidence, but must not be used as an
 accepted model-serving configuration until their AIME output differs only for
 an independently justified numerical reason and task-level quality is proven.
 
+### Current quality restoration proof
+
+After restoring the exact PyTorch router, the same AIME-25 problem zero was
+warmed once and measured once against the live LAN-223 server. The checkpoint
+used greedy sampling, a thinking-enabled template, and a forced 128-token
+decode. The 54-token prompt produced the historic output SHA-1
+`0acef4eab6f4` exactly. The dedicated script
+`scripts/lan223/verify_qwen_aime_quality.py` now makes this a repeatable
+quality gate for every future performance candidate.
+
 ## Calibration and rejected alternatives
 
 `ft bench bw` measured Qwen NVFP4's real expert kernels on LAN-223. The CPU
