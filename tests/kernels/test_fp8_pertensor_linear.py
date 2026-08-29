@@ -9,6 +9,10 @@ to fp8 and is held to a reference that applies the same quantization.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -125,3 +129,71 @@ def test_layer_load_marks_uniform_scale_and_optional_input_scale():
     # a reload must not trip over the input_scale it kept from the first load
     single.load_state_dict({"weight": w8, "weight_scale": flat})
     assert single.input_scale is None
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.parametrize("M", [1, 4, 64, 300])
+def test_per_part_path_matches_rowwise(M: int, monkeypatch):
+    """Where row-wise ``_scaled_mm`` is unsafe a fused projection runs one tensor-wise GEMM per
+    part instead. Same scheme, so the two paths agree up to accumulation order (~7e-4)."""
+    import freetoken.kernel.triton.fp8_pertensor_linear as mod
+
+    K, part_rows = 2048, [1024, 256, 256]
+    w8, scale = _quant_parts(part_rows, K, seed=M)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
+    input_scale = (x.abs().max().float() / 448.0).reshape(())
+
+    monkeypatch.setattr(mod, "rowwise_scaled_mm_ok", lambda: True)
+    y_row = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
+    monkeypatch.setattr(mod, "rowwise_scaled_mm_ok", lambda: False)
+    y_part = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
+    rel = ((y_part.float() - y_row.float()).norm() / y_row.float().norm()).item()
+    assert rel < 2e-3, rel
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+def test_fused_layer_forward_on_a_side_stream_completes():
+    """Regression for #182 / #72 / #220: on sm_89 with torch < 2.12 a fused FP8 projection's
+    row-wise ``_scaled_mm`` issued from a non-default stream stalls the GPU (PyTorch's
+    CUTLASS row-wise kernel ignored the current stream; fixed upstream in 2.12). The layer
+    must take a path that completes on every supported build. Runs in a subprocess so a
+    stall fails the test instead of hanging the session."""
+    script = textwrap.dedent("""
+        import os, time, torch
+        from freetoken.kernel.triton.fp8_pertensor_linear import FP8, Fp8PerTensorColMerged
+
+        torch.manual_seed(0)
+        K, parts = 2048, [8192, 512, 512]  # a prefill-sized fused qkv
+        w8 = (torch.randn(sum(parts), K, device="cuda") * 8).clamp(-448, 448).to(FP8)
+        scale = torch.cat([torch.full((p,), 0.01 * (i + 1), device="cuda")
+                           for i, p in enumerate(parts)])
+        layer = Fp8PerTensorColMerged(K, parts)
+        layer.load_state_dict({"weight": w8, "weight_scale": scale,
+                               "input_scale": torch.tensor(0.02, device="cuda")})
+        x = torch.randn(2010, K, device="cuda", dtype=torch.bfloat16)  # #182 shape
+        torch.cuda.synchronize()
+
+        stream = torch.cuda.Stream()
+        events = []
+        with torch.cuda.stream(stream):
+            for _ in range(128):
+                layer.forward(x)
+                ev = torch.cuda.Event()
+                ev.record(stream)
+                events.append(ev)
+        deadline = time.monotonic() + 30
+        done = 0
+        while time.monotonic() < deadline:
+            while done < len(events) and events[done].query():
+                done += 1
+            if done == len(events):
+                print("completed", done, flush=True)
+                os._exit(0)
+            time.sleep(0.05)
+        print("stalled at", done, "of", len(events), flush=True)
+        os._exit(124)  # a normal exit would wait on the stuck kernel
+    """)
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr[-2000:]}"
