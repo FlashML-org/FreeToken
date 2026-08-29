@@ -287,3 +287,35 @@ The final current-main service health check returned `status: ok` on
 child behind; it was identified by its profiler benchmark command, terminated,
 and then force-cleared when it ignored SIGTERM. The serving parent and current
 worker were verified separately before and after that cleanup.
+
+### Unified-memory expert-cache copy screen
+
+The full ROCm trace showed `fast_index_copy` at 593.192 ms across 10,240
+dispatches. That total makes the helper worth measuring, but it does not prove
+that cache fills limit observed single-stream decode TPS. The existing cache
+copy benchmark did not previously encode Qwen3.6-35B-A3B-NVFP4's real model
+geometry, so the AMD branch adds a documented profile: 40 MoE layers, 256
+experts per layer, top-8 routing, hidden size 2048, intermediate size 512, and
+the production six-bank NVFP4 layout.
+
+On LAN-223, with a 513-slot cache, one active token and all eight routed experts
+missing, the benchmark copied 13.5 MiB in 0.097 ms, or 146.8 GB/s. Across all
+40 MoE layers, its documented extrapolation is 3.87 ms per decode token. The
+all-hit case took 0.023 ms. This is a native HIP measurement using the actual
+allocation and copy path, not a theoretical memory-bandwidth figure.
+
+| Batch | Active experts | Miss rate | Copy amount | Median time | Bandwidth |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 0% | 0.0 MiB | 0.023 ms | not applicable |
+| 1 | 8 | 100% | 13.5 MiB | 0.097 ms | 146.8 GB/s |
+
+The measured worst-case fill is materially smaller than the approximate 35 ms
+per-token service interval at 28.775 output TPS. It does not support changing
+`fast_index_copy` parameters or bypassing cache maintenance: cache behavior is
+correctness-sensitive, and the directly profiled dense FP8 and NVFP4 decode
+kernels remain the dominant performance targets. The full reproducibility log
+and exit code are retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-copy-bench-20260829T114800Z/
+```
