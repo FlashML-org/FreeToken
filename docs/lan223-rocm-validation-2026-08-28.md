@@ -1178,3 +1178,24 @@ given a five-run matrix.
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-dense-q4-four-waves-isolated-cache-20260829T033846Z/
 ```
+
+### Isolated dense Q4 two-wave experiment
+
+Commit `56caf3b` tested the only remaining small workgroup-size point: two
+wave32 rows per HIP Q4_0 dense-matrix-vector workgroup.  As with the four-wave
+experiment, the CUDA route remains unchanged and the candidate retains the
+generic arithmetic, row mapping, and partial-row bounds check.  The static
+ROCm gate passed (`4 passed`) before the live run.
+
+The live run used a new artifact-local extension directory and logged a native
+`hipcc --offload-arch=gfx1151` build plus link of
+`freetoken_gguf_kernels.so`.  It returned the exact expected output hash
+`abeee5e73e89`, but measured **60.64 decode TPS** with 242.3 ms warm TTFT.
+This is statistically indistinguishable from the four-wave single-run screen
+(60.67 TPS), below the llama.cpp 61.71 TPS median gate, and insufficient to
+justify a clean-host five-run matrix.  The candidate is rejected and remains
+outside the shipping AMD branch.
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-dense-q4-two-waves-isolated-cache-20260829T034349Z/
+```
