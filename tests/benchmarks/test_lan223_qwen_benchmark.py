@@ -65,3 +65,20 @@ class DpmPolicyWrapperTests(unittest.TestCase):
         self.assertIn('readonly BENCHMARK_DIR="${ARTIFACT_ROOT}/benchmark"', contents)
         self.assertIn('bash "${HARNESS}" "${BENCHMARK_DIR}"', contents)
         self.assertNotIn('mkdir -p "${BENCHMARK_DIR}"', contents)
+
+
+class LlamaCppControlScriptTests(unittest.TestCase):
+    """Protect the isolated ROCm llama.cpp control lifecycle and workload reuse."""
+
+    def test_control_uses_a_loopback_child_and_existing_fixed_harness(self) -> None:
+        """The control must terminate its own port-1921 child and reuse Qwen inputs."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_control.sh"
+        contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertIn('readonly BASE_URL="http://127.0.0.1:1921/v1"', contents)
+        self.assertIn('trap cleanup_server EXIT', contents)
+        self.assertIn('LAN223_QWEN_BASE_URL="${BASE_URL}"', contents)
+        self.assertIn('run_qwen_scheduler_baseline.sh', contents)
+        self.assertIn('--port 1921', contents)
