@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from benchmarks.lan223_qwen.run_api_benchmark import parse_args, require_expected_host
@@ -49,3 +50,18 @@ class RequireExpectedHostTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.reasoning_effort, "none")
+
+
+class DpmPolicyWrapperTests(unittest.TestCase):
+    """Protect the policy wrapper's separate telemetry and harness paths."""
+
+    def test_dpm_wrapper_reserves_a_new_harness_child_directory(self) -> None:
+        """Policy logs use a parent while the immutable harness receives `benchmark`."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_dpm_policy_benchmark.sh"
+        contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertIn('readonly BENCHMARK_DIR="${ARTIFACT_ROOT}/benchmark"', contents)
+        self.assertIn('bash "${HARNESS}" "${BENCHMARK_DIR}"', contents)
+        self.assertNotIn('mkdir -p "${BENCHMARK_DIR}"', contents)
