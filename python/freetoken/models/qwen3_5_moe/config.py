@@ -360,6 +360,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         # routed down in Q5_K. The explicit tag selects the mixed bank provider.
         expert_quant="q4_k_q5_k",
         moe_weight_format="q4_k_q5_k",
+        # Dense Q8_0 projections use the native GGUF operator pair.  This is distinct
+        # from modelopt FP8: qkv|z remains packed GGUF while b|a stays F32.
+        attn_quant="gguf_q8",
     )
 
 
