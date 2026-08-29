@@ -200,7 +200,9 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     # sizing otherwise consumes the remaining VRAM for KV pages, while a fixed
     # expert cache leaves the server's conservative default KV allocation intact.
     if args.num_token_override is not None:
-        cmd += ["--num-token-override", str(args.num_token_override)]
+        # The benchmark names the value after the Engine field, while the public
+        # CLI intentionally exposes it as the concise ``--num-tokens`` flag.
+        cmd += ["--num-tokens", str(args.num_token_override)]
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
