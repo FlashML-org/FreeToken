@@ -768,6 +768,33 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-rdna4-eightwaves-api-repaired-20260829T023038Z/
 ```
 
+### Rejected RDNA4 dense Q6_K eight-wave candidate
+
+The current final-source trace showed dense Q6_K vector work at 15.64 percent
+of total traced GPU kernel time.  Gemma uses Q6_K for its tied token embedding
+and LM head, and the matching current llama.cpp RDNA4 policy selects eight
+waves for one-vector Q6_K matvec.  Candidate commit `ebf3f06` therefore
+changed only FreeToken's HIP dense Q6_K wrapper to launch the established
+generic Q6_K dot-product kernel with eight independent row waves per block.
+It retained Q6_K and Q8_1 packing, reduction arithmetic, the BF16 result
+contract, CUDA behavior, Q4_0 dense behavior, and all routed-MoE behavior.
+
+The full graph-captured loopback API workload returned the exact established
+Gemma SHA-1 `abeee5e73e89`, used 15.66 GiB VRAM, and reported 259.6 ms TTFT
+with a 17.663 ms p99 event latency.  Its decode result was **59.98 TPS** or
+16.672 ms per token.  That is close to, but below, the 60.16 TPS accepted
+final-source checkpoint.  A one-run result without a TPS improvement does not
+justify a second specialized scheduling path, so the candidate remains on its
+separate experiment branch and is not part of the upstream-review branch.
+
+The test used the unchanged native pinned-memory extension after SHA-256 and
+byte-for-byte equality checks against the validated final source.  The raw
+evidence is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q6-rdna4-eightwaves-api-20260829T023720Z/
+```
+
 A temporary high-performance DPM governor test could not be run because the
 non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
 automatic mode was unchanged.
