@@ -70,6 +70,22 @@ capture_command cpu.txt lscpu
 capture_command memory.txt free -h
 capture_command mounts.txt findmnt -D
 
+# Record Linux pressure-stall information before a benchmark starts.  UMA
+# inference shares system memory and storage paths, so I/O pressure can create
+# latency outliers even when the GPU, model, and launch command are unchanged.
+capture_command io-pressure.txt cat /proc/pressure/io
+capture_command memory-pressure.txt cat /proc/pressure/memory
+
+# Record only blocked filesystem scans, not every blocked process.  This keeps
+# the artifact focused on a known source of benchmark interference and avoids
+# collecting unrelated command-line arguments from other user applications.
+capture_command blocked-find-scans.txt bash -lc "ps -eo pid,ppid,state,etimes,ni,pcpu,pmem,comm,args --sort=pid | awk 'NR == 1 || (\$3 == \"D\" && \$8 == \"find\")'"
+
+# Preserve recent AMDGPU and KFD warnings as read-only context.  The command
+# deliberately tolerates missing journal permissions and records an empty file
+# when no relevant warnings occurred in the preceding two hours.
+capture_command recent-amdgpu-kfd-warnings.txt bash -lc "journalctl -k --since '2 hours ago' --no-pager 2>/dev/null | grep -Ei 'amdgpu|kfd|xgmi|gpu reset|ring timeout|ras|fault' || true"
+
 # Record the ROCm installation selected by the shell and the compiler version.
 # Resolving symlinks exposes mixed ROCm installations before profiling begins.
 capture_command rocm-links.txt readlink -f /opt/rocm
