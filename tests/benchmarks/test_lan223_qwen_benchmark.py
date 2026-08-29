@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from benchmarks.lan223_qwen.run_api_benchmark import require_expected_host
+from benchmarks.lan223_qwen.run_api_benchmark import parse_args, require_expected_host
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -23,3 +23,17 @@ class RequireExpectedHostTests(unittest.TestCase):
         with patch("socket.gethostname", return_value="lan-199"):
             with self.assertRaisesRegex(RuntimeError, "refusing benchmark"):
                 require_expected_host("lan-223")
+
+    def test_throughput_mode_requires_two_requested_tokens(self) -> None:
+        """The TPS mode rejects a one-token interval before it can produce nonsense."""
+
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--model", "qwen",
+                    "--tokenizer", "tokenizer",
+                    "--artifact-dir", "artifacts",
+                    "--mode", "throughput",
+                    "--max-tokens", "1",
+                ]
+            )
