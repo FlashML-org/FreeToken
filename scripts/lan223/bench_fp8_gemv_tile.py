@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tile", type=int, choices=(16, 32), required=True)
-    parser.add_argument("--warps", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--warps", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--rows", type=int, choices=(512, 2048, 4096, 8192), default=8192)
     parser.add_argument("--scale-activation", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)

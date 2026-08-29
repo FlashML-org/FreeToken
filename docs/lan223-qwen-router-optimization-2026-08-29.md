@@ -226,3 +226,37 @@ quality, not merely a different kernel that happens to pass one output check.
 The current source passed the native focused regression suite after these
 experiments: `22 passed, 11 skipped` in
 `tests/kernels/test_fp8_pertensor_linear.py` on LAN-223.
+
+### Hardware counters and NVFP4 follow-up
+
+The wheel-compatible ROCm profiler wrapper also supports isolated performance
+counter collection. A direct host `rocprofv3` launch aborts before Python starts
+because it injects a second LLVM and registers `spirv-expand-step` twice. The
+existing wheel-SDK wrapper avoids that conflict and captured the dense FP8
+`[8192, 2048]` GEMV successfully. `FetchSize` and `VALUUtilization` are not
+available for this `gfx1151` agent through the installed SDK, but the available
+counters are sufficient to classify the bottleneck:
+
+| Counter | Observed range on steady GEMV dispatches | Interpretation |
+| --- | ---: | --- |
+| `MemUnitBusy` | about 89 to 93% | The memory unit is near saturation |
+| `L2CacheHit` | about 39 to 51% | Large streamed FP8 weights do not persist fully in L2 |
+
+That evidence explains why row tiles, additional waves, and relocation of an
+exact power-of-two FP8 scale did not create a repeatable gain. The next profile
+consumer was the Marlin-style inline-NVFP4 MoE decode kernel, so it received an
+equally strict screen at Qwen's actual eight-route shapes: gate/up `[1024,
+2048]` and down `[2048, 512]`.
+
+| Projection | Candidate | Raw BF16 hash | Timing result | Decision |
+| --- | --- | --- | --- | --- |
+| Gate/up | 8 output rows | Changed | Faster in isolation | Rejected: exact output changed |
+| Gate/up | 32 output rows | Matched | 0.0946 ms vs 0.0615 ms baseline screen | Rejected: slower |
+| Gate/up | 2 waves | Matched | 0.0941 ms | Rejected: slower |
+| Gate/up | 8 waves | Changed | 0.0557 ms | Rejected: exact output changed |
+| Down | 8, 16, or 32 output rows; 2, 4, or 8 waves | Matched | No faster result | Rejected: no repeatable gain |
+
+The helper `scripts/lan223/bench_nvfp4_marlin_decode.py` creates layout-correct
+NVFP4 banks and evaluates the production decode kernel directly. It deliberately
+uses raw output SHA-1 as the first gate, so numerically faster variants cannot
+leak into a full-model reload merely because they are faster.
