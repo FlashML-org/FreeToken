@@ -90,6 +90,22 @@ def _segments_w8a8_ok(segments: list[tuple[int, int]]) -> bool:
     means a genuine per-row scale."""
     return 0 < len(segments) <= _MAX_SEGMENTS and all((e - s) % 16 == 0 for s, e in segments)
 
+# The baseline emits sixteen independent output rows per split-K CTA.  Radeon
+# gfx1151 executes Wave32, so a thirty-two-row CTA is a quality-preserving
+# occupancy candidate: it changes only which independent output rows share a
+# launch, never the K chunks, per-row accumulation, partial buffer layout, or
+# final split-K reduction order.  Keep the compact allowlist deliberately
+# narrow because arbitrary tile sizes would create undocumented kernels and
+# make performance evidence impossible to compare across runs.  The setting is
+# read once at module import, which is safe because it is a compile-time Triton
+# specialization and a server has one immutable runtime policy.
+_GEMV_BLOCK_N = int(os.environ.get("FREETOKEN_FP8_GEMV_BLOCK_N", "16"))
+if _GEMV_BLOCK_N not in (16, 32):
+    raise ValueError(
+        "FREETOKEN_FP8_GEMV_BLOCK_N must be 16 (validated baseline) or 32 "
+        "(quality-gated gfx1151 candidate)"
+    )
+
 
 # ======================================================================================
 # Decode (M==1) split-K GEMV: raw fp8 x bf16 reduction in fp32, per-row scale at reduce.
@@ -149,7 +165,11 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     N, K = weight.shape
     BLOCK_K = 128
     n_kb = triton.cdiv(K, BLOCK_K)
-    BLOCK_N = 16
+    # This output-row tile leaves every row's arithmetic untouched.  It may
+    # only alter hardware occupancy and memory-transaction coalescing, so all
+    # non-baseline values still require the full deterministic model-quality
+    # gate before they can become a default.
+    BLOCK_N = _GEMV_BLOCK_N
     n_tiles = triton.cdiv(N, BLOCK_N)
     split_k = max(1, min(1536 // n_tiles, n_kb))
     split_k = 1 << (split_k.bit_length() - 1)  # pow2 -> stable reduction order

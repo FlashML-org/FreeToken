@@ -16,6 +16,7 @@ readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
 readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
 readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
+readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
 readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/${RUN_ID}"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
@@ -40,6 +41,10 @@ case "${CUDA_GRAPH_MAX_BS}" in
     0|1|2|4|8) ;;
     *) echo "invalid FREETOKEN_CUDA_GRAPH_MAX_BS: ${CUDA_GRAPH_MAX_BS}" >&2; exit 2 ;;
 esac
+case "${FP8_GEMV_BLOCK_N}" in
+    16|32) ;;
+    *) echo "invalid FREETOKEN_FP8_GEMV_BLOCK_N: ${FP8_GEMV_BLOCK_N}" >&2; exit 2 ;;
+esac
 mkdir -p "${ARTIFACT_DIR}"
 
 # These variables select the native ROCm toolchain and retain the existing HIP
@@ -50,6 +55,11 @@ export TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions"
 export ROCM_PATH="/opt/rocm-10.0"
 export HIP_PATH="/opt/rocm-10.0"
 export ROCM_HOME="/opt/rocm-10.0"
+# Pass the explicitly recorded FP8 output-row tile to the isolated process.
+# The code permits only 16 (validated baseline) and 32 (a deterministic,
+# quality-gated gfx1151 candidate), so an accidental shell value cannot create
+# an untracked Triton specialization.
+export FREETOKEN_FP8_GEMV_BLOCK_N="${FP8_GEMV_BLOCK_N}"
 
 # FreeToken's MoE offload path requires the in-tree pinned-tensor extension.
 # A clean git worktree does not contain generated shared objects, so verify the
@@ -73,7 +83,9 @@ fi
 # server command. Serial expert loading is the ROCm-correct route and prefill
 # overlap stays disabled for the validated safe baseline. Graph capture defaults
 # to zero because ROCm correctness takes priority; the bounded override enables
-# an isolated batch-size experiment without changing the baseline command.
+# an isolated batch-size experiment without changing the baseline command. The
+# FP8 row-tile override changes neither split-K partitioning nor reduction order
+# and is only used with a separately saved deterministic quality result.
 nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --model-path "${MODEL_DIR}" \
     --served-model-name qwen3.6-35b-a3b-nvfp4-amd \

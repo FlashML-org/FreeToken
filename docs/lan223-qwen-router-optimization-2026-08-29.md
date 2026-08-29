@@ -117,3 +117,80 @@ revision remain unrecovered, so this is not a strict paper-parity comparison.
 Further work should profile per-layer NVFP4 expert execution and the Qwen
 linear-attention path under native HIP, then repeat this task-level quality and
 throughput protocol.
+
+## Native HIP trace and FP8 dense-path investigation
+
+### Trace method and limitations
+
+`rocprofv3 --attach` cannot instrument an already running server with this
+PyTorch ROCm wheel because the wheel does not provide the ROCProfiler SDK
+attachment registration thread. The evidence was instead captured by launching
+the same isolated Qwen command directly through the wheel-compatible
+`scripts/lan223-rocprof-wheel-sdk.sh` wrapper. That run created the native
+ROCm SQLite trace below and passed the deterministic AIME output gate.
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T100601Z/
+  rocprof-full-qwen/david-Gmktec-x2-2/54976_results.db
+```
+
+The profiler recorded 353,457 dispatches. Its 15.61 decode TPS is intrusive
+trace overhead, not serving performance and must never be compared with the
+unprofiled client TPS rows in this report.
+
+The added `scripts/lan223/inspect_rocprof_db.py` is a standard-library,
+read-only companion for that evidence. It opens the SQLite artifact with
+`mode=ro&immutable=1`, inventories ROCm's version-specific table names, and
+aggregates a requested final kernel window without altering the database or
+requiring a host `sqlite3` package.
+
+### Dominant kernel
+
+The final 120-second active window showed that the largest GPU-time consumer is
+not the routed NVFP4 expert kernel. It is the dense mixed-FP8 decode kernel
+`_gemv_splitk_kernel` from `fp8_pertensor_linear.py`.
+
+| Kernel | Calls | GPU time in final window |
+| --- | ---: | ---: |
+| `_gemv_splitk_kernel` | 20,320 | 5,631.844 ms |
+| `_gemm_kernel` | 160 | 1,676.018 ms |
+| `_decode_nvfp4_marlin_kernel` | 20,320 | 1,566.004 ms |
+| `fast_index_copy` | 10,240 | 593.192 ms |
+| `_nvfp4_gemv_kernel` | 256 | 322.227 ms |
+
+Qwen's relevant dense projection shapes include `[8192, 2048]`, `[4096,
+2048]`, `[2048, 4096]`, and `[512, 2048]`. The initial split-K policy was
+written for NVIDIA's much larger GPU target and partitions the K dimension.
+Changing that policy changed the numerical reduction grouping, so it cannot be
+treated as a quality-neutral performance switch.
+
+### Rejected split-K candidate
+
+An isolated target-512 split-K experiment completed at 22.504 decode TPS and
+produced output SHA-1 `1cae5bae914f`, instead of the required
+`0acef4eab6f4`. It was both slower and incorrect under the deterministic gate.
+The source override was removed and the normal split-K policy restored.
+
+The next candidate is constrained to output-row tiling only: it preserves the
+K chunks, each row's FP32 accumulation, partial-buffer layout, and final
+split-K reduction order. It is still a candidate, not an accepted optimization,
+until it has a saved exact-hash response and an unprofiled TPS result.
+
+### Quality-preserving but inconclusive output-row candidate
+
+The gfx1151 candidate changed the dense FP8 GEMV output-row tile from 16 to
+32, while retaining split-K and all arithmetic that determines each output
+value. All three AIME responses matched the required SHA-1 exactly.
+
+| Tile | Output SHA-1 | Output TPS samples | Mean output TPS | Decision |
+| --- | --- | --- | ---: | --- |
+| 16 baseline | `0acef4eab6f4` | 26.786, 28.422, 28.431 | 27.880 | Validated baseline |
+| 32 candidate | `0acef4eab6f4` | 28.677, 26.867, 28.683 | 28.075 | Quality preserved, speedup inconclusive |
+
+The candidate mean is 0.7 percent higher than the earlier baseline mean, but
+the 26.867 TPS sample had a 114.51 ms p99 stream-event gap and the immediate
+post-reboot tile-16 validation measured 28.596 TPS. This is within normal
+measurement variation, not evidence of a repeatable throughput improvement.
+The candidate is therefore not made the default. The launcher restricts tile
+values to `16` and `32`, records the selection explicitly, and restores the
+validated 16-row policy for normal isolated serving.
