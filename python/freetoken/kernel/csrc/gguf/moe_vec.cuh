@@ -52,31 +52,6 @@ static __global__ void moe_vec_q(
 }
 
 #if defined(USE_ROCM)
-// Compute one Q4_0 row against four Q8_1 packed words that the caller has
-// already loaded.  The two-row HIP kernel invokes this twice per lane with two
-// adjacent Q4_0 rows but one common activation block.  Keeping the activation
-// words in the caller avoids issuing the same four global Q8 loads for both
-// rows.  The DP4A order and Q4_0 scale correction match vec_dot_q4_0_q8_1,
-// preserving the exact native GGUF arithmetic contract.
-static __device__ __forceinline__ float moe_vec_q4_0_dot_shared_q8(
-    const block_q4_0* __restrict__ row,
-    const int u0,
-    const int u1,
-    const int u2,
-    const int u3,
-    const half2 ds8,
-    const int iqs) {
-  const int v0 = get_int_from_uint8(row->qs, iqs);
-  const int v1 = get_int_from_uint8(row->qs, iqs + 1);
-  int sumi = 0;
-  sumi = __dp4a(v0 & 0x0F0F0F0F, u0, sumi);
-  sumi = __dp4a((v0 >> 4) & 0x0F0F0F0F, u1, sumi);
-  sumi = __dp4a(v1 & 0x0F0F0F0F, u2, sumi);
-  sumi = __dp4a((v1 >> 4) & 0x0F0F0F0F, u3, sumi);
-  const float2 ds8f = __half22float2(ds8);
-  return __half2float(row->d) * (sumi * ds8f.x - (8 * 2 / QI4_0) * ds8f.y);
-}
-
 // The HIP launcher is defined after the CUDA-compatible wrapper so the
 // generic wrappers remain grouped by quantization format below.
 template <typename scalar_t>
@@ -161,19 +136,9 @@ static __global__ void moe_vec_q4_0_hip_two_rows(
        i += blocks_per_wave) {
     const int iby = i * (QK4_0 / QK8_1);
     const int iqs = VDR_Q4_0_Q8_1_MMVQ * (threadIdx.x % (QI4_0 / VDR_Q4_0_Q8_1_MMVQ));
-    // Both output rows consume one identical Q8_1 activation block.  Load its
-    // four packed words once per lane and pass them to the two row products.
-    // This is deliberately confined to the HIP two-row specialization: the
-    // generic CUDA and non-Q4 routes retain their established helper calls.
-    const block_q8_1* y_block = &y[iby];
-    const int u0 = get_int_from_int8_aligned(y_block->qs, iqs);
-    const int u1 = get_int_from_int8_aligned(y_block->qs, iqs + QI4_0);
-    const int u2 = get_int_from_int8_aligned(y_block->qs, iqs + 1);
-    const int u3 = get_int_from_int8_aligned(y_block->qs, iqs + 1 + QI4_0);
-    tmp0 += moe_vec_q4_0_dot_shared_q8(&x[row0 * blocks_per_row + i], u0, u1, u2, u3, y_block->ds, iqs);
+    tmp0 += vec_dot_q4_0_q8_1(&x[row0 * blocks_per_row + i], &y[iby], iqs);
     if (row0 + 1 < nrows) {
-      tmp1 += moe_vec_q4_0_dot_shared_q8(
-          &x[(row0 + 1) * blocks_per_row + i], u0, u1, u2, u3, y_block->ds, iqs);
+      tmp1 += vec_dot_q4_0_q8_1(&x[(row0 + 1) * blocks_per_row + i], &y[iby], iqs);
     }
   }
 
