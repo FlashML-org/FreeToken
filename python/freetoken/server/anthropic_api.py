@@ -33,6 +33,7 @@ from .anthropic_models import (
     AnthropicUsage,
 )
 from .generation import (
+    extract_images,
     KEEPALIVE,
     ContentDelta,
     GenDone,
@@ -148,7 +149,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
-        messages, template_tools, _, ctk = convert_anthropic_prompt(
+        messages, template_tools, _, ctk, _images = convert_anthropic_prompt(
             req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
         )
     except ValueError as exc:
@@ -214,8 +215,19 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                # Vision: convert the Anthropic image source into an OpenAI-shaped
+                # image_url part; extract_images decodes it and the chat template's
+                # image branch emits the placeholder tokens. Opaque/unknown sources
+                # keep the old drop behavior.
+                src = block.source or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    media = src.get("media_type") or "image/png"
+                    url = f"data:{media};base64,{src['data']}"
+                elif src.get("type") == "url" and src.get("url"):
+                    url = src["url"]
+                else:
+                    continue
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -296,7 +308,8 @@ def convert_anthropic_prompt(
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
 
-    return render_messages(messages), template_tools, parser_tools, ctk
+    images = extract_images(messages) or None
+    return render_messages(messages), template_tools, parser_tools, ctk, images
 
 
 def convert_anthropic_to_genspec(
@@ -304,11 +317,12 @@ def convert_anthropic_to_genspec(
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
 ) -> GenSpec:
-    messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
+    messages, template_tools, parser_tools, ctk, images = convert_anthropic_prompt(
         req, reasoning_parser=reasoning_parser
     )
     return GenSpec(
         messages=messages,
+        images=images,
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,

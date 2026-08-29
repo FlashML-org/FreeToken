@@ -489,6 +489,79 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if getattr(msg, "mm_images", None):
+                # Vision: encode pixels into soft-token embeddings here -- this process
+                # owns the model/GPU; the tower is a ~0.6B BF16 ViT, a few ms per image.
+                try:
+                    import numpy as np
+
+                    model = self.engine.model
+                    assert hasattr(model, "encode_images"), (
+                        "model is text-only (boot with FREETOKEN_GLM5_VISION=1)"
+                    )
+                    pix_parts, grids = [], []
+                    for d in msg.mm_images:
+                        t, gh, gw = d["grid"]
+                        arr = np.frombuffer(d["pix"], dtype=np.float32).copy()
+                        pix_parts.append(arr.reshape(t * gh * gw, -1))
+                        grids.append([t, gh, gw])
+                    msg.mm_embeds = model.encode_images(
+                        torch.from_numpy(np.concatenate(pix_parts, axis=0)).to(
+                            self.device, torch.bfloat16
+                        ),
+                        torch.tensor(grids, dtype=torch.long, device=self.device),
+                    )
+                    # Content-hash cache keys: fill each image's placeholder span with a
+                    # per-image pixel hash (negative id range). Identical prefixes with the
+                    # SAME image become prefix-cache hits; different images diverge at the
+                    # span's first token, so cross-image reuse is impossible.
+                    image_token_id = getattr(
+                        self.engine.model.config, "image_token_id", None
+                    )
+                    if image_token_id is not None:
+                        import hashlib
+
+                        key_ids = msg.input_ids.clone()
+                        pos = (key_ids == image_token_id).nonzero(as_tuple=True)[0]
+                        runs = []
+                        if pos.numel():
+                            brk = (pos[1:] - pos[:-1] > 1).nonzero(as_tuple=True)[0] + 1
+                            runs = [
+                                t
+                                for t in torch.tensor_split(pos, brk.tolist())
+                                if t.numel()
+                            ]
+                        expected = sum(d["grid"][0] for d in msg.mm_images)
+                        assert len(runs) == expected, (
+                            f"{len(runs)} image-token spans vs {expected} expected "
+                            "(one per image, grid_t per video; literal placeholder "
+                            "text in the prompt?)"
+                        )
+                        ri = 0
+                        for d in msg.mm_images:
+                            h = int.from_bytes(
+                                hashlib.blake2b(d["pix"], digest_size=8).digest(), "big"
+                            )
+                            hid = -(h % (2**31 - 2)) - 2
+                            for _ in range(d["grid"][0]):
+                                key_ids[runs[ri]] = hid
+                                ri += 1
+                        msg.cache_key_ids = key_ids
+                    msg.mm_images = None
+                except Exception as exc:  # noqa: BLE001 -- reply, never crash the loop
+                    logger.warning_rank0(
+                        f"vision encode failed for request {msg.uid}: {exc!r}"
+                    )
+                    self.send_result(
+                        [
+                            ErrorReplyMsg(
+                                uid=msg.uid,
+                                error=f"could not encode request images: {exc}",
+                                code="invalid_image",
+                            )
+                        ]
+                    )
+                    return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:

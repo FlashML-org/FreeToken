@@ -40,9 +40,14 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
-- GLM-5.3-Flash support is text-only (the vision tower is not loaded). Full expert
+- GLM-5.3-Flash serves text by default; `FREETOKEN_GLM5_VISION=1` loads the vision
+  tower (~1.2 GiB BF16) and enables image input on both APIs (OpenAI `image_url`
+  data URI/http parts, Anthropic base64 `image` blocks) plus video input on the
+  OpenAI API (`video_url` parts; needs `pillow` + `av`). Image/video spans key the
+  prefix cache by pixel-content hash, so identical media prefixes are reused safely
+  with `--cache-type radix`. Full expert
   offload pins ~163 GiB of host RAM; `FREETOKEN_GLM5_RESIDENT_LAYERS` (e.g. `3-6,8-11`)
   keeps the named layers' experts on the GPU as model weights instead, cutting the pin
   footprint to ~129 GiB and removing their PCIe traffic. The MTP head is skipped unless
   `FREETOKEN_GLM5_MTP=1`.
-- Multimodal checkpoints are served text-only.
+- Other multimodal checkpoints are served text-only.

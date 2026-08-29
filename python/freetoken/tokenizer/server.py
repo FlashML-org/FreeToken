@@ -253,10 +253,15 @@ def tokenize_worker(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if ok_msgs:
-                    backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
-                    ]
+                    backend = []
+                    for msg, t in zip(ok_msgs, ok_tensors, strict=True):
+                        um = UserMsg(
+                            uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params
+                        )
+                        images = getattr(msg, "images", None)
+                        if images:
+                            um.mm_images = images  # transport-safe dicts, verbatim
+                        backend.append(um)
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(

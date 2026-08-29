@@ -285,6 +285,14 @@ def iter_weights(
             yield "lm_head.weight_scale", scale
         else:
             yield "lm_head.weight", head
+
+        if config.is_multimodal:
+            # Vision tower: verbatim BF16 passthrough, model.visual.* -> visual.*
+            # (attribute tree in vision.py mirrors the checkpoint names exactly).
+            visual_keys = sorted(k for k in weight_map if k.startswith("model.visual."))
+            for k in tqdm(visual_keys, desc="Loading GLM-5.3 vision tower",
+                          disable=not primary):
+                yield k[len("model.") :], reader.get(k)
     finally:
         reader.close()
 

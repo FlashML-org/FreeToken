@@ -37,6 +37,7 @@ from .args import Glm5NextArgs, load_args
 # Non-expert FP8: default OFF (bf16 quality baseline). Turn on after the bf16 run is the A/B
 # reference. lm_head stays bf16 even when MLP_FP8 is on (logits / rare-word sensitivity).
 _ATTN_FP8 = os.getenv("FREETOKEN_GLM5_ATTN_FP8", "0") != "0"
+_VISION = os.getenv("FREETOKEN_GLM5_VISION", "0") != "0"
 _MLP_FP8 = os.getenv("FREETOKEN_GLM5_MLP_FP8", "0") != "0"
 _LMHEAD_FP8 = os.getenv("FREETOKEN_GLM5_LMHEAD_FP8", "0") != "0"
 
@@ -64,6 +65,19 @@ def _derive_dsa_args(a: Glm5NextArgs) -> GlmMoeDsaArgs:
         index_kpool_always_select_tail=a.index_kpool_always_select_tail,
     )
 
+
+
+def _vision_cfg_dict(hf_config) -> dict | None:
+    """Raw vision_config as a plain dict (the tower port indexes by key). Env-gated:
+    default OFF keeps the text-only boot byte-identical."""
+    if not _VISION:
+        return None
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None or isinstance(vc, dict):
+        return vc
+    if hasattr(vc, "to_dict"):
+        return vc.to_dict()
+    return dict(vars(vc))
 
 def parse_config(hf_config: Any) -> ModelConfig:
     a = load_args(hf_config)
@@ -159,7 +173,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=a.qk_head_dim**-0.5,
         swiglu_limit=(a.swiglu_limit or None),
         has_attn_bias=False,
-        vision_config=None,  # text-only
+        vision_config=_vision_cfg_dict(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         attn_quant="fp8_pertensor" if _ATTN_FP8 else "none",

@@ -18,6 +18,9 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    # input_ids with image spans replaced by per-image content hashes; prefix-cache
+    # keys only (the model always consumes the real input_ids).
+    cache_key_ids: torch.Tensor | None = None
 
     @property
     def input_len(self) -> int:

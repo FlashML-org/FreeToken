@@ -37,6 +37,10 @@ class UserMsg(BaseBackendMsg):
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
+    # Online vision path: per-image {"pix": fp32 bytes [P*D], "grid": [t, gh, gw]}
+    # dicts (the msgpack codec carries primitives/bytes only). The scheduler -- which
+    # owns the model/GPU -- decodes and encodes them into mm_embeds at admission.
+    mm_images: list | None = None
 
 
 @dataclass

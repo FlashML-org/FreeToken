@@ -152,6 +152,7 @@ class Glm5Model(BaseOP):
         self.hc_mult = a.hc_mult
         self.hc_eps = a.hc_eps
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self._image_token_id = config.image_token_id
         self.layers = OPList([Glm5DecoderLayer(config, i) for i in range(config.num_layers)])
         self.norm = RMSNorm(size=self.dim, eps=self.norm_eps)
 
@@ -163,6 +164,19 @@ class Glm5Model(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self.embed_tokens.forward(input_ids)  # [total, dim]
+        # Multimodal splice (gemma4 pattern): rows at image_token_id placeholders are
+        # replaced by the vision features BEFORE the residual streams fan out. Only
+        # prefill batches ever carry mm_embeds; decode (and graph capture) skip the
+        # branch at Python level.
+        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
+        if mm_embeds is not None and self._image_token_id is not None:
+            mask = input_ids == self._image_token_id
+            n_slots = int(mask.sum())
+            assert n_slots == mm_embeds.shape[0], (
+                f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]})"
+            )
+            if n_slots:
+                h = h.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(h.dtype))
         h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)  # [total, hc_mult, dim]
         for layer in self.layers.op_list:
             h = layer.forward(h)
@@ -179,6 +193,10 @@ class Glm5NextForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.config = config
         self.model = Glm5Model(config)
+        if config.is_multimodal:
+            from .vision import Glm5Vision
+
+            self.visual = Glm5Vision(config.vision_config)
         if config.glm5_args.mtp_enabled:
             from .mtp import Glm5MtpBlock
 
@@ -195,6 +213,17 @@ class Glm5NextForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    def encode_images(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Vision tower forward. ``grid_thw`` [num_images, 3] rides in the generic
+        ``image_position_ids`` slot of the mm contract (LLM.encode_images passes both
+        args positionally). Returns ``[num_image_tokens, out_hidden]`` bf16."""
+        assert hasattr(self, "visual"), (
+            "vision tower not loaded -- boot with FREETOKEN_GLM5_VISION=1"
+        )
+        return self.visual.forward(pixel_values, grid_thw.to(torch.long))
 
     def prepare_for_runtime(self) -> None:
         for layer in self.model.layers.op_list:
