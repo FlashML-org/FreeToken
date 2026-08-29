@@ -562,3 +562,30 @@ authentication. The port does not change an undocumented platform policy or
 claim a clock-based gain without that reversible measurement. The serving
 baseline stays on the normal driver policy and remains subject to the same
 quality and TPS gates as kernel candidates.
+
+#### DPM-policy measurement contract and setup failure
+
+The DPM experiment uses
+`scripts/lan223/run_qwen_dpm_policy_benchmark.sh`. It requires an interactive
+sudo credential in the terminal that invokes it because the host caches sudo
+authorization per terminal. The script requests a named temporary policy,
+records the pre-run policy, delegates the fixed three-sample 256-token Qwen
+scheduler workload to the existing harness, and restores the normal `auto`
+policy through an `EXIT` trap. It neither reloads FreeToken nor alters the
+model, cache, scheduler configuration, llama-swap, or other LAN hosts.
+
+The policy log lives in a newly-created parent evidence directory. The harness
+receives a distinct, absent `benchmark` child directory because its immutable
+artifact contract intentionally fails if that exact directory already exists.
+This separation is enforced by a unit test in
+`tests/benchmarks/test_lan223_qwen_benchmark.py`.
+
+An initial manual attempt at `2026-08-29T18:30:35Z` correctly changed the GPU
+from `auto` to `high` and restored it to `auto`, but created the harness
+artifact directory before invoking the harness. The harness consequently
+raised `FileExistsError` before making an API request. It produced no scored
+samples, no input TPS, and no output TPS, so it is not a performance result
+and must not be compared with the `auto` baseline. The corrected wrapper and
+its regression test were added after that attempt. A valid high-policy result
+requires a fresh artifact containing the harness manifest, all three scored
+sample JSON files, the policy log, and a post-run health check.
