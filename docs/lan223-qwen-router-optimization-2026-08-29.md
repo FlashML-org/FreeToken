@@ -589,3 +589,40 @@ and must not be compared with the `auto` baseline. The corrected wrapper and
 its regression test were added after that attempt. A valid high-policy result
 requires a fresh artifact containing the harness manifest, all three scored
 sample JSON files, the policy log, and a post-run health check.
+
+#### Valid high-policy result
+
+The corrected wrapper completed a valid high-policy run at
+`2026-08-29T22:02:24Z`. It recorded `high` before the workload and `auto`
+afterward, completed all three forced 251-generated-token scheduler samples,
+and left the isolated OpenAI-compatible Qwen endpoint healthy. The matching
+accepted eight-block `auto` baseline used the same 1,212-token prompt,
+251 generated tokens, three scored samples, model, server process, cache
+configuration, fixed decoding settings, and loopback endpoint.
+
+| GPU policy | Mean output TPS | Median output TPS | Output TPS samples | Mean input TPS | Mean TTFT |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `auto` | 28.153 | 28.150 | 28.147, 28.150, 28.162 | 2913.096 | 416.255 ms |
+| `high` | 28.355 | 28.353 | 28.353, 28.362, 28.349 | 2957.942 | 409.835 ms |
+
+The temporary `high` policy improved fixed-workload output throughput by
+0.202 TPS, or 0.72 percent, and raised measured input throughput by 44.846
+TPS, or 1.54 percent. Mean first-text latency decreased by 6.420 ms, or 1.54
+percent. The output gain exceeds the combined run-to-run standard deviations
+of the two three-sample sets, but the sample count is deliberately small, so
+this is a measured operating preference rather than a broad claim about every
+prompt shape or concurrent load level.
+
+After restoration to `auto`, the live service passed the existing deterministic
+AIME quality gate with the required output SHA-1 `0acef4eab6f4`. Its 127-token
+quality stream measured 28.421 decode tokens per second and 395.561 ms TTFT.
+The quality artifact proves that the run did not leave the model or serving
+configuration altered. The policy wrapper changes only driver performance
+policy, not model arithmetic, but that post-run gate is not presented as a
+separate quality measurement performed while `high` was active.
+
+The complete high-policy evidence is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-dpm-high-20260829T220224Z/
+```
