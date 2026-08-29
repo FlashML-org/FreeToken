@@ -1,18 +1,8 @@
 // copied from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/mmvq.cuh
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
-// The LAN-223 HIP profiler reports materially higher VGPR use for this
-// one-wave GEMV than the matched llama.cpp implementation.  Constrain only the
-// HIP compiler to one 32-lane wave per workgroup, matching that reference's
-// launch contract.  CUDA keeps its upstream scheduling and code generation.
-#if defined(USE_ROCM)
-#define FREETOKEN_DENSE_GEMV_LAUNCH_BOUNDS __launch_bounds__(WARP_SIZE, 1)
-#else
-#define FREETOKEN_DENSE_GEMV_LAUNCH_BOUNDS
-#endif
-
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
-static __global__ FREETOKEN_DENSE_GEMV_LAUNCH_BOUNDS void mul_mat_vec_q(
+static __global__ void mul_mat_vec_q(
     const void* __restrict__ vx,
     const void* __restrict__ vy,
     scalar_t* __restrict__ dst,
@@ -56,8 +46,6 @@ static __global__ FREETOKEN_DENSE_GEMV_LAUNCH_BOUNDS void mul_mat_vec_q(
     dst[vec * nrows + row] = tmp;
   }
 }
-
-#undef FREETOKEN_DENSE_GEMV_LAUNCH_BOUNDS
 
 template <typename scalar_t>
 static void mul_mat_vec_q4_0_q8_1_cuda(
