@@ -4,18 +4,24 @@ import importlib.util
 from pathlib import Path
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
 
 
-def _check_toolchain() -> None:
+def _load_toolchain():
     path = ROOT / "python" / "freetoken" / "kernel" / "_toolchain.py"
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.check_nvcc_matches_torch()
+    return module
+
+
+_TOOLCHAIN = _load_toolchain()
+_TOOLCHAIN.check_nvcc_matches_torch()
+
+# Import only after CUDA_HOME/PATH are exact, because cpp_extension caches CUDA_HOME.
+from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension  # noqa: E402
 
 
 def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
@@ -32,7 +38,6 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
 
 
 cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
-_check_toolchain()
 
 
 setup(
