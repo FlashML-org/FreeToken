@@ -100,6 +100,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
+    p.add_argument(
+        "--num-token-override",
+        type=int,
+        default=None,
+        help=(
+            "pin the server KV-token pool capacity instead of accepting its automatic "
+            "allocation; use this to compare cache policies at the same context capacity"
+        ),
+    )
     p.add_argument("--gpu", default=None,
                    help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
@@ -187,6 +196,11 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    # An explicit token-pool size makes cache-policy comparisons fair: auto cache
+    # sizing otherwise consumes the remaining VRAM for KV pages, while a fixed
+    # expert cache leaves the server's conservative default KV allocation intact.
+    if args.num_token_override is not None:
+        cmd += ["--num-token-override", str(args.num_token_override)]
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
