@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -434,6 +435,18 @@ def decode_paged_attention(
         if rocm_num_warps_probe not in (1, 2, 4, 8):
             raise ValueError("rocm_num_warps_probe must be one of 1, 2, 4, or 8")
         num_warps = rocm_num_warps_probe
+    elif torch.version.hip is not None:
+        # Keep production behavior at four warps unless the LAN-223 experiment
+        # explicitly opts in. Parsing happens before Triton dispatch and has no
+        # device-side cost or graph-captured data dependency.
+        configured_warps = os.environ.get("FREETOKEN_ROCM_ATTENTION_WARPS")
+        if configured_warps is not None:
+            try:
+                num_warps = int(configured_warps)
+            except ValueError as error:
+                raise ValueError("FREETOKEN_ROCM_ATTENTION_WARPS must be an integer") from error
+            if num_warps not in (1, 2, 4, 8):
+                raise ValueError("FREETOKEN_ROCM_ATTENTION_WARPS must be one of 1, 2, 4, or 8")
 
     _decode_grouped_stage1_kernel[
         (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
