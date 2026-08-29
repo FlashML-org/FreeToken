@@ -39,6 +39,14 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
+    from freetoken.kernel.backend import is_rocm_runtime
+
+    # The HIP implementation keeps the exact Torch reference until the
+    # in-tree Triton router is requalified against full-model greedy output.
+    # Other runtimes retain upstream's current in-tree implementation.
+    if is_rocm_runtime():
+        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
+
     from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)

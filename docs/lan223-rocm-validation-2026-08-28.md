@@ -356,6 +356,32 @@ The raw evidence is retained at:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/rebased-current-main-qwen36-api-20260829T015240Z/
 ```
 
+### Rejected ROCm vendored-Triton router candidate
+
+The Qwen revalidation exposed a pure-PyTorch router fallback because OpenAI's
+`triton_kernels` package contains CUDA-only binaries.  Current upstream also
+contains an in-tree Triton router, so it was evaluated as a ROCm-only candidate
+before any production use.  On the actual Radeon 8060S it selected the same
+expert set as PyTorch; BF16 equal-logit ties can have a different internal
+ordering, while FP32 indices matched exactly.  Its selected routing weights
+matched PyTorch within `2.98e-8`, and the isolated one-token, 128-expert,
+top-8 router time improved from 21.14 us to 14.96 us.
+
+That microbenchmark improvement was insufficient.  The complete Qwen API run
+with the candidate reached 30.26 client TPS, but its deterministic greedy
+response SHA-1 was `cd580f4978fb`, not the reference `0acef4eab6f4`.  Small
+router differences therefore accumulated into a different generated response.
+The candidate was reverted and ROCm continues to use the reference PyTorch
+router.  This keeps quality behavior stable even though the fused alternative
+is faster in isolation.  The fallback warning now explicitly distinguishes
+intentional ROCm behavior from a missing CUDA Linux package.
+
+The rejected candidate evidence is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/qwen36-vendored-router-api-20260829T015937Z/
+```
+
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
 
 The first two-row experiment did not reproduce llama.cpp's execution shape: it
