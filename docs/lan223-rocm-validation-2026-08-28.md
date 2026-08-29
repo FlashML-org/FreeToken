@@ -1150,3 +1150,31 @@ accepted.  The immutable raw bundles are on LAN-223:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-four-rows-20260829T033123Z/
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-four-rows-isolated-cache-20260829T033230Z/
 ```
+
+### Isolated dense Q4 four-wave experiment
+
+Commit `9e36b2d` keeps the CUDA generic path intact and adds a HIP-only dense
+Q4_0 dispatch wrapper that launches four wave32 rows in one workgroup.  The
+change addresses the second-largest measured decode hot spot, rather than the
+already-tested MoE-vector kernel.  The candidate passed the static ROCm gate
+(`4 passed`) before the live run.
+
+Its live test used a fresh artifact-local `TORCH_EXTENSIONS_DIR`.  The log
+contains both the `hipcc --offload-arch=gfx1151` compile invocation and the
+successful shared-module link.  The resulting module is
+`freetoken_gguf_kernels.so`, SHA-256
+`8c363e3c9345b9ab03bda75a7660d4a284642c908a03f3faeb7b21f6f078e61d`.
+This proves the timing used the candidate source rather than a shared cached
+extension.
+
+The candidate produced the expected deterministic FreeToken output hash
+`abeee5e73e89` and measured **60.67 decode TPS** with a 241.9 ms warm TTFT.
+That is a 0.75 percent single-run improvement over FreeToken's clean-host
+60.21 TPS five-run mean, but it remains 1.68 percent below the llama.cpp
+61.71 TPS five-run median acceptance gate.  It is therefore retained only as
+an evidence-backed non-shipping experiment, not promoted to the AMD branch or
+given a five-run matrix.
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-dense-q4-four-waves-isolated-cache-20260829T033846Z/
+```
