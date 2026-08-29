@@ -364,8 +364,15 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    rocm_block_h_probe: int | None = None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    ``rocm_block_h_probe`` is benchmark-only: it asks HIP Triton for an explicit
+    power-of-two query-head tile so LAN-223 can measure whether a smaller GQA
+    tile lowers correctly.  Normal serving leaves it ``None`` and therefore
+    preserves the established ROCm 16-head padded tile.
+    """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -396,7 +403,13 @@ def decode_paged_attention(
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
     block_h = triton.next_power_of_2(valid_block_h)
-    if torch.version.hip is not None:
+    if rocm_block_h_probe is not None:
+        if torch.version.hip is None:
+            raise ValueError("rocm_block_h_probe is only valid for HIP builds")
+        if rocm_block_h_probe < valid_block_h or rocm_block_h_probe & (rocm_block_h_probe - 1):
+            raise ValueError("rocm_block_h_probe must be a power of two at least valid_block_h")
+        block_h = rocm_block_h_probe
+    elif torch.version.hip is not None:
         # RDNA WMMA has no matrix-core instruction below a 16x16 tile, so a decode
         # GQA group smaller than 16 (e.g. 4 here) leaves tl.dot's M dim too small to
         # lower on this backend. The kernel already masks lanes >= VALID_BLOCK_H
