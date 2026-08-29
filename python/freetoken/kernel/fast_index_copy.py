@@ -15,12 +15,32 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_BLOCKS = 4
 SKIP_FAST_INDEX_COPY_ENV = "FREETOKEN_SKIP_FAST_INDEX_COPY"
+FUSED_COPY_BLOCKS_PER_BANK_ENV = "FREETOKEN_FUSED_COPY_BLOCKS_PER_BANK"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 # The legacy per-bank C++ kernel issues one 128-byte vectorized transaction per
 # worker iteration. The fused multi-bank path has a tail-aware implementation
 # and supports every 16-byte-aligned bank row, but this legacy specialization
 # cannot represent a 240- or 400-byte worker row.
 _LEGACY_COPY_ITERATION_BYTES = 128
+
+
+def fused_copy_blocks_per_bank() -> int:
+    """Return the AOT-compiled fused-copy grid width selected for one cache bank.
+
+    Eight blocks is the established default. Sixty-four blocks widens the same
+    vector-copy grid without changing indices, source bytes, destination slots,
+    or arithmetic. Restricting the setting to the two cache-built variants keeps
+    strict no-JIT launches reproducible on gfx1151.
+    """
+
+    raw = os.getenv(FUSED_COPY_BLOCKS_PER_BANK_ENV, "8")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{FUSED_COPY_BLOCKS_PER_BANK_ENV} must be 8 or 64, got {raw!r}") from exc
+    if value not in (8, 64):
+        raise ValueError(f"{FUSED_COPY_BLOCKS_PER_BANK_ENV} must be 8 or 64, got {value}")
+    return value
 
 
 def _skip_fast_index_copy_enabled() -> bool:
@@ -179,7 +199,7 @@ def fast_index_copy_multi_jit(
     num_indices: torch.Tensor | None = None,
     *,
     num_threads: int = 1024,
-    blocks_per_bank: int = 8,
+    blocks_per_bank: int | None = None,
 ) -> None:
     """Fused multi-bank index copy: copy the same rows for every bank in ONE launch.
 
@@ -199,8 +219,11 @@ def fast_index_copy_multi_jit(
     """
     if _skip_fast_index_copy_enabled():
         return
+    selected_blocks = fused_copy_blocks_per_bank() if blocks_per_bank is None else blocks_per_bank
+    if selected_blocks not in (8, 64):
+        raise ValueError(f"blocks_per_bank must be 8 or 64, got {selected_blocks}")
     module = _jit_fast_index_copy_multi_module(
-        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+        num_threads=num_threads, blocks_per_bank=selected_blocks
     )
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
 
