@@ -1621,6 +1621,12 @@ struct CpuMoeExecutor {
         const float glu = gate / (1.0f + std::exp(-gate * alpha));
         g_row[i] = f32_to_bf16(glu * (up + 1.0f));
       } else {
+        // Clamped swiglu (GLM-5.3 "swiglu_clamp" = silu + finite lim):
+        // silu(min(gate,lim)) * clamp(up,+-lim). lim == +inf (every other
+        // model/act): both clamps are no-ops, bitwise identical to before.
+        if (gate > lim) gate = lim;
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
     }

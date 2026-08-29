@@ -65,6 +65,9 @@ _ACT_IDS = {
     "gelu_pytorch_tanh": 2,
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
+    # silu family: the C++ generic epilogue applies swiglu_limit (finite for
+    # GLM-5.3 swiglu_clamp; +inf leaves plain silu untouched).
+    "swiglu_clamp": 0,
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
