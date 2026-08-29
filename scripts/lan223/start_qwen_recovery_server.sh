@@ -14,6 +14,8 @@ readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
+readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
+readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
 readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/${RUN_ID}"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
@@ -30,6 +32,14 @@ fi
 test -d "${SOURCE_DIR}"
 test -x "${VENV_PYTHON}"
 test -d "${MODEL_DIR}"
+case "${MEMORY_RATIO}" in
+    0.[0-9][0-9]) ;;
+    *) echo "invalid FREETOKEN_MEMORY_RATIO: ${MEMORY_RATIO}" >&2; exit 2 ;;
+esac
+case "${CUDA_GRAPH_MAX_BS}" in
+    0|1|2|4|8) ;;
+    *) echo "invalid FREETOKEN_CUDA_GRAPH_MAX_BS: ${CUDA_GRAPH_MAX_BS}" >&2; exit 2 ;;
+esac
 mkdir -p "${ARTIFACT_DIR}"
 
 # These variables select the native ROCm toolchain and retain the existing HIP
@@ -57,9 +67,13 @@ fi
     >"${NATIVE_IMPORT_LOG}"
 
 # The fixed policy is the previously successful LAN-223 Qwen configuration.
-# The 0.35 memory budget and 2,048-token KV reserve avoid the OOM observed with
-# the larger automatic allocation. Serial expert loading is the ROCm-correct
-# route and prefill overlap stays disabled for the validated safe baseline.
+# The default 0.35 memory budget and 2,048-token KV reserve avoid the OOM
+# observed with a much larger automatic allocation. A two-decimal environment
+# override supports an isolated cache-capacity experiment without editing the
+# server command. Serial expert loading is the ROCm-correct route and prefill
+# overlap stays disabled for the validated safe baseline. Graph capture defaults
+# to zero because ROCm correctness takes priority; the bounded override enables
+# an isolated batch-size experiment without changing the baseline command.
 nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --model-path "${MODEL_DIR}" \
     --served-model-name qwen3.6-35b-a3b-nvfp4-amd \
@@ -70,10 +84,10 @@ nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --nvfp4-backend triton \
     --expert-load serial \
     --moe-cache-auto \
-    --memory-ratio 0.35 \
+    --memory-ratio "${MEMORY_RATIO}" \
     --max-seq-len-override 8192 \
     --kv-reserve-tokens 2048 \
-    --cuda-graph-max-bs 0 \
+    --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" \
     --disable-pynccl \
     --disable-moe-prefill-overlap \
     >"${LOG_FILE}" 2>&1 < /dev/null &
