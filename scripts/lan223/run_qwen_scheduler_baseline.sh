@@ -13,9 +13,13 @@ readonly ARTIFACT_DIR="${1:?usage: run_qwen_scheduler_baseline.sh ARTIFACT_DIR}"
 readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
-readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
-readonly MODEL_NAME="qwen3.6-35b-a3b-nvfp4-amd"
-readonly BASE_URL="http://127.0.0.1:1919/v1"
+# Preserve the original FreeToken service as the default while permitting an
+# explicitly named, isolated local control to reuse this exact workload.  The
+# optional overrides are intentionally not exported globally, so ordinary
+# service runs remain bound to port 1919 and the validated FreeToken model.
+readonly MODEL_DIR="${LAN223_QWEN_TOKENIZER_DIR:-${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4}"
+readonly MODEL_NAME="${LAN223_QWEN_MODEL_NAME:-qwen3.6-35b-a3b-nvfp4-amd}"
+readonly BASE_URL="${LAN223_QWEN_BASE_URL:-http://127.0.0.1:1919/v1}"
 readonly EXPECTED_HOST="david-Gmktec-x2-2"
 readonly BASE_PROMPT="The scheduler manages incoming inference requests by prioritizing, batching, and assigning them to available compute resources to optimize throughput and latency. "
 
