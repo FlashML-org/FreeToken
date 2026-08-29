@@ -820,6 +820,25 @@ authorization.  Until then, accepted performance claims remain based on
 multiple clean launches and retain raw tail-latency data rather than hiding
 the interference.
 
+### Current review-branch static validation
+
+The current upstream-review commit `6c6198b10d9fb6a9c93e0aa94a05ac4144ec061d`
+was validated directly on LAN-223 after the I/O evidence capture tooling was
+added.  The check completed without starting an inference server or changing
+host state:
+
+```text
+python -m compileall -q python benchmarks                 passed
+pytest -q tests/kernels/test_gguf_hip_build_flags.py \
+          tests/utils/test_rocm_runtime.py                4 passed
+```
+
+The raw output and commit metadata are retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/current-review-static-validation-20260829T024456Z/
+```
+
 A temporary high-performance DPM governor test could not be run because the
 non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
 automatic mode was unchanged.
