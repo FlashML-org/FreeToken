@@ -706,15 +706,24 @@ expert tensors such as `blk.N.ffn_gate_exps.weight`,
 `blk.N.ffn_up_exps.weight`, and `blk.N.ffn_down_exps.weight`.
 
 FreeToken's current GGUF registry maps only `gemma4`. It consequently rejects
-`qwen35moe` before loading weights. The existing GGUF linear and expert paths
-also support Q4_0, Q8_0, and Q6_K packed blocks, but not the control's
-Q4_K_M block format. An exact FreeToken-Q4 versus llama.cpp-Q4 test therefore
+`qwen35moe` before loading weights. A byte-level inspection of this exact file
+found 361 F32 tensors, 251 Q8_0 tensors, 80 Q4_K tensors, 37 Q5_K tensors,
+and four Q6_K tensors. In particular, `token_embd.weight` is Q8_0,
+`output.weight` is Q6_K, each routed-expert gate tensor is Q4_K, and each
+routed-expert down tensor is Q5_K. The `Q4_K_M` filename is a model-wide
+mixed-quantization recipe, not one universal tensor encoding.
+
+The vendored GGUF HIP kernels already implement Q4_K dispatch, including ROCm
+tile settings. This branch now exposes Q4_K through the Python layer and adds a
+GGML-equivalent reference decoder test. Q5_K is still required for the routed
+expert down projections, so an exact FreeToken-Q4 versus llama.cpp-Q4 test
 requires three native components, all with HIP validation on gfx1151:
 
 1. A `qwen35moe` GGUF registry entry, metadata parser, tokenizer dispatch, and
    tensor-name mapping into the existing Qwen3.5 MoE model.
-2. Native Q4_K_M linear, embedding, and packed routed-expert kernels, including
-   byte-exact block-layout tests against GGML reference dequantization.
+2. A Qwen GGUF tensor-name loader plus mixed packed routed-expert banks: Q4_K
+   gate/up and Q5_K down, with byte-exact block-layout tests against GGML
+   reference dequantization.
 3. A quality-gated loading and serving path that supports the hybrid
    attention-plus-SSM layer schedule before a new full-GPU five-run matrix.
 

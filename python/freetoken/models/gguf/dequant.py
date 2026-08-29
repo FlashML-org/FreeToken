@@ -23,6 +23,7 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +34,11 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    # Q4_K is the common ``Q4_K_M`` tensor encoding. The ``M`` label describes
+    # a model-wide mixed quantization recipe, while individual GGUF tensors carry
+    # the base GGML type Q4_K. Each super-block holds two fp16 scales, twelve packed
+    # six-bit sub-scales, and 128 packed four-bit values.
+    GGML_Q4_K: (256, 144),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +48,7 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -115,8 +122,50 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K reference decoder matching llama.cpp's ``dequantize_row_q4_K``.
+
+    A Q4_K super-block covers 256 values as eight 32-value groups.  ``scales``
+    packs the eight positive scales followed by the eight minimum coefficients as
+    six-bit little-endian integers.  For each group the decoded value is
+    ``d * scale * q - dmin * minimum``.  This runs only in tests and non-hot
+    load-time conversions; GPU execution stays packed in the GGUF kernels.
+    """
+    raw = raw.reshape(-1, 144)
+    block_count = raw.shape[0]
+    scale_bytes = raw[:, 4:16].to(torch.int32)
+    # Direct vector form of ggml's get_scale_min_k4. Entries 0..3 store a
+    # six-bit scale and minimum directly. Entries 4..7 split each high two
+    # bits across the first four bytes and the upper nibble of bytes 8..11.
+    scales = torch.empty((block_count, 8), dtype=torch.float32, device=raw.device)
+    minimums = torch.empty_like(scales)
+    scales[:, :4] = (scale_bytes[:, :4] & 0x3F).to(torch.float32)
+    minimums[:, :4] = (scale_bytes[:, 4:8] & 0x3F).to(torch.float32)
+    scales[:, 4:] = (
+        (scale_bytes[:, 8:12] & 0x0F) | ((scale_bytes[:, :4] >> 6) << 4)
+    ).to(torch.float32)
+    minimums[:, 4:] = (
+        (scale_bytes[:, 8:12] >> 4) | ((scale_bytes[:, 4:8] >> 6) << 4)
+    ).to(torch.float32)
+    d = _f16_scales(raw, 0, 2)
+    dmin = _f16_scales(raw, 2, 4)
+    quantized = raw[:, 16:144]
+    values = torch.empty((block_count, 256), dtype=torch.float32, device=raw.device)
+    for group in range(8):
+        group_bytes = quantized[:, group * 16:(group + 1) * 16]
+        q = torch.cat(
+            [(group_bytes & 0x0F).to(torch.float32), (group_bytes >> 4).to(torch.float32)],
+            dim=1,
+        )
+        values[:, group * 32:(group + 1) * 32] = (
+            d * scales[:, group:group + 1] * q - dmin * minimums[:, group:group + 1]
+        )
+    return values.reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q4_K: dequant_q4_k,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -142,12 +191,14 @@ __all__ = [
     "GGML_F16",
     "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q4_K",
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q4_k",
     "dequant_q6_k",
     "dequantize",
 ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from freetoken.models.config import (
     FullAttentionGroupConfig,
@@ -9,6 +9,9 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_compressed_tensors_nvfp4,
 )
+
+if TYPE_CHECKING:
+    from freetoken.models.gguf.config import GgufConfigShim
 
 
 def _quant_accessor(hf_config: Any):
@@ -260,4 +263,100 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    """Build the Qwen3.5 MoE runtime configuration from ``qwen35moe`` GGUF metadata.
+
+    llama.cpp records the same hybrid decoder geometry as the official Hugging Face
+    configuration, but expresses the Gated DeltaNet fields with its SSM vocabulary.
+    This parser keeps that translation in one audited location.  It intentionally
+    describes the model only: native Q4_K_M tensor loading and kernel dispatch are
+    separate implementation milestones, so callers cannot mistake metadata parsing
+    for a runnable GGUF path.
+    """
+    metadata = shim.metadata
+
+    def value(key: str):
+        """Read one required architecture-scoped GGUF value with a clear error."""
+        full_key = f"qwen35moe.{key}"
+        if full_key not in metadata:
+            raise KeyError(f"missing GGUF metadata key {full_key}")
+        return metadata[full_key]
+
+    hidden_size = int(value("embedding_length"))
+    head_dim = int(value("attention.key_length"))
+    num_qo_heads = int(value("attention.head_count"))
+    num_kv_heads = int(value("attention.head_count_kv"))
+    linear_key_head_dim = int(value("ssm.state_size"))
+    linear_value_head_dim = int(value("ssm.state_size"))
+    linear_num_key_heads = int(value("ssm.group_count"))
+    linear_inner_size = int(value("ssm.inner_size"))
+    if linear_inner_size % linear_value_head_dim:
+        raise ValueError(
+            "qwen35moe.ssm.inner_size must divide exactly into value-head groups: "
+            f"{linear_inner_size} / {linear_value_head_dim}"
+        )
+    linear_num_value_heads = linear_inner_size // linear_value_head_dim
+
+    num_layers = int(value("block_count"))
+    full_interval = int(value("full_attention_interval"))
+    if full_interval <= 0:
+        raise ValueError(f"invalid qwen35moe.full_attention_interval {full_interval}")
+    layer_types = tuple(
+        "full_attention" if (layer_index + 1) % full_interval == 0 else "linear_attention"
+        for layer_index in range(num_layers)
+    )
+    full_ids = tuple(index for index, kind in enumerate(layer_types) if kind == "full_attention")
+    linear_ids = tuple(index for index, kind in enumerate(layer_types) if kind == "linear_attention")
+
+    rotary = RotaryConfig(
+        head_dim=head_dim,
+        rotary_dim=int(value("rope.dimension_count")),
+        max_position=int(value("context_length")),
+        base=float(value("rope.freq_base")),
+        scaling=None,
+    )
+    full_group = FullAttentionGroupConfig(
+        name="full",
+        layer_ids=full_ids,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        rotary_config=rotary,
+    )
+    linear_group = LinearGatedDeltaGroupConfig(
+        name="linear",
+        layer_ids=linear_ids,
+        num_key_heads=linear_num_key_heads,
+        num_value_heads=linear_num_value_heads,
+        key_head_dim=linear_key_head_dim,
+        value_head_dim=linear_value_head_dim,
+        conv_kernel_dim=int(value("ssm.conv_kernel")),
+        output_gate="silu",
+    )
+
+    return ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        hidden_size=hidden_size,
+        vocab_size=int(shim.vocab_size),
+        intermediate_size=0,
+        hidden_act="silu",
+        rms_norm_eps=float(value("attention.layer_norm_rms_epsilon")),
+        tie_word_embeddings=bool(shim.tie_word_embeddings),
+        rotary_config=rotary,
+        num_experts=int(value("expert_count")),
+        num_experts_per_tok=int(value("expert_used_count")),
+        moe_intermediate_size=int(value("expert_feed_forward_length")),
+        shared_expert_intermediate_size=int(value("expert_shared_feed_forward_length")),
+        norm_topk_prob=True,
+        moe_enabled=True,
+        use_qk_norm=True,
+        model_type="qwen3_5_moe",
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        vision_config=None,
+        attention_groups=(linear_group, full_group),
+    )
+
+
+__all__ = ["parse_config", "parse_gguf_config"]
