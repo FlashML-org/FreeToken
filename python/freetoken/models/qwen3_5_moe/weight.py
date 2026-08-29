@@ -645,7 +645,11 @@ def _iter_weights_compressed_tensors(
                     continue
 
                 if name.endswith(".weight"):
-                    yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
+                    # Some exports (e.g. GDN in_proj_{qkv,z}) quantize a bare ``.weight`` to
+                    # per-tensor FP8 (no weight_packed); ``reader`` supports ``in`` across all
+                    # shards, so a sibling scale in a different shard is still found.
+                    tensor = _load_maybe_quantized(reader, raw_name, reader)
+                    yield from _emit_bf16_weight(name, tensor)
                     continue
 
                 # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).

@@ -182,6 +182,9 @@ class ShardReader:
     def names_in(self, file: str) -> list[str]:
         return [name for name, shard in self._map.items() if shard == file]
 
+    def __contains__(self, name: str) -> bool:
+        return name in self._map
+
     def get_tensor(self, name: str) -> torch.Tensor:
         import safetensors
 
