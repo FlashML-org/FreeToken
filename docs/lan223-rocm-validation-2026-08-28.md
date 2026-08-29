@@ -279,6 +279,48 @@ retained on LAN-223 at:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/llamacpp-current-host-context8320-20260829T013730Z/
 ```
 
+### Current-upstream rebase and full API revalidation
+
+After the comparison, upstream `main` advanced from `9ef3651` to `a05c265`
+with Qwen 3.8 support and engine or cache changes.  The AMD branch was rebased
+onto that current upstream revision without a conflict, rather than leaving a
+performance result attached to an obsolete upstream base.  The rebased branch
+was then installed into the isolated LAN-223 virtual environment so its native
+HIP pinned-memory extension was built from the rebased source.  The source
+checkout used for that validation was deliberately separate from the earlier
+test checkout, preventing an uncommitted working-tree change from becoming
+test evidence.
+
+The first complete Gemma launch from the rebased checkout rebuilt the target-
+specific GGUF HIP extension and matching graph helper because the source path
+is part of their cache identity.  The build used ROCm 10 `hipcc`, `-O3`, and
+`--offload-arch=gfx1151`; a later process restart can reuse that cache.  The
+server then completed its normal graph capture, exposed `/v1/models`, and
+served two streamed OpenAI-compatible chat completions before clean shutdown.
+
+| Check | Observed value |
+| --- | --- |
+| Upstream revision in branch history | `a05c265` |
+| HIP build and ROCm-runtime tests | 4 passed |
+| MoE configuration | `offload`, 4,096 expert slots, 8,320 KV tokens, graph batch size 1 |
+| Warm streamed API decode | 60.07 client TPS, 16.648 ms/token |
+| Warm TTFT | 258.2 ms |
+| Prompt and completion tokens | 63 and 127, respectively |
+| Output SHA-1 | `abeee5e73e89` |
+| Server VRAM | 15.66 GiB |
+| Post-run process state | Server shut down; no serving process remained |
+
+The response ended at 127 tokens despite the requested 128-token limit, so
+the benchmark harness emitted its explicit token-count warning.  The request
+was otherwise successful, deterministic, and had the expected response hash.
+This one-run revalidation is evidence that rebasing did not break native HIP
+serving.  It is intentionally not folded into the five-run performance score.
+Its raw logs and result are retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/rebased-current-main-api-retry-20260829T014741Z/
+```
+
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
 
 The first two-row experiment did not reproduce llama.cpp's execution shape: it
