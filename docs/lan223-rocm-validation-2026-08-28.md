@@ -714,6 +714,60 @@ repaired launch produced FreeToken kernel traces, including the active
 `moe_vec_q4_0_hip_two_rows` kernel.  Traces are diagnostic evidence only and
 are never used as TPS scoring because profiling changes execution timing.
 
+### Current-source trace and rejected RDNA4 dense Q4_0 eight-wave candidate
+
+After an unprofiled final-source warm run rebuilt the path-specific native HIP
+extension, the complete loopback API workload returned the established greedy
+Gemma SHA-1 `abeee5e73e89` at **60.16 TPS**, 16.623 ms per token, 259.0 ms
+TTFT, 16.877 ms p50 event latency, and 17.931 ms p99 event latency.  It kept
+the full 4,096-slot expert cache and 8,320-token KV budget.  This is the
+current unprofiled checkpoint for the accepted source path.
+
+The repaired profiler wrapper then traced that already-built final source.
+The trace also preserved the output SHA-1, but measured 41.41 TPS and a 216.2
+ms p99 because tracing changes dispatch timing.  It is not a performance
+result.  Its kernel statistics do identify the next work order: routed Q4_0
+MoE vector work consumed 31.05 percent of GPU kernel time, dense Q4_0 vector
+work 28.18 percent, and dense Q6_K vector work 15.64 percent.  The active
+MoE kernel name was `moe_vec_q4_0_hip_two_rows`, proving that the trace covers
+the accepted HIP specialization rather than the earlier generic path.
+
+Current llama.cpp source uses an RDNA4-specific eight-wave policy for simple
+one-vector Q4_0 matvecs.  Candidate commit `1bf9489` applied that scheduling
+policy only to FreeToken's dense HIP Q4_0 launcher.  It deliberately retained
+the generic dot product, Q4_0 and Q8_1 packing, BF16 result contract, CUDA
+path, all non-Q4_0 types, and the separately accepted routed-MoE kernel.
+This made the candidate distinct from the already rejected dense two-row and
+launch-bound experiments.
+
+The four shape-accurate dense microbenchmarks were mixed when rerun with 10
+warmups and 100 repetitions: the candidate improved 8,192 by 2,816 from
+28.29 to 27.49 microseconds and 4,224 by 2,816 from 26.89 to 17.26
+microseconds, but regressed 2,816 by 4,096 from 21.30 to 23.91 microseconds
+and 10,240 by 2,816 from 33.04 to 34.18 microseconds.  Because Gemma uses all
+four projections, this was insufficient to accept the launch policy.
+
+The full graph-captured API result confirmed rejection.  It returned the
+exact established SHA-1, but reached only **59.33 TPS**, 16.856 ms per token,
+290.7 ms TTFT, and 18.011 ms p99 event latency.  This is below the current
+60.16 TPS final-source checkpoint and below the established accepted five-run
+60.11 TPS median.  The candidate remains on its separate branch and is not
+part of the upstream-review branch.  Its isolated worktree initially lacked
+the unchanged native pinned-memory extension; the test setup copied the
+validated extension only after SHA-256 and byte-for-byte equality checks.
+That repair affected no source logic and the resulting API run is the only
+performance outcome used for this decision.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gemma-final-path-warm-20260829T021243Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/gemma-final-current-kernel-trace-20260829T021738Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-current-baseline-micro-20260829T022723Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-rdna4-eightwaves-micro-20260829T022528Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-rdna4-eightwaves-api-repaired-20260829T023038Z/
+```
+
 A temporary high-performance DPM governor test could not be run because the
 non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
 automatic mode was unchanged.
