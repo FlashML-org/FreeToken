@@ -694,3 +694,31 @@ evidence, is retained at:
 ```text
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T222712Z/
 ```
+
+#### Exact-Q4 FreeToken feasibility boundary
+
+The downloaded control GGUF exposes `general.architecture = qwen35moe` and
+contains the Qwen3.5 hybrid architecture metadata: full-attention geometry,
+MoE expert counts and sizes, rotary sections, plus state-space model (SSM)
+inner size, group count, state size, time-step rank, and convolution kernel.
+Its tensor table contains both attention and SSM groups and packed routed
+expert tensors such as `blk.N.ffn_gate_exps.weight`,
+`blk.N.ffn_up_exps.weight`, and `blk.N.ffn_down_exps.weight`.
+
+FreeToken's current GGUF registry maps only `gemma4`. It consequently rejects
+`qwen35moe` before loading weights. The existing GGUF linear and expert paths
+also support Q4_0, Q8_0, and Q6_K packed blocks, but not the control's
+Q4_K_M block format. An exact FreeToken-Q4 versus llama.cpp-Q4 test therefore
+requires three native components, all with HIP validation on gfx1151:
+
+1. A `qwen35moe` GGUF registry entry, metadata parser, tokenizer dispatch, and
+   tensor-name mapping into the existing Qwen3.5 MoE model.
+2. Native Q4_K_M linear, embedding, and packed routed-expert kernels, including
+   byte-exact block-layout tests against GGML reference dequantization.
+3. A quality-gated loading and serving path that supports the hybrid
+   attention-plus-SSM layer schedule before a new full-GPU five-run matrix.
+
+This is a real porting project, not a launch-flag adjustment. Until those
+components are implemented and validated, the 49.234 TPS llama.cpp Q4 result
+remains the best practical same-base-model ROCm control, while the NVFP4
+FreeToken result remains the supported native AMD port measurement.
