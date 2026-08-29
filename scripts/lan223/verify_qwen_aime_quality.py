@@ -11,9 +11,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+
+# Permit the helper to run from any working directory. The benchmark module is
+# intentionally kept at the repository root rather than installed into the
+# runtime wheel, so add that root before importing it. This keeps the quality
+# gate reproducible on LAN-223 without relying on a caller to append `.` to
+# PYTHONPATH by hand.
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
 from benchmarks.bench_decode_moe import load_problem, resolve_sampling, stream_generate
 

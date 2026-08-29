@@ -76,9 +76,14 @@ def _index_spec(element_size: int, num_splits: int) -> KernelSpec:
 
 
 def _fast_index_copy_spec(feature_size: int) -> KernelSpec:
-    from .fast_index_copy import default_worker_args
+    from .fast_index_copy import default_worker_args, legacy_fast_index_copy_is_supported
 
     worker_threads, worker_feature_size, num_block = default_worker_args(feature_size)
+    if not legacy_fast_index_copy_is_supported(feature_size):
+        raise ValueError(
+            "legacy fast_index_copy requires a whole 128-byte worker row; "
+            f"feature_size={feature_size} resolves to {worker_feature_size} bytes"
+        )
     args = make_cpp_args(feature_size, worker_threads, worker_feature_size, 1024, num_block, 1)
 
     def build(build_directory: pathlib.Path) -> object:
@@ -144,6 +149,11 @@ def _radix_spec() -> KernelSpec:
 
 
 def default_kernel_specs() -> tuple[KernelSpec, ...]:
+    # Import lazily with the other kernel builders. This keeps importing the
+    # catalog inexpensive while sharing the validity rule with the runtime
+    # argument derivation rather than duplicating a 128-byte magic number.
+    from .fast_index_copy import legacy_fast_index_copy_is_supported
+
     specs: list[KernelSpec] = []
     specs.extend(_store_spec(element_size) for element_size in DEFAULT_STORE_ELEMENT_SIZES)
     specs.extend(_index_spec(*variant) for variant in DEFAULT_INDEX_VARIANTS)
@@ -151,6 +161,10 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(
         _fast_index_copy_spec(feature_size)
         for feature_size in DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES
+        # The fused multi-bank cache path supports these small rows directly.
+        # Do not emit legacy per-bank templates that cannot satisfy their own
+        # 128-byte vector-loop static assertion.
+        if legacy_fast_index_copy_is_supported(feature_size)
     )
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=8))
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.

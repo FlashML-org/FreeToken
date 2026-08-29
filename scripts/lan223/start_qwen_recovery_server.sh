@@ -14,6 +14,12 @@ readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
+# Pair a strict native cache with the exact source revision that built it.
+# Unlike a generic Torch extension directory, the FreeToken cache identifies
+# individual helper-kernel ABI names, so loading objects built from another
+# source revision could silently defeat the no-JIT guarantee.
+readonly SOURCE_REVISION="$(git -C "${SOURCE_DIR}" rev-parse --short=12 HEAD)"
+readonly ROCM_KERNEL_CACHE_DIR="${FREETOKEN_ROCM_KERNEL_CACHE_DIR:-${ROOT_DIR}/cache/kernel-cache-rocm-gfx1151-${SOURCE_REVISION}}"
 readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
 readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
 readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
@@ -35,6 +41,7 @@ fi
 test -d "${SOURCE_DIR}"
 test -x "${VENV_PYTHON}"
 test -d "${MODEL_DIR}"
+test -d "${ROCM_KERNEL_CACHE_DIR}"
 case "${MEMORY_RATIO}" in
     0.[0-9][0-9]) ;;
     *) echo "invalid FREETOKEN_MEMORY_RATIO: ${MEMORY_RATIO}" >&2; exit 2 ;;
@@ -65,6 +72,13 @@ export TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions"
 export ROCM_PATH="/opt/rocm-10.0"
 export HIP_PATH="/opt/rocm-10.0"
 export ROCM_HOME="/opt/rocm-10.0"
+# The completed gfx1151 cache contains every valid C++/HIP helper in the
+# FreeToken catalog. Make the server resolve objects only from that cache and
+# fail explicitly if a source edit introduces a missing specialization. Triton
+# keeps its own persistent code cache; this flag governs FreeToken's C++/HIP
+# helper JIT rather than disabling native Triton execution.
+export FREETOKEN_KERNEL_CACHE_DIR="${ROCM_KERNEL_CACHE_DIR}"
+export FREETOKEN_DISABLE_JIT=1
 # Pass the explicitly recorded FP8 output-row tile to the isolated process.
 # The code permits only 16 (validated baseline) and 32 (a deterministic,
 # quality-gated gfx1151 candidate), so an accidental shell value cannot create
