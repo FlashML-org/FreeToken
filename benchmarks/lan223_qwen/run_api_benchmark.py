@@ -25,7 +25,7 @@ from typing import Any, Iterable
 
 
 # This prompt tests transport and deterministic response handling. It is not
-# claimed to reproduce FreeToken's unpublished paper workload.
+# claimed to reproduce FreeToken's paper workload or to provide a TPS result.
 CANARY_PROMPT = "Return exactly the word LAN223 and nothing else. Do not add punctuation."
 
 
@@ -48,14 +48,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt", default=CANARY_PROMPT)
+    parser.add_argument(
+        "--mode",
+        choices=("quality", "throughput"),
+        default="quality",
+        help="quality permits natural EOS; throughput requires fixed-length decode",
+    )
+    parser.add_argument(
+        "--expected-text",
+        default="LAN223",
+        help="exact stripped response required in quality mode; empty disables the check",
+    )
     parser.add_argument("--expected-host", default="lan-223")
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--warmup", action="store_true")
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples must be at least one")
-    if args.max_tokens < 2:
-        parser.error("--max-tokens must be at least two")
+    if args.mode == "throughput" and args.max_tokens < 2:
+        parser.error("throughput mode needs --max-tokens of at least two")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     return args
@@ -99,8 +110,10 @@ def stream_completion(
         # These are FreeToken request fields, not an OpenAI SDK extension wrapper.
         # Sending them at the top level mirrors benchmarks/bench_decode_moe.py.
         "top_k": 1,
-        "ignore_eos": True,
     }
+    if args.mode == "throughput":
+        # Fixed-length generation makes the decode interval independent of EOS.
+        request_body["ignore_eos"] = True
     request = urllib.request.Request(
         args.base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(request_body, separators=(",", ":")).encode("utf-8"),
@@ -162,6 +175,12 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
     decode_tps = None
     if generated_tokens > 1 and decode_seconds is not None and decode_seconds > 0:
         decode_tps = (generated_tokens - 1) / decode_seconds
+    if args.mode == "quality" and args.expected_text and text.strip() != args.expected_text:
+        protocol_errors.append(
+            f"quality canary mismatch: expected {args.expected_text!r}, got {text.strip()!r}"
+        )
+    if args.mode == "throughput" and decode_tps is None:
+        protocol_errors.append("throughput run produced fewer than two generated tokens")
     token_gaps = [
         observations[index].offset_seconds - observations[index - 1].offset_seconds
         for index in range(1, len(observations))
@@ -169,17 +188,19 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
     return {
         "schema_version": 1,
         "sample_index": sample_index,
-        "status": "passed" if not protocol_errors and decode_tps is not None else "failed",
+        "status": "passed" if not protocol_errors else "failed",
         "request": {
             "base_url": args.base_url,
             "model": args.model,
             "prompt": args.prompt,
             "prompt_sha256": hashlib.sha256(args.prompt.encode("utf-8")).hexdigest(),
+            "mode": args.mode,
+            "expected_text": args.expected_text,
             "max_tokens": args.max_tokens,
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": 1,
-            "ignore_eos": True,
+            "ignore_eos": args.mode == "throughput",
         },
         "timing": {
             "wall_seconds": finished_at - started_at,
@@ -231,7 +252,11 @@ def main(argv: list[str] | None = None) -> int:
         sample = make_sample_artifact(args, tokenizer, sample_index)
         samples.append(sample)
         write_json(args.artifact_dir / f"sample-{sample_index:02d}.json", sample)
-    successful_tps = [sample["timing"]["decode_tps"] for sample in samples if sample["status"] == "passed"]
+    successful_tps = [
+        sample["timing"]["decode_tps"]
+        for sample in samples
+        if sample["status"] == "passed" and sample["timing"]["decode_tps"] is not None
+    ]
     summary = {
         "schema_version": 1,
         "successful_samples": len(successful_tps),
@@ -245,7 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         "failed_samples": [sample["sample_index"] for sample in samples if sample["status"] != "passed"],
     }
     write_json(args.artifact_dir / "summary.json", summary)
-    return 0 if len(successful_tps) == args.samples else 2
+    required_successes = args.samples if args.mode == "throughput" else len(
+        [sample for sample in samples if sample["status"] == "passed"]
+    )
+    return 0 if required_successes == args.samples else 2
 
 
 if __name__ == "__main__":
