@@ -432,7 +432,67 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "q4_k_q5_k":
+            # Qwen Q4_K_M is a mixed GGUF recipe: routed gate/up rows are Q4_K
+            # while down rows are Q5_K.  The kernel reads both packed layouts
+            # directly and applies the two quant dispatches in sequence.
+            from freetoken.moe.fused_q4_k_q5_k import fused_experts_gguf_q4_k_q5_k
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_k_q5_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "mxfp4_triton":
+            # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
+            # decode + grouped `_t` prefill. The swiglu scalars live on the layer
+            # (set at construction), not in the base signature.
+            from freetoken.moe.fused_mxfp4 import (
+                run_mxfp4_prefill_experts_t,
+                run_mxfp4_splitk_decode_experts,
+            )
+
+            gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
+            run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
+            return run(
+                hidden_states, topk_weights, topk_ids,
+                gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias,
+                top_k=self.top_k,
+                hidden_act_alpha=self.hidden_act_alpha,
+                swiglu_limit=self.swiglu_limit,
+            )
+        if fmt == "ds_fp4":
+            # DeepSeek-V4 FP4 experts: grouped inline-dequant GEMM for streaming
+            # prefill chunks (n = bank rows to sort over); per-route dequant GEMV
+            # for decode and the sparse small-chunk slot path (n is None there,
+            # and sorting over the full slot cache would drown in padding).
+            gate_up_packed, gate_up_scale, down_packed, down_scale = views
+            if is_prefill and n is not None:
+                from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
+
+                return routed_experts_fp4_prefill(
+                    hidden_states, topk_ids, topk_weights,
+                    gate_up_packed, gate_up_scale, down_packed, down_scale,
+                    self.swiglu_limit, n,
+                )
+            from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+            return routed_experts_fp4(
+                hidden_states, topk_ids, topk_weights,
+                gate_up_packed, gate_up_scale, down_packed, down_scale,
+                self.swiglu_limit,
+            )
+        assert fmt == "bf16", f"unknown quant_format {fmt!r}"
+        gate_up, down = views
+        impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
+        return impl(
+            hidden_states,
+            gate_up,
+            down,
+            topk_weights,
+            topk_ids,
+            self.activation,
+            self.apply_router_weight_on_input,
+        )
 
 
 def make_moe_layer(
