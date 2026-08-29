@@ -382,6 +382,17 @@ The rejected candidate evidence is retained at:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/qwen36-vendored-router-api-20260829T015937Z/
 ```
 
+The restored branch was then revalidated through the full Qwen API path.  It
+returned to the reference SHA-1 `0acef4eab6f4` at 28.96 client TPS, with the
+same 19.12 GiB VRAM use and clean shutdown.  Its 1,272.2 ms warm TTFT is not a
+performance regression claim: the model's 21.8 GiB expert-bank load was
+concurrently slowed by the documented host I/O pressure, taking 3 minutes and
+37 seconds instead of about 2 minutes.  The final exact-path artifact is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/qwen36-router-revert-api-20260829T020626Z/
+```
+
 ### Accepted HIP Q4_0 one-wave/two-row MoE specialization
 
 The first two-row experiment did not reproduce llama.cpp's execution shape: it
