@@ -1116,3 +1116,37 @@ decode first, then dense Q4 and Q6_K matrix-vector kernels.  New candidates
 must retain deterministic API output and be accepted only when a five-fresh-
 server clean-host matrix matches or exceeds the llama.cpp median, rather than
 on an isolated best run.
+
+### Post-matrix Q4 MoE launch experiments
+
+The following HIP-only experiments were run after the clean-host matrix.  They
+are not shipping changes.  Each used the accepted Gemma workload and produced
+the expected deterministic greedy response hash `abeee5e73e89`; the throughput
+result, not merely successful compilation, determines rejection.
+
+| Candidate | Change from accepted two-row kernel | Result | Decision |
+| --- | --- | ---: | --- |
+| `2f019fa` | Raise the wave32 launch minimum from one to eight resident workgroups per CU | 59.95 TPS | Rejected: 0.44 percent below the accepted 60.21 TPS mean. |
+| `ddaf194` | Raise the same minimum from one to two resident workgroups per CU | 60.20 TPS | Rejected: no improvement and no progress toward the 61.71 TPS gate. |
+| `3f57285` | Have one wave32 calculate four rows per route instead of two | 59.22 TPS | Rejected: 1.64 percent below the accepted mean. |
+
+The first two experiments initially used the shared persistent extension
+directory.  The eight-workgroup result compiled its own source successfully;
+the two-workgroup source reused the existing shared module, so its numerical
+result is recorded only as a directional screen rather than a source-binary
+proof.  A four-row run also detected this cache reuse before it was interpreted
+and is explicitly excluded.  The valid four-row result then set
+`TORCH_EXTENSIONS_DIR` to an artifact-local directory, rebuilt the native
+`gfx1151` shared module there, and recorded that module alongside the raw logs.
+
+This establishes a stricter rule for all remaining performance work: every
+source-changing HIP candidate must compile in a unique extension-cache path,
+and the artifact must contain the resulting shared module before API timing is
+accepted.  The immutable raw bundles are on LAN-223:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-occupancy-retry-20260829T032503Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-occupancy-two-20260829T032852Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-four-rows-20260829T033123Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-four-rows-isolated-cache-20260829T033230Z/
+```
