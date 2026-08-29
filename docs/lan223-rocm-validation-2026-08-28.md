@@ -1199,3 +1199,47 @@ outside the shipping AMD branch.
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-dense-q4-two-waves-isolated-cache-20260829T034349Z/
 ```
+
+### Accepted gfx1151 RDNA3 dot-product intrinsic selection
+
+The current llama.cpp source was examined at immutable revision
+`d7bd3bfcad3e29c7e49fd26f38c79ee3e9a3fd6b`.  Its HIP helper chooses
+`__builtin_amdgcn_sudot4(true, a, true, b, c, false)` on RDNA3 and RDNA4,
+whereas FreeToken's copied GGUF helper always selected `sdot4` whenever that
+builtin was available.  Both forms implement the same signed four-byte dot
+product for this Q4_0 plus Q8_1 route, but the source-level intrinsic choice
+changes the gfx1151 compiler's generated code.
+
+Commit `5f040ba` adds a strictly scoped branch before FreeToken's existing
+`sdot4` fallback.  It is enabled only when the compiler exposes `sudot4` and
+the device macro is `__gfx1100__`, `__gfx1150__`, or `__gfx1151__`.  The
+CUDA implementation, all non-RDNA3-family AMD targets, packing, scale math,
+and BF16 output contract remain unchanged.  The candidate passed the static
+ROCm gate (`4 passed`) and built a separate native gfx1151 module with
+`hipcc --offload-arch=gfx1151`.  Its matrix module SHA-256 is
+`5683cf07a9a081dbaf51c857757ce2307daa6822c6da4102908eb00ecd08ee3c`.
+
+The first five fresh-server executions all produced the expected FreeToken
+output hash `abeee5e73e89`.  Two were conservatively excluded because a
+transient blocked process was present at their preflight snapshot, even though
+none remained afterward.  Two replacements explicitly waited for zero blocked
+processes.  The final acceptance set therefore uses runs 1, 2, 3, 6, and 7,
+all with zero blocked processes before and after execution:
+
+| Runtime | Five clean decode TPS samples | Mean TPS | Median TPS | TPS stdev | Mean warm TTFT |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FreeToken gfx1151 `sudot4` HIP | 61.68, 61.80, 61.84, 62.05, 61.94 | **61.86** | **61.84** | 0.14 | 241.7 ms |
+| Previous FreeToken native HIP | 60.25, 60.20, 60.17, 60.13, 60.33 | 60.21 | 60.20 | 0.08 | 250.0 ms |
+| llama.cpp `b10141` ROCm 10 HIP control | 60.24, 60.50, 62.25, 61.71, 61.83 | 61.31 | 61.71 | 0.88 | 113.3 ms |
+
+This is a 2.74 percent FreeToken mean-decode improvement over the prior clean
+matrix.  It exceeds the matched llama.cpp control by 0.56 TPS or 0.91 percent
+on mean decode throughput, and by 0.14 TPS or 0.22 percent on median decode
+throughput.  The FreeToken warm TTFT remains higher, so this acceptance is
+specifically for the requested sustained decode-TPS requirement.  The API
+remains OpenAI-compatible and deterministic for the workload.
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-rdna35-sudot4-isolated-cache-20260829T035002Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-rdna35-sudot4-clean-host-matrix-20260829T035209Z/
+```
