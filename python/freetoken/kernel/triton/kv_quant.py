@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kvcache.quant import BLOCK
+from freetoken.kvcache.quant import LAYOUT_NVFP4 as _LAYOUT_NVFP4
 from freetoken.kvcache.quant import LAYOUT_Q4 as _LAYOUT_Q4
 from freetoken.kvcache.quant import LAYOUT_Q6 as _LAYOUT_Q6
 from freetoken.kvcache.quant import LAYOUT_Q8 as _LAYOUT_Q8
@@ -39,6 +40,7 @@ from freetoken.kvcache.quant import LAYOUT_Q8 as _LAYOUT_Q8
 LAYOUT_Q8 = tl.constexpr(_LAYOUT_Q8)
 LAYOUT_Q4 = tl.constexpr(_LAYOUT_Q4)
 LAYOUT_Q6 = tl.constexpr(_LAYOUT_Q6)
+LAYOUT_NVFP4 = tl.constexpr(_LAYOUT_NVFP4)
 
 
 @triton.jit
@@ -105,13 +107,19 @@ def _store_kv_quant_kernel(
             else:
                 q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
         else:
-            # The native fp32 -> float8e4nv downcast does not round to nearest on
-            # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
-            # on sm_89), so values just above a grid midpoint collapse downward and
-            # disagree with the RNE torch reference. Round explicitly first.
-            from freetoken.kernel.triton.e4m3_compat import round_e4m3
+            if LAYOUT == LAYOUT_NVFP4:
+                # E2M1 4-bit float: q is already in [-6, 6] from the div_rn above
+                # (scale = amax / 6 ensures |q| <= 6). The pack step further down
+                # calls _round_e2m1, so we keep `q` as fp32 here.
+                pass
+            else:
+                # The native fp32 -> float8e4nv downcast does not round to nearest on
+                # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
+                # on sm_89), so values just above a grid midpoint collapse downward and
+                # disagree with the RNE torch reference. Round explicitly first.
+                from freetoken.kernel.triton.e4m3_compat import round_e4m3
 
-            q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
+                q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
 
         # ---- pack into the storage dtype ----
         if LAYOUT == LAYOUT_Q8:
@@ -165,6 +173,52 @@ def _store_kv_quant_kernel(
                 dst_ptr + slot * stride_ct + head * stride_ch + hi_offs,
                 packed_hi,
             )
+        elif LAYOUT == LAYOUT_NVFP4:
+            # NVFP4 is float, not integer: `q` here is the float quotient
+            # (value / scale). Round each fp32 to the nearest E2M1 4-bit code
+            # in [0, 15] using the same tie-break as the spec's torch argmin
+            # (lowest index wins, so magnitude 0 ties go to code 0 = +0).
+            # The cutoffs are midpoints between adjacent E2M1 magnitudes
+            # [0, 0.5, 1, 1.5, 2, 3, 4, 6]: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0.
+            # We use `<=` (round half DOWN to the lower code) so the tie-break
+            # matches argmin's "lowest index on ties" behavior bit-for-bit
+            # (e.g. q = 1.25, equidistant from 1.0 (code 2) and 1.5 (code 3),
+            # both should land on code 2).
+            mag = tl.minimum(tl.abs(q), 6.0)
+            mag_code = tl.where(
+                mag <= 0.25, 0,
+                tl.where(
+                    mag <= 0.75, 1,
+                    tl.where(
+                        mag <= 1.25, 2,
+                        tl.where(
+                            mag <= 1.75, 3,
+                            tl.where(
+                                mag <= 2.5, 4,
+                                tl.where(
+                                    mag <= 3.5, 5,
+                                    tl.where(
+                                        mag <= 5.0, 6, 7,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            # Sign bit only when magnitude > 0, so 0-magnitude ties land on
+            # code 0 (= +0) the same way the spec's argmin does.
+            sign = tl.where((q < 0) & (mag_code > 0), 8, 0)
+            codes = (mag_code | sign).to(tl.int32)  # [NBLOCK, 16] in [0, 15]
+            # Pack two codes per byte: low nibble = even index, high nibble = odd.
+            pairs = tl.reshape(codes, (NBLOCK, 8, 2))
+            lo, hi = tl.split(pairs)  # each [NBLOCK, 8]
+            packed = (lo | (hi << 4)).to(tl.uint8)
+            byte_offs = tl.arange(0, NBLOCK)[:, None] * 8 + tl.arange(0, 8)[None, :]
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + byte_offs,
+                packed,
+            )
         else:
             tl.static_assert(False, f"unknown LAYOUT {LAYOUT!r}")
 
@@ -196,7 +250,10 @@ def store_kv_quant(
     num_tokens, num_heads, head_dim = k.shape
     if num_tokens == 0:
         return
-    assert head_dim % BLOCK == 0, f"head_dim {head_dim} not a multiple of {BLOCK}"
+    # NVFP4 quantizes in 16-element blocks; Q2/Q4/Q6 (and q8 for 32-wide tiles) in 32.
+    # We pick the per-kernel block size from the spec so a single kernel can serve both.
+    block = spec.block_size if spec.layout == "nvfp4" else BLOCK
+    assert head_dim % block == 0, f"head_dim {head_dim} not a multiple of {block}"
     # The cache's last axis is the PACKED byte count, which differs from the source's
     # head_dim for sub-byte schemes. We pass both as constexprs to the kernel.
     d_physical = k_cache.shape[-1]
@@ -222,8 +279,8 @@ def store_kv_quant(
         D_PHYSICAL=d_physical,
         MAX_MAG=spec.max_magnitude,
         IS_INT=spec.is_integer,
-        BLOCK=BLOCK,
-        NBLOCK=head_dim // BLOCK,
+        BLOCK=block,
+        NBLOCK=head_dim // block,
         LAYOUT=spec.layout,
         num_warps=4,
     )

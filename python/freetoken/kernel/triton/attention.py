@@ -75,6 +75,47 @@ def _load_kv(
         raw6 = (lo_val | (hi_val << 4))
         se = (raw6 ^ 0x20) - 0x20
         vals = se
+    elif LAYOUT == "nvfp4":
+        # NVFP4: 16-element blocks, 2 codes per byte, same nibble layout as Q4
+        # (low = even, high = odd). Codes 0..7 = +magnitude, 8..15 = -magnitude;
+        # the magnitudes in order are 0, 0.5, 1, 1.5, 2, 3, 4, 6. We extract the
+        # unsigned code, then expand it to its float magnitude with an
+        # if-else ladder (Triton has no float4 lookup table).
+        block_idx = elem_offsets >> 4  # 16 values per block
+        in_block = elem_offsets & 15
+        byte_offs = block_idx * 8 + (in_block >> 1)
+        is_odd = (in_block & 1).to(tl.int32)
+        packed = tl.load(ptr + slot_base + byte_offs, mask=elem_mask, other=0).to(tl.uint8)
+        lo = (packed & 0xF).to(tl.int32)
+        hi = ((packed >> 4) & 0xF).to(tl.int32)
+        code = tl.where(is_odd == 0, lo, hi)
+        sign_bit = (code >> 3) & 1
+        mag_code = code & 0x7
+        # Magnitude ladder: 0 -> 0, 1 -> 0.5, 2 -> 1, 3 -> 1.5, 4 -> 2, 5 -> 3,
+        # 6 -> 4, 7 -> 6. We expand to fp32 by checking the code (the magnitude
+        # itself is not the value; e.g. code 5 -> 3.0, not 5.0).
+        mag = tl.where(
+            mag_code == 0, 0.0,
+            tl.where(
+                mag_code == 1, 0.5,
+                tl.where(
+                    mag_code == 2, 1.0,
+                    tl.where(
+                        mag_code == 3, 1.5,
+                        tl.where(
+                            mag_code == 4, 2.0,
+                            tl.where(
+                                mag_code == 5, 3.0,
+                                tl.where(
+                                    mag_code == 6, 4.0, 6.0,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        vals = tl.where(sign_bit == 1, -mag, mag)
     else:
         tl.static_assert(False, f"unknown LAYOUT {LAYOUT!r}")
 
@@ -178,8 +219,9 @@ def _paged_attention_kernel(
     offs_nb = tl.arange(0, BLOCK_D // QBLOCK)
     mask_nb = offs_nb < D // QBLOCK
     # Byte offset along the head_dim axis. 8-bit: 1 byte per element. Q4: 2 per
-    # byte. Q6: see _load_kv (it reads two planes, so the offset it consumes is
-    # the per-element raw position -- the byte address differs per plane).
+    # byte. Q6/NVFP4: see _load_kv (it reads two planes / a packed nibble, so the
+    # offset it consumes is the per-element raw position -- the byte address
+    # differs per plane or per nibble).
     if LAYOUT == "q4":
         phys_offs_d = offs_d >> 1
     elif LAYOUT == "q6":

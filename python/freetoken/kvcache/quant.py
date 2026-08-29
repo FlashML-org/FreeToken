@@ -45,7 +45,9 @@ STORAGE_BYTE_DTYPE = torch.uint8
 
 # Layout identifiers. Add a new one here to plug in a new scheme.
 LAYOUT_Q8 = "q8"        # 1 byte per element (Q8_0 / FP8_E4M3)
+LAYOUT_Q2 = "q2"        # 8 bytes pack 32 2-bit values (4 per byte at bits 0/2/4/6)
 LAYOUT_Q4 = "q4"        # 16 bytes pack 32 4-bit values
+LAYOUT_NVFP4 = "nvfp4"  # 8 bytes pack 16 4-bit E2M1 float values + 1 fp8 E4M3 block scale
 LAYOUT_Q6 = "q6"        # 24 bytes pack 32 6-bit values (16 lo + 8 hi)
 
 
@@ -56,13 +58,18 @@ class KVQuantSpec:
     ``name`` is the ``--kv-cache-dtype`` value. ``storage_dtype`` is the underlying
     byte dtype (always ``uint8`` once we go sub-byte; 8-bit schemes may use int8/float8
     and let the user-side interpretation matter for the actual bits). ``layout`` is one
-    of :data:`LAYOUT_Q8`, :data:`LAYOUT_Q4`, :data:`LAYOUT_Q6`. ``max_magnitude`` is
-    the largest absolute value a quantized element can take (127 / 7 / 31).
+    of :data:`LAYOUT_Q8`, :data:`LAYOUT_Q2`, :data:`LAYOUT_Q4`, :data:`LAYOUT_NVFP4`,
+    :data:`LAYOUT_Q6`. ``max_magnitude`` is the largest absolute value a quantized
+    element can take (127 / 1 / 7 / 6 / 31 for q8_0 / q2_0 / q4_0 / nvfp4 / q6_0).
 
-    For sub-byte schemes, ``bits`` is the number of bits per element (4 for Q4, 6 for
-    Q6) and ``payload_bytes_per_block`` is the number of payload bytes that hold one
-    BLOCK of elements (16 for Q4, 24 for Q6). For 8-bit schemes these are set
-    automatically from ``max_magnitude``.
+    For sub-byte schemes, ``bits`` is the number of bits per element (2 / 4 / 4 / 6
+    for q2_0 / q4_0 / nvfp4 / q6_0) and ``payload_bytes_per_block`` is the number of
+    payload bytes that hold one ``block_size``-element block. For 8-bit schemes these
+    are set automatically from ``max_magnitude``.
+
+    ``block_size`` defaults to ``BLOCK`` (32, used by q2_0 / q4_0 / q6_0); nvfp4 uses
+    16-element blocks. ``scale_dtype`` defaults to fp16; nvfp4 uses fp8 E4M3 to
+    halve the per-block scale storage.
     """
 
     name: str
@@ -71,6 +78,8 @@ class KVQuantSpec:
     layout: str = LAYOUT_Q8
     bits: int = 8
     payload_bytes_per_block: int = BLOCK
+    block_size: int = BLOCK
+    scale_dtype: torch.dtype = SCALE_DTYPE
 
     @property
     def enabled(self) -> bool:
@@ -78,7 +87,10 @@ class KVQuantSpec:
 
     @property
     def is_integer(self) -> bool:
-        """Integer schemes round; float ones just divide. 4-/6-bit are always integer."""
+        """Integer schemes round; float ones just divide. Q2/Q4/Q6 are integer;
+        NVFP4 is float (E2M1)."""
+        if self.layout == LAYOUT_NVFP4:
+            return False
         if self.layout != LAYOUT_Q8:
             return True
         return self.storage_dtype == torch.int8
@@ -87,12 +99,12 @@ class KVQuantSpec:
         """Storage bytes per K/V element, scales amortized over the block.
 
         Unquantized: the compute dtype's itemsize. 8-bit quantized: 1 byte + 2/32 for
-        the fp16 scale = 1.0625. Sub-byte: ``payload_bytes_per_block / BLOCK +
-        scale_bytes / BLOCK``.
+        the fp16 scale = 1.0625. Sub-byte: ``payload_bytes_per_block / block_size +
+        scale.itemsize / block_size``.
         """
         if not self.enabled:
             return float(compute_dtype.itemsize)
-        return self.payload_bytes_per_block / BLOCK + SCALE_DTYPE.itemsize / BLOCK
+        return self.payload_bytes_per_block / self.block_size + self.scale_dtype.itemsize / self.block_size
 
     def physical_head_dim(self, head_dim: int) -> int:
         """Number of bytes in the buffer's last (head_dim) axis under this scheme.
@@ -114,15 +126,17 @@ class KVQuantSpec:
         ``physical_head_dim(logical_head_dim)``; recover logical by multiplying by
         ``8 // bits``.
         """
-        if shape[-1] % BLOCK:
+        if shape[-1] % self.payload_bytes_per_block:
             raise ValueError(
-                f"physical head_dim {shape[-1]} is not a multiple of the KV quant block {BLOCK}"
+                f"physical last-dim {shape[-1]} is not a multiple of the NVFP4 block payload"
+                if self.layout == LAYOUT_NVFP4
+                else f"physical head_dim {shape[-1]} is not a multiple of the KV quant block {BLOCK}"
             )
         if self.layout == LAYOUT_Q8:
             return (*shape[:-1], shape[-1] // BLOCK)
-        # Sub-byte: logical = physical * 8 / bits; scale extent = logical / BLOCK
+        # Sub-byte: logical = physical * 8 / bits; scale extent = logical / block_size.
         logical = shape[-1] * 8 // self.bits
-        return (*shape[:-1], logical // BLOCK)
+        return (*shape[:-1], logical // self.block_size)
 
     # ---- reference implementations (correctness oracle for the Triton kernels) ----
 
@@ -135,6 +149,8 @@ class KVQuantSpec:
         assert self.enabled, "quantize() on an unquantized spec"
         if self.layout == LAYOUT_Q8:
             return self._quantize_8bit(x)
+        if self.layout == LAYOUT_NVFP4:
+            return self._quantize_nvfp4(x)
         if self.layout == LAYOUT_Q4:
             return self._quantize_subbyte(x, bits=4)
         if self.layout == LAYOUT_Q6:
@@ -148,6 +164,9 @@ class KVQuantSpec:
         if self.layout == LAYOUT_Q8:
             payload, scales = payload_scales
             return self._dequantize_8bit(payload, scales)
+        if self.layout == LAYOUT_NVFP4:
+            payload, scales = payload_scales
+            return self._dequantize_nvfp4(payload, scales)
         if self.layout == LAYOUT_Q4:
             payload, scales = payload_scales
             return self._dequantize_subbyte(payload, scales, bits=4)
@@ -172,6 +191,58 @@ class KVQuantSpec:
     def _dequantize_8bit(self, q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         blocks = q.float().unflatten(-1, (q.shape[-1] // BLOCK, BLOCK))
         return (blocks * scales.float().unsqueeze(-1)).flatten(-2)
+
+    # ---- NVFP4: E2M1 4-bit float, 16-value blocks, fp8 E4M3 block scale ----
+
+    # E2M1 4-bit float code table. codes 0..7 are non-negative; 8..15 are the same
+    # magnitudes with the sign bit set. Per NVIDIA OCP NVFP4 spec.
+    _E2M1_VALUES = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ]
+
+    def _quantize_nvfp4(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-block NVFP4 quantization: 16 values -> 8 payload bytes (4-bit
+        E2M1 codes, 2 per byte same nibble layout as Q4) + 1 fp8 E4M3 scale.
+        Symmetric around 0; max representable magnitude is 6, so scale = amax / 6
+        and values in (-6, +6) are coded exactly, beyond that clip."""
+        assert x.shape[-1] % self.block_size == 0, (
+            f"head_dim {x.shape[-1]} is not a multiple of the NVFP4 block {self.block_size}"
+        )
+        nb = x.shape[-1] // self.block_size
+        tail_shape = list(x.shape[:-1]) + [nb, self.block_size]
+        blocks = x.float().reshape(tail_shape)
+        amax = blocks.abs().amax(dim=-1)
+        scales = torch.where(amax > 0, amax / self.max_magnitude, torch.ones_like(amax))
+        # Round scale to fp8 E4M3 storage precision before using it, so the value
+        # the attention kernel reads back is scaled by the identical number.
+        scales_fp8 = scales.to(self.scale_dtype).float()
+        qf = blocks / scales_fp8.unsqueeze(-1)
+        # Find the nearest E2M1 code per value (16 codes; argmin |x - table|).
+        e2m1 = torch.tensor(self._E2M1_VALUES, dtype=qf.dtype, device=qf.device)
+        diffs = (qf.unsqueeze(-1) - e2m1).abs()
+        codes = diffs.argmin(dim=-1).to(torch.int32)  # [..., NB, 16] in [0, 15]
+        # Pack two 4-bit codes per byte (low/even, high/odd -- same layout as q4_0).
+        lo = codes[..., 0::2]  # [..., NB, 8]
+        hi = codes[..., 1::2]
+        payload = (lo | (hi << 4)).to(torch.uint8).reshape(*x.shape[:-1], nb * 8)
+        return (payload, scales.to(self.scale_dtype))
+
+    def _dequantize_nvfp4(self, payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_quantize_nvfp4`. Returns float32 with logical head_dim."""
+        # payload shape: [..., nb * payload_bytes_per_block] = [..., nb * 8] for NVFP4
+        nb = payload.shape[-1] // self.payload_bytes_per_block
+        # Per-block layout: 8 bytes, 2 nibbles per byte, 1 value per nibble.
+        bytes_view = payload.unflatten(-1, (nb, self.payload_bytes_per_block))
+        lo = (bytes_view & 0xF).to(torch.int64)
+        hi = ((bytes_view >> 4) & 0xF).to(torch.int64)
+        # Interleave: lo[0], hi[0], lo[1], hi[1], ...
+        stacked = torch.stack([lo, hi], dim=-1)  # [..., NB, 8, 2]
+        stacked = stacked.flatten(-2)  # [..., NB, 16]
+        # Look up the E2M1 value table. 16 entries indexed by unsigned 4-bit code.
+        e2m1 = torch.tensor(self._E2M1_VALUES, dtype=torch.float32, device=payload.device)
+        vals = e2m1[stacked]  # [..., NB, 16]
+        return (vals * scales.float().unsqueeze(-1)).flatten(-2)
 
     # ---- sub-byte (Q4 / Q6) ----
 
@@ -338,9 +409,30 @@ Q6_0 = KVQuantSpec(
     payload_bytes_per_block=24,
 )
 
+# NVFP4: NVIDIA FP4 (E2M1) per-block, 16 values per block with one
+# fp8 E4M3 block scale. (8 payload + 1 scale) / 16 = 0.5625 B/elem --
+# the same density as q4_0, but the E2M1 floating-point code (1 sign
+# + 2 exponent + 1 mantissa) is log-spaced (0, 0.5, 1, 1.5, 2, 3, 4, 6)
+# rather than uniform-integer, which is materially more accurate on
+# kurtotic K/V distributions. max_magnitude=6 is the largest representable
+# magnitude (the 0b0111 code); we don't clamp during quantize because
+# the float code handles overflow naturally. Reuses the existing MoE
+# expert-weight NVFP4 quantize/dequantize machinery (kernel/triton/nvfp4_linear.py),
+# so porting cost is mostly the attention path.
+NVFP4 = KVQuantSpec(
+    name="nvfp4",
+    storage_dtype=STORAGE_BYTE_DTYPE,
+    max_magnitude=6.0,
+    layout=LAYOUT_NVFP4,
+    bits=4,
+    payload_bytes_per_block=8,
+    block_size=16,
+    scale_dtype=torch.float8_e4m3fn,
+)
+
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
-_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, Q4_0, Q6_0)}
+_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, NVFP4, Q4_0, Q6_0)}
 KV_CACHE_DTYPES = tuple(_BY_NAME)
 
 
