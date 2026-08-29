@@ -260,3 +260,30 @@ The helper `scripts/lan223/bench_nvfp4_marlin_decode.py` creates layout-correct
 NVFP4 banks and evaluates the production decode kernel directly. It deliberately
 uses raw output SHA-1 as the first gate, so numerically faster variants cannot
 leak into a full-model reload merely because they are faster.
+
+### Current-main integration validation
+
+The AMD branch merged FreeToken upstream commit `58f4b9e`, which fixes an
+NVIDIA Ada row-wise W8A8 prefill issue. The merge is current-main compatible
+and does not alter LAN-223's ROCm W8A16 dense decode route, but it was still
+validated from a fresh isolated server launch rather than inferred from source
+inspection. The combined focused native test suite completed with `28 passed,
+22 skipped`.
+
+The reloaded current-main server passed the deterministic AIME gate with the
+required output SHA-1 `0acef4eab6f4`, 28.775 output TPS, 403.57 ms TTFT, and
+36.77 ms p99 stream-event gap. The newer source resolved 8,974 cache slots and
+2,068 KV pages with 19.45 GiB free memory, versus 8,990 slots and 2,081 pages
+in the prior baseline. This allocation difference is recorded as a source
+revision effect, not an optimization result.
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T113506Z/
+  aime-quality-current-main.json
+```
+
+The final current-main service health check returned `status: ok` on
+`127.0.0.1:1919`. A failed direct host-profiler run left one non-serving Python
+child behind; it was identified by its profiler benchmark command, terminated,
+and then force-cleared when it ignored SIGTERM. The serving parent and current
+worker were verified separately before and after that cleanup.
