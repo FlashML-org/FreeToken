@@ -86,6 +86,23 @@ def test_fast_index_copy_skip_env_noops_without_jit(monkeypatch):
     torch.testing.assert_close(output, torch.full_like(output, -1.0))
 
 
+def test_aot_catalog_excludes_legacy_rows_without_full_vector_transactions():
+    """AOT must not ask HIP to compile templates rejected by their static assertion."""
+
+    from freetoken.kernel.aot import DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES, default_kernel_specs
+    from freetoken.kernel.fast_index_copy import legacy_fast_index_copy_is_supported
+
+    # These are valid fused multi-bank rows, but cannot be partitioned into
+    # the legacy kernel's mandatory 128-byte transactions.
+    assert {240, 400}.issubset(DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES)
+    assert not legacy_fast_index_copy_is_supported(240)
+    assert not legacy_fast_index_copy_is_supported(400)
+
+    names = {spec.name for spec in default_kernel_specs()}
+    assert not any("fast_index_copy_240_" in name for name in names)
+    assert not any("fast_index_copy_400_" in name for name in names)
+
+
 def test_device_ptr_pinned_bank_resolves():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")

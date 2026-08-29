@@ -346,3 +346,42 @@ optimization. Reproducible workload and sensor artifacts are retained at:
 ```text
 /home/david/freetoken-amd/artifacts/qwen-live-telemetry-20260829T050800Z/
 ```
+
+### Reusable gfx1151 C++ and HIP cache
+
+LAN-223 initially had no `freetoken_kernel_cache` package and therefore no
+formal prebuilt helper-kernel inventory. The AMD branch now includes
+`scripts/lan223/build_rocm_kernel_cache.sh`. It validates the native HIP
+runtime and gfx1151 device, derives a source-revision-scoped cache path, and
+compiles the complete explicit model catalog with four bounded compiler jobs.
+The startup script resolves that cache and sets `FREETOKEN_DISABLE_JIT=1`, so a
+missing FreeToken C++ or HIP helper fails explicitly instead of compiling during
+an inference request.
+
+The first full build found and corrected a portability defect in the shared AOT
+catalog: 240-byte and 400-byte scale-bank rows were incorrectly emitted for the
+legacy per-bank kernel even though its vector loop requires whole 128-byte
+worker rows. Those small rows are supported by the production fused multi-bank
+path, which has tail handling. The branch now excludes only the impossible
+legacy templates and has a regression test that pins the rule. The repaired
+ROCm 10 build produced all 80 valid catalog modules for gfx1151:
+
+```text
+/home/david/freetoken-amd/cache/kernel-cache-rocm-gfx1151-d6ee8cef479c/
+```
+
+The strict cache launch completed the normal serial NVFP4 expert-bank load,
+then passed the AIME output gate with the required SHA-1 `0acef4eab6f4` at
+28.504 output TPS, 399.99 ms TTFT, and 36.62 ms p99 stream-event gap. It
+resolved the same 8,974 MoE cache slots and 2,068 KV pages as the earlier
+current-main validation. The startup artifact is retained at:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T120405Z/
+```
+
+This cache eliminates FreeToken's C++ and HIP helper JIT for the catalog it
+contains. It does not claim to precompile every Triton specialization or a
+GGUF kernel: Qwen3.6-35B-A3B-NVFP4 is a safetensors NVFP4 checkpoint, not a
+GGUF model, and Triton maintains its own architecture- and source-keyed
+persistent cache.

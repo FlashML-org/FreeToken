@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 DEFAULT_NUM_BLOCKS = 4
 SKIP_FAST_INDEX_COPY_ENV = "FREETOKEN_SKIP_FAST_INDEX_COPY"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+# The legacy per-bank C++ kernel issues one 128-byte vectorized transaction per
+# worker iteration. The fused multi-bank path has a tail-aware implementation
+# and supports every 16-byte-aligned bank row, but this legacy specialization
+# cannot represent a 240- or 400-byte worker row.
+_LEGACY_COPY_ITERATION_BYTES = 128
 
 
 def _skip_fast_index_copy_enabled() -> bool:
@@ -86,6 +91,21 @@ def default_worker_args(feature_size: int) -> tuple[int, int, int]:
         _shrink_worker_feature_size(feature_size, 2048),
         DEFAULT_NUM_BLOCKS,
     )
+
+
+def legacy_fast_index_copy_is_supported(feature_size: int) -> bool:
+    """Return whether the legacy per-bank template can represent ``feature_size``.
+
+    ``FastIndexCopyKernel`` has no scalar tail: every worker copies an integral
+    number of 128-byte transactions. The fused multi-bank production path does
+    support smaller 16-byte-aligned rows, so this predicate only controls AOT
+    generation for the unused legacy fallback. Keeping the condition beside the
+    runtime argument derivation prevents the cache catalog from emitting a HIP
+    specialization that fails its own compile-time assertion.
+    """
+
+    _, worker_feature_size, _ = default_worker_args(feature_size)
+    return worker_feature_size % _LEGACY_COPY_ITERATION_BYTES == 0
 
 
 def fast_index_copy_jit(
