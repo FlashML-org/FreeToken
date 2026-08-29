@@ -275,6 +275,32 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-fp32-output-rocprof-20260828T235258Z/
 ```
 
+### Rejected dense HIP launch-bound candidate
+
+Commit `c7009a9` tested the other conspicuous structural difference from the
+matched llama.cpp Q4_0 vector kernel: a HIP-only `__launch_bounds__(32, 1)`
+constraint for FreeToken's one-wave dense GEMV.  CUDA was unchanged.  The
+candidate compiled cleanly for `gfx1151` and kept the same 48 VGPRs, 128
+SGPRs, zero LDS, and zero scratch as the generic FreeToken kernel.  It did
+improve three of the four isolated Gemma projection measurements, but did not
+reduce the compiler resource gap against llama.cpp.
+
+Five independent graph-captured loopback API runs produced **55.90 TPS mean**
+and **55.88 TPS median**, with deterministic output SHA-1 `abeee5e73e89` in
+every run.  The accepted MoE-only specialization measured 55.91 TPS mean and
+55.89 TPS median under the same workload.  The candidate therefore has no
+meaningful decode gain and its 274.7 ms mean TTFT was worse than the accepted
+candidate's 262.2 ms mean.  It was reverted in `1d555e3`; the upstream-ready
+path remains unchanged by this experiment.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-launch-bounds-20260828T235459Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-launch-bounds-rocprof-20260828T235726Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-launch-bounds-api-20260828T235756Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
