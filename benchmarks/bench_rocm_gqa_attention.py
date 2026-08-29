@@ -23,7 +23,9 @@ from freetoken.kernel.triton.attention import decode_paged_attention
 def _parse_args() -> argparse.Namespace:
     """Parse reproducible ROCm GQA tile benchmark controls."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--probe-block-h", type=int, default=2)
+    parser.add_argument("--probe-block-h", type=int)
+    parser.add_argument("--probe-block-n", type=int)
+    parser.add_argument("--probe-num-warps", type=int)
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repetitions", type=int, default=200)
@@ -64,16 +66,17 @@ def main() -> int:
     mid_lse = torch.empty(batch, query_heads, splits, dtype=torch.float32, device=device)
     num_splits = torch.full((batch,), splits, dtype=torch.int32, device=device)
 
-    def call(probe: int | None) -> torch.Tensor:
+    def call(probe_h: int | None, probe_n: int | None, probe_warps: int | None) -> torch.Tensor:
         return decode_paged_attention(
             q, k, v, indptr, indices, positions, mid_o, mid_lse, num_splits,
-            splits, head_dim**-0.5, sliding_window=1024, rocm_block_h_probe=probe,
+            splits, head_dim**-0.5, sliding_window=1024, rocm_block_h_probe=probe_h,
+            rocm_block_n_probe=probe_n, rocm_num_warps_probe=probe_warps,
         )
 
     for _ in range(args.warmup):
-        default = call(None)
+        default = call(None, None, None)
     for _ in range(args.warmup):
-        candidate = call(args.probe_block_h)
+        candidate = call(args.probe_block_h, args.probe_block_n, args.probe_num_warps)
     torch.cuda.synchronize()
     torch.testing.assert_close(candidate.float(), default.float(), atol=2e-2, rtol=2e-2)
     result = {
@@ -82,8 +85,13 @@ def main() -> int:
         "geometry": {"q_heads": query_heads, "kv_heads": kv_heads, "head_dim": head_dim},
         "sequence_length": args.sequence_length,
         "probe_block_h": args.probe_block_h,
-        "default_us": _event_us(lambda: call(None), args.repetitions),
-        "probe_us": _event_us(lambda: call(args.probe_block_h), args.repetitions),
+        "probe_block_n": args.probe_block_n,
+        "probe_num_warps": args.probe_num_warps,
+        "default_us": _event_us(lambda: call(None, None, None), args.repetitions),
+        "probe_us": _event_us(
+            lambda: call(args.probe_block_h, args.probe_block_n, args.probe_num_warps),
+            args.repetitions,
+        ),
         "warmup": args.warmup,
         "repetitions": args.repetitions,
     }
