@@ -102,7 +102,7 @@ def iter_sse_events(response: Any, started_at: float) -> Iterable[tuple[float, s
 
 def stream_completion(
     args: argparse.Namespace,
-) -> tuple[list[StreamObservation], str, float, float, list[str]]:
+) -> tuple[list[StreamObservation], str, float, float, list[str], dict[str, Any] | None]:
     """Execute one fixed greedy request and collect content plus protocol errors."""
 
     request_body = {
@@ -132,6 +132,7 @@ def stream_completion(
     )
     observations: list[StreamObservation] = []
     protocol_errors: list[str] = []
+    usage: dict[str, Any] | None = None
     completed = False
     started_at = time.perf_counter()
     try:
@@ -147,11 +148,17 @@ def stream_completion(
                     continue
                 choices = event.get("choices", [])
                 if not choices:
+                    event_usage = event.get("usage")
+                    if isinstance(event_usage, dict):
+                        usage = event_usage
                     continue
                 delta = choices[0].get("delta", {})
                 # Reasoning models may emit their decode tokens in this field.
                 content = delta.get("reasoning_content") or delta.get("content")
-                if content is not None:
+                # OpenAI streaming commonly sends an empty role-only delta
+                # before the first generated text. It is not model output and
+                # must not become the client-observed TTFT timestamp.
+                if content:
                     observations.append(StreamObservation(offset, str(content)))
     except urllib.error.HTTPError as error:
         message = error.read().decode("utf-8", errors="replace")
@@ -163,7 +170,14 @@ def stream_completion(
         protocol_errors.append("stream ended without [DONE]")
     if not observations:
         protocol_errors.append("stream contained no content events")
-    return observations, "".join(item.content for item in observations), started_at, finished_at, protocol_errors
+    return (
+        observations,
+        "".join(item.content for item in observations),
+        started_at,
+        finished_at,
+        protocol_errors,
+        usage,
+    )
 
 
 def load_tokenizer(path: Path) -> Any:
@@ -177,7 +191,7 @@ def load_tokenizer(path: Path) -> Any:
 def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index: int) -> dict[str, Any]:
     """Run one request and return a self-contained, JSON-serializable evidence record."""
 
-    observations, text, started_at, finished_at, protocol_errors = stream_completion(args)
+    observations, text, started_at, finished_at, protocol_errors, usage = stream_completion(args)
     generated_tokens = len(tokenizer.encode(text, add_special_tokens=False))
     first_offset = observations[0].offset_seconds if observations else None
     last_offset = observations[-1].offset_seconds if observations else None
@@ -185,6 +199,8 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
     decode_tps = None
     if generated_tokens > 1 and decode_seconds is not None and decode_seconds > 0:
         decode_tps = (generated_tokens - 1) / decode_seconds
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    input_tps = prompt_tokens / first_offset if isinstance(prompt_tokens, int) and first_offset else None
     if args.mode == "quality" and args.expected_text and text.strip() != args.expected_text:
         protocol_errors.append(
             f"quality canary mismatch: expected {args.expected_text!r}, got {text.strip()!r}"
@@ -218,8 +234,10 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
             "warm_ttft_seconds": first_offset,
             "decode_seconds": decode_seconds,
             "decode_tps": decode_tps,
+            "input_tps": input_tps,
             "token_gap_seconds": token_gaps,
         },
+        "usage": usage,
         "response": {
             "text": text,
             "generated_tokens": generated_tokens,
