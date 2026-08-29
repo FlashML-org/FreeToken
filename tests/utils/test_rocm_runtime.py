@@ -7,6 +7,7 @@ because a stale package happens to be installed in the environment.
 """
 
 import torch
+from pathlib import Path
 
 from freetoken.kernel import backend
 from freetoken.utils import arch
@@ -52,3 +53,17 @@ def test_rocm_disables_cuda_only_optional_backends(monkeypatch):
         backend.is_sgl_kernel_installed.cache_clear()
         backend.is_triton_kernels_installed.cache_clear()
         backend.driver_cuda_version.cache_clear()
+
+
+def test_native_extension_build_uses_torch_hip_and_explicit_host_macro():
+    """ROCm host C++ builds must not infer their ABI from CUDA toolkit presence."""
+
+    root = Path(__file__).resolve().parents[2]
+    setup_source = (root / "setup.py").read_text(encoding="utf-8")
+    compat_source = (root / "python/freetoken/kernel/csrc/hip_compat.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "IS_ROCM = torch.version.hip is not None" in setup_source
+    assert 'GPU_RUNTIME_MACROS = [("FREETOKEN_USE_ROCM", "1")]' in setup_source
+    assert "defined(FREETOKEN_USE_ROCM)" in compat_source

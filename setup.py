@@ -4,11 +4,17 @@ import importlib.util
 from pathlib import Path
 
 from setuptools import setup
+import torch
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, ROCM_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
-IS_ROCM = CUDA_HOME is None and ROCM_HOME is not None
+# The active PyTorch build, rather than toolkit discovery, defines the extension
+# ABI.  A developer can have a CUDA toolkit installed while building a HIP
+# PyTorch environment; requiring CUDA_HOME to be absent would then link host
+# extensions against cudart even though the process uses libamdhip64.
+IS_ROCM = torch.version.hip is not None
+GPU_RUNTIME_MACROS = [("FREETOKEN_USE_ROCM", "1")] if IS_ROCM else []
 
 
 def _check_toolchain() -> None:
@@ -71,6 +77,7 @@ setup(
             libraries=cuda_libraries,
             extra_link_args=cuda_extra_link_args,
             extra_compile_args=["-O3", "-std=c++17"],
+            define_macros=GPU_RUNTIME_MACROS,
         ),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
@@ -87,6 +94,7 @@ setup(
             libraries=cuda_libraries,
             extra_link_args=cuda_extra_link_args,
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            define_macros=GPU_RUNTIME_MACROS,
         ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
