@@ -329,6 +329,29 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-indexed-pointer-api-20260829T001156Z/
 ```
 
+### Rejected Q4_0 MoE route-grouping candidate
+
+The source comparison showed that llama.cpp places the eight routed experts in
+separate waves of one multi-wave MoE workgroup, while FreeToken's accepted HIP
+specialization uses one workgroup per route.  Commit `dc73e8e` tested that
+topology directly: a HIP-only Q4_0 kernel with eight independent 32-lane route
+waves in a 256-thread workgroup, retaining the accepted two-output-row
+arithmetic inside each wave.  CUDA and all non-Q4_0 formats remained unchanged.
+
+The candidate compiled for `gfx1151` and passed the targeted HIP build tests,
+but failed the shape-accurate microbenchmark gate.  For Gemma's eight-route
+decode geometry it measured 34.93 us gate/up plus 30.69 us down, or **65.62 us
+per pair**, versus the accepted two-row kernel's 64.25 us mean pair time.  Since
+the grouped workgroup was slower before the API workload, no server benchmark
+was run.  It was reverted in `96c51f9` and the accepted one-wave/two-row MoE
+kernel remains active.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-route-group8-20260829T001802Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
