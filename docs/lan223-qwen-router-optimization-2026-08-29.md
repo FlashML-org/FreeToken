@@ -545,3 +545,20 @@ the complete hipcc command and timing JSON for later component work:
 ```text
 /home/david/freetoken-amd/artifacts/fp8-hip-prototype-20260829T133900Z/
 ```
+
+### System-level performance-policy audit
+
+LAN-223's CPU governor is already `performance`. The Radeon 8060S reports the
+standard `auto` GPU performance policy at idle, where shader and SoC clocks
+fall to 600 MHz while memory remains at 1,000 MHz. This is not evidence of a
+decode throttle: the earlier fixed API workload recorded 100 percent GPU use,
+a sustained 2.9 GHz shader clock, and roughly 70 to 90 W graphics package
+power during active generation.
+
+This host does not expose the usual amdgpu DPM control files through DRM sysfs,
+and `rocm-smi` reports that its power cap is unsupported. An isolated
+high-performance-policy test is therefore contingent on interactive sudo
+authentication. The port does not change an undocumented platform policy or
+claim a clock-based gain without that reversible measurement. The serving
+baseline stays on the normal driver policy and remains subject to the same
+quality and TPS gates as kernel candidates.
