@@ -53,3 +53,10 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class CacheStatsBackendMsg(BaseBackendMsg):
+    """Request one read-only snapshot of the MoE cache counters from the scheduler."""
+
+    request_id: str

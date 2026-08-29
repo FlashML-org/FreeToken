@@ -16,6 +16,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    CacheStatsBackendMsg,
+    CacheStatsMsg,
+    CacheStatsReply,
+    CacheStatsResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserReply,
@@ -51,6 +55,30 @@ def test_cache_rebuild_reply_roundtrip():
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
     assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+
+
+def test_cache_stats_messages_roundtrip():
+    """The read-only cache-statistics control path preserves nested counter data on every hop."""
+
+    request = CacheStatsMsg(request_id="stats-request")
+    backend = CacheStatsBackendMsg(request_id="stats-request")
+    result = CacheStatsResultMsg(
+        request_id="stats-request",
+        stats={"available": True, "summary": {"miss_rate": 0.25}},
+    )
+    reply = CacheStatsReply(
+        request_id="stats-request",
+        stats={"available": True, "summary": {"miss_rate": 0.25}},
+    )
+
+    assert isinstance(BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(request)), CacheStatsMsg)
+    assert isinstance(BaseBackendMsg.decoder(backend.encoder()), CacheStatsBackendMsg)
+    decoded_result = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(result))
+    decoded_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(decoded_result, CacheStatsResultMsg)
+    assert isinstance(decoded_reply, CacheStatsReply)
+    assert decoded_result.stats == reply.stats
+    assert decoded_reply.stats == reply.stats
 
 
 def test_prompt_admitted_msg_roundtrip():

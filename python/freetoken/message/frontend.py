@@ -68,3 +68,11 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+
+
+@dataclass
+class CacheStatsReply(BaseFrontendMsg):
+    """Scheduler-provided, read-only MoE cache-statistics response for the API server."""
+
+    request_id: str
+    stats: Dict

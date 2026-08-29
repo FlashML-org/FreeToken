@@ -17,6 +17,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    CacheStatsBackendMsg,
+    CacheStatsMsg,
+    CacheStatsReply,
+    CacheStatsResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
@@ -194,10 +198,17 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, CacheStatsMsg):
+                    # Cache statistics are already accumulated by the backend.
+                    # The tokenizer only forwards this read-only request.
+                    send_backend.put(CacheStatsBackendMsg(request_id=m.request_id))
+                elif isinstance(m, CacheStatsResultMsg):
+                    send_frontend.put(CacheStatsReply(request_id=m.request_id, stats=m.stats))
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (CacheRebuildMsg, CacheRebuildResultMsg, CacheStatsMsg,
+                     CacheStatsResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
                 )
                 for m in pending_msg
             )

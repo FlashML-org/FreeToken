@@ -538,6 +538,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate read-only decode expert-cache hit and miss counters on the device. "
+            "The counters are intended for explicit diagnostic snapshots, not per-request logs."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

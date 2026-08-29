@@ -103,6 +103,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class CacheStatsMsg(BaseTokenizerMsg):
+    """API-to-tokenizer passthrough for a read-only MoE cache-statistics snapshot."""
+
+    request_id: str
+
+
+@dataclass
+class CacheStatsResultMsg(BaseTokenizerMsg):
+    """Scheduler-to-tokenizer passthrough carrying an immutable cache-statistics snapshot."""
+
+    request_id: str
+    stats: Dict[str, Any]
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

@@ -13,6 +13,8 @@ from freetoken.message import (
     BatchBackendMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
+    CacheStatsBackendMsg,
+    CacheStatsResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
@@ -578,6 +580,19 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, CacheStatsBackendMsg):
+            # The counter tensors are read only here.  Their host transfer is a
+            # one-off synchronization requested explicitly by the diagnostic API,
+            # never a per-token cost on the serving path.
+            cache = self.engine.moe_offload_cache
+            stats = {"available": False}
+            if cache is not None:
+                stats = {
+                    "available": True,
+                    "summary": cache.decode_miss_stats(),
+                    "per_layer": cache.decode_miss_stats_per_layer(),
+                }
+            self.send_result([CacheStatsResultMsg(request_id=msg.request_id, stats=stats)])
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError

@@ -439,3 +439,32 @@ identical at 0.07702 ms. Stages 1, 4, and 5 were slower in the initial screen.
 The small difference is ordinary device-timing variation, not a defensible
 end-to-end improvement. The staging override was removed without a model
 reload, preserving the established default Triton pipeline policy.
+
+### Measured expert-cache residency and rejected capacity increase
+
+The AMD branch now exposes a read-only `/v1/cache/stats` endpoint through the
+existing API, tokenizer, and scheduler control-message path. It transfers an
+already accumulated device-counter snapshot only when explicitly requested;
+it does not alter cache contents, scheduling, routing, model weights, or the
+normal no-statistics serving path. The associated `--moe-collect-stats` launch
+option is disabled by default because its counter updates are diagnostic work.
+
+At the validated 0.35 memory ratio, Qwen allocated 8,974 cache slots, 2,068
+KV pages, and 24 GDN state slots. The fixed workload accumulated 33,920
+MoE-layer decode calls: eight active experts per layer and 0.671 misses per
+layer, an 8.39 percent miss rate. A 0.38 memory-ratio candidate raised
+residency to 9,990 slots while retaining 2,055 KV pages and 24 GDN slots. It
+reduced the realized miss rate to 7.33 percent, but its three-sample scheduler
+throughput fell from 28.038 TPS to 27.908 TPS. The capacity increase is
+therefore rejected. It consumes roughly 1.7 GiB of additional headroom without
+producing a serving improvement.
+
+The counters establish that a small number of expert fetches remains, but not
+that larger static residency is a profitable AMD optimization. Direct cache
+copy measurements and the sustained TPS result agree: the dense FP8 decode
+path remains the more valuable target. The two diagnostic artifact roots are:
+
+```text
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T124643Z/
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T125511Z/
+```
