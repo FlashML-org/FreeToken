@@ -37,3 +37,15 @@ class RequireExpectedHostTests(unittest.TestCase):
                     "--max-tokens", "1",
                 ]
             )
+
+    def test_quality_mode_defaults_to_no_reasoning(self) -> None:
+        """The canary requests final-answer text instead of an unbounded thought stream."""
+
+        args = parse_args(
+            [
+                "--model", "qwen",
+                "--tokenizer", "tokenizer",
+                "--artifact-dir", "artifacts",
+            ]
+        )
+        self.assertEqual(args.reasoning_effort, "none")
