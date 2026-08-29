@@ -520,3 +520,28 @@ The conclusion is deliberately limited to this ROCm 10, PyTorch 2.13, and
 gfx1151 environment. The result keeps the verified native Triton W8A16 route
 as the active path and directs follow-up work toward custom kernels that retain
 the checkpoint's OCP E4M3 bytes and its exact output contract.
+
+### Rejected direct HIP OCP-E4M3 GEMV prototype
+
+To validate that a custom HIP component remains possible despite the library
+gate, an isolated one-Wave32-per-output-row W8A16 GEMV was compiled with
+ROCm 10 hipcc for gfx1151. It reads the checkpoint's raw OCP E4M3 bytes,
+streams one shared BF16 activation vector, accumulates in FP32, applies the
+existing per-row FP32 scale, and avoids the production split-K partial buffer.
+The prototype is intentionally outside the API serving path.
+
+The build succeeded after supplying rocThrust as a compiler-only system include
+to PyTorch's ROCm extension machinery. At Qwen's `[8192, 2048]` dense shape,
+however, the candidate measured 0.10674 ms median versus 0.07687 ms for the
+production Triton kernel, a 38.9 percent regression. Its raw BF16 SHA-1 also
+differed (`e08b284faedd608850119511655e1e94cab87b05` versus
+`0aca8b9e38ebfaa91893366a175970f1c45599b9`), with a maximum absolute element
+difference of `3.814697265625e-06`. The altered wave-local reduction order is
+therefore not an exact replacement.
+
+This prototype is rejected before model integration. The artifact preserves
+the complete hipcc command and timing JSON for later component work:
+
+```text
+/home/david/freetoken-amd/artifacts/fp8-hip-prototype-20260829T133900Z/
+```
