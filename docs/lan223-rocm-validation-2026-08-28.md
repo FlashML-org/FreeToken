@@ -329,6 +329,41 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-indexed-pointer-api-20260829T001156Z/
 ```
 
+### Rejected scalarized dense Q4_0 dot-product candidate
+
+The source and trace audit found that the historical FreeToken dense Q4_0
+helper materializes two packed Q4 words and four Q8 words in short local
+arrays before issuing four DP4A operations.  llama.cpp's newer HIP path does
+not share FreeToken's old wrapper structure, so a HIP-only candidate replaced
+only that dense helper with named scalar values.  It retained the original
+packed GGUF layout, four DP4A operations in the same order, scale formula, and
+BF16 output contract.  CUDA and the separately accepted routed-MoE kernel were
+unchanged.
+
+The candidate compiled for `gfx1151`, passed the targeted HIP build and
+attention tests, and produced finite results for all four exact Gemma dense
+projection shapes.  Its isolated event times were 17.38 us for 2816x4096,
+28.38 us for 8192x2816, 19.20 us for 4224x2816, and 35.84 us for 10240x2816.
+That showed useful synthetic movement, especially for the second shape, but
+was not enough to accept it.
+
+Five independent graph-captured API runs all returned the deterministic
+SHA-1 `abeee5e73e89`, retained 27.52 GiB server-reported VRAM, and left no KFD
+process after shutdown.  Their TPS range was 55.812 to 56.155, with **55.946
+TPS mean** and **55.919 TPS median**.  Those figures differ from the accepted
+Q4_0 MoE baseline by only 0.041 TPS mean and 0.025 TPS median, while mean TTFT
+increased from 262.2 ms to 269.7 ms.  This is normal run-to-run noise, not a
+repeatable end-to-end improvement, so it was reverted in `d9ce2c5`.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-scalarized-20260829T003720Z/microbench.json
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-scalarized-20260829T003720Z/microbench-rocprof.json
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-scalarized-20260829T003720Z/api-first.jsonl
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-scalarized-20260829T003720Z/api-repeats.jsonl
+```
+
 ### Rejected Q4_0 MoE route-grouping candidate
 
 The source comparison showed that llama.cpp places the eight routed experts in
