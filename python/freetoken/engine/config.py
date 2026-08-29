@@ -80,6 +80,17 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # KV element storage (--kv-cache-dtype): "auto" keeps the compute dtype, "q8_0" and
+    # "fp8_e4m3" store 8 bits plus a per-block scale, and the sub-byte "q4_0"/"q6_0"
+    # pack multiple values per byte. Resolved through
+    # freetoken.kvcache.quant.resolve_kv_quant by the pools and the cost model.
+    kv_cache_dtype: str = "auto"
+
+    @cached_property
+    def kv_quant(self):
+        from freetoken.kvcache.quant import resolve_kv_quant
+
+        return resolve_kv_quant(self.kv_cache_dtype)
 
     @cached_property
     def hf_config(self):
