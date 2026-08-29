@@ -301,6 +301,34 @@ The retained raw evidence is:
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-launch-bounds-api-20260828T235756Z/
 ```
 
+### Rejected indexed Q4_0 dense HIP kernel
+
+The dominant llama.cpp Q4_0 trace was rechecked before this experiment.  Its
+main kernel uses the same 32-thread by 1-row workgroup as FreeToken, but
+reports 24 VGPRs versus FreeToken's 48.  Commit `a5e04d1` isolated the remaining
+source-level difference: a Q4_0-only HIP kernel that keeps the base weight
+pointer and block index separate until the vector-dot helper.  It preserved
+the generic FreeToken launch geometry and left CUDA and every non-Q4_0 type
+unchanged.
+
+The isolated evidence was favorable but insufficient.  The four exact Gemma
+dense projections measured 16.49 us, 28.69 us, 17.83 us, and 35.52 us, and the
+profile trace measured 18.16 us, 22.88 us, 13.17 us, and 29.22 us.  The compiler
+still used 48 VGPRs, 128 SGPRs, no LDS, and no scratch.  The first full
+graph-captured API run preserved the deterministic output SHA-1
+`abeee5e73e89`, but collapsed to **15.21 TPS**, 65.73 ms/token, 3014.5 ms TTFT,
+and 1674.5 ms p99 event latency.  This is a functional result but a clear
+performance failure.  It was reverted in `b281e0e` and must not be retried
+without an explanation for the end-to-end stalls.
+
+The retained raw evidence is:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-indexed-pointer-20260829T000901Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-q4-indexed-pointer-rocprof-20260829T001126Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/dense-indexed-pointer-api-20260829T001156Z/
+```
+
 The best verified FreeToken command shape is:
 
 ```bash
