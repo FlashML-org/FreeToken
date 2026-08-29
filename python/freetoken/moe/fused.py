@@ -44,10 +44,22 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from freetoken.kernel.backend import is_triton_kernels_installed
+    from freetoken.kernel.backend import is_rocm_runtime, is_triton_kernels_installed
 
-    # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
-    # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
+    # ``triton_kernels`` distributes CUDA-only binaries, so its availability
+    # probe deliberately returns false on HIP even if an unrelated package is
+    # importable.  FreeToken's vendored Triton router is source JIT compiled
+    # and has been validated on ROCm.  Select it explicitly here instead of
+    # falling back to several eager PyTorch operations on every MoE layer.
+    # Its device-side token-limit mask also keeps it safe inside HIP graphs.
+    if is_rocm_runtime():
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+
+    # Non-ROCm systems use OpenAI's optimized CUDA package when it is available.
+    # Windows and CUDA environments without that optional package keep the
+    # numerically equivalent PyTorch fallback below.
     if not is_triton_kernels_installed():
         global _warned_torch_topk
         if not _warned_torch_topk:
