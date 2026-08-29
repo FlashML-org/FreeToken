@@ -43,10 +43,32 @@ def main() -> int:
     with urllib.request.urlopen(args.base_url.rstrip("/") + "/v1/models", timeout=10) as response:
         model_id = json.load(response)["data"][0]["id"]
     stream_args = SimpleNamespace(decode=args.decode)
+    # Send one complete request first so the measured request observes a populated
+    # expert cache instead of one-time load and scheduling work.
     stream_generate(args.base_url, model_id, problem, sampling, stream_args)
+    # Capture the quality-gated request itself.  stream_generate records a
+    # monotonic timestamp for every non-empty streamed text event.
     result = stream_generate(args.base_url, model_id, problem, sampling, stream_args)
     text = result["text"]
     output_sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    # The first event includes warm prompt processing.  The intervals after it
+    # describe steady-state decode, which makes this directly comparable to the
+    # historical AIME benchmark and avoids reporting prompt work as token rate.
+    stamps = result["stamps"]
+    completion_tokens = result["usage"]["completion_tokens"]
+    decode_steps = max(completion_tokens - 1, 0)
+    decode_seconds = stamps[-1] - stamps[0] if len(stamps) >= 2 else 0.0
+    gaps_ms = sorted((later - earlier) * 1e3 for earlier, later in zip(stamps, stamps[1:]))
+    metrics = {
+        "decode_steps": decode_steps,
+        "decode_seconds": decode_seconds,
+        "decode_tok_s": decode_steps / decode_seconds if decode_seconds > 0 else 0.0,
+        "ms_per_token": decode_seconds * 1e3 / decode_steps if decode_steps > 0 else 0.0,
+        "event_ms_p50": gaps_ms[len(gaps_ms) // 2] if gaps_ms else 0.0,
+        "event_ms_p99": gaps_ms[min(len(gaps_ms) - 1, int(len(gaps_ms) * 0.99))] if gaps_ms else 0.0,
+        "ttft_ms": (stamps[0] - result["t0"]) * 1e3 if stamps else 0.0,
+        "events": len(stamps),
+    }
     artifact = {
         "schema_version": 1,
         "model_id": model_id,
@@ -55,7 +77,8 @@ def main() -> int:
         "sampling": sampling,
         "sampling_source": sampling_source,
         "prompt_tokens": result["usage"]["prompt_tokens"],
-        "completion_tokens": result["usage"]["completion_tokens"],
+        "completion_tokens": completion_tokens,
+        "metrics": metrics,
         "expected_output_sha1": REFERENCE_SHA1,
         "output_sha1": output_sha1,
         "status": "passed" if output_sha1 == REFERENCE_SHA1 else "failed",

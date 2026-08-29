@@ -57,6 +57,23 @@ decode. The 54-token prompt produced the historic output SHA-1
 `scripts/lan223/verify_qwen_aime_quality.py` now makes this a repeatable
 quality gate for every future performance candidate.
 
+The gate now records client-visible timing from the same streamed request. Three
+additional warm, quality-matched repeats all produced the reference hash:
+
+| Measure | Result |
+| --- | ---: |
+| Mean decode TPS | 27.880 |
+| Decode TPS samples | 26.786, 28.422, 28.431 |
+| Mean warm TTFT | 409.0 ms |
+| Prompt / completion tokens | 54 / 127 |
+| Output hash | `0acef4eab6f4` in every run |
+
+The first run includes a modest cache or scheduler outlier, with a 50.49 ms
+p99 event gap, while the two later runs had 37.81 ms and 37.29 ms p99 gaps.
+The three-run mean is 3.6 percent below the historical 28.935 TPS
+quality-matched reference. It is therefore a bounded regression, not evidence
+that the rejected Triton router should be restored.
+
 ## Calibration and rejected alternatives
 
 `ft bench bw` measured Qwen NVFP4's real expert kernels on LAN-223. The CPU
@@ -79,6 +96,9 @@ accepted isolated launcher.
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T085317Z/
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T090601Z/
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T091716Z/
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T093921Z/aime-quality-tps-run1.json
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T093921Z/aime-quality-tps-run2.json
+/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T093921Z/aime-quality-tps-run3.json
 ```
 
 The current best configuration is reloading under:
@@ -91,8 +111,9 @@ The current best configuration is reloading under:
 
 The 29.186 client decode TPS is an informative but rejected performance-only
 result, not a quality-validated serving claim. The quality-preserving reference
-router result must be remeasured with the improved harness. The paper's exact
-prompt sequence, stop policy, warm-cache state, and source revision remain
-unrecovered, so this is not a strict paper-parity comparison. Further work
-should profile per-layer NVFP4 expert execution and the Qwen linear-attention
-path under native HIP, then repeat a task-level quality and throughput protocol.
+router is now measured at 27.880 mean TPS with the improved hash-gated harness.
+The paper's exact prompt sequence, stop policy, warm-cache state, and source
+revision remain unrecovered, so this is not a strict paper-parity comparison.
+Further work should profile per-layer NVFP4 expert execution and the Qwen
+linear-attention path under native HIP, then repeat this task-level quality and
+throughput protocol.
