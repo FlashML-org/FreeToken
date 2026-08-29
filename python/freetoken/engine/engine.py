@@ -1219,6 +1219,21 @@ _DENSE_MOE_SETTINGS = {
 }
 
 
+def _validate_ple_backend(config: EngineConfig, model_config) -> None:
+    ple_backend = getattr(config, "ple_backend", "pinned")
+    if ple_backend not in ("pinned", "mmap"):
+        raise ValueError(f"ple_backend must be 'pinned' or 'mmap', got {ple_backend!r}")
+    if ple_backend == "pinned":
+        return
+
+    qwen4_args = getattr(model_config, "qwen4_args", None)
+    if qwen4_args is None or not getattr(qwen4_args, "ple_layer_ids", ()):
+        raise ValueError(
+            "--ple-backend mmap is currently supported only for "
+            "Qwen3.8-Flash-Next checkpoints with a PLE table"
+        )
+
+
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
@@ -1264,6 +1279,7 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 
+    _validate_ple_backend(config, model_config)
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 

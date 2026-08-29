@@ -500,6 +500,13 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--ple-backend",
+        default=ServerArgs.ple_backend,
+        choices=["pinned", "mmap"],
+        help="Qwen3.8 PLE storage backend; mmap demand-pages safetensors.",
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

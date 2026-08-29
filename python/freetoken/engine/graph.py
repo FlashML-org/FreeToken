@@ -118,6 +118,7 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        self.model = model
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -172,6 +173,7 @@ class GraphRunner:
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
+                model.prepare_cuda_graph_capture(batch)
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
@@ -193,6 +195,7 @@ class GraphRunner:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
+        self.model.prepare_cuda_graph_replay(batch)
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
@@ -214,4 +217,5 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
+        self.model.reset_cuda_graph()
         gc.collect()

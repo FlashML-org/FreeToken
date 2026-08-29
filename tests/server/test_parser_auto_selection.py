@@ -94,3 +94,13 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_ple_backend_is_exposed_by_the_server_cli():
+    config = _Config({"architectures": ["Qwen4ExpForConditionalGeneration"],
+                      "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        default, _ = parse_args(["--model", ANON_PATH])
+        mapped, _ = parse_args(["--model", ANON_PATH, "--ple-backend", "mmap"])
+    assert default.ple_backend == "pinned"
+    assert mapped.ple_backend == "mmap"

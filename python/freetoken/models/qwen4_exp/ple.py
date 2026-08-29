@@ -11,14 +11,13 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
     D = U + silu(conv1d(norm_conv(U)))           # depthwise, kernel 4, dilation ngram_size
     R += D                                       # before the attention hyper-connection mix
 
-The table is the 47.7 GiB FP8 n-gram store: ``PinnedUVATable`` keeps it in pinned host memory and
-gathers rows over UVA, optionally started early on a side stream (``PLELayer.start_prefetch``).
-``GpuResidentTable`` is the small-table oracle the pinned backend is diffed against.
+The FP8 n-gram store can use pinned host memory or mmap-backed safetensors.
 """
 
 from __future__ import annotations
 
 import math
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
     from .config import Qwen4ExpArgs
+    from .weight import MmapPleStorage
 
 
 _MASK64 = (1 << 64) - 1
@@ -47,7 +47,7 @@ _PLE_LAYER_PRIME = 10007
 class PLETableBackend(Protocol):
     """Row store for one PLE layer's n-gram embedding table (Qwen3.8: 40M rows x 160, FP8 + one scalar scale).
 
-    Frozen contract. ``GpuResidentTable`` (oracle, small tables) and ``PinnedUVATable`` (the real 47.7 GiB pinned-host table) implement it. Rows are addressed by the
+    ``GpuResidentTable``, ``PinnedUVATable``, and ``MmapStagedTable`` implement it. Rows use the
     GLOBAL hashed id, i.e. the per-head vocab offset is already added by ``NGramEmbedding``.
 
     ``lookup`` gets ``row_ids [T, num_ngram_heads]`` (int64, device) and returns
@@ -207,6 +207,161 @@ class PinnedUVATable:
             return rows
         out.copy_(rows)
         return out
+
+
+@dataclass
+class _MmapPending:
+    row_ids: torch.Tensor
+    future: Future[torch.Tensor]
+
+
+class MmapStagedTable:
+    """Gather mmap-backed PLE rows on the CPU and stage them to CUDA."""
+
+    external_cuda_graph_staging = True
+
+    def __init__(
+        self,
+        storage: MmapPleStorage,
+        scale: float = 1.0,
+        *,
+        device: torch.device | None = None,
+    ) -> None:
+        self.storage = storage
+        self.scale = float(scale)
+        self.num_rows = storage.num_rows
+        self.head_dim = storage.head_dim
+        self.dtype = torch.bfloat16
+        self._device = device or torch.device("cuda", torch.cuda.current_device())
+        if self._device.type != "cuda":
+            raise ValueError("MmapStagedTable requires a CUDA device")
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ple-mmap"
+        )
+        self._pending: _MmapPending | None = None
+        self._graph_staging: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _gather_after_copy(
+        self,
+        ready: torch.cuda.Event,
+        host_ids: torch.Tensor,
+        host_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        ready.synchronize()
+        # Inference mode is thread-local; staging tensors were created under it.
+        with torch.inference_mode():
+            return self.storage.gather(host_ids, host_rows)
+
+    def _schedule(self, row_ids: torch.Tensor) -> Future[torch.Tensor]:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MmapStagedTable cannot run in a CUDA graph; use --cuda-graph-max-bs 0"
+            )
+        flat = row_ids.reshape(-1)
+        host_ids = torch.empty(flat.numel(), dtype=torch.int64, device="cpu", pin_memory=True)
+        host_rows = torch.empty(
+            (flat.numel(), self.head_dim),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        host_ids.copy_(flat, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self._device))
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError("MmapStagedTable is closed")
+        return executor.submit(self._gather_after_copy, ready, host_ids, host_rows)
+
+    def _finish(self, row_ids: torch.Tensor) -> torch.Tensor:
+        pending, self._pending = self._pending, None
+        if pending is not None and pending.row_ids is row_ids:
+            return pending.future.result()
+        if pending is not None:
+            pending.future.result()
+        return self._schedule(row_ids).result()
+
+    def prepare_cuda_graph_capture(self, num_rows: int) -> None:
+        if num_rows in self._graph_staging:
+            return
+        raw = torch.empty((num_rows, self.head_dim), dtype=torch.uint8, device=self._device)
+        rows = torch.zeros((num_rows, self.head_dim), dtype=self.dtype, device=self._device)
+        self._graph_staging[num_rows] = (raw, rows)
+
+    def prepare_cuda_graph_replay(self, row_ids: torch.Tensor) -> None:
+        staging = self._graph_staging.get(row_ids.numel())
+        if staging is None:
+            raise RuntimeError(f"no mmap PLE graph buffer for {row_ids.numel()} rows")
+        host_rows = self._finish(row_ids)
+        raw, rows = staging
+        raw.copy_(host_rows, non_blocking=True)
+        rows.copy_(raw.view(torch.float8_e4m3fn))
+        if self.scale != 1.0:
+            rows.mul_(self.scale)
+
+    def cuda_graph_lookup(
+        self,
+        tokens: int,
+        num_heads: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        staging = self._graph_staging.get(tokens * num_heads)
+        if staging is None:
+            raise RuntimeError(f"no mmap PLE graph buffer for {tokens * num_heads} rows")
+        rows = staging[1].view(tokens, -1)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def reset_cuda_graph(self) -> None:
+        self._graph_staging.clear()
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        if row_ids.numel() == 0 or torch.cuda.is_current_stream_capturing():
+            return
+        if self._pending is not None:
+            self._pending.future.result()
+        self._pending = _MmapPending(row_ids=row_ids, future=self._schedule(row_ids))
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            staging = self._graph_staging.get(row_ids.numel())
+            if staging is None:
+                raise RuntimeError(f"no mmap PLE graph buffer for {row_ids.numel()} rows")
+            rows = staging[1].view(*row_ids.shape[:-1], -1)
+            if out is None:
+                return rows
+            out.copy_(rows)
+            return out
+
+        host_rows = self._finish(row_ids)
+        raw = host_rows.to(device=self._device, non_blocking=True)
+        rows = raw.view(torch.float8_e4m3fn).to(self.dtype)
+        if self.scale != 1.0:
+            rows.mul_(self.scale)
+        rows = rows.view(*row_ids.shape[:-1], -1)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def close(self) -> None:
+        executor, self._executor = self._executor, None
+        if executor is None:
+            return
+        pending, self._pending = self._pending, None
+        try:
+            if pending is not None:
+                pending.future.result()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _splitmix64(value: int) -> int:
@@ -566,15 +721,23 @@ class PLELayer(BaseOP):
         assert self.state_len <= CHUNK_SIZE, (
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
-        self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        self._pending: Tuple[PLEMetadata, torch.Tensor | None] | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
         if meta is None:
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
+        table = self.ple_embedding.table
+        if (
+            batch.input_ids.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+            and getattr(table, "external_cuda_graph_staging", False)
+        ):
+            self._pending = (meta, None)
+            return
         row_ids = self.ple_embedding.row_ids(meta)
         self._pending = (meta, row_ids)
-        self.ple_embedding.table.prefetch(row_ids)
+        table.prefetch(row_ids)
 
     def forward(
         self,
@@ -592,10 +755,17 @@ class PLELayer(BaseOP):
                 meta = build_ple_metadata(batch, self.args, R.device)
         elif pending is not None and pending[0] is meta:
             row_ids = pending[1]
-        if row_ids is None:
-            row_ids = self.ple_embedding.row_ids(meta)
-
-        embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
+        table = self.ple_embedding.table
+        if (
+            R.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+            and getattr(table, "external_cuda_graph_staging", False)
+        ):
+            embeddings = table.cuda_graph_lookup(meta.input_ids.numel(), self.ple_embedding.num_heads)
+        else:
+            if row_ids is None:
+                row_ids = self.ple_embedding.row_ids(meta)
+            embeddings = table.lookup(row_ids).to(R.dtype)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
@@ -709,6 +879,7 @@ class PLELayer(BaseOP):
 
 __all__ = [
     "GpuResidentTable",
+    "MmapStagedTable",
     "NGramEmbedding",
     "ZeroTable",
     "PLELayer",

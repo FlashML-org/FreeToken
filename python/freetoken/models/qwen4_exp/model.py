@@ -105,6 +105,28 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
+    def prepare_mmap_ple_graph_capture(self, batch: Batch) -> None:
+        for ple in self._ple:
+            table = ple.ple_embedding.table
+            table.prepare_cuda_graph_capture(batch.padded_size * ple.ple_embedding.num_heads)
+
+    def prepare_mmap_ple_graph_replay(self, batch: Batch) -> None:
+        from .ple import build_ple_metadata
+
+        meta = build_ple_metadata(batch, self._ple[0].args, batch.input_ids.device)
+        pending = []
+        for ple in self._ple:
+            table = ple.ple_embedding.table
+            row_ids = ple.ple_embedding.row_ids(meta)
+            table.prefetch(row_ids)
+            pending.append((table, row_ids))
+        for table, row_ids in pending:
+            table.prepare_cuda_graph_replay(row_ids)
+
+    def reset_mmap_ple_graph(self) -> None:
+        for ple in self._ple:
+            ple.ple_embedding.table.reset_cuda_graph()
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
         meta = None
@@ -126,6 +148,7 @@ class Qwen4ExpModel(BaseOP):
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
+        self._mmap_ple = False
         self.model = Qwen4ExpModel(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -143,8 +166,20 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+    def prepare_cuda_graph_capture(self, batch: Batch) -> None:
+        if self._mmap_ple:
+            self.model.prepare_mmap_ple_graph_capture(batch)
+
+    def prepare_cuda_graph_replay(self, batch: Batch) -> None:
+        if self._mmap_ple:
+            self.model.prepare_mmap_ple_graph_replay(batch)
+
+    def reset_cuda_graph(self) -> None:
+        if self._mmap_ple:
+            self.model.reset_mmap_ple_graph()
+
     def load_host_tables(self, engine_config) -> int:
-        """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        """Attach the PLE table and return persistent pinned bytes."""
         ple_layers = self.model.ple_layers
         if not ple_layers:
             return 0
@@ -168,6 +203,22 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
+
+        ple_backend = getattr(engine_config, "ple_backend", "pinned")
+        if ple_backend == "mmap":
+            from .ple import MmapStagedTable
+            from .weight import load_mmap_ple_table
+
+            table = load_mmap_ple_table(engine_config.model_path, self._config.qwen4_args)
+            self._ple_table = table  # Keep mappings alive.
+            self._mmap_ple = True
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(
+                    MmapStagedTable(table.storage, float(table.weight_scale))
+                )
+            return 0
+        if ple_backend != "pinned":
+            raise ValueError(f"unsupported PLE backend {ple_backend!r}")
 
         from .weight import load_ple_table
 

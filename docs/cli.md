@@ -33,6 +33,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
+| `--ple-backend` | pinned | Qwen3.8 PLE storage: `pinned` or `mmap` |
 
 ### Server & runtime
 

@@ -17,8 +17,10 @@ import numpy as np
 import pytest
 import torch
 
+import freetoken.models.qwen4_exp.ple as ple_module
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
+from freetoken.models.qwen4_exp.model import Qwen4ExpModel
 from freetoken.models.qwen4_exp.ple import (
     GpuResidentTable,
     PinnedUVATable,
@@ -38,6 +40,56 @@ requires_hf_ref = pytest.mark.skipif(
     not (_HF_REF_PYTHON and Path(_HF_REF_PYTHON).exists()),
     reason="set FREETOKEN_QWEN4_HF_PYTHON to a transformers build that ships qwen4_exp",
 )
+
+
+def test_mmap_graph_hooks_stage_every_ple_layer(monkeypatch):
+    events = []
+    meta = object()
+
+    class Table:
+        def __init__(self, name):
+            self.name = name
+
+        def prepare_cuda_graph_capture(self, rows):
+            events.append(("capture", self.name, rows))
+
+        def prefetch(self, row_ids):
+            events.append(("prefetch", self.name, row_ids.item()))
+
+        def prepare_cuda_graph_replay(self, row_ids):
+            events.append(("replay", self.name, row_ids.item()))
+
+        def reset_cuda_graph(self):
+            events.append(("reset", self.name))
+
+    def ple(name, row):
+        table = Table(name)
+        embedding = SimpleNamespace(
+            num_heads=4,
+            table=table,
+            row_ids=lambda got_meta: torch.tensor([row]) if got_meta is meta else None,
+        )
+        return SimpleNamespace(args=object(), ple_embedding=embedding)
+
+    model = object.__new__(Qwen4ExpModel)
+    model._ple = (ple("a", 11), ple("b", 22))
+    batch = SimpleNamespace(padded_size=3, input_ids=torch.zeros(3))
+    monkeypatch.setattr(ple_module, "build_ple_metadata", lambda *args: meta)
+
+    model.prepare_mmap_ple_graph_capture(batch)
+    model.prepare_mmap_ple_graph_replay(batch)
+    model.reset_mmap_ple_graph()
+
+    assert events == [
+        ("capture", "a", 12),
+        ("capture", "b", 12),
+        ("prefetch", "a", 11),
+        ("prefetch", "b", 22),
+        ("replay", "a", 11),
+        ("replay", "b", 22),
+        ("reset", "a"),
+        ("reset", "b"),
+    ]
 
 
 # --------------------------------------------------------------------------------------

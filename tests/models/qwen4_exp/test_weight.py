@@ -18,6 +18,7 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     iter_weights,
+    load_mmap_ple_table,
     load_ple_table,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -323,6 +324,110 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
     args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS + 1, ngram_head_dim=NGRAM_DIM)
     with pytest.raises(ValueError, match="shards 0"):
         load_ple_table(folder, args, pin=False)
+
+
+def test_mmap_ple_table_gathers_rows_without_materializing_the_table(checkpoint):
+    folder, raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    table = load_mmap_ple_table(folder, args)
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    ids = torch.tensor([
+        0,
+        NGRAM_ROWS - 1,
+        NGRAM_ROWS,
+        2 * NGRAM_ROWS + 3,
+        NGRAM_SHARDS * NGRAM_ROWS - 1,
+        -1,
+        NGRAM_SHARDS * NGRAM_ROWS,
+    ], dtype=torch.int64)
+    out = torch.empty(ids.numel(), NGRAM_DIM, dtype=torch.uint8)
+    try:
+        assert table.storage.gather(ids, out) is out
+        assert table.storage.num_rows == NGRAM_SHARDS * NGRAM_ROWS
+        assert table.storage.nbytes == NGRAM_SHARDS * NGRAM_ROWS * NGRAM_DIM
+        for i, row_id in enumerate(ids.tolist()[:5]):
+            shard, row = divmod(row_id, NGRAM_ROWS)
+            want = raw[f"{prefix}.shard_{shard}.weight"][row].view(torch.uint8)
+            assert torch.equal(out[i], want)
+        assert out[-2:].count_nonzero() == 0
+        assert float(table.weight_scale) == 0.125
+    finally:
+        table.storage.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_mmap_staged_backend_matches_checkpoint_rows(checkpoint):
+    from freetoken.models.qwen4_exp.ple import MmapStagedTable
+
+    folder, raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    table = load_mmap_ple_table(folder, args)
+    backend = MmapStagedTable(table.storage, float(table.weight_scale))
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    source = torch.cat([
+        raw[f"{prefix}.shard_{i}.weight"] for i in range(NGRAM_SHARDS)
+    ]).cuda()
+    ids = torch.tensor([[0, 6, 7, 17], [27, 20, 3, 14]], device="cuda")
+    want = source.index_select(0, ids.reshape(-1)).to(torch.bfloat16)
+    want = (want * float(table.weight_scale)).view(2, -1)
+    try:
+        # Match the scheduler's inference-mode context.
+        with torch.inference_mode():
+            assert torch.equal(backend.lookup(ids), want)
+            backend.prefetch(ids)
+            assert torch.equal(backend.lookup(ids), want)
+    finally:
+        backend.close()
+        table.storage.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_mmap_staged_backend_cuda_graph_replay_stages_new_rows(checkpoint):
+    from freetoken.models.qwen4_exp.ple import MmapStagedTable
+
+    folder, raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    table = load_mmap_ple_table(folder, args)
+    backend = MmapStagedTable(table.storage, float(table.weight_scale))
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    source = torch.cat([
+        raw[f"{prefix}.shard_{i}.weight"] for i in range(NGRAM_SHARDS)
+    ]).cuda()
+    graphs = {}
+    captured = {}
+    try:
+        for tokens in (1, 2):
+            backend.prepare_cuda_graph_capture(tokens * 4)
+            captured[tokens] = torch.empty(
+                tokens, 4 * NGRAM_DIM, dtype=torch.bfloat16, device="cuda"
+            )
+        torch.cuda.synchronize()
+        for tokens in (1, 2):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured[tokens].copy_(backend.cuda_graph_lookup(tokens, 4))
+            graphs[tokens] = graph
+
+        for ids in (
+            torch.tensor([[0, 6, 7, 17]], device="cuda"),
+            torch.tensor([[1, 8, 15, 22], [4, 11, 18, 25]], device="cuda"),
+            torch.tensor([[27, 20, 3, 14]], device="cuda"),
+        ):
+            tokens = ids.shape[0]
+            with torch.inference_mode():
+                backend.prefetch(ids)
+                backend.prepare_cuda_graph_replay(ids)
+                graphs[tokens].replay()
+            torch.cuda.synchronize()
+            want = source.index_select(0, ids.reshape(-1)).to(torch.bfloat16)
+            want = (want * float(table.weight_scale)).view_as(captured[tokens])
+            assert torch.equal(captured[tokens], want)
+    finally:
+        graphs.clear()
+        torch.cuda.synchronize()
+        backend.reset_cuda_graph()
+        backend.close()
+        table.storage.close()
 
 
 # ======================================================================================

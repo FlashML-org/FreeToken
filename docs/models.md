@@ -38,5 +38,6 @@ for them; other checkpoints of the same architectures work too.
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next supports `--ple-backend mmap` for demand-paging its PLE table
+  from the original safetensors while retaining decode CUDA graphs.
 - Multimodal checkpoints are served text-only.

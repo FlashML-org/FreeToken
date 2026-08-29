@@ -12,11 +12,12 @@ Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.e
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 import safetensors
 import torch
@@ -202,6 +203,112 @@ class PleTable:
         return self.bank.tensor
 
 
+@dataclass(frozen=True)
+class PleShard:
+    """A PLE byte range in a safetensor file."""
+
+    path: str
+    offset: int
+    nbytes: int
+    rows: int
+    cols: int
+
+
+@dataclass(frozen=True)
+class PleLayout:
+    """Validated on-disk PLE layout."""
+
+    shards: tuple[PleShard, ...]
+    weight_scale: torch.Tensor
+    rows_per_shard: int
+    head_dim: int
+
+
+class MmapPleStorage:
+    """Memory-map PLE safetensor ranges and gather selected rows."""
+
+    def __init__(self, layout: PleLayout) -> None:
+        self.rows_per_shard = layout.rows_per_shard
+        self.head_dim = layout.head_dim
+        self.num_rows = len(layout.shards) * self.rows_per_shard
+        self.nbytes = sum(shard.nbytes for shard in layout.shards)
+        self._files: dict[str, BinaryIO] = {}
+        self._maps: dict[str, mmap.mmap] = {}
+        self._shards: list[torch.Tensor] = []
+        try:
+            for shard in layout.shards:
+                mapping = self._maps.get(shard.path)
+                if mapping is None:
+                    fh = open(shard.path, "rb")
+                    mapping = mmap.mmap(fh.fileno(), length=0, access=mmap.ACCESS_COPY)
+                    if hasattr(mapping, "madvise") and hasattr(mmap, "MADV_RANDOM"):
+                        mapping.madvise(mmap.MADV_RANDOM)
+                    self._files[shard.path] = fh
+                    self._maps[shard.path] = mapping
+                tensor = torch.frombuffer(
+                    mapping,
+                    dtype=torch.uint8,
+                    count=shard.nbytes,
+                    offset=shard.offset,
+                ).reshape(shard.rows, shard.cols)
+                self._shards.append(tensor)
+        except Exception:
+            self.close()
+            raise
+
+    def gather(self, row_ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Copy valid rows into a CPU buffer; invalid IDs produce zeros."""
+        ids = row_ids.reshape(-1)
+        if ids.device.type != "cpu" or ids.dtype != torch.int64:
+            raise ValueError("mmap PLE row ids must be a CPU int64 tensor")
+        expected = (ids.numel(), self.head_dim)
+        if out.device.type != "cpu" or out.dtype != torch.uint8 or tuple(out.shape) != expected:
+            raise ValueError(
+                f"mmap PLE output must be CPU uint8 {expected}, got {out.device} "
+                f"{out.dtype} {tuple(out.shape)}"
+            )
+        out.zero_()
+        if ids.numel() == 0:
+            return out
+
+        valid = (ids >= 0) & (ids < self.num_rows)
+        positions = valid.nonzero().reshape(-1)
+        if positions.numel() == 0:
+            return out
+        valid_ids = ids.index_select(0, positions)
+        shard_ids = torch.div(valid_ids, self.rows_per_shard, rounding_mode="floor")
+        for shard_id in torch.unique(shard_ids).tolist():
+            in_shard = (shard_ids == shard_id).nonzero().reshape(-1)
+            dst_positions = positions.index_select(0, in_shard)
+            local_ids = valid_ids.index_select(0, in_shard).remainder(self.rows_per_shard)
+            rows = self._shards[shard_id].index_select(0, local_ids)
+            out.index_copy_(0, dst_positions, rows)
+        return out
+
+    def close(self) -> None:
+        self._shards.clear()
+        for mapping in self._maps.values():
+            mapping.close()
+        self._maps.clear()
+        for fh in self._files.values():
+            fh.close()
+        self._files.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class MmapPleTable:
+    """Mapped PLE storage and its FP8 scale."""
+
+    storage: MmapPleStorage
+    weight_scale: torch.Tensor
+
+
 _PLE_ST_DTYPE = "F8_E4M3"
 
 
@@ -222,15 +329,8 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
-def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
-    """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
-
-    The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
-    index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order, so the
-    bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
-    table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
-    """
+def _ple_layout(model_path: str, qwen4_args) -> PleLayout:
+    """Parse and validate the PLE shards."""
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
@@ -266,22 +366,60 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
+    shards = tuple(
+        PleShard(path=parts[i][0], offset=parts[i][1], nbytes=parts[i][2], rows=rows, cols=cols)
+        for i in range(expected)
+    )
     shard_bytes = rows * cols
-    bar = byte_bar(expected * shard_bytes, "Loading PLE table")
+    for shard_id, shard in enumerate(shards):
+        if shard.nbytes != shard_bytes:
+            raise ValueError(
+                f"PLE shard {shard_id} is {shard.nbytes} B, expected {shard_bytes}"
+            )
+    return PleLayout(
+        shards=shards,
+        weight_scale=scale,
+        rows_per_shard=rows,
+        head_dim=cols,
+    )
+
+
+def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
+                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
+    """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
+
+    The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
+    index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order, so the
+    bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
+    table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
+    """
+    layout = _ple_layout(model_path, qwen4_args)
+
+    bank = HostBank((len(layout.shards) * layout.rows_per_shard, layout.head_dim),
+                    torch.float8_e4m3fn)
+    bar = byte_bar(sum(shard.nbytes for shard in layout.shards), "Loading PLE table")
     try:
         buf = bank.memoryview()
-        for shard in range(expected):
-            path, offset, nbytes = parts[shard]
-            assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
+        dest_offset = 0
+        for shard in layout.shards:
+            read_range_into(buf, shard.path, file_offset=shard.offset, nbytes=shard.nbytes,
+                            dest_offset=dest_offset, workers=workers, chunk=chunk)
+            dest_offset += shard.nbytes
+            bar.update(shard.nbytes)
     finally:
         bar.close()
     if pin and torch.cuda.is_available():
         bank.pin()
-    return PleTable(bank=bank, weight_scale=scale)
+    return PleTable(bank=bank, weight_scale=layout.weight_scale)
+
+
+def load_mmap_ple_table(model_path: str, qwen4_args) -> MmapPleTable:
+    """Map the PLE safetensor ranges."""
+    layout = _ple_layout(model_path, qwen4_args)
+    return MmapPleTable(
+        storage=MmapPleStorage(layout),
+        weight_scale=layout.weight_scale,
+    )
 
 
 # ======================================================================================
@@ -320,9 +458,12 @@ def load_nvfp4_expert_sources_parallel(
 
 
 __all__ = [
+    "MmapPleStorage",
+    "MmapPleTable",
     "PleTable",
     "iter_weights",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
+    "load_mmap_ple_table",
     "load_ple_table",
 ]
