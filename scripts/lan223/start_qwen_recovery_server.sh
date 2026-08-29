@@ -25,6 +25,7 @@ readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
 readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
 readonly FP8_GEMV_NUM_WARPS="${FREETOKEN_FP8_GEMV_NUM_WARPS:-1}"
 readonly FP8_GEMV_SCALE_ACTIVATION="${FREETOKEN_FP8_GEMV_SCALE_ACTIVATION:-0}"
+readonly MOE_COLLECT_STATS="${FREETOKEN_MOE_COLLECT_STATS:-0}"
 readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/${RUN_ID}"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
@@ -62,6 +63,10 @@ case "${FP8_GEMV_SCALE_ACTIVATION}" in
     0|1) ;;
     *) echo "invalid FREETOKEN_FP8_GEMV_SCALE_ACTIVATION: ${FP8_GEMV_SCALE_ACTIVATION}" >&2; exit 2 ;;
 esac
+case "${MOE_COLLECT_STATS}" in
+    0|1) ;;
+    *) echo "invalid FREETOKEN_MOE_COLLECT_STATS: ${MOE_COLLECT_STATS}" >&2; exit 2 ;;
+esac
 mkdir -p "${ARTIFACT_DIR}"
 
 # These variables select the native ROCm toolchain and retain the existing HIP
@@ -89,6 +94,14 @@ export FREETOKEN_FP8_GEMV_BLOCK_N="${FP8_GEMV_BLOCK_N}"
 # one bounded variable rather than an implicit, inherited shell setting.
 export FREETOKEN_FP8_GEMV_NUM_WARPS="${FP8_GEMV_NUM_WARPS}"
 export FREETOKEN_FP8_GEMV_SCALE_ACTIVATION="${FP8_GEMV_SCALE_ACTIVATION}"
+
+# Cache counters are opt-in because their atomic updates are diagnostic work.
+# The default leaves the verified performance service unchanged, while an
+# isolated launch can enable a single post-workload read-only snapshot.
+EXTRA_ARGS=()
+if [[ "${MOE_COLLECT_STATS}" == "1" ]]; then
+    EXTRA_ARGS+=(--moe-collect-stats)
+fi
 
 # FreeToken's MoE offload path requires the in-tree pinned-tensor extension.
 # A clean git worktree does not contain generated shared objects, so verify the
@@ -133,6 +146,7 @@ nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" \
     --disable-pynccl \
     --disable-moe-prefill-overlap \
+    "${EXTRA_ARGS[@]}" \
     >"${LOG_FILE}" 2>&1 < /dev/null &
 
 # Persist the child PID for diagnostics and explicit shutdown after the run.
