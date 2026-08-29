@@ -27,6 +27,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-block-n", type=int)
     parser.add_argument("--probe-num-warps", type=int)
     parser.add_argument("--sequence-length", type=int, default=1024)
+    parser.add_argument("--kv-heads", type=int, default=8)
+    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--sliding-window", type=int, default=1024, help="zero means full attention")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repetitions", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260829)
@@ -55,7 +58,9 @@ def main() -> int:
         raise ValueError("sequence length, warmup, and repetitions must be positive")
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
-    batch, query_heads, kv_heads, head_dim, splits = 1, 16, 8, 256, 8
+    batch, query_heads, kv_heads, head_dim, splits = 1, 16, args.kv_heads, args.head_dim, 8
+    if query_heads % kv_heads:
+        raise ValueError("--kv-heads must divide Gemma's 16 query heads")
     q = torch.randn(batch, query_heads, head_dim, dtype=torch.bfloat16, device=device)
     k = torch.randn(args.sequence_length, kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
@@ -69,7 +74,9 @@ def main() -> int:
     def call(probe_h: int | None, probe_n: int | None, probe_warps: int | None) -> torch.Tensor:
         return decode_paged_attention(
             q, k, v, indptr, indices, positions, mid_o, mid_lse, num_splits,
-            splits, head_dim**-0.5, sliding_window=1024, rocm_block_h_probe=probe_h,
+            splits, head_dim**-0.5,
+            sliding_window=args.sliding_window or None,
+            rocm_block_h_probe=probe_h,
             rocm_block_n_probe=probe_n, rocm_num_warps_probe=probe_warps,
         )
 
@@ -84,6 +91,7 @@ def main() -> int:
         "hip": torch.version.hip,
         "geometry": {"q_heads": query_heads, "kv_heads": kv_heads, "head_dim": head_dim},
         "sequence_length": args.sequence_length,
+        "sliding_window": args.sliding_window or None,
         "probe_block_h": args.probe_block_h,
         "probe_block_n": args.probe_block_n,
         "probe_num_warps": args.probe_num_warps,
