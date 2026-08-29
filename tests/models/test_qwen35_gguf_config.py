@@ -49,6 +49,7 @@ def test_qwen35moe_gguf_metadata_maps_to_the_official_hybrid_geometry():
     assert (config.num_experts_per_tok, config.moe_intermediate_size) == (8, 512)
     assert config.rotary_config.rotary_dim == 64
     assert (config.expert_quant, config.moe_weight_format) == ("q4_k_q5_k", "q4_k_q5_k")
+    assert config.gguf_q6_down_layer_ids == ()  # metadata-only shim has no tensor table
 
     linear, full = config.attention_groups
     assert linear.layer_ids == tuple(index for index in range(40) if (index + 1) % 4)
