@@ -49,6 +49,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt", default=CANARY_PROMPT)
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default="none",
+        help="Qwen reasoning policy sent to FreeToken and retained in each artifact",
+    )
+    parser.add_argument(
         "--mode",
         choices=("quality", "throughput"),
         default="quality",
@@ -110,6 +116,10 @@ def stream_completion(
         # These are FreeToken request fields, not an OpenAI SDK extension wrapper.
         # Sending them at the top level mirrors benchmarks/bench_decode_moe.py.
         "top_k": 1,
+        # Qwen otherwise may emit its optional reasoning stream until the token
+        # cap. A fixed explicit policy keeps a final-answer quality canary and
+        # a decode-TPS run comparable across retries.
+        "reasoning_effort": args.reasoning_effort,
     }
     if args.mode == "throughput":
         # Fixed-length generation makes the decode interval independent of EOS.
@@ -200,6 +210,7 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": 1,
+            "reasoning_effort": args.reasoning_effort,
             "ignore_eos": args.mode == "throughput",
         },
         "timing": {
