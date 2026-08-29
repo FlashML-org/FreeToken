@@ -1004,7 +1004,15 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 }
 
 static __device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
-#if __has_builtin(__builtin_amdgcn_sdot4)
+#if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1150__) || defined(__gfx1151__))
+  // RDNA3-family HIP compilers can lower the signed-dot form through sudot4.
+  // The two `true` operand flags preserve the signed four-byte dot-product
+  // semantics of sdot4, while matching the intrinsic selection in the current
+  // llama.cpp HIP implementation.  This branch is intentionally limited to
+  // gfx1100/gfx1150/gfx1151 so older AMD targets and every CUDA build retain
+  // their proven implementation below.
+  c = __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#elif __has_builtin(__builtin_amdgcn_sdot4)
   c = __builtin_amdgcn_sdot4(a, b, c, false);
 #else
   const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
