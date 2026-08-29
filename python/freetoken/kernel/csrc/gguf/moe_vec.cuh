@@ -66,19 +66,6 @@ static void moe_vec_q4_0_q8_1_hip_two_rows_cuda(
     const int nrows,
     const int token_stride,
     cudaStream_t stream);
-
-template <typename scalar_t>
-static void moe_vec_q4_0_q8_1_hip_route_group8_cuda(
-    const void* vx,
-    const void* vy,
-    scalar_t* dst,
-    const int* topk_ids,
-    const int top_k,
-    const int tokens,
-    const int ncols,
-    const int nrows,
-    const int token_stride,
-    cudaStream_t stream);
 #endif
 
 template <typename scalar_t>
@@ -94,10 +81,10 @@ static void moe_vec_q4_0_q8_1_cuda(
     const int token_stride,
     cudaStream_t stream) {
 #if defined(USE_ROCM)
-  // Route AMD builds through the grouped-route specialization. CUDA retains
-  // the established generic implementation until it has independent NVIDIA
-  // evidence, so this HIP experiment cannot alter CUDA behavior.
-  moe_vec_q4_0_q8_1_hip_route_group8_cuda<scalar_t>(
+  // Route AMD builds through the one-wave/two-row specialization above.  CUDA
+  // retains the established generic implementation until it has independent
+  // NVIDIA evidence, so this HIP experiment cannot alter CUDA behavior.
+  moe_vec_q4_0_q8_1_hip_two_rows_cuda<scalar_t>(
       vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
 #else
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -188,85 +175,6 @@ static void moe_vec_q4_0_q8_1_hip_two_rows_cuda(
   const dim3 block_dims(WARP_SIZE, 1, 1);
   moe_vec_q4_0_hip_two_rows<scalar_t>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
-}
-
-// Current llama.cpp's dedicated MMVQ MoE path groups the routed-token axis as
-// one wave per route inside a multi-wave workgroup.  FreeToken's original
-// launcher put every route in a separate 32-thread workgroup.  This HIP-only
-// variant retains the accepted two-output-row arithmetic above, but groups up
-// to eight routes so the gfx1151 scheduler sees the same route-axis shape as
-// llama.cpp.  Each wave remains independent, so no inter-route synchronization
-// or shared-memory reduction is required.
-template <typename scalar_t>
-__launch_bounds__(WARP_SIZE * 8, 1)
-static __global__ void moe_vec_q4_0_hip_route_group8(
-    const void* __restrict__ vx,
-    const void* __restrict__ vy,
-    scalar_t* __restrict__ dst,
-    const int* __restrict__ topk_ids,
-    const int topk,
-    const int routes,
-    const int ncols,
-    const int nrows,
-    const int token_stride) {
-  const int row0 = 2 * blockIdx.x;
-  const int route = blockIdx.y * blockDim.y + threadIdx.y;
-  if (row0 >= nrows || route >= routes) {
-    return;
-  }
-
-  const int token = route / topk;
-  const int expert = topk_ids[route];
-  const int blocks_per_row = ncols / QK4_0;
-  const int blocks_per_wave = VDR_Q4_0_Q8_1_MMVQ * WARP_SIZE / QI4_0;
-  const block_q4_0* x = ((const block_q4_0*)vx) + expert * nrows * blocks_per_row;
-  const block_q8_1* y = (const block_q8_1*)(((const int*)vy) + token * token_stride);
-  float tmp0 = 0.0f;
-  float tmp1 = 0.0f;
-
-  for (int i = threadIdx.x / (QI4_0 / VDR_Q4_0_Q8_1_MMVQ); i < blocks_per_row;
-       i += blocks_per_wave) {
-    const int iby = i * (QK4_0 / QK8_1);
-    const int iqs = VDR_Q4_0_Q8_1_MMVQ * (threadIdx.x % (QI4_0 / VDR_Q4_0_Q8_1_MMVQ));
-    tmp0 += vec_dot_q4_0_q8_1(&x[row0 * blocks_per_row + i], &y[iby], iqs);
-    if (row0 + 1 < nrows) {
-      tmp1 += vec_dot_q4_0_q8_1(&x[(row0 + 1) * blocks_per_row + i], &y[iby], iqs);
-    }
-  }
-
-  // ROCm's shuffle is wave scoped.  This reduces only lanes in the current
-  // route wave even though the workgroup contains up to eight such waves.
-#pragma unroll
-  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-    tmp0 += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp0, mask);
-    tmp1 += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp1, mask);
-  }
-  if (threadIdx.x == 0) {
-    dst[route * nrows + row0] = tmp0;
-  }
-  if (threadIdx.x == 1 && row0 + 1 < nrows) {
-    dst[route * nrows + row0 + 1] = tmp1;
-  }
-}
-
-template <typename scalar_t>
-static void moe_vec_q4_0_q8_1_hip_route_group8_cuda(
-    const void* vx,
-    const void* vy,
-    scalar_t* dst,
-    const int* topk_ids,
-    const int top_k,
-    const int tokens,
-    const int ncols,
-    const int nrows,
-    const int token_stride,
-    cudaStream_t stream) {
-  constexpr int routes_per_block = 8;
-  const int routes = tokens * top_k;
-  const dim3 block_nums((nrows + 1) / 2, (routes + routes_per_block - 1) / routes_per_block, 1);
-  const dim3 block_dims(WARP_SIZE, routes_per_block, 1);
-  moe_vec_q4_0_hip_route_group8<scalar_t><<<block_nums, block_dims, 0, stream>>>(
-      vx, vy, dst, topk_ids, top_k, routes, ncols, nrows, token_stride);
 }
 #endif
 
