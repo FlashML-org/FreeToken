@@ -179,9 +179,15 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     native = decode_target == "cpu"
     backend = None
     if not native:
+        # Effective ROUTED-expert activation, not the raw hidden_act: a config carrying
+        # swiglu_limit (GLM-5.3) serves clamped swiglu, which only the Triton kernels
+        # implement -- marlin/b12x hard-code plain silu and must not be selected.
+        _act = getattr(model_config, "hidden_act", "silu")
+        if getattr(model_config, "swiglu_limit", None):
+            _act = "swiglu_clamp"
         backend = select_nvfp4_backend(device, getattr(model_config, "moe_intermediate_size", None),
                                        getattr(model_config, "nvfp4_backend", "auto"),
-                                       activation=getattr(model_config, "hidden_act", "silu"))
+                                       activation=_act)
         native = backend == "triton"
 
     repack_sink = None

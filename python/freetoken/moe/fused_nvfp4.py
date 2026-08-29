@@ -46,6 +46,13 @@ def _run_act(
     if activation == "swigluoai":
         swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
         return
+    if activation == "swiglu_clamp":
+        # GLM-5.3: silu(min(gate, limit)) * clamp(up, -limit, limit) -- the dsv4 fused
+        # kernel implements exactly this (verified bit-exact vs the HF formula).
+        from freetoken.kernel.triton.dsv4.fused_moe import fused_swiglu
+
+        out.copy_(fused_swiglu(gate_up, act_limit))
+        return
     _ACT[activation](gate_up, out)
 
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,

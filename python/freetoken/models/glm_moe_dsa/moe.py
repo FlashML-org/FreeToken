@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
+import os as _os
+
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
@@ -40,15 +42,23 @@ class GlmMoeDsaSparseBlock(BaseOP):
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
         # first_k_dense_replace), matching how the loader packs the expert banks.
-        self.experts = make_moe_layer(
-            config,
-            layer_id=layer_id - config.first_k_dense_replace,
-            renormalize=config.norm_topk_prob,
-        )
+        # Subclasses (glm5_next: resident split) override _make_experts.
+        self.experts = self._make_experts(config, layer_id)
         self.shared_experts = GlmDsaGatedMLP(
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
             quant=config.dense_quant,
+        )
+
+    def _make_experts(self, config: ModelConfig, layer_id: int):
+        return make_moe_layer(
+            config,
+            layer_id=layer_id - config.first_k_dense_replace,
+            renormalize=config.norm_topk_prob,
+            # GLM-5.3 experts clamp swiglu at config.swiglu_limit (GLM-5.2: None -> silu).
+            # Only the Triton NVFP4 kernels honor the limit, so backend auto resolves there
+            # (marlin/b12x hard-code plain silu and are rejected for this kind).
+            activation="swiglu_clamp" if getattr(config, "swiglu_limit", None) else "silu",
         )
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
@@ -64,6 +74,15 @@ class GlmMoeDsaSparseBlock(BaseOP):
     def _route(self, hidden_states: torch.Tensor) -> TopK:
         # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        if self.n_group <= 1 and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1":
+            # tail-fusion (2026-08-28): sigmoid/+bias/topk/gather/renorm/cast chain
+            # (~8 launches) -> one kernel. Same math; see fused_route docstring.
+            from freetoken.kernel.triton.fused_route import fused_route
+
+            return fused_route(
+                logits, self.e_score_correction_bias, self.top_k,
+                self.norm_topk_prob, self.routed_scaling_factor,
+            )
         scores = logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias.float()
         if self.n_group > 1:
@@ -76,6 +95,9 @@ class GlmMoeDsaSparseBlock(BaseOP):
         return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        import os as _os
+        if _os.environ.get("FREETOKEN_GLM5_STUB_MOE", "0") == "1":  # ablation timing only
+            return torch.zeros_like(hidden_states)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         topk_weights, topk_ids = self._route(hidden_states)
