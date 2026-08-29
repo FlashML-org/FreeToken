@@ -1066,3 +1066,53 @@ git diff --check
 The port's HIP gate tests are retained under `tests/utils/test_rocm_runtime.py`.
 The live end-to-end checks above are the required full-model validation for
 this change.
+
+## Clean-host ROCm 10 comparison after I/O remediation
+
+The earlier five-run comparison was repeated after the two identified
+user-space filesystem scans had been stopped with the operator's explicit
+authorization.  This is the decision-quality comparison: it uses the same
+LAN-223 `gfx1151` device, ROCm 10 runtime, 14 GB Gemma 4 26B A4B Q4_0 GGUF,
+cached AIME-25 problem 0, greedy OpenAI-compatible streamed request, and
+128-token generation limit on each runner.  Every scored sample starts a
+fresh server, makes one excluded warm request, then makes one scored request.
+Decode TPS is `(completion_tokens - 1)` divided by the client-observed time
+between the first and last text SSE events.
+
+FreeToken uses its accepted native HIP configuration: offload backend, 4,096
+expert-cache slots, 8,320-token KV pool, 0.50 memory ratio, and graph batch
+size 1.  llama.cpp uses its fixed ROCm 10 `b10141` release with all layers on
+the GPU (`-ngl 999`), `-c 8320`, one parallel slot, and Flash Attention on.
+Both use loopback only and no production service was enabled.
+
+| Runtime | Five decode TPS samples | Mean TPS | Median TPS | Mean TTFT | Median p99 event gap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FreeToken native HIP | 60.25, 60.20, 60.17, 60.13, 60.33 | 60.21 | 60.20 | 250.0 ms | 17.74 ms |
+| llama.cpp `b10141` ROCm 10 HIP | 60.24, 60.50, 62.25, 61.71, 61.83 | 61.31 | 61.71 | 113.3 ms | 16.88 ms |
+
+All five FreeToken completions had hash `abeee5e73e89`; all five llama.cpp
+completions had hash `63a18854de72`.  The two hashes are intentionally not
+compared to each other because the independent implementations render their
+chat templates and tokenize internally.  They establish deterministic output
+within each runner.  llama.cpp leads by 1.8 percent on the five-run mean and
+2.5 percent on the median decode rate.  FreeToken's mean warm TTFT is 120.6
+percent higher.  Therefore the AMD port is proven functional and stable but
+does not yet meet the requested requirement to match or exceed the optimized
+llama.cpp control.
+
+The raw, per-run result and server-log bundles remain on LAN-223:
+
+```text
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/clean-host-freetoken-matrix-20260829T030633Z/
+/home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/clean-host-llamacpp-matrix-20260829T031840Z/
+```
+
+The llama.cpp bundle records zero blocked (`D`) processes before and after all
+five samples.  The FreeToken bundle was generated after the same scan removal
+and has a 0.08 TPS standard deviation, so it is the more stable side of this
+matrix.  The remaining performance investigation should prioritize the
+observed HIP decode hot spots already captured by rocprof: Q4 MoE vector
+decode first, then dense Q4 and Q6_K matrix-vector kernels.  New candidates
+must retain deterministic API output and be accepted only when a five-fresh-
+server clean-host matrix matches or exceeds the llama.cpp median, rather than
+on an isolated best run.
