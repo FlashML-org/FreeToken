@@ -3,7 +3,11 @@
 // Lets pinned_tensor.cpp and cpu_moe_ext.cpp call the CUDA Runtime API names they
 // were written against while actually linking HIP on ROCm builds. Only the calls
 // those two files use are covered -- this is not a general CUDA/HIP compat layer.
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+// Host C++ extension compilation can use a normal C++ frontend even when the
+// active PyTorch distribution is ROCm. setup.py therefore supplies the explicit
+// FREETOKEN_USE_ROCM build macro, while the compiler macros retain compatibility
+// with HIP device translation units and standalone hipcc builds.
+#if defined(FREETOKEN_USE_ROCM) || defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include <hip/hip_runtime_api.h>
 
 // CUDA's host-callback calling-convention annotation; empty on POSIX (matches
