@@ -44,3 +44,7 @@ for _ in {1..480}; do
 done
 grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log"
 curl -fsS "http://127.0.0.1:${TEST_PORT}/health" >"${ARTIFACT_DIR}/health.json"
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_text.py \
+    --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+    --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
+    >"${ARTIFACT_DIR}/quality.log" 2>&1
