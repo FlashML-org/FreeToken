@@ -35,20 +35,19 @@ restore_production() {
     fi
     if ! production_ready; then
         recovered=0
-        for _ in {1..3}; do
-            bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
-                | tee -a "${ARTIFACT_DIR}/recovery.log" || true
-            for _ in {1..20}; do
-                # Qwen can answer HTTP health while its model is still
-                # loading. Require the authoritative ready status before this
-                # isolated benchmark considers production restored.
-                production_ready && {
-                    recovered=1
-                    break 2
-                }
-                sleep 1
-            done
-            sleep 10
+        # Start only once. The serial NVFP4 Qwen load on LAN-223 lasts minutes;
+        # retrying its launcher after the listener exists merely reports a
+        # refusal and shortens the useful ready-status wait.
+        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+            | tee -a "${ARTIFACT_DIR}/recovery.log" || true
+        # Keep the benchmark process alive until Qwen is actually serving, up
+        # to the known cold-start envelope, not merely until health answers.
+        for _ in {1..480}; do
+            production_ready && {
+                recovered=1
+                break
+            }
+            sleep 1
         done
         [[ "${recovered}" == "1" ]] || echo "WARNING: Qwen recovery did not become reachable" >&2
     fi
