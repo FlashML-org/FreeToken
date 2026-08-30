@@ -35,9 +35,12 @@ test -f "${SUITE}"
 
 # Do not start an endurance-style workload from an already degraded memory
 # state. Swap is a failure signal for this campaign, not a performance cache.
+# Ubuntu can immediately fault one bookkeeping page after a clean swap reset,
+# so permit at most 64 KiB. Any larger value is treated as real pressure.
 total_swap="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
 free_swap="$(awk '/SwapFree/ {print $2}' /proc/meminfo)"
-if [[ "${total_swap}" != "${free_swap}" ]]; then
+used_swap_kb=$((total_swap - free_swap))
+if (( used_swap_kb > 64 )); then
     echo "refusing multi-turn battery with swap in use" >&2
     exit 2
 fi

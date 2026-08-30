@@ -167,6 +167,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('refusing multi-turn battery with swap in use', contents)
+        self.assertIn('if (( used_swap_kb > 64 )); then', contents)
         self.assertIn('"requested_sessions": expected', contents)
 
 
