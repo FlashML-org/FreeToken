@@ -145,6 +145,20 @@ class DpmPolicyWrapperTests(unittest.TestCase):
         self.assertNotIn('mkdir -p "${BENCHMARK_DIR}"', contents)
 
 
+class QwenRecoveryContextTests(unittest.TestCase):
+    """Protect the recovery server's validated long-context cache allocation."""
+
+    def test_recovery_reserves_the_advertised_8192_token_context(self) -> None:
+        """A restart must not silently shrink the usable cache back to 2,068 tokens."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        recovery = repository_root / "scripts" / "lan223" / "start_qwen_recovery_server.sh"
+        contents = recovery.read_text(encoding="utf-8")
+
+        self.assertIn('readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"', contents)
+        self.assertIn('--kv-reserve-tokens "${KV_RESERVE_TOKENS}"', contents)
+
+
 class LlamaCppControlScriptTests(unittest.TestCase):
     """Protect the isolated ROCm llama.cpp control lifecycle and workload reuse."""
 
