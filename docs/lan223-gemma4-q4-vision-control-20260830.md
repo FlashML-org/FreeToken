@@ -100,6 +100,23 @@ that the current native FreeToken ROCm/HIP path exceeds the matched llama.cpp
 decode rate for that bounded control, but it does not establish a general
 long-output advantage.
 
+## Long visual response boundary
+
+The deterministic split-color fixture was extended to require a 45 to 65 word
+visible description containing the colors and their left-to-right arrangement.
+FreeToken passed this quality gate with 51 visible words, 63 completion tokens,
+1,093.83 ms TTFT, and 53.87 completion tokens per second over a 1.169 s
+stream window. Its artifact is
+`/home/david/freetoken-amd/artifacts/gemma4-gguf-vision-20260830T055500Z`.
+
+The matched ROCm 10 llama.cpp model recognized the same image correctly but
+placed every generated token in `reasoning_content`, leaving visible `content`
+empty. This remained true at both 512 and 1,024 completion-token caps. The
+1,024-token diagnostic reached 55.91 generated tokens per second but failed
+the visible-output quality gate, so it is not comparable to FreeToken's 53.87
+visible-output TPS. This is a response-format/API-contract limitation of this
+llama.cpp Gemma invocation, not evidence that it failed visual understanding.
+
 ## Recovery-contract result
 
 The final isolated FreeToken vision run is
