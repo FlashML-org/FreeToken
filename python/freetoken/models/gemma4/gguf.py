@@ -12,6 +12,7 @@ through the native-Q4_0 offload-cache path.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -169,6 +170,62 @@ def _to_bf16(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
     return flat.reshape(t.shape)
+
+
+def find_gemma4_mmproj(model_path: str) -> str | None:
+    """Return the unique sibling Gemma4 projector GGUF, when the release supplies one.
+
+    Text GGUF releases keep the 1.2 GiB vision tower in a separate file whose name
+    includes ``mmproj``.  Text-only loading deliberately never calls this helper;
+    vision setup calls it only after the explicit ``FREETOKEN_LOAD_VISION`` opt-in.
+    A missing or ambiguous sibling remains an error for the caller to report with
+    the model path, rather than silently loading arbitrary GGUF content.
+    """
+    directory = os.path.dirname(model_path)
+    candidates = sorted(
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if name.endswith(".gguf") and "mmproj" in name.lower()
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def gemma4_mmproj_param_name(source_name: str) -> str | None:
+    """Map one llama.cpp Gemma4 projector tensor name to FreeToken's module key."""
+    if source_name == "mm.input_projection.weight":
+        return "embed_vision.embedding_projection.weight"
+    if source_name == "v.patch_embd.weight":
+        return "vision_tower.patch_embedder.input_proj.weight"
+    if source_name == "v.position_embd.weight":
+        return "vision_tower.patch_embedder.position_embedding_table"
+    if source_name == "v.std_bias":
+        return "vision_tower.std_bias"
+    if source_name == "v.std_scale":
+        return "vision_tower.std_scale"
+    if not source_name.startswith("v.blk."):
+        return None
+    prefix, suffix = source_name.rsplit(".", 1)[0], source_name.rsplit(".", 1)[1]
+    parts = prefix.split(".")
+    if len(parts) != 3 or not parts[1].isdigit() or suffix != "weight":
+        return None
+    layer = parts[1]
+    remap = {
+        "ln1": "input_layernorm.weight",
+        "ln2": "pre_feedforward_layernorm.weight",
+        "attn_post_norm": "post_attention_layernorm.weight",
+        "ffn_post_norm": "post_feedforward_layernorm.weight",
+        "attn_q_norm": "self_attn.q_norm.weight",
+        "attn_k_norm": "self_attn.k_norm.weight",
+        "attn_q": "self_attn.q_proj.weight",
+        "attn_k": "self_attn.k_proj.weight",
+        "attn_v": "self_attn.v_proj.weight",
+        "attn_out": "self_attn.o_proj.weight",
+        "ffn_gate": "mlp.gate_proj.weight",
+        "ffn_up": "mlp.up_proj.weight",
+        "ffn_down": "mlp.down_proj.weight",
+    }
+    mapped = remap.get(parts[2])
+    return f"vision_tower.encoder.layers.{layer}.{mapped}" if mapped else None
 
 
 def _require_tp1(what: str) -> None:
