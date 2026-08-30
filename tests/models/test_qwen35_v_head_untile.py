@@ -142,8 +142,10 @@ def _build(path) -> None:
         gate = np.repeat(TILED_TAGS, V_HEAD_DIM)[:, None] * np.ones((1, HID), dtype=np.float32)
         _q8(w, p + "attn_gate.weight", gate)
 
-        # attn_qkv is q|k|v: only the trailing V rows are reordered.
-        qk = rng.standard_normal((2 * KEY_DIM, HID))
+        # attn_qkv is q|k|v: only the trailing V rows are reordered. Give q/k rows their
+        # own stable tags so the test proves the adapter did not move them accidentally.
+        qk_tags = np.arange(1, 2 * KEY_DIM + 1, dtype=np.float32)
+        qk = qk_tags[:, None] * np.ones((1, HID), dtype=np.float32)
         vpart = np.repeat(TILED_TAGS, V_HEAD_DIM)[:, None] * np.ones((1, HID), dtype=np.float32)
         _q8(w, p + "attn_qkv.weight", np.concatenate([qk, vpart], axis=0))
 
@@ -152,9 +154,16 @@ def _build(path) -> None:
         # F32 on purpose: ssm_out needs its COLUMNS un-tiled, which cannot be done on
         # packed blocks, so the quantized path routes through a CUDA-only dense dequant
         # and the load would need a GPU. Unquantized keeps this suite CPU-only.
-        _f32(w, p + "ssm_out.weight", rng.standard_normal((HID, VALUE_DIM)))
+        out_cols = np.ones((HID, 1), dtype=np.float32) * np.repeat(
+            TILED_TAGS, V_HEAD_DIM
+        )[None, :]
+        _f32(w, p + "ssm_out.weight", out_cols)
         _f32(w, p + "ssm_norm.weight", rng.standard_normal((V_HEAD_DIM,)))
-        _f32(w, p + "ssm_conv1d.weight", rng.standard_normal((CONV_DIM, CONV_K)))
+        conv_qk = rng.standard_normal((2 * KEY_DIM, CONV_K))
+        conv_v = np.repeat(TILED_TAGS, V_HEAD_DIM)[:, None] * np.ones(
+            (1, CONV_K), dtype=np.float32
+        )
+        _f32(w, p + "ssm_conv1d.weight", np.concatenate([conv_qk, conv_v], axis=0))
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
@@ -181,7 +190,9 @@ def weights(tmp_path_factory):
     return dict(
         getattr(mod, spec.iter_weights)(
             str(path), torch.device("cpu"),
-            include_moe_experts=False, include_non_moe=True,
+            # A dense Qwen3.5/3.8 load asks for all resident weights. Keep the fixture on
+            # that production contract instead of the MoE/offload-only call shape.
+            include_moe_experts=True, include_non_moe=True,
         )
     )
 
@@ -239,6 +250,15 @@ def test_in_proj_z_half_is_regrouped(weights):
     assert got == list(range(V_HEADS)), f"in_proj z half still tiled: {got}"
 
 
+def test_in_proj_qkv_v_rows_are_regrouped(weights):
+    """attn_qkv contributes q|k|v; only its trailing V-head blocks must move."""
+    key = "model.layers.0.linear_attn.in_proj"
+    name = f"{key}.qweight" if f"{key}.qweight" in weights else f"{key}.weight"
+    v = _rows_to_f32(weights[name], 2 * KEY_DIM, CONV_DIM, HID)
+    got = [round(float(v[i * V_HEAD_DIM][0])) for i in range(V_HEADS)]
+    assert got == list(range(V_HEADS)), f"in_proj qkv V rows still tiled: {got}"
+
+
 def test_in_proj_beta_and_alpha_are_regrouped(weights):
     """beta and alpha are one row per V head, immediately after the z half."""
     key = "model.layers.0.linear_attn.in_proj"
@@ -260,6 +280,42 @@ def test_qk_half_of_in_proj_is_left_alone(weights):
     assert t.shape[0] == CONV_DIM + VALUE_DIM + 2 * V_HEADS, (
         f"unexpected in_proj height {t.shape[0]}"
     )
+    qk = _rows_to_f32(t, 0, 2 * KEY_DIM, HID)
+    got = [round(float(row[0])) for row in qk]
+    assert got == list(range(1, 2 * KEY_DIM + 1)), f"q/k rows were moved: {got}"
+
+
+def test_conv1d_v_channels_are_regrouped(weights):
+    """conv1d channels are q|k|v, so only the trailing V channel blocks move."""
+    w = weights["model.layers.0.linear_attn.conv1d.weight"]
+    assert w.shape == (CONV_DIM, 1, CONV_K)
+    v = w[2 * KEY_DIM :, 0, :].float()
+    got = [round(float(v[i * V_HEAD_DIM][0])) for i in range(V_HEADS)]
+    assert got == list(range(V_HEADS)), f"conv1d V channels still tiled: {got}"
+
+
+def test_out_proj_v_columns_are_regrouped(weights):
+    """ssm_out consumes V heads along columns, unlike every row-wise packed group."""
+    key = "model.layers.0.linear_attn.out_proj"
+    name = f"{key}.qweight" if f"{key}.qweight" in weights else f"{key}.weight"
+    w = _rows_to_f32(weights[name], 0, HID, VALUE_DIM)
+    assert w.shape == (HID, VALUE_DIM)
+    got = [round(float(w[0, i * V_HEAD_DIM])) for i in range(V_HEADS)]
+    assert got == list(range(V_HEADS)), f"out_proj V columns still tiled: {got}"
+
+
+def test_q8_requantization_is_bounded_and_preserves_values():
+    """The memory-safe ssm_out path keeps only Q8_0 and has ordinary Q8 error."""
+    from freetoken.models.qwen3_5_moe import gguf as qwen_gguf
+
+    source = torch.linspace(-5.0, 5.0, steps=2 * 64, dtype=torch.float32).reshape(2, 64)
+    source[0, :32] = 0  # pin the zero-scale edge case
+    packed = qwen_gguf._requant_q8_0(source)
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (2, 2 * 34)
+
+    decoded = _rows_to_f32(packed, 0, 2, 64)
+    torch.testing.assert_close(decoded, source, rtol=0, atol=0.04)
 
 
 def test_untile_is_not_applied_when_k_equals_v():

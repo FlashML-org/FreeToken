@@ -51,6 +51,7 @@ from freetoken.models.gguf.dequant import (
     GGML_NAME,
     GGML_Q4_K,
     GGML_Q6_K,
+    GGML_Q8_0,
     dequantize,
     row_bytes,
 )
@@ -409,28 +410,46 @@ def _to_bf16(t) -> torch.Tensor:
     return flat.reshape(t.shape)
 
 
-def _dequant_any(t) -> torch.Tensor:
-    """Dequantize a GgufTensor of ANY ggml type to dense bf16, via the CUDA kernel.
-
-    The pure-torch ``dequantize`` in models/gguf/dequant.py implements only Q4_0 and Q6_K
-    (it is the reference/test path). ``ggml_dequantize`` covers all 19 quant types, so use
-    it for the one tensor that genuinely has to be materialized dense -- ssm_out, whose
-    columns need un-tiling. Round-trips through the GPU; the result is a CPU tensor so the
-    normal load path places it.
-    """
+def _dequant_any(t, device) -> torch.Tensor:
+    """Dequantize any ggml type on ``device`` for a bounded load-time transform."""
     from freetoken.kernel.gguf import ggml_dequantize
 
     if t.ggml_type in GGML_UNQUANTIZED_SET:
-        return _to_bf16(t)
-    if not torch.cuda.is_available():
+        return _to_f32(t).to(device)
+    if device.type == "cpu":
         raise RuntimeError(
             f"{t.name}: needs dense dequantization of ggml type "
             f"{GGML_NAME.get(t.ggml_type, t.ggml_type)}, which only the CUDA kernel "
-            f"implements, but no CUDA device is available"
+            f"implements, but the requested load device is CPU"
         )
     out_f, in_f = t.shape[0], t.shape[1]
-    packed = t.packed().reshape(out_f, row_bytes(in_f, t.ggml_type)).cuda()
-    return ggml_dequantize(packed, t.ggml_type, out_f, in_f, torch.bfloat16).cpu()
+    packed = t.packed().reshape(out_f, row_bytes(in_f, t.ggml_type)).to(device)
+    return ggml_dequantize(packed, t.ggml_type, out_f, in_f, torch.float32)
+
+
+def _requant_q8_0(w: torch.Tensor) -> torch.Tensor:
+    """Quantize dense ``[out, in]`` values to native Q8_0 packed rows.
+
+    ``ssm_out`` is the only user: its V-head permutation crosses the source quant's
+    column blocks. The dense matrix exists only while this function runs; the returned
+    resident tensor is about half the size of BF16.
+    """
+    out_features, in_features = w.shape
+    assert in_features % 32 == 0
+    blocks = w.reshape(out_features, in_features // 32, 32).float()
+    scales_f16 = (blocks.abs().amax(dim=-1, keepdim=True) / 127.0).to(torch.float16)
+    divisors = torch.where(
+        scales_f16 != 0,
+        scales_f16.float(),
+        torch.ones_like(scales_f16, dtype=torch.float32),
+    )
+    codes = torch.round(blocks / divisors).clamp_(-127, 127).to(torch.int8)
+    raw = torch.empty(
+        out_features, in_features // 32, 34, dtype=torch.uint8, device=w.device
+    )
+    raw[:, :, :2] = scales_f16.view(torch.uint8)
+    raw[:, :, 2:] = codes.view(torch.uint8)
+    return raw.reshape(out_features, in_features // 32 * 34)
 
 
 def _to_f32(t) -> torch.Tensor:
@@ -746,14 +765,13 @@ def iter_gguf_weights(
             elif suffix == "ssm_out.weight":
                 # out_proj consumes the V dimension along its COLUMNS, and llama.cpp tiled
                 # those columns. A column permutation cannot be done on packed data -- a
-                # 128-wide head straddles the 256-element quant blocks -- so this one tensor
-                # is dequantized to dense bf16. Cost: out*in*2 bytes per GDN layer
-                # (2048*4096*2 = 16 MiB, ~503 MiB over 30 layers). convert_qwen35_to_gguf
-                # therefore leaves linear_attn.out_proj as a dense Linear.
-                w = _dequant_any(t)
+                # 128-wide head straddles the 256-element quant blocks. Dequantize on the
+                # load device, un-tile, then immediately requantize to Q8_0. Keeping BF16
+                # resident would cost 2.8125 GiB over Qwen3.8's 48 GDN layers.
+                w = _dequant_any(t, device)
                 if _untile:
                     w = _ungroup_v(w, 1, _vK, _vR, _vD)
-                yield f"{base}.linear_attn.out_proj.weight", w
+                yield f"{base}.linear_attn.out_proj.qweight", _requant_q8_0(w)
             else:
                 continue  # unmapped for GDN layers
 
@@ -916,10 +934,13 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
                 ],
                 has_bias=False,
             )
-            # linear_attn.out_proj is deliberately NOT swapped: its columns index the
-            # V-head dimension, which llama.cpp tiled, and un-tiling columns needs dense
-            # values (a 128-wide head straddles the quant blocks). iter_gguf_weights yields
-            # it as dense bf16 ".weight", so the constructed Linear must stay dense.
+            # The source column permutation crosses packed blocks. The iterator performs
+            # a bounded dequantize -> un-tile -> Q8_0 transform once at load, so the model
+            # keeps a packed projection rather than 60 MiB of BF16 per Qwen3.8 GDN layer.
+            value_dim = _g.num_value_heads * _g.value_head_dim
+            layer.linear_attn.out_proj = GGUFLinear(
+                value_dim, config.hidden_size, GGML_Q8_0, has_bias=False
+            )
 
         if not config.moe_enabled:
             # Dense qwen35: one SwiGLU MLP per layer (Qwen3_5DenseMLP), no routed experts
