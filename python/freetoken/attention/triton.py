@@ -152,9 +152,29 @@ class TritonAttentionBackend(BaseAttnBackend):
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+        # Sub-byte quantization packs several elements per byte: the cache's last
+        # axis is the packed byte count, not the logical head dim. Recover the
+        # logical extent and pass per-layer scales + layout to the kernels, which
+        # do the unpacking (see kernel/triton/attention.py:_load_kv).
+        quant = getattr(self.kvcache, "quant", None)
+        # pools without scale accessors (non-MHA backends) fall back to unquantized
+        _k_scale_fn = getattr(self.kvcache, "k_scale", None)
+        _v_scale_fn = getattr(self.kvcache, "v_scale", None)
+        k_scale = _k_scale_fn(layer_id) if _k_scale_fn else None
+        v_scale = _v_scale_fn(layer_id) if _v_scale_fn else None
+        layout = "q8"
+        if k_scale is not None:
+            # pool returns [pages, page_size, heads, D // block]; the kernels
+            # want the slot-collapsed [slots, heads, D // block]
+            k_scale = k_scale.reshape(-1, k_scale.shape[-2], k_scale.shape[-1])
+            v_scale = v_scale.reshape(-1, v_scale.shape[-2], v_scale.shape[-1])
+        if quant is not None and quant.enabled:
+            layout = quant.layout
+            if quant.bits < 8:
+                head_dim = head_dim * 8 // quant.bits
         assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        k_cache = k_raw.view(-1, kv_heads, k_raw.shape[-1])
+        v_cache = v_raw.view(-1, kv_heads, v_raw.shape[-1])
 
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
@@ -181,6 +201,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                layout=layout,
             )
         if (
             (not metadata.is_decode)
@@ -201,6 +224,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale,
+                v_scale=v_scale,
+                layout=layout,
             )
         return paged_attention(
             q=q,
@@ -213,6 +239,9 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            layout=layout,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
