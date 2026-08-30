@@ -43,21 +43,22 @@ restore_production() {
         # checkout. Verify its observable health result rather than treating a
         # background PID or an artifact-directory print as successful recovery.
         local recovered=0
-        for _ in {1..3}; do
-            bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
-                | tee -a "${ARTIFACT_DIR}/recovery.log" || true
-            for _ in {1..20}; do
-                # A 200 response is not sufficient: FreeToken exposes health
-                # while the model remains in its loading state. Reuse the
-                # status-aware predicate so the protected service is actually
-                # ready before this runner reports cleanup complete.
-                production_ready && {
-                    recovered=1
-                    break 2
-                }
-                sleep 1
-            done
-            sleep 10
+        # Launch exactly once. Qwen takes several minutes to load its three
+        # serial NVFP4 expert groups on LAN-223. Retrying the launcher while
+        # its listener already exists only produces a misleading refusal and
+        # wastes the short recovery window.
+        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+            | tee -a "${ARTIFACT_DIR}/recovery.log" || true
+        # The protected model normally needs roughly six to eight minutes from
+        # a cold recovery. Wait a bounded eight minutes for the authoritative
+        # ready status, rather than mistaking a temporary loading response for
+        # success or declaring a healthy in-progress recovery a failure.
+        for _ in {1..480}; do
+            production_ready && {
+                recovered=1
+                break
+            }
+            sleep 1
         done
         [[ "${recovered}" == "1" ]] || echo "WARNING: Qwen recovery did not become reachable" >&2
     fi
