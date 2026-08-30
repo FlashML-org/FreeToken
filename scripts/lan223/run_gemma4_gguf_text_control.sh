@@ -33,9 +33,29 @@ restore_production() {
             kill -0 "${test_pid}" 2>/dev/null || break
             sleep 1
         done
+        # The port owner can exit before HIP finishes tearing down its GPU
+        # context. Give ROCm a bounded grace period before Qwen tries to claim
+        # the device, avoiding a child that dies before it can write server.log.
+        sleep 10
     fi
     if ! production_ready; then
-        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" | tee "${ARTIFACT_DIR}/recovery.log"
+        # The recovery script is intentionally external and protects the source
+        # checkout. Verify its observable health result rather than treating a
+        # background PID or an artifact-directory print as successful recovery.
+        local recovered=0
+        for _ in {1..3}; do
+            bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+                | tee -a "${ARTIFACT_DIR}/recovery.log" || true
+            for _ in {1..20}; do
+                timeout 5 curl -fsS "http://127.0.0.1:${PRODUCTION_PORT}/health" >/dev/null && {
+                    recovered=1
+                    break 2
+                }
+                sleep 1
+            done
+            sleep 10
+        done
+        [[ "${recovered}" == "1" ]] || echo "WARNING: Qwen recovery did not become reachable" >&2
     fi
 }
 trap restore_production EXIT
