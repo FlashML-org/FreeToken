@@ -39,7 +39,7 @@ def build_health(state: Any, version: str) -> dict:
 
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
-    return {
+    doc = {
         "status": "ok",
         "model": model,
         "instance_id": instance_id,
@@ -47,6 +47,19 @@ def build_health(state: Any, version: str) -> dict:
         "maintenance": mstate,
         "version": version,
     }
+    # KV quant / context info so dashboards (desktop console, config panel) can show
+    # what the engine is actually running without parsing the serve command line.
+    if config is not None:
+        kv_dtype = getattr(config, "kv_cache_dtype", None)
+        if kv_dtype and kv_dtype != "auto":
+            doc["kv_cache_dtype"] = kv_dtype
+        reserve = getattr(config, "kv_reserve_tokens", None)
+        if reserve:
+            doc["kv_reserve_tokens"] = reserve
+        moe_backend = getattr(config, "moe_backend", None)
+        if moe_backend:
+            doc["moe_backend"] = moe_backend
+    return doc
 
 
 def register_control_routes(
