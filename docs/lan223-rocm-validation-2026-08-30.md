@@ -132,12 +132,75 @@ The Q4 server also passed the full cold long-context retrieval control: five
 unique-prefix requests at 6,856 reported prompt tokens all returned only
 `azure-17`. Mean TTFT was 26.989 seconds, maximum TTFT was 39.088 seconds,
 and p99 visible token gap was 23.890 ms. The strict 30-session multi-turn
-endurance gate is not yet qualified for Q4. After the cold long-context run,
-3.3 GiB of swap residency was observed; a controlled reset returned swap to
-zero and preserved endpoint health, but 540 KiB reappeared immediately before
-the first endurance session, exceeding the existing 64 KiB guard. No Q4
-endurance session was therefore counted as a pass. This remains an active
-stability investigation, not a throughput or quality failure.
+endurance gate was initially not qualified for the `0.35` memory-ratio
+configuration. After the cold long-context run, 3.3 GiB of swap residency was
+observed. A controlled reset returned swap to zero and preserved endpoint
+health, but 540 KiB reappeared immediately before the first endurance session,
+exceeding the existing 64 KiB guard. That original high-cache profile remains
+an active stability investigation, not a throughput or quality failure.
+
+## Q4 SVM-resident-memory recovery profile
+
+Follow-up investigation established that the failures above were not an
+incorrect answer or an API-contract failure. A Q4 server with the original
+`0.35` memory ratio could initialize successfully, but a first decode after a
+forced cancellation could stall. The Linux kernel recorded
+`amdgpu: SVM mapping failed, exceeds resident system memory limit`; the
+associated FreeToken scheduler worker consumed CPU while the request emitted no
+response bytes. The test procedure also revealed that stopping only the HTTP
+parent leaves its multiprocessing children alive, including a child that keeps
+the internal distributed port `1923` bound. All subsequent controls used a
+dedicated process group and terminated that full group before another GPU
+server was started.
+
+The recovery profile preserves the exact same Q4_K_M GGUF, native ROCm/HIP
+path, 8,192-token context policy, four request slots, OpenAI-compatible API,
+and automatic MoE cache policy. It changes only the memory ratio from `0.35`
+to `0.25`, retains the host's temporary `vm.swappiness=1` test policy, and
+starts from a verified zero-swap state. The lower ratio resolved 5,465 MoE
+slots and 8,237 KV pages, leaving 23.06 GiB free after initialization instead
+of about 17.46 GiB. It is therefore a stability-oriented configuration, not a
+claimed decode-speed optimization.
+
+| Control | Result |
+| --- | --- |
+| visible-output quality suite | 3 of 3 pass |
+| multi-turn state retention | 30 of 30 sessions pass, zero KiB swap at every session boundary |
+| multi-turn p99 maximum turn TTFT | 0.429 s |
+| multi-turn p99 visible-token gap | 25.75 ms |
+| 6,856-token cold marker retrieval | 5 of 5 pass, 24.733 s mean TTFT, 26.255 s maximum TTFT |
+| two simultaneous users | 3 of 3 rounds pass, 45.29 mean aggregate TPS, 8.192 s p99 TTFT |
+| four simultaneous users | 3 of 3 rounds pass, 79.00 mean aggregate TPS, 1.561 s p99 TTFT |
+
+The five long-context requests produced 4.864 MiB of swap after completion,
+despite the low-swappiness policy, so the long-context result is a successful
+quality and latency result but not proof of a strict zero-swap all-day service
+state. Resetting swap while the healthy reduced-memory server remained loaded
+returned it to zero. A following full three-turn state test and the 30-session
+battery both kept swap at zero.
+
+The same fixed 256-token scheduler workload was rerun from the current
+FreeToken Q4 profile and a fresh ROCm 10 llama.cpp control, with the same GGUF
+file, prompt, tokenizer, temperature, top-p, top-k, output length, context,
+and one request. Both also passed the same deterministic three-case quality
+suite.
+
+| Runtime | Mean decode TPS | Median decode TPS | Mean TTFT | Quality suite |
+| --- | ---: | ---: | ---: | --- |
+| FreeToken Q4 recovery profile | 47.960 | 48.075 | 0.453 s | 3 of 3 pass |
+| llama.cpp ROCm 10 current control | 48.831 | 48.832 | 0.062 s | 3 of 3 pass |
+
+The recovery profile is 0.871 TPS, or 1.78 percent, below the fresh llama.cpp
+control for that fixed decode workload. It restores full functional
+qualification under the memory guard but does not meet or exceed llama.cpp.
+The original higher-cache Q4 profile remains the closer decode result, at 1.39
+percent below its fresh llama.cpp control, but requires a repair for the SVM
+resident-memory limit before it can be recommended as the stable profile.
+
+Retained raw evidence for this recovery investigation is under
+`/home/david/freetoken-amd/artifacts/qwen35moe-gguf-memory-ratio-025-20260830T150554Z/`
+and the fresh llama.cpp control is under
+`/home/david/freetoken-amd/artifacts/qwen35moe-llamacpp-rocm10-current-harness-retry-20260830T151654Z/`.
 
 ## Clean-memory endurance
 
