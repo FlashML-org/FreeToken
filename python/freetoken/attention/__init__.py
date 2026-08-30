@@ -33,6 +33,9 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # Whether this backend coexists with hybrid-linear (GDN/mamba) models. Linear
+    # layers bypass attention backend dispatch.
+    hybrid_linear_ok: bool = True
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
