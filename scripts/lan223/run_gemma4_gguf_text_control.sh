@@ -50,7 +50,10 @@ if [[ "${MODE}" == "vision" ]]; then
     # normal production memory budget.
     vision_env=(FREETOKEN_LOAD_VISION=1)
 fi
-ROCM_HOME=/opt/rocm-10.0 ROCM_PATH=/opt/rocm-10.0 HIP_PATH=/opt/rocm-10.0 \
+# ``env`` is required here: an expanded Bash array is not parsed as assignment
+# words, so placing ``${vision_env[@]}`` before ``nohup`` directly would try to
+# execute the literal ``FREETOKEN_LOAD_VISION=1`` string as a program.
+env ROCM_HOME=/opt/rocm-10.0 ROCM_PATH=/opt/rocm-10.0 HIP_PATH=/opt/rocm-10.0 \
 PYTHONPATH=python TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions" \
 "${vision_env[@]}" nohup "${ROOT_DIR}/.venv/bin/python" -m freetoken.cli serve \
     --model-path "${MODEL_PATH}" --served-model-name gemma4-26b-q4-amd \
