@@ -96,7 +96,10 @@ def iter_gguf_weights(
             yield "lm_head.qweight", t.packed()
             continue
         if name == "output_norm.weight":
-            yield "model.norm.weight", _to_bf16(t) + 1.0
+            # Unlike Gemma GGUF checkpoints, Qwen stores the final RMSNorm scale
+            # directly.  Adding one here would apply the Gemma delta convention
+            # to an already complete Qwen weight and corrupt every output logit.
+            yield "model.norm.weight", _to_bf16(t)
             continue
         if not name.startswith("blk."):
             continue
@@ -132,11 +135,12 @@ def iter_gguf_weights(
                 # The single shared-expert gate is stored as a vector in GGUF but
                 # executes as a one-row replicated linear projection.
                 tensor = tensor.unsqueeze(0)
-            # Gemma-style norms carry the delta from unity in GGUF.  GDN's gated RMS
-            # norm is conventional and intentionally excluded from this adjustment.
+            # Qwen GGUF stores all of these RMSNorm vectors as direct scales.
+            # ``GemmaRMSNorm`` adds its own implicit unity only for Gemma-format
+            # checkpoints, so its Qwen use must receive ``scale - 1`` below.
             if rel.endswith(("input_layernorm.weight", "post_attention_layernorm.weight",
                              "self_attn.q_norm.weight", "self_attn.k_norm.weight")):
-                tensor = tensor + 1.0
+                tensor = tensor - 1.0
             if rel.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 tensor = tensor.to(torch.float32)
             yield f"{base}.{rel}", tensor
