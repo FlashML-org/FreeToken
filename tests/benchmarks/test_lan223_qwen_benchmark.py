@@ -14,6 +14,7 @@ from benchmarks.lan223_qwen.run_api_benchmark import (
 )
 from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
 from benchmarks.lan223_qwen.run_multiturn_state_suite import nearest_rank
+from benchmarks.lan223_qwen.run_long_context_control import build_prompt
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -102,6 +103,24 @@ class MultiTurnTailMetricTests(unittest.TestCase):
         """Three turn values make p99 the actual worst measured turn."""
 
         self.assertEqual(nearest_rank([0.1, 0.2, 0.3], 0.99), 0.3)
+
+
+class LongContextControlTests(unittest.TestCase):
+    """Keep the controlled long prompt deterministic and retrieval-focused."""
+
+    def test_prompt_starts_with_marker_and_ends_with_exact_instruction(self) -> None:
+        """The retrieval answer appears only in the protected prefix."""
+
+        prompt = build_prompt(2)
+        self.assertTrue(prompt.startswith("Protected marker: azure-17"))
+        self.assertEqual(prompt.count("azure-17"), 1)
+        self.assertTrue(prompt.endswith("Reply with only the protected marker and no other text."))
+
+    def test_prompt_rejects_zero_filler(self) -> None:
+        """A zero-context request cannot accidentally masquerade as a long test."""
+
+        with self.assertRaises(ValueError):
+            build_prompt(0)
 
 
 class DpmPolicyWrapperTests(unittest.TestCase):
