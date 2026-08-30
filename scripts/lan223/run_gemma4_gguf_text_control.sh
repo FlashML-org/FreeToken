@@ -118,4 +118,10 @@ if [[ "${MODE}" == "vision" ]]; then
         --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
         --stream --artifact "${ARTIFACT_DIR}/image-quality.json" \
         >"${ARTIFACT_DIR}/image-quality.log" 2>&1
+    # The long-response fixture supplies an output-length quality gate, which
+    # makes its stream timing suitable for a visual decode-TPS measurement.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_visual_tps.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --artifact "${ARTIFACT_DIR}/visual-tps.json" \
+        >"${ARTIFACT_DIR}/visual-tps.log" 2>&1
 fi
