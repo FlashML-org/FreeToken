@@ -636,6 +636,33 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            auxiliary_cache = None
+            if banks.auxiliary_sources is not None:
+                if decode_target != "gpu":
+                    raise NotImplementedError(
+                        "Qwen GGUF Q6_K down layers currently support only GPU offload decode"
+                    )
+                if config.moe_prefill_overlap:
+                    raise NotImplementedError(
+                        "Qwen GGUF Q6_K down layers require --disable-moe-prefill-overlap"
+                    )
+                if not banks.auxiliary_layer_ids:
+                    raise ValueError("auxiliary expert banks are missing their model-layer mapping")
+                # Each exceptional Qwen layer contains all experts, so a 256-slot
+                # cache makes its prefill bank a direct expert-id mapping and also
+                # avoids reloading a Q6_K row after its first decode use.
+                auxiliary_cache = OffloadMoeCache(
+                    num_layers=len(banks.auxiliary_layer_ids),
+                    num_experts=config.model_config.num_experts,
+                    cache_size=config.model_config.num_experts,
+                    device=self.device,
+                    cache_policy=config.moe_cache_policy,
+                    prefill_overlap=False,
+                    prefill_hit_d2d=False,
+                    quant_format=banks.auxiliary_quant_format,
+                    decode_target="gpu",
+                )
+                auxiliary_cache.set_bank_sources(banks.auxiliary_sources)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -650,6 +677,18 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if cache_factory is None and auxiliary_cache is not None:
+            layer_to_auxiliary = {
+                layer_id: index for index, layer_id in enumerate(banks.auxiliary_layer_ids)
+            }
+            for layer in layers:
+                auxiliary_layer_id = layer_to_auxiliary.get(layer.layer_id)
+                if auxiliary_layer_id is not None:
+                    layer.auxiliary_offload_cache = auxiliary_cache
+                    layer.auxiliary_layer_id = auxiliary_layer_id
+            # Keep an ownership reference for diagnostics and future cache rebuild
+            # work.  The main cache remains the scheduler's authoritative cache.
+            cache.auxiliary_caches = [auxiliary_cache]
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache

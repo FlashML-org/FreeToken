@@ -49,6 +49,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # are Q5_K.  Both stay byte-exact and the two GGML kernels are called
     # separately by the mixed-format fused MoE path.
     "q4_k_q5_k": ("gate_up", "down"),
+    # Qwen Q4_K_M's three late Q6_K down projections.  This intentionally has
+    # one bank and is used only by a small auxiliary cache.
+    "q6_k_down": ("down",),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -98,6 +101,7 @@ _BANK_BYTES_PER_EXPERT = {
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "q4_k_q5_k": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 256) * 176,
+    "q6_k_down": lambda H, I: H * (I // 256) * 210,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
