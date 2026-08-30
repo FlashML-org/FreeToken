@@ -13,6 +13,7 @@ from benchmarks.lan223_qwen.run_api_benchmark import (
     require_expected_host,
 )
 from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
+from benchmarks.lan223_qwen.run_multiturn_state_suite import nearest_rank
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -92,6 +93,15 @@ class QualitySuiteCheckTests(unittest.TestCase):
             (True, None),
         )
         self.assertFalse(evaluate_check("not json", {"kind": "json_fields", "fields": {"status": "ok"}})[0])
+
+
+class MultiTurnTailMetricTests(unittest.TestCase):
+    """Keep short-suite tail aggregation tied to recorded rather than invented values."""
+
+    def test_nearest_rank_uses_the_observed_worst_value_for_p99(self) -> None:
+        """Three turn values make p99 the actual worst measured turn."""
+
+        self.assertEqual(nearest_rank([0.1, 0.2, 0.3], 0.99), 0.3)
 
 
 class DpmPolicyWrapperTests(unittest.TestCase):
