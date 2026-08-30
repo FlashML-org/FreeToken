@@ -8,6 +8,7 @@ worker_source_dir="${TEKIZAI_WORKER_SOURCE_DIR:-${workspace}/vast-pyworker}"
 pyworker_uv_cache="${TEKIZAI_PYWORKER_UV_CACHE:-${workspace}/pyworker-uv-cache}"
 repo="${TEKIZAI_FREETOKEN_REPO:-https://github.com/earlvanze/FreeToken.git}"
 ref="${TEKIZAI_FREETOKEN_REF:-feat/glm53-flash}"
+expected_commit="${TEKIZAI_FREETOKEN_EXPECTED_COMMIT:-}"
 model_repo="${TEKIZAI_MODEL_REPO:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
 bootstrap_ref="${TEKIZAI_PYWORKER_BOOTSTRAP_REF:-2207a3f94b55a0921c1641520eeb83de5a0c1611}"
 
@@ -81,6 +82,17 @@ checkout_ref() {
 
 checkout_ref "$freetoken_dir"
 checkout_ref "$worker_source_dir"
+
+if [[ -n "$expected_commit" ]]; then
+  for checkout in "$freetoken_dir" "$worker_source_dir"; do
+    actual_commit="$(git -C "$checkout" rev-parse HEAD)"
+    if [[ "$actual_commit" != "$expected_commit" ]]; then
+      printf 'Expected FreeToken commit %s at %s, got %s\n' \
+        "$expected_commit" "$checkout" "$actual_commit" >&2
+      exit 1
+    fi
+  done
+fi
 
 bootstrap="${workspace}/vast-pyworker-bootstrap.sh"
 echo "FREETOKEN_PROVISION_STAGE=pyworker_bootstrap"
