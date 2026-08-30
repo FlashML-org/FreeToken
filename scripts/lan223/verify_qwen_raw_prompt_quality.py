@@ -68,6 +68,10 @@ def stream_completion(base_url: str, model: str, prompt: str, decode: int) -> tu
         "temperature": 0.0,
         "top_p": 1.0,
         "top_k": -1,
+        # The prompt came from apply_chat_template and already includes Qwen's
+        # assistant and thinking markers.  Keeping it literal makes this a
+        # token-for-token control against llama.cpp's raw completion endpoint.
+        "add_special_tokens": False,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
