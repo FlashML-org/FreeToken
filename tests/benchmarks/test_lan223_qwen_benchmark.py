@@ -15,6 +15,7 @@ from benchmarks.lan223_qwen.run_api_benchmark import (
 from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
 from benchmarks.lan223_qwen.run_multiturn_state_suite import nearest_rank
 from benchmarks.lan223_qwen.run_long_context_control import build_prompt
+from benchmarks.lan223_qwen.run_concurrent_api_control import parse_args as parse_concurrent_args
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -157,6 +158,16 @@ class QwenRecoveryContextTests(unittest.TestCase):
 
         self.assertIn('readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"', contents)
         self.assertIn('--kv-reserve-tokens "${KV_RESERVE_TOKENS}"', contents)
+
+
+class ConcurrentControlArgumentTests(unittest.TestCase):
+    """Reject nonsensical concurrent workloads before they can reach LAN-223."""
+
+    def test_concurrency_must_be_positive(self) -> None:
+        """Zero clients has no latency or throughput meaning."""
+
+        with self.assertRaises(SystemExit):
+            parse_concurrent_args(["--model", "qwen", "--tokenizer", "tokenizer", "--artifact", "artifact", "--concurrency", "0"])
 
 
 class LlamaCppControlScriptTests(unittest.TestCase):
