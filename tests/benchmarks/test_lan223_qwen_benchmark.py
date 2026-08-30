@@ -159,6 +159,16 @@ class QwenRecoveryContextTests(unittest.TestCase):
         self.assertIn('readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"', contents)
         self.assertIn('--kv-reserve-tokens "${KV_RESERVE_TOKENS}"', contents)
 
+    def test_multiturn_battery_requires_swap_free_preflight(self) -> None:
+        """Repeated state tests must not begin from a swapped memory condition."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_multiturn_battery.sh"
+        contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertIn('refusing multi-turn battery with swap in use', contents)
+        self.assertIn('"requested_sessions": expected', contents)
+
 
 class ConcurrentControlArgumentTests(unittest.TestCase):
     """Reject nonsensical concurrent workloads before they can reach LAN-223."""
