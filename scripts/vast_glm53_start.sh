@@ -39,6 +39,8 @@ fi
 
 "${serve_cmd[@]}" >>"$log_file" 2>&1 &
 backend_pid=$!
+warmup_request="${TEKIZAI_WARMUP_REQUEST:-1}"
+warmup_timeout="${TEKIZAI_WARMUP_TIMEOUT:-600}"
 
 on_exit() {
   if kill -0 "$backend_pid" 2>/dev/null; then
@@ -53,7 +55,15 @@ for _ in $(seq 1 "${TEKIZAI_READY_POLLS:-900}"); do
     printf '%s\n' 'FREETOKEN_SERVER_EXITED' >>"$log_file"
     wait "$backend_pid"
   fi
-  if curl --fail --silent --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null; then
+  health="$(curl --fail --silent --max-time 2 "http://127.0.0.1:${port}/health" || true)"
+  if [[ "$health" == *'"status":"ok"'* ]]; then
+    if [[ "$warmup_request" == "1" ]]; then
+      curl --fail --silent --show-error --max-time "$warmup_timeout" \
+        "http://127.0.0.1:${port}/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"model\":\"${served_model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK.\"}],\"max_tokens\":1,\"temperature\":0,\"reasoning_effort\":\"none\",\"stream\":false}" \
+        >/dev/null
+    fi
     printf '%s\n' 'FREETOKEN_SERVER_READY' >>"$log_file"
     wait "$backend_pid"
     exit $?
