@@ -14,6 +14,7 @@ immediate combine::
 """
 
 from __future__ import annotations
+import os
 
 from typing import TYPE_CHECKING, List
 
@@ -150,7 +151,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
         from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
 
-        if getattr(engine_config, "use_dummy_weight", False):
+        if getattr(engine_config, "use_dummy_weight", False) or os.environ.get("FREETOKEN_ZERO_PLE", "0") == "1":
             # Dummy fill leaves the int64 hash buffers garbage (a zero vocab size divides by
             # zero in the hash), so re-derive the real constants and read a zero table.
             for ple in ple_layers:
@@ -163,9 +164,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                     ple_layer_index=ple.ple_index,
                 )
                 emb = ple.ple_embedding
-                emb.layer_multipliers.copy_(torch.tensor(mult, dtype=torch.int64))
-                emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
-                emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
+                emb.layer_multipliers = torch.tensor(mult, dtype=torch.int64, device=torch.cuda.current_device())
+                emb.ngram_heads_vocab_sizes = torch.tensor(sizes, dtype=torch.int64, device=torch.cuda.current_device())
+                emb.ngram_heads_offsets = torch.tensor(offsets, dtype=torch.int64, device=torch.cuda.current_device())
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 

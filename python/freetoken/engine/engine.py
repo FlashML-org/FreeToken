@@ -459,7 +459,7 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
+        state_dict = _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
@@ -468,6 +468,22 @@ class Engine:
             ),
             device=self.device,
         )
+        # Fuse any separate Hyper-Connection mix + block injection weights
+        keys = list(state_dict.keys())
+        for k in keys:
+            if k.endswith(".input_mix_weight_down.weight"):
+                prefix = k[:-len(".input_mix_weight_down.weight")]
+                inject_k = f"{prefix}.block_inject_weight.weight"
+                if inject_k in state_dict:
+                    w_down = state_dict.pop(k)
+                    w_inject = state_dict.pop(inject_k)
+                    pad = (-(w_down.shape[0] + w_inject.shape[0])) % 16
+                    parts = [w_down, w_inject]
+                    if pad:
+                        parts.append(torch.zeros(pad, *w_down.shape[1:], dtype=w_down.dtype, device=w_down.device))
+                    fused_name = f"{prefix}.input_mix_weight_down_block_inject.weight"
+                    state_dict[fused_name] = torch.cat(parts, dim=0)
+        return state_dict
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
