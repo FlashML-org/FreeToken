@@ -16,14 +16,19 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-aime-quality-20260830T082000Z/quality.json` | Qwen deterministic quality | Expected AIME output hash passed: 28.34 TPS, 410 ms TTFT, 37.62 ms p99 gap |
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-quality-suite-20260830T083000Z/quality-suite.json` | Qwen versioned quality suite | Three visible-output checks passed: exact canary, arithmetic, and JSON fields |
 | 2026-08-30 | LAN-223 read-only memory snapshot | Capacity and measurement readiness | Host reports 64 GB total RAM and about 1.4 GB swap in use, mainly Qwen workers; timed acceptance is paused pending clean memory recovery |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260830T081547Z/` | Controlled Qwen recovery | Verified server restart completed only after health returned `status: ok`; cold serial expert loading took about 6 minutes 22 seconds |
+| 2026-08-30 | LAN-223 swap-residency reset | Measurement remediation | Temporarily disabled and re-enabled configured swap after verifying 20 GB available RAM and 2.1 GB swapped; swap use returned to zero and Qwen stayed healthy |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/runtime-manifest-20260830T082300Z/` | Runtime provenance | Captured clean host, ROCm, GPU policy, source, memory, storage, and process state before accepted baseline |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-baseline-20260830T082400Z/` | LAN-223 warm NVFP4 baseline | Five samples passed with zero swap: 28.69 mean TPS, 367 ms mean TTFT, 37.89 ms p99 gap, 39.08 ms maximum gap |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-scheduler-20260830T082500Z/` | LAN-223 medium scheduler baseline | Three samples passed with zero swap: 27.89 mean TPS, 429 ms mean TTFT, 38.99 ms p99 gap, 71.23 ms maximum gap |
 
 ## Open work
 
 | ID | Required evidence | State |
 | --- | --- | --- |
 | P0 | Complete paper protocol fields or explicit unresolved record | In progress |
-| P1 | Harness manifest and tail-summary validation | Tail summary implemented and validated; provenance expansion remains |
-| P2 | Five-sample Qwen NVFP4 warm and cold baseline | Warm fixed-length baseline completed; cold baseline remains |
+| P1 | Harness manifest and tail-summary validation | Completed: tail summaries and clean runtime manifest validated |
+| P2 | Five-sample Qwen NVFP4 warm and cold baseline | Warm short and medium baselines complete; full cold request timing remains |
 | P3 | Versioned Qwen and Gemma quality suite | Qwen three-case suite completed; Gemma expansion remains |
 | P4 | Paper-inspired W1 to W4 agent workloads | Not started |
 | P5 | Tail-latency matrix and 24-hour endurance | Not started |
