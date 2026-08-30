@@ -17,6 +17,38 @@ export PYWORKER_REPO="${PYWORKER_REPO:-$repo}"
 export PYWORKER_REF="${PYWORKER_REF:-$ref}"
 
 mkdir -p "$workspace" "$(dirname "$MODEL_LOG")"
+
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="${HOME}/.local/bin:${PATH}"
+fi
+
+download_model() {
+  local attempt status
+  for attempt in 1 2 3 4 5; do
+    echo "FREETOKEN_PROVISION_STAGE=model_download attempt=${attempt}"
+    if uvx --from huggingface-hub==1.29.0 hf download "$model_repo" --local-dir "$model_dir"; then
+      echo "FREETOKEN_PROVISION_STAGE=model_download_complete"
+      return 0
+    else
+      status=$?
+    fi
+    echo "FREETOKEN_PROVISION_STAGE=model_download_retry status=${status}"
+    sleep "$((attempt * 10))"
+  done
+  return "$status"
+}
+
+download_model &
+model_download_pid=$!
+cleanup_download() {
+  if kill -0 "$model_download_pid" 2>/dev/null; then
+    kill "$model_download_pid"
+    wait "$model_download_pid" || true
+  fi
+}
+trap cleanup_download EXIT INT TERM
+
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ca-certificates cuda-compiler-13-0 cuda-cudart-dev-13-0 \
@@ -26,11 +58,6 @@ apt-get clean
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-
-if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="${HOME}/.local/bin:${PATH}"
-fi
 
 checkout_ref() {
   local destination="$1"
@@ -52,23 +79,8 @@ if [[ ! -x "$freetoken_dir/.venv/bin/python" ]]; then
 fi
 uv pip install --python "$freetoken_dir/.venv/bin/python" -e "$freetoken_dir[accel]"
 
-download_model() {
-  local attempt status
-  for attempt in 1 2 3 4 5; do
-    echo "FREETOKEN_PROVISION_STAGE=model_download attempt=${attempt}"
-    if "$freetoken_dir/.venv/bin/hf" download "$model_repo" --local-dir "$model_dir"; then
-      echo "FREETOKEN_PROVISION_STAGE=model_download_complete"
-      return 0
-    else
-      status=$?
-    fi
-    echo "FREETOKEN_PROVISION_STAGE=model_download_retry status=${status}"
-    sleep "$((attempt * 10))"
-  done
-  return "$status"
-}
-
-download_model
+wait "$model_download_pid"
+trap - EXIT INT TERM
 echo "FREETOKEN_PROVISION_STAGE=bandwidth_check"
 "$freetoken_dir/.venv/bin/ft" bench bw --dtype nvfp4
 
