@@ -89,6 +89,17 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
+    if fmt == "q4_k_q5_k":
+        # qwen3_5_moe/gguf.py _expert_specs: Q4_K gate/up rows have 144-byte
+        # 256-element blocks; Q5_K down rows have 176-byte blocks.
+        return {
+            "gate_up": 2 * I * (H // 256 * 144),
+            "down": H * (I // 256 * 176),
+        }
+    if fmt == "q6_k_down":
+        # qwen3_5_moe/gguf.py _q6_down_specs: exceptional late Qwen layers
+        # keep their byte-exact Q6_K down rows in a separate one-bank cache.
+        return {"down": H * (I // 256 * 210)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
@@ -176,6 +187,19 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("fp8_block",),
+    ),
+    AotModel(
+        # The UnsLOTH Q4_K_M GGUF recipe uses Q4_K gate/up and Q5_K down
+        # experts, with Q6_K down rows on three late layers.  Both cache
+        # formats appear here so a strict HIP launch cannot JIT the copy helper.
+        name="unsloth/Qwen3.6-35B-A3B-GGUF-Q4_K_M",
+        architecture="Qwen3_5MoeForConditionalGeneration",
+        hidden_size=2048,
+        kv_groups=((2, 256),),
+        top_k=8,
+        moe_intermediate_size=512,
+        expert_formats=("q4_k_q5_k", "q6_k_down"),
+        arch_aliases=("Qwen3_5MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="nvidia/Qwen3.6-35B-A3B-NVFP4",
