@@ -41,8 +41,16 @@ def fused_topk(
 
     from freetoken.kernel.backend import is_rocm_runtime
 
-    # HIP retains the exact Torch reference until the in-tree Triton router is
-    # requalified against deterministic full-model greedy output.
+    # The HIP reference remains the default until the in-tree router is
+    # requalified against deterministic full-model greedy output. An operator
+    # may opt in explicitly for a bounded local validation run.
+    use_rocm_triton_router = is_rocm_runtime() and os.environ.get(
+        "FREETOKEN_ROCM_TRITON_ROUTER", "0"
+    ) == "1"
+    if use_rocm_triton_router:
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
     if is_rocm_runtime():
         return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 
