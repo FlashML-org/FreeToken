@@ -35,7 +35,6 @@ _SCALAR_MAP = {
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
-    "ssm_a": "linear_attn.A_log",
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
     "ssm_dt.bias": "linear_attn.dt_bias",
     "ssm_norm.weight": "linear_attn.norm.weight",
@@ -44,6 +43,21 @@ _SCALAR_MAP = {
 }
 _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
 _GDN_BA_SUFFIXES = {"ssm_alpha.weight": "a", "ssm_beta.weight": "b"}
+
+
+def _ssm_a_to_a_log(ssm_a: torch.Tensor) -> torch.Tensor:
+    """Recover HF ``A_log`` from llama.cpp's precomputed negative decay.
+
+    The GGUF Qwen3.5 exporter writes ``ssm_a = -exp(A_log)`` because llama.cpp
+    multiplies that value directly by the softplus alpha gate.  FreeToken's Gated
+    DeltaNet instead owns the equivalent ``-A_log.exp()`` expression.  Loading the
+    GGUF value as ``A_log`` would exponentiate it a second time and destabilize every
+    linear-attention layer, so invert the exporter transformation exactly here.
+    """
+    value = ssm_a.to(torch.float32)
+    if not torch.isfinite(value).all() or not torch.all(value < 0):
+        raise ValueError("Qwen GGUF ssm_a must contain finite negative -exp(A_log) values")
+    return torch.log(-value)
 
 
 def _to_bf16(t) -> torch.Tensor:
@@ -122,6 +136,11 @@ def iter_gguf_weights(
                 )
                 if not slots:
                     del gdn_buf[layer]
+            continue
+        if suffix == "ssm_a":
+            # llama.cpp serializes the already-exponentiated negative coefficient;
+            # FreeToken stores A_log and evaluates -exp(A_log) at runtime.
+            yield f"{base}.linear_attn.A_log", _ssm_a_to_a_log(_to_bf16(t))
             continue
         if suffix in _SCALAR_MAP:
             tensor = _to_bf16(t)
