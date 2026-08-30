@@ -173,6 +173,29 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    if os.name == "nt":
+        # Windows: VirtualLock per-region; the process working-set cap governs how
+        # much can stay resident, no RLIMIT_MEMLOCK equivalent.
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_errno=True)
+        min_ws = _os_locked_total + nbytes + (512 << 20)
+        # QUOTA_LIMITS_HARDWS_MIN_ENABLE (0x1) | HARDWS_MAX_ENABLE (0x2): pin the
+        # working-set floor so trimmed pages can't include locked ones. Best-effort.
+        try:
+            k32.SetProcessWorkingSetSizeEx(ctypes.c_void_p(-1), ctypes.c_size_t(min_ws), ctypes.c_size_t(min_ws * 2), 0x1 | 0x2)
+        except OSError:
+            pass
+        if not k32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+            err = ctypes.get_errno()
+            raise OSError(
+                err,
+                f"VirtualLock({nbytes / 2**30:.1f} GiB) failed: {os.strerror(err)} "
+                f"(the process working-set cap bounds OS-locked bytes; "
+                f"shrink --moe-cpu-layers or raise the working-set minimum)",
+            )
+        _os_locked_total += nbytes
+        return
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
