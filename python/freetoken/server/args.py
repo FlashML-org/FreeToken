@@ -50,13 +50,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return self._zmq_addr("ipc:///tmp/freetoken_3", 93)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = self._zmq_addr("ipc:///tmp/freetoken_4", 94)
         assert result != self.zmq_detokenizer_addr
         return result
 
