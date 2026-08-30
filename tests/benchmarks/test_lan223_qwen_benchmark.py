@@ -166,8 +166,9 @@ class QwenRecoveryContextTests(unittest.TestCase):
         wrapper = repository_root / "scripts" / "lan223" / "run_qwen_multiturn_battery.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
-        self.assertIn('refusing multi-turn battery with swap in use: ${used} KiB', contents)
-        self.assertIn('if (( used > 64 )); then', contents)
+        self.assertIn('readonly MAX_SWAP_KIB="${LAN223_BATTERY_MAX_SWAP_KIB:-64}"', contents)
+        self.assertIn('refusing multi-turn battery with swap in use: ${used} KiB exceeds ${MAX_SWAP_KIB} KiB', contents)
+        self.assertIn('if (( used > MAX_SWAP_KIB )); then', contents)
         self.assertIn('assert_clean_swap\ncurl -fsS', contents)
         self.assertIn('"requested_sessions": expected', contents)
 
