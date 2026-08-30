@@ -206,9 +206,9 @@ def gemma4_mmproj_param_name(source_name: str) -> str | None:
         return None
     prefix, suffix = source_name.rsplit(".", 1)[0], source_name.rsplit(".", 1)[1]
     parts = prefix.split(".")
-    if len(parts) != 3 or not parts[1].isdigit() or suffix != "weight":
+    if len(parts) != 4 or parts[0] != "v" or parts[1] != "blk" or not parts[2].isdigit() or suffix != "weight":
         return None
-    layer = parts[1]
+    layer = parts[2]
     remap = {
         "ln1": "input_layernorm.weight",
         "ln2": "pre_feedforward_layernorm.weight",
@@ -224,7 +224,7 @@ def gemma4_mmproj_param_name(source_name: str) -> str | None:
         "ffn_up": "mlp.up_proj.weight",
         "ffn_down": "mlp.down_proj.weight",
     }
-    mapped = remap.get(parts[2])
+    mapped = remap.get(parts[3])
     return f"vision_tower.encoder.layers.{layer}.{mapped}" if mapped else None
 
 
