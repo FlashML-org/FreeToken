@@ -100,6 +100,17 @@ that the current native FreeToken ROCm/HIP path exceeds the matched llama.cpp
 decode rate for that bounded control, but it does not establish a general
 long-output advantage.
 
+## Recovery-contract result
+
+The final isolated FreeToken vision run is
+`/home/david/freetoken-amd/artifacts/gemma4-gguf-vision-20260830T053317Z`.
+It passed all three image controls (`red`, `green`, and spatial `red`), then
+shut down the candidate and restored the protected Qwen server. Qwen reported
+the authoritative `status: ok` after about eight minutes and twenty seconds;
+the control runner then exited cleanly. This verifies that the runner now
+handles the real serial-NVFP4 recovery envelope without a false success while
+Qwen is still loading or a false failure from re-running its launcher.
+
 ## Boundary and next measurement
 
 The image controls are functionality and short-request measurements, not a
