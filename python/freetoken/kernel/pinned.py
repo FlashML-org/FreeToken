@@ -56,13 +56,22 @@ def _host_ptr_identity() -> bool:
     return bool(_load_pinned_extension().host_ptr_identity())
 
 
-def device_ptr(t: torch.Tensor) -> int:
+def device_ptr(t: torch.Tensor) -> int | None:
     """Base address of ``t`` as the GPU must dereference it.
 
     Equals ``data_ptr()`` on CUDA tensors and wherever pinned host memory is
     device-visible at its host VA (Linux/UVA). On Windows/WDDM registered memory maps
     to a different device address, so zero-copy consumers must use this, not
-    ``data_ptr()``. Host tensors must be pinned+mapped."""
-    if t.is_cuda or _host_ptr_identity():
+    ``data_ptr()``. Host tensors must be pinned+mapped.
+
+    Returns ``None`` when the host memory is not pinned+mapped (e.g. a bank whose
+    cudaHostRegister failed and was downgraded to PAGEABLE). The caller treats
+    ``None`` as "no device alias" and routes through the pageable copy path."""
+    if t.is_cuda:
         return t.data_ptr()
-    return _load_pinned_extension().host_device_ptr(t.data_ptr())
+    if _host_ptr_identity():
+        return t.data_ptr()
+    try:
+        return _load_pinned_extension().host_device_ptr(t.data_ptr())
+    except RuntimeError:
+        return None

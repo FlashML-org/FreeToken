@@ -387,6 +387,12 @@ class OffloadMoeCache:
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM).
                 src_dev = device_ptr(source)
+                if src_dev is None:
+                    # pin failed -> PAGEABLE bank, no device alias; placeholder 0
+                    # mirrors the unpinned-layer path; the consumer treats it as
+                    # "not on the GPU fast path, route through pageable copy"
+                    layer_src_ptrs[layer_id].append(0)
+                    continue
                 if src_dev % 16 != 0:
                     return
                 layer_src_ptrs[layer_id].append(src_dev)

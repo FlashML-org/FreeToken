@@ -1210,7 +1210,26 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
     elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
+        if not hasattr(os, "uname"):
+            # native Windows/WDDM: pinning IS capped (driver locks ~half of RAM,
+            # shared with VirtualLock); plan with 40% of physical RAM so the
+            # CPU-layer split engages instead of over-allocating one pinned pool
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            cap = int(st.ullTotalPhys * 0.4)
+        else:
+            return None
     else:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
     return max(0, cap - reserved)
