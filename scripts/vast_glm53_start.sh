@@ -7,6 +7,7 @@ ft_executable="${TEKIZAI_FREETOKEN_EXECUTABLE:-/workspace/freetoken/.venv/bin/ft
 port="${TEKIZAI_FREETOKEN_PORT:-1919}"
 log_file="${TEKIZAI_FREETOKEN_LOG:-/workspace/logs/freetoken-glm53.log}"
 max_running_requests="${TEKIZAI_MAX_RUNNING_REQUESTS:-1}"
+moe_backend="${TEKIZAI_MOE_BACKEND:-auto}"
 
 if [[ ! "$max_running_requests" =~ ^[1-9][0-9]*$ ]]; then
   printf 'TEKIZAI_MAX_RUNNING_REQUESTS must be a positive integer, got %q\n' \
@@ -22,7 +23,7 @@ serve_cmd=("$ft_executable" serve \
   --served-model-name "$served_model" \
   --host 127.0.0.1 \
   --port "$port" \
-  --moe-backend auto \
+  --moe-backend "$moe_backend" \
   --moe-cpu-threads "${TEKIZAI_CPU_THREADS:-48}" \
   --memory-ratio "${TEKIZAI_MEMORY_RATIO:-0.95}" \
   --max-seq-len-override "${TEKIZAI_MAX_SEQ_LEN:-32768}" \
