@@ -6,6 +6,7 @@ freetoken_dir="${TEKIZAI_FREETOKEN_DIR:-${workspace}/freetoken}"
 model_dir="${TEKIZAI_FREETOKEN_MODEL_PATH:-${workspace}/models/GLM-5.3-Flash-NVFP4}"
 repo="${TEKIZAI_FREETOKEN_REPO:-https://github.com/earlvanze/FreeToken.git}"
 ref="${TEKIZAI_FREETOKEN_REF:-feat/glm53-flash}"
+expected_commit="${TEKIZAI_FREETOKEN_EXPECTED_COMMIT:-}"
 model_repo="${TEKIZAI_MODEL_REPO:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -64,6 +65,13 @@ if [[ ! -d "$freetoken_dir/.git" ]]; then
 fi
 git -C "$freetoken_dir" fetch --depth 1 origin "$ref"
 git -C "$freetoken_dir" checkout --detach --force FETCH_HEAD
+if [[ -n "$expected_commit" ]]; then
+  resolved_commit="$(git -C "$freetoken_dir" rev-parse HEAD)"
+  if [[ "$resolved_commit" != "$expected_commit" && "$resolved_commit" != "$expected_commit"* ]]; then
+    echo "FreeToken ref resolved to unexpected commit: ${resolved_commit}" >&2
+    exit 1
+  fi
+fi
 
 echo "FREETOKEN_PROVISION_STAGE=dependencies"
 if [[ ! -x "$freetoken_dir/.venv/bin/python" ]]; then
