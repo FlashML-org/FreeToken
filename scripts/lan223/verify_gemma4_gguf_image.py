@@ -35,6 +35,58 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _post_json_stream(url: str, payload: dict) -> tuple[dict, dict]:
+    """Stream one OpenAI response and retain timing plus the final message.
+
+    The returned metrics deliberately distinguish the server-reported completion
+    token count from the number of network chunks. A chunk is not necessarily a
+    token, so TPS is calculated only when final OpenAI usage is available.
+    """
+    payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    started = time.perf_counter()
+    first_chunk: float | None = None
+    last_chunk: float | None = None
+    content: list[str] = []
+    reasoning: list[str] = []
+    usage: dict = {}
+    with urllib.request.urlopen(request, timeout=300) as response:  # nosec B310: caller controls local base URL
+        for raw in response:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            event = json.loads(data)
+            usage = event.get("usage") or usage
+            for choice in event.get("choices", []):
+                delta = choice.get("delta", {})
+                piece = delta.get("content") or ""
+                thought = delta.get("reasoning_content") or ""
+                if piece or thought:
+                    now = time.perf_counter()
+                    first_chunk = first_chunk if first_chunk is not None else now
+                    last_chunk = now
+                    content.append(piece)
+                    reasoning.append(thought)
+    elapsed = time.perf_counter() - started
+    completion = usage.get("completion_tokens")
+    generated_window = (last_chunk - first_chunk) if first_chunk is not None and last_chunk is not None else 0.0
+    metrics = {
+        "wall_s": elapsed,
+        "ttft_ms": (first_chunk - started) * 1000 if first_chunk is not None else None,
+        "stream_window_s": generated_window,
+        "completion_tokens": completion,
+        "completion_tok_s": completion / generated_window if completion and generated_window else None,
+    }
+    return {
+        "choices": [{"message": {"role": "assistant", "content": "".join(content), "reasoning_content": "".join(reasoning)}}],
+        "usage": usage,
+    }, metrics
+
+
 def main() -> int:
     """Run color and spatial fixtures, validate exact answers, and save evidence."""
     parser = argparse.ArgumentParser()
@@ -45,6 +97,7 @@ def main() -> int:
         "--max-tokens", type=int, default=16,
         help="per-case generation cap; llama.cpp needs a larger cap when it emits thought first",
     )
+    parser.add_argument("--stream", action="store_true", help="capture stream timing and final usage")
     args = parser.parse_args()
 
     split = Image.new("RGB", (96, 48), (0, 0, 255))
@@ -71,7 +124,11 @@ def main() -> int:
             "max_tokens": args.max_tokens,
         }
         started = time.perf_counter()
-        response = _post_json(args.base_url.rstrip("/") + "/v1/chat/completions", request)
+        metrics = None
+        if args.stream:
+            response, metrics = _post_json_stream(args.base_url.rstrip("/") + "/v1/chat/completions", request)
+        else:
+            response = _post_json(args.base_url.rstrip("/") + "/v1/chat/completions", request)
         text = response["choices"][0]["message"]["content"].strip().lower()
         records.append({
             "control": name,
@@ -79,6 +136,7 @@ def main() -> int:
             "expected": expected,
             "actual": text,
             "elapsed_s": time.perf_counter() - started,
+            "stream_metrics": metrics,
             "usage": response.get("usage"),
             "response": response,
         })
