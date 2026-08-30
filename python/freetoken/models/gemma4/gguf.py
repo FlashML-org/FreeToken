@@ -354,6 +354,24 @@ def iter_gguf_weights(
     assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
     assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
 
+    # Gemma's text GGUF stores the vision tower in a sibling ``*-mmproj.gguf``.
+    # This stays behind the explicit vision opt-in so text-only serving never
+    # pays the startup or memory cost of the projector.
+    if config.is_multimodal:
+        mmproj_path = find_gemma4_mmproj(model_path)
+        if mmproj_path is None:
+            raise FileNotFoundError(
+                f"Gemma4 vision is enabled but no unique sibling mmproj GGUF exists beside {model_path}"
+            )
+        for t in iter_gguf_tensors(mmproj_path):
+            target = gemma4_mmproj_param_name(t.name)
+            if target is None:
+                raise ValueError(f"unmapped Gemma4 projector tensor: {t.name}")
+            tensor = _to_bf16(t)
+            if t.name == "v.patch_embd.weight":
+                tensor = tensor.flatten(1)
+            yield target, tensor
+
 
 # --------------------------------------------------------------------------------------
 # Model layer swap: dense bf16 Linear/Embedding -> native GGUF-quant ops.
