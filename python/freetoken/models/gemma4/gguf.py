@@ -226,12 +226,12 @@ def _gemma4_image_token_id(metadata: dict) -> int:
 def _parse_gguf_vision_config(shim: "GgufConfigShim", text_hidden_size: int) -> VisionConfig | None:
     """Build :class:`VisionConfig` from the sibling Gemma4 projector GGUF.
 
-    The parameter names and dimensions are release-owned evidence.  Constant
-    algorithm settings are the official Gemma4 26B-A4B vision contract: 3x3
-    pooling, 280 soft tokens, two-dimensional RoPE theta 100, standardization,
-    and unclipped linears.  Validate the cross-file projection width so a mixed
-    text/projector directory fails during startup instead of producing corrupt
-    image embeddings.
+    The projector supplies its parameter dimensions.  Algorithm settings not
+    represented in the GGUF metadata follow the official Gemma4 26B-A4B vision
+    contract: 10,240 position slots, 3x3 pooling, 280 soft tokens,
+    two-dimensional RoPE theta 100, standardization, and unclipped linears.
+    Validate the cross-file projection width so a mixed text/projector directory
+    fails during startup instead of producing corrupt image embeddings.
     """
     if not vision_load_enabled():
         return None
@@ -267,7 +267,9 @@ def _parse_gguf_vision_config(shim: "GgufConfigShim", text_hidden_size: int) -> 
         head_dim=vision_hidden // num_heads,
         intermediate_size=int(v("feed_forward_length")),
         patch_size=int(v("patch_size")),
-        position_embedding_size=int(v("position_embedding_size")),
+        # llama.cpp's mmproj metadata does not serialize the learned table's
+        # capacity.  Gemma4's released 26B config fixes it at 10 * 1024.
+        position_embedding_size=10_240,
         pooling_kernel_size=3,
         rms_norm_eps=float(v("attention.layer_norm_epsilon")),
         rope_theta=100.0,
