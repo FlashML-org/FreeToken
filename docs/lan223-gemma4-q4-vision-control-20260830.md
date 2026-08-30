@@ -26,9 +26,9 @@ Qwen on `127.0.0.1:1919` on every exit path.
 
 ## Evidence
 
-Artifact directory on LAN-223:
+Latest artifact directory on LAN-223:
 
-`/home/david/freetoken-amd/artifacts/gemma4-gguf-vision-20260830T044510Z`
+`/home/david/freetoken-amd/artifacts/gemma4-gguf-vision-20260830T045559Z`
 
 The runner completed both controls before it shut down the candidate and
 started Qwen recovery.
@@ -36,11 +36,15 @@ started Qwen recovery.
 | Control | Result | Prompt tokens | Completion tokens | Observed latency or rate |
 | --- | --- | ---: | ---: | --- |
 | Text arithmetic | `323` | 30 | 4 | TTFT 2471.37 ms, 45.52 decode tok/s across two decode steps |
-| Red PNG data URL | `red` | 284 | 2 | 3.03 s end-to-end request time |
+| Solid red PNG data URL | `red` | 284 | 2 | 1.89 s end-to-end request time |
+| Solid green PNG data URL | `green` | 284 | 2 | 1.08 s end-to-end request time |
+| Red-left, blue-right PNG | `red` for the left half | 282 | 2 | 1.06 s end-to-end request time |
 
-The image prompt had 284 tokens because the processor produced 256 image soft
-tokens, plus the rendered text/template tokens. The model returned the expected
-one-word answer. This verifies decoding, resizing, patchification, shaped
+The image prompts had 282 to 284 tokens because the processor produced 256
+image soft tokens, plus the rendered text/template tokens. All three controls
+returned their expected one-word answer. The spatial split-color control shows
+that the path preserves image position rather than merely detecting a dominant
+global color. Together they verify decoding, resizing, patchification, shaped
 inter-process tensor transport, ROCm vision-tower execution, projector
 execution, image-token replacement, and OpenAI response formatting.
 
