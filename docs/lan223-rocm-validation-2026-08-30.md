@@ -128,6 +128,17 @@ The exact-Q4 evidence is retained on LAN-223 at
 and
 `/home/david/freetoken-amd/artifacts/qwen35b-llamacpp-rocm10-q4matched-20260830T142002Z-retry/`.
 
+The Q4 server also passed the full cold long-context retrieval control: five
+unique-prefix requests at 6,856 reported prompt tokens all returned only
+`azure-17`. Mean TTFT was 26.989 seconds, maximum TTFT was 39.088 seconds,
+and p99 visible token gap was 23.890 ms. The strict 30-session multi-turn
+endurance gate is not yet qualified for Q4. After the cold long-context run,
+3.3 GiB of swap residency was observed; a controlled reset returned swap to
+zero and preserved endpoint health, but 540 KiB reappeared immediately before
+the first endurance session, exceeding the existing 64 KiB guard. No Q4
+endurance session was therefore counted as a pass. This remains an active
+stability investigation, not a throughput or quality failure.
+
 ## Clean-memory endurance
 
 Before the strict endurance run, diagnostic inspection showed swapped pages belonging primarily to FreeToken multiprocessing workers. With about 18 GiB of RAM available, the existing controlled `swapoff` and `swapon` reset was performed. Qwen remained healthy, swap stayed at zero during a short observation period, and the strict battery was then allowed to start.
