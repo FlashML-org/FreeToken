@@ -51,10 +51,14 @@ only be labelled with the category its evidence supports.
 7. Larger-model capacity assessment only after Qwen gates pass.
 8. Strict NVIDIA comparison only with a reference system and complete paper protocol.
 
+Before every accepted baseline, run
+`scripts/lan223/capture_validation_manifest.sh` against a new artifact path.
+The resulting read-only manifest proves the host, source state, ROCm stack,
+GPU policy, memory, swap, disk, and process context without exposing secrets.
+
 ## Prohibited claims
 
 - A Q4 GGUF control is not a replication of NVFP4 or BF16 paper tests.
 - A short warm request is not the paper's worst agent-turn TTFT.
 - Hidden reasoning text is not a visible OpenAI-compatible answer.
 - A larger model does not fit until a complete memory-reserve manifest proves it.
-
