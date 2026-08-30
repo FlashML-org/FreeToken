@@ -35,10 +35,12 @@ original vocabulary IDs and matching the checkpoint tokenizer's 54-token input.
 | FreeToken AMD | 54 | 1023 | 47.12 | Derives `b + 7` divides `56`; verifies `b=21` and `b=49` |
 | llama.cpp ROCm 10 | 54 | 1024 | 50.29 | Derives the same divisibility condition and the same two bases |
 
-FreeToken's steady decode rate is 6.3% below llama.cpp on this matched Q4
-control. It must not be described as meeting or exceeding llama.cpp until a
-subsequent optimization produces a measured improvement under this same
-contract.
+The initial FreeToken control was 6.3% below llama.cpp. A historical opt-in run
+of the in-tree native HIP Triton router recorded 50.63 TPS while preserving the
+same derivation and 54-token prompt, 0.7% above the matching llama.cpp control.
+That historical result does not requalify the router after this rebase: ROCm
+continues to use the PyTorch reference router by default. Set
+`FREETOKEN_ROCM_TRITON_ROUTER=1` only for a bounded validation run.
 
 The response from each engine remained inside Qwen's verbose reasoning trace at
 the 1024-token ceiling, so neither emitted the requested boxed final line. This
@@ -50,6 +52,7 @@ or use a prompt that requests a concise answer after the reasoning trace.
 ## Evidence locations on LAN-223
 
 - FreeToken: `/home/david/freetoken-amd/artifacts/qwen-gguf-raw-20260830T032253Z/raw-quality.json`
+- FreeToken with HIP router: `/home/david/freetoken-amd/artifacts/qwen-gguf-raw-20260830T033941Z/raw-quality.json`
 - llama.cpp: `/home/david/freetoken-amd/artifacts/qwen-llama-raw-20260830T033324Z/raw-quality.json`
 
 The two self-restoring control runners are
