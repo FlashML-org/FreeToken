@@ -103,6 +103,34 @@ The battery ran 30 complete multi-turn sessions and enforced a maximum of 64 KiB
 | Qwen health after run | `status: ok` |
 | Final sampled GPU edge temperature | 42 C |
 
+## Full-context MoE cache telemetry
+
+The normal Qwen service intentionally leaves MoE counters disabled because the
+counter atomics are diagnostic work. A temporary, loopback-only instance was
+therefore started with `--moe-collect-stats`, using the same native ROCm/HIP
+configuration, `0.35` memory ratio, and 8,192-token KV reservation as the
+restored service. The normal no-counter service was restarted immediately after
+the test and passed its deterministic AIME output-hash gate.
+
+The diagnostic instance resolved 8,903 MoE cache slots and 8,224 KV pages. Its
+fixed scheduler workload completed all three scored samples at 28.035 mean
+decode TPS, with only 0.0066 TPS standard deviation. Across 40,800 decode-layer
+calls, it selected eight experts per layer and missed 0.586 experts per layer,
+for a 7.33 percent MoE cache miss rate. No expert fetches were reported through
+the separate fetch counter on this workload.
+
+This result confirms that full 8K context capacity is active while the Qwen
+decode rate remains near the accepted 28 TPS baseline. It also supports the
+previous rejection of a larger static MoE cache: prior 0.38-memory-ratio
+testing reduced misses but did not produce a sustained TPS gain. Cache capacity
+alone is therefore not a justified route to closing the current llama.cpp gap.
+
+The telemetry and restoration evidence is retained on LAN-223 at
+`/home/david/freetoken-amd/artifacts/qwen-cache-stats-driver-20260830T135236Z/`.
+The restored normal service returned the required AIME SHA-1
+`0acef4eab6f4`, at 28.60 visible decode TPS, 399.08 ms TTFT, and 38.49 ms p99
+stream-event gap.
+
 ## Regression tests
 
 The focused regression suite passed 21 tests on LAN-223:
@@ -116,7 +144,7 @@ tests/benchmarks/test_lan223_qwen_benchmark.py
 
 ## Remaining work
 
-1. Add a quantization-equivalent Qwen control before making any broader performance claim. The current NVFP4 versus Q4_K_M result is intentionally labeled non-equivalent.
-2. Profile the FreeToken decode path and GPU occupancy to address the current 28.15 TPS result. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
+1. Add a quantization-equivalent Qwen control before making any broader performance claim. The current NVFP4 versus Q4_K_M result is intentionally labeled non-equivalent. That work requires FreeToken support for the Qwen hybrid GGUF architecture and every tensor encoding used by the reference file, not merely a different launch flag.
+2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
 3. Run a longer wall-clock endurance workload with periodic telemetry if the deployment target requires all-day serving evidence.
 4. Package sanitized build manifests and selected raw artifacts for the fork and upstream pull request. Do not publish local model files, private host paths, or operational access information.
