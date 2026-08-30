@@ -68,6 +68,30 @@ def _expert_quant(hf_config: Any) -> str:
 _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
+def _compressed_tensors_mixed_fp8block(hf_config: Any) -> bool:
+    """compressed-tensors mixed-precision checkpoint: routed experts are NVFP4 (4-bit,
+    group_size 16, strategy tensor_group) while the dense projections (self_attn
+    q/k/v/o, linear_attn in_proj_*/out_proj, mlp.shared_expert gate/up/down) are 128x128
+    block FP8 (8-bit, strategy block, W8A8). Distinct from pure compressed-tensors NVFP4
+    (detect_compressed_tensors_nvfp4), where the dense side is packed FP4 as well."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False
+    saw_fp8_block = saw_nvfp4 = False
+    for gspec in (get("config_groups") or {}).values():
+        w = (gspec or {}).get("weights") or {}
+        bits = int(w.get("num_bits", 0) or 0)
+        strategy = str(w.get("strategy", "")).lower()
+        group_size = int(w.get("group_size", 0) or 0)
+        if bits == 8 and strategy == "block":
+            saw_fp8_block = True
+        if bits == 4 and group_size == 16 and strategy == "tensor_group":
+            saw_nvfp4 = True
+    return saw_fp8_block and saw_nvfp4
+
+
 def _lm_head_quant(hf_config: Any) -> str:
     """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
     the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
@@ -164,9 +188,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    mixed_ct = _compressed_tensors_mixed_fp8block(hf_config)
     expert_quant, weight_block_size = _fp8_block_quant(hf_config)
     if expert_quant == "none":
         expert_quant = _expert_quant(hf_config)  # nvfp4 / mixed-precision modelopt
+    if mixed_ct:
+        # Routed experts are packed NVFP4 (offload banks); dense side is 128x128 block FP8.
+        expert_quant = "nvfp4"
+        weight_block_size = (128, 128)
     # Dense attention/GDN quant is independent of the routed experts (block-fp8 already
     # quantizes both, so only probe for per-tensor FP8 when experts aren't block-fp8).
     attn_quant = "none" if expert_quant == "fp8_block" else _attn_quant(hf_config)
@@ -182,9 +211,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
-    if _compressed_tensors_nvfp4(hf_config):
+    if _compressed_tensors_nvfp4(hf_config) and not mixed_ct:
         attn_quant = "nvfp4"
         dense_quant = "nvfp4"
+        lm_head_quant = "none"
+    if mixed_ct:
+        # Dense attn/GDN projections and the shared expert stay native 128x128 block FP8
+        # (W8A8); lm_head / embeddings / norms are bf16.
+        attn_quant = "fp8_block"
+        dense_quant = "fp8_block"
         lm_head_quant = "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
