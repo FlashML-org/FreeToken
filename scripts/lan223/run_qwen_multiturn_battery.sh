@@ -37,14 +37,25 @@ test -f "${SUITE}"
 # state. Swap is a failure signal for this campaign, not a performance cache.
 # Ubuntu can immediately fault one bookkeeping page after a clean swap reset,
 # so permit at most 64 KiB. Any larger value is treated as real pressure.
-total_swap="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
-free_swap="$(awk '/SwapFree/ {print $2}' /proc/meminfo)"
-used_swap_kb=$((total_swap - free_swap))
-if (( used_swap_kb > 64 )); then
-    echo "refusing multi-turn battery with swap in use" >&2
-    exit 2
-fi
+swap_used_kb() {
+    local total free
+    total="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
+    free="$(awk '/SwapFree/ {print $2}' /proc/meminfo)"
+    echo $((total - free))
+}
+assert_clean_swap() {
+    local used
+    used="$(swap_used_kb)"
+    if (( used > 64 )); then
+        echo "refusing multi-turn battery with swap in use: ${used} KiB" >&2
+        exit 2
+    fi
+}
+assert_clean_swap
 curl -fsS "http://127.0.0.1:1919/health" | grep -q '"status":"ok"'
+# The health request can wake a lazily swapped worker page. Check again before
+# the first test request so a seemingly clean preflight cannot mask that state.
+assert_clean_swap
 
 mkdir -p "${ARTIFACT_ROOT}/sessions"
 export PYTHONPATH="${SOURCE_DIR}/python"
