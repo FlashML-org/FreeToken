@@ -13,7 +13,7 @@ This guide explains how to build, configure, and serve LLMs using FreeToken in a
 
 Verify GPU passthrough is working before proceeding:
 ```bash
-docker run --rm --gpus all nvidia/cuda:13.3.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:13.3.1-base-ubuntu26.04 nvidia-smi
 ```
 
 ---
