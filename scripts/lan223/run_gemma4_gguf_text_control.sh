@@ -23,7 +23,17 @@ production_ready() {
 restore_production() {
     local test_pid
     test_pid="$(port_pid "${TEST_PORT}")"
-    [[ -z "${test_pid}" ]] || kill "${test_pid}" || true
+    if [[ -n "${test_pid}" ]]; then
+        # Do not race the Qwen recovery process against the temporary Gemma
+        # process still releasing its ROCm context. A bare kill followed by an
+        # immediate recovery launch intermittently produced an empty Qwen log
+        # and a dead child on LAN-223.
+        kill "${test_pid}" || true
+        for _ in {1..30}; do
+            kill -0 "${test_pid}" 2>/dev/null || break
+            sleep 1
+        done
+    fi
     if ! production_ready; then
         bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" | tee "${ARTIFACT_DIR}/recovery.log"
     fi
