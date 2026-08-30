@@ -60,6 +60,32 @@ def _ssm_a_to_a_log(ssm_a: torch.Tensor) -> torch.Tensor:
     return torch.log(-value)
 
 
+def _restore_gdn_value_head_order(value: torch.Tensor, num_key_heads: int) -> torch.Tensor:
+    """Convert llama.cpp's grouped GDN value-head order to Qwen's interleaved order.
+
+    Qwen3.5 uses more value than key heads.  GGUF places all value heads belonging
+    to the first position of each key-head group before the second position, while
+    the Hugging Face checkpoint and FreeToken's Gated DeltaNet use consecutive
+    per-key-head values.  This applies both to one scalar per value head (``ssm_a``
+    and ``ssm_dt``) and to matrices whose output axis is the value-head axis
+    (``ssm_alpha`` and ``ssm_beta``).
+    """
+    if value.ndim < 1:
+        raise ValueError("Qwen GDN value-head tensor must have at least one dimension")
+    num_value_heads = value.shape[0]
+    if num_key_heads <= 0 or num_value_heads % num_key_heads:
+        raise ValueError(
+            "Qwen GDN value-head tensor is incompatible with the GGUF key-head count: "
+            f"{tuple(value.shape)} vs {num_key_heads}"
+        )
+    head_ratio = num_value_heads // num_key_heads
+    if head_ratio == 1:
+        return value
+    # [ratio, key_head, ...] in GGUF becomes [key_head, ratio, ...], then a
+    # contiguous leading output axis matching the HF/FreeToken projection order.
+    return value.reshape(head_ratio, num_key_heads, *value.shape[1:]).transpose(0, 1).reshape_as(value)
+
+
 def _to_bf16(t) -> torch.Tensor:
     """Dequantize one GGUF scalar tensor to its logical torch shape."""
     return dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16).reshape(t.shape)
@@ -88,10 +114,14 @@ def iter_gguf_weights(
     every fused member has the same input width and quantization type (Q8_0).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.gguf.reader import load_gguf_metadata
 
     assert not include_moe_experts, "Qwen GGUF routed experts are supplied by the offload cache"
     assert include_non_moe
     _require_weight_tp1()
+
+    metadata = load_gguf_metadata(model_path)
+    gdn_num_key_heads = int(metadata["qwen35moe.ssm.group_count"])
 
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     gdn_buf: dict[int, dict[str, torch.Tensor]] = {}
@@ -128,7 +158,9 @@ def iter_gguf_weights(
             # The split GGUF path keeps qkv|z packed Q8_0, while recurrence b|a
             # remains a conventional dense fused projection.  The runtime order is
             # explicitly b then a, matching Qwen3_5GatedDeltaNet._in_proj_split.
-            gdn_buf.setdefault(layer, {})[_GDN_BA_SUFFIXES[suffix]] = _to_bf16(t)
+            gdn_buf.setdefault(layer, {})[_GDN_BA_SUFFIXES[suffix]] = _restore_gdn_value_head_order(
+                _to_bf16(t), gdn_num_key_heads
+            )
             slots = gdn_buf[layer]
             if all(key in slots for key in ("b", "a")):
                 yield f"{base}.linear_attn.in_proj_ba.weight", torch.cat(
@@ -140,11 +172,15 @@ def iter_gguf_weights(
         if suffix == "ssm_a":
             # llama.cpp serializes the already-exponentiated negative coefficient;
             # FreeToken stores A_log and evaluates -exp(A_log) at runtime.
-            yield f"{base}.linear_attn.A_log", _ssm_a_to_a_log(_to_bf16(t))
+            yield f"{base}.linear_attn.A_log", _ssm_a_to_a_log(
+                _restore_gdn_value_head_order(_to_bf16(t), gdn_num_key_heads)
+            )
             continue
         if suffix in _SCALAR_MAP:
             tensor = _to_bf16(t)
             rel = _SCALAR_MAP[suffix]
+            if suffix == "ssm_dt.bias":
+                tensor = _restore_gdn_value_head_order(tensor, gdn_num_key_heads)
             if suffix == "ssm_conv1d.weight":
                 # GGUF stores depthwise filters as [channels, kernel]; FreeToken's
                 # causal-convolution holder uses the PyTorch depthwise layout
