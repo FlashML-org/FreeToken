@@ -90,8 +90,9 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gg
     >"${ARTIFACT_DIR}/image-quality.log" 2>&1
 # Use the identical deterministic fixture and visible-output quality gate as
 # FreeToken. This keeps visual decode timing comparable despite llama.cpp's
-# optional reasoning channel.
+# optional reasoning channel. Gemma4 through llama.cpp may emit its reasoning
+# channel before visible content, so 512 tokens lets the visible answer finish.
 PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_visual_tps.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
-    --artifact "${ARTIFACT_DIR}/visual-tps.json" \
+    --max-tokens 512 --artifact "${ARTIFACT_DIR}/visual-tps.json" \
     >"${ARTIFACT_DIR}/visual-tps.log" 2>&1
