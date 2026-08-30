@@ -86,6 +86,58 @@ def _restore_gdn_value_head_order(value: torch.Tensor, num_key_heads: int) -> to
     return value.reshape(head_ratio, num_key_heads, *value.shape[1:]).transpose(0, 1).reshape_as(value)
 
 
+def _restore_gdn_value_head_rows(
+    value: torch.Tensor,
+    num_key_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Restore grouped GGUF rows whose leading axis contains complete value heads.
+
+    A GDN projection can contain a prefix of key-head rows followed by its value
+    rows, such as the Q|K|V and depthwise-convolution projections.  Only the
+    value suffix needs the llama.cpp-to-HF permutation.  ``head_dim`` is the
+    number of consecutive rows occupied by one value head, so this routine also
+    handles projections such as ``z`` where each head spans 128 output rows.
+    """
+    if value.ndim < 1 or head_dim <= 0 or value.shape[0] % head_dim:
+        raise ValueError(
+            "Qwen GDN value-head rows require a positive whole-head leading axis: "
+            f"{tuple(value.shape)} with head_dim={head_dim}"
+        )
+    num_value_heads = value.shape[0] // head_dim
+    ordered = _restore_gdn_value_head_order(
+        value.reshape(num_value_heads, head_dim, *value.shape[1:]), num_key_heads
+    )
+    return ordered.reshape_as(value)
+
+
+def _restore_gdn_value_head_input_blocks(
+    packed: torch.Tensor,
+    num_key_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Restore GDN value-head order along a Q8_0 packed projection input axis.
+
+    ``ssm_out`` consumes all value heads as its input.  Q8_0 stores independent
+    32-element blocks along each output row, and Qwen's 128-element value heads
+    therefore occupy four complete byte blocks.  Reordering those blocks is exact:
+    it neither dequantizes weights nor changes their Q8 scales or integers.
+    """
+    if packed.ndim != 2:
+        raise ValueError(f"Qwen GDN packed output projection must be rank 2, got {tuple(packed.shape)}")
+    bytes_per_head = row_bytes(head_dim, GGML_Q8_0)
+    if head_dim <= 0 or packed.shape[1] % bytes_per_head:
+        raise ValueError(
+            "Qwen GDN packed output projection does not contain complete value-head blocks: "
+            f"{tuple(packed.shape)} with head_dim={head_dim}"
+        )
+    num_value_heads = packed.shape[1] // bytes_per_head
+    grouped = packed.reshape(packed.shape[0], num_value_heads, bytes_per_head)
+    # The generic helper operates on the leading head axis.  Transpose the packed
+    # view so the same explicit permutation is applied to every output row.
+    return _restore_gdn_value_head_order(grouped.transpose(0, 1), num_key_heads).transpose(0, 1).reshape_as(packed)
+
+
 def _to_bf16(t) -> torch.Tensor:
     """Dequantize one GGUF scalar tensor to its logical torch shape."""
     return dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16).reshape(t.shape)
@@ -122,6 +174,14 @@ def iter_gguf_weights(
 
     metadata = load_gguf_metadata(model_path)
     gdn_num_key_heads = int(metadata["qwen35moe.ssm.group_count"])
+    gdn_num_value_heads = int(metadata["qwen35moe.ssm.time_step_rank"])
+    gdn_inner_size = int(metadata["qwen35moe.ssm.inner_size"])
+    if gdn_num_value_heads <= 0 or gdn_inner_size % gdn_num_value_heads:
+        raise ValueError(
+            "Qwen GGUF GDN metadata has an invalid value-head geometry: "
+            f"inner_size={gdn_inner_size}, time_step_rank={gdn_num_value_heads}"
+        )
+    gdn_value_head_dim = gdn_inner_size // gdn_num_value_heads
 
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     gdn_buf: dict[int, dict[str, torch.Tensor]] = {}
@@ -185,7 +245,18 @@ def iter_gguf_weights(
                 # GGUF stores depthwise filters as [channels, kernel]; FreeToken's
                 # causal-convolution holder uses the PyTorch depthwise layout
                 # [channels, 1, kernel].
-                tensor = tensor.unsqueeze(1)
+                # Its Q|K prefix retains key-head order, while its V suffix uses
+                # llama.cpp's grouped value-head order and must be made consistent
+                # with the restored scalar recurrence terms.
+                gdn_key_dim = gdn_num_key_heads * gdn_value_head_dim
+                gdn_value_dim = gdn_num_value_heads * gdn_value_head_dim
+                qk_prefix = tensor[: 2 * gdn_key_dim]
+                value_rows = _restore_gdn_value_head_rows(
+                    tensor[2 * gdn_key_dim : 2 * gdn_key_dim + gdn_value_dim],
+                    gdn_num_key_heads,
+                    gdn_value_head_dim,
+                )
+                tensor = torch.cat((qk_prefix, value_rows), dim=0).unsqueeze(1)
             elif suffix == "ffn_gate_inp_shexp.weight":
                 # The single shared-expert gate is stored as a vector in GGUF but
                 # executes as a one-row replicated linear projection.
@@ -208,11 +279,23 @@ def iter_gguf_weights(
         elif suffix == "attn_output.weight":
             yield f"{base}.self_attn.o_proj.qweight", t.packed()
         elif suffix == "attn_qkv.weight":
-            gdn_buf.setdefault(layer, {})["qkv"] = t.packed()
+            # The Q|K prefix is keyed by the 16 GDN key heads.  The V suffix is
+            # keyed by the 32 value heads and is grouped by llama.cpp in GGUF.
+            packed = t.packed()
+            gdn_key_dim = gdn_num_key_heads * gdn_value_head_dim
+            qk_rows = packed[: 2 * gdn_key_dim]
+            value_rows = _restore_gdn_value_head_rows(
+                packed[2 * gdn_key_dim :], gdn_num_key_heads, gdn_value_head_dim
+            )
+            gdn_buf.setdefault(layer, {})["qkv"] = torch.cat((qk_rows, value_rows), dim=0)
         elif suffix == "attn_gate.weight":
-            gdn_buf.setdefault(layer, {})["z"] = t.packed()
+            gdn_buf.setdefault(layer, {})["z"] = _restore_gdn_value_head_rows(
+                t.packed(), gdn_num_key_heads, gdn_value_head_dim
+            )
         elif suffix == "ssm_out.weight":
-            yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+            yield f"{base}.linear_attn.out_proj.qweight", _restore_gdn_value_head_input_blocks(
+                t.packed(), gdn_num_key_heads, gdn_value_head_dim
+            )
         elif suffix == "ffn_gate_shexp.weight":
             shared_buf.setdefault(layer, {})["gate"] = t.packed()
         elif suffix == "ffn_up_shexp.weight":
