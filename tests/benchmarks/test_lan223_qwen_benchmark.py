@@ -12,6 +12,7 @@ from benchmarks.lan223_qwen.run_api_benchmark import (
     parse_args,
     require_expected_host,
 )
+from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -72,6 +73,25 @@ class TailMetricTests(unittest.TestCase):
         """A one-token answer must not fabricate token-gap tail statistics."""
 
         self.assertTrue(all(value is None for value in numeric_summary([]).values()))
+
+
+class QualitySuiteCheckTests(unittest.TestCase):
+    """Verify fixture scoring without needing a server or model weights."""
+
+    def test_exact_check_accepts_only_visible_exact_text(self) -> None:
+        """Whitespace around an otherwise exact completion is acceptable."""
+
+        self.assertEqual(evaluate_check(" LAN223\n", {"kind": "exact", "value": "LAN223"}), (True, None))
+        self.assertFalse(evaluate_check("LAN223!", {"kind": "exact", "value": "LAN223"})[0])
+
+    def test_json_fields_check_rejects_nonvisible_or_wrong_structure(self) -> None:
+        """The gate requires a valid visible JSON object with the requested fields."""
+
+        self.assertEqual(
+            evaluate_check('{"status":"ok","value":7}', {"kind": "json_fields", "fields": {"status": "ok", "value": 7}}),
+            (True, None),
+        )
+        self.assertFalse(evaluate_check("not json", {"kind": "json_fields", "fields": {"status": "ok"}})[0])
 
 
 class DpmPolicyWrapperTests(unittest.TestCase):
