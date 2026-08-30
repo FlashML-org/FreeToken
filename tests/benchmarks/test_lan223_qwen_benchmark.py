@@ -198,3 +198,15 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         self.assertIn('LAN223_QWEN_BASE_URL="${BASE_URL}"', contents)
         self.assertIn('run_qwen_scheduler_baseline.sh', contents)
         self.assertIn('--port 1921', contents)
+
+    def test_timeshare_control_requires_serving_state_before_returning(self) -> None:
+        """A port-1919 HTTP response is insufficient while FreeToken is loading."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_timeshare_control.sh"
+        contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertIn('"status":"ok"', contents)
+        self.assertIn('find_freetoken_pid', contents)
+        self.assertIn('sudo swapoff -a', contents)
+        self.assertIn('bash "${RECOVERY_SCRIPT}"', contents)
