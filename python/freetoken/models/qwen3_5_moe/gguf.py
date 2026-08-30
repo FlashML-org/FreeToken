@@ -400,11 +400,6 @@ def _ungroup_packed_rows(packed: torch.Tensor, num_k_heads: int, num_v_per_k: in
 
 
 def _to_bf16(t) -> torch.Tensor:
-    """A (1 + weight) norm: dequantize then add 1, matching weight.py's load-time shift."""
-    return _to_bf16(t) + 1.0
-
-
-def _to_bf16(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
     return flat.reshape(t.shape)

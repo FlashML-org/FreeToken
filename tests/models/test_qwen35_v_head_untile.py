@@ -57,12 +57,14 @@ def _grouped_index_of_tiled_slot(t: int) -> int:
     return k * R + r
 
 
-TILED_TAGS = np.array(
+TILED_HEAD_IDS = np.array(
     [_grouped_index_of_tiled_slot(t) for t in range(V_HEADS)], dtype=np.float32
 )
+TAG_OFFSET = np.float32(0.1234567)  # deliberately not exactly representable as bf16
+TILED_TAGS = TILED_HEAD_IDS + TAG_OFFSET
 # Sanity: writing these tags in file order and un-tiling must produce 0..V_HEADS-1.
-assert sorted(TILED_TAGS.tolist()) == list(range(V_HEADS))
-assert TILED_TAGS.tolist() != list(range(V_HEADS)), "tags must not already be the identity"
+assert sorted(TILED_HEAD_IDS.tolist()) == list(range(V_HEADS))
+assert TILED_HEAD_IDS.tolist() != list(range(V_HEADS)), "tags must not already be the identity"
 
 
 def _ensure_tp1() -> None:
@@ -218,6 +220,18 @@ def test_dt_bias_is_regrouped(weights):
     assert dt.shape == (V_HEADS,)
     got = [round(float(x)) for x in dt]
     assert got == list(range(V_HEADS)), f"dt_bias still in file order {got}"
+
+
+def test_gating_params_keep_fp32_precision(weights):
+    """A_log/dt_bias must not round through bf16 before reaching their fp32 params."""
+    expected = torch.arange(V_HEADS, dtype=torch.float32) + float(TAG_OFFSET)
+    a_log = weights["model.layers.0.linear_attn.A_log"]
+    dt = weights["model.layers.0.linear_attn.dt_bias"]
+    assert a_log.dtype == torch.float32
+    assert dt.dtype == torch.float32
+    torch.testing.assert_close(a_log, expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(dt, expected, rtol=0, atol=0)
+    assert not torch.equal(expected.to(torch.bfloat16).float(), expected)
 
 
 def _rows_to_f32(t: torch.Tensor, lo: int, hi: int, in_features: int) -> torch.Tensor:
