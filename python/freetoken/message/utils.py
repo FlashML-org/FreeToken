@@ -32,10 +32,19 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        # Backend messages cross a ZMQ boundary as JSON plus bytes.  Image
+        # preprocessing needs 3-D patch and position tensors, while token ids
+        # remain 1-D.  Preserve arbitrary CPU shapes explicitly instead of
+        # flattening and losing the vision batch contract.
+        assert self.device.type == "cpu", "only CPU tensors can cross a process boundary"
+        tensor = self.contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        serialized["shape"] = list(tensor.shape)
+        serialized["dtype"] = str(tensor.dtype)
+        # NumPy has no stable bfloat16 dtype on every supported version.  Carry
+        # its bit pattern as uint16 and restore the original torch dtype below.
+        raw = tensor.view(torch.uint16) if tensor.dtype == torch.bfloat16 else tensor
+        serialized["buffer"] = raw.numpy().tobytes()
         return serialized
 
     # normal type
@@ -64,14 +73,17 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
+        shape = tuple(int(dim) for dim in data.get("shape", []))
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        if dtype_str == "bfloat16":
+            raw = np.frombuffer(buffer, dtype=np.uint16).copy().reshape(shape)
+            return torch.from_numpy(raw).view(torch.bfloat16)
+        np_dtype = getattr(np, dtype_str)
+        np_tensor = np.frombuffer(buffer, dtype=np_dtype).copy().reshape(shape)
+        return torch.from_numpy(np_tensor)
 
     cls = cls_map.get(type_name)
     if cls is None:

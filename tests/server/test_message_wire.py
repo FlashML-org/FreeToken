@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -22,6 +24,7 @@ from freetoken.message import (
     CacheStatsResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
@@ -150,3 +153,19 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_backend_wire_preserves_multidimensional_cpu_tensors():
+    """Vision patch data needs its original batch and feature dimensions after ZMQ."""
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        mm_embeds=torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+    )
+    decoded = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(decoded, UserMsg)
+    assert decoded.mm_embeds is not None
+    assert decoded.mm_embeds.shape == (2, 3, 4)
+    assert decoded.mm_embeds.dtype == torch.float32
+    assert torch.equal(decoded.mm_embeds, msg.mm_embeds)
