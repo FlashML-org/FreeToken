@@ -97,14 +97,18 @@ class Glm5NextLinearAttention(BaseOP):
                 raw, pool.conv_states[li], self._conv_weight(), fla.cache_indices
             )
         else:
-            mixed = causal_conv1d_varlen(
-                raw.transpose(0, 1).contiguous(),
-                self._conv_weight(),
-                pool.conv_states[li],
-                fla.cu_seqlens,
-                fla.cache_indices,
-                fla.has_initial_state,
-            ).transpose(0, 1)
+            mixed = (
+                causal_conv1d_varlen(
+                    raw.transpose(0, 1).contiguous(),
+                    self._conv_weight(),
+                    pool.conv_states[li],
+                    fla.cu_seqlens,
+                    fla.cache_indices,
+                    fla.has_initial_state,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         total = hidden_states.shape[0]
         q, k, v = torch.split(mixed, [self.qkv_dim] * 3, dim=-1)
