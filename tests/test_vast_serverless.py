@@ -90,4 +90,6 @@ def test_deepseek_v4_vast_provisioner_sets_model_contract():
     assert "TEKIZAI_MODEL_BENCH_DTYPE" in source
     assert "ds_fp4" in source
     assert "TEKIZAI_SERVED_MODEL" in source
-    assert 'exec "$script_dir/vast_glm53_provision.sh"' in source
+    assert "raw.githubusercontent.com/earlvanze/FreeToken" in source
+    assert "TEKIZAI_FREETOKEN_REF" in source
+    assert 'exec "$shared_provisioner"' in source
