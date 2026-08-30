@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -517,8 +518,14 @@ class Scheduler(SchedulerIOMixin):
                     ]
                 )
                 return
-            if msg.mm_pixel_values is not None or msg.mm_image_position_ids is not None:
-                if msg.mm_pixel_values is None or msg.mm_image_position_ids is None:
+            # Older and text-only tokenizer messages legitimately omit the two
+            # multimodal attributes altogether. Treat an absent attribute the
+            # same as ``None`` so a normal completion can never crash the
+            # scheduler before image handling is even considered.
+            mm_pixel_values = getattr(msg, "mm_pixel_values", None)
+            mm_image_position_ids = getattr(msg, "mm_image_position_ids", None)
+            if mm_pixel_values is not None or mm_image_position_ids is not None:
+                if mm_pixel_values is None or mm_image_position_ids is None:
                     self.send_result([ErrorReplyMsg(uid=msg.uid, error="incomplete image tensors")])
                     return
                 model = self.engine.model
@@ -532,9 +539,30 @@ class Scheduler(SchedulerIOMixin):
                     # not in the tokenizer process, so the vision weights and
                     # features stay resident on the one serving device.
                     msg.mm_embeds = model.encode_images(
-                        msg.mm_pixel_values.to(self.device),
-                        msg.mm_image_position_ids.to(self.device),
+                        mm_pixel_values.to(self.device),
+                        mm_image_position_ids.to(self.device),
                     )
+                    # This diagnostic sits at the scheduler boundary, after the
+                    # actual model wrapper returns image soft-token embeddings.
+                    # It is intentionally opt-in because copying GPU values to
+                    # the host synchronizes the request and would distort normal
+                    # vision latency measurements.
+                    if os.environ.get("FREETOKEN_GEMMA4_VISION_DEBUG") == "1":
+                        values = msg.mm_embeds.detach().float()
+                        sample = values.reshape(-1)[:16].cpu().tolist()
+                        logger.info_rank0(
+                            "Gemma4 scheduler vision debug: model=%s shape=%s finite=%s "
+                            "mean=%.8f std=%.8f min=%.8f max=%.8f sum=%.8f first16=%s",
+                            type(model).__name__,
+                            tuple(values.shape),
+                            bool(torch.isfinite(values).all().item()),
+                            float(values.mean().item()),
+                            float(values.std(unbiased=False).item()),
+                            float(values.min().item()),
+                            float(values.max().item()),
+                            float(values.sum().item()),
+                            ",".join(f"{value:.8f}" for value in sample),
+                        )
                 except Exception as exc:  # noqa: BLE001 - return a request error, not a dead worker
                     logger.warning_rank0("image encoding failed for request %d: %r", msg.uid, exc)
                     self.send_result([ErrorReplyMsg(uid=msg.uid, error=f"could not encode image: {exc}")])

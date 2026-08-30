@@ -6,6 +6,146 @@ import pytest
 import torch
 
 
+def test_image_group_ids_only_unmask_contiguous_soft_image_tokens():
+    """Two images get distinct groups while text and delimiters remain causal."""
+    from freetoken.attention.triton import _image_group_ids_for_prefill
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([11, 99, 99, 12, 99, 99, 99, 13], dtype=torch.int32),
+        cached_len=0,
+        device_len=8,
+    )
+
+    actual = _image_group_ids_for_prefill([req], image_token_id=99)
+
+    assert actual is not None
+    assert actual.tolist() == [-1, 0, 0, -1, 1, 1, 1, -1]
+
+
+def test_image_group_ids_only_cover_the_uncached_prefill_suffix():
+    """A cached image span cannot make a later decode or continuation non-causal."""
+    from freetoken.attention.triton import _image_group_ids_for_prefill
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([99, 99, 10, 99, 99, 20], dtype=torch.int32),
+        cached_len=3,
+        device_len=6,
+    )
+
+    actual = _image_group_ids_for_prefill([req], image_token_id=99)
+
+    assert actual is not None
+    assert actual.tolist() == [0, 0, -1]
+
+
+def test_image_group_ids_are_absent_without_soft_image_tokens():
+    """Text-only and delimiter-only extensions stay on the existing causal fast path."""
+    from freetoken.attention.triton import _image_group_ids_for_prefill
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([11, 12, 13], dtype=torch.int32),
+        cached_len=0,
+        device_len=3,
+    )
+
+    assert _image_group_ids_for_prefill([req], image_token_id=99) is None
+
+
+def test_triton_backend_enables_image_groups_only_when_layer_requests_them(monkeypatch):
+    """Gemma full layers stay causal while its sliding layers opt in explicitly."""
+    from freetoken.attention import AttentionSpec
+    from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
+
+    class FakeKVCache:
+        device = torch.device("cpu")
+
+        def store_kv(self, *_args):
+            pass
+
+        def k_cache(self, _layer_id):
+            return torch.zeros(4, 1, 4)
+
+        def v_cache(self, _layer_id):
+            return torch.zeros(4, 1, 4)
+
+    monkeypatch.setattr(
+        "freetoken.attention.triton.get_global_ctx",
+        lambda: SimpleNamespace(kv_cache=FakeKVCache()),
+    )
+    captured = []
+
+    def fake_extend(**kwargs):
+        captured.append(kwargs["image_group_ids"])
+        return torch.zeros_like(kwargs["q"])
+
+    monkeypatch.setattr("freetoken.kernel.triton.attention.extend_paged_attention", fake_extend)
+    backend = TritonAttentionBackend(SimpleNamespace())
+    metadata = TritonMetadata(
+        cu_seqlens_q_gpu=torch.tensor([0, 2], dtype=torch.int32),
+        indptr=torch.tensor([0, 2], dtype=torch.int32),
+        indices=torch.tensor([0, 1], dtype=torch.int32),
+        q_to_req=torch.tensor([0, 0], dtype=torch.int32),
+        q_positions=torch.tensor([0, 1], dtype=torch.int64),
+        is_decode=False,
+        prefix_lens=torch.tensor([0], dtype=torch.int32),
+        max_q_len=2,
+        image_group_ids=torch.tensor([0, 0], dtype=torch.int32),
+    )
+    batch = SimpleNamespace(attn_metadata=metadata, out_loc=torch.tensor([0, 1], dtype=torch.int32))
+    q = torch.randn(2, 2, 4, dtype=torch.bfloat16)
+    k = torch.randn(2, 4, dtype=torch.bfloat16)
+    v = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    backend.forward(q, k, v, 0, batch, AttentionSpec(multimodal_bidirectional=False))
+    backend.forward(q, k, v, 0, batch, AttentionSpec(multimodal_bidirectional=True))
+
+    assert captured == [None, metadata.image_group_ids]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA or ROCm")
+def test_extend_triton_attention_unmasks_only_same_image_group():
+    """The ROCm kernel must match Gemma's image-only bidirectional mask."""
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    token_count, q_heads, kv_heads, head_dim = 6, 2, 1, 256
+    q = torch.randn(token_count, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_extend = torch.randn(token_count, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_extend = torch.randn(token_count, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache = torch.zeros_like(k_extend)
+    v_cache = torch.zeros_like(v_extend)
+    groups = torch.tensor([-1, 0, 0, -1, 1, 1], dtype=torch.int32, device=device)
+    actual = extend_paged_attention(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        qo_indptr=torch.tensor([0, token_count], dtype=torch.int32, device=device),
+        kv_indptr=torch.tensor([0, token_count], dtype=torch.int32, device=device),
+        kv_indices=torch.arange(token_count, dtype=torch.int32, device=device),
+        prefix_lens=torch.tensor([0], dtype=torch.int32, device=device),
+        max_q_len=token_count,
+        sm_scale=head_dim**-0.5,
+        k_extend=k_extend,
+        v_extend=v_extend,
+        image_group_ids=groups,
+    )
+
+    expected_rows = []
+    k = k_extend.repeat_interleave(q_heads // kv_heads, dim=1).transpose(0, 1).float()
+    v = v_extend.repeat_interleave(q_heads // kv_heads, dim=1).transpose(0, 1).float()
+    for query_index in range(token_count):
+        causal = torch.arange(token_count, device=device) <= query_index
+        same_group = (groups == groups[query_index]) & (groups[query_index] >= 0)
+        allowed = causal | same_group
+        scores = torch.einsum("hd,hkd->hk", q[query_index].float(), k) * (head_dim**-0.5)
+        probabilities = torch.softmax(scores.masked_fill(~allowed.unsqueeze(0), float("-inf")), dim=-1)
+        expected_rows.append(torch.einsum("hk,hkd->hd", probabilities, v))
+    expected = torch.stack(expected_rows).to(actual.dtype)
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 def _reference_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,

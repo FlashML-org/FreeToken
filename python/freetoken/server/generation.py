@@ -338,7 +338,13 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     except Exception:  # noqa: BLE001 -- server fault, not this request's problem
         return None
     try:
-        await asyncio.to_thread(manager.render_prompt, msg)
+        # Match the tokenizer worker's sequence exactly: render the chat
+        # template first, then expand image markers once into verified Gemma
+        # placeholders and CPU tensors. The worker itself performs this after
+        # render_prompt, so folding expansion into render_prompt would make
+        # actual image requests expand twice.
+        prompt = await asyncio.to_thread(manager.render_prompt, msg)
+        await asyncio.to_thread(manager._expand_gemma4_images, msg, prompt)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
         return GenerationError(f"could not encode request: {exc}")
     return None

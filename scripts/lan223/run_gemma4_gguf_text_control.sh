@@ -77,6 +77,15 @@ production_pid="$(port_pid "${PRODUCTION_PORT}")"
 [[ -z "${production_pid}" ]] || kill "${production_pid}"
 for _ in {1..60}; do ss -ltn "( sport = :${PRODUCTION_PORT} )" | grep -q "${PRODUCTION_PORT}" || break; sleep 1; done
 
+# The preceding time-share and recovery tests can leave cold pages in the host
+# swap file even when enough RAM is currently free.  Qwen has released its
+# memory before this point, so cycling the already-configured swap file is a
+# bounded way to give the isolated Gemma candidate a clean measurement start.
+# This does not resize swap or change the host's vm.swappiness policy.
+sudo swapoff -a
+sudo swapon -a
+swapon --show --bytes >"${ARTIFACT_DIR}/swap-after-qwen-release.txt"
+
 cd "${CHECKOUT}"
 vision_env=()
 if [[ "${MODE}" == "vision" ]]; then
@@ -84,6 +93,12 @@ if [[ "${MODE}" == "vision" ]]; then
     # load its sibling 1.2 GiB mmproj vision tower. Text mode preserves the
     # normal production memory budget.
     vision_env=(FREETOKEN_LOAD_VISION=1)
+    # The embedding fingerprint is a temporary parity aid. Preserve its explicit
+    # caller opt-in so ordinary vision controls never synchronize the device to
+    # compute debug statistics or expand the normally concise server log.
+    if [[ "${FREETOKEN_GEMMA4_VISION_DEBUG:-}" == "1" ]]; then
+        vision_env+=(FREETOKEN_GEMMA4_VISION_DEBUG=1)
+    fi
 fi
 # ``env`` is required here: an expanded Bash array is not parsed as assignment
 # words, so placing ``${vision_env[@]}`` before ``nohup`` directly would try to
@@ -104,6 +119,14 @@ for _ in {1..480}; do
 done
 grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log"
 curl -fsS "http://127.0.0.1:${TEST_PORT}/health" >"${ARTIFACT_DIR}/health.json"
+# Capture the environment as observed by the actual candidate process, rather
+# than assuming a wrapper-level export survived ``nohup`` and multiprocessing.
+# This artifact is written only for the parity diagnostic and contains solely
+# the named boolean flag, never the server's complete environment.
+if [[ "${FREETOKEN_GEMMA4_VISION_DEBUG:-}" == "1" ]]; then
+    tr '\0' '\n' <"/proc/${candidate_pid}/environ" | \
+        grep '^FREETOKEN_GEMMA4_VISION_DEBUG=' >"${ARTIFACT_DIR}/vision-debug-env.txt" || true
+fi
 PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_text.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
@@ -114,9 +137,22 @@ if [[ "${MODE}" == "vision" ]]; then
     # control. The verifier writes a self-contained response/usage artifact;
     # only after it succeeds does the EXIT trap reclaim port 1923 and restore
     # the protected Qwen server.
+    image_verify_args=()
+    if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
+        # The core three-fixture gate stays fast enough for every normal
+        # candidate. This explicit option adds color and spatial-direction
+        # regression controls after the core pipeline has already passed.
+        image_verify_args+=(--extended)
+    fi
+    if [[ -n "${FREETOKEN_GEMMA4_IMAGE_REPETITIONS:-}" ]]; then
+        # The verifier validates this as a positive integer. Keeping the value
+        # in the environment lets an operator request a repeatability campaign
+        # without changing the normal short candidate-control behavior.
+        image_verify_args+=(--repetitions "${FREETOKEN_GEMMA4_IMAGE_REPETITIONS}")
+    fi
     PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_image.py \
         --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
-        --stream --artifact "${ARTIFACT_DIR}/image-quality.json" \
+        --stream "${image_verify_args[@]}" --artifact "${ARTIFACT_DIR}/image-quality.json" \
         >"${ARTIFACT_DIR}/image-quality.log" 2>&1
     # The long-response fixture supplies an output-length quality gate, which
     # makes its stream timing suitable for a visual decode-TPS measurement.

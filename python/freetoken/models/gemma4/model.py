@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,7 +12,7 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from freetoken.models.blocks import BaseLLMModel
 
@@ -21,6 +22,38 @@ from .vision import Gemma4MultimodalEmbedder, Gemma4VisionModel
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+logger = init_logger(__name__)
+
+
+def _log_vision_embedding_summary(label: str, tensor: torch.Tensor) -> None:
+    """Write a bounded numerical fingerprint for an opt-in vision parity run.
+
+    ``FREETOKEN_GEMMA4_VISION_DEBUG=1`` enables this diagnostic while investigating
+    a reference mismatch.  It deliberately records only shape, finite-state,
+    aggregate statistics, and the first sixteen scalar values: that is enough to
+    compare FreeToken's vision output with llama.cpp's mtmd debug output without
+    placing a full image embedding in a server log.  The environment guard keeps
+    normal serving free from the device synchronization caused by ``cpu()``.
+    """
+    if os.environ.get("FREETOKEN_GEMMA4_VISION_DEBUG") != "1":
+        return
+    values = tensor.detach().float()
+    sample = values.reshape(-1)[:16].cpu().tolist()
+    logger.info_rank0(
+        "Gemma4 vision debug %s: shape=%s finite=%s mean=%.8f std=%.8f "
+        "min=%.8f max=%.8f sum=%.8f first16=%s",
+        label,
+        tuple(values.shape),
+        bool(torch.isfinite(values).all().item()),
+        float(values.mean().item()),
+        float(values.std(unbiased=False).item()),
+        float(values.min().item()),
+        float(values.max().item()),
+        float(values.sum().item()),
+        ",".join(f"{value:.8f}" for value in sample),
+    )
 
 
 class Gemma4DecoderLayer(BaseOP):
@@ -125,7 +158,10 @@ class Gemma4ForCausalLM(BaseLLMModel):
         ``image_position_ids``: ``[num_images, num_patches, 2]`` with ``(-1, -1)`` padding.
         """
         features = self.vision_tower.forward(pixel_values, image_position_ids)
-        return self.embed_vision.forward(features)
+        _log_vision_embedding_summary("tower", features)
+        projected = self.embed_vision.forward(features)
+        _log_vision_embedding_summary("projected", projected)
+        return projected
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

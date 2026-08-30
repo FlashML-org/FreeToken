@@ -77,8 +77,10 @@ def gemma4_image_inputs(image: Image.Image) -> Gemma4ImageInputs:
 
     The resize equation matches Gemma4's processor: at most 280 soft tokens
     after 3-by-3 pooling, dimensions aligned to ``16 * 3`` pixels, and a
-    lower bound of one pooled patch.  Patch pixels are channel-major and scaled
-    to [0, 1], exactly matching the model's internal ``2 * (x - 0.5)`` step.
+    lower bound of one pooled patch.  Every image is then padded to the fixed
+    2,520-patch vision sequence used by the official processor. Patch pixels
+    are channel-planar RGB values in [0, 1], exactly matching the projector's
+    convolution-kernel layout before the model applies ``2 * (x - 0.5)``.
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -91,8 +93,12 @@ def gemma4_image_inputs(image: Image.Image) -> Gemma4ImageInputs:
     target_width = max(unit, int(math.floor(source_width * scale / unit)) * unit)
     resized = image.resize((target_width, target_height), Image.Resampling.BICUBIC)
 
-    # HWC RGB -> [grid_y, grid_x, channels, patch_y, patch_x] -> flattened
-    # channel-major patch vectors expected by the linear patch embedder.
+    # HWC RGB -> [grid_y, grid_x, channels, patch_y, patch_x] -> flattened.
+    # The sibling mmproj stores ``v.patch_embd.weight`` as a conventional
+    # convolution kernel: [output, channel, patch_y, patch_x]. Its input vector
+    # therefore contains one complete red patch, then green, then blue. An
+    # RGB-interleaved vector is shape-compatible but produces wrong vision
+    # features for otherwise simple, deterministic color controls.
     pixels = np.asarray(resized, dtype=np.float32) / 255.0
     grid_y, grid_x = target_height // _PATCH_SIZE, target_width // _PATCH_SIZE
     patches = (
@@ -107,6 +113,23 @@ def gemma4_image_inputs(image: Image.Image) -> Gemma4ImageInputs:
     positions = np.stack((xs.reshape(-1), ys.reshape(-1)), axis=-1).astype(np.int64)
     soft_token_count = (grid_y * grid_x) // _POOLING_KERNEL_SIZE**2
     assert soft_token_count <= _MAX_SOFT_TOKENS
+    # The Gemma 4 vision tower derives its pooled output length from the input
+    # tensor length, not from the count of valid patches. Pad each image to the
+    # official max-patch budget so a 256-token image is processed in the same
+    # 280-slot geometry as the reference implementation. The -1 coordinates
+    # mark padding for both attention and the pooler's final validity mask.
+    patches = np.pad(
+        patches,
+        ((0, max_patches - patches.shape[0]), (0, 0)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    positions = np.pad(
+        positions,
+        ((0, max_patches - positions.shape[0]), (0, 0)),
+        mode="constant",
+        constant_values=-1,
+    )
     return Gemma4ImageInputs(
         pixel_values=torch.from_numpy(patches),
         image_position_ids=torch.from_numpy(positions),

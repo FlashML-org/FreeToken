@@ -213,7 +213,7 @@ def _gemma4_image_token_id(metadata: dict) -> int:
     tokens = metadata.get("tokenizer.ggml.tokens")
     if not isinstance(tokens, list):
         raise ValueError("Gemma4 GGUF vision requires tokenizer.ggml.tokens")
-    accepted = {"<image_soft_token>", "<image>", "<|image>"}
+    accepted = {"<|image|>"}
     matches = [index for index, token in enumerate(tokens) if str(token) in accepted]
     if len(matches) != 1:
         raise ValueError(

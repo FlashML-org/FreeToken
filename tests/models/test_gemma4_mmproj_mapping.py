@@ -21,11 +21,11 @@ def test_gemma4_mmproj_rejects_unknown_names() -> None:
 
 
 def test_gemma4_gguf_image_placeholder_uses_checkpoint_token() -> None:
-    """Gemma's actual ``<|image>`` placeholder is not inferred from a fixed id."""
-    assert _gemma4_image_token_id({"tokenizer.ggml.tokens": ["x", "<|image>"]}) == 1
+    """Gemma's soft image placeholder is not inferred from a fixed id."""
+    assert _gemma4_image_token_id({"tokenizer.ggml.tokens": ["x", "<|image|>"]}) == 1
 
 
 def test_gemma4_gguf_image_placeholder_rejects_ambiguous_tokenizers() -> None:
     """A conversion that carries multiple candidate placeholders must fail closed."""
     with pytest.raises(ValueError, match="exactly one image placeholder"):
-        _gemma4_image_token_id({"tokenizer.ggml.tokens": ["<image>", "<|image>"]})
+        _gemma4_image_token_id({"tokenizer.ggml.tokens": ["<|image|>", "<|image|>"]})

@@ -210,3 +210,15 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         self.assertIn('find_freetoken_pid', contents)
         self.assertIn('sudo swapoff -a', contents)
         self.assertIn('bash "${RECOVERY_SCRIPT}"', contents)
+
+    def test_gemma_control_releases_stale_swap_only_after_qwen_stops(self) -> None:
+        """Gemma must start from a clean state without changing host swap policy."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        wrapper = repository_root / "scripts" / "lan223" / "run_gemma4_gguf_text_control.sh"
+        contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertIn('sudo swapoff -a', contents)
+        self.assertIn('sudo swapon -a', contents)
+        self.assertIn('swap-after-qwen-release.txt', contents)
+        self.assertLess(contents.index('production_pid="$(port_pid'), contents.index('sudo swapoff -a'))

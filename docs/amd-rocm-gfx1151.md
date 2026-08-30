@@ -130,3 +130,16 @@ fork unless the upstream maintainers request them.
 The completed 2026-08-28 native HIP validation, exact LAN-223 environment,
 API evidence, command shapes, and known limitations are documented in
 [`lan223-rocm-validation-2026-08-28.md`](lan223-rocm-validation-2026-08-28.md).
+The post-repair Gemma vision, Qwen API, matched runner, and clean-memory
+endurance evidence is documented separately in
+[`lan223-rocm-validation-2026-08-30.md`](lan223-rocm-validation-2026-08-30.md).
+
+## Public reproduction interface
+
+The LAN-223 scripts intentionally preserve a local protected service and use
+host-specific model locations. They are not the public entry point. Independent
+users should begin with [`reproducibility.md`](reproducibility.md) and its
+parameterized `scripts/reproduce/collect_host_manifest.sh` collector. The
+collector requires a native HIP PyTorch device, writes a new non-sensitive
+artifact directory, redacts the hostname by default, and never starts or stops
+a model server or changes host state.

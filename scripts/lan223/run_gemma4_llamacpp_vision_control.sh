@@ -62,6 +62,13 @@ production_pid="$(port_pid "${PRODUCTION_PORT}")"
 [[ -z "${production_pid}" ]] || kill "${production_pid}"
 for _ in {1..60}; do ss -ltn "( sport = :${PRODUCTION_PORT} )" | grep -q "${PRODUCTION_PORT}" || break; sleep 1; done
 
+# Release stale pages only after the protected FreeToken process has exited.
+# This preserves the host's swap-file size and swappiness policy while giving
+# the standalone projector control a clean shared-memory baseline.
+sudo swapoff -a
+sudo swapon -a
+swapon --show --bytes >"${ARTIFACT_DIR}/swap-after-qwen-release.txt"
+
 # Use the same ROCm 10 libraries, full text-model and projector offload, Q8 KV,
 # Flash Attention, one slot, and 8,192-token context as the existing Qwen
 # llama.cpp controls. The projector is explicit so no download or auto-selection
@@ -84,9 +91,16 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gg
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
     >"${ARTIFACT_DIR}/quality.log" 2>&1
+image_verify_args=()
+if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
+    # Keep the normal llama.cpp reference quick, but permit the identical
+    # expanded fixture set when checking color and spatial parity with
+    # FreeToken after a multimodal implementation change.
+    image_verify_args+=(--extended)
+fi
 PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_image.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
-    --max-tokens 128 --stream --artifact "${ARTIFACT_DIR}/image-quality.json" \
+    --max-tokens 128 --stream "${image_verify_args[@]}" --artifact "${ARTIFACT_DIR}/image-quality.json" \
     >"${ARTIFACT_DIR}/image-quality.log" 2>&1
 # Use the identical deterministic fixture and visible-output quality gate as
 # FreeToken. This keeps visual decode timing comparable despite llama.cpp's

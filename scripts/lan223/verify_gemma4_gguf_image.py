@@ -14,6 +14,7 @@ import base64
 import io
 import json
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -51,26 +52,33 @@ def _post_json_stream(url: str, payload: dict) -> tuple[dict, dict]:
     content: list[str] = []
     reasoning: list[str] = []
     usage: dict = {}
-    with urllib.request.urlopen(request, timeout=300) as response:  # nosec B310: caller controls local base URL
-        for raw in response:
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            event = json.loads(data)
-            usage = event.get("usage") or usage
-            for choice in event.get("choices", []):
-                delta = choice.get("delta", {})
-                piece = delta.get("content") or ""
-                thought = delta.get("reasoning_content") or ""
-                if piece or thought:
-                    now = time.perf_counter()
-                    first_chunk = first_chunk if first_chunk is not None else now
-                    last_chunk = now
-                    content.append(piece)
-                    reasoning.append(thought)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:  # nosec B310: caller controls local base URL
+            for raw in response:
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                event = json.loads(data)
+                usage = event.get("usage") or usage
+                for choice in event.get("choices", []):
+                    delta = choice.get("delta", {})
+                    piece = delta.get("content") or ""
+                    thought = delta.get("reasoning_content") or ""
+                    if piece or thought:
+                        now = time.perf_counter()
+                        first_chunk = first_chunk if first_chunk is not None else now
+                        last_chunk = now
+                        content.append(piece)
+                        reasoning.append(thought)
+    except urllib.error.HTTPError as exc:
+        # The server's JSON body explains whether the image wire shape, template,
+        # tokenizer, or vision model rejected the request. Preserve it in the
+        # raised error instead of leaving only an uninformative HTTP status.
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"image request HTTP {exc.code}: {detail}") from exc
     elapsed = time.perf_counter() - started
     completion = usage.get("completion_tokens")
     generated_window = (last_chunk - first_chunk) if first_chunk is not None and last_chunk is not None else 0.0
@@ -87,6 +95,29 @@ def _post_json_stream(url: str, payload: dict) -> tuple[dict, dict]:
     }, metrics
 
 
+def _two_color_image(
+    size: tuple[int, int], first: tuple[int, int, int], second: tuple[int, int, int], *, horizontal: bool
+) -> Image.Image:
+    """Build one sharp two-color spatial fixture without external image assets.
+
+    ``horizontal=True`` means the first color occupies the left half and the
+    second color occupies the right half.  ``False`` places the first color on
+    top.  Keeping this construction local and procedural makes the exact input
+    bytes reproducible while exercising real image decoding and preprocessing.
+    """
+    width, height = size
+    image = Image.new("RGB", size, second)
+    if horizontal:
+        for x in range(width // 2):
+            for y in range(height):
+                image.putpixel((x, y), first)
+    else:
+        for x in range(width):
+            for y in range(height // 2):
+                image.putpixel((x, y), first)
+    return image
+
+
 def main() -> int:
     """Run color and spatial fixtures, validate exact answers, and save evidence."""
     parser = argparse.ArgumentParser()
@@ -98,12 +129,22 @@ def main() -> int:
         help="per-case generation cap; llama.cpp needs a larger cap when it emits thought first",
     )
     parser.add_argument("--stream", action="store_true", help="capture stream timing and final usage")
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="add deterministic blue, yellow, right-half, and top-half controls after core parity passes",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="run the complete selected fixture set this many times against the same ready server",
+    )
     args = parser.parse_args()
+    if args.repetitions < 1:
+        parser.error("--repetitions must be at least one")
 
-    split = Image.new("RGB", (96, 48), (0, 0, 255))
-    for x in range(48):
-        for y in range(48):
-            split.putpixel((x, y), (255, 0, 0))
+    split = _two_color_image((96, 48), (255, 0, 0), (0, 0, 255), horizontal=True)
     cases = [
         ("solid_red", Image.new("RGB", (16, 16), (255, 0, 0)),
          "What is the dominant color in the image? Reply with one lowercase word.", "red"),
@@ -112,35 +153,58 @@ def main() -> int:
         ("red_left_blue_right", split,
          "What color is the left half of the image? Reply with one lowercase word.", "red"),
     ]
+    if args.extended:
+        # These controls deliberately ask about the opposite half and a vertical
+        # layout. They catch a pipeline that recognizes colors but reverses or
+        # otherwise loses spatial coordinates after patch pooling.
+        cases.extend([
+            ("solid_blue", Image.new("RGB", (16, 16), (0, 0, 255)),
+             "What is the dominant color in the image? Reply with one lowercase word.", "blue"),
+            ("solid_yellow", Image.new("RGB", (16, 16), (255, 255, 0)),
+             "What is the dominant color in the image? Reply with one lowercase word.", "yellow"),
+            ("red_left_blue_right_right_half", split,
+             "What color is the right half of the image? Reply with one lowercase word.", "blue"),
+            ("blue_top_yellow_bottom_top_half",
+             _two_color_image((48, 96), (0, 0, 255), (255, 255, 0), horizontal=False),
+             "What color is the top half of the image? Reply with one lowercase word.", "blue"),
+        ])
     records = []
-    for name, image, prompt, expected in cases:
-        request = {
-            "model": args.model,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
-            ]}],
-            "temperature": 0,
-            "max_tokens": args.max_tokens,
-        }
-        started = time.perf_counter()
-        metrics = None
-        if args.stream:
-            response, metrics = _post_json_stream(args.base_url.rstrip("/") + "/v1/chat/completions", request)
-        else:
-            response = _post_json(args.base_url.rstrip("/") + "/v1/chat/completions", request)
-        text = response["choices"][0]["message"]["content"].strip().lower()
-        records.append({
-            "control": name,
-            "prompt": prompt,
-            "expected": expected,
-            "actual": text,
-            "elapsed_s": time.perf_counter() - started,
-            "stream_metrics": metrics,
-            "usage": response.get("usage"),
-            "response": response,
-        })
-    record = {"schema_version": 2, "passed": all(item["actual"] == item["expected"] for item in records), "cases": records}
+    for repetition in range(1, args.repetitions + 1):
+        for name, image, prompt, expected in cases:
+            request = {
+                "model": args.model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
+                ]}],
+                "temperature": 0,
+                "max_tokens": args.max_tokens,
+            }
+            started = time.perf_counter()
+            metrics = None
+            if args.stream:
+                response, metrics = _post_json_stream(args.base_url.rstrip("/") + "/v1/chat/completions", request)
+            else:
+                response = _post_json(args.base_url.rstrip("/") + "/v1/chat/completions", request)
+            text = response["choices"][0]["message"]["content"].strip().lower()
+            records.append({
+                "control": name,
+                "repetition": repetition,
+                "prompt": prompt,
+                "expected": expected,
+                "actual": text,
+                "elapsed_s": time.perf_counter() - started,
+                "stream_metrics": metrics,
+                "usage": response.get("usage"),
+                "response": response,
+            })
+    record = {
+        "schema_version": 3,
+        "fixture_set": "extended" if args.extended else "core",
+        "repetitions": args.repetitions,
+        "passed": all(item["actual"] == item["expected"] for item in records),
+        "cases": records,
+    }
     args.artifact.parent.mkdir(parents=True, exist_ok=True)
     args.artifact.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     if not record["passed"]:

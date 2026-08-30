@@ -633,6 +633,7 @@ def _extend_attention_split_kernel(
     kv_indptr_ptr,
     kv_indices_ptr,
     prefix_lens_ptr,
+    image_group_ids_ptr,
     sm_scale,
     sinks_ptr,
     stride_qt,
@@ -655,6 +656,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_IMAGE_GROUPS: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -737,12 +739,25 @@ def _extend_attention_split_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
-    current_end = tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
+    # Causal attention normally needs only keys through this query tile. Gemma
+    # 4 image soft tokens are the exception: every token in one image group can
+    # see the group's future tokens. Iterate over the full current extension
+    # only when a batch carries those group ids.
+    current_end = q_len if HAS_IMAGE_GROUPS else tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
     for start_n in tl.range(0, current_end, BLOCK_N):
         local_kv_offsets = start_n + offs_n
         mask_n = local_kv_offsets < current_end
         local_q_pos = offs_m
         causal_mask = local_kv_offsets[None, :] <= local_q_pos[:, None]
+        if HAS_IMAGE_GROUPS:
+            q_groups = tl.load(image_group_ids_ptr + q_start + offs_m, mask=mask_m, other=-1)
+            k_groups = tl.load(
+                image_group_ids_ptr + q_start + local_kv_offsets, mask=mask_n, other=-1
+            )
+            same_image_group = (
+                (q_groups[:, None] >= 0) & (q_groups[:, None] == k_groups[None, :])
+            )
+            causal_mask = causal_mask | same_image_group
         if SLIDING_WINDOW > 0:
             causal_mask = causal_mask & (
                 (local_kv_offsets[None, :] + SLIDING_WINDOW) > local_q_pos[:, None]
@@ -809,8 +824,14 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    image_group_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-tiled causal prefill/extend attention over paged KV cache."""
+    """Block-tiled prefill attention over paged KV cache.
+
+    Normal tokens use causal attention. When ``image_group_ids`` is supplied,
+    equal non-negative ids receive Gemma 4's bidirectional image-block
+    exception during this prefill only.
+    """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -826,9 +847,15 @@ def extend_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    if image_group_ids is not None:
+        assert image_group_ids.is_cuda
+        assert image_group_ids.dim() == 1
+        assert image_group_ids.numel() == num_q_tokens
+        image_group_ids = image_group_ids.contiguous()
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    image_groups_arg = image_group_ids if image_group_ids is not None else q
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
@@ -856,6 +883,7 @@ def extend_paged_attention(
             kv_indptr,
             kv_indices,
             prefix_lens,
+            image_groups_arg,
             sm_scale,
             sinks_arg,
             q.stride(0),
@@ -878,6 +906,7 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            HAS_IMAGE_GROUPS=image_group_ids is not None,
             num_warps=8,
             num_stages=1,
         )

@@ -156,16 +156,24 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
 
 
 def test_backend_wire_preserves_multidimensional_cpu_tensors():
-    """Vision patch data needs its original batch and feature dimensions after ZMQ."""
+    """Gemma 4 patch data and image positions survive the tokenizer scheduler ZMQ hop."""
     msg = UserMsg(
         uid=9,
         input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
         sampling_params=SamplingParams(),
-        mm_embeds=torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+        # ``mm_embeds`` is used by the in-process offline path. Online requests
+        # instead move these CPU tensors to the scheduler, where its ROCm-owned
+        # model instance runs the vision tower and projector.
+        mm_pixel_values=torch.arange(24, dtype=torch.float32).reshape(1, 2, 12),
+        mm_image_position_ids=torch.tensor([[[0, 0], [0, 1]]], dtype=torch.int64),
     )
     decoded = BaseBackendMsg.decoder(msg.encoder())
     assert isinstance(decoded, UserMsg)
-    assert decoded.mm_embeds is not None
-    assert decoded.mm_embeds.shape == (2, 3, 4)
-    assert decoded.mm_embeds.dtype == torch.float32
-    assert torch.equal(decoded.mm_embeds, msg.mm_embeds)
+    assert decoded.mm_pixel_values is not None
+    assert decoded.mm_image_position_ids is not None
+    assert decoded.mm_pixel_values.shape == (1, 2, 12)
+    assert decoded.mm_pixel_values.dtype == torch.float32
+    assert decoded.mm_image_position_ids.shape == (1, 2, 2)
+    assert decoded.mm_image_position_ids.dtype == torch.int64
+    assert torch.equal(decoded.mm_pixel_values, msg.mm_pixel_values)
+    assert torch.equal(decoded.mm_image_position_ids, msg.mm_image_position_ids)

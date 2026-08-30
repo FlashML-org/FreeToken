@@ -27,6 +27,14 @@ logger = init_logger(__name__)
 # chat template output is encoded, never shown to the model.
 _IMAGE_MARKER = "<|freetoken-image|>"
 
+# Gemma 4 wraps the repeated image-feature placeholders in learned begin and
+# end delimiters. Only the middle token is replaced by projected vision
+# embeddings inside the model. Keeping the delimiters as normal text tokens
+# matches the official processor's serialized multimodal prompt.
+_GEMMA4_BOI_TOKEN = "<|image>"
+_GEMMA4_SOFT_IMAGE_TOKEN = "<|image|>"
+_GEMMA4_EOI_TOKEN = "<image|>"
+
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
@@ -112,7 +120,12 @@ class TokenizeManager:
             n_patches = item.pixel_values.shape[0]
             pixels[index, :n_patches] = item.pixel_values
             positions[index, :n_patches] = item.image_position_ids
-            prompt = prompt.replace(_IMAGE_MARKER, "<|image>" * item.soft_token_count, 1)
+            image_tokens = (
+                _GEMMA4_BOI_TOKEN
+                + _GEMMA4_SOFT_IMAGE_TOKEN * item.soft_token_count
+                + _GEMMA4_EOI_TOKEN
+            )
+            prompt = prompt.replace(_IMAGE_MARKER, image_tokens, 1)
         msg.mm_pixel_values = pixels
         msg.mm_image_position_ids = positions
         return prompt
@@ -121,7 +134,10 @@ class TokenizeManager:
         """The template/encoder half of ``tokenize``, exposed so the frontend can
         validate a request before committing an SSE stream. Sanitizes
         ``reasoning_effort`` first: every render path (worker, frontend
-        validation, count_tokens) must quantize identically."""
+        validation, count_tokens) must quantize identically. The tokenizer
+        worker performs image expansion after this render step; streaming
+        preflight calls that same expansion explicitly without changing the
+        worker's one-expansion lifecycle."""
         if not isinstance(msg.text, list):
             return msg.text
         return self._render(

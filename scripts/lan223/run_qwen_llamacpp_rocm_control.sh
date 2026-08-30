@@ -114,5 +114,19 @@ LAN223_QWEN_MODEL_NAME="${MODEL_NAME}" \
 LAN223_QWEN_TOKENIZER_DIR="${TOKENIZER_DIR}" \
     bash "${SOURCE_DIR}/scripts/lan223/run_qwen_scheduler_baseline.sh" "${BENCHMARK_DIR}"
 
+if [[ "${LAN223_QWEN_QUALITY_SUITE:-}" == "1" ]]; then
+    # The optional suite uses only deterministic visible-output controls.  Keep
+    # it opt-in so the normal throughput control remains unchanged, while a
+    # paired quality campaign can run against this exact temporary ROCm server.
+    PYTHONPATH="${SOURCE_DIR}/python" "${ROOT_DIR}/.venv/bin/python" \
+        "${SOURCE_DIR}/benchmarks/lan223_qwen/run_quality_suite.py" \
+        --base-url "${BASE_URL}" \
+        --model "${MODEL_NAME}" \
+        --expected-host "david-Gmktec-x2-2" \
+        --max-tokens 64 \
+        --artifact "${ARTIFACT_ROOT}/quality.json" \
+        >"${ARTIFACT_ROOT}/quality.log" 2>&1
+fi
+
 # Capture final endpoint health before the EXIT trap terminates the control.
 curl -fsS "${BASE_URL%/v1}/health" >"${ARTIFACT_ROOT}/health-before-cleanup.json"

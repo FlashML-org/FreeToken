@@ -1,13 +1,44 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, OPList
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from freetoken.models.gemma4.config import VisionConfig
+
+
+logger = init_logger(__name__)
+
+
+def _log_vision_stage(label: str, tensor: torch.Tensor) -> None:
+    """Record a compact, opt-in fingerprint at one vision-model boundary.
+
+    llama.cpp's mtmd debugger can expose intermediate vision graph values.  This
+    matching summary lets an AMD FreeToken investigation identify the first
+    divergent stage without dumping a full image embedding, which would both
+    distort a timing run and create enormous artifacts.
+    """
+    if os.environ.get("FREETOKEN_GEMMA4_VISION_DEBUG") != "1":
+        return
+    values = tensor.detach().float()
+    logger.info_rank0(
+        "Gemma4 vision stage %s: shape=%s finite=%s mean=%.8f std=%.8f "
+        "min=%.8f max=%.8f sum=%.8f first16=%s",
+        label,
+        tuple(values.shape),
+        bool(torch.isfinite(values).all().item()),
+        float(values.mean().item()),
+        float(values.std(unbiased=False).item()),
+        float(values.min().item()),
+        float(values.max().item()),
+        float(values.sum().item()),
+        ",".join(f"{value:.8f}" for value in values.reshape(-1)[:16].cpu().tolist()),
+    )
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -204,17 +235,26 @@ class Gemma4VisionModel(BaseOP):
         padding = (position_ids == -1).all(dim=-1)  # [B, P] True = padding patch
 
         h = self.patch_embedder.forward(pixel_values, position_ids, padding)
+        _log_vision_stage("patch_embed", h)
+        # Reference encoders operate on the unpadded patch grid. Record the
+        # equivalent compact view as well, so padding-query values cannot hide
+        # the first numerical mismatch during a parity investigation.
+        _log_vision_stage("patch_embed_valid", h[~padding])
         cos, sin = self.encoder._rotary.cos_sin(position_ids, h.dtype)
         attn_mask = (~padding)[:, None, None, :]  # [B, 1, 1, P] True = attend
         for layer in self.encoder.layers.op_list:
             h = layer.forward(h, cos, sin, attn_mask)
+        _log_vision_stage("encoder", h)
+        _log_vision_stage("encoder_valid", h[~padding])
 
         h = h.masked_fill(padding.unsqueeze(-1), 0.0)
         pooled, mask = _avg_pool_by_positions(h, position_ids, output_length)
         pooled = pooled.float() * self._root_hidden
+        _log_vision_stage("pooled_scaled", pooled)
         pooled = pooled[mask]  # [num_valid, hidden] fp32
         if self._standardize:
             pooled = (pooled - self.std_bias.float()) * self.std_scale.float()
+        _log_vision_stage("standardized", pooled)
         return pooled.to(h.dtype)
 
 
@@ -230,7 +270,11 @@ class Gemma4MultimodalEmbedder(BaseOP):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.embedding_projection.forward(self.embedding_pre_projection_norm.forward(x))
+        normalized = self.embedding_pre_projection_norm.forward(x)
+        _log_vision_stage("projector_norm", normalized)
+        projected = self.embedding_projection.forward(normalized)
+        _log_vision_stage("projector_output", projected)
+        return projected
 
 
 __all__ = ["Gemma4VisionModel", "Gemma4MultimodalEmbedder"]
