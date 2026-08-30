@@ -48,6 +48,9 @@ dependencies = [
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
+    # OpenAI-compatible image inputs decode through Pillow before being packed
+    # into Gemma4's patch-major CPU tensors for the tokenizer-to-engine wire.
+    "pillow>=10,<12",
     "prompt_toolkit>=3.0,<4",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
