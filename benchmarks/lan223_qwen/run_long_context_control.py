@@ -105,6 +105,7 @@ def stream_sample(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     )
     started = time.perf_counter()
     events: list[dict[str, Any]] = []
+    raw_sse_events: list[dict[str, Any]] = []
     errors: list[str] = []
     usage: dict[str, Any] | None = None
     done = False
@@ -124,6 +125,9 @@ def stream_sample(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
                 except json.JSONDecodeError as error:
                     errors.append(f"invalid JSON SSE event: {error}")
                     continue
+                raw_sse_events.append({"offset_seconds": offset, "event": event})
+                if isinstance(event.get("error"), dict):
+                    errors.append(f"server error event: {event['error']}")
                 if isinstance(event.get("usage"), dict):
                     usage = event["usage"]
                 for choice in event.get("choices", []):
@@ -143,6 +147,7 @@ def stream_sample(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     return {
         "text": text,
         "events": events,
+        "raw_sse_events": raw_sse_events,
         "usage": usage,
         "errors": errors,
         "ttft_seconds": events[0]["offset_seconds"] if events else None,
