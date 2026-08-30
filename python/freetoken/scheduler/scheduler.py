@@ -589,6 +589,13 @@ class Scheduler(SchedulerIOMixin):
         pool = self.engine.linear_state_pool
         if pool is None or not batch.is_prefill:
             return
+        if not any(r.mamba_restore_src is not None for r in batch.reqs):
+            return
+        # Hit-admission barrier: settle in-flight device work before COW-restoring tree
+        # snapshots (pair of the donate barrier in CacheManager._cache_req_hybrid; see the
+        # comment there). Fires only when this batch admits a prefix HIT -- request-level,
+        # sub-millisecond.
+        torch.cuda.synchronize(self.device)
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)

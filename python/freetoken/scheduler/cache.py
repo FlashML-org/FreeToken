@@ -338,14 +338,35 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def _clone_slot_for_tree(self, src: int) -> int:
+        """copy-on-donate: give the tree a PRIVATE clone of a GDN snapshot slot instead of
+        transferring ownership of the request's slot. Ownership transfer shares one slot id
+        between the still-in-flight request pipeline and the tree; a late write through any
+        retained alias then poisons every future prefix hit of that branch (observed as
+        ~10% corrupted hit answers under concurrent load, in sticky per-branch windows
+        that self-heal on re-donation). A private clone is written exactly once -- here,
+        after the donate barrier's full device sync, so the source is quiescent -- and is
+        read-only for the rest of its tree lifetime. Cost: one ~MB slot copy per donation."""
+        self.ensure_mamba_slots(1)
+        dst = self.linear_state_pool.alloc(1)[0]
+        self.linear_state_pool.copy_from(src, dst)
+        return dst
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
-        Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
-        at the tracked ×64 boundary mamba_last_track_seqlen) into the tree; replace it with a
-        fresh slot if the tree took it (dedup keeps it for reuse). Finish: donate the live slot
-        (final full-sequence state, zero-copy since the req is done) and free the req's slots."""
+        Prefill chunk commit: donate a PRIVATE CLONE of the frozen ping-pong slot (the
+        snapshot the forward wrote at the tracked ×64 boundary mamba_last_track_seqlen)
+        into the tree; the request keeps its own slots. Finish: donate a clone of the live
+        slot (final full-sequence state) and free all of the req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
+        # Donate barrier: settle all in-flight device work before snapshot donation and the
+        # dedup/re-point bookkeeping below. Stream-level wait_stream ordering alone leaves a
+        # window in which a hit admitted alongside in-flight decode restores or donates
+        # corrupted GDN state (reproduced with deterministic ground-truth probes: ~10% wrong
+        # answers under saturation, cold prefill always clean). Fires once per prefill
+        # commit / request finish -- request-level, sub-millisecond.
+        torch.cuda.synchronize(self.device)
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
@@ -375,9 +396,12 @@ class CacheManager:
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
+                clone = self._clone_slot_for_tree(frozen)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
-                pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
+                    req.input_ids[:L], page_indices[:L], clone)
+                if mamba_exist:
+                    pool.free(clone)  # node already had a snapshot; clone unused
+                pool.free(list(req.mamba_ping_pong))
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
@@ -389,11 +413,14 @@ class CacheManager:
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
+                clone = self._clone_slot_for_tree(req.linear_slot_idx)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                    req.input_ids[:insert_len], page_indices[:insert_len], clone)
+                if mamba_exist:
+                    pool.free(clone)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                keep_live = False                     # tree holds a private clone
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
@@ -412,8 +439,11 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
+        clone = self._clone_slot_for_tree(frozen)
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen)
+            req.input_ids[:L], page_indices[:L], clone)
+        if mamba_exist:
+            pool.free(clone)  # node already had a snapshot; clone unused
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
@@ -427,11 +457,8 @@ class CacheManager:
                 m.kv_indices[old_handle.cached_len : prefix_len])
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
-        if not mamba_exist:                                # tree took `frozen`; replace it
-            self.ensure_mamba_slots(1)
-            pp = list(req.mamba_ping_pong)
-            pp[frozen_idx] = pool.alloc(1)[0]
-            req.mamba_ping_pong = tuple(pp)
+        # copy-on-donate: the tree holds a private clone and the request keeps `frozen`
+        # for its next track -- no replacement alloc, no shared ownership.
         req.mamba_last_track_seqlen = None
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
