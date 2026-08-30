@@ -22,6 +22,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-baseline-20260830T082400Z/` | LAN-223 warm NVFP4 baseline | Five samples passed with zero swap: 28.69 mean TPS, 367 ms mean TTFT, 37.89 ms p99 gap, 39.08 ms maximum gap |
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-scheduler-20260830T082500Z/` | LAN-223 medium scheduler baseline | Three samples passed with zero swap: 27.89 mean TPS, 429 ms mean TTFT, 38.99 ms p99 gap, 71.23 ms maximum gap |
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-multiturn-state-20260830T083100Z/multiturn.json` | Bounded multi-turn state control | Three dependent turns passed with zero swap: 411 ms mean TTFT, 440 ms worst TTFT, 38.49 ms worst token gap |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-long-context-2k-clean-20260830T083657Z/long-context.json` | LAN-223 1.8K-context retrieval control | Five of five exact marker retrievals passed at 1,845 reported prompt tokens with zero swap: 428 ms mean TTFT, 431 ms p99 TTFT, and 40.48 ms p99 token gap. This is a LAN-223 control, not a replication of the paper's 56K to 65K agent sessions. |
 
 ## Open work
 

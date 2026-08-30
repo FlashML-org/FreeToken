@@ -122,6 +122,13 @@ class LongContextControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_prompt(0)
 
+    def test_prefix_nonce_precedes_the_long_filler(self) -> None:
+        """A changing early nonce prevents reuse of the long filler prefix."""
+
+        prompt = build_prompt(2, prefix_nonce="sample-1")
+        self.assertIn("Per-sample prefix nonce: sample-1", prompt)
+        self.assertLess(prompt.index("sample-1"), prompt.index("This is deterministic filler"))
+
 
 class DpmPolicyWrapperTests(unittest.TestCase):
     """Protect the policy wrapper's separate telemetry and harness paths."""

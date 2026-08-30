@@ -38,14 +38,23 @@ def nearest_rank(values: list[float], percentile: float) -> float | None:
     return ordered[max(0, int(len(ordered) * percentile + 0.999999999) - 1)]
 
 
-def build_prompt(filler_repetitions: int, marker: str = MARKER) -> str:
-    """Build a fixed retrieval prompt with the answer only at its beginning."""
+def build_prompt(
+    filler_repetitions: int, marker: str = MARKER, prefix_nonce: str | None = None
+) -> str:
+    """Build a retrieval prompt whose optional early nonce defeats prefix reuse.
+
+    A nonce placed before the long filler means a radix or prefix cache cannot
+    reuse the expensive common prefix from an earlier sample.  The protected
+    answer remains at the prompt beginning and therefore still tests retrieval.
+    """
 
     if filler_repetitions < 1:
         raise ValueError("filler repetitions must be positive")
+    nonce_line = f"Per-sample prefix nonce: {prefix_nonce}\n" if prefix_nonce else ""
     return (
         "Protected marker: " + marker + "\n"
         "Do not repeat or transform the marker while reading this material.\n\n"
+        + nonce_line
         + FILLER * filler_repetitions
         + "\n\nReply with only the protected marker and no other text."
     )
@@ -60,6 +69,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--expected-host", default="lan-223")
     parser.add_argument("--filler-repetitions", type=int, required=True)
+    parser.add_argument(
+        "--sample-variation",
+        choices=("none", "prefix_nonce"),
+        default="none",
+        help="Use prefix_nonce to prevent later samples from reusing the full prompt cache.",
+    )
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
@@ -163,8 +178,19 @@ def main(argv: list[str] | None = None) -> int:
     host = require_expected_host(args.expected_host)
     if args.artifact.exists():
         raise FileExistsError(f"refusing to overwrite existing artifact: {args.artifact}")
-    prompt = build_prompt(args.filler_repetitions)
-    samples = [stream_sample(args, prompt) for _ in range(args.samples)]
+    prompts = [
+        build_prompt(
+            args.filler_repetitions,
+            prefix_nonce=(f"long-context-sample-{index + 1}" if args.sample_variation == "prefix_nonce" else None),
+        )
+        for index in range(args.samples)
+    ]
+    samples = []
+    for prompt in prompts:
+        sample = stream_sample(args, prompt)
+        sample["prompt"] = prompt
+        sample["prompt_character_count"] = len(prompt)
+        samples.append(sample)
     ttft = [sample["ttft_seconds"] for sample in samples if sample["ttft_seconds"] is not None]
     gaps = [gap for sample in samples for gap in sample["token_gap_seconds"]]
     prompt_token_counts = [sample["usage"].get("prompt_tokens") for sample in samples if sample["usage"]]
@@ -178,10 +204,16 @@ def main(argv: list[str] | None = None) -> int:
             "filler_repetitions": args.filler_repetitions,
             "max_tokens": args.max_tokens,
             "samples": args.samples,
+            "sample_variation": args.sample_variation,
             "temperature": 0.0,
             "reasoning_effort": "none",
         },
-        "prompt": {"marker": MARKER, "character_count": len(prompt), "text": prompt},
+        "prompt": {
+            "marker": MARKER,
+            "variation": args.sample_variation,
+            "representative_character_count": len(prompts[0]),
+            "representative_text": prompts[0],
+        },
         "samples": samples,
         "summary": {
             "sample_count": len(samples),
