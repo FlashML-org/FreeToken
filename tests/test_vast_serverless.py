@@ -65,3 +65,10 @@ def test_vast_launcher_uses_validated_request_limit():
     source = (ROOT / "scripts/vast_glm53_start.sh").read_text(encoding="utf-8")
     assert 'max_running_requests="${TEKIZAI_MAX_RUNNING_REQUESTS:-1}"' in source
     assert '--max-running-requests "$max_running_requests"' in source
+
+
+def test_vast_provisioner_installs_jit_headers_and_verifies_commit():
+    source = (ROOT / "scripts/vast_glm53_provision.sh").read_text(encoding="utf-8")
+    assert "libcurand-dev-13-0" in source
+    assert "TEKIZAI_FREETOKEN_EXPECTED_COMMIT" in source
+    assert 'git -C "$checkout" rev-parse HEAD' in source
