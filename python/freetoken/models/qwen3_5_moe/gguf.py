@@ -136,11 +136,9 @@ def iter_gguf_weights(
                 # executes as a one-row replicated linear projection.
                 tensor = tensor.unsqueeze(0)
             # Qwen GGUF stores all of these RMSNorm vectors as direct scales.
-            # ``GemmaRMSNorm`` adds its own implicit unity only for Gemma-format
-            # checkpoints, so its Qwen use must receive ``scale - 1`` below.
-            if rel.endswith(("input_layernorm.weight", "post_attention_layernorm.weight",
-                             "self_attn.q_norm.weight", "self_attn.k_norm.weight")):
-                tensor = tensor - 1.0
+            # ``GemmaRMSNorm`` in this runtime applies the raw stored tensor; the
+            # safetensors loader performs a separate +1 bake only because HF Qwen
+            # checkpoints carry delta-from-unity weights.  GGUF must not adjust it.
             if rel.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 tensor = tensor.to(torch.float32)
             yield f"{base}.{rel}", tensor
