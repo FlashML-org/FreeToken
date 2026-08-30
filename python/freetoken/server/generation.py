@@ -139,6 +139,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    image_urls: list[Any] = field(default_factory=list)  # OpenAI image_url values in marker order
 
     @property
     def parse_tools(self) -> bool:
@@ -236,6 +237,10 @@ def _flatten_text_parts(parts: list[Any]) -> str:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
             texts.append((part.get("text") if isinstance(part, dict) else None) or "")
+        elif ptype == "image_url":
+            # Exact image length is unavailable until decoding and resizing in
+            # the tokenizer worker, so leave a private replacement marker here.
+            texts.append("<|freetoken-image|>")
         else:
             raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
     return "".join(texts)
@@ -269,6 +274,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            image_urls=spec.image_urls or None,
         )
     )
     return uid
@@ -325,6 +331,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        image_urls=spec.image_urls or None,
     )
     try:
         manager = await asyncio.to_thread(build)

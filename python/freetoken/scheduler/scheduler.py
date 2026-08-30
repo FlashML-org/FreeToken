@@ -517,6 +517,28 @@ class Scheduler(SchedulerIOMixin):
                     ]
                 )
                 return
+            if msg.mm_pixel_values is not None or msg.mm_image_position_ids is not None:
+                if msg.mm_pixel_values is None or msg.mm_image_position_ids is None:
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error="incomplete image tensors")])
+                    return
+                model = self.engine.model
+                if not hasattr(model, "encode_images"):
+                    self.send_result(
+                        [ErrorReplyMsg(uid=msg.uid, error="this model does not support image inputs")]
+                    )
+                    return
+                try:
+                    # The engine owns the ROCm context. Keep image encoding here,
+                    # not in the tokenizer process, so the vision weights and
+                    # features stay resident on the one serving device.
+                    msg.mm_embeds = model.encode_images(
+                        msg.mm_pixel_values.to(self.device),
+                        msg.mm_image_position_ids.to(self.device),
+                    )
+                except Exception as exc:  # noqa: BLE001 - return a request error, not a dead worker
+                    logger.warning_rank0("image encoding failed for request %d: %r", msg.uid, exc)
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=f"could not encode image: {exc}")])
+                    return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(

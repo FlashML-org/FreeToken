@@ -22,6 +22,11 @@ from .effort import (
 
 logger = init_logger(__name__)
 
+# Deliberately private sentinel emitted by API adapters before the tokenizer
+# knows each image's post-pooling soft-token count. It is replaced before the
+# chat template output is encoded, never shown to the model.
+_IMAGE_MARKER = "<|freetoken-image|>"
+
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
@@ -60,6 +65,7 @@ class TokenizeManager:
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
+            prompt = self._expand_gemma4_images(msg, prompt)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
@@ -76,6 +82,40 @@ class TokenizeManager:
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
+
+    def _expand_gemma4_images(self, msg: TokenizeMsg, prompt: str) -> str:
+        """Replace image markers with the exact number of Gemma4 soft-token slots.
+
+        Each image is independently resized and patchified. Their grids are
+        padded to a common patch count for one vision-tower call, while the
+        placeholder stream contains only valid pooled slots. The GPU model
+        verifies that final count again before it scatters the embeddings.
+        """
+        image_urls = msg.image_urls or []
+        marker_count = prompt.count(_IMAGE_MARKER)
+        if not image_urls:
+            if marker_count:
+                raise ValueError("image marker appeared without an image_url payload")
+            return prompt
+        if marker_count != len(image_urls):
+            raise ValueError(
+                f"image marker count ({marker_count}) does not match image_url count ({len(image_urls)})"
+            )
+        from .gemma4_image import decode_openai_image_data_url, gemma4_image_inputs
+
+        prepared = [gemma4_image_inputs(decode_openai_image_data_url(value)) for value in image_urls]
+        max_patches = max(item.pixel_values.shape[0] for item in prepared)
+        patch_width = prepared[0].pixel_values.shape[1]
+        pixels = torch.zeros((len(prepared), max_patches, patch_width), dtype=torch.float32)
+        positions = torch.full((len(prepared), max_patches, 2), -1, dtype=torch.int64)
+        for index, item in enumerate(prepared):
+            n_patches = item.pixel_values.shape[0]
+            pixels[index, :n_patches] = item.pixel_values
+            positions[index, :n_patches] = item.image_position_ids
+            prompt = prompt.replace(_IMAGE_MARKER, "<|image>" * item.soft_token_count, 1)
+        msg.mm_pixel_values = pixels
+        msg.mm_image_position_ids = positions
+        return prompt
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can

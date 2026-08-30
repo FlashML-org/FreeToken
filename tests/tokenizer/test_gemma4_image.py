@@ -8,7 +8,10 @@ import io
 import torch
 from PIL import Image
 
+from freetoken.core import SamplingParams
+from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.gemma4_image import decode_openai_image_data_url, gemma4_image_inputs
+from freetoken.tokenizer.tokenize import TokenizeManager
 
 
 def _png_data_url() -> str:
@@ -38,3 +41,20 @@ def test_remote_image_url_is_rejected_without_network_fetching() -> None:
         assert "only data:image URLs" in str(exc)
     else:  # pragma: no cover - keeps the failure obvious if the security policy regresses
         raise AssertionError("remote image URL was unexpectedly accepted")
+
+
+def test_tokenizer_expands_one_image_marker_and_stages_shaped_cpu_tensors() -> None:
+    """The online tokenizer computes the placeholder count from the same processed image."""
+    msg = TokenizeMsg(
+        uid=1,
+        text="unused",
+        sampling_params=SamplingParams(),
+        image_urls=[{"url": _png_data_url()}],
+    )
+    manager = TokenizeManager.__new__(TokenizeManager)
+    prompt = manager._expand_gemma4_images(msg, "before<|freetoken-image|>after")
+    assert prompt == "before" + "<|image>" * 256 + "after"
+    assert msg.mm_pixel_values is not None
+    assert msg.mm_image_position_ids is not None
+    assert msg.mm_pixel_values.shape == (1, 2304, 768)
+    assert msg.mm_image_position_ids.shape == (1, 2304, 2)
