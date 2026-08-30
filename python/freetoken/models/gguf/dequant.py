@@ -154,14 +154,25 @@ def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     dmin = _f16_scales(raw, 2, 4)
     quantized = raw[:, 16:144]
     values = torch.empty((block_count, 256), dtype=torch.float32, device=raw.device)
-    for group in range(8):
-        group_bytes = quantized[:, group * 16:(group + 1) * 16]
-        q = torch.cat(
-            [(group_bytes & 0x0F).to(torch.float32), (group_bytes >> 4).to(torch.float32)],
-            dim=1,
+    # GGML stores each pair of 32-value groups in the same 32-byte region:
+    # the low nibbles are group ``2 * pair`` and the high nibbles are group
+    # ``2 * pair + 1``.  They are therefore not eight consecutive 16-byte
+    # groups.  Keeping this order identical to ``dequantize_block_q4_K`` is
+    # essential because this decoder is the independent correctness oracle for
+    # the packed HIP kernels.
+    for pair in range(4):
+        pair_bytes = quantized[:, pair * 32:(pair + 1) * 32]
+        low = (pair_bytes & 0x0F).to(torch.float32)
+        high = (pair_bytes >> 4).to(torch.float32)
+        low_group = 2 * pair
+        high_group = low_group + 1
+        values[:, low_group * 32:(low_group + 1) * 32] = (
+            d * scales[:, low_group:low_group + 1] * low
+            - dmin * minimums[:, low_group:low_group + 1]
         )
-        values[:, group * 32:(group + 1) * 32] = (
-            d * scales[:, group:group + 1] * q - dmin * minimums[:, group:group + 1]
+        values[:, high_group * 32:(high_group + 1) * 32] = (
+            d * scales[:, high_group:high_group + 1] * high
+            - dmin * minimums[:, high_group:high_group + 1]
         )
     return values.reshape(-1).to(out_dtype)
 
