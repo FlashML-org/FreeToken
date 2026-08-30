@@ -6,6 +6,13 @@ served_model="${TEKIZAI_SERVED_MODEL:-glm-5.3-flash-nvfp4}"
 ft_executable="${TEKIZAI_FREETOKEN_EXECUTABLE:-/workspace/freetoken/.venv/bin/ft}"
 port="${TEKIZAI_FREETOKEN_PORT:-1919}"
 log_file="${TEKIZAI_FREETOKEN_LOG:-/workspace/logs/freetoken-glm53.log}"
+max_running_requests="${TEKIZAI_MAX_RUNNING_REQUESTS:-1}"
+
+if [[ ! "$max_running_requests" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'TEKIZAI_MAX_RUNNING_REQUESTS must be a positive integer, got %q\n' \
+    "$max_running_requests" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "$log_file")"
 : >"$log_file"
@@ -19,7 +26,7 @@ serve_cmd=("$ft_executable" serve \
   --moe-cpu-threads "${TEKIZAI_CPU_THREADS:-48}" \
   --memory-ratio "${TEKIZAI_MEMORY_RATIO:-0.95}" \
   --max-seq-len-override "${TEKIZAI_MAX_SEQ_LEN:-32768}" \
-  --max-running-requests 1 \
+  --max-running-requests "$max_running_requests" \
   --disable-moe-prefill-overlap)
 
 gpu_cpu_affinity="${TEKIZAI_GPU_CPU_AFFINITY:-}"

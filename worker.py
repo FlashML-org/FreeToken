@@ -13,6 +13,12 @@ def _positive_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _enabled(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _text_size(value: Any) -> int:
     if isinstance(value, str):
         return len(value)
@@ -52,7 +58,14 @@ def build_worker_config() -> Any:
     )
 
     port = _positive_int(os.environ.get("TEKIZAI_FREETOKEN_PORT"), 1919) or 1919
-    common = {"allow_parallel_requests": False, "max_queue_time": 180}
+    allow_parallel = _enabled(os.environ.get("TEKIZAI_ALLOW_PARALLEL_REQUESTS"))
+    benchmark_concurrency = (
+        _positive_int(os.environ.get("TEKIZAI_BENCHMARK_CONCURRENCY"), 1) or 1
+    )
+    common = {
+        "allow_parallel_requests": allow_parallel,
+        "max_queue_time": 180,
+    }
     return WorkerConfig(
         model_server_url="http://127.0.0.1",
         model_server_port=port,
@@ -67,7 +80,7 @@ def build_worker_config() -> Any:
                 benchmark_config=BenchmarkConfig(
                     generator=benchmark_payload,
                     runs=2,
-                    concurrency=1,
+                    concurrency=benchmark_concurrency,
                 ),
             ),
             HandlerConfig(
