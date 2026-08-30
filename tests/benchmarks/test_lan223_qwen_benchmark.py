@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from benchmarks.lan223_qwen.run_api_benchmark import parse_args, require_expected_host
+from benchmarks.lan223_qwen.run_api_benchmark import (
+    nearest_rank_percentile,
+    numeric_summary,
+    parse_args,
+    require_expected_host,
+)
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -50,6 +55,23 @@ class RequireExpectedHostTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.reasoning_effort, "none")
+
+
+class TailMetricTests(unittest.TestCase):
+    """Keep percentile output stable and auditable for later tail studies."""
+
+    def test_nearest_rank_percentiles_select_observed_values(self) -> None:
+        """A four-event stream has no fictional interpolated p95 or p99 value."""
+
+        values = [0.01, 0.02, 0.03, 0.04]
+        self.assertEqual(nearest_rank_percentile(values, 0.50), 0.02)
+        self.assertEqual(nearest_rank_percentile(values, 0.95), 0.04)
+        self.assertEqual(nearest_rank_percentile(values, 0.99), 0.04)
+
+    def test_empty_metric_summary_has_explicit_nulls(self) -> None:
+        """A one-token answer must not fabricate token-gap tail statistics."""
+
+        self.assertTrue(all(value is None for value in numeric_summary([]).values()))
 
 
 class DpmPolicyWrapperTests(unittest.TestCase):

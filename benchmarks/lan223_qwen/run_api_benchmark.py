@@ -37,6 +37,35 @@ class StreamObservation:
     content: str
 
 
+def nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
+    """Return an auditable nearest-rank percentile from observed stream gaps."""
+
+    if not values:
+        return None
+    if not 0 < percentile <= 1:
+        raise ValueError("percentile must be in the interval (0, 1]")
+    ordered = sorted(values)
+    rank = max(1, int((len(ordered) * percentile) + 0.999999999))
+    return ordered[rank - 1]
+
+
+def numeric_summary(values: list[float]) -> dict[str, float | None]:
+    """Summarize a metric while retaining maximum and tail percentiles."""
+
+    if not values:
+        return {key: None for key in ("mean", "median", "minimum", "maximum", "stdev", "p50", "p95", "p99")}
+    return {
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+        "minimum": min(values),
+        "maximum": max(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else None,
+        "p50": nearest_rank_percentile(values, 0.50),
+        "p95": nearest_rank_percentile(values, 0.95),
+        "p99": nearest_rank_percentile(values, 0.99),
+    }
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse explicit inputs so every performance-affecting choice is recorded."""
 
@@ -236,6 +265,7 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
             "decode_tps": decode_tps,
             "input_tps": input_tps,
             "token_gap_seconds": token_gaps,
+            "token_gap_summary_seconds": numeric_summary(token_gaps),
         },
         "usage": usage,
         "response": {
@@ -286,16 +316,24 @@ def main(argv: list[str] | None = None) -> int:
         for sample in samples
         if sample["status"] == "passed" and sample["timing"]["decode_tps"] is not None
     ]
+    successful_ttft = [
+        sample["timing"]["warm_ttft_seconds"]
+        for sample in samples
+        if sample["status"] == "passed" and sample["timing"]["warm_ttft_seconds"] is not None
+    ]
+    successful_gaps = [
+        gap
+        for sample in samples
+        if sample["status"] == "passed"
+        for gap in sample["timing"]["token_gap_seconds"]
+    ]
     summary = {
         "schema_version": 1,
         "successful_samples": len(successful_tps),
         "requested_samples": args.samples,
-        "decode_tps": {
-            "samples": successful_tps,
-            "mean": statistics.mean(successful_tps) if successful_tps else None,
-            "median": statistics.median(successful_tps) if successful_tps else None,
-            "stdev": statistics.stdev(successful_tps) if len(successful_tps) > 1 else None,
-        },
+        "decode_tps": {"samples": successful_tps, **numeric_summary(successful_tps)},
+        "warm_ttft_seconds": {"samples": successful_ttft, **numeric_summary(successful_ttft)},
+        "token_gap_seconds": {"samples": successful_gaps, **numeric_summary(successful_gaps)},
         "failed_samples": [sample["sample_index"] for sample in samples if sample["status"] != "passed"],
     }
     write_json(args.artifact_dir / "summary.json", summary)
