@@ -253,8 +253,11 @@ The single 1.184-second maximum-turn TTFT observation is retained as an
 observed tail outlier, not hidden by a mean-only result. It did not cause an
 incorrect answer, runner swapping, process failure, or loss of API service.
 The machine was restored after the battery: the temporary Q4 listener on
-port 1922 was stopped, `vm.swappiness` was restored to 60, and the normal
-NVFP4 service was verified on loopback port 1919 with its advertised
+port 1922 was stopped and `vm.swappiness` was restored to 60. The normal
+NVFP4 service on loopback port 1919 required about eight minutes of cold
+expert initialization before its readiness log appeared. It was then checked
+through the OpenAI-compatible endpoint with a live arithmetic request, which
+returned the correct visible answer `4`, and retained its advertised
 8,192-token context.
 
 Raw evidence is retained under
