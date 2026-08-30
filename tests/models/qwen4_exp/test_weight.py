@@ -18,6 +18,8 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     iter_weights,
+    load_nvfp4_expert_sources,
+    load_nvfp4_expert_sources_parallel,
     load_ple_table,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -408,3 +410,82 @@ def test_fusion_pad_rides_the_tensor_device():
     key, fused = _try_fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject, buf)
     assert fused.device.type == "cuda" and fused.shape[0] == 336
     assert torch.equal(fused[324:], torch.zeros(12, 64, device="cuda", dtype=torch.bfloat16))
+
+
+# ======================================================================================
+# Routed NVFP4 expert source banks, loaded from a no-index checkpoint
+# ======================================================================================
+#
+# The RadixArk Qwen3.8-Flash-Next-NVFP4 checkpoint ships NO model.safetensors.index.json:
+# its weights are split across model-bf16-*, model-plefp8-* and layer-*-experts-* shards.
+# The dense (iter_weights) and PLE (load_ple_table) paths already enumerate shards from
+# their headers in that case; the NVFP4 expert-bank loaders must do the same instead of
+# crashing on the missing index.
+
+
+def _expert_tensors(lm: str, layer: int, E: int, H: int, I: int) -> dict[str, torch.Tensor]:
+    """One layer's routed NVFP4 experts in the ModelOpt layout: packed uint8 weight,
+    fp8-e4m3 block scale, and a scalar per-tensor global (weight_scale_2)."""
+    out: dict[str, torch.Tensor] = {}
+    for expert in range(E):
+        base = f"{lm}.layers.{layer}.mlp.experts.{expert}"
+        for proj, rows, cols in (("gate_proj", I, H), ("up_proj", I, H), ("down_proj", H, I)):
+            out[f"{base}.{proj}.weight"] = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+            out[f"{base}.{proj}.weight_scale"] = torch.ones(rows, cols // 16, dtype=torch.float8_e4m3fn)
+            out[f"{base}.{proj}.weight_scale_2"] = torch.tensor(0.5)
+    return out
+
+
+@pytest.fixture(scope="module")
+def expert_ckpt(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """A no-index checkpoint whose only tensors are routed NVFP4 experts, split across two
+    shards (named like the real layer-*-experts-* files) so the reader must build its
+    name->shard map from the shard headers. I=16 keeps the down block-scale bank non-empty."""
+    torch.manual_seed(1)
+    folder = tmp_path_factory.mktemp("qwen4_exp_experts")
+    tensors = _expert_tensors("model.language_model", 0, E=2, H=32, I=16)
+    names = sorted(tensors)
+    save_file({n: tensors[n] for n in names[::2]}, str(folder / "layer-00000-experts-0000-0001.safetensors"))
+    save_file({n: tensors[n] for n in names[1::2]}, str(folder / "layer-00000-experts-0002-0003.safetensors"))
+    return str(folder), tensors
+
+
+def _expert_config() -> SimpleNamespace:
+    return SimpleNamespace(num_layers=1, num_moe_layers=1, num_experts=2,
+                           hidden_size=32, moe_intermediate_size=16)
+
+
+def _assert_expert_banks(banks: dict[str, list[torch.Tensor]], tensors, config) -> None:
+    H, I, E = config.hidden_size, config.moe_intermediate_size, config.num_experts
+    lm = "model.language_model"
+    assert set(banks) == {"gate_up_packed", "gate_up_scale", "gate_up_global",
+                          "down_packed", "down_scale", "down_global"}
+    for name in banks:
+        assert len(banks[name]) == 1  # one MoE layer
+    for expert in range(E):
+        base = f"{lm}.layers.0.mlp.experts.{expert}"
+        # gate/up fused on the output-row axis: [gate | up]
+        assert torch.equal(banks["gate_up_packed"][0][expert, :I], tensors[f"{base}.gate_proj.weight"])
+        assert torch.equal(banks["gate_up_packed"][0][expert, I:], tensors[f"{base}.up_proj.weight"])
+        assert torch.equal(banks["gate_up_scale"][0][expert, :I], tensors[f"{base}.gate_proj.weight_scale"])
+        assert torch.equal(banks["gate_up_scale"][0][expert, I:], tensors[f"{base}.up_proj.weight_scale"])
+        assert torch.equal(banks["down_packed"][0][expert], tensors[f"{base}.down_proj.weight"])
+        assert torch.equal(banks["down_scale"][0][expert], tensors[f"{base}.down_proj.weight_scale"])
+        # the scalar global scale is broadcast into the per-row bank
+        assert torch.all(banks["gate_up_global"][0][expert, :I] == 0.5)
+        assert torch.all(banks["gate_up_global"][0][expert, I:] == 0.5)
+        assert torch.all(banks["down_global"][0][expert] == 0.5)
+
+
+def test_nvfp4_expert_banks_parallel_load_from_a_no_index_checkpoint(expert_ckpt):
+    """The path that crashed at launch: the parallel reader must enumerate shards from their
+    headers when model.safetensors.index.json is absent, not raise FileNotFoundError."""
+    folder, tensors = expert_ckpt
+    banks = load_nvfp4_expert_sources_parallel(folder, _expert_config(), workers=4)
+    _assert_expert_banks(banks, tensors, _expert_config())
+
+
+def test_nvfp4_expert_banks_serial_load_from_a_no_index_checkpoint(expert_ckpt):
+    folder, tensors = expert_ckpt
+    banks = load_nvfp4_expert_sources(folder, _expert_config())
+    _assert_expert_banks(banks, tensors, _expert_config())

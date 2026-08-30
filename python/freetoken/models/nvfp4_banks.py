@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import collections
+import glob
 import json
 import os
 import re
+import struct
 from dataclasses import dataclass
 from typing import Callable
 
@@ -62,6 +64,26 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     }, num_layers)
 
 
+def _weight_map(folder: str) -> dict[str, str]:
+    """Tensor name -> shard filename. From ``model.safetensors.index.json`` when present, else
+    each ``*.safetensors`` shard's header (single-file / no-index checkpoints, e.g. the RadixArk
+    NVFP4 layout that splits weights across model-bf16-* / model-plefp8-* / layer-*-experts-*).
+    Mirrors the no-index fallback in ``models.weight.iter_expert_tensors_parallel``."""
+    index_path = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return json.load(f)["weight_map"]
+    weight_map: dict[str, str] = {}
+    for shard in sorted(os.path.basename(p) for p in glob.glob(os.path.join(folder, "*.safetensors"))):
+        with open(os.path.join(folder, shard), "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+        for nm in hdr:
+            if nm != "__metadata__":
+                weight_map[nm] = shard
+    return weight_map
+
+
 def load_nvfp4_expert_source_banks(
     model_path: str,
     config,
@@ -87,9 +109,7 @@ def load_nvfp4_expert_source_banks(
     until then (the caller owns that tradeoff).
     """
     folder = download_hf_weight(model_path)
-    index_path = os.path.join(folder, "model.safetensors.index.json")
-    with open(index_path, encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
@@ -219,8 +239,7 @@ def load_nvfp4_expert_source_banks_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
 
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
