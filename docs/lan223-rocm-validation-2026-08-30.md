@@ -86,6 +86,48 @@ Both runners executed the same fixed scheduler prompt, 256 requested output toke
 
 This is a same-host, same-prompt, same-output-length comparison, but it is not a quantization-equivalent comparison. FreeToken loaded NVFP4 while llama.cpp loaded Q4_K_M GGUF. Therefore it proves the current observed runner outcome for these deployed artifacts, not an intrinsic winner between FreeToken and llama.cpp. The current FreeToken configuration does not meet or exceed the llama.cpp decode figure in this workload.
 
+## Exact-Q4_K_M ROCm comparison
+
+The branch now includes a native FreeToken loader for the same
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` file used by the llama.cpp control. This path
+keeps the GGUF weights packed: dense Q8_0 and Q6_K tensors use the native GGML
+HIP operators, routed gate and up experts use Q4_K, routed down experts use
+Q5_K or the file's late-layer Q6_K exception, and the Qwen hybrid
+Gated-DeltaNet metadata and recurrent-state layout are handled by the native
+Qwen3.5 model path.
+
+Before serving, a source-revision-specific gfx1151 helper cache compiled 82
+native ROCm/HIP modules and a strict no-JIT verifier loaded all 82. The Q4
+server then started on a temporary loopback port with the same 8,192-token
+context policy used by llama.cpp: `0.35` memory ratio, 8,192-token KV reserve,
+one host, one GPU, greedy sampling, one request, the fixed scheduler prompt,
+256 requested output tokens, warmup, and three scored samples. The FreeToken
+Q4 server resolved 8,626 MoE cache slots and 8,227 KV pages.
+
+| Runtime | Model file and format | Mean decode TPS | Median decode TPS | Sample standard deviation | Quality suite |
+| --- | --- | ---: | ---: | ---: | --- |
+| FreeToken ROCm/HIP | Exact Q4_K_M GGUF | 48.444 | 48.450 | 0.0267 | 3 of 3 pass |
+| llama.cpp ROCm 10 | Same exact Q4_K_M GGUF | 49.125 | 49.131 | 0.0138 | 3 of 3 pass |
+
+The fresh same-format difference is 0.680 TPS, or 1.39 percent in favor of
+the current llama.cpp control. This is the relevant comparison for runner
+efficiency because it removes the NVFP4-versus-Q4_K_M weight-format difference.
+FreeToken is very close but does not yet meet or exceed llama.cpp in this
+strict matched workload.
+
+FreeToken's additional caller-rendered, 512-token raw-prompt control produced
+511 visible completion tokens at 48.487 TPS and 433.11 ms TTFT. The standard
+visible-output quality suite passed its exact `LAN223`, arithmetic `323`, and
+strict JSON controls. A temporary GPU `high` DPM policy was also tested with
+the loaded Q4 server, but it reduced mean decode throughput to 47.287 TPS while
+quality still passed. The normal `auto` policy therefore remains the accepted
+policy for this configuration.
+
+The exact-Q4 evidence is retained on LAN-223 at
+`/home/david/freetoken-amd/artifacts/qwen35moe-gguf-full-control-20260830T141438Z/`
+and
+`/home/david/freetoken-amd/artifacts/qwen35b-llamacpp-rocm10-q4matched-20260830T142002Z-retry/`.
+
 ## Clean-memory endurance
 
 Before the strict endurance run, diagnostic inspection showed swapped pages belonging primarily to FreeToken multiprocessing workers. With about 18 GiB of RAM available, the existing controlled `swapoff` and `swapon` reset was performed. Qwen remained healthy, swap stayed at zero during a short observation period, and the strict battery was then allowed to start.
@@ -144,7 +186,7 @@ tests/benchmarks/test_lan223_qwen_benchmark.py
 
 ## Remaining work
 
-1. Add a quantization-equivalent Qwen control before making any broader performance claim. The current NVFP4 versus Q4_K_M result is intentionally labeled non-equivalent. That work requires FreeToken support for the Qwen hybrid GGUF architecture and every tensor encoding used by the reference file, not merely a different launch flag.
-2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
+1. The quantization-equivalent Qwen control is now complete. The exact Q4_K_M comparison is close but FreeToken remains 1.39 percent below llama.cpp in the fixed single-request decode workload. Any claim to meet or exceed llama.cpp needs a new retained optimization and a fresh matched requalification.
+2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, DPM-policy, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
 3. Run a longer wall-clock endurance workload with periodic telemetry if the deployment target requires all-day serving evidence.
 4. Package sanitized build manifests and selected raw artifacts for the fork and upstream pull request. Do not publish local model files, private host paths, or operational access information.
