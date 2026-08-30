@@ -72,6 +72,11 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # ``None`` preserves the tokenizer's normal policy: rendered chat messages
+    # own their special tokens, while raw completion strings receive the model
+    # default.  A completion caller that has already rendered a complete prompt
+    # can set this explicitly to avoid inserting a second BOS or template token.
+    add_special_tokens: bool | None = None
 
 
 @dataclass

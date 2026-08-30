@@ -66,10 +66,13 @@ class TokenizeManager:
             # the template already rendered one. Raw-string prompts and the dsv4
             # encoder path keep the default.
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+            # Completion callers may provide a fully rendered chat prompt.  In
+            # that explicit mode the caller owns special-token placement just as
+            # the Jinja chat-template path does.  ``None`` keeps the established
+            # default for ordinary raw completion strings.
+            add_special_tokens = not templated if msg.add_special_tokens is None else msg.add_special_tokens
+            input_ids: torch.Tensor = self.tokenizer.encode(  # type: ignore
+                prompt, return_tensors="pt", add_special_tokens=add_special_tokens
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
