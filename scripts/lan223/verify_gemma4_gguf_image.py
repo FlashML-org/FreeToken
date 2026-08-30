@@ -41,6 +41,10 @@ def main() -> int:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument(
+        "--max-tokens", type=int, default=16,
+        help="per-case generation cap; llama.cpp needs a larger cap when it emits thought first",
+    )
     args = parser.parse_args()
 
     split = Image.new("RGB", (96, 48), (0, 0, 255))
@@ -64,7 +68,7 @@ def main() -> int:
                 {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
             ]}],
             "temperature": 0,
-            "max_tokens": 16,
+            "max_tokens": args.max_tokens,
         }
         started = time.perf_counter()
         response = _post_json(args.base_url.rstrip("/") + "/v1/chat/completions", request)

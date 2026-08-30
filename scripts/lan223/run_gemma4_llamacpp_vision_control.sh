@@ -84,5 +84,5 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gg
     >"${ARTIFACT_DIR}/quality.log" 2>&1
 PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_image.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
-    --artifact "${ARTIFACT_DIR}/image-quality.json" \
+    --max-tokens 128 --artifact "${ARTIFACT_DIR}/image-quality.json" \
     >"${ARTIFACT_DIR}/image-quality.log" 2>&1
