@@ -17,22 +17,126 @@ import statistics
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-from benchmarks.lan223_qwen.run_api_benchmark import (
-    load_tokenizer,
-    nearest_rank_percentile,
-    numeric_summary,
-    stream_completion,
-)
+from typing import Any, Iterable
 
 
 DEFAULT_PROMPT = (
     "The scheduler manages incoming inference requests by prioritizing, batching, "
     "and assigning them to available compute resources to optimize throughput and latency. "
 ) * 48
+
+
+@dataclass(frozen=True)
+class StreamObservation:
+    """One visible SSE fragment and the monotonic time at which it arrived."""
+
+    offset_seconds: float
+    content: str
+
+
+def nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
+    """Return an observed tail value without interpolating an unmeasured result."""
+
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, int(len(ordered) * percentile + 0.999999999) - 1)]
+
+
+def numeric_summary(values: list[float]) -> dict[str, float | None]:
+    """Report central and tail values while retaining the measured maximum."""
+
+    if not values:
+        return {key: None for key in ("mean", "median", "minimum", "maximum", "stdev", "p50", "p95", "p99")}
+    return {
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+        "minimum": min(values),
+        "maximum": max(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else None,
+        "p50": nearest_rank_percentile(values, 0.50),
+        "p95": nearest_rank_percentile(values, 0.95),
+        "p99": nearest_rank_percentile(values, 0.99),
+    }
+
+
+def load_tokenizer(path: Path) -> Any:
+    """Load the checkpoint tokenizer locally so generated-token counts are real."""
+
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+
+
+def iter_sse_events(response: Any, started_at: float) -> Iterable[tuple[float, str]]:
+    """Yield every server-sent data payload with its receive timestamp."""
+
+    for raw_line in response:
+        offset = time.perf_counter() - started_at
+        line = raw_line.decode("utf-8", errors="strict").rstrip("\r\n")
+        if line.startswith("data:"):
+            yield offset, line[5:].lstrip()
+
+
+def stream_completion(args: argparse.Namespace) -> tuple[list[StreamObservation], str, float, float, list[str], dict[str, Any] | None]:
+    """Issue one greedy fixed-length request without relying on remote source files."""
+
+    body = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": args.prompt}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "max_tokens": args.max_tokens,
+        "reasoning_effort": "none",
+        "ignore_eos": True,
+    }
+    request = urllib.request.Request(
+        args.base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    started = time.perf_counter()
+    observations: list[StreamObservation] = []
+    errors: list[str] = []
+    usage: dict[str, Any] | None = None
+    completed = False
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout_seconds) as response:
+            for offset, event_data in iter_sse_events(response, started):
+                if event_data == "[DONE]":
+                    completed = True
+                    continue
+                try:
+                    event = json.loads(event_data)
+                except json.JSONDecodeError as error:
+                    errors.append(f"invalid JSON SSE event: {error}")
+                    continue
+                if isinstance(event.get("error"), dict):
+                    errors.append(f"server error event: {event['error']}")
+                if isinstance(event.get("usage"), dict):
+                    usage = event["usage"]
+                for choice in event.get("choices", []):
+                    delta = choice.get("delta", {})
+                    content = delta.get("reasoning_content") or delta.get("content")
+                    if content:
+                        observations.append(StreamObservation(offset, str(content)))
+    except urllib.error.HTTPError as error:
+        errors.append(f"HTTP {error.code}: {error.read().decode('utf-8', errors='replace')}")
+    except urllib.error.URLError as error:
+        errors.append(f"transport failure: {error}")
+    finished = time.perf_counter()
+    if not completed:
+        errors.append("stream ended without [DONE]")
+    return observations, "".join(item.content for item in observations), started, finished, errors, usage
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
