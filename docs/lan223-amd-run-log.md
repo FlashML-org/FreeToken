@@ -21,6 +21,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/runtime-manifest-20260830T082300Z/` | Runtime provenance | Captured clean host, ROCm, GPU policy, source, memory, storage, and process state before accepted baseline |
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-baseline-20260830T082400Z/` | LAN-223 warm NVFP4 baseline | Five samples passed with zero swap: 28.69 mean TPS, 367 ms mean TTFT, 37.89 ms p99 gap, 39.08 ms maximum gap |
 | 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-nvfp4-clean-scheduler-20260830T082500Z/` | LAN-223 medium scheduler baseline | Three samples passed with zero swap: 27.89 mean TPS, 429 ms mean TTFT, 38.99 ms p99 gap, 71.23 ms maximum gap |
+| 2026-08-30 | `/home/david/freetoken-amd/artifacts/qwen-multiturn-state-20260830T083100Z/multiturn.json` | Bounded multi-turn state control | Three dependent turns passed with zero swap: 411 ms mean TTFT, 440 ms worst TTFT, 38.49 ms worst token gap |
 
 ## Open work
 
@@ -30,7 +31,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | P1 | Harness manifest and tail-summary validation | Completed: tail summaries and clean runtime manifest validated |
 | P2 | Five-sample Qwen NVFP4 warm and cold baseline | Warm short and medium baselines complete; full cold request timing remains |
 | P3 | Versioned Qwen and Gemma quality suite | Qwen three-case suite completed; Gemma expansion remains |
-| P4 | Paper-inspired W1 to W4 agent workloads | Not started |
+| P4 | Paper-inspired W1 to W4 agent workloads | Bounded state-retention control completed; full tool-using workloads remain |
 | P5 | Tail-latency matrix and 24-hour endurance | Not started |
 | P6 | 284B capacity manifest | Blocked pending clean-memory assessment; current host has 64 GB RAM, not the paper desktop's 192 GiB system RAM plus 32 GB VRAM |
 | P7 | Strict NVIDIA reference run | Blocked on reference hardware and missing paper fields |
