@@ -10,6 +10,9 @@ set -euo pipefail
 
 readonly ARTIFACT_ROOT="${1:?usage: run_qwen_multiturn_battery.sh ARTIFACT_ROOT [SESSION_COUNT]}"
 readonly SESSION_COUNT="${2:-30}"
+# Default to the strict clean-memory gate. A caller may pass a higher,
+# explicitly recorded ceiling for a diagnostic characterization run.
+readonly MAX_SWAP_KIB="${LAN223_BATTERY_MAX_SWAP_KIB:-64}"
 readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
@@ -25,6 +28,9 @@ if (( SESSION_COUNT < 1 )); then
     echo "session count must be positive" >&2
     exit 2
 fi
+case "${MAX_SWAP_KIB}" in
+    ''|*[!0-9]*) echo "maximum swap must be a non-negative integer" >&2; exit 2 ;;
+esac
 if [[ -e "${ARTIFACT_ROOT}" ]]; then
     echo "refusing to overwrite artifact root: ${ARTIFACT_ROOT}" >&2
     exit 2
@@ -46,8 +52,8 @@ swap_used_kb() {
 assert_clean_swap() {
     local used
     used="$(swap_used_kb)"
-    if (( used > 64 )); then
-        echo "refusing multi-turn battery with swap in use: ${used} KiB" >&2
+    if (( used > MAX_SWAP_KIB )); then
+        echo "refusing multi-turn battery with swap in use: ${used} KiB exceeds ${MAX_SWAP_KIB} KiB" >&2
         exit 2
     fi
 }
@@ -69,11 +75,14 @@ for session in $(seq -w 1 "${SESSION_COUNT}"); do
         --expected-host "${EXPECTED_HOST}" \
         --max-tokens 64 \
         >"${ARTIFACT_ROOT}/sessions/session-${session}.log" 2>&1
+    # Detect sustained memory deterioration at a session boundary while still
+    # preserving all completed raw artifacts for later diagnosis.
+    assert_clean_swap
 done
 
 # The summary retains raw per-session files and records tail values across all
 # sessions, which makes a single late response visible instead of averaged out.
-"${VENV_PYTHON}" - "${ARTIFACT_ROOT}" "${SESSION_COUNT}" <<'PY'
+"${VENV_PYTHON}" - "${ARTIFACT_ROOT}" "${SESSION_COUNT}" "${MAX_SWAP_KIB}" <<'PY'
 import json
 import statistics
 import sys
@@ -81,6 +90,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 expected = int(sys.argv[2])
+max_swap_kib = int(sys.argv[3])
 records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((root / "sessions").glob("session-*.json"))]
 ttft = [item["tail_metrics"]["max_ttft_seconds"] for item in records if item["tail_metrics"]["max_ttft_seconds"] is not None]
 gaps = [item["tail_metrics"]["max_token_gap_seconds"] for item in records if item["tail_metrics"]["max_token_gap_seconds"] is not None]
@@ -92,6 +102,7 @@ def observed(values, percentile):
 summary = {
     "schema_version": 1,
     "requested_sessions": expected,
+    "maximum_swap_kib": max_swap_kib,
     "completed_sessions": len(records),
     "passed_sessions": sum(item["status"] == "passed" for item in records),
     "max_turn_ttft_seconds": {
