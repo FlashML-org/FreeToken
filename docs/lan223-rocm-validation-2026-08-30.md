@@ -133,11 +133,14 @@ unique-prefix requests at 6,856 reported prompt tokens all returned only
 `azure-17`. Mean TTFT was 26.989 seconds, maximum TTFT was 39.088 seconds,
 and p99 visible token gap was 23.890 ms. The strict 30-session multi-turn
 endurance gate was initially not qualified for the `0.35` memory-ratio
-configuration. After the cold long-context run, 3.3 GiB of swap residency was
-observed. A controlled reset returned swap to zero and preserved endpoint
-health, but 540 KiB reappeared immediately before the first endurance session,
-exceeding the existing 64 KiB guard. That original high-cache profile remains
-an active stability investigation, not a throughput or quality failure.
+configuration. After the cold long-context run, 3.3 GiB of whole-host swap
+usage was observed. A controlled reset returned the host counter to zero and
+preserved endpoint health, but 540 KiB reappeared immediately before the first
+endurance session, exceeding the original whole-host 64 KiB guard. That
+measurement did not identify the process responsible for the swapped pages.
+The original high-cache profile remains an active stability investigation
+because it can also hit the separate ROCm SVM-resident-memory failure above,
+not because of a throughput or quality failure.
 
 ## Q4 SVM-resident-memory recovery profile
 
@@ -165,19 +168,22 @@ claimed decode-speed optimization.
 | Control | Result |
 | --- | --- |
 | visible-output quality suite | 3 of 3 pass |
-| multi-turn state retention | 30 of 30 sessions pass, zero KiB swap at every session boundary |
+| multi-turn state retention | 30 of 30 sessions pass, zero KiB verified runner-process-group swap at every session boundary |
 | multi-turn p99 maximum turn TTFT | 0.429 s |
 | multi-turn p99 visible-token gap | 25.75 ms |
 | 6,856-token cold marker retrieval | 5 of 5 pass, 24.733 s mean TTFT, 26.255 s maximum TTFT |
 | two simultaneous users | 3 of 3 rounds pass, 45.29 mean aggregate TPS, 8.192 s p99 TTFT |
 | four simultaneous users | 3 of 3 rounds pass, 79.00 mean aggregate TPS, 1.561 s p99 TTFT |
 
-The five long-context requests produced 4.864 MiB of swap after completion,
-despite the low-swappiness policy, so the long-context result is a successful
-quality and latency result but not proof of a strict zero-swap all-day service
-state. Resetting swap while the healthy reduced-memory server remained loaded
-returned it to zero. A following full three-turn state test and the 30-session
-battery both kept swap at zero.
+The five long-context requests coincided with a 4.864 MiB increase in the
+whole-host swap counter, despite the low-swappiness policy. That counter is
+useful host telemetry but does not identify the model process, so the
+long-context result is a successful quality and latency result, not proof of a
+strict zero-swap all-day service state. Later attribution showed that desktop
+and monitoring daemons can hold swapped pages while every member of the
+verified FreeToken server process group reports `VmSwap: 0 kB`. The ongoing
+wall-clock battery therefore records whole-host swap but fails only when the
+dedicated FreeToken process group itself has swapped pages.
 
 The same fixed 256-token scheduler workload was rerun from the current
 FreeToken Q4 profile and a fresh ROCm 10 llama.cpp control, with the same GGUF
@@ -202,11 +208,13 @@ Retained raw evidence for this recovery investigation is under
 and the fresh llama.cpp control is under
 `/home/david/freetoken-amd/artifacts/qwen35moe-llamacpp-rocm10-current-harness-retry-20260830T151654Z/`.
 
-## Clean-memory endurance
+## Initial clean-memory endurance
 
-Before the strict endurance run, diagnostic inspection showed swapped pages belonging primarily to FreeToken multiprocessing workers. With about 18 GiB of RAM available, the existing controlled `swapoff` and `swapon` reset was performed. Qwen remained healthy, swap stayed at zero during a short observation period, and the strict battery was then allowed to start.
-
-The battery ran 30 complete multi-turn sessions and enforced a maximum of 64 KiB swap at every session boundary.
+The initial 30-session battery reset whole-host swap before starting and
+enforced a maximum of 64 KiB at every session boundary. It completed before
+the later process attribution work. Its functional and timing results remain
+valid, but the whole-host swap limit is superseded by the verified
+runner-process-group gate used by the current wall-clock endurance battery.
 
 | Metric | Observed result |
 | --- | --- |
@@ -215,7 +223,7 @@ The battery ran 30 complete multi-turn sessions and enforced a maximum of 64 KiB
 | p95 maximum turn TTFT | 0.596 s |
 | p99 maximum turn TTFT | 2.369 s |
 | p99 maximum token gap | 39.63 ms |
-| Swap guard | passed, zero KiB observed after completion |
+| Initial swap guard | passed, zero KiB whole-host usage observed after completion |
 | Qwen health after run | `status: ok` |
 | Final sampled GPU edge temperature | 42 C |
 
@@ -262,5 +270,5 @@ tests/benchmarks/test_lan223_qwen_benchmark.py
 
 1. The quantization-equivalent Qwen control is now complete. The exact Q4_K_M comparison is close but FreeToken remains 1.39 percent below llama.cpp in the fixed single-request decode workload. Any claim to meet or exceed llama.cpp needs a new retained optimization and a fresh matched requalification.
 2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, DPM-policy, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
-3. Run a longer wall-clock endurance workload with periodic telemetry if the deployment target requires all-day serving evidence.
+3. Complete the active one-hour process-scoped wall-clock endurance workload with periodic telemetry. Consider a longer all-day workload only if deployment requires evidence beyond this explicit one-hour qualification.
 4. Package sanitized build manifests and selected raw artifacts for the fork and upstream pull request. Do not publish local model files, private host paths, or operational access information.
