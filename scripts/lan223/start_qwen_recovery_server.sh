@@ -21,6 +21,12 @@ readonly MODEL_DIR="${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4"
 readonly SOURCE_REVISION="$(git -C "${SOURCE_DIR}" rev-parse --short=12 HEAD)"
 readonly ROCM_KERNEL_CACHE_DIR="${FREETOKEN_ROCM_KERNEL_CACHE_DIR:-${ROOT_DIR}/cache/kernel-cache-rocm-gfx1151-${SOURCE_REVISION}}"
 readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
+# The previous 2,048-token reserve made the advertised 8,192-token sequence
+# limit unreachable because --moe-cache-auto allocated the remaining budget to
+# experts.  LAN-223 validation proved an 8,192-token reserve keeps zero swap,
+# preserves short-decode TPS, and enables a real 6,856-token cold-prefill test.
+# Permit a small, explicit set of recovery overrides for isolated experiments.
+readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"
 readonly CUDA_GRAPH_MAX_BS="${FREETOKEN_CUDA_GRAPH_MAX_BS:-0}"
 readonly FP8_GEMV_BLOCK_N="${FREETOKEN_FP8_GEMV_BLOCK_N:-16}"
 readonly FP8_GEMV_NUM_WARPS="${FREETOKEN_FP8_GEMV_NUM_WARPS:-1}"
@@ -47,6 +53,10 @@ test -d "${ROCM_KERNEL_CACHE_DIR}"
 case "${MEMORY_RATIO}" in
     0.[0-9][0-9]) ;;
     *) echo "invalid FREETOKEN_MEMORY_RATIO: ${MEMORY_RATIO}" >&2; exit 2 ;;
+esac
+case "${KV_RESERVE_TOKENS}" in
+    2048|4096|8192) ;;
+    *) echo "invalid FREETOKEN_KV_RESERVE_TOKENS: ${KV_RESERVE_TOKENS}" >&2; exit 2 ;;
 esac
 case "${CUDA_GRAPH_MAX_BS}" in
     0|1|2|4|8) ;;
@@ -127,11 +137,11 @@ fi
     'import freetoken.kernel._pinned_tensor as pinned; print(pinned.__file__)' \
     >"${NATIVE_IMPORT_LOG}"
 
-# The fixed policy is the previously successful LAN-223 Qwen configuration.
-# The default 0.35 memory budget and 2,048-token KV reserve avoid the OOM
-# observed with a much larger automatic allocation. A two-decimal environment
-# override supports an isolated cache-capacity experiment without editing the
-# server command. Serial expert loading is the ROCm-correct route and prefill
+# The fixed policy is the validated LAN-223 Qwen configuration. The default
+# 0.35 memory budget and 8,192-token KV reserve make the advertised context
+# limit real while --moe-cache-auto retains as many MoE experts as safely fit.
+# A constrained environment override supports isolated cache-capacity controls
+# without editing the server command. Serial expert loading is the ROCm-correct route and prefill
 # overlap stays disabled for the validated safe baseline. Graph capture defaults
 # to zero because ROCm correctness takes priority; the bounded override enables
 # an isolated batch-size experiment without changing the baseline command. The
@@ -151,7 +161,7 @@ nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --moe-cache-auto \
     --memory-ratio "${MEMORY_RATIO}" \
     --max-seq-len-override 8192 \
-    --kv-reserve-tokens 2048 \
+    --kv-reserve-tokens "${KV_RESERVE_TOKENS}" \
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" \
     --disable-pynccl \
     --disable-moe-prefill-overlap \
