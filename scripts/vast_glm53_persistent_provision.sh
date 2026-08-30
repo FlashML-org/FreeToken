@@ -51,6 +51,7 @@ model_download_pid=$!
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ca-certificates cuda-compiler-13-0 cuda-cudart-dev-13-0 \
+  cuda-curand-dev-13-0 \
   curl git ninja-build numactl python3.12-dev util-linux
 apt-get clean
 
