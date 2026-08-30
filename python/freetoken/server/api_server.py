@@ -930,6 +930,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
 
+    # pyzmq's asyncio sockets need ``add_reader``, which Windows' Proactor loop does not
+    # implement (it works only if tornado>=6.1 is importable). Without a selector loop the
+    # frontend's ZMQ listener dies at startup and every request hangs until it times out,
+    # while the scheduler happily logs the prefill. Setting the policy is not enough:
+    # uvicorn's own loop factory hardcodes ProactorEventLoop on win32, so the loop is also
+    # created explicitly below and handed to uvicorn via ``loop="none"``. No-op on POSIX.
+    if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
     # Always surface the effective default sampling (model-recommended where available,
@@ -1037,4 +1046,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        # ``loop="none"`` keeps uvicorn off its own factory (which would hand us a
+        # Proactor loop on win32) and runs the server on the selector loop we own.
+        server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, loop="none"))
+        asyncio.run(server.serve())
+    else:
+        uvicorn.run(app, host=host, port=port)
