@@ -249,7 +249,7 @@ def test_linear_state_pool_prices_itself():
 
     group = LinearGatedDeltaGroupConfig(
         name="linear", layer_ids=(1, 3), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
     )
     config = _generic_config()
     config.linear_state_cache_ratio = 0.5

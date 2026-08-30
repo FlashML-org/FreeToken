@@ -234,7 +234,7 @@ def test_auto_backend_resolution():
     cfg = parse_config(_hf_config())
     required = _required_attn_types(cfg)
     assert required == frozenset({AttnType.BSA})
-    assert _resolve_auto_attention_backend(required, False) == "m3_sparse"
+    assert _resolve_auto_attention_backend(required) == "m3_sparse"
     assert attention_backend_info("m3_sparse").page_sizes == (128,)
 
 

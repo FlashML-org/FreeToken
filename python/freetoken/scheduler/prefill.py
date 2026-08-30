@@ -156,6 +156,13 @@ class PrefillAdder:
             self.reserved_swa += (
                 div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
             ) * ps
+        align = self.cache_manager.prefill_chunk_align
+        if align > 1 and 0 < chunk_size < remain_len:
+            # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
+            # so keep it when the leftover budget cannot fill one whole unit instead of stalling
+            # the request until it gets a bigger turn.
+            aligned = align_down(cached_len + chunk_size, align) - cached_len
+            chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size

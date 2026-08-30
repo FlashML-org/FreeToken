@@ -153,7 +153,7 @@ def test_pool_family_and_backend_resolution():
     assert required == frozenset({AttnType.FULL, AttnType.SWA})
     # SWA restricts serving to the triton backend (the only one in the capability
     # matrix that consumes per-call sliding windows), same as gemma4.
-    assert _resolve_auto_attention_backend(required, False) == "triton"
+    assert _resolve_auto_attention_backend(required) == "triton"
 
 
 def test_registry_resolves_architecture():
