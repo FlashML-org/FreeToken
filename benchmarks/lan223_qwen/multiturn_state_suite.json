@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "description": "Bounded multi-turn state-retention control for LAN-223. It is not a replacement for the paper's coding-agent workflows.",
+  "turns": [
+    {
+      "id": "remember",
+      "user": "Remember the codeword azure-17 for this conversation. Reply exactly ACK.",
+      "expected": "ACK"
+    },
+    {
+      "id": "recall",
+      "user": "What codeword did I ask you to remember? Reply only with the codeword.",
+      "expected": "azure-17"
+    },
+    {
+      "id": "transform",
+      "user": "Add 6 to the numeric part of the remembered codeword. Reply only with the decimal integer.",
+      "expected": "23"
+    }
+  ]
+}
