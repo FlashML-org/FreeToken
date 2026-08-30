@@ -227,6 +227,42 @@ runner-process-group gate used by the current wall-clock endurance battery.
 | Qwen health after run | `status: ok` |
 | Final sampled GPU edge temperature | 42 C |
 
+## Process-scoped wall-clock endurance qualification
+
+The corrected endurance battery ran 60 deterministic three-turn conversations
+at one-minute cadence, for a full hour of wall-clock observation. It validated
+the exact visible answers `ACK`, `azure-17`, and `23` in every session. The
+wrapper also resolved the dedicated Q4 HTTP server process group before every
+memory sample and rejected a session if any member reported nonzero `VmSwap`.
+Whole-host swap was retained as diagnostic telemetry only, because Linux
+desktop and monitoring processes can use swap independently of FreeToken.
+
+| Metric | Result |
+| --- | --- |
+| completed and passed sessions | 60 of 60 |
+| runner process-group swap | 0 KiB minimum and maximum |
+| maximum-turn TTFT mean | 0.424 s |
+| maximum-turn TTFT p95 | 0.414 s |
+| maximum-turn TTFT p99 and maximum | 1.184 s |
+| maximum visible-token-gap mean | 24.95 ms |
+| maximum visible-token-gap p95 | 25.98 ms |
+| maximum visible-token-gap p99 and maximum | 27.17 ms |
+| whole-host swap telemetry | 33.07 MiB to 38.17 MiB |
+
+The single 1.184-second maximum-turn TTFT observation is retained as an
+observed tail outlier, not hidden by a mean-only result. It did not cause an
+incorrect answer, runner swapping, process failure, or loss of API service.
+The machine was restored after the battery: the temporary Q4 listener on
+port 1922 was stopped, `vm.swappiness` was restored to 60, and the normal
+NVFP4 service was verified on loopback port 1919 with its advertised
+8,192-token context.
+
+Raw evidence is retained under
+`/home/david/freetoken-amd/artifacts/qwen35moe-gguf-process-scoped-endurance-20260830T153333Z/`,
+including each request JSON, per-session telemetry, and the machine-generated
+`summary.json`. The reusable verifier is
+`benchmarks/lan223_qwen/summarize_qwen_gguf_endurance.py`.
+
 ## Full-context MoE cache telemetry
 
 The normal Qwen service intentionally leaves MoE counters disabled because the
@@ -270,5 +306,5 @@ tests/benchmarks/test_lan223_qwen_benchmark.py
 
 1. The quantization-equivalent Qwen control is now complete. The exact Q4_K_M comparison is close but FreeToken remains 1.39 percent below llama.cpp in the fixed single-request decode workload. Any claim to meet or exceed llama.cpp needs a new retained optimization and a fresh matched requalification.
 2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, DPM-policy, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
-3. Complete the active one-hour process-scoped wall-clock endurance workload with periodic telemetry. Consider a longer all-day workload only if deployment requires evidence beyond this explicit one-hour qualification.
+3. The one-hour process-scoped wall-clock endurance workload is complete and qualified. Consider a longer all-day workload only if deployment requires evidence beyond this explicit one-hour qualification.
 4. Package sanitized build manifests and selected raw artifacts for the fork and upstream pull request. Do not publish local model files, private host paths, or operational access information.
