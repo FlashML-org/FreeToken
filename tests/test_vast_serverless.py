@@ -72,3 +72,11 @@ def test_vast_provisioner_installs_jit_headers_and_verifies_commit():
     assert "libcurand-dev-13-0" in source
     assert "TEKIZAI_FREETOKEN_EXPECTED_COMMIT" in source
     assert 'git -C "$checkout" rev-parse HEAD' in source
+
+
+def test_vast_provisioner_has_validated_fast_resume_path():
+    source = (ROOT / "scripts/vast_glm53_provision.sh").read_text(encoding="utf-8")
+    assert 'FREETOKEN_PROVISION_STAGE=fast_resume' in source
+    assert '[[ -s "$model_dir/config.json" ]]' in source
+    assert 'checkout_matches_expected_commit' in source
+    assert 'printf \'%s\\n\' "$provision_marker_value" >"$provision_marker"' in source
