@@ -28,16 +28,21 @@ class Nvfp4ExpertSourceSpec:
     # The checkpoint stores the QUANT-side global scale (local fp8 scales were
     # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
+    # Applied to each global-scale tensor as it is read. compressed-tensors stores the
+    # QUANT-side scale (``448*6/amax``) but the dequant kernel wants its reciprocal
+    # (``fp4 * block_scale * global``); ModelOpt's ``weight_scale_2`` is already
+    # dequant-side, so the default is identity. Cf. models/loader.py.
+    global_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Mixed-precision checkpoints: bank layers whose experts are absent from the
+    # checkpoint entirely (Laguna quantizes only layers 1-39; 40-47 ship bf16). Called
+    # as ``fill(bank_layer, {bank_name: tensor})`` for each missing layer and must write
+    # all E experts of all 6 banks; each counts as ``E*6`` placements so the completion
+    # tracker fires it exactly like a natively-packed layer.
+    synthesize_layer: Callable[[int, dict[str, torch.Tensor]], None] | None = None
 
 
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
     return spec.kind_map.get(kind, kind) if spec.kind_map else kind
-
-
-def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
-    if spec.global_reciprocal:
-        tensor = 1.0 / tensor.float()
-    return tensor.to(torch.float16)
 
 
 def _num_moe_layers(config) -> int:
@@ -76,6 +81,46 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
         "down_scale": ((E, H, I // 16), fp8),
         "down_global": ((E, H), torch.float16),
     }, num_layers)
+
+
+def _read_global(spec: Nvfp4ExpertSourceSpec, handle, name: str) -> torch.Tensor:
+    """Read one global-scale tensor, applying the spec's dequant-side transforms."""
+    tensor = handle.get_tensor(name)
+    if spec.global_reciprocal:
+        tensor = 1.0 / tensor.float()
+    if spec.global_transform is not None:
+        tensor = spec.global_transform(tensor)
+    return tensor.to(torch.float16)
+
+
+def _missing_bank_layers(
+    spec: Nvfp4ExpertSourceSpec, num_layers: int, seen: set[int]
+) -> list[int]:
+    """Bank layers with no packed experts in the checkpoint (mixed-precision models)."""
+    missing = sorted(set(range(num_layers)) - seen)
+    if missing and spec.synthesize_layer is None:
+        raise ValueError(
+            f"{spec.desc}: no NVFP4 expert tensors for bank layers {missing}; "
+            "the checkpoint is mixed precision but the spec has no synthesize_layer"
+        )
+    return missing
+
+
+def _synthesize_missing(
+    spec: Nvfp4ExpertSourceSpec,
+    missing_layers: list[int],
+    banks: dict[str, list[torch.Tensor]],
+    tracker,
+    per_layer: int,
+) -> int:
+    """Fill layers absent from the checkpoint, noting them so the sink fires normally."""
+    placed = 0
+    for bank_layer in missing_layers:
+        spec.synthesize_layer(bank_layer, {name: per[bank_layer] for name, per in banks.items()})
+        for _ in range(per_layer):
+            tracker.note(bank_layer)
+        placed += per_layer
+    return placed
 
 
 def load_nvfp4_expert_source_banks(
@@ -117,6 +162,7 @@ def load_nvfp4_expert_source_banks(
 
     weight_shards: dict[str, list[tuple[str, re.Match[str], int]]] = collections.defaultdict(list)
     global_shards: dict[str, list[tuple[str, re.Match[str], int]]] = collections.defaultdict(list)
+    seen_layers: set[int] = set()
     for name, shard in weight_map.items():
         match = spec.key_pattern.match(name)
         if match is None:
@@ -128,6 +174,7 @@ def load_nvfp4_expert_source_banks(
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
+        seen_layers.add(bank_layer)
         kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
             global_shards[shard].append((name, match, bank_layer))
@@ -135,6 +182,8 @@ def load_nvfp4_expert_source_banks(
             weight_shards[shard].append((name, match, bank_layer))
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+
+    missing_layers = _missing_bank_layers(spec, num_layers, seen_layers)
 
     globals_map: dict[tuple[int, int, str], torch.Tensor] = {}
     for shard in sorted(global_shards):
@@ -146,7 +195,7 @@ def load_nvfp4_expert_source_banks(
                     int(match.group("expert")),
                     match.group("proj"),
                 )
-                globals_map[key] = _ingest_global(spec, f.get_tensor(name))
+                globals_map[key] = _read_global(spec, f, name)
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -156,6 +205,14 @@ def load_nvfp4_expert_source_banks(
     down_packed = [b.tensor for b in _hb["down_packed"]]
     down_scale = [b.tensor for b in _hb["down_scale"]]
     down_global = [b.tensor for b in _hb["down_global"]]
+    _bank_tensors = {
+        "gate_up_packed": gate_up_packed,
+        "gate_up_scale": gate_up_scale,
+        "gate_up_global": gate_up_global,
+        "down_packed": down_packed,
+        "down_scale": down_scale,
+        "down_global": down_global,
+    }
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -197,6 +254,10 @@ def load_nvfp4_expert_source_banks(
                     tracker.note(bank_layer_id)
                     placed += 1
             drop_page_cache(path)
+        if missing_layers:
+            placed += _synthesize_missing(
+                spec, missing_layers, _bank_tensors, tracker, E * 6
+            )
         return placed
 
     if layer_sink is not None:
@@ -245,6 +306,7 @@ def load_nvfp4_expert_source_banks_parallel(
 
     weight_info: dict[str, tuple[re.Match[str], int]] = {}  # name -> (match, bank_layer)
     global_names_by_shard: dict[str, list[str]] = collections.defaultdict(list)
+    seen_layers: set[int] = set()
     for name, shard in weight_map.items():
         match = spec.key_pattern.match(name)
         if match is None:
@@ -252,6 +314,7 @@ def load_nvfp4_expert_source_banks_parallel(
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
+        seen_layers.add(bank_layer)
         kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
             global_names_by_shard[shard].append(name)
@@ -259,6 +322,8 @@ def load_nvfp4_expert_source_banks_parallel(
             weight_info[name] = (match, bank_layer)
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+
+    missing_layers = _missing_bank_layers(spec, num_layers, seen_layers)
 
     # Pass 1: tiny per-tensor global scales (serial; data is scalar-per-expert).
     globals_map: dict[tuple[int, int, str], torch.Tensor] = {}
@@ -269,7 +334,7 @@ def load_nvfp4_expert_source_banks_parallel(
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
                 globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (
-                    _ingest_global(spec, f.get_tensor(name))
+                    _read_global(spec, f, name)
                 )
         drop_page_cache(path)
 
@@ -280,6 +345,14 @@ def load_nvfp4_expert_source_banks_parallel(
     down_packed = [b.tensor for b in _hb["down_packed"]]
     down_scale = [b.tensor for b in _hb["down_scale"]]
     down_global = [b.tensor for b in _hb["down_global"]]
+    _bank_tensors = {
+        "gate_up_packed": gate_up_packed,
+        "gate_up_scale": gate_up_scale,
+        "gate_up_global": gate_up_global,
+        "down_packed": down_packed,
+        "down_scale": down_scale,
+        "down_global": down_global,
+    }
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -316,6 +389,10 @@ def load_nvfp4_expert_source_banks_parallel(
                     down_global[bank_layer_id][expert] = g
             tracker.note(bank_layer_id)
             placed += 1
+        if missing_layers:
+            placed += _synthesize_missing(
+                spec, missing_layers, _bank_tensors, tracker, E * 6
+            )
         return placed
 
     if layer_sink is not None:

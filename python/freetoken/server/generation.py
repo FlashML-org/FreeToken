@@ -351,6 +351,12 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # GLM's template honors enable_thinking (default on) even with tools; the
         # generic fallback would force thinking and mislabel disabled output as reasoning.
         force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+    elif parser_name == "laguna":
+        # Laguna's template pre-opens <think> when enable_thinking (its default is true,
+        # and generation_config sets enable_thinking in default_chat_template_kwargs), so
+        # the model emits only the closing </think>. With thinking off the template
+        # pre-closes </think> instead, and the visible answer must stay content.
+        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
     elif parser_name == "gemma4":
         # Gemma4 defaults thinking off even when tools are present: its template injects an
         # empty thought channel before generation. Do not let Codex tool definitions make all

@@ -143,6 +143,18 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm5_next",
         "Glm5NextForCausalLM",
     ),
+    # Laguna S/XS 2.1 (model_type laguna): 48-layer 1:3 full/SWA hybrid (window 512),
+    # per-head softplus gating, per-layer head count (48 vs 72), yarn full rope +
+    # default SWA rope, sigmoid router with bias, shared expert. NVFP4 routed experts
+    # (compressed-tensors W4A16) served from offload cache.
+    "LagunaForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+    ),
+    "LagunaForConditionalGeneration": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+    ),
 }
 
 

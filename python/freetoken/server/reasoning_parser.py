@@ -878,6 +878,7 @@ class ReasoningParser:
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": ThinkReasoningParser,
         "glm": ThinkReasoningParser,
+        "laguna": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
