@@ -20,7 +20,7 @@ mkdir -p "$workspace" "$(dirname "$MODEL_LOG")"
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ca-certificates cuda-compiler-13-0 cuda-cudart-dev-13-0 \
-  curl git ninja-build numactl util-linux
+  curl git ninja-build numactl python3.12-dev util-linux
 apt-get clean
 
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
