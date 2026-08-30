@@ -46,6 +46,19 @@ def fused_topk(
 
     from freetoken.kernel.backend import is_rocm_runtime, is_triton_kernels_installed
 
+    # The in-tree HIP router is independently parity-tested on LAN-223, but it
+    # remains opt-in until an end-to-end Qwen quality control proves that its
+    # routing tie behavior preserves the generated answer.  This switch lets
+    # the isolated benchmark server exercise the native Triton implementation
+    # without changing the production AMD default during investigation.
+    use_rocm_triton_router = is_rocm_runtime() and os.environ.get(
+        "FREETOKEN_ROCM_TRITON_ROUTER", "0"
+    ) == "1"
+    if use_rocm_triton_router:
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+
     # OpenAI's triton_kernels package distributes CUDA-only binaries. The
     # in-tree Triton router is useful for research on HIP, but it changed a
     # deterministic Qwen AIME output on LAN-223 despite matching router values
