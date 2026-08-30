@@ -10,6 +10,7 @@ as bf16 or fp32, because they are stored as F32 in the GGUF.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterator
 
 import torch
@@ -278,14 +279,41 @@ def _expert_specs(config) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     }
 
 
-def load_q4_k_q5_k_expert_sources(model_path: str, config, *, layer_sink=None):
+def _q6_down_specs(config) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """One Q6_K down bank for each exceptional Qwen GGUF layer."""
+    experts = int(config.num_experts)
+    hidden = int(config.hidden_size)
+    intermediate = int(config.moe_intermediate_size)
+    return {
+        "down": ((experts, hidden, row_bytes(intermediate, GGML_Q6_K)), torch.uint8),
+    }
+
+
+@dataclass(frozen=True)
+class QwenGGUFExpertSources:
+    """Primary Q4_K/Q5_K banks plus exact Q6_K down-only exceptional banks.
+
+    ``primary`` stays shape-uniform for the existing cache.  Its Q5_K down rows
+    for ``q6_layer_ids`` are deliberately unused placeholders.  ``q6_down`` has
+    only the actual Q6_K layers in the same order as ``q6_layer_ids`` and feeds a
+    small auxiliary cache, avoiding any conversion between the two GGML layouts.
+    """
+
+    primary: dict[str, list[torch.Tensor]]
+    q6_down: list[torch.Tensor]
+    q6_layer_ids: tuple[int, ...]
+
+
+def load_q4_k_q5_k_expert_sources(
+    model_path: str, config, *, layer_sink=None
+) -> QwenGGUFExpertSources:
     """Load byte-exact Qwen GGUF experts into per-layer host banks.
 
     The loader fuses separately stored `ffn_gate_exps` and `ffn_up_exps` rows
     along their output dimension, which is safe because both use the same Q4_K
-    input-row geometry.  `ffn_down_exps` remains Q5_K.  Completion is reported
-    only after all three tensors for a layer are present, so a conversion sink
-    can write or release the layer without racing a later tensor.
+    input-row geometry.  Most down rows remain Q5_K.  The explicit Q6_K late
+    layers are held in a compact side list for an auxiliary cache instead of
+    being coerced into the primary Q5_K bank.
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
@@ -297,8 +325,17 @@ def load_q4_k_q5_k_expert_sources(model_path: str, config, *, layer_sink=None):
     intermediate = int(config.moe_intermediate_size)
     gate_row_bytes = row_bytes(hidden, GGML_Q4_K)
     down_row_bytes = row_bytes(intermediate, GGML_Q5_K)
+    q6_down_row_bytes = row_bytes(intermediate, GGML_Q6_K)
+    q6_layer_ids = tuple(int(layer) for layer in getattr(config, "gguf_q6_down_layer_ids", ()))
+    q6_index = {layer: index for index, layer in enumerate(q6_layer_ids)}
+    if layer_sink is not None and q6_layer_ids:
+        raise NotImplementedError(
+            "Qwen GGUF FTW conversion does not yet serialize the auxiliary Q6_K down banks"
+        )
     host_banks = alloc_layer_banks(_expert_specs(config), layers)
     banks = {name: [bank.tensor for bank in host_banks[name]] for name in host_banks}
+    q6_host_banks = alloc_layer_banks(_q6_down_specs(config), len(q6_layer_ids))
+    q6_down = [bank.tensor for bank in q6_host_banks["down"]]
     gate_seen: set[int] = set()
     up_seen: set[int] = set()
     down_seen: set[int] = set()
@@ -328,11 +365,22 @@ def load_q4_k_q5_k_expert_sources(model_path: str, config, *, layer_sink=None):
                 )
                 up_seen.add(layer)
             elif suffix == "ffn_down_exps.weight":
-                if tensor.ggml_type != GGML_Q5_K:
-                    raise ValueError(f"{tensor.name} expected Q5_K, got {tensor.ggml_type}")
-                banks["down"][layer].copy_(
-                    tensor.packed().reshape(experts, hidden, down_row_bytes)
-                )
+                if layer in q6_index:
+                    if tensor.ggml_type != GGML_Q6_K:
+                        raise ValueError(f"{tensor.name} expected Q6_K, got {tensor.ggml_type}")
+                    q6_down[q6_index[layer]].copy_(
+                        tensor.packed().reshape(experts, hidden, q6_down_row_bytes)
+                    )
+                    # The primary cache must retain one uniform Q5_K bank shape. The
+                    # Q6 layers never read this placeholder because their execution
+                    # uses the auxiliary Q6_K cache.
+                    banks["down"][layer].zero_()
+                else:
+                    if tensor.ggml_type != GGML_Q5_K:
+                        raise ValueError(f"{tensor.name} expected Q5_K, got {tensor.ggml_type}")
+                    banks["down"][layer].copy_(
+                        tensor.packed().reshape(experts, hidden, down_row_bytes)
+                    )
                 down_seen.add(layer)
                 if tracker is not None:
                     tracker.note(layer)
@@ -348,6 +396,8 @@ def load_q4_k_q5_k_expert_sources(model_path: str, config, *, layer_sink=None):
     elif torch.cuda.is_available():
         with PinPipeline() as pins:
             load(pins)
+            for bank in q6_host_banks["down"]:
+                pins.submit(bank)
     else:
         load(None)
 
@@ -357,20 +407,26 @@ def load_q4_k_q5_k_expert_sources(model_path: str, config, *, layer_sink=None):
         f"gate={sorted(wanted - gate_seen)}, up={sorted(wanted - up_seen)}, "
         f"down={sorted(wanted - down_seen)}"
     )
-    return banks
+    return QwenGGUFExpertSources(banks, q6_down, q6_layer_ids)
 
 
-def dummy_q4_k_q5_k_expert_sources(config):
+def dummy_q4_k_q5_k_expert_sources(config) -> QwenGGUFExpertSources:
     """Build correctly shaped random packed banks for loader and cache tests."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
     host_banks = alloc_layer_banks(_expert_specs(config), int(config.num_layers))
     banks = {name: [bank.tensor for bank in host_banks[name]] for name in host_banks}
+    q6_layer_ids = tuple(int(layer) for layer in getattr(config, "gguf_q6_down_layer_ids", ()))
+    q6_host_banks = alloc_layer_banks(_q6_down_specs(config), len(q6_layer_ids))
+    q6_down = [bank.tensor for bank in q6_host_banks["down"]]
     for tensor in banks["gate_up"] + banks["down"]:
+        tensor.random_(0, 256)
+    for tensor in q6_down:
         tensor.random_(0, 256)
     if torch.cuda.is_available():
         pin_banks(host_banks)
-    return banks
+        pin_banks(q6_host_banks)
+    return QwenGGUFExpertSources(banks, q6_down, q6_layer_ids)
 
 
 __all__ = [
