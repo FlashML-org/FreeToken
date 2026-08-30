@@ -4,7 +4,8 @@ set -Eeuo pipefail
 workspace="${WORKSPACE_DIR:-/workspace}"
 freetoken_dir="${TEKIZAI_FREETOKEN_DIR:-${workspace}/freetoken}"
 model_dir="${TEKIZAI_FREETOKEN_MODEL_PATH:-${workspace}/models/GLM-5.3-Flash-NVFP4}"
-worker_source_dir="${TEKIZAI_WORKER_SOURCE_DIR:-${workspace}/freetoken-vast-worker}"
+worker_source_dir="${TEKIZAI_WORKER_SOURCE_DIR:-${workspace}/vast-pyworker}"
+pyworker_uv_cache="${TEKIZAI_PYWORKER_UV_CACHE:-${workspace}/pyworker-uv-cache}"
 repo="${TEKIZAI_FREETOKEN_REPO:-https://github.com/earlvanze/FreeToken.git}"
 ref="${TEKIZAI_FREETOKEN_REF:-feat/glm53-flash}"
 model_repo="${TEKIZAI_MODEL_REPO:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
@@ -15,6 +16,7 @@ export PATH="${HOME}/.local/bin:${PATH}"
 export MODEL_LOG="${TEKIZAI_FREETOKEN_LOG:-${workspace}/logs/freetoken-glm53.log}"
 export PYWORKER_REPO="${PYWORKER_REPO:-$repo}"
 export PYWORKER_REF="${PYWORKER_REF:-$ref}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 
 mkdir -p "$workspace" "$(dirname "$MODEL_LOG")"
 
@@ -39,15 +41,22 @@ download_model() {
   return "$status"
 }
 
+model_download_pid=""
+pyworker_pid=""
+model_launcher_pid=""
+cleanup() {
+  local pid
+  for pid in "$model_launcher_pid" "$pyworker_pid" "$model_download_pid"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      wait "$pid" || true
+    fi
+  done
+}
+trap cleanup EXIT INT TERM
+
 download_model &
 model_download_pid=$!
-cleanup_download() {
-  if kill -0 "$model_download_pid" 2>/dev/null; then
-    kill "$model_download_pid"
-    wait "$model_download_pid" || true
-  fi
-}
-trap cleanup_download EXIT INT TERM
 
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -73,6 +82,18 @@ checkout_ref() {
 checkout_ref "$freetoken_dir"
 checkout_ref "$worker_source_dir"
 
+bootstrap="${workspace}/vast-pyworker-bootstrap.sh"
+echo "FREETOKEN_PROVISION_STAGE=pyworker_bootstrap"
+curl -fsSL \
+  "https://raw.githubusercontent.com/vast-ai/pyworker/${bootstrap_ref}/start_server.sh" \
+  -o "$bootstrap"
+chmod 0755 "$bootstrap"
+UV_CACHE_DIR="$pyworker_uv_cache" \
+  USE_SYSTEM_PYTHON=true \
+  ROTATE_MODEL_LOG=true \
+  "$bootstrap" &
+pyworker_pid=$!
+
 echo "FREETOKEN_PROVISION_STAGE=dependencies"
 if [[ ! -x "$freetoken_dir/.venv/bin/python" ]]; then
   uv venv --python 3.12 "$freetoken_dir/.venv"
@@ -80,7 +101,6 @@ fi
 uv pip install --python "$freetoken_dir/.venv/bin/python" -e "$freetoken_dir[accel]"
 
 wait "$model_download_pid"
-trap - EXIT INT TERM
 echo "FREETOKEN_PROVISION_STAGE=bandwidth_check"
 "$freetoken_dir/.venv/bin/ft" bench bw --dtype nvfp4
 
@@ -88,18 +108,4 @@ echo "FREETOKEN_PROVISION_STAGE=model_start"
 "$freetoken_dir/scripts/vast_glm53_start.sh" &
 model_launcher_pid=$!
 
-cleanup() {
-  if kill -0 "$model_launcher_pid" 2>/dev/null; then
-    kill "$model_launcher_pid"
-    wait "$model_launcher_pid" || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-bootstrap="${workspace}/vast-pyworker-bootstrap.sh"
-echo "FREETOKEN_PROVISION_STAGE=pyworker_bootstrap"
-curl -fsSL \
-  "https://raw.githubusercontent.com/vast-ai/pyworker/${bootstrap_ref}/start_server.sh" \
-  -o "$bootstrap"
-chmod 0755 "$bootstrap"
-"$bootstrap"
+wait "$pyworker_pid"
