@@ -46,13 +46,33 @@ checkout_ref() {
 checkout_ref "$freetoken_dir"
 checkout_ref "$worker_source_dir"
 
+echo "FREETOKEN_PROVISION_STAGE=dependencies"
 if [[ ! -x "$freetoken_dir/.venv/bin/python" ]]; then
   uv venv --python 3.12 "$freetoken_dir/.venv"
 fi
 uv pip install --python "$freetoken_dir/.venv/bin/python" -e "$freetoken_dir[accel]"
-"$freetoken_dir/.venv/bin/hf" download "$model_repo" --local-dir "$model_dir"
+
+download_model() {
+  local attempt status
+  for attempt in 1 2 3 4 5; do
+    echo "FREETOKEN_PROVISION_STAGE=model_download attempt=${attempt}"
+    if "$freetoken_dir/.venv/bin/hf" download "$model_repo" --local-dir "$model_dir"; then
+      echo "FREETOKEN_PROVISION_STAGE=model_download_complete"
+      return 0
+    else
+      status=$?
+    fi
+    echo "FREETOKEN_PROVISION_STAGE=model_download_retry status=${status}"
+    sleep "$((attempt * 10))"
+  done
+  return "$status"
+}
+
+download_model
+echo "FREETOKEN_PROVISION_STAGE=bandwidth_check"
 "$freetoken_dir/.venv/bin/ft" bench bw --dtype nvfp4
 
+echo "FREETOKEN_PROVISION_STAGE=model_start"
 "$freetoken_dir/scripts/vast_glm53_start.sh" &
 model_launcher_pid=$!
 
@@ -65,6 +85,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 bootstrap="${workspace}/vast-pyworker-bootstrap.sh"
+echo "FREETOKEN_PROVISION_STAGE=pyworker_bootstrap"
 curl -fsSL \
   "https://raw.githubusercontent.com/vast-ai/pyworker/${bootstrap_ref}/start_server.sh" \
   -o "$bootstrap"
