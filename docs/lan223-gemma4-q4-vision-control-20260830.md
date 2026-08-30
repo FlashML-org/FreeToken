@@ -71,9 +71,41 @@ PYTHONPATH=python /home/david/freetoken-amd/.venv/bin/python \
   --artifact /tmp/gemma4-image-quality.json
 ```
 
-## Boundaries
+## Matched ROCm 10 llama.cpp control
 
-This is a functionality and short-control measurement, not a long-output
-throughput benchmark. The next performance phase must use a fixed visual task,
-multiple repetitions, warmup exclusion, server telemetry, and matched
-llama.cpp controls before making any TPS comparison.
+The matched llama.cpp runner used the same text GGUF, sibling projector,
+ROCm 10 installation, loopback-only OpenAI API contract, and deterministic
+image fixtures. Its artifact is:
+
+`/home/david/freetoken-amd/artifacts/gemma4-llamacpp-vision-20260830T051736Z`
+
+| Control | FreeToken AMD ROCm/HIP | llama.cpp ROCm 10 | Result |
+| --- | --- | --- | --- |
+| Text arithmetic | `323`, 47.97 decode tok/s, 1687.71 ms TTFT | `323`, 30.99 decode tok/s, 204.23 ms TTFT | Both correct. FreeToken decoded this two-step short control 54.8% faster, while llama.cpp had lower first-token latency. |
+| Solid red image | `red`, 284 prompt and 2 completion tokens, 2.27 s wall time | `red`, 82 prompt and 92 completion tokens, 56.10 generated tok/s, 1.96 s wall time | Both correct. llama.cpp emitted 91 reasoning tokens before its visible answer. |
+| Solid green image | `green`, 284 prompt and 2 completion tokens, 1.08 s wall time | `green`, 82 prompt and 84 completion tokens, 56.00 generated tok/s, 1.81 s wall time | Both correct. llama.cpp emitted 83 reasoning tokens before its visible answer. |
+| Red-left, blue-right image | `red`, 282 prompt and 2 completion tokens, 1.06 s wall time | `red`, 79 prompt and 121 completion tokens, 56.16 generated tok/s, 2.44 s wall time | Both correct. llama.cpp preserved spatial information but emitted 120 reasoning tokens first. |
+
+This is a real OpenAI-compatible quality comparison, not an equivalence claim
+for visual TPS. The runtimes tokenize image inputs differently, and llama.cpp
+deliberately exposes a long `reasoning_content` trace on this Gemma template.
+That makes its reported 56 tok/s an internally useful decode measurement but
+not directly comparable to FreeToken's two-token user-visible response. On the
+user-visible contract FreeToken completed the green and split-image controls
+faster; on the first cold red request llama.cpp was faster.
+
+The text result is directly comparable because both runners used the same
+caller-rendered prompt and returned the same four completion tokens. It shows
+that the current native FreeToken ROCm/HIP path exceeds the matched llama.cpp
+decode rate for that bounded control, but it does not establish a general
+long-output advantage.
+
+## Boundary and next measurement
+
+The image controls are functionality and short-request measurements, not a
+long-output visual throughput benchmark. The next performance phase should use
+a fixed visual-description task, a quality rubric that scores both visible and
+reasoning channels separately, warmup exclusion, multiple repetitions, and
+streaming telemetry. That will measure prompt TPS, first-token latency, and
+decode TPS without rewarding a runtime merely for emitting more hidden
+reasoning tokens.

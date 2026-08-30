@@ -47,7 +47,11 @@ restore_production() {
             bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
                 | tee -a "${ARTIFACT_DIR}/recovery.log" || true
             for _ in {1..20}; do
-                timeout 5 curl -fsS "http://127.0.0.1:${PRODUCTION_PORT}/health" >/dev/null && {
+                # A 200 response is not sufficient: FreeToken exposes health
+                # while the model remains in its loading state. Reuse the
+                # status-aware predicate so the protected service is actually
+                # ready before this runner reports cleanup complete.
+                production_ready && {
                     recovered=1
                     break 2
                 }
