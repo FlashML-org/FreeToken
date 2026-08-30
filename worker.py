@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 
 def _positive_int(value: Any, default: int = 0) -> int:
