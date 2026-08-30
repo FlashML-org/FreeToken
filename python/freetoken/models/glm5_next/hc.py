@@ -8,14 +8,12 @@ Sinkhorn/collapse/expand kernels instead of maintaining a second implementation.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
-from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
+from freetoken.layers import BaseOP
 
 
-class HyperConnection(nn.Module):
+class HyperConnection(BaseOP):
     """One attention or FFN mHC site over ``hc_mult`` residual streams."""
 
     def __init__(
@@ -26,19 +24,23 @@ class HyperConnection(nn.Module):
         sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
     ) -> None:
-        super().__init__()
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.norm_eps = norm_eps
         self.sinkhorn_iters = sinkhorn_iters
         self.hc_eps = hc_eps
         mix_size = (2 + hc_mult) * hc_mult
-        self.fn = nn.Parameter(
-            torch.empty(mix_size, hc_mult * hidden_size, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.base = nn.Parameter(torch.empty(mix_size, dtype=torch.float32), requires_grad=False)
-        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
+        self.fn = torch.empty(mix_size, hc_mult * hidden_size, dtype=torch.float32)
+        self.base = torch.empty(mix_size, dtype=torch.float32)
+        self.scale = torch.empty(3, dtype=torch.float32)
+
+    def to(self, device) -> HyperConnection:
+        """Small compatibility helper for direct module tests; engine loading replaces
+        BaseOP tensors through its state-dict path."""
+        self.fn = self.fn.to(device)
+        self.base = self.base.to(device)
+        self.scale = self.scale.to(device)
+        return self
 
     def mix(self, hidden_streams: torch.Tensor):
         """Return collapsed sublayer input plus the placement/mixing coefficients."""
@@ -51,19 +53,28 @@ class HyperConnection(nn.Module):
         flat = hidden_streams.flatten(-2).float()
         inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(flat, self.fn) * inv_rms
-        pre, post, comb = hc_split_sinkhorn(
-            mixes.reshape(-1, mixes.shape[-1]),
-            self.scale,
-            self.base,
-            self.hc_mult,
-            self.sinkhorn_iters,
-            self.hc_eps,
+        pre_w, post_w, comb_w = mixes.split(
+            [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], dim=-1
         )
-        tokens = flat.numel() // (self.hc_mult * self.hidden_size)
-        collapsed = hc_pre_combine(
-            flat.reshape(tokens, self.hc_mult, self.hidden_size),
-            pre,
-            hidden_streams.dtype,
+        pre_b, post_b, comb_b = self.base.split(
+            [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult]
+        )
+        pre = torch.sigmoid(pre_w * self.scale[0] + pre_b) + self.hc_eps
+        post = 2 * torch.sigmoid(post_w * self.scale[1] + post_b)
+        comb = torch.softmax(
+            comb_w.reshape(-1, self.hc_mult, self.hc_mult) * self.scale[2]
+            + comb_b.view(self.hc_mult, self.hc_mult),
+            dim=-1,
+        )
+        comb = comb + self.hc_eps
+        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        for _ in range(self.sinkhorn_iters - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        collapsed = (
+            (pre.unsqueeze(-1) * hidden_streams.float())
+            .sum(-2)
+            .to(hidden_streams.dtype)
         )
         return (
             collapsed.reshape(*shape[:-2], self.hidden_size),
@@ -81,12 +92,13 @@ class HyperConnection(nn.Module):
         """Place a sublayer output back into and mix the residual streams."""
         shape = residual.shape
         tokens = residual.numel() // (self.hc_mult * self.hidden_size)
-        mixed = hc_post_combine(
-            block_output.reshape(tokens, self.hidden_size),
-            residual.reshape(tokens, self.hc_mult, self.hidden_size),
-            post.reshape(tokens, self.hc_mult),
-            comb.reshape(tokens, self.hc_mult, self.hc_mult),
-        )
+        block = block_output.reshape(tokens, self.hidden_size).float()
+        streams = residual.reshape(tokens, self.hc_mult, self.hidden_size).float()
+        post = post.reshape(tokens, self.hc_mult).float()
+        comb = comb.reshape(tokens, self.hc_mult, self.hc_mult).float()
+        mixed = post.unsqueeze(-1) * block.unsqueeze(-2)
+        mixed = mixed + torch.matmul(comb.transpose(-1, -2), streams)
+        mixed = mixed.to(residual.dtype)
         return mixed.reshape(shape)
 
 

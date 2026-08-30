@@ -97,3 +97,36 @@ def test_nvfp4_config_keeps_only_routed_experts_quantized():
         }
     )
     assert _quant_modes(config) == ("nvfp4", "none", "none", "none", None)
+
+
+def test_sparse_block_propagates_release_swiglu_limit(monkeypatch):
+    from freetoken.models.glm5_next import moe
+
+    captured = {}
+
+    def fake_make_moe_layer(config, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(moe, "make_moe_layer", fake_make_moe_layer)
+    monkeypatch.setattr(
+        moe, "LinearReplicated", lambda *args, **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(moe, "Glm5NextMLP", lambda *args, **kwargs: SimpleNamespace())
+    config = SimpleNamespace(
+        num_experts_per_tok=8,
+        num_experts=288,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        n_group=1,
+        topk_group=1,
+        hidden_size=128,
+        first_k_dense_replace=3,
+        n_shared_experts=1,
+        moe_intermediate_size=64,
+        swiglu_limit=10.0,
+    )
+
+    moe.Glm5NextSparseBlock(config, layer_id=3)
+
+    assert captured["extra_attrs"] == {"swiglu_limit": 10.0}

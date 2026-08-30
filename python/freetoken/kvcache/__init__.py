@@ -6,6 +6,7 @@ from freetoken.utils import Registry
 
 if TYPE_CHECKING:
     import torch
+
     from freetoken.models import ModelConfig
 
 from .base import (
@@ -75,8 +76,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
     from .dsv4_cost_model import _dsv4_pool_sizes
-    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
+    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
 
     model_config = config.model_config
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
@@ -147,7 +148,9 @@ def create_kvcache_pool(
     head_dim = model_config.head_dim
     if model_config.has_linear_attention:
         specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
-        assert len(specs) == 1, f"expected one paged-KV group, got {[s.name for s in specs]}"
+        assert len(specs) == 1, (
+            f"expected one paged-KV group, got {[s.name for s in specs]}"
+        )
         spec = specs[0]
         layer_ids = spec.layer_ids
         num_kv_heads = spec.num_kv_heads
@@ -219,6 +222,7 @@ def create_kvcache_pool(
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=spec.layer_ids,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
@@ -227,6 +231,7 @@ def create_kvcache_pool(
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=spec.layer_ids,
         )
 
     return MHAKVCache(
@@ -268,14 +273,14 @@ def create_prefix_cache(
 
 
 __all__ = [
+    "SUPPORTED_CACHE_MANAGER",
+    "BaseCacheHandle",
+    "BaseKVCachePool",
+    "BasePrefixCache",
+    "MatchResult",
+    "SizeInfo",
     "create_kv_pool",
     "create_kvcache_pool",
     "create_prefix_cache",
     "resolve_pool_class",
-    "BaseKVCachePool",
-    "BaseCacheHandle",
-    "BasePrefixCache",
-    "SizeInfo",
-    "MatchResult",
-    "SUPPORTED_CACHE_MANAGER",
 ]

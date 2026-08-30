@@ -36,14 +36,29 @@ MIN_TILES_PER_SPLIT = 4
 
 @triton.jit
 def _glm_dsa_sparse_kernel(
-    q_ptr, pool_ptr, o_ptr, idx_ptr, cnt_ptr,
+    q_ptr,
+    pool_ptr,
+    o_ptr,
+    idx_ptr,
+    cnt_ptr,
     scale,
-    H, TOPK,
-    stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_pn, stride_pd,
-    stride_ob, stride_om, stride_oh, stride_od,
-    stride_ib, stride_im, stride_it,
-    stride_nb, stride_nm,
+    H,
+    TOPK,
+    stride_qb,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_pn,
+    stride_pd,
+    stride_ob,
+    stride_om,
+    stride_oh,
+    stride_od,
+    stride_ib,
+    stride_im,
+    stride_it,
+    stride_nb,
+    stride_nm,
     D_V: tl.constexpr,
     D_R: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -57,11 +72,18 @@ def _glm_dsa_sparse_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
 
     q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
-    q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-    q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+    q_v = tl.load(
+        q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0
+    ).to(tl.float32)
+    if D_R > 0:
+        offs_r = tl.arange(0, D_R)
+        q_r = tl.load(
+            q_base + (D_V + offs_r[None, :]) * stride_qd,
+            mask=h_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -72,16 +94,24 @@ def _glm_dsa_sparse_kernel(
         n_active = tl.load(cnt_ptr + pid_b * stride_nb + pid_m * stride_nm)
 
     idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
-    for t in range(0, tl.cdiv(n_active, BLOCK_T)):
+    for t in range(tl.cdiv(n_active, BLOCK_T)):
         offs_t = t * BLOCK_T + tl.arange(0, BLOCK_T)
         t_mask = offs_t < n_active
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
         kv_base = pool_ptr + idxs[:, None] * stride_pn
-        kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-        kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-
-        scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+        kv_v = tl.load(
+            kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0
+        ).to(tl.float32)
+        scores = tl.dot(q_v, tl.trans(kv_v))
+        if D_R > 0:
+            kv_r = tl.load(
+                kv_base + (D_V + offs_r[None, :]) * stride_pd,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            scores += tl.dot(q_r, tl.trans(kv_r))
+        scores *= scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -93,19 +123,36 @@ def _glm_dsa_sparse_kernel(
         m_i = m_new
 
     o = acc / l_i[:, None]
-    o_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + offs_h[:, None] * stride_oh + offs_v[None, :] * stride_od
+    o_ptrs = (
+        o_ptr
+        + pid_b * stride_ob
+        + pid_m * stride_om
+        + offs_h[:, None] * stride_oh
+        + offs_v[None, :] * stride_od
+    )
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty), mask=h_mask[:, None])
 
 
 @triton.jit
 def _glm_dsa_decode_logits_kernel(
-    q_ptr, w_ptr, pool_ptr, rows_ptr, valid_ptr, out_ptr,
+    q_ptr,
+    w_ptr,
+    pool_ptr,
+    rows_ptr,
+    valid_ptr,
+    out_ptr,
     N_STAGE,
-    stride_qb, stride_qh, stride_qd,
-    stride_wb, stride_wh,
-    stride_pr, stride_pd,
-    stride_rb, stride_rw,
-    stride_ob, stride_ot,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_wb,
+    stride_wh,
+    stride_pr,
+    stride_pd,
+    stride_rb,
+    stride_rw,
+    stride_ob,
+    stride_ot,
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -131,7 +178,9 @@ def _glm_dsa_decode_logits_kernel(
 
     n_valid = tl.load(valid_ptr + pid_b)
     if pid_t * BLOCK_T >= n_valid:
-        tl.store(out_ptrs, tl.full((BLOCK_T,), float("-inf"), tl.float32), mask=store_mask)
+        tl.store(
+            out_ptrs, tl.full((BLOCK_T,), float("-inf"), tl.float32), mask=store_mask
+        )
         return
 
     t_mask = offs_t < n_valid
@@ -139,13 +188,26 @@ def _glm_dsa_decode_logits_kernel(
     offs_h = tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
 
-    rows = tl.load(rows_ptr + pid_b * stride_rb + offs_t * stride_rw, mask=t_mask, other=0)
+    rows = tl.load(
+        rows_ptr + pid_b * stride_rb + offs_t * stride_rw, mask=t_mask, other=0
+    )
     rows = tl.maximum(rows, 0)
-    k = tl.load(pool_ptr + rows[:, None] * stride_pr + offs_d[None, :] * stride_pd,
-                mask=t_mask[:, None], other=0.0)
-    q = tl.load(q_ptr + pid_b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd,
-                mask=h_mask[:, None], other=0.0)
-    w = tl.load(w_ptr + pid_b * stride_wb + offs_h * stride_wh, mask=h_mask, other=0.0).to(tl.float32)
+    k = tl.load(
+        pool_ptr + rows[:, None] * stride_pr + offs_d[None, :] * stride_pd,
+        mask=t_mask[:, None],
+        other=0.0,
+    )
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qb
+        + offs_h[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    w = tl.load(
+        w_ptr + pid_b * stride_wb + offs_h * stride_wh, mask=h_mask, other=0.0
+    ).to(tl.float32)
 
     score = tl.dot(q, tl.trans(k))  # [BLOCK_H, BLOCK_T] fp32
     score = tl.maximum(score, 0.0) * w[:, None]
@@ -155,11 +217,11 @@ def _glm_dsa_decode_logits_kernel(
 
 
 def glm_dsa_decode_logits(
-    q: torch.Tensor,       # [B, H, D] bf16, one index query per request
-    weights: torch.Tensor, # [B, H] fp32 (head gate; softmax scale folded in by caller)
-    idx_pool: torch.Tensor,# [R, D] bf16, this slot's paged index keys
-    rows: torch.Tensor,    # [B, W] int, physical-row snapshot in position order
-    valid: torch.Tensor,   # [B] int32, live length per request (device-read)
+    q: torch.Tensor,  # [B, H, D] bf16, one index query per request
+    weights: torch.Tensor,  # [B, H] fp32 (head gate; softmax scale folded in by caller)
+    idx_pool: torch.Tensor,  # [R, D] bf16, this slot's paged index keys
+    rows: torch.Tensor,  # [B, W] int, physical-row snapshot in position order
+    valid: torch.Tensor,  # [B] int32, live length per request (device-read)
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Head-reduced indexer logits ``[B, W]`` fp32 for a decode step.
@@ -177,31 +239,65 @@ def glm_dsa_decode_logits(
         out = torch.empty(b, w_stage, dtype=torch.float32, device=q.device)
     BLOCK_T = 64
     _glm_dsa_decode_logits_kernel[(b, triton.cdiv(w_stage, BLOCK_T))](
-        q, weights, idx_pool, rows, valid, out,
+        q,
+        weights,
+        idx_pool,
+        rows,
+        valid,
+        out,
         w_stage,
-        q.stride(0), q.stride(1), q.stride(2),
-        weights.stride(0), weights.stride(1),
-        idx_pool.stride(0), idx_pool.stride(1),
-        rows.stride(0), rows.stride(1),
-        out.stride(0), out.stride(1),
-        H=h, D=d,
-        BLOCK_H=triton.next_power_of_2(h), BLOCK_T=BLOCK_T,
-        num_warps=4, num_stages=2,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        idx_pool.stride(0),
+        idx_pool.stride(1),
+        rows.stride(0),
+        rows.stride(1),
+        out.stride(0),
+        out.stride(1),
+        H=h,
+        D=d,
+        BLOCK_H=triton.next_power_of_2(h),
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+        num_stages=2,
     )
     return out
 
 
 @triton.jit
 def _glm_dsa_splitk_kernel(
-    q_ptr, pool_ptr, mid_o_ptr, mid_lse_ptr, idx_ptr, cnt_ptr,
+    q_ptr,
+    pool_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    idx_ptr,
+    cnt_ptr,
     scale,
-    H, TOPK,
-    stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_pn, stride_pd,
-    stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
-    stride_lb, stride_lm, stride_lh, stride_ls,
-    stride_ib, stride_im, stride_it,
-    stride_nb, stride_nm,
+    H,
+    TOPK,
+    stride_qb,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_pn,
+    stride_pd,
+    stride_mb,
+    stride_mm,
+    stride_mh,
+    stride_ms,
+    stride_md,
+    stride_lb,
+    stride_lm,
+    stride_lh,
+    stride_ls,
+    stride_ib,
+    stride_im,
+    stride_it,
+    stride_nb,
+    stride_nm,
     D_V: tl.constexpr,
     D_R: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -221,7 +317,8 @@ def _glm_dsa_splitk_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
+    if D_R > 0:
+        offs_r = tl.arange(0, D_R)
 
     n_active = TOPK
     if HAS_COUNTS:
@@ -236,9 +333,18 @@ def _glm_dsa_splitk_kernel(
     acc = tl.zeros((BLOCK_H, D_V), dtype=tl.float32)
 
     if split_end > split_start:
-        q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
-        q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+        q_base = (
+            q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
+        )
+        q_v = tl.load(
+            q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0
+        ).to(tl.float32)
+        if D_R > 0:
+            q_r = tl.load(
+                q_base + (D_V + offs_r[None, :]) * stride_qd,
+                mask=h_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
 
         for start in range(split_start, split_end, BLOCK_T):
@@ -247,10 +353,18 @@ def _glm_dsa_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             kv_base = pool_ptr + idxs[:, None] * stride_pn
-            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-
-            scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+            kv_v = tl.load(
+                kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0
+            ).to(tl.float32)
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if D_R > 0:
+                kv_r = tl.load(
+                    kv_base + (D_V + offs_r[None, :]) * stride_pd,
+                    mask=valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
+            scores *= scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -264,23 +378,42 @@ def _glm_dsa_splitk_kernel(
     lse = tl.where(l_i == 0.0, -float("inf"), m_i + tl.log(l_i))
 
     mid_base = (
-        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm
-        + offs_h[:, None] * stride_mh + split_id * stride_ms + offs_v[None, :] * stride_md
+        mid_o_ptr
+        + pid_b * stride_mb
+        + pid_m * stride_mm
+        + offs_h[:, None] * stride_mh
+        + split_id * stride_ms
+        + offs_v[None, :] * stride_md
     )
     tl.store(mid_base, out, mask=h_mask[:, None])
     lse_base = (
-        mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm
-        + offs_h * stride_lh + split_id * stride_ls
+        mid_lse_ptr
+        + pid_b * stride_lb
+        + pid_m * stride_lm
+        + offs_h * stride_lh
+        + split_id * stride_ls
     )
     tl.store(lse_base, lse, mask=h_mask)
 
 
 @triton.jit
 def _glm_dsa_merge_kernel(
-    mid_o_ptr, mid_lse_ptr, o_ptr,
-    stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
-    stride_lb, stride_lm, stride_lh, stride_ls,
-    stride_ob, stride_om, stride_oh, stride_od,
+    mid_o_ptr,
+    mid_lse_ptr,
+    o_ptr,
+    stride_mb,
+    stride_mm,
+    stride_mh,
+    stride_ms,
+    stride_md,
+    stride_lb,
+    stride_lm,
+    stride_lh,
+    stride_ls,
+    stride_ob,
+    stride_om,
+    stride_oh,
+    stride_od,
     D_V: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
@@ -296,7 +429,10 @@ def _glm_dsa_merge_kernel(
     acc = tl.zeros((D_V,), dtype=tl.float32)
 
     mid_base = (
-        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm + pid_h * stride_mh
+        mid_o_ptr
+        + pid_b * stride_mb
+        + pid_m * stride_mm
+        + pid_h * stride_mh
         + offs_v * stride_md
     )
     lse_base = mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm + pid_h * stride_lh
@@ -313,7 +449,10 @@ def _glm_dsa_merge_kernel(
 
     o = acc / l_i
     o_ptrs = (
-        o_ptr + pid_b * stride_ob + pid_m * stride_om + pid_h * stride_oh
+        o_ptr
+        + pid_b * stride_ob
+        + pid_m * stride_om
+        + pid_h * stride_oh
         + offs_v * stride_od
     )
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty))
@@ -333,13 +472,14 @@ def _split_count(b: int, m: int, h: int, topk: int, device) -> int:
 
 
 def glm_dsa_sparse_attn(
-    q: torch.Tensor,          # [b, m, h, d_v + d_r]  (ckv-absorbed | rope)
-    pool: torch.Tensor,       # [rows, d_v + d_r]     GLOBAL latent pool slab (this layer)
+    q: torch.Tensor,  # [b, m, h, d_v + d_r]  (ckv-absorbed | rope)
+    pool: torch.Tensor,  # [rows, d_v + d_r]     GLOBAL latent pool slab (this layer)
     topk_idxs: torch.Tensor,  # [b, m|1, topk] int32 global rows, -1 masked
     softmax_scale: float,
-    counts: torch.Tensor | None = None,  # [b, m] int32 live columns per query (device-read)
+    counts: torch.Tensor
+    | None = None,  # [b, m] int32 live columns per query (device-read)
     d_v: int = 512,
-    force_splits: int | None = None,     # tests only: 0 = single-program, N = split-k N
+    force_splits: int | None = None,  # tests only: 0 = single-program, N = split-k N
 ) -> torch.Tensor:
     """Sparse MLA attention over gathered latent rows; returns ``[b, m, h, d_v]``.
 
@@ -367,53 +507,110 @@ def glm_dsa_sparse_attn(
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0
 
-    n_splits = _split_count(b, m, h, topk, q.device) if force_splits is None else force_splits
+    n_splits = (
+        _split_count(b, m, h, topk, q.device) if force_splits is None else force_splits
+    )
     if n_splits:
         mid_o = q.new_empty(b, m, h, n_splits, d_v, dtype=torch.float32)
         mid_lse = q.new_empty(b, m, h, n_splits, dtype=torch.float32)
         grid1 = (m * n_splits, b, triton.cdiv(h, BLOCK_H))
         _glm_dsa_splitk_kernel[grid1](
-            q, pool_2d, mid_o, mid_lse, idx, cnt,
+            q,
+            pool_2d,
+            mid_o,
+            mid_lse,
+            idx,
+            cnt,
             float(softmax_scale),
-            h, topk,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            pool_2d.stride(0), pool_2d.stride(1),
-            mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
-            mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
-            idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
-            stride_nb, stride_nm,
-            D_V=d_v, D_R=d_r,
-            BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
-            HAS_COUNTS=has_counts, NUM_SPLITS=n_splits,
-            num_warps=4, num_stages=2,
+            h,
+            topk,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            pool_2d.stride(0),
+            pool_2d.stride(1),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            mid_o.stride(3),
+            mid_o.stride(4),
+            mid_lse.stride(0),
+            mid_lse.stride(1),
+            mid_lse.stride(2),
+            mid_lse.stride(3),
+            idx.stride(0),
+            0 if broadcast_m else idx.stride(1),
+            idx.stride(2),
+            stride_nb,
+            stride_nm,
+            D_V=d_v,
+            D_R=d_r,
+            BLOCK_H=BLOCK_H,
+            BLOCK_T=BLOCK_T,
+            HAS_COUNTS=has_counts,
+            NUM_SPLITS=n_splits,
+            num_warps=4,
+            num_stages=2,
         )
         grid2 = (m, b, h)
         _glm_dsa_merge_kernel[grid2](
-            mid_o, mid_lse, o,
-            mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
-            mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            D_V=d_v, NUM_SPLITS=n_splits,
+            mid_o,
+            mid_lse,
+            o,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            mid_o.stride(3),
+            mid_o.stride(4),
+            mid_lse.stride(0),
+            mid_lse.stride(1),
+            mid_lse.stride(2),
+            mid_lse.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            D_V=d_v,
+            NUM_SPLITS=n_splits,
             num_warps=4,
         )
         return o
 
     grid = (m, b, triton.cdiv(h, BLOCK_H))
     _glm_dsa_sparse_kernel[grid](
-        q, pool_2d, o, idx, cnt,
+        q,
+        pool_2d,
+        o,
+        idx,
+        cnt,
         float(softmax_scale),
-        h, topk,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        pool_2d.stride(0), pool_2d.stride(1),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
-        stride_nb, stride_nm,
-        D_V=d_v, D_R=d_r,
-        BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
+        h,
+        topk,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        pool_2d.stride(0),
+        pool_2d.stride(1),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        idx.stride(0),
+        0 if broadcast_m else idx.stride(1),
+        idx.stride(2),
+        stride_nb,
+        stride_nm,
+        D_V=d_v,
+        D_R=d_r,
+        BLOCK_H=BLOCK_H,
+        BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
     return o
 
 
-__all__ = ["glm_dsa_sparse_attn", "glm_dsa_decode_logits"]
+__all__ = ["glm_dsa_decode_logits", "glm_dsa_sparse_attn"]

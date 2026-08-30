@@ -2,14 +2,14 @@
 
 GLM-5.3 alternates three Kimi Delta Attention layers with one compressed DSA/MLA
 layer and carries four manifold-constrained residual streams through every block.
-This parser describes that hybrid layout without advertising runnable model support.
+This parser describes that hybrid layout for the runnable FreeToken implementation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from typing import Any, Tuple
+from typing import Any
 
 from freetoken.models.config import (
     FullAttentionGroupConfig,
@@ -38,16 +38,20 @@ class Glm5NextArgs:
     index_head_dim: int
     index_topk: int
     index_kpool: int
-    indexer_types: Tuple[str, ...]
-    layer_types: Tuple[str, ...]
-    mlp_layer_types: Tuple[str, ...]
+    indexer_types: tuple[str, ...]
+    layer_types: tuple[str, ...]
+    mlp_layer_types: tuple[str, ...]
 
 
 def _quant_get(hf_config: Any):
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    return (
+        quant.get
+        if isinstance(quant, dict)
+        else (lambda k, d=None: getattr(quant, k, d))
+    )
 
 
 def _ignored(patterns: list[str], module_name: str) -> bool:
@@ -97,16 +101,24 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if len(mlp_layer_types) != int(text.num_hidden_layers):
         raise ValueError("mlp_layer_types must contain one entry per decoder layer")
 
-    linear_ids = tuple(i for i, kind in enumerate(layer_types) if kind == "linear_attention")
+    linear_ids = tuple(
+        i for i, kind in enumerate(layer_types) if kind == "linear_attention"
+    )
     full_ids = tuple(
         i for i, kind in enumerate(layer_types) if kind == "deepseek_sparse_attention"
     )
     unknown = set(layer_types) - {"linear_attention", "deepseek_sparse_attention"}
     if unknown:
-        raise ValueError(f"unsupported GLM-5.3 attention layer types: {sorted(unknown)}")
+        raise ValueError(
+            f"unsupported GLM-5.3 attention layer types: {sorted(unknown)}"
+        )
 
     linear = text.linear_attn_config
-    linear_get = linear.get if isinstance(linear, dict) else lambda k, d=None: getattr(linear, k, d)
+    linear_get = (
+        linear.get
+        if isinstance(linear, dict)
+        else lambda k, d=None: getattr(linear, k, d)
+    )
     qk_rope = int(getattr(text, "qk_rope_head_dim", 0) or 0)
     qk_head = int(text.qk_head_dim)
     rotary = RotaryConfig(
@@ -130,7 +142,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             key_head_dim=int(linear_get("head_dim")),
             value_head_dim=int(linear_get("head_dim")),
             conv_kernel_dim=int(linear_get("short_conv_kernel_size")),
-            output_gate="silu",
+            output_gate="sigmoid",
         ),
         FullAttentionGroupConfig(
             name="full",
@@ -144,7 +156,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
             index_ratio=int(text.index_kpool),
         ),
     )
-    expert_quant, attn_quant, dense_quant, lm_head_quant, block_size = _quant_modes(hf_config)
+    expert_quant, attn_quant, dense_quant, lm_head_quant, block_size = _quant_modes(
+        hf_config
+    )
     args = Glm5NextArgs(
         hc_mult=int(text.hc_mult),
         hc_eps=float(text.hc_eps),
@@ -185,7 +199,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         moe_intermediate_size=int(text.moe_intermediate_size),
         norm_topk_prob=bool(text.norm_topk_prob),
         model_type=str(getattr(hf_config, "model_type", "glm5_next")),
-        architectures=list(getattr(hf_config, "architectures", ["Glm5NextForConditionalGeneration"])),
+        architectures=list(
+            getattr(hf_config, "architectures", ["Glm5NextForConditionalGeneration"])
+        ),
         moe_enabled=True,
         first_k_dense_replace=int(text.first_k_dense_replace),
         n_shared_experts=int(text.n_shared_experts),

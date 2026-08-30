@@ -130,6 +130,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+    ),
 }
 
 
@@ -137,7 +141,9 @@ def get_model_spec(model_architecture: str) -> ModelSpec:
     try:
         return _MODEL_REGISTRY[model_architecture]
     except KeyError as exc:
-        raise ValueError(f"Model architecture {model_architecture} not supported") from exc
+        raise ValueError(
+            f"Model architecture {model_architecture} not supported"
+        ) from exc
 
 
 def _load_attr(module_path: str, attr_name: str) -> Any:
@@ -151,4 +157,4 @@ def get_model_class(model_architecture: str, model_config: ModelConfig):
     return model_cls(model_config)
 
 
-__all__ = ["ModelSpec", "get_model_spec", "get_model_class"]
+__all__ = ["ModelSpec", "get_model_class", "get_model_spec"]

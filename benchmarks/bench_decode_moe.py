@@ -104,6 +104,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
     p.add_argument(
+        "--disable-prefill-overlap",
+        action="store_true",
+        help="disable MoE prefill overlap (permits expert caches below 2 * num_experts)",
+    )
+    p.add_argument(
         "--greedy",
         action="store_true",
         help="force temperature 0 (ignore the checkpoint's sampling) so ids are comparable",
@@ -187,6 +192,8 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    if args.disable_prefill_overlap:
+        cmd.append("--disable-moe-prefill-overlap")
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
