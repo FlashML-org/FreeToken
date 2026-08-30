@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from benchmarks.lan223_qwen.run_api_benchmark import (
@@ -16,6 +18,7 @@ from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
 from benchmarks.lan223_qwen.run_multiturn_state_suite import nearest_rank
 from benchmarks.lan223_qwen.run_long_context_control import build_prompt
 from benchmarks.lan223_qwen.run_concurrent_api_control import parse_args as parse_concurrent_args
+from benchmarks.lan223_qwen.summarize_qwen_gguf_endurance import summarize
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -181,6 +184,49 @@ class ConcurrentControlArgumentTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             parse_concurrent_args(["--model", "qwen", "--tokenizer", "tokenizer", "--artifact", "artifact", "--concurrency", "0"])
+
+
+class QwenEnduranceSummaryTests(unittest.TestCase):
+    """Ensure retained endurance evidence cannot hide missing or swapped sessions."""
+
+    def _write_session(self, root: Path, number: int, runner_swap_kib: int = 0) -> None:
+        """Write the smallest valid passed session plus its explicit telemetry."""
+
+        sessions = root / "sessions"
+        sessions.mkdir(exist_ok=True)
+        payload = {
+            "status": "passed",
+            "results": [{"id": "remember", "status": "passed"}],
+            "tail_metrics": {"max_ttft_seconds": 0.4, "max_token_gap_seconds": 0.02},
+        }
+        (sessions / f"session-{number:02d}.json").write_text(json.dumps(payload))
+        (sessions / f"session-{number:02d}-telemetry.txt").write_text(
+            f"runner_swap_kib={runner_swap_kib}\nwhole_host_swap_kib=39088\n"
+        )
+
+    def test_summary_passes_only_complete_zero_runner_swap_evidence(self) -> None:
+        """A complete artifact can include background swap without failing the runner gate."""
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_session(root, 1)
+            summary = summarize(root, expected_sessions=1)
+
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["runner_swap_kib"]["max"], 0)
+        self.assertEqual(summary["whole_host_swap_kib"]["max"], 39088)
+
+    def test_summary_rejects_swapped_runner_or_missing_session(self) -> None:
+        """Neither runner paging nor an incomplete series may be reported as endurance-qualified."""
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_session(root, 1, runner_swap_kib=4)
+            summary = summarize(root, expected_sessions=2)
+
+        self.assertFalse(summary["passed"])
+        self.assertTrue(any("expected 2 sessions" in failure for failure in summary["failures"]))
+        self.assertTrue(any("runner swap=4" in failure for failure in summary["failures"]))
 
 
 class LlamaCppControlScriptTests(unittest.TestCase):
