@@ -80,3 +80,14 @@ def test_vast_provisioner_has_validated_fast_resume_path():
     assert '[[ -s "$model_dir/config.json" ]]' in source
     assert 'checkout_matches_expected_commit' in source
     assert 'printf \'%s\\n\' "$provision_marker_value" >"$provision_marker"' in source
+
+
+def test_deepseek_v4_vast_provisioner_sets_model_contract():
+    source = (ROOT / "scripts/vast_deepseek_v4_provision.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "deepseek-ai/DeepSeek-V4-Flash-0731" in source
+    assert "TEKIZAI_MODEL_BENCH_DTYPE" in source
+    assert "ds_fp4" in source
+    assert "TEKIZAI_SERVED_MODEL" in source
+    assert 'exec "$script_dir/vast_glm53_provision.sh"' in source
