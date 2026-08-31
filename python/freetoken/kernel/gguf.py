@@ -12,15 +12,53 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import os
 import pathlib
 import shutil
+from collections.abc import Iterator
 
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+
+
+def _rocm_gguf_build_config(extra: list[str]) -> tuple[list[str], list[str]]:
+    """Use FreeToken's ROCm arch contract and reject non-wave32 targets."""
+    from freetoken.kernel.utils import DEFAULT_ROCM_ARCHES, rocm_compile_flags
+
+    flags = rocm_compile_flags(extra)
+    targets = [
+        flag.removeprefix("--offload-arch=")
+        for flag in flags
+        if flag.startswith("--offload-arch=")
+    ]
+    unsupported = [target for target in targets if target not in DEFAULT_ROCM_ARCHES]
+    if unsupported:
+        raise RuntimeError(
+            "native GGUF kernels currently require a wave32 RDNA3/RDNA4 target; "
+            f"unsupported ROCm architecture(s): {', '.join(unsupported)}"
+        )
+    # The vendored kernels use WARP_SIZE=32 throughout. Make that choice explicit
+    # even on AMD targets that can generate either wave32 or wave64 code.
+    flags = [flag for flag in flags if not flag.startswith("--offload-arch=")]
+    return flags + ["-mno-wavefrontsize64"], targets
+
+
+@contextlib.contextmanager
+def _pytorch_rocm_arch(arches: list[str]) -> Iterator[None]:
+    """Make cpp_extension generate only FreeToken's selected ROCm targets."""
+    previous = os.environ.get("PYTORCH_ROCM_ARCH")
+    os.environ["PYTORCH_ROCM_ARCH"] = ";".join(arches)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PYTORCH_ROCM_ARCH", None)
+        else:
+            os.environ["PYTORCH_ROCM_ARCH"] = previous
 
 
 def _staged_rocm_sources() -> pathlib.Path:
@@ -82,6 +120,7 @@ def _module():
     is_rocm = getattr(torch.version, "hip", None) is not None
     extra_cuda_cflags = ["-O3"]
     extra_ldflags: list[str] = []
+    rocm_arches: list[str] = []
     if is_rocm:
         from freetoken.kernel.utils import _rocm_link_flags
 
@@ -91,6 +130,7 @@ def _module():
         # libtorch complex-number header, so the backend-neutral C++ path is
         # sufficient for HIP compilation.
         extra_cuda_cflags.append("-DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CPP")
+        extra_cuda_cflags, rocm_arches = _rocm_gguf_build_config(extra_cuda_cflags)
         csrc = _staged_rocm_sources()
     else:
         extra_cuda_cflags.append("--expt-relaxed-constexpr")
@@ -108,14 +148,16 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
-    return load(
-        name="freetoken_gguf_kernels",
-        sources=[str(csrc / "gguf_kernel.cu")],
-        extra_include_paths=[str(csrc)],
-        extra_cuda_cflags=extra_cuda_cflags,
-        extra_ldflags=extra_ldflags,
-        verbose=True,
-    )
+    build_context = _pytorch_rocm_arch(rocm_arches) if is_rocm else contextlib.nullcontext()
+    with build_context:
+        return load(
+            name="freetoken_gguf_kernels",
+            sources=[str(csrc / "gguf_kernel.cu")],
+            extra_include_paths=[str(csrc)],
+            extra_cuda_cflags=extra_cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            verbose=True,
+        )
 
 
 # ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----

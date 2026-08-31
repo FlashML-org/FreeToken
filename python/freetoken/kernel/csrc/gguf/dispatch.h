@@ -7,6 +7,11 @@
 #include <ATen/Dispatch.h>
 #include <cstdint>
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE__) && \
+    __AMDGCN_WAVEFRONT_SIZE__ != 32
+#error "FreeToken native GGUF kernels currently require an AMD wave32 target"
+#endif
+
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
