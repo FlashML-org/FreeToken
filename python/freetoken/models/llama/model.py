@@ -14,6 +14,7 @@ from .attention import LlamaAttention as LlamaAttn
 from freetoken.models.llama.gguf import is_gguf_model, convert_llama_to_gguf, parse_gguf_config
 
 from freetoken.layers.moe import make_moe_layer
+from freetoken.layers.linear import LinearReplicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -24,6 +25,9 @@ class LlamaDecoderLayer(BaseOP):
         self.self_attn = LlamaAttn(config, layer_id)       
         # build the router and the smaller experts
         if config.num_experts > 1:
+            # router
+            self.router = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False) 
+            # Smaller experts 
             self.mlp = make_moe_layer(
                 config, 
                 layer_id=layer_id, 
@@ -60,7 +64,11 @@ class LlamaDecoderLayer(BaseOP):
         
         # --- NEW ROUTING LOGIC ---  
         if getattr(self, "shared_expert", None) is not None:
-            routed_out = self.mlp.forward(x)
+            
+            # routing logits for usage of the smaller experts 
+            router_logits = self.router.forward(x)
+            routed_out = self.mlp.forward(x, router_logits=router_logits)
+                
             shared_out = self.shared_expert.forward(x)
             # adding the shareed expert and MoE expert together
             x = routed_out + shared_out
@@ -107,6 +115,7 @@ class LlamaForCausalLM(BaseLLMModel):
 
 
     def forward(self) -> torch.Tensor:
+        
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
         return logits
