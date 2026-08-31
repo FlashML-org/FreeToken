@@ -226,6 +226,32 @@ def test_layouts_readers_and_errors(tmp_path):
     )
     with pytest.raises(ValueError, match="contiguous"):
         source_from_safetensors(str(tmp_path))
+    save_file(
+        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
+         f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
+        str(tmp_path / "model.safetensors"),
+    )
+    save_file(
+        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn)},
+        str(tmp_path / "model-2.safetensors"),
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        source_from_safetensors(str(tmp_path))
+    (tmp_path / "model-2.safetensors").unlink()
+
+    # truncated checkpoint: a contiguous shard prefix passes the scan, init rejects the row count
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    args = parse_config(toy_hf_config()).qwen4_args
+    multipliers, vocab, offs = hash_constants(args)
+    rows = int(offs[-1] + vocab[-1])
+    _write_checkpoint(tmp_path, torch.zeros(rows // 2, args.ngram_head_dim, dtype=torch.uint8), 1)
+    constants = {
+        "num_ngram_heads": args.num_ngram_heads, "layer_multipliers": multipliers.tolist(),
+        "per_head_vocab_sizes": vocab.tolist(), "per_head_offsets": offs.tolist(), "eos_token_id": EOS,
+    }
+    with pytest.raises(ValueError, match="hash addresses"):
+        DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
 
 
 @requires_cuda

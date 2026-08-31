@@ -15,6 +15,7 @@ import torch
 
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.utils import init_logger
 
 from .weight import (
     _PLE_SCALE_SUFFIX,
@@ -26,6 +27,8 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
+
+logger = init_logger(__name__)
 
 
 def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
@@ -78,7 +81,10 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             if path not in path_idx:
                 path_idx[path] = len(paths)
                 paths.append(path)
-            shards[int(match.group("shard"))] = (path_idx[path], base + meta["data_offsets"][0])
+            idx = int(match.group("shard"))
+            if idx in shards:
+                raise ValueError(f"duplicate PLE shard {idx} in {path}")
+            shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
     if scale is None:
@@ -112,6 +118,13 @@ class DiskRowTable:
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
         self.eos_token_id = int(hash_constants["eos_token_id"])
+        sizes = [int(x) for x in hash_constants["per_head_vocab_sizes"]]
+        offsets = [int(x) for x in hash_constants["per_head_offsets"]]
+        need = max(o + s for o, s in zip(offsets, sizes))
+        if need > source.total_rows:
+            raise ValueError(
+                f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
+            )
         self._store = _ple_store.PleStore(
             paths=list(source.paths),
             extent_file=list(source.extent_file),
@@ -120,8 +133,8 @@ class DiskRowTable:
             row_bytes=source.row_bytes,
             row_stride=source.row_stride,
             multipliers=[int(x) for x in hash_constants["layer_multipliers"]],
-            head_vocab_sizes=[int(x) for x in hash_constants["per_head_vocab_sizes"]],
-            head_offsets=[int(x) for x in hash_constants["per_head_offsets"]],
+            head_vocab_sizes=sizes,
+            head_offsets=offsets,
             eos_token_id=self.eos_token_id,
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
@@ -144,6 +157,8 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        sync = "wait-sync" if self._wait_sync else "launch-gating"
+        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
     def _probe_wait_sync(self, mode: str) -> bool:
         from freetoken.kernel import _ple_store
@@ -186,11 +201,11 @@ class DiskRowTable:
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
                 def _complete() -> None:
-                    self._readback_event.synchronize()
-                    tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                    runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                            for r, t in zip(reqs, tokens)]
                     try:
+                        self._readback_event.synchronize()
+                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
+                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+                                for r, t in zip(reqs, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel import _ple_store
