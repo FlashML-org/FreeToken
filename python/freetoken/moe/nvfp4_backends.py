@@ -125,6 +125,11 @@ def _b12x_unusable_reason(cc: tuple[int, int]) -> str | None:
     kernel itself requires sm_120+ and a CUDA>=13 *driver* (it JIT-compiles PTX through the
     driver), so selection must check the runtime here -- not just that flashinfer imports --
     or the model loads in the b12x layout and then crashes on the first decode."""
+    from freetoken.kernel.backend import is_rocm
+
+    if is_rocm():
+        return "flashinfer b12x is CUDA-only and unavailable on ROCm"
+
     import importlib.util
 
     if cc < (12, 0):
@@ -213,6 +218,17 @@ def select_nvfp4_backend(
         raise ValueError(
             f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer or triton"
         )
+
+    from freetoken.kernel.backend import is_rocm
+
+    if is_rocm():
+        if requested in ("auto", "triton"):
+            return "triton"
+        raise RuntimeError(
+            f"--nvfp4-backend={requested} is CUDA-only and unavailable on ROCm; "
+            "use --nvfp4-backend triton (or auto)"
+        )
+
     if requested == "triton":
         return "triton"
     if activation != "silu":
