@@ -63,6 +63,13 @@ class AotModel:
     arch_aliases: tuple[str, ...] = ()
 
 
+def fp8_block_scale_pad(rows: int, cols: int) -> int:
+    """Trailing scale-bank dim padded so per-expert row bytes are 16B-aligned (fused copy)."""
+    while (rows * cols * 2) % 16:
+        cols += 1
+    return cols
+
+
 def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int) -> dict[str, int]:
     """Per-expert row bytes for each offload bank a format registers.
 
@@ -77,8 +84,6 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "fp8_block":
         # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block
         # scales, trailing scale dim 16B-padded (same helper as the loader)
-        from freetoken.moe.offload_cache import fp8_block_scale_pad
-
         B = 128
         return {
             "gate_up": 2 * I * H,

@@ -77,11 +77,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
-def fp8_block_scale_pad(rows: int, cols: int) -> int:
-    """Trailing scale-bank dim padded so per-expert row bytes are 16B-aligned (fused copy)."""
-    while (rows * cols * 2) % 16:
-        cols += 1
-    return cols
+# lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
+from freetoken.kernel.aot_models import fp8_block_scale_pad
 
 
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
