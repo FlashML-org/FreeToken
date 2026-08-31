@@ -116,7 +116,7 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
-#ifdef __HIP__
+#if FREETOKEN_USE_ROCM
     (void)use_pdl;
     m_config.numAttrs = 0;
 #else

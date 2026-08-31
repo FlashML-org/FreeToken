@@ -45,11 +45,11 @@
 #endif
 
 #ifndef cudaMallocHost
-#define cudaMallocHost hipMallocHost
+#define cudaMallocHost hipHostMalloc
 #endif
 
 #ifndef cudaFreeHost
-#define cudaFreeHost hipFreeHost
+#define cudaFreeHost hipHostFree
 #endif
 
 #ifndef cudaHostAlloc

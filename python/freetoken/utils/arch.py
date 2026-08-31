@@ -27,7 +27,10 @@ def get_rocm_gfx_arch() -> str | None:
 
     Prefer the runtime device because build variables may contain multiple
     semicolon-separated targets. Environment variables remain useful for
-    cross-compilation and systems where no GPU is currently visible.
+    cross-compilation and systems where no GPU is currently visible; in that
+    fallback mode the first target is returned. The result is process-cached
+    for FreeToken's one-process-per-GPU execution model, so callers must select
+    the intended device before the first call.
     """
     if not is_rocm():
         return None
@@ -49,20 +52,6 @@ def get_rocm_gfx_arch() -> str | None:
         if arch:
             return arch
     return None
-
-
-@functools.cache
-def is_gfx11xx_family() -> bool:
-    """True when the current AMD GPU is RDNA3 (gfx110x)."""
-    arch = get_rocm_gfx_arch()
-    return arch is not None and arch.startswith("gfx110")
-
-
-@functools.cache
-def is_gfx12xx_family() -> bool:
-    """True when the current AMD GPU is RDNA4 (gfx120x)."""
-    arch = get_rocm_gfx_arch()
-    return arch is not None and arch.startswith("gfx120")
 
 
 @functools.cache

@@ -9,8 +9,6 @@ from freetoken.utils import arch
 
 def _clear_arch_caches() -> None:
     arch.get_rocm_gfx_arch.cache_clear()
-    arch.is_gfx11xx_family.cache_clear()
-    arch.is_gfx12xx_family.cache_clear()
 
 
 def test_rocm_arch_prefers_visible_device_over_multi_arch_build_env(monkeypatch):
@@ -26,8 +24,6 @@ def test_rocm_arch_prefers_visible_device_over_multi_arch_build_env(monkeypatch)
     _clear_arch_caches()
 
     assert arch.get_rocm_gfx_arch() == "gfx1201"
-    assert arch.is_gfx12xx_family()
-    assert not arch.is_gfx11xx_family()
 
     _clear_arch_caches()
 
