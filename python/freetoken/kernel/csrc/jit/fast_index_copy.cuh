@@ -34,40 +34,64 @@ inline constexpr auto get_mem_package() {
 }
 
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+#if FREETOKEN_USE_ROCM
+    return *src;
+#else
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+#if FREETOKEN_USE_ROCM
+    return *src;
+#else
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+#if FREETOKEN_USE_ROCM
+    return *src;
+#else
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
+#endif
 }
 
 __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#if FREETOKEN_USE_ROCM
+    *dst = value;
+#else
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#if FREETOKEN_USE_ROCM
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#if FREETOKEN_USE_ROCM
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#endif
 }
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
@@ -75,7 +99,7 @@ __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
     while (atomicAdd(flag, 0) > 0) {
-#if __CUDA_ARCH__ >= 700
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 700
         __nanosleep(sleep_ns);
 #endif
         sleep_ns = sleep_ns < 2048 ? (sleep_ns << 1) : 2048;
@@ -147,7 +171,7 @@ inline bool host_ptr_identity() {
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || host_ptr_identity()) {
+    if (dev.device_type == kDLCUDA || dev.device_type == kDLROCM || host_ptr_identity()) {
         return ptr;
     }
     void* mapped = nullptr;
@@ -269,7 +293,7 @@ inline auto get_sync_flag_ptr(
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
         .with_dtype<int32_t>(flag_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
@@ -344,17 +368,17 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -363,7 +387,7 @@ struct FastIndexCopyKernel {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
                 .with_dtype<int64_t>(num_indices_dtype)
-                .with_device<kDLCUDA>(device)
+                .with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
@@ -529,14 +553,14 @@ struct MultiIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
