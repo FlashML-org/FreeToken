@@ -27,7 +27,13 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    # TODO(ROCm): NCCL -> RCCL migration for multi-GPU tensor parallelism on AMD.
+    from freetoken.kernel.backend import is_rocm
+
+    if is_rocm():
+        raise RuntimeError(
+            "PyNCCL is NVIDIA-only and cannot be loaded on ROCm; "
+            "use PyTorch distributed's RCCL-backed nccl process group"
+        )
     return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
 
 
