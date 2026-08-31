@@ -187,6 +187,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         self.assertIn('FREETOKEN_RECOVERY_SOURCE_DIR:?set FREETOKEN_RECOVERY_SOURCE_DIR', contents)
         self.assertIn('readonly SESSION_COUNT="${2:-1440}"', contents)
         self.assertIn('[[ -f "${Q4_LAUNCHER}" && -f "${Q4_BATTERY}"', contents)
+        self.assertIn('missing_listener >= 30', contents)
         self.assertIn('trap \'restore_normal_service\' EXIT INT TERM', contents)
         self.assertIn('wait_for_serving 1919 "${RECOVERY_ARTIFACT}"', contents)
         self.assertIn('wait_for_serving 1922 "${ARTIFACT_ROOT}/q4-health.json"', contents)

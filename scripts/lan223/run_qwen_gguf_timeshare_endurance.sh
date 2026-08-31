@@ -44,8 +44,20 @@ case "${INTERVAL_SECONDS}" in ''|*[!0-9]*) echo "interval must be non-negative" 
 # Poll the documented health state instead of treating a bound port or model
 # listing as proof that a cold server has loaded all expert banks.
 wait_for_serving() {
-    local port="$1" destination="$2" status maintenance
+    local port="$1" destination="$2" status maintenance missing_listener=0
     for _ in $(seq 1 900); do
+        # A launch may need a few seconds to bind the port, but a missing
+        # listener for a sustained interval means the candidate exited and the
+        # controller must enter recovery instead of waiting the full timeout.
+        if ss -ltn "( sport = :${port} )" | grep -q ":${port}"; then
+            missing_listener=0
+        else
+            missing_listener=$((missing_listener + 1))
+            if (( missing_listener >= 30 )); then
+                echo "server on port ${port} exited before readiness" >&2
+                return 1
+            fi
+        fi
         curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" >"${destination}" 2>/dev/null || true
         status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' "${destination}" 2>/dev/null || true)"
         maintenance="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("maintenance", ""))' "${destination}" 2>/dev/null || true)"
