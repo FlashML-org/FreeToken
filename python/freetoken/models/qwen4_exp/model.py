@@ -55,30 +55,6 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
     )
 
 
-def _ple_hash_constants(model_path: str) -> dict:
-    """The n-gram hash constants derived from the model config."""
-    from freetoken.models.qwen4_exp.config import parse_config
-    from freetoken.models.qwen4_exp.ple import derive_ngram_hash_constants
-    from freetoken.utils import cached_load_hf_config
-
-    mc = parse_config(cached_load_hf_config(model_path))
-    args = mc.qwen4_args
-    multipliers, sizes, offsets = derive_ngram_hash_constants(
-        vocab_size=mc.vocab_size,
-        ngram_size=args.ngram_size,
-        num_ngram_heads=args.num_ngram_heads,
-        ngram_vocab_size_base=args.ngram_vocab_size_base,
-        ple_layer_index=0,
-    )
-    return {
-        "num_ngram_heads": args.num_ngram_heads,
-        "layer_multipliers": multipliers,
-        "per_head_vocab_sizes": sizes,
-        "per_head_offsets": offsets,
-        "eos_token_id": args.ngram_boundary_token_id,
-    }
-
-
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
@@ -199,9 +175,17 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             from .ple_disk import DiskRowTable, resolve_row_source
 
             folder = download_hf_weight(engine_config.model_path)
-            constants = _ple_hash_constants(folder)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
+            emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
+            # hash with the state-dict-loaded constants, the same source the pinned path reads
+            constants = {
+                "num_ngram_heads": args.num_ngram_heads,
+                "layer_multipliers": emb.layer_multipliers.tolist(),
+                "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
+                "per_head_offsets": emb.ngram_heads_offsets.tolist(),
+                "eos_token_id": args.ngram_boundary_token_id,
+            }
             disk_table = DiskRowTable(
                 resolve_row_source(folder),
                 constants,
