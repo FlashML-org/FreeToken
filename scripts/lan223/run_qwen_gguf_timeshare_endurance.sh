@@ -36,7 +36,7 @@ case "${INTERVAL_SECONDS}" in ''|*[!0-9]*) echo "interval must be non-negative" 
 [[ ! -e "${ARTIFACT_ROOT}" ]] || { echo "artifact root already exists: ${ARTIFACT_ROOT}" >&2; exit 2; }
 [[ "${Q4_SOURCE_DIR}" == "${ROOT_DIR}/source-qwen-"* ]] || { echo "Q4 source must be under ${ROOT_DIR}" >&2; exit 2; }
 [[ "${RECOVERY_SOURCE_DIR}" == "${ROOT_DIR}/source-qwen-"* ]] || { echo "recovery source must be under ${ROOT_DIR}" >&2; exit 2; }
-[[ -x "${Q4_LAUNCHER}" && -x "${Q4_BATTERY}" && -x "${RECOVERY_STOPPER}" && -x "${RECOVERY_STARTER}" ]] || {
+[[ -f "${Q4_LAUNCHER}" && -f "${Q4_BATTERY}" && -f "${RECOVERY_STOPPER}" && -f "${RECOVERY_STARTER}" ]] || {
     echo "missing time-share dependency" >&2
     exit 2
 }
