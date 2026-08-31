@@ -1,0 +1,52 @@
+# ROCm unit-tests gate. Per plan (rocm-perf-parity/Inc 1): the unit suite must stay
+# green on AMD hardware too — the box that serves gfx1100 is the only honest runner.
+#
+# This job runs on the self-hosted ROCm node, which is an ALWAYS-ON dev box: keep it
+# manual (workflow_dispatch) and off-hours so it never contends with local dev or
+# benchmark runs. It consumes whatever venv the runner has at .venv-rocm.
+# There is deliberately NO pull_request trigger; fork code must never reach the
+# self-hosted node (same policy as nightly-wheels.yml).
+
+name: Unit tests (ROCm, self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: "Also run the bench_decode_moe smoke after the suite"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-rocm
+  cancel-in-progress: false
+
+jobs:
+  rocm-unit:
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show ROCm environment
+        run: |
+          .venv-rocm/bin/python -c "import torch; print(torch.__version__, torch.version.hip)"
+          rocm-smi | head -8
+
+      - name: Unit suite
+        run: |
+          PYTHONPATH=python .venv-rocm/bin/python -m pytest tests/ -m "not slow" -q \
+            2>&1 | tail -60
+
+      - name: Optional bench smoke
+        if: ${{ inputs.run_bench }}
+        run: |
+          PYTHONPATH=python .venv-rocm/bin/python benchmarks/bench_decode_moe.py \
+            --model "${FREETOKEN_BENCH_MODEL:-/home/smk/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}" \
+            --backend offload --json /tmp/ft-rocm-ci-bench.jsonl 2>&1 | tail -20
+        continue-on-error: true

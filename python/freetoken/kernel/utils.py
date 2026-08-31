@@ -108,8 +108,14 @@ def _version_parts(version: str) -> Tuple[str, List[str]]:
 
 def _build_stamps(local_segments: List[str]) -> List[str]:
     """The `g<sha>` commit-stamp tokens of a local version segment list
-    (``["cu130", "g3f01615"]`` -> ``["g3f01615"]``)."""
-    return [s for s in local_segments if s.startswith("g")]
+    (``["cu130", "g3f01615"]`` -> ``["g3f01615"]``).
+
+    Only genuine build stamps count: ``g`` followed by 7..40 hex chars (the
+    pre-ROCm regex). A bare ``startswith("g")`` would promote arbitrary local
+    segments like ``gabcdefgh`` (non-hex letters) to stamps and wrongly reject a
+    dev build paired with a stamped one (tests/kernels/test_kernel_cache_version.py
+    pins this case)."""
+    return [s for s in local_segments if re.fullmatch(r"g[0-9a-f]{7,40}", s)]
 
 
 def _arch_tags(local_segments: List[str]) -> List[str]:

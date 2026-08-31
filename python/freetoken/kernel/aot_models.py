@@ -89,6 +89,11 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
+    if fmt == "gguf":
+        # qwen3_5_moe/gguf.py iter_gguf_weights: gate_up stays native Q4_K
+        # (row_bytes(H, Q4_K) = H//256*144), down re-quantized to Q8_0
+        # (row_bytes(I, Q8_0) = I//32*34); matches moe/offload_cache.py "gguf".
+        return {"gate_up": 2 * I * (H // 256 * 144), "down": H * (I // 32 * 34)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
@@ -176,6 +181,21 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("fp8_block",),
+    ),
+    AotModel(
+        name="Qwen/Qwen3.6-35B-A3B-GGUF",
+        # GGUF (native Q4_K/Q5_K/Q6_K/Q8_0) variant of the 3.5/3.6-35B-A3B hybrid: same
+        # model classes, different register key + config/weight loaders. Q4_K gate_up +
+        # down re-quantized to Q8_0 (moe/offload_cache.py "gguf" schema). GGUF embeddings
+        # bypass the index kernel (module docstring), so no embedding indexing spec.
+        architecture="Qwen3_5MoeForConditionalGeneration",
+        hidden_size=2048,
+        kv_groups=((2, 256),),
+        top_k=8,
+        moe_intermediate_size=512,
+        expert_formats=("gguf",),
+        embed_indexing=False,
+        arch_aliases=("Qwen35moeGGUFForCausalLM",),
     ),
     AotModel(
         name="nvidia/Qwen3.6-35B-A3B-NVFP4",

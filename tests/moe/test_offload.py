@@ -447,6 +447,15 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     from freetoken.core import Context, Req, get_global_ctx
     from freetoken.engine.graph import GraphRunner
 
+    # This test asserts the capture bookkeeping contract in isolation. The ROCm gate
+    # (graph_capture_status) reads the real host and would return "fail" on an AMD box,
+    # skipping capture entirely; capture-path coverage lives with CUDA-graph machinery,
+    # so pin the gate to pass like the other NVIDIA-env fakes in this suite.
+    import freetoken.utils.graph_gate as graph_gate
+
+    monkeypatch.setattr(graph_gate, "graph_capture_status", lambda: "pass")
+    monkeypatch.setattr(graph_gate, "graph_capture_env", lambda: {}, raising=False)
+
     events = []
     _init_tp()
     monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))

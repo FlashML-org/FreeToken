@@ -207,8 +207,10 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     # explicit --attention-backend choices.
     for part in backend_parts:
         info = attention_backend_info(part)
-        from freetoken.utils.arch import is_rocm
 
+        # Module-level is_rocm (deliberately not re-imported locally): one reference for
+        # gating, so patching engine.is_rocm covers config-time validation exactly as it
+        # covers _backend_requirements_met.
         if is_rocm() and (info.requires_flashinfer or info.requires_sgl_kernel or info.requires_sm100):
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} is NVIDIA-only and "

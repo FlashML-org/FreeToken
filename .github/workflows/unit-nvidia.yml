@@ -1,0 +1,69 @@
+# NVIDIA unit-tests gate: compile the CUDA sources (catches USE_HIP/USE_ROCM-gated
+# refactors that break the CUDA build) and run the test suite on a hosted runner.
+#
+# The runner has no GPU: cu126 torch installs fine, GPU tests self-skip, and the unit
+# suite asserts the CUDA-path *logic* (gating, dispatch, version pairing) which is
+# exactly what a HIP port can silently drift. Compile failures surface here.
+#
+# Trigger policy follows nightly-wheels.yml: only trusted paths for expensive builds.
+# fork PRs cannot run the CUDA install (they can: hosted runner, no secrets). Keep
+# pull_request restricted to code paths; everything else is workflow_dispatch.
+
+name: Unit tests (NVIDIA)
+
+on:
+  pull_request:
+    paths:
+      - "python/**"
+      - "tests/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/unit-nvidia.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-nvidia-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-compile-and-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # torch's CUDA wheel brings its own cudart headers; nvcc from the same toolkit
+      # major compiles the _pinned_tensor / gguf extensions against them.
+      TORCH_CUDA_VERSION: "126"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA toolkit (nvcc)
+        uses: js-data/add-cuda-toolkit@v1.1.0
+        with:
+          cuda-version: "12.6"
+
+      - name: Install pytest (uv is preinstalled on hosted runners)
+        run: uv pip install --system pytest
+
+      - name: Compile CUDA extensions (nvcc gate)
+        run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
+          uv pip install --system -e . --no-build-isolation
+
+      - name: Run unit suite (GPU tests self-skip)
+        run: |
+          python -m pytest tests/ -m "not slow" -q -x \
+            --ignore=tests/e2e --ignore=tests/dsv4 2>&1 | tail -40
+
+      - name: Summarize
+        if: always()
+        run: echo "CUDA-compile + unit gate finished; see the step log for failures."

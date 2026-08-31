@@ -64,9 +64,21 @@ def _load_nvfp4(rocm: bool):
 
 @pytest.fixture(autouse=True)
 def _clean():
+    # Snapshot-restore, NOT pop: see tests/kernels/test_backend_rocm.py — popping these
+    # names after replacing the real freetoken package leaves its already-imported
+    # submodules cached with a dangling parent module, cascading AttributeError/
+    # ImportError into unrelated tests for the rest of the session.
+    saved = {
+        key: mod
+        for key, mod in sys.modules.items()
+        if key == "freetoken" or key.startswith("freetoken.")
+    }
     yield
-    for name in ("freetoken", "freetoken.utils", "freetoken.utils.arch"):
-        sys.modules.pop(name, None)
+    for key in [k for k in sys.modules if k == "freetoken" or k.startswith("freetoken.")]:
+        if key in saved and saved[key] is not None:
+            sys.modules[key] = saved[key]
+        else:
+            sys.modules.pop(key, None)
 
 
 def test_rocm_auto_resolves_triton():

@@ -42,9 +42,23 @@ def _load_backend(rocm: bool):
 
 @pytest.fixture(autouse=True)
 def _clean_sys_modules():
+    # Snapshot-restore, NOT pop: when the real freetoken package was already imported
+    # earlier in the session, popping the 4 fake names leaves the real submodules
+    # (freetoken.attention, freetoken.kernel.pinned, ...) cached with a dangling parent,
+    # so every later `getattr(freetoken, "attention")` / `import freetoken.kernel.pinned`
+    # in unrelated tests raises AttributeError/ImportError. Restoring the exact pre-test
+    # snapshot (and only creating entries we removed) keeps the session clean.
+    saved = {
+        key: mod
+        for key, mod in sys.modules.items()
+        if key == "freetoken" or key.startswith("freetoken.") or key == "torch"
+    }
     yield
-    for name in ("freetoken", "freetoken.utils", "freetoken.utils.arch", "freetoken.kernel"):
-        sys.modules.pop(name, None)
+    for key in [k for k in sys.modules if k == "freetoken" or k.startswith("freetoken.")]:
+        if key in saved and saved[key] is not None:
+            sys.modules[key] = saved[key]
+        else:
+            sys.modules.pop(key, None)
 
 
 def test_rocm_native_packages_unavailable():
