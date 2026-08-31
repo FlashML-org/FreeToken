@@ -50,7 +50,7 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     return flags
 
 
-def _hip_cflags(extra: List[str]) -> List[str]:
+def rocm_compile_flags(extra: List[str]) -> List[str]:
     """HIP flags for a kernel build on ROCm."""
     # TODO(ROCm): Triton autotune configs need RDNA-specific tuning (wave count, LDS size).
     flags = DEFAULT_HIP_CFLAGS + extra
@@ -289,7 +289,7 @@ def load_aot(
     cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
 
     if _is_rocm():
-        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        cuda_cflags = rocm_compile_flags(extra_cuda_cflags)
         runtime_ldflags = _rocm_link_flags()
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags)
@@ -351,7 +351,7 @@ def load_jit(
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
     if _is_rocm():
-        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        cuda_cflags = rocm_compile_flags(extra_cuda_cflags)
         runtime_ldflags = _rocm_link_flags()
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags)

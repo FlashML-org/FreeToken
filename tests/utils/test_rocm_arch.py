@@ -39,12 +39,12 @@ def test_rocm_arch_falls_back_to_cross_compile_env(monkeypatch):
     _clear_arch_caches()
 
 
-def test_hip_cflags_emit_one_offload_flag_per_arch(monkeypatch):
-    from freetoken.kernel.utils import _hip_cflags
+def test_rocm_compile_flags_emit_one_offload_flag_per_arch(monkeypatch):
+    from freetoken.kernel.utils import rocm_compile_flags
 
     monkeypatch.setenv("FREETOKEN_ROCM_ARCH", "gfx1200;gfx1201")
 
-    flags = _hip_cflags(["-Wno-unused-command-line-argument"])
+    flags = rocm_compile_flags(["-Wno-unused-command-line-argument"])
 
     assert "--offload-arch=gfx1200" in flags
     assert "--offload-arch=gfx1201" in flags
