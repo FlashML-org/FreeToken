@@ -25,6 +25,8 @@ import torch
 
 from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter, layer_bank_entry_name
 
+_AUXILIARY_DIR = "auxiliary"
+
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
 # FREETOKEN_CONVERT_PROGRESS=1 so plain CLI use isn't spammed; the human tqdm bars stay on
@@ -160,6 +162,29 @@ class _ConvertSink:
         return len(self._seen)
 
 
+def _write_auxiliary_ftw(out_dir: str, banks, *, shard_limit: int) -> dict:
+    sources = banks.auxiliary_sources
+    if sources is None:
+        return {}
+    layer_ids = list(banks.auxiliary_layer_ids)
+    if not banks.auxiliary_quant_format or not layer_ids:
+        raise ValueError("auxiliary expert banks require a quant format and layer mapping")
+    writer = FTWWriter(os.path.join(out_dir, _AUXILIARY_DIR), shard_limit=shard_limit)
+    count = 0
+    for name, per_layer in sources.items():
+        if len(per_layer) != len(layer_ids):
+            raise ValueError(f"auxiliary bank {name!r} has {len(per_layer)} layers, expected {len(layer_ids)}")
+        for layer_id, tensor in enumerate(per_layer):
+            writer.add_tensor(layer_bank_entry_name(name, layer_id), tensor, kind="experts_bank")
+            count += 1
+    writer.finalize({
+        "quant_format": banks.auxiliary_quant_format,
+        "expert_bank_num_layers": len(layer_ids),
+        "counts": {"weight": 0, "experts_bank": count},
+    })
+    return {"auxiliary_checkpoint": _AUXILIARY_DIR, "auxiliary_layer_ids": layer_ids}
+
+
 def convert_checkpoint(
     model_path: str,
     out_dir: str,
@@ -204,6 +229,7 @@ def convert_checkpoint(
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = 0
+    auxiliary_meta = {}
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -273,6 +299,7 @@ def convert_checkpoint(
                 n_bank += name not in ("gate_up_alpha", "down_alpha")
                 n_alpha += name in ("gate_up_alpha", "down_alpha")
             bar.close()
+        auxiliary_meta = _write_auxiliary_ftw(out_dir, banks, shard_limit=shard_limit)
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
@@ -297,6 +324,7 @@ def convert_checkpoint(
         "expert_bank_num_layers": num_layers,
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
+        **auxiliary_meta,
     })
     return index
 
