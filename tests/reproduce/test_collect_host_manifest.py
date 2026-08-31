@@ -22,6 +22,8 @@ class CollectHostManifestTests(unittest.TestCase):
 
     def test_default_manifest_redacts_hostname_and_omits_sensitive_inventory(self) -> None:
         self.assertIn('PUBLIC_HOSTNAME="redacted"', self.script)
+        self.assertNotIn("uname -a", self.script)
+        self.assertIn('printf \'kernel_system=%s\\n\'', self.script)
         self.assertNotIn("ps -eo", self.script)
         self.assertNotIn("lsblk -o NAME,MODEL,SERIAL", self.script)
 

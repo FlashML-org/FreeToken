@@ -125,7 +125,14 @@ fi
 {
     printf 'captured_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'hostname=%s\n' "${PUBLIC_HOSTNAME}"
-    uname -a
+    # Do not use `uname -a`: its second field is the local host name and would
+    # defeat the redacted default. These explicit fields preserve the useful
+    # operating-system, kernel, and architecture facts without identifying the
+    # machine that produced a public reproducibility bundle.
+    printf 'kernel_system=%s\n' "$(uname -s)"
+    printf 'kernel_release=%s\n' "$(uname -r)"
+    printf 'kernel_version=%s\n' "$(uname -v)"
+    printf 'machine_architecture=%s\n' "$(uname -m)"
     test -r /etc/os-release && cat /etc/os-release
     command -v lscpu >/dev/null 2>&1 && lscpu || true
 } >"${ARTIFACT_DIR}/system.txt"
