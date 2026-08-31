@@ -422,7 +422,8 @@ def aggregate_fast_index_copy_feature_sizes() -> tuple[int, ...]:
     sizes: set[int] = set(TEST_FEATURE_SIZES)
     for model in SUPPORTED_MODELS:
         sizes.update(fast_index_copy_feature_sizes(model))
-    return tuple(sorted(sizes))
+    # the per-bank kernel copies rows in fixed 128-byte steps; other sizes cannot compile
+    return tuple(sorted(size for size in sizes if size % 128 == 0))
 
 
 __all__ = [
