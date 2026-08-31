@@ -140,7 +140,28 @@ def iter_gguf_weights(
         elif suffix == "ffn_up.weight":
             gate_up_buf.setdefault(layer, {})["up"] = t.packed()
             
-        # 3. Trigger Fusion
+    # MoE and Shared Expert Tensors 
+        # The Router Gate
+        elif suffix == "ffn_gate_inp.weight":
+            yield f"{base}.router.weight", t.packed()
+        
+        # Shared Expert (shexp)
+        elif suffix == "ffn_down_shexp.weight":
+            yield f"{base}.shared_expert.down_proj.qweight", t.packed()
+        elif suffix == "ffn_gate_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["gate_shexp"] = t.packed()
+        elif suffix == "ffn_up_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["up_shexp"] = t.packed()
+            
+        # Routed Experts (exps)
+        elif suffix == "ffn_down_exps.weight":
+            yield f"{base}.mlp.down_proj.qweight", t.packed()
+        elif suffix == "ffn_gate_exps.weight":
+            gate_up_buf.setdefault(layer, {})["gate_exps"] = t.packed()
+        elif suffix == "ffn_up_exps.weight":
+            gate_up_buf.setdefault(layer, {})["up_exps"] = t.packed()
+            
+        # Trigger Fusion
         slots = qkv_buf.get(layer)
         if slots and "q" in slots and "k" in slots and "v" in slots:
             yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
@@ -149,11 +170,27 @@ def iter_gguf_weights(
             del qkv_buf[layer]
             
         gu = gate_up_buf.get(layer)
-        if gu and "gate" in gu and "up" in gu:
-            yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
-                [gu["gate"], gu["up"]], dim=0
-            )
-            del gate_up_buf[layer]
+        if gu:
+            if "gate" in gu and "up" in gu:
+                yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
+                    [gu["gate"], gu["up"]], dim=0
+                )
+                del gu["gate"]
+                del gu["up"]
+                
+            if "gate_shexp" in gu and "up_shexp" in gu:
+                yield f"{base}.shared_expert.gate_up_proj.qweight", torch.cat(
+                    [gu["gate_shexp"], gu["up_shexp"]], dim=0
+                )
+                del gu["gate_shexp"]
+                del gu["up_shexp"]
+                
+            if "gate_exps" in gu and "up_exps" in gu:
+                yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
+                    [gu["gate_exps"], gu["up_exps"]], dim=0
+                )
+                del gu["gate_exps"]
+                del gu["up_exps"]
 
 def convert_llama_to_gguf(model, config) -> None:
     """Convert a FreeToken Llama model to GGUF format in-place.
