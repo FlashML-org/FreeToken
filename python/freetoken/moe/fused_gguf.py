@@ -38,11 +38,17 @@ def fused_experts_gguf(
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
 
-    gate_up = ggml_moe_a8_vec(
-        hidden_states, gate_up_q, topk_ids, top_k, int(GGML_Q4_K), n2, num_tokens
-    )
+    # "moe_gate_up" / "moe_down" record_function labels = the profiler-segmented
+    # expert-GEMM halves of the fused MoE forward (Inc 2, .plans/rocm-perf-parity).
+    with torch.profiler.record_function("moe_gate_up"):
+        gate_up = ggml_moe_a8_vec(
+            hidden_states, gate_up_q, topk_ids, top_k, int(GGML_Q4_K), n2, num_tokens
+        )
     inter = act_fn(gate_up)
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(GGML_Q8_0), h, num_tokens * top_k)
+    with torch.profiler.record_function("moe_down"):
+        out = ggml_moe_a8_vec(
+            inter, down_q, topk_ids, 1, int(GGML_Q8_0), h, num_tokens * top_k
+        )
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )

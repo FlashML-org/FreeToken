@@ -16,6 +16,8 @@ import functools
 import os
 import pathlib
 import shutil
+import subprocess
+import time
 
 import torch
 
@@ -47,6 +49,55 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
+# A JIT-rebuild lock older than this is stale even while its owner lives: no honest
+# rebuild of one extension takes hours (the slowest measured gguf_kernel build is
+# ~13 min on the gfx1100 box).
+_STALE_JIT_LOCK_AGE_S = 3 * 3600
+
+
+def _clear_stale_jit_lock(module_name: str) -> None:
+    """Remove a torch-extension ``lock`` whose owner died.
+
+    torch's ``FileBaton`` waits forever when a previous compile was ``kill -9``-ed
+    mid-rebuild (observed: every later serve hung in warmup at
+    ``cpp_extension.py _jit_compile -> wait``; the lock file has no owner pid and
+    no fd is held on it, so there is nothing to poll). Guard on BOTH the age and
+    the absence of a live freetoken serve/worker process, so a legitimately
+    concurrent rebuild is never clobbered.
+    """
+    try:
+        build_dir = pathlib.Path(
+            torch.utils.cpp_extension._get_build_directory(module_name, False)
+        )
+        lock = build_dir / "lock"
+        if not lock.exists():
+            return
+        age = time.time() - lock.stat().st_mtime
+        if age < _STALE_JIT_LOCK_AGE_S:
+            return
+        if _freetoken_processes_running():
+            # Without the age check a mid-compile server would be clobbered; with it,
+            # anything left after hours while no freetoken process lives is the corpse
+            # of a killed run.
+            return
+        lock.unlink()
+    except Exception:  # noqa: BLE001 - hygiene must never break the build path
+        pass
+
+
+def _freetoken_processes_running() -> bool:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", r"freetoke[n].cli serve|multiprocessing.s[p]awn"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return True  # cannot tell -> assume a live owner
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
@@ -77,6 +128,7 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
+    _clear_stale_jit_lock("freetoken_gguf_kernels")
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],

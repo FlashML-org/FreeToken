@@ -167,7 +167,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             assert metadata.attn_logits is not None
             assert metadata.attn_lse is not None
             assert metadata.num_kv_splits is not None
-            return decode_paged_attention(
+            # "attn" record_function label = the profiler-segmented attention stage
+            # of the decode step (Inc 2, .plans/rocm-perf-parity). The prefill/extend
+            # branch below stays unlabeled (its stage shows via kernel names).
+            with torch.profiler.record_function("attn"):
+                return decode_paged_attention(
                 q=q,
                 k_cache=k_cache,
                 v_cache=v_cache,

@@ -171,12 +171,16 @@ class MoELayer(BaseOP):
         if self.weight_format != "bf16":
             # Quantized resident experts: generic softmax router + format kernel.
             # The bf16 path below stays on ctx.moe_backend byte-for-byte.
-            topk_weights, topk_ids = fused_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=self.top_k,
-                renormalize=self.renormalize,
-            )
+            # "moe_router" record_function label = the profiler-segmented router stage
+            # (Inc 2, .plans/rocm-perf-parity); a range object costs ~1µs and keeps the
+            # name visible in torch.profiler tables on both backends.
+            with torch.profiler.record_function("moe_router"):
+                topk_weights, topk_ids = fused_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=self.top_k,
+                    renormalize=self.renormalize,
+                )
             return self._maybe_all_reduce(
                 self._resident_gemm(hidden_states, topk_weights, topk_ids)
             )
