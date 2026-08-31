@@ -307,7 +307,13 @@ tests/benchmarks/test_lan223_qwen_benchmark.py
 
 ## Remaining work
 
-1. The quantization-equivalent Qwen control is now complete. The exact Q4_K_M comparison is close but FreeToken remains 1.39 percent below llama.cpp in the fixed single-request decode workload. Any claim to meet or exceed llama.cpp needs a new retained optimization and a fresh matched requalification.
+1. The quantization-equivalent Qwen control is now complete. The recommended
+   stable recovery profile is 1.78 percent below llama.cpp in the fixed
+   single-request decode workload. The higher-cache profile measured 1.39
+   percent below its separately fresh llama.cpp control, but is not a
+   recommended configuration because its SVM-resident-memory failure remains
+   unresolved. Any claim to meet or exceed llama.cpp needs a retained
+   optimization and a fresh matched requalification.
 2. Continue kernel-level decode work only from profiler evidence. Existing cache-capacity, graph, copy-grid, DPM-policy, and several dense and NVFP4 kernel candidates did not produce a quality-preserving end-to-end gain. Candidate work must preserve the API, vision, quality, long-context, and endurance gates in this report.
 3. The one-hour process-scoped wall-clock endurance workload is complete and qualified. Consider a longer all-day workload only if deployment requires evidence beyond this explicit one-hour qualification.
 4. Package sanitized build manifests and selected raw artifacts for the fork and upstream pull request. Do not publish local model files, private host paths, or operational access information.
