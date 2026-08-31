@@ -234,3 +234,6 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Rendered PDF review images are local QA intermediates, never release inputs.
+/tmp/

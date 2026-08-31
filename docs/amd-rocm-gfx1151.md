@@ -7,7 +7,7 @@ the AMD Ryzen AI Max+ 395 with Radeon 8060S (`gfx1151`).  The port preserves
 the NVIDIA implementation as a separate runtime path.  It does not use Vulkan
 or a CPU-only runner as a substitute for native GPU execution.
 
-The intended first deployment host is LAN-223.  It serves the same local API
+The evaluated deployment system serves the same local API
 surface as upstream FreeToken, including OpenAI-compatible endpoints, while
 using HIP-compiled extensions and AMD Triton kernels.
 
@@ -25,7 +25,7 @@ initial full-model validation set is:
 The project records correctness, stability, API behavior, GPU memory, host
 memory, prefill throughput, decode throughput, TTFT, temperature, clocks, and
 throttling.  NVIDIA GPU tokens per second are context, not an AMD acceptance
-threshold: LAN-223 uses a shared-memory APU rather than discrete VRAM and
+threshold: the evaluated platform uses a shared-memory APU rather than discrete VRAM and
 PCIe.
 
 ## What this branch changes
@@ -47,13 +47,13 @@ behavior stays unchanged.
   This matters because PyTorch presents HIP devices under `torch.cuda` for
   compatibility, and `gfx1151` must never be interpreted as a new NVIDIA SM.
 
-## Clean LAN-223 installation
+## Clean installation
 
 Do not install into system Python, an existing llama.cpp environment, or the
 existing vLLM environment.  The reference layout is intentionally isolated:
 
 ```text
-/home/david/freetoken-amd/
+$PROJECT_ROOT/
   source/       this Git checkout
   .venv/        Python 3.12, ROCm PyTorch, AMD Triton, FreeToken
   artifacts/    commands, environment manifests, tests, logs, telemetry
@@ -61,7 +61,7 @@ existing vLLM environment.  The reference layout is intentionally isolated:
 ```
 
 The exact PyTorch ROCm wheel must be selected after validating its compatible
-Triton build on LAN-223.  FreeToken's upstream CUDA package set must not be
+Triton build on the target system.  FreeToken's upstream CUDA package set must not be
 installed on AMD: `flashinfer`, `sglang-kernel`, CUDA-indexed Torch wheels, and
 the CUDA kernel-cache wheel are NVIDIA binaries.
 
@@ -88,7 +88,7 @@ portable installation-specific location, set this before every `ft serve`
 launch and keep the directory across reboots and service restarts:
 
 ```bash
-export TORCH_EXTENSIONS_DIR=/home/david/freetoken-amd/cache/torch_extensions
+export TORCH_EXTENSIONS_DIR="$PROJECT_ROOT/cache/torch_extensions"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 ```
 
@@ -107,7 +107,7 @@ that development step is not part of normal operation.
 4. Run Qwen3.6-35B-A3B through `ft serve` on a non-conflicting local port.
 5. Test `/v1/models`, non-streaming `/v1/chat/completions`, and streamed
    `/v1/chat/completions` with fixed requests.
-6. Run `ft bench bw` on LAN-223.  Treat its recommendation as a measured
+6. Run `ft bench bw` on the target system.  Treat its recommendation as a measured
    candidate, then verify it with full serving workloads.
 7. Repeat the same API and stability checks for the supported Gemma 4 MoE
    GGUF.
@@ -124,10 +124,10 @@ This branch incorporates the focused current-main ROCm work from FreeToken
 pull request #241, preserving its commits and authorship.  It adds explicit
 `gfx1151` safety coverage and project-specific validation documentation.
 Upstream review should receive a focused pull request containing code plus
-tests.  LAN-223 environment reports and benchmark artifacts belong in this
+tests.  Evaluated-system environment reports and benchmark artifacts belong in this
 fork unless the upstream maintainers request them.
 
-The completed 2026-08-28 native HIP validation, exact LAN-223 environment,
+The completed 2026-08-28 native HIP validation, exact evaluated-system environment,
 API evidence, command shapes, and known limitations are documented in
 [`lan223-rocm-validation-2026-08-28.md`](lan223-rocm-validation-2026-08-28.md).
 The post-repair Gemma vision, Qwen API, matched runner, and clean-memory
@@ -136,7 +136,7 @@ endurance evidence is documented separately in
 
 ## Public reproduction interface
 
-The LAN-223 scripts intentionally preserve a local protected service and use
+The original host-specific scripts intentionally preserve a local protected service and use
 host-specific model locations. They are not the public entry point. Independent
 users should begin with [`reproducibility.md`](reproducibility.md) and its
 parameterized `scripts/reproduce/collect_host_manifest.sh` collector. The

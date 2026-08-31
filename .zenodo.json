@@ -1,0 +1,22 @@
+{
+  "title": "FreeToken AMD ROCm/HIP Port for Strix Halo",
+  "description": "Technical white paper and reproducibility package for a native ROCm/HIP port of FreeToken on AMD Strix Halo. Includes gfx1151 validation, controlled benchmark methodology, and portable artifact tooling. This release candidate does not claim strict replication of the upstream NVIDIA result or general AMD superiority.",
+  "creators": [
+    {
+      "name": "Bourdeau, David"
+    }
+  ],
+  "version": "0.1.0-rc1",
+  "license": "Apache-2.0",
+  "keywords": [
+    "AMD ROCm",
+    "HIP",
+    "Strix Halo",
+    "Radeon 8060S",
+    "Mixture of Experts",
+    "LLM serving",
+    "reproducibility"
+  ],
+  "upload_type": "software",
+  "access_right": "open"
+}
