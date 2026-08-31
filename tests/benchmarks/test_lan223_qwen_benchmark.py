@@ -176,6 +176,20 @@ class QwenRecoveryContextTests(unittest.TestCase):
         self.assertIn('[[ "${pgid}" == "${pid}" ]]', contents)
         self.assertIn('kill -TERM -- "-${pgid}"', contents)
 
+    def test_timeshare_endurance_requires_explicit_sources_and_health_recovery(self) -> None:
+        """The extended Q4 battery must fail closed and restore the protected service."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        controller = repository_root / "scripts" / "lan223" / "run_qwen_gguf_timeshare_endurance.sh"
+        contents = controller.read_text(encoding="utf-8")
+
+        self.assertIn('FREETOKEN_Q4_SOURCE_DIR:?set FREETOKEN_Q4_SOURCE_DIR', contents)
+        self.assertIn('FREETOKEN_RECOVERY_SOURCE_DIR:?set FREETOKEN_RECOVERY_SOURCE_DIR', contents)
+        self.assertIn('readonly SESSION_COUNT="${2:-1440}"', contents)
+        self.assertIn('trap \'restore_normal_service\' EXIT INT TERM', contents)
+        self.assertIn('wait_for_serving 1919 "${RECOVERY_ARTIFACT}"', contents)
+        self.assertIn('wait_for_serving 1922 "${ARTIFACT_ROOT}/q4-health.json"', contents)
+
     def test_multiturn_battery_requires_swap_free_preflight(self) -> None:
         """Repeated state tests must not begin from a swapped memory condition."""
 
