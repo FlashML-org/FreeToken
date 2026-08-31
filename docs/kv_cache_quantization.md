@@ -59,9 +59,16 @@ throughput.
   and a safe bet; near-bf16 precision, 47% memory savings over bf16.
 - **Need maximum context** (long documents, full-book Q&A): `q4_0`
   gives 3.5x the bf16 context on the same VRAM, at the cost of
-  ~9% kernel rel_err. Empirically: GSM8K-CoT 97.3% (no loss), MMLU
-  90.8% (no loss), GPQA Diamond 73.2% (Q4 vs bf16 89.2%: -16pp
-  on hard reasoning).
+  ~9% kernel rel_err. Retrieval is unaffected (needle-in-haystack
+  passes at 8K through 220K), but multi-step chain-of-thought
+  degrades measurably: on a six-scheme same-protocol ladder
+  (GSM8K-CoT 8-shot greedy, n=150), q4_0 scored 0.83-0.85 vs
+  0.96-0.97 for q6_0/q8_0/nvfp4 at the same bytes/element and
+  0.95 for the 0.39-byte LM-codebook q3_lm -- the 4-bit amax
+  scale combination is the outlier. Pick `q4_0` when context
+  capacity is the goal and your workload is retrieval-shaped;
+  prefer `nvfp4` (same bytes, no CoT loss) or `q6_0` when
+  reasoning quality matters.
 - **Precision-first sub-byte**: `q6_0` is between Q4 and Q8: ~4x
   better kernel precision than Q4, 24% more bytes. Use when Q4
   loses too much on your workload and Q8's context window is
