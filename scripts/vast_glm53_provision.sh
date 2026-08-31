@@ -158,7 +158,7 @@ fi
 uv pip install --python "$freetoken_dir/.venv/bin/python" -e "$freetoken_dir[accel]"
 
 wait "$model_download_pid"
-if [[ "$convert_ftw" == "1" ]] && [[ ! -s "$model_dir/freetoken.index.json" ]]; then
+if [[ "$convert_ftw" == "1" ]] && [[ ! -s "$model_dir/freetoken_weight.json" ]]; then
   echo "FREETOKEN_PROVISION_STAGE=ftw_conversion"
   rm -rf "$model_dir"
   FREETOKEN_SKIP_BANK_PIN=1 \
