@@ -16,7 +16,6 @@ import functools
 import os
 import pathlib
 import shutil
-import subprocess
 import time
 
 import torch
@@ -62,9 +61,12 @@ def _clear_stale_jit_lock(module_name: str) -> None:
     torch's ``FileBaton`` waits forever when a previous compile was ``kill -9``-ed
     mid-rebuild (observed: every later serve hung in warmup at
     ``cpp_extension.py _jit_compile -> wait``; the lock file has no owner pid and
-    no fd is held on it, so there is nothing to poll). Guard on BOTH the age and
-    the absence of a live freetoken serve/worker process, so a legitimately
-    concurrent rebuild is never clobbered.
+    no fd is held on it, so there is nothing to poll). Only the lock's age can
+    distinguish stale from live: a live rebuild's lock is minutes old; no honest
+    build of one extension takes hours (slowest measured gguf_kernel build ~13 min
+    on the gfx1100 box), so _STALE_JIT_LOCK_AGE_S (3 h) is the staleness bar. A
+    freshly-created lock is never touched, so a genuinely concurrent rebuild is
+    not clobbered.
     """
     try:
         build_dir = pathlib.Path(
@@ -76,28 +78,9 @@ def _clear_stale_jit_lock(module_name: str) -> None:
         age = time.time() - lock.stat().st_mtime
         if age < _STALE_JIT_LOCK_AGE_S:
             return
-        if _freetoken_processes_running():
-            # Without the age check a mid-compile server would be clobbered; with it,
-            # anything left after hours while no freetoken process lives is the corpse
-            # of a killed run.
-            return
         lock.unlink()
     except Exception:  # noqa: BLE001 - hygiene must never break the build path
         pass
-
-
-def _freetoken_processes_running() -> bool:
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", r"freetoke[n].cli serve|multiprocessing.s[p]awn"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return bool(out.stdout.strip())
-    except Exception:  # noqa: BLE001
-        return True  # cannot tell -> assume a live owner
-
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load

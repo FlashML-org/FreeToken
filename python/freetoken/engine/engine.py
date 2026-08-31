@@ -297,6 +297,9 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+from freetoken.utils.step_profiler import step_profiler
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -937,8 +940,6 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        from freetoken.utils.step_profiler import step_profiler
-
         # Inc 2 instrument of .plans/rocm-perf-parity: stage-time breakdowns via
         # FREETOKEN_TORCH_PROFILE (no-op/cached-flag when unset). Wraps the whole
         # forward+sample step; range labels live at the MoE/router/attention callsites.
