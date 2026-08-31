@@ -192,7 +192,7 @@ def iter_gguf_weights(
                 del gu["gate_exps"]
                 del gu["up_exps"]
 
-def convert_llama_to_gguf(model, config) -> None:
+def convert_llama_to_gguf(model, config:ModelConfig) -> None:
     """Convert a FreeToken Llama model to GGUF format in-place.
 
     This is a no-op for non-GGUF models, and raises an error if the model is not a Llama.
@@ -220,10 +220,18 @@ def convert_llama_to_gguf(model, config) -> None:
     )
     
     for layer in inner_model.layers:                 
-            swap_linear(layer.self_attn, "qkv_proj")     
-            swap_linear(layer.self_attn, "o_proj")       
+        swap_linear(layer.self_attn, "qkv_proj")     
+        swap_linear(layer.self_attn, "o_proj")       
+        
+        # If it's a Dense model, swap the standard MLP
+        if not hasattr(layer, "router"):
             swap_linear(layer.mlp, "gate_up_proj")       
             swap_linear(layer.mlp, "down_proj")   
+            
+        # If it's a Shared-Expert MoE model, swap the Shared Expert MLP
+        if getattr(layer, "shared_expert", None) is not None:
+            swap_linear(layer.shared_expert, "gate_up_proj")       
+            swap_linear(layer.shared_expert, "down_proj")   
     
     # swap the LM head
     if not config.tie_word_embeddings:
