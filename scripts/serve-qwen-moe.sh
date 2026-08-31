@@ -73,6 +73,11 @@ KV_TOKENS="${FT_KV_TOKENS:-131072}"
 MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
 MOE_CACHE="${FT_MOE_CACHE:-auto}"
 LOG="${FT_LOG:-/tmp/serve_qwen_moe.log}"
+# Advertised model id in /v1/models (--served-model-name). Copilot-fork custom
+# endpoints validate the configured model id against this list, so set it to the
+# exact id the client config declares (e.g. FT_SERVED_MODEL=qwen3.6). Empty =
+# server default (the GGUF filename).
+SERVED_MODEL="${FT_SERVED_MODEL:-}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -104,6 +109,7 @@ start() {
     # One arg per array element; expanded once, single line, no continuations.
     local -a SERVE_ARGS=(
         "--model" "$MODEL"
+        $( [ -n "$SERVED_MODEL" ] && echo "--served-model-name" "$SERVED_MODEL" )
         "--moe-backend" "$MOE_BACKEND"
         "--cache-type" "$CACHE_TYPE"
         $( [ "$MOE_STATS" = 1 ] && echo "--moe-collect-stats" )
