@@ -347,6 +347,19 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
+        self._build_fused_copy_plan()
+        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
+            return
+        for name in self.bank_schema:
+            cache = self.bank_caches[name]
+            feat = math.prod(cache.shape[1:]) * cache.element_size()
+            if feat % 128:
+                raise RuntimeError(
+                    f"MoE bank {name!r} rows are {feat} bytes (not a multiple of 128): "
+                    f"only the fused multi-bank copy can move them, but it is disabled"
+                )
+
+    def _build_fused_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
         Built once here (and on :meth:`rebuild`, which reallocates the slot caches);
