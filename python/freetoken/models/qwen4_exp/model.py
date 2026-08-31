@@ -55,6 +55,30 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
     )
 
 
+def _ple_hash_constants(model_path: str) -> dict:
+    """The n-gram hash constants derived from the model config."""
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.ple import derive_ngram_hash_constants
+    from freetoken.utils import cached_load_hf_config
+
+    mc = parse_config(cached_load_hf_config(model_path))
+    args = mc.qwen4_args
+    multipliers, sizes, offsets = derive_ngram_hash_constants(
+        vocab_size=mc.vocab_size,
+        ngram_size=args.ngram_size,
+        num_ngram_heads=args.num_ngram_heads,
+        ngram_vocab_size_base=args.ngram_vocab_size_base,
+        ple_layer_index=0,
+    )
+    return {
+        "num_ngram_heads": args.num_ngram_heads,
+        "layer_multipliers": multipliers,
+        "per_head_vocab_sizes": sizes,
+        "per_head_offsets": offsets,
+        "eos_token_id": args.ngram_boundary_token_id,
+    }
+
+
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
@@ -167,6 +191,28 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            return 0
+
+        if engine_config.ple_backend == "disk":
+            from freetoken.utils import download_hf_weight
+
+            from .ple_disk import DiskRowTable, resolve_row_source
+
+            folder = download_hf_weight(engine_config.model_path)
+            constants = _ple_hash_constants(folder)
+            # one WAIT node per captured graph: the flag protocol supports a single consume
+            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
+            disk_table = DiskRowTable(
+                resolve_row_source(folder),
+                constants,
+                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                max_extend_tokens=engine_config.max_extend_tokens,
+            )
+            self._ple_table = disk_table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(disk_table)
+            # engine enters this around every dispatch; the graph itself never waits on the disk
+            self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
         from .weight import load_ple_table
