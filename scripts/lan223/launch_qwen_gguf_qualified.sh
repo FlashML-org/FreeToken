@@ -26,7 +26,10 @@ readonly MEMORY_RATIO="${3:-0.25}"
 # out source so source switching cannot delete benchmark evidence or weights.
 readonly ROOT_DIR="/home/david/freetoken-amd"
 # This is the isolated Q4-capable checkout used for the native GGUF controls.
-readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-gguf-5c7f0fd"
+# A caller may select a separately created candidate worktree for a recorded
+# experiment, but the validation below limits that override to this host's
+# dedicated FreeToken source area and never changes the protected live server.
+readonly SOURCE_DIR="${FREETOKEN_Q4_SOURCE_DIR:-${ROOT_DIR}/source-qwen-gguf-5c7f0fd}"
 # The exact file is also used by the matching ROCm llama.cpp control.
 readonly MODEL_PATH="${ROOT_DIR}/models/controls/qwen36-35b-a3b-unsloth-a483e9e6/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 # Preserve the shared checkpoint tokenizer for API and benchmark token counts.
@@ -91,6 +94,10 @@ stop_qualified_group() {
 # Validate fixed paths before any lifecycle action so a changed layout fails
 # closed rather than starting a different model or a CPU fallback.
 validate_paths() {
+    [[ "${SOURCE_DIR}" == "${ROOT_DIR}/source-qwen-"* ]] || {
+        echo "source directory must be an isolated Qwen checkout under ${ROOT_DIR}" >&2
+        return 1
+    }
     [[ -d "${SOURCE_DIR}" ]] || { echo "missing source directory: ${SOURCE_DIR}" >&2; return 1; }
     [[ -f "${MODEL_PATH}" ]] || { echo "missing Q4 model: ${MODEL_PATH}" >&2; return 1; }
     [[ -x "${ROOT_DIR}/.venv/bin/python" ]] || { echo "missing benchmark Python" >&2; return 1; }

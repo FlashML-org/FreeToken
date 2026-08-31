@@ -21,7 +21,10 @@ readonly INTERVAL_SECONDS="${3:-60}"
 
 # Keep all fixed LAN-223 paths explicit for reproducibility and host isolation.
 readonly ROOT_DIR="/home/david/freetoken-amd"
-readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-gguf-5c7f0fd"
+# Allow an isolated candidate worktree to reuse the exact endurance contract.
+# The caller must choose a path under the dedicated Qwen source root, so this
+# override cannot accidentally execute arbitrary code or touch port 1919.
+readonly SOURCE_DIR="${FREETOKEN_Q4_SOURCE_DIR:-${ROOT_DIR}/source-qwen-gguf-5c7f0fd}"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 readonly RUNNER="${SOURCE_DIR}/benchmarks/lan223_qwen/run_multiturn_state_suite.py"
 readonly SUITE="${SOURCE_DIR}/benchmarks/lan223_qwen/multiturn_state_suite.json"
@@ -34,6 +37,10 @@ case "${SESSION_COUNT}" in ''|*[!0-9]*) echo "session count must be a positive i
 case "${INTERVAL_SECONDS}" in ''|*[!0-9]*) echo "interval must be a non-negative integer" >&2; exit 2;; esac
 (( SESSION_COUNT > 0 )) || { echo "session count must be positive" >&2; exit 2; }
 [[ ! -e "${ARTIFACT_ROOT}" ]] || { echo "artifact root already exists: ${ARTIFACT_ROOT}" >&2; exit 2; }
+[[ "${SOURCE_DIR}" == "${ROOT_DIR}/source-qwen-"* ]] || {
+    echo "source directory must be an isolated Qwen checkout under ${ROOT_DIR}" >&2
+    exit 2
+}
 [[ -x "${VENV_PYTHON}" && -f "${RUNNER}" && -f "${SUITE}" ]] || {
     echo "missing Qwen endurance dependency" >&2
     exit 2
