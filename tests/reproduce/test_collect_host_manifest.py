@@ -32,7 +32,9 @@ class CollectHostManifestTests(unittest.TestCase):
         self.assertNotIn(forbidden_host, self.script.lower())
         self.assertNotIn("/home/" + "david", self.script)
 
-    def test_artifact_directory_must_be_new(self) -> None:
+    def test_collector_accepts_a_git_worktree_and_requires_a_new_artifact_directory(self) -> None:
+        self.assertIn('git -C "${SOURCE_DIR}" rev-parse --is-inside-work-tree', self.script)
+        self.assertNotIn('[[ ! -d "${SOURCE_DIR}/.git" ]]', self.script)
         self.assertIn('if [[ -e "${ARTIFACT_DIR}" ]]', self.script)
         self.assertIn("artifact directory already exists", self.script)
 

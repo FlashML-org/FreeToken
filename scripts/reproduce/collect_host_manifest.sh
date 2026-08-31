@@ -70,7 +70,7 @@ if [[ -z "${SOURCE_DIR}" || -z "${ARTIFACT_DIR}" ]]; then
     usage >&2
     exit 2
 fi
-if [[ ! -d "${SOURCE_DIR}/.git" ]]; then
+if ! git -C "${SOURCE_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     printf 'error: source directory is not a Git checkout: %s\n' "${SOURCE_DIR}" >&2
     exit 2
 fi
