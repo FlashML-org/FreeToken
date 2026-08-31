@@ -45,6 +45,19 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     from freetoken.kernel.backend import is_triton_kernels_installed
+    from freetoken.utils.arch import device_kind, is_rocm
+
+    # ROCm: triton_kernels (OpenAI's, CUDA-oriented) returns False in backend.py, so
+    # route to the IN-REPO portable triton router instead of the pure-torch chain.
+    # kernel/triton/moe_router.fused_topk_softmax already handles renormalize + the
+    # num_token_non_padded device-scalar mask and ties-lowest-id, and is
+    # torch-reference-tested; this removes ~4 launches + a warpMergeSort topk from
+    # every decode step on AMD (Inc 3 of .plans/rocm-perf-parity, profiler-measured
+    # ~0.8 ms/step of GPU busy).
+    if is_rocm() and device_kind() != "cpu":
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
     # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
     # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
@@ -58,7 +71,8 @@ def fused_topk(
             logger.warning_rank0(
                 "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
                 "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
+                "install triton_kernels to restore the fused router. On ROCm/AMD the fused "
+                "in-repo triton router is used instead, so this message means CPU mode."
             )
         return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 
