@@ -167,6 +167,7 @@ class TableFile {
 class BatchReader {
  public:
   virtual ~BatchReader() = default;
+  virtual const char *name() const = 0;
   virtual unsigned capacity() const = 0;
   virtual void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
                       int64_t off) = 0;
@@ -191,6 +192,7 @@ class ThreadPoolBatchReader final : public BatchReader {
     for (auto &w : workers_) w.join();
   }
 
+  const char *name() const override { return "pread-pool"; }
   unsigned capacity() const override { return kBatchEntries; }
 
   void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
@@ -316,6 +318,7 @@ class IoUringBatchReader final : public BatchReader {
     if (fd_ >= 0) ::close(fd_);
   }
 
+  const char *name() const override { return "io_uring"; }
   unsigned capacity() const override { return entries_; }
 
   void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
@@ -352,13 +355,13 @@ class IoUringBatchReader final : public BatchReader {
         return tag;
       }
       const unsigned to_submit = to_submit_;
-      to_submit_ = 0;
       long rc = syscall(__NR_io_uring_enter, fd_, to_submit, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
       if (rc < 0) {
-        to_submit_ = to_submit;
         if (errno == EINTR) continue;
         throw std::runtime_error(std::string("io_uring_enter: ") + std::strerror(errno));
       }
+      // partial submission is legal (signal, transient alloc); the rest stay in the ring
+      to_submit_ = to_submit - (unsigned)rc;
     }
   }
 
@@ -372,10 +375,12 @@ class IoUringBatchReader final : public BatchReader {
         continue;
       }
       const unsigned to_submit = to_submit_;
-      to_submit_ = 0;
-      if (syscall(__NR_io_uring_enter, fd_, to_submit, 1, IORING_ENTER_GETEVENTS, nullptr, 0) < 0 &&
-          errno != EINTR)
-        return;
+      long rc = syscall(__NR_io_uring_enter, fd_, to_submit, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+      if (rc < 0) {
+        if (errno != EINTR) return;
+        continue;
+      }
+      to_submit_ = to_submit - (unsigned)rc;
     }
   }
 
@@ -437,6 +442,11 @@ class PleStore {
         sizes_(std::move(head_vocab_sizes)),
         offsets_(std::move(head_offsets)),
         eos_(eos_token_id) {
+    if (mult_.size() != 3 || sizes_.size() != offsets_.size() || sizes_.empty())
+      throw std::runtime_error("PLE hash geometry: want 3 multipliers and equal-length head tables");
+    if (row_bytes_ > kPage)
+      throw std::runtime_error("PLE row_bytes " + std::to_string(row_bytes_) +
+                               " exceeds a page; bounce slots assume one-page rows");
     for (const std::string &p : paths)
       files_.push_back(std::make_unique<TableFile>(p));
     const int64_t extent_bytes = (rows_per_extent_ - 1) * row_stride_ + row_bytes_;
@@ -453,7 +463,11 @@ class PleStore {
     bounce_ = page_aligned_alloc((size_t)reader_->capacity() * kSpanMax);
   }
 
-  ~PleStore() { free(bounce_); }
+  // reader first: a still-running read must not land in freed bounce memory
+  ~PleStore() {
+    reader_.reset();
+    free(bounce_);
+  }
 
   PleStore(const PleStore &) = delete;
   PleStore &operator=(const PleStore &) = delete;
@@ -486,6 +500,15 @@ class PleStore {
   void flush(uintptr_t signal_addr) {
     flush_pending();
     if (signal_addr) signal_flag(signal_addr);
+  }
+
+  std::string io_backend() const {
+    size_t direct = 0;
+    for (const auto &f : files_) direct += f->direct_io() ? 1 : 0;
+    std::string s = reader_->name();
+    if (direct == files_.size()) return s + ", O_DIRECT";
+    return s + ", buffered " + std::to_string(files_.size() - direct) + "/" +
+           std::to_string(files_.size()) + " files";
   }
 
  private:
@@ -581,7 +604,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("stage", &PleStore::stage, py::arg("tokens_addr"), py::arg("n"),
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
-           py::call_guard<py::gil_scoped_release>());
+           py::call_guard<py::gil_scoped_release>())
+      .def("io_backend", &PleStore::io_backend);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_reset", &memop_wait_reset, py::arg("stream"), py::arg("flag_addr"));
