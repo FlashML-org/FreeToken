@@ -82,6 +82,18 @@ def test_vast_provisioner_has_validated_fast_resume_path():
     assert 'printf \'%s\\n\' "$provision_marker_value" >"$provision_marker"' in source
 
 
+def test_vast_provisioner_supports_persistent_ftw_conversion():
+    source = (ROOT / "scripts/vast_glm53_provision.sh").read_text(encoding="utf-8")
+    assert 'model_source_dir="${TEKIZAI_MODEL_SOURCE_PATH:-$model_dir}"' in source
+    assert 'convert_ftw="${TEKIZAI_CONVERT_FTW:-0}"' in source
+    assert 'FREETOKEN_PROVISION_STAGE=ftw_conversion' in source
+    assert '"$freetoken_dir/.venv/bin/ft" checkpoint' in source
+    assert '--model "$model_source_dir"' in source
+    assert '--out "$model_dir"' in source
+    assert 'TEKIZAI_PROVISION_MARKER' in source
+    assert '--dtype "$model_bench_dtype"' in source
+
+
 def test_deepseek_v4_vast_provisioner_sets_model_contract():
     source = (ROOT / "scripts/vast_deepseek_v4_provision.sh").read_text(
         encoding="utf-8"
@@ -92,4 +104,7 @@ def test_deepseek_v4_vast_provisioner_sets_model_contract():
     assert "TEKIZAI_SERVED_MODEL" in source
     assert "raw.githubusercontent.com/earlvanze/FreeToken" in source
     assert "TEKIZAI_FREETOKEN_REF" in source
+    assert "TEKIZAI_MODEL_SOURCE_PATH" in source
+    assert "DeepSeek-V4-Flash-0731-ftw" in source
+    assert 'TEKIZAI_CONVERT_FTW="${TEKIZAI_CONVERT_FTW:-1}"' in source
     assert 'exec "$shared_provisioner"' in source
