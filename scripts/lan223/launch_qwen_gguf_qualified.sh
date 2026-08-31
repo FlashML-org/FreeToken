@@ -45,6 +45,10 @@ readonly EXTENSION_CACHE="${ROOT_DIR}/cache/torch_extensions"
 # Store lifecycle data next to the supplied immutable test artifact.
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
+# Preserve native-extension build and import evidence in the same immutable
+# artifact because a clean Git worktree does not contain generated HIP modules.
+readonly NATIVE_BUILD_LOG="${ARTIFACT_DIR}/native-extension-build.log"
+readonly NATIVE_IMPORT_LOG="${ARTIFACT_DIR}/native-extension-import.txt"
 
 # Resolve a listener PID without assuming that a stale PID file identifies the
 # live owner of a TCP port.  An empty answer is a valid no-listener condition.
@@ -115,6 +119,17 @@ case "${ACTION}" in
         [[ -z "$(listener_pid "${INTERNAL_PORT}")" ]] || { echo "internal port ${INTERNAL_PORT} is already listening" >&2; exit 2; }
         mkdir -p "${ARTIFACT_DIR}"
         cd "${SOURCE_DIR}"
+        # The Q4 MoE path requires this in-tree HIP extension. Build it only
+        # when the isolated source lacks it, and retain the compiler outcome so
+        # a later benchmark cannot silently rely on a different checkout.
+        if ! PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" -c 'import freetoken.kernel._pinned_tensor' >/dev/null 2>&1; then
+            ROCM_HOME=/opt/rocm-10.0 ROCM_PATH=/opt/rocm-10.0 HIP_PATH=/opt/rocm-10.0 \
+            PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" setup.py build_ext --inplace \
+                >"${NATIVE_BUILD_LOG}" 2>&1
+        fi
+        PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" -c \
+            'import freetoken.kernel._pinned_tensor as pinned; print(pinned.__file__)' \
+            >"${NATIVE_IMPORT_LOG}"
         # Set only this child environment.  ROCm paths select the native HIP
         # stack, while PYTHONPATH and TORCH_EXTENSIONS_DIR select the reviewed
         # Q4 source and prebuilt extension cache without changing the login
@@ -137,7 +152,12 @@ case "${ACTION}" in
         # Prefer the recorded server PID, but verify it before a signal.  This
         # keeps a malformed artifact from targeting an unrelated user process.
         [[ -f "${PID_FILE}" ]] || { echo "missing server PID file: ${PID_FILE}" >&2; exit 2; }
-        stop_qualified_group "$(<"${PID_FILE}")"
+        recorded_pid="$(<"${PID_FILE}")"
+        # A backend-startup failure can already have exited the frontend before
+        # the controller's EXIT trap runs. Treat that absent recorded process as
+        # successful cleanup rather than blocking normal-service recovery.
+        kill -0 "${recorded_pid}" 2>/dev/null || exit 0
+        stop_qualified_group "${recorded_pid}"
         ;;
     *)
         echo "unknown action: ${ACTION}; expected start or stop" >&2

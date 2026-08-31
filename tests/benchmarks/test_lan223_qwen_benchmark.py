@@ -187,9 +187,30 @@ class QwenRecoveryContextTests(unittest.TestCase):
         self.assertIn('FREETOKEN_RECOVERY_SOURCE_DIR:?set FREETOKEN_RECOVERY_SOURCE_DIR', contents)
         self.assertIn('readonly SESSION_COUNT="${2:-1440}"', contents)
         self.assertIn('[[ -f "${Q4_LAUNCHER}" && -f "${Q4_BATTERY}"', contents)
+        self.assertIn('missing_listener >= 30', contents)
         self.assertIn('trap \'restore_normal_service\' EXIT INT TERM', contents)
         self.assertIn('wait_for_serving 1919 "${RECOVERY_ARTIFACT}"', contents)
         self.assertIn('wait_for_serving 1922 "${ARTIFACT_ROOT}/q4-health.json"', contents)
+
+    def test_q4_cleanup_accepts_an_already_exited_failed_frontend(self) -> None:
+        """A failed candidate must not prevent the normal service from recovering."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        launcher = repository_root / "scripts" / "lan223" / "launch_qwen_gguf_qualified.sh"
+        contents = launcher.read_text(encoding="utf-8")
+
+        self.assertIn('kill -0 "${recorded_pid}" 2>/dev/null || exit 0', contents)
+
+    def test_q4_launcher_builds_its_native_extension_in_a_clean_worktree(self) -> None:
+        """A clean candidate must not fail at runtime due to a missing HIP extension."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        launcher = repository_root / "scripts" / "lan223" / "launch_qwen_gguf_qualified.sh"
+        contents = launcher.read_text(encoding="utf-8")
+
+        self.assertIn('readonly NATIVE_BUILD_LOG="${ARTIFACT_DIR}/native-extension-build.log"', contents)
+        self.assertIn('setup.py build_ext --inplace', contents)
+        self.assertIn('import freetoken.kernel._pinned_tensor as pinned', contents)
 
     def test_multiturn_battery_requires_swap_free_preflight(self) -> None:
         """Repeated state tests must not begin from a swapped memory condition."""
