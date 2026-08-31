@@ -109,3 +109,18 @@ def test_deepseek_v4_vast_provisioner_sets_model_contract():
     assert "DeepSeek-V4-Flash-0731-ftw" in source
     assert 'TEKIZAI_CONVERT_FTW="${TEKIZAI_CONVERT_FTW:-1}"' in source
     assert 'exec "$shared_provisioner"' in source
+
+
+def test_qwen38_wrapper_selects_nvfp4_cache_contract():
+    source = (ROOT / "scripts/vast_qwen38_27b_provision.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "set -Eeuo pipefail" in source
+    assert "RadixArk/Qwen3.8-27B-NVFP4" in source
+    assert "Qwen3.8-27B-NVFP4-hf" in source
+    assert "Qwen3.8-27B-NVFP4-ftw" in source
+    assert 'TEKIZAI_CONVERT_FTW="${TEKIZAI_CONVERT_FTW:-1}"' in source
+    assert 'TEKIZAI_MODEL_BENCH_DTYPE="${TEKIZAI_MODEL_BENCH_DTYPE:-nvfp4}"' in source
+    assert 'TEKIZAI_SERVED_MODEL="${TEKIZAI_SERVED_MODEL:-qwen3.8:27b}"' in source
+    assert 'TEKIZAI_MEMORY_RATIO="${TEKIZAI_MEMORY_RATIO:-0.90}"' in source
+    assert 'TEKIZAI_MAX_SEQ_LEN="${TEKIZAI_MAX_SEQ_LEN:-8192}"' in source
