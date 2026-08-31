@@ -13,14 +13,31 @@ from .attention import LlamaAttention as LlamaAttn
 
 from freetoken.models.llama.gguf import is_gguf_model, convert_llama_to_gguf, parse_gguf_config
 
+from freetoken.layers.moe import make_moe_layer
+
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
 class LlamaDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = LlamaAttn(config, layer_id)
-        self.mlp = LlamaMLP(config)
+        self.self_attn = LlamaAttn(config, layer_id)       
+        # build the router and the smaller experts
+        if config.num_experts > 1:
+            self.mlp = make_moe_layer(
+                config, 
+                layer_id=layer_id, 
+                weight_format= getattr(config,"moe_weight_format","bf16")
+                )           
+            # Build the massive Shared Expert
+            if getattr(config, "shared_expert_intermediate_size", 0) > 0:
+                self.shared_expert=LlamaMLP(config)
+            else:
+                self.shared_expert = None               
+        else:
+            # standard dense LLaMA 1/2/3     
+            self.mlp = LlamaMLP(config)
+            
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -29,7 +46,6 @@ class LlamaDecoderLayer(BaseOP):
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
-
         self._layer_id = layer_id
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -41,7 +57,16 @@ class LlamaDecoderLayer(BaseOP):
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        
+        # --- NEW ROUTING LOGIC ---  
+        if getattr(self, "shared_expert", None) is not None:
+            routed_out = self.mlp.forward(x)
+            shared_out = self.shared_expert.forward(x)
+            # adding the shareed expert and MoE expert together
+            x = routed_out + shared_out
+        else:
+            # standard dense routing
+            x = self.mlp.forward(x)
         return x, residual
 
 
