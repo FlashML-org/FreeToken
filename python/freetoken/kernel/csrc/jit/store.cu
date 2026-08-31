@@ -107,8 +107,8 @@ struct StoreKernel {
         .length = length,
     };
 
-    constexpr auto kWarpPerBlock = num_threads / 32;
-    static_assert(num_threads % 32 == 0);
+    constexpr auto kWarpPerBlock = num_threads / device::kWarpThreads;
+    static_assert(num_threads % device::kWarpThreads == 0);
     const auto num_blocks = div_ceil(length, kWarpPerBlock);
     const auto kernel = use_int32
                             ? store_kv_cache<num_threads, max_concurrency,
