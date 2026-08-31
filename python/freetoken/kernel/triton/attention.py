@@ -185,7 +185,7 @@ def _paged_attention_kernel(
 
     if HAS_SINKS:
         m_i = tl.load(sinks_ptr + q_head).to(tl.float32)
-        l_i = 1
+        l_i = 1.0
     else:
         m_i = -float("inf")
         l_i = 0.0
