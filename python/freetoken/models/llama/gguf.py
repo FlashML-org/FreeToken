@@ -11,45 +11,59 @@ def parse_gguf_config(shim:GgufConfigShim) -> ModelConfig:
     """Parse a GGUF config shim into a FreeToken ``ModelConfig``."""
 
     gguf_metadata_llama = shim.metadata
+    # model architecture
+    arch=shim.model_type
     
-    hidden_size = gguf_metadata_llama.get("llama.embedding_length")
-    num_of_heads = gguf_metadata_llama.get("llama.attention.head_count")
-    # for the rotary embedding config
+    hidden_size = gguf_metadata_llama.get(f"{arch}.embedding_length")
+    num_of_heads = gguf_metadata_llama.get(f"{arch}.attention.head_count")
+    # head_dim and rotary_dim 
     head_dim = hidden_size//num_of_heads
+    
+    dense_ffn_size = gguf_metadata_llama.get(f"{arch}.feed_forward_length")
+    
+    expert_count = gguf_metadata_llama.get(f"{arch}.expert_count", 1)
      
     # The GGUF shim is a minimal HF-config-like dict with the fields we need.
     return ModelConfig(
     #   directly, from shim
-        model_type=shim.model_type,
-        architectures=shim.architectures,
-        vocab_size=shim.vocab_size,
-        tie_word_embeddings=shim.tie_word_embeddings,
+        model_type = shim.model_type,
+        architectures = shim.architectures,
+        vocab_size = shim.vocab_size,
+        tie_word_embeddings = shim.tie_word_embeddings,
+        head_dim = head_dim,
+        hidden_size = hidden_size,      
       
     
-    # from mapping GGUF keys
-        num_layers=shim.metadata.get("llama.block_count"),
-        num_qo_heads=num_of_heads,                       
-        num_kv_heads=shim.metadata.get("llama.attention.head_count_kv"),                                       
-        hidden_size=hidden_size,                         
-        head_dim=head_dim,                               
-        intermediate_size=shim.metadata.get("llama.feed_forward_length"),                                 
-        rms_norm_eps=shim.metadata.get("llama.attention.layer_norm_rms_epsilon"),                              
+# from mapping GGUF keys
+
+        num_layers = gguf_metadata_llama.get(f"{arch}.block_count"),
+        intermediate_size = gguf_metadata_llama.get(f"{arch}.feed_forward_length"),                                 
+        
+        num_qo_heads = num_of_heads,                       
+        num_kv_heads = gguf_metadata_llama.get(f"{arch}.attention.head_count_kv"),                                       
+        rms_norm_eps = gguf_metadata_llama.get(f"{arch}.attention.layer_norm_rms_epsilon"),                              
                                                          
-    # --- Rotary Config ---                          
-        rotary_config=RotaryConfig(                      
-            head_dim=head_dim,                           
-            rotary_dim=head_dim,                         
-            max_position=shim.metadata.get("llama.context_length"),                                      
-            base=shim.metadata.get("llama.rope.freq_base"),                                           
-            scaling=None                                 
+    # Rotary Config                           
+        rotary_config = RotaryConfig(                      
+            head_dim = gguf_metadata_llama.get(f"{arch}.rope.dimension_count",head_dim)   ,                           
+            rotary_dim = gguf_metadata_llama.get(f"{arch}.rope.dimension_count",head_dim)   ,      #identical to head_dim                
+            max_position = gguf_metadata_llama.get(f"{arch}.context_length"),                                      
+            base = gguf_metadata_llama.get(f"{arch}.rope.freq_base"),                                           
+            scaling = None                                 
         ),      
-    # --- Hardcoded LLaMA Structural Defaults ---    
-        hidden_act="silu",   #llama standard activation                            
-        num_experts=1,        #current llama is still a dense model(no MoE)                           
-        num_experts_per_tok=1,                           
-        moe_intermediate_size=0,                         
-        norm_topk_prob=False,                            
-        moe_weight_format="q4_0", #4bit symmetric     
+        
+        hidden_act = "silu",   #llama standard activation                            
+        num_experts = expert_count,   #for MoE              
+        num_experts_per_tok = gguf_metadata_llama.get(f"{arch}.expert_used_count", 1), 
+        norm_topk_prob = False, 
+         
+        # If it's a dense model, this just falls back to the dense size.    
+        moe_intermediate_size = gguf_metadata_llama.get(f"{arch}.expert_feed_forward_length",dense_ffn_size),                       
+        
+        moe_weight_format = "q4_0", #4bit symmetric    
+        
+        shared_expert_intermediate_size= dense_ffn_size if expert_count> 1 else 0 
+         
     )
 
 from freetoken.models.gguf.reader import iter_gguf_tensors
