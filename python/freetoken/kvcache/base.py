@@ -17,19 +17,35 @@ class CacheRebuildRejected(Exception):
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
+    """One paged-KV group's bytes per token: (1|2 slabs) x the physical KV vector cost
+    x local kv heads x layers, plus the bf16 DSA index-key slab when the spec carries
+    indexer dims.  The physical vector cost includes the payload and per-block scale slabs
+    for quantized KV; using ``config.dtype.itemsize`` here would incorrectly budget Q8/Q4/Q6
+    rebuilds as bf16 even though the live pool uses compact byte storage. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    quant = getattr(config, "kv_quant", None)
+    if quant is not None and quant.enabled:
+        # QuantizedKVStorageMixin allocates one byte payload tensor with a packed physical
+        # last dimension, plus one fp16 scale for every BLOCK logical elements. Mirror that
+        # allocation exactly so startup sizing and pre-rebuild validation agree with the live
+        # pool's unit_bytes().
+        from .quant import BLOCK, SCALE_DTYPE
+
+        payload_bytes = quant.physical_head_dim(spec.head_dim) * quant.storage_dtype.itemsize
+        scale_bytes = div_even(spec.head_dim, BLOCK) * SCALE_DTYPE.itemsize
+        vector_bytes = payload_bytes + scale_bytes
+    else:
+        vector_bytes = spec.head_dim * config.dtype.itemsize
+
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
+        * vector_bytes
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio

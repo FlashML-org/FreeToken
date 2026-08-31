@@ -112,16 +112,22 @@ class KVQuantSpec:
         scale shape is derived from the *logical* head dim -- which the caller passes
         via the buffer shape's last dim. We rely on the buffer's last dim being
         ``physical_head_dim(logical_head_dim)``; recover logical by multiplying by
-        ``8 // bits``.
+        ``8`` and dividing by ``bits``.
         """
-        if shape[-1] % BLOCK:
-            raise ValueError(
-                f"physical head_dim {shape[-1]} is not a multiple of the KV quant block {BLOCK}"
-            )
+        physical = shape[-1]
         if self.layout == LAYOUT_Q8:
-            return (*shape[:-1], shape[-1] // BLOCK)
-        # Sub-byte: logical = physical * 8 / bits; scale extent = logical / BLOCK
-        logical = shape[-1] * 8 // self.bits
+            logical = physical
+        else:
+            if physical * 8 % self.bits:
+                raise ValueError(
+                    f"physical head_dim {physical} cannot represent a whole number of "
+                    f"{self.bits}-bit KV elements"
+                )
+            logical = physical * 8 // self.bits
+        if logical % BLOCK:
+            raise ValueError(
+                f"logical head_dim {logical} is not a multiple of the KV quant block {BLOCK}"
+            )
         return (*shape[:-1], logical // BLOCK)
 
     # ---- reference implementations (correctness oracle for the Triton kernels) ----

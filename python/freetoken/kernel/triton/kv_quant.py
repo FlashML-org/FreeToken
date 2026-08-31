@@ -52,6 +52,10 @@ def _store_kv_quant_kernel(
     indices_ptr,  # [tokens] destination slot per token
     stride_kt,
     stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
     stride_ct,
     stride_ch,
     stride_st,
@@ -78,8 +82,16 @@ def _store_kv_quant_kernel(
         src_ptr = v_ptr if is_v else k_ptr
         dst_ptr = vc_ptr if is_v else kc_ptr
         sc_ptr = vs_ptr if is_v else ks_ptr
+        stride_src_t = stride_vt if is_v else stride_kt
+        stride_src_h = stride_vh if is_v else stride_kh
+        stride_src_d = stride_vd if is_v else stride_kd
 
-        x = tl.load(src_ptr + tok * stride_kt + head * stride_kh + offs).to(tl.float32)
+        x = tl.load(
+            src_ptr
+            + tok * stride_src_t
+            + head * stride_src_h
+            + offs * stride_src_d
+        ).to(tl.float32)
         amax = tl.max(tl.abs(x), axis=1)
         # An all-zero block quantizes to zeros under any positive scale; 1.0 keeps the
         # division finite.
@@ -196,6 +208,10 @@ def store_kv_quant(
     num_tokens, num_heads, head_dim = k.shape
     if num_tokens == 0:
         return
+    assert v.shape == k.shape, f"K/V source shapes differ: {k.shape} vs {v.shape}"
+    assert indices.numel() == num_tokens, (
+        f"one destination index is required per token: {indices.numel()} != {num_tokens}"
+    )
     assert head_dim % BLOCK == 0, f"head_dim {head_dim} not a multiple of {BLOCK}"
     # The cache's last axis is the PACKED byte count, which differs from the source's
     # head_dim for sub-byte schemes. We pass both as constexprs to the kernel.
@@ -204,6 +220,15 @@ def store_kv_quant(
     assert d_physical == expected_physical, (
         f"cache physical dim {d_physical} != spec {spec.name} expected {expected_physical}"
     )
+    assert k_cache.shape == v_cache.shape
+    assert k_cache.shape[1] == num_heads
+    assert k_cache.stride(-1) == v_cache.stride(-1) == 1
+    expected_scale_shape = (k_cache.shape[0], num_heads, head_dim // BLOCK)
+    assert k_scale.shape == v_scale.shape == expected_scale_shape, (
+        f"scale shape {k_scale.shape}/{v_scale.shape} != expected {expected_scale_shape}"
+    )
+    assert k_cache.stride() == v_cache.stride()
+    assert k_scale.stride() == v_scale.stride()
     _store_kv_quant_kernel[(num_tokens, num_heads)](
         k,
         v,
@@ -214,6 +239,10 @@ def store_kv_quant(
         indices,
         k.stride(0),
         k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
         k_cache.stride(0),
         k_cache.stride(1),
         k_scale.stride(0),

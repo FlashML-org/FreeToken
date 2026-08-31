@@ -78,6 +78,29 @@ def test_generic_kv_cost_and_solve_parity():
     assert MHAKVCache.min_kv_tokens(config) == config.page_size
 
 
+@pytest.mark.parametrize(
+    ("quant_name", "bytes_per_vector"),
+    (("q8_0", 68), ("q6_0", 52), ("q4_0", 36)),
+)
+def test_generic_kv_cost_prices_quantized_payload_and_scales(quant_name, bytes_per_vector):
+    """The backend fit-check must use the same compact payload + fp16 scales as the pool.
+
+    A stale bf16 price here makes the desktop correctly show a larger Q8 context but causes
+    Apply to reject it before rebuilding.
+    """
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.kvcache.quant import resolve_kv_quant
+
+    config = _generic_config()
+    config.kv_quant = resolve_kv_quant(quant_name)
+    per_page, fixed, _, _ = MHAKVCache.kv_cost(config)
+    # 2 K/V slabs x 2 local heads x 2 layers, with a 64-element vector.  The vector
+    # prices include two fp16 scales: Q8=64+4, Q6=48+4, Q4=32+4 bytes.
+    assert per_page == 2 * 2 * 2 * bytes_per_vector * config.page_size
+    assert fixed == 0
+    assert per_page < 2 * 64 * 2 * 2 * 2 * config.page_size  # all beat bf16
+
+
 def _dsv4_config(num_page_override=None):
     from freetoken.models.deepseek_v4.args import DeepseekV4Args
 

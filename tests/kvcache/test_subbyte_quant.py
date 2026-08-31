@@ -122,12 +122,16 @@ def test_q4_0_scale_shape():
     # physical 64 -> logical 128 -> scale extent 4
     shape = (3, 4, 64)
     assert Q4_0.scale_shape(shape) == (3, 4, 4)
+    # One logical 32-element block occupies only 16 physical bytes. Validation
+    # must apply to the recovered logical dimension, not reject the packed size.
+    assert Q4_0.scale_shape((3, 4, 16)) == (3, 4, 1)
 
 
 def test_q6_0_scale_shape():
     """Same recovery for Q6: physical 96 -> logical 128 -> scale extent 4."""
     shape = (3, 4, 96)
     assert Q6_0.scale_shape(shape) == (3, 4, 4)
+    assert Q6_0.scale_shape((3, 4, 24)) == (3, 4, 1)
 
 
 def test_scale_shape_rejects_non_block_aligned():

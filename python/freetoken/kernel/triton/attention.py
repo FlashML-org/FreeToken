@@ -177,15 +177,6 @@ def _paged_attention_kernel(
     # One scale per QBLOCK elements of head_dim: the tile's block axis.
     offs_nb = tl.arange(0, BLOCK_D // QBLOCK)
     mask_nb = offs_nb < D // QBLOCK
-    # Byte offset along the head_dim axis. 8-bit: 1 byte per element. Q4: 2 per
-    # byte. Q6: see _load_kv (it reads two planes, so the offset it consumes is
-    # the per-element raw position -- the byte address differs per plane).
-    if LAYOUT == "q4":
-        phys_offs_d = offs_d >> 1
-    elif LAYOUT == "q6":
-        phys_offs_d = offs_d
-    else:
-        phys_offs_d = offs_d
     q = tl.load(
         q_ptr + q_tok * stride_qt + q_head * stride_qh + offs_d,
         mask=mask_d,
@@ -218,7 +209,7 @@ def _paged_attention_kernel(
                 k_ptr,
                 ks_ptr,
                 (slots * stride_ks + kv_head * stride_kh)[:, None],  # [BLOCK_N, 1]
-                phys_offs_d[None, :],  # [1, BLOCK_D] -> [BLOCK_N, BLOCK_D]
+                offs_d[None, :],  # logical elems; _load_kv maps them to packed bytes
                 kv_mask,
                 (slots * stride_kss + kv_head * stride_ksh)[:, None] + offs_nb[None, :],
                 kv_scale_mask,
@@ -241,7 +232,7 @@ def _paged_attention_kernel(
                 v_ptr,
                 vs_ptr,
                 (slots * stride_vs + kv_head * stride_vh)[:, None],  # [BLOCK_N, 1]
-                phys_offs_d[None, :],  # [1, BLOCK_D] -> [BLOCK_N, BLOCK_D]
+                offs_d[None, :],  # logical elems; _load_kv maps them to packed bytes
                 kv_mask,
                 (slots * stride_vss + kv_head * stride_vsh)[:, None] + offs_nb[None, :],
                 kv_scale_mask,
@@ -746,15 +737,6 @@ def _extend_attention_kernel(
     offs_nbv = tl.arange(0, BLOCK_DV // QBLOCK)
     mask_nb = offs_nb < D // QBLOCK
     mask_nbv = offs_nbv < D // QBLOCK
-    # Byte offset into the KV cache. 8-bit: 1 byte per element; Q4: 2 per byte;
-    # Q6: see _load_kv (it reads two planes; the offset consumed is the per-element
-    # raw position).
-    if LAYOUT == "q4":
-        phys_offs_d = offs_d >> 1
-        phys_offs_dv = offs_dv >> 1
-    else:
-        phys_offs_d = offs_d
-        phys_offs_dv = offs_dv
     q_abs_pos = prefix_len + offs_m
     block_q_end = tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
     kv_loop_end = tl.minimum(kv_len, prefix_len + block_q_end)
@@ -790,7 +772,7 @@ def _extend_attention_kernel(
                 k_ptr,
                 ks_ptr,
                 (slots * stride_ks + kv_head * stride_kh)[None, :],  # [1, BLOCK_N]
-                phys_offs_d[:, None],  # [BLOCK_D, 1] -> [BLOCK_D, BLOCK_N]
+                offs_d[:, None],  # logical elems; _load_kv maps them to packed bytes
                 mask_n[None, :] & mask_d[:, None],
                 (slots * stride_kss + kv_head * stride_ksh)[None, :] + offs_nb[:, None],
                 mask_n[None, :] & mask_nb[:, None],
@@ -813,7 +795,7 @@ def _extend_attention_kernel(
                 v_ptr,
                 vs_ptr,
                 (slots * stride_vs + kv_head * stride_vh)[:, None],  # [BLOCK_N, 1]
-                phys_offs_dv[None, :],  # [1, BLOCK_DV] -> [BLOCK_N, BLOCK_DV]
+                offs_dv[None, :],  # logical elems; _load_kv maps them to packed bytes
                 mask_n[:, None] & mask_dv[None, :],
                 (slots * stride_vss + kv_head * stride_vsh)[:, None] + offs_nbv[None, :],
                 mask_n[:, None] & mask_nbv[None, :],
@@ -903,13 +885,6 @@ def _extend_attention_split_kernel(
     offs_nbv = tl.arange(0, BLOCK_DV // QBLOCK)
     mask_nb = offs_nb < D // QBLOCK
     mask_nbv = offs_nbv < D // QBLOCK
-    # Byte offset into the cache for the head_dim axis (Q4 = elem // 2).
-    if LAYOUT == "q4":
-        phys_offs_d = offs_d >> 1
-        phys_offs_dv = offs_dv >> 1
-    else:
-        phys_offs_d = offs_d
-        phys_offs_dv = offs_dv
     q_abs_pos = prefix_len + offs_m
 
     q = tl.load(
@@ -949,7 +924,7 @@ def _extend_attention_split_kernel(
                 k_cache_ptr,
                 ks_ptr,
                 (slots * stride_kcs + kv_head * stride_kch)[None, :],  # [1, BLOCK_N]
-                phys_offs_d[:, None],  # [BLOCK_D, 1] -> [BLOCK_D, BLOCK_N]
+                offs_d[:, None],  # logical elems; _load_kv maps them to packed bytes
                 mask_n[None, :] & mask_d[:, None],
                 (slots * stride_kss + kv_head * stride_ksh)[None, :] + offs_nb[:, None],
                 mask_n[None, :] & mask_nb[:, None],
@@ -972,7 +947,7 @@ def _extend_attention_split_kernel(
                 v_cache_ptr,
                 vs_ptr,
                 (slots * stride_vcs + kv_head * stride_vch)[:, None],  # [BLOCK_N, 1]
-                phys_offs_dv[None, :],  # [1, BLOCK_DV] -> [BLOCK_N, BLOCK_DV]
+                offs_dv[None, :],  # logical elems; _load_kv maps them to packed bytes
                 mask_n[:, None] & mask_dv[None, :],
                 (slots * stride_vss + kv_head * stride_vsh)[:, None] + offs_nbv[None, :],
                 mask_n[:, None] & mask_nbv[None, :],
