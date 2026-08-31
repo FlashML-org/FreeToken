@@ -149,6 +149,7 @@ class DiskRowTable:
         )
         eager_bytes = max_extend_tokens * self._token_bytes
         self._eager_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
+        self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
         self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"))
