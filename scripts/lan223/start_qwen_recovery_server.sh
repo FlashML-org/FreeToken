@@ -149,7 +149,10 @@ fi
 # and is only used with a separately saved deterministic quality result. Wave
 # count and activation scaling are likewise disabled defaults and require their
 # own raw-output plus model-level quality evidence before any promotion.
-nohup "${VENV_PYTHON}" -m freetoken.cli serve \
+# `setsid` gives this complete multiprocessing server a dedicated process
+# group. A later controlled stop can therefore release the frontend, scheduler,
+# tokenizer, and tracker together instead of leaving a GPU-owning child behind.
+setsid nohup "${VENV_PYTHON}" -m freetoken.cli serve \
     --model-path "${MODEL_DIR}" \
     --served-model-name qwen3.6-35b-a3b-nvfp4-amd \
     --host 127.0.0.1 \
