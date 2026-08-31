@@ -162,6 +162,20 @@ class QwenRecoveryContextTests(unittest.TestCase):
         self.assertIn('readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"', contents)
         self.assertIn('--kv-reserve-tokens "${KV_RESERVE_TOKENS}"', contents)
 
+    def test_recovery_uses_a_dedicated_group_and_checked_stop_helper(self) -> None:
+        """Recovery must make later GPU handoff safe for isolated ROCm candidates."""
+
+        repository_root = Path(__file__).resolve().parents[2]
+        recovery = repository_root / "scripts" / "lan223" / "start_qwen_recovery_server.sh"
+        stopper = repository_root / "scripts" / "lan223" / "stop_qwen_recovery_server.sh"
+
+        self.assertIn('setsid nohup "${VENV_PYTHON}" -m freetoken.cli serve', recovery.read_text(encoding="utf-8"))
+        contents = stopper.read_text(encoding="utf-8")
+        self.assertIn('readonly PORT="1919"', contents)
+        self.assertIn('readonly MODEL_PATH="/home/david/freetoken-amd/models/Qwen3.6-35B-A3B-NVFP4"', contents)
+        self.assertIn('[[ "${pgid}" == "${pid}" ]]', contents)
+        self.assertIn('kill -TERM -- "-${pgid}"', contents)
+
     def test_multiturn_battery_requires_swap_free_preflight(self) -> None:
         """Repeated state tests must not begin from a swapped memory condition."""
 
