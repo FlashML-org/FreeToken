@@ -87,6 +87,7 @@ def test_vast_provisioner_supports_persistent_ftw_conversion():
     assert 'model_source_dir="${TEKIZAI_MODEL_SOURCE_PATH:-$model_dir}"' in source
     assert 'convert_ftw="${TEKIZAI_CONVERT_FTW:-0}"' in source
     assert 'FREETOKEN_PROVISION_STAGE=ftw_conversion' in source
+    assert '[[ ! -s "$model_dir/freetoken_weight.json" ]]' in source
     assert '"$freetoken_dir/.venv/bin/ft" checkpoint' in source
     assert '--model "$model_source_dir"' in source
     assert '--out "$model_dir"' in source
