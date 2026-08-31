@@ -81,6 +81,8 @@ def _clear_stale_jit_lock(module_name: str) -> None:
         lock.unlink()
     except Exception:  # noqa: BLE001 - hygiene must never break the build path
         pass
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
@@ -108,6 +110,17 @@ def _module():
             extra_cuda_cflags += ["-ccbin", cxx_path]
             os.environ["CXX"] = cxx_path
             os.environ["CC"] = _c_compiler_for(cxx_path)
+
+    # Rows-per-warp for the MMVQ/MoE-vec launches (Inc 4, .plans/rocm-perf-parity).
+    # Overridable for tuning/AB; the JIT cache keys on the cflags, so a changed value
+    # rebuilds cleanly. CUDA-side the same -D reaches ggml-common.h's #ifndef guard.
+    mmv_y = os.getenv("FREETOKEN_GGUF_MMV_Y", "").strip()
+    if mmv_y:
+        if not mmv_y.isdigit() or int(mmv_y) not in (1, 2, 4, 8):
+            raise ValueError(
+                f"FREETOKEN_GGUF_MMV_Y={mmv_y!r}: expected one of 1, 2, 4, 8"
+            )
+        extra_cuda_cflags.append(f"-DGGML_CUDA_MMV_Y={mmv_y}")
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
