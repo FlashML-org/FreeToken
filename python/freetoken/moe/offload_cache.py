@@ -1001,7 +1001,12 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
-        if self._copy_fused_ok:
+        # HIP graphs do not reliably retain the pinned-host mappings hidden behind the
+        # fused kernel's device-side pointer table. Direct per-bank tensor arguments do.
+        use_fused = self._copy_fused_ok and not (
+            torch.version.hip and torch.cuda.is_current_stream_capturing()
+        )
+        if use_fused:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
