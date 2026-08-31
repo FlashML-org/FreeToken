@@ -50,11 +50,15 @@ def _device_name() -> str | None:
         return None
 
 
-def probe_graph_capture() -> dict:
-    """Run the actual capture probe on the current device. Returns a dict:
-    ``{"device_kind": ..., "device": ..., "ok": bool, "detail": str}``.
+def probe_graph_capture(variants: tuple[tuple[str, dict[str, str], str], ...] | None = None) -> dict:
+    """Run the capture probes on the current device across the variants.
 
-    The GEMM-capture attempt is run in a **fresh subprocess**: on some ROCm builds a
+    Returns ``{"device_kind", "device", "ok", "detail", "variant", "env"}`` where
+    ``variant`` is the first passing entry (or the last failing one) and ``env`` is
+    the environment the engine worker must be spawned with for capture to work
+    (empty for the default variant). See :data:`_GRAPH_VARIANTS`.
+
+    Each variant runs in a **fresh subprocess**: on some ROCm builds a
     hipBLASLt/capture failure raises an uncatchable fatal HIP error (error 900) that
     aborts the whole process, so running it inline would crash the caller (and, worse,
     a decode path that attempted graph capture would die). A subprocess lets a fatal
@@ -80,52 +84,90 @@ def probe_graph_capture() -> dict:
             "detail": f"torch unavailable: {type(exc).__name__}: {detail}",
         }
 
-    # The child probes both an elementwise op (capturable on both backends) and a GEMM
-    # (hipBLASLt on ROCm), which is what a real decode forward would run. The GEMM is
-    # the discriminating case: on this ROCm build it fatally aborts -> child exit != 0.
+    # Each variant probes both an elementwise op (capturable on both backends) and a
+    # GEMM (hipBLASLt on ROCm), which is what a real decode forward would run. The GEMM
+    # is the discriminating case: on this ROCm build it fatally aborts -> child exit != 0.
     import subprocess as _subprocess
     import sys as _sys
 
-    child = _subprocess.run(
-        [_sys.executable, "-c", _CAPTURE_CHILD],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if child.returncode != 0:
-        detail = next(
-            (l.strip() for l in child.stderr.splitlines() if l.strip()),
-            f"graph capture subprocess aborted (rc={child.returncode})",
+    variants = variants if variants is not None else _GRAPH_VARIANTS
+    last_fail: dict | None = None
+    for name, extra_env, mode in variants:
+        env = {**os.environ, **extra_env}
+        child = _subprocess.run(
+            [_sys.executable, "-c", _CAPTURE_CHILD, mode],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
         )
-        return {
-            "device_kind": _device_kind(),
-            "device": device,
-            "ok": False,
-            "detail": f"fatal during capture: {detail[:240]}",
-        }
+        if child.returncode != 0:
+            detail = next(
+                (l.strip() for l in child.stderr.splitlines() if l.strip()),
+                f"graph capture subprocess aborted (rc={child.returncode})",
+            )
+            last_fail = {
+                "device_kind": _device_kind(),
+                "device": device,
+                "ok": False,
+                "detail": f"fatal during capture: {detail[:240]}",
+            }
+            continue
+        try:
+            data = json.loads(child.stdout)
+        except Exception:
+            last_fail = {
+                "device_kind": _device_kind(),
+                "device": device,
+                "ok": False,
+                "detail": f"unparseable probe output: {child.stdout[:120]}",
+            }
+            continue
+        data.setdefault("device_kind", _device_kind())
+        data.setdefault("device", device)
+        data["variant"] = name
+        data["env"] = dict(extra_env)
+        if data.get("ok"):
+            return data
+        last_fail = data
+    assert last_fail is not None
+    return last_fail
+
+
+@lru_cache(maxsize=1)
+def graph_capture_env() -> dict[str, str]:
+    """Env vars the engine worker must be spawned with for graph capture to work.
+
+    Empty when the default variant passes (or the gate failed / no device); otherwise
+    the winning variant's extra env (e.g. ``TORCH_BLAS_PREFER_HIPBLASLT=0``). Applied
+    by the server supervisor BEFORE the engine worker is spawned — never late at
+    capture time, where a late env write may no-op.
+    """
     try:
-        data = json.loads(child.stdout)
+        result = run_graph_gate()
+        env = result.get("env") or {}
+        return env if result.get("ok") else {}
     except Exception:
-        return {
-            "device_kind": _device_kind(),
-            "device": device,
-            "ok": False,
-            "detail": f"unparseable probe output: {child.stdout[:120]}",
-        }
-    data.setdefault("device_kind", _device_kind())
-    data.setdefault("device", device)
-    return data
+        return {}
 
 
 #: Child body for the graph-capture probe (see :func:`probe_graph_capture`). Prints a
 #: JSON line ``{"ok": true/false, "detail": ...}`` and exits nonzero on a fatal abort.
+#: Modes: "plain" = capture a GEMM with default BLAS/library state; "prewarm" = run the
+#: same-shaped GEMM once before capture (hipBLASLt lazily allocates its workspace on
+#: the first GEMM, and a capture that includes that allocation is what aborts on some
+#: ROCm builds).
 _CAPTURE_CHILD = r"""
 import json, sys
+mode = sys.argv[1] if len(sys.argv) > 1 else "plain"
 import torch
 try:
     torch.cuda.synchronize()
     s = torch.cuda.Stream()
     x = torch.randn(8, 8, device='cuda')
+    if mode == "prewarm":
+        a0 = torch.randn(64, 64, device='cuda')
+        torch.mm(a0, a0)  # pre-allocate the BLAS workspace OUTSIDE any capture
     # elementwise (capturable) first, then a GEMM (hipBLASLt on ROCm)
     with torch.cuda.stream(s):
         g = torch.cuda.CUDAGraph()
@@ -139,10 +181,24 @@ try:
             torch.mm(a, a)
         s.synchronize()
     torch.cuda.synchronize()
-    print(json.dumps({"ok": True, "detail": "elementwise+GEMM capture/replay succeeded"}))
+    print(json.dumps({"ok": True, "detail": f"{mode}: elementwise+GEMM capture/replay succeeded"}))
 except Exception as e:
     print(json.dumps({"ok": False, "detail": f"{type(e).__name__}: {str(e)[:160]}"}))
 """
+
+
+# Capture-probe variants, tried in order (Inc 6, .plans/rocm-perf-parity). Each entry
+# is (name, extra_env, child_mode). "rocblas" forces the rocBLAS GEMM path via
+# TORCH_BLAS_PREFER_HIPBLASLT=0 — hipBLASLt is the capture abort's usual suspect on
+# gfx1100. "prewarm" pre-runs the GEMM outside capture (workspace pre-alloc). The
+# winning variant's env must be applied to the engine worker process at SPAWN time
+# (server/launch.py) — never late at capture time, where a late env write may no-op.
+_GRAPH_VARIANTS: tuple[tuple[str, dict[str, str], str], ...] = (
+    ("default", {}, "plain"),
+    ("rocblas", {"TORCH_BLAS_PREFER_HIPBLASLT": "0"}, "plain"),
+    ("prewarm", {}, "prewarm"),
+    ("rocblas_prewarm", {"TORCH_BLAS_PREFER_HIPBLASLT": "0"}, "prewarm"),
+)
 
 
 def _load_cached() -> dict | None:
@@ -152,6 +208,10 @@ def _load_cached() -> dict | None:
         if (
             data.get("device_kind") == _device_kind()
             and data.get("device") == _device_name()
+            # v2 cache format: carries the winning "variant"/"env". An old all-FAIL
+            # record (no variant) must not mask a possible variant PASS after a
+            # ROCm/driver upgrade.
+            and "variant" in data
         ):
             return data
     except Exception:

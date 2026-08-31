@@ -136,12 +136,15 @@ class GraphRunner:
         # viable on this AMD card, skip graphs entirely so decode uses the kernel-launch
         # path (correct, just not graph-accelerated) rather than erroring mid-capture.
         from freetoken.utils.arch import is_rocm
-        from freetoken.utils.graph_gate import graph_capture_status
+        from freetoken.utils.graph_gate import graph_capture_status, run_graph_gate
 
         if is_rocm() and graph_capture_status() == "fail":
+            # Variant detail matters: the all-variants record is what closes the thread.
+            detail = run_graph_gate().get("detail", "")
             logger.info_rank0(
-                "AMD ROCm build: HIP graph capture gate FAILED on this device; "
-                "using the kernel-launch decode path (CUDA graphs disabled)."
+                "AMD ROCm build: HIP graph capture gate FAILED on this device (all "
+                f"capture variants: {detail[:160]}); using the kernel-launch decode "
+                "path (CUDA graphs disabled)."
             )
             return None
         if self.max_graph_bs == 0:
