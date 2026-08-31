@@ -17,20 +17,29 @@ class CacheRebuildRejected(Exception):
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
-    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads
+    x layers, priced from the KV quant spec's ``bytes_per_element`` (storage bytes per
+    element, scales amortized over the block) plus the bf16 DSA index-key slab when the
+    spec carries indexer dims. Pure per-spec arithmetic -- pool families compose it over
+    THEIR OWN groups; no family branching here. With quantization disabled this is the
+    compute dtype's itemsize (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
+    hardcodes; keep the two in lockstep if the slab dtype ever changes) -- under an
+    active KV quant it is the quantized cost (e.g. 0.5625 for Q4_0), so the startup
+    budget solve and the rebuild validator never price a quantized cache at bf16.
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
-    per_token = (
+    from math import ceil
+
+    from .quant import NONE
+
+    quant = getattr(config, "kv_quant", NONE)
+    per_token = ceil(
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
         * spec.num_layers
+        * quant.bytes_per_element(config.dtype)
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
