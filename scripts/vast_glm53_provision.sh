@@ -4,6 +4,8 @@ set -Eeuo pipefail
 workspace="${WORKSPACE_DIR:-/workspace}"
 freetoken_dir="${TEKIZAI_FREETOKEN_DIR:-${workspace}/freetoken}"
 model_dir="${TEKIZAI_FREETOKEN_MODEL_PATH:-${workspace}/models/GLM-5.3-Flash-NVFP4}"
+model_source_dir="${TEKIZAI_MODEL_SOURCE_PATH:-$model_dir}"
+convert_ftw="${TEKIZAI_CONVERT_FTW:-0}"
 worker_source_dir="${TEKIZAI_WORKER_SOURCE_DIR:-${workspace}/vast-pyworker}"
 pyworker_uv_cache="${TEKIZAI_PYWORKER_UV_CACHE:-${workspace}/pyworker-uv-cache}"
 repo="${TEKIZAI_FREETOKEN_REPO:-https://github.com/earlvanze/FreeToken.git}"
@@ -12,8 +14,9 @@ expected_commit="${TEKIZAI_FREETOKEN_EXPECTED_COMMIT:-}"
 model_repo="${TEKIZAI_MODEL_REPO:-LibertAIDAI/GLM-5.3-Flash-NVFP4}"
 bootstrap_ref="${TEKIZAI_PYWORKER_BOOTSTRAP_REF:-2207a3f94b55a0921c1641520eeb83de5a0c1611}"
 bootstrap="${workspace}/vast-pyworker-bootstrap.sh"
-provision_marker="${workspace}/.tekizai-glm53-provisioned"
+provision_marker="${TEKIZAI_PROVISION_MARKER:-${workspace}/.tekizai-glm53-provisioned}"
 provision_marker_value="${expected_commit:-$ref}"
+model_bench_dtype="${TEKIZAI_MODEL_BENCH_DTYPE:-nvfp4}"
 
 export DEBIAN_FRONTEND=noninteractive
 export PATH="${HOME}/.local/bin:${PATH}"
@@ -87,7 +90,7 @@ download_model() {
   local attempt status
   for attempt in 1 2 3 4 5; do
     echo "FREETOKEN_PROVISION_STAGE=model_download attempt=${attempt}"
-    if uvx --from huggingface-hub==1.29.0 hf download "$model_repo" --local-dir "$model_dir"; then
+    if uvx --from huggingface-hub==1.29.0 hf download "$model_repo" --local-dir "$model_source_dir"; then
       echo "FREETOKEN_PROVISION_STAGE=model_download_complete"
       return 0
     else
@@ -155,8 +158,18 @@ fi
 uv pip install --python "$freetoken_dir/.venv/bin/python" -e "$freetoken_dir[accel]"
 
 wait "$model_download_pid"
+if [[ "$convert_ftw" == "1" ]] && [[ ! -s "$model_dir/freetoken.index.json" ]]; then
+  echo "FREETOKEN_PROVISION_STAGE=ftw_conversion"
+  rm -rf "$model_dir"
+  FREETOKEN_SKIP_BANK_PIN=1 \
+    "$freetoken_dir/.venv/bin/ft" checkpoint \
+      --model "$model_source_dir" \
+      --out "$model_dir" \
+      --moe-backend offload
+  echo "FREETOKEN_PROVISION_STAGE=ftw_conversion_complete"
+fi
 echo "FREETOKEN_PROVISION_STAGE=bandwidth_check"
-"$freetoken_dir/.venv/bin/ft" bench bw --dtype nvfp4
+"$freetoken_dir/.venv/bin/ft" bench bw --dtype "$model_bench_dtype"
 
 printf '%s\n' "$provision_marker_value" >"$provision_marker"
 
