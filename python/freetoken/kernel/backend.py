@@ -56,17 +56,6 @@ def is_rocm() -> bool:
 
 
 @functools.cache
-def driver_hip_version() -> int | None:
-    """ROCm driver version, or None if undetermined."""
-    # TODO(ROCm): flashinfer/sgl_kernel have no ROCm builds — Triton fallback is used.
-    try:
-        from freetoken.kernel.pinned import _load_pinned_extension
-        return int(_load_pinned_extension().driver_cuda_version()) or None
-    except Exception:
-        return None
-
-
-@functools.cache
 def driver_cuda_version() -> int | None:
     """Max CUDA version the installed NVIDIA driver supports (``13000`` == CUDA 13.0),
     or None if undetermined. Driver-JIT kernels (PTX compiled at runtime, e.g.
