@@ -1,5 +1,12 @@
 #pragma once
 
+// MSVC has no __always_inline (a sys/cdefs.h / GCC predefined macro); its
+// equivalent is __forceinline. The kernel headers use __always_inline
+// throughout, so alias it before anything includes them.
+#if defined(_MSC_VER) && !defined(__always_inline)
+#define __always_inline __forceinline
+#endif
+
 // ref:
 // https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__
