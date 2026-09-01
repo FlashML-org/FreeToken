@@ -30,6 +30,42 @@ def test_fused_topk_keeps_reference_router_on_rocm(monkeypatch):
     assert got_ids is ids
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_rocm_grouped_moe_alignment_assigns_each_routed_expert():
+    """The ROCm alignment path must not collapse all grouped blocks onto expert zero."""
+    from freetoken.kernel.backend import is_rocm_runtime
+
+    if not is_rocm_runtime():
+        pytest.skip("ROCm-specific grouped-MoE regression")
+
+    from freetoken.moe.fused import moe_align_block_size
+
+    # Each flattened route names a distinct expert.  With a 16-row grouped
+    # block each route consumes exactly one padded block, making ownership
+    # unambiguous and exposing the former gfx1151 small-alignment defect.
+    topk_ids = torch.tensor(
+        [[31, 4, 18, 0], [29, 7, 35, 12], [6, 21, 1, 33], [16, 3, 28, 9]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size=16, num_experts=37
+    )
+    torch.cuda.synchronize()
+
+    padded = int(num_tokens_post_padded.cpu())
+    routed_experts = sorted(set(topk_ids.flatten().cpu().tolist()))
+    block_experts = expert_ids[: padded // 16].cpu().tolist()
+    routed_tokens = sorted_ids[:padded].cpu()
+
+    assert padded == topk_ids.numel() * 16
+    assert block_experts == routed_experts
+    assert sorted(routed_tokens[routed_tokens < topk_ids.numel()].tolist()) == list(
+        range(topk_ids.numel())
+    )
+    assert torch.all(routed_tokens[(routed_tokens >= topk_ids.numel())] == topk_ids.numel())
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
