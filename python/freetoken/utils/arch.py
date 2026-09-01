@@ -14,6 +14,13 @@ def _get_torch_cuda_version() -> Tuple[int, int] | None:
     return torch.cuda.get_device_capability()
 
 
+def is_hip() -> bool:
+    """Running on the ROCm/HIP build of torch."""
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
 def is_arch_supported(major: int, minor: int = 0) -> bool:
     """capability >= (major, minor). Open-ended: newer archs also pass. Only use this
     for family-portable features (e.g. PDL); arch-specific kernels (sm_90a/sm_100a
