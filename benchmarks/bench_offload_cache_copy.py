@@ -35,7 +35,7 @@ class ModelProfile:
 
 MODELS = {
     "qwen3.5-35B": ModelProfile(40, 256, 8, "bf16", 2048, 512),
-    # Qwen3.6-35B-A3B-NVFP4 on LAN-223: 40 MoE layers, 256 experts, top-8,
+    # Qwen3.6-35B-A3B-NVFP4 on GMKtec EVO-X2: 40 MoE layers, 256 experts, top-8,
     # H=2048, I=512. This is the production inline-dequant six-bank layout,
     # not the older BF16 Qwen3.5 profile above.
     "qwen3.6-35B-nvfp4": ModelProfile(40, 256, 8, "nvfp4", 2048, 512),

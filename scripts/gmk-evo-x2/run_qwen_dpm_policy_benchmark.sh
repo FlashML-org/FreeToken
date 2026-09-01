@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the isolated LAN-223 Qwen scheduler workload with a temporary GPU DPM policy.
+# Run the isolated GMKtec EVO-X2 Qwen scheduler workload with a temporary GPU DPM policy.
 #
 # This wrapper exists because the normal scheduler harness deliberately refuses an
 # already-existing artifact directory, whereas policy telemetry must be written
@@ -9,7 +9,7 @@
 # The script changes only GPU DPM policy for the duration of its own process.
 # Its EXIT trap restores the requested prior policy even if the benchmark fails.
 # It neither starts nor stops FreeToken, touches llama-swap, nor contacts a host
-# other than LAN-223's local API endpoint through the delegated harness.
+# other than GMKtec EVO-X2's local API endpoint through the delegated harness.
 
 set -euo pipefail
 

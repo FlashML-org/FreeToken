@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect a ROCm rocprofv3 SQLite trace without requiring the sqlite3 CLI.
 
-This LAN-223 helper is deliberately read-only.  It inventories the database
+This GMKtec EVO-X2 helper is deliberately read-only.  It inventories the database
 schema first, then prints one representative row from each trace table so a
 subsequent aggregation can use the exact ROCm-version-specific column names.
 """

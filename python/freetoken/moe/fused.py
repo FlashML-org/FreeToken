@@ -47,7 +47,7 @@ def fused_topk(
     from freetoken.kernel.backend import is_rocm_runtime, is_triton_kernels_installed
 
     # The in-tree HIP router is independently parity-tested and has passed the
-    # LAN-223 end-to-end Qwen quality control at least as fast as the matching
+    # GMKtec EVO-X2 end-to-end Qwen quality control at least as fast as the matching
     # ROCm llama.cpp control.  Make it the native ROCm default.  An operator can
     # still set this to ``0`` to reproduce the PyTorch reference route during a
     # diagnosis without changing model weights or server configuration.
@@ -61,7 +61,7 @@ def fused_topk(
 
     # OpenAI's triton_kernels package distributes CUDA-only binaries. The
     # in-tree Triton router is useful for research on HIP, but it changed a
-    # deterministic Qwen AIME output on LAN-223 despite matching router values
+    # deterministic Qwen AIME output on GMKtec EVO-X2 despite matching router values
     # in isolation. Production ROCm therefore retains this exact PyTorch route
     # until an end-to-end quality-equivalent replacement is demonstrated.
     if not is_triton_kernels_installed():

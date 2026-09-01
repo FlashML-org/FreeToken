@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure a deterministic LAN-223 multi-turn state-retention control.
+"""Measure a deterministic GMKtec EVO-X2 multi-turn state-retention control.
 
 This is a bounded intermediate workload between single prompts and the
 FreeToken paper's tool-using agents. Each turn receives the full prior visible
@@ -33,7 +33,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path(__file__).with_name("multiturn_state_suite.json"),
         type=Path,
     )
-    parser.add_argument("--expected-host", default="lan-223")
+    parser.add_argument("--expected-host", default="david-Gmktec-x2-2")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     args = parser.parse_args(argv)

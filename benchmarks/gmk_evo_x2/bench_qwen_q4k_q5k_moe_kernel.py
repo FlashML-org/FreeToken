@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the exact Qwen3.6 Q4_K and Q5_K routed-MoE kernels on LAN-223.
+"""Measure the exact Qwen3.6 Q4_K and Q5_K routed-MoE kernels on GMKtec EVO-X2.
 
 This screening benchmark reads real packed rows from the qualified Qwen3.6
 Q4_K_M GGUF instead of manufacturing bytes.  It copies eight actual experts

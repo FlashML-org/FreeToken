@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the isolated FreeToken Qwen NVFP4 recovery server on LAN-223.
+# Start the isolated FreeToken Qwen NVFP4 recovery server on GMKtec EVO-X2.
 #
 # This script never touches systemd, llama-swap, or the masked production
 # llama.cpp service on port 18302. It launches one loopback-only FreeToken
@@ -23,7 +23,7 @@ readonly ROCM_KERNEL_CACHE_DIR="${FREETOKEN_ROCM_KERNEL_CACHE_DIR:-${ROOT_DIR}/c
 readonly MEMORY_RATIO="${FREETOKEN_MEMORY_RATIO:-0.35}"
 # The previous 2,048-token reserve made the advertised 8,192-token sequence
 # limit unreachable because --moe-cache-auto allocated the remaining budget to
-# experts.  LAN-223 validation proved an 8,192-token reserve keeps zero swap,
+# experts.  GMKtec EVO-X2 validation proved an 8,192-token reserve keeps zero swap,
 # preserves short-decode TPS, and enables a real 6,856-token cold-prefill test.
 # Permit a small, explicit set of recovery overrides for isolated experiments.
 readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"
@@ -137,7 +137,7 @@ fi
     'import freetoken.kernel._pinned_tensor as pinned; print(pinned.__file__)' \
     >"${NATIVE_IMPORT_LOG}"
 
-# The fixed policy is the validated LAN-223 Qwen configuration. The default
+# The fixed policy is the validated GMKtec EVO-X2 Qwen configuration. The default
 # 0.35 memory budget and 8,192-token KV reserve make the advertised context
 # limit real while --moe-cache-auto retains as many MoE experts as safely fit.
 # A constrained environment override supports isolated cache-capacity controls

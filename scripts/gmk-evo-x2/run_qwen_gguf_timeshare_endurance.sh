@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a long isolated Q4 endurance battery and restore LAN-223's NVFP4 service.
+# Run a long isolated Q4 endurance battery and restore GMKtec EVO-X2's NVFP4 service.
 #
 # This controller owns one deliberate GPU time-share window. It does not touch
 # llama-swap or any LAN endpoint. It stops the verified dedicated loopback

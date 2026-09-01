@@ -371,7 +371,7 @@ def decode_paged_attention(
     """SGLang-style split-k grouped decode attention for one query per request.
 
     The ``rocm_*_probe`` arguments are benchmark-only HIP controls. They let
-    LAN-223 measure a query-head tile, KV block length, or launch warp count
+    GMKtec EVO-X2 measure a query-head tile, KV block length, or launch warp count
     without changing the serving defaults. Normal callers leave every probe
     argument ``None`` and preserve the established ROCm configuration.
     """

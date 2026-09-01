@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the LAN-223 ROCm llama.cpp Qwen control after temporarily releasing the
+# Run the GMKtec EVO-X2 ROCm llama.cpp Qwen control after temporarily releasing the
 # isolated FreeToken benchmark server, then recover and validate FreeToken.
 #
 # A 64 GB Strix Halo host cannot keep the current FreeToken NVFP4 Qwen service
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-# Keep the fixed LAN-223 paths explicit to prevent comparison with another
+# Keep the fixed GMKtec EVO-X2 paths explicit to prevent comparison with another
 # llama.cpp build or benchmark harness revision.
 readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"

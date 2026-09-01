@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify LAN-223 Qwen output stability with the historical AIME-25 workload.
+"""Verify GMKtec EVO-X2 Qwen output stability with the historical AIME-25 workload.
 
 The benchmark uses the same question, greedy sampling, thinking-enabled template,
 and forced 128-token decode that exposed the rejected HIP router candidate. It
@@ -19,7 +19,7 @@ from types import SimpleNamespace
 # Permit the helper to run from any working directory. The benchmark module is
 # intentionally kept at the repository root rather than installed into the
 # runtime wheel, so add that root before importing it. This keeps the quality
-# gate reproducible on LAN-223 without relying on a caller to append `.` to
+# gate reproducible on GMKtec EVO-X2 without relying on a caller to append `.` to
 # PYTHONPATH by hand.
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 if str(SOURCE_ROOT) not in sys.path:

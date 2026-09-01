@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "description": "Small deterministic Qwen API quality suite for LAN-223. This is a local control, not the FreeToken paper workload.",
+  "description": "Small deterministic Qwen API quality suite for GMKtec EVO-X2. This is a local control, not the FreeToken paper workload.",
   "cases": [
     {
       "id": "canary_exact",
-      "prompt": "Return exactly the word LAN223 and nothing else. Do not add punctuation.",
-      "check": {"kind": "exact", "value": "LAN223"}
+      "prompt": "Return exactly the word GMK_EVO_X2 and nothing else. Do not add punctuation.",
+      "check": {"kind": "exact", "value": "GMK_EVO_X2"}
     },
     {
       "id": "arithmetic_exact",

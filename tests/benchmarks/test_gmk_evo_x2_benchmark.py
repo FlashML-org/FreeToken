@@ -1,4 +1,4 @@
-"""Unit tests for the LAN-223 Qwen API benchmark safety primitives."""
+"""Unit tests for the GMKtec EVO-X2 Qwen API benchmark safety primitives."""
 
 from __future__ import annotations
 
@@ -24,18 +24,18 @@ from benchmarks.gmk_evo_x2.summarize_qwen_gguf_endurance import summarize
 class RequireExpectedHostTests(unittest.TestCase):
     """Exercise the host guard without requiring any third-party test package."""
 
-    def test_accepts_lan223_short_name(self) -> None:
-        """The harness accepts the exact LAN-223 host name used by the test policy."""
+    def test_accepts_gmk_evo_x2_short_name(self) -> None:
+        """The harness accepts the exact GMKtec EVO-X2 host name used by the test policy."""
 
-        with patch("socket.gethostname", return_value="lan-223"):
-            self.assertEqual(require_expected_host("lan-223"), "lan-223")
+        with patch("socket.gethostname", return_value="david-Gmktec-x2-2"):
+            self.assertEqual(require_expected_host("david-Gmktec-x2-2"), "david-gmktec-x2-2")
 
     def test_rejects_other_hosts(self) -> None:
         """The harness prevents accidental benchmark traffic to any other LAN machine."""
 
         with patch("socket.gethostname", return_value="lan-199"):
             with self.assertRaisesRegex(RuntimeError, "refusing benchmark"):
-                require_expected_host("lan-223")
+                require_expected_host("david-Gmktec-x2-2")
 
     def test_throughput_mode_requires_two_requested_tokens(self) -> None:
         """The TPS mode rejects a one-token interval before it can produce nonsense."""
@@ -87,8 +87,8 @@ class QualitySuiteCheckTests(unittest.TestCase):
     def test_exact_check_accepts_only_visible_exact_text(self) -> None:
         """Whitespace around an otherwise exact completion is acceptable."""
 
-        self.assertEqual(evaluate_check(" LAN223\n", {"kind": "exact", "value": "LAN223"}), (True, None))
-        self.assertFalse(evaluate_check("LAN223!", {"kind": "exact", "value": "LAN223"})[0])
+        self.assertEqual(evaluate_check(" GMK_EVO_X2\n", {"kind": "exact", "value": "GMK_EVO_X2"}), (True, None))
+        self.assertFalse(evaluate_check("GMK_EVO_X2!", {"kind": "exact", "value": "GMK_EVO_X2"})[0])
 
     def test_json_fields_check_rejects_nonvisible_or_wrong_structure(self) -> None:
         """The gate requires a valid visible JSON object with the requested fields."""
@@ -166,7 +166,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """Recovery must make later GPU handoff safe for isolated ROCm candidates."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        recovery = repository_root / "scripts" / "lan223" / "start_qwen_recovery_server.sh"
+        recovery = repository_root / "scripts" / "gmk-evo-x2" / "start_qwen_recovery_server.sh"
         stopper = repository_root / "scripts" / "gmk-evo-x2" / "stop_qwen_recovery_server.sh"
 
         self.assertIn('setsid nohup "${VENV_PYTHON}" -m freetoken.cli serve', recovery.read_text(encoding="utf-8"))
@@ -205,7 +205,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """A clean candidate must not fail at runtime due to a missing HIP extension."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        launcher = repository_root / "scripts" / "lan223" / "launch_qwen_gguf_qualified.sh"
+        launcher = repository_root / "scripts" / "gmk-evo-x2" / "launch_qwen_gguf_qualified.sh"
         contents = launcher.read_text(encoding="utf-8")
 
         self.assertIn('readonly NATIVE_BUILD_LOG="${ARTIFACT_DIR}/native-extension-build.log"', contents)
@@ -219,7 +219,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_multiturn_battery.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
-        self.assertIn('readonly MAX_SWAP_KIB="${LAN223_BATTERY_MAX_SWAP_KIB:-64}"', contents)
+        self.assertIn('readonly MAX_SWAP_KIB="${GMK_EVO_X2_BATTERY_MAX_SWAP_KIB:-64}"', contents)
         self.assertIn('refusing multi-turn battery with swap in use: ${used} KiB exceeds ${MAX_SWAP_KIB} KiB', contents)
         self.assertIn('if (( used > MAX_SWAP_KIB )); then', contents)
         self.assertIn('assert_clean_swap\ncurl -fsS', contents)
@@ -227,7 +227,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
 
 
 class ConcurrentControlArgumentTests(unittest.TestCase):
-    """Reject nonsensical concurrent workloads before they can reach LAN-223."""
+    """Reject nonsensical concurrent workloads before they can reach GMKtec EVO-X2."""
 
     def test_concurrency_must_be_positive(self) -> None:
         """Zero clients has no latency or throughput meaning."""
@@ -291,7 +291,7 @@ class LlamaCppControlScriptTests(unittest.TestCase):
 
         self.assertIn('readonly BASE_URL="http://127.0.0.1:1921/v1"', contents)
         self.assertIn('trap cleanup_server EXIT', contents)
-        self.assertIn('LAN223_QWEN_BASE_URL="${BASE_URL}"', contents)
+        self.assertIn('GMK_EVO_X2_QWEN_BASE_URL="${BASE_URL}"', contents)
         self.assertIn('run_qwen_scheduler_baseline.sh', contents)
         self.assertIn('--port 1921', contents)
 

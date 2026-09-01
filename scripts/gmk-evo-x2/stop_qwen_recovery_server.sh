@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop only the LAN-223 loopback NVFP4 recovery server as one process group.
+# Stop only the GMKtec EVO-X2 loopback NVFP4 recovery server as one process group.
 #
 # The FreeToken frontend creates scheduler and tokenizer child processes. A
 # parent-only signal can leave one of those children holding GPU memory or the

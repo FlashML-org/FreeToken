@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure one isolated FP8 W8A16 GEMV tile on LAN-223's native HIP path.
+"""Measure one isolated FP8 W8A16 GEMV tile on GMKtec EVO-X2's native HIP path.
 
 This is deliberately a kernel screen, not a model-quality benchmark.  It uses
 one of Qwen3.6's common ``[N, 2048]`` dense projection shapes, deterministic

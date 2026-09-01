@@ -1,4 +1,4 @@
-"""Measure the dense native-GGUF Q4_0 vector kernels used by Gemma 4 on LAN-223.
+"""Measure the dense native-GGUF Q4_0 vector kernels used by Gemma 4 on GMKtec EVO-X2.
 
 The Gemma 4 26B A4B Q4_0 checkpoint has four recurring dense projection
 geometries.  They are supplied as defaults here so a HIP optimization can be
@@ -27,7 +27,7 @@ from freetoken.kernel.gguf import ggml_mul_mat_vec_a8
 from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
 
 
-# Output rows and input columns, recovered from the exact LAN-223 Gemma GGUF.
+# Output rows and input columns, recovered from the exact GMKtec EVO-X2 Gemma GGUF.
 DEFAULT_SHAPES = ((2816, 4096), (8192, 2816), (4224, 2816), (10240, 2816))
 
 

@@ -1,12 +1,12 @@
-# LAN-223 Qwen API replication harness
+# GMKtec EVO-X2 Qwen API replication harness
 
 `run_api_benchmark.py` measures a running local FreeToken server through its
 OpenAI-compatible streaming API. It does not start a service, modify model
 files, change llama-swap, or contact another LAN host. The script refuses to
-run unless the operating system host name is LAN-223 or an explicitly supplied
+run unless the operating system host name is GMKtec EVO-X2 or an explicitly supplied
 test host.
 
-Run a quality canary on LAN-223 from the isolated FreeToken environment after
+Run a quality canary on GMKtec EVO-X2 from the isolated FreeToken environment after
 the server is already warm:
 
 ```bash

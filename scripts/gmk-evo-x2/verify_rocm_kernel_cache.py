@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove that a LAN-223 FreeToken C++ and HIP cache resolves without JIT.
+"""Prove that a GMKtec EVO-X2 FreeToken C++ and HIP cache resolves without JIT.
 
 The cache builder records successful compilation, but a file count alone cannot
 prove that every shared object is loadable by the current Python, TVM FFI, ROCm
@@ -9,7 +9,7 @@ load itself. A missing object or ABI mismatch fails immediately because runtime
 compilation remains disabled throughout the check.
 
 This utility never starts a server, loads a model checkpoint, mutates a cache,
-or contacts any non-LAN-223 endpoint.
+or contacts any non-GMKtec EVO-X2 endpoint.
 """
 
 from __future__ import annotations

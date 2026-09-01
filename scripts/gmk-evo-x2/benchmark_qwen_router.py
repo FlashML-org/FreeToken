@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare Qwen's production MoE router with FreeToken's HIP Triton candidate.
 
-This LAN-223-only diagnostic does not load a model or modify a server. It uses
+This GMKtec EVO-X2-only diagnostic does not load a model or modify a server. It uses
 Qwen3.6's 256-expert, top-8 router shape, checks every candidate result against
 the current PyTorch reference, and reports synchronized GPU timings as JSON.
 """
@@ -61,7 +61,7 @@ def main() -> None:
     """Emit machine-readable parity and timing evidence for decode and small batches."""
 
     if not torch.cuda.is_available():
-        raise RuntimeError("this diagnostic requires LAN-223's native ROCm device")
+        raise RuntimeError("this diagnostic requires GMKtec EVO-X2's native ROCm device")
     result = {
         "schema_version": 1,
         "device": torch.cuda.get_device_name(),

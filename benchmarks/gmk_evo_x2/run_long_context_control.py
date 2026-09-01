@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Measure deterministic long-context retrieval on the isolated LAN-223 API.
+"""Measure deterministic long-context retrieval on the isolated GMKtec EVO-X2 API.
 
 This tool deliberately covers the context range exposed by the running Qwen
-server.  It is a LAN-223 control, not a replication of the FreeToken paper's
+server.  It is a GMKtec EVO-X2 control, not a replication of the FreeToken paper's
 much longer agent sessions.  It places an exact marker at the start of a
 deterministic prompt, asks the model to retrieve only that marker, records
 every visible SSE event and refuses to overwrite an existing artifact.
@@ -67,7 +67,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--base-url", default="http://127.0.0.1:1919/v1")
     parser.add_argument("--model", required=True)
     parser.add_argument("--artifact", required=True, type=Path)
-    parser.add_argument("--expected-host", default="lan-223")
+    parser.add_argument("--expected-host", default="david-Gmktec-x2-2")
     parser.add_argument("--filler-repetitions", type=int, required=True)
     parser.add_argument(
         "--sample-variation",
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     artifact = {
         "schema_version": 1,
         "host": host,
-        "classification": "LAN-223 long-context control, not paper replication",
+        "classification": "GMKtec EVO-X2 long-context control, not paper replication",
         "request": {
             "base_url": args.base_url,
             "model": args.model,

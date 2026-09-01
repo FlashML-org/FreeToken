@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a reusable native ROCm kernel cache for FreeToken on LAN-223.
+# Build a reusable native ROCm kernel cache for FreeToken on GMKtec EVO-X2.
 #
 # FreeToken's C++/HIP helper kernels normally compile on their first matching
 # call when no prebuilt cache is configured. This builder compiles the complete
@@ -66,7 +66,7 @@ build_dir = pathlib.Path(sys.argv[2])
 if torch.version.hip is None:
     raise SystemExit("refusing to build a ROCm cache with a non-HIP PyTorch runtime")
 if "gfx1151" not in torch.cuda.get_device_name().lower() and "8060" not in torch.cuda.get_device_name().lower():
-    raise SystemExit(f"refusing non-LAN-223 GPU: {torch.cuda.get_device_name()}")
+    raise SystemExit(f"refusing non-GMKtec EVO-X2 GPU: {torch.cuda.get_device_name()}")
 
 specs = default_kernel_specs()
 paths = compile_and_package_kernels(

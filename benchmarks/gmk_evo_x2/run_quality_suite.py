@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a small, versioned quality suite against the LAN-223 Qwen API.
+"""Run a small, versioned quality suite against the GMKtec EVO-X2 Qwen API.
 
 The suite is intentionally separate from the paper's agent workloads. It
 provides a repeatable precondition for local performance changes: every
@@ -33,7 +33,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         help="versioned JSON fixture defining prompts and deterministic checks",
     )
-    parser.add_argument("--expected-host", default="lan-223")
+    parser.add_argument("--expected-host", default="david-Gmktec-x2-2")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     args = parser.parse_args(argv)

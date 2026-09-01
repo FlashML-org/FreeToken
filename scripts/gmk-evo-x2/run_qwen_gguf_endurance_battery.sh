@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run an isolated, process-scoped Qwen GGUF endurance battery on LAN-223.
+# Run an isolated, process-scoped Qwen GGUF endurance battery on GMKtec EVO-X2.
 #
 # Linux reports swap for every desktop and monitoring process.  A system-wide
 # zero-swap requirement can therefore reject a healthy model server because an
@@ -19,7 +19,7 @@ readonly SESSION_COUNT="${2:-60}"
 # of compressing every request into a short throughput-only batch.
 readonly INTERVAL_SECONDS="${3:-60}"
 
-# Keep all fixed LAN-223 paths explicit for reproducibility and host isolation.
+# Keep all fixed GMKtec EVO-X2 paths explicit for reproducibility and host isolation.
 readonly ROOT_DIR="/home/david/freetoken-amd"
 # Allow an isolated candidate worktree to reuse the exact endurance contract.
 # The caller must choose a path under the dedicated Qwen source root, so this

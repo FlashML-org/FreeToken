@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a secret-free, read-only LAN-223 ROCm baseline for a FreeToken run.
+# Capture a secret-free, read-only GMKtec EVO-X2 ROCm baseline for a FreeToken run.
 #
 # The script intentionally does not start a server, alter GPU clocks, install
 # packages, delete cache entries, or edit system configuration.  It records
@@ -12,7 +12,7 @@ set -euo pipefail
 
 # Keep the output path explicit.  A caller may pass a unique campaign folder;
 # the default is suitable only for a one-off local capture.
-output_dir="${1:-./artifacts/lan223-baseline-$(date -u +%Y%m%dT%H%M%SZ)}"
+output_dir="${1:-./artifacts/gmk_evo_x2-baseline-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 # Accept the GGUF path as an optional second argument.  Hashing the exact
 # payload prevents a same-name but different model file from contaminating a
@@ -27,7 +27,7 @@ llama_binary="${3:-}"
 # independent of the shell's starting directory.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Prefer an explicit virtual environment, then support FreeToken's LAN-223
+# Prefer an explicit virtual environment, then support FreeToken's GMKtec EVO-X2
 # layout where the environment is a sibling of the source checkout, and finally
 # support a conventional in-repository `.venv`.  Resolving this once prevents
 # later runtime probes from silently using the system Python.

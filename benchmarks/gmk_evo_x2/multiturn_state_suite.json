@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Bounded multi-turn state-retention control for LAN-223. It is not a replacement for the paper's coding-agent workflows.",
+  "description": "Bounded multi-turn state-retention control for GMKtec EVO-X2. It is not a replacement for the paper's coding-agent workflows.",
   "turns": [
     {
       "id": "remember",

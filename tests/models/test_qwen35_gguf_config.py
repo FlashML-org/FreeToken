@@ -1,6 +1,6 @@
 """Unit tests for the metadata-only Qwen3.5 MoE GGUF configuration adapter.
 
-These tests use the public Qwen3.6-35B-A3B GGUF geometry recorded on LAN-223.
+These tests use the public Qwen3.6-35B-A3B GGUF geometry recorded on GMKtec EVO-X2.
 They prove the parser's architecture translation without requiring a 22 GiB model
 file or a GPU in the test process.
 """

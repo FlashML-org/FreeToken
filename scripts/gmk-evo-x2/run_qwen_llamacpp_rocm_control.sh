@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the isolated ROCm 10 llama.cpp Qwen3.6-35B-A3B control on LAN-223.
+# Run the isolated ROCm 10 llama.cpp Qwen3.6-35B-A3B control on GMKtec EVO-X2.
 #
 # This script intentionally starts a short-lived loopback-only llama.cpp server
 # on port 1921. It never contacts llama-swap, modifies its configuration, stops
@@ -67,7 +67,7 @@ trap cleanup_server EXIT
 
 # Start the exact ROCm 10 b10141 control on an otherwise unused loopback port.
 # One slot, 8,192 context tokens, full GPU offload, Flash Attention, and Q8 KV
-# cache retain the previously documented LAN-223 ROCm control conventions.
+# cache retain the previously documented GMKtec EVO-X2 ROCm control conventions.
 "${LLAMA_SERVER}" \
     -m "${MODEL_FILE}" \
     --alias "${MODEL_NAME}" \
@@ -109,12 +109,12 @@ fi
 
 # Delegate the unchanged fixed workload to the existing harness while overriding
 # only endpoint identity and tokenizer location for this temporary control.
-LAN223_QWEN_BASE_URL="${BASE_URL}" \
-LAN223_QWEN_MODEL_NAME="${MODEL_NAME}" \
-LAN223_QWEN_TOKENIZER_DIR="${TOKENIZER_DIR}" \
+GMK_EVO_X2_QWEN_BASE_URL="${BASE_URL}" \
+GMK_EVO_X2_QWEN_MODEL_NAME="${MODEL_NAME}" \
+GMK_EVO_X2_QWEN_TOKENIZER_DIR="${TOKENIZER_DIR}" \
     bash "${SOURCE_DIR}/scripts/gmk-evo-x2/run_qwen_scheduler_baseline.sh" "${BENCHMARK_DIR}"
 
-if [[ "${LAN223_QWEN_QUALITY_SUITE:-}" == "1" ]]; then
+if [[ "${GMK_EVO_X2_QWEN_QUALITY_SUITE:-}" == "1" ]]; then
     # The optional suite uses only deterministic visible-output controls.  Keep
     # it opt-in so the normal throughput control remains unchanged, while a
     # paired quality campaign can run against this exact temporary ROCm server.

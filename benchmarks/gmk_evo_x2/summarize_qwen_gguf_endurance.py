@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and summarize a retained LAN-223 Qwen GGUF endurance artifact.
+"""Validate and summarize a retained GMKtec EVO-X2 Qwen GGUF endurance artifact.
 
 The endurance wrapper stores one JSON result and one process-scoped memory
 sample for each deterministic multi-turn conversation.  This program turns

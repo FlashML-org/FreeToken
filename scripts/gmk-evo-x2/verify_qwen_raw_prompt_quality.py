@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Capture a Qwen quality stream with one caller-rendered prompt.
 
-This LAN-223 control intentionally avoids ``/v1/chat/completions``.  Different
+This GMKtec EVO-X2 control intentionally avoids ``/v1/chat/completions``.  Different
 servers can legitimately ship different Jinja renderers for the same GGUF, which
 makes chat-token counts and output text incomparable even when their model
 execution is correct.  The script renders the request once with an explicit

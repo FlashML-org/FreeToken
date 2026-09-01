@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a read-only, secret-safe LAN-223 runtime manifest for one test run.
+# Capture a read-only, secret-safe GMKtec EVO-X2 runtime manifest for one test run.
 #
 # The collector never starts or stops a model server.  It creates a new artifact
 # directory, records only operational metadata needed to reproduce a benchmark,

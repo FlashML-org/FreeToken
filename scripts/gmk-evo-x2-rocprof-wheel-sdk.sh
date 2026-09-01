@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch rocprofv3 against the ROCm SDK bundled with the active PyTorch wheel.
 #
-# On LAN-223, FreeToken's PyTorch ROCm wheel loads its own LLVM and
+# On GMKtec EVO-X2, FreeToken's PyTorch ROCm wheel loads its own LLVM and
 # rocprofiler-sdk libraries.  Launching rocprofv3 against /opt/rocm injects a
 # second copy of LLVM, which aborts during `import torch` because LLVM command
 # line options are registered twice.  This wrapper selects the wheel's matching
@@ -19,7 +19,7 @@ if [[ "$#" -lt 1 ]]; then
   exit 64
 fi
 
-# Prefer an explicit virtual environment and otherwise use the LAN-223 layout
+# Prefer an explicit virtual environment and otherwise use the GMKtec EVO-X2 layout
 # where `.venv` is adjacent to the source checkout that contains this script.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 venv_root="${FREETOKEN_VENV_ROOT:-$(dirname "$repo_root")/.venv}"

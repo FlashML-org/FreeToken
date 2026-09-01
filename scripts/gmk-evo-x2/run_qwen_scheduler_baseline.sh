@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Measure warm Qwen decode throughput against the isolated LAN-223 FreeToken API.
+# Measure warm Qwen decode throughput against the isolated GMKtec EVO-X2 FreeToken API.
 #
 # The workload is deliberately a fixed 48-times scheduler paragraph. It preserves
-# the former 733-token-class LAN-223 baseline shape while remaining separate from
+# the former 733-token-class GMKtec EVO-X2 baseline shape while remaining separate from
 # the unrecovered upstream paper workload. This script neither starts nor stops a
-# server and never contacts llama-swap or any non-LAN-223 endpoint.
+# server and never contacts llama-swap or any non-GMKtec EVO-X2 endpoint.
 
 set -euo pipefail
 
@@ -17,9 +17,9 @@ readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 # explicitly named, isolated local control to reuse this exact workload.  The
 # optional overrides are intentionally not exported globally, so ordinary
 # service runs remain bound to port 1919 and the validated FreeToken model.
-readonly MODEL_DIR="${LAN223_QWEN_TOKENIZER_DIR:-${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4}"
-readonly MODEL_NAME="${LAN223_QWEN_MODEL_NAME:-qwen3.6-35b-a3b-nvfp4-amd}"
-readonly BASE_URL="${LAN223_QWEN_BASE_URL:-http://127.0.0.1:1919/v1}"
+readonly MODEL_DIR="${GMK_EVO_X2_QWEN_TOKENIZER_DIR:-${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4}"
+readonly MODEL_NAME="${GMK_EVO_X2_QWEN_MODEL_NAME:-qwen3.6-35b-a3b-nvfp4-amd}"
+readonly BASE_URL="${GMK_EVO_X2_QWEN_BASE_URL:-http://127.0.0.1:1919/v1}"
 readonly EXPECTED_HOST="david-Gmktec-x2-2"
 readonly BASE_PROMPT="The scheduler manages incoming inference requests by prioritizing, batching, and assigning them to available compute resources to optimize throughput and latency. "
 

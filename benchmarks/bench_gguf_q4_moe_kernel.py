@@ -1,7 +1,7 @@
 """Measure FreeToken's native GGUF Q4_0 MoE vector kernels in isolation.
 
 This benchmark deliberately uses the Gemma 4 26B A4B Q4_0 expert geometry
-observed on LAN-223: 128 routed experts, top-k 8, hidden width 2816, and MoE
+observed on GMKtec EVO-X2: 128 routed experts, top-k 8, hidden width 2816, and MoE
 intermediate width 704.  It is not a replacement for the end-to-end OpenAI API
 benchmark.  Instead, it supplies the kernel-level evidence needed before a HIP
 port changes Q4_0 launch geometry, indexing, or register use.
@@ -27,7 +27,7 @@ from freetoken.kernel.gguf import ggml_moe_a8_vec
 from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
 
 
-# These defaults are the verified LAN-223 Gemma 4 26B A4B Q4_0 dimensions.
+# These defaults are the verified GMKtec EVO-X2 Gemma 4 26B A4B Q4_0 dimensions.
 DEFAULT_EXPERTS = 128
 DEFAULT_TOP_K = 8
 DEFAULT_HIDDEN = 2816
