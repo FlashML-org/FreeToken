@@ -46,7 +46,11 @@ readonly PORT="1922"
 readonly INTERNAL_PORT="1923"
 # Keep HIP extension artifacts in the revisioned shared cache established by
 # the native strict no-JIT qualification rather than compiling per run.
-readonly EXTENSION_CACHE="${ROOT_DIR}/cache/torch_extensions"
+# Keep the default reusable extension cache for the qualified control, while
+# allowing an isolated candidate to select a dedicated cache directory.  The
+# validation below confines that override to the managed cache area so a shell
+# variable cannot redirect native-build output into the normal source tree.
+readonly EXTENSION_CACHE="${FREETOKEN_Q4_EXTENSION_CACHE_DIR:-${ROOT_DIR}/cache/torch_extensions}"
 # Store lifecycle data next to the supplied immutable test artifact.
 readonly PID_FILE="${ARTIFACT_DIR}/server.pid"
 readonly LOG_FILE="${ARTIFACT_DIR}/server.log"
@@ -112,6 +116,7 @@ validate_paths() {
     [[ -x "${ROOT_DIR}/.venv/bin/python" ]] || { echo "missing benchmark Python" >&2; return 1; }
     [[ "${MEMORY_RATIO}" =~ ^0\.[0-9]+$|^1\.0+$ ]] || { echo "invalid memory ratio: ${MEMORY_RATIO}" >&2; return 1; }
     [[ "${CUDA_GRAPH_MAX_BS}" =~ ^[0-9]+$ ]] || { echo "invalid CUDA graph max batch size: ${CUDA_GRAPH_MAX_BS}" >&2; return 1; }
+    [[ "${EXTENSION_CACHE}" == "${ROOT_DIR}/cache/"* ]] || { echo "extension cache must be under ${ROOT_DIR}/cache" >&2; return 1; }
 }
 
 case "${ACTION}" in
