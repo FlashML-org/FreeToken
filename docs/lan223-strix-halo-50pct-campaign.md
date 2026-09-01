@@ -239,3 +239,31 @@ samples.
 controls, but its 0.25 percent gain is below the one percent acceptance floor
 and is within normal run-to-run variation.  The change was reverted in
 `0a1b709`; its complete candidate artifact remains on LAN-223 for comparison.
+
+### C02: opt-in HIP unsafe-math optimizations
+
+Current llama.cpp HIP build guidance uses `-funsafe-math-optimizations`, which
+is narrower than `-ffast-math`.  The candidate made that flag opt-in through
+`FREETOKEN_HIP_GGUF_FAST_MATH=1`, so its generated HIP extension has a distinct
+build configuration and cannot alter the conservative default path.  It was
+built in clean worktree `dd8bc3b` and ran the exact qualified Q4 model, the
+three deterministic API controls, and the fixed 256-token throughput workload.
+
+| Measure | Stable baseline | C02 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Mean decode TPS | 47.960 | 41.391 | -13.70% |
+| Median decode TPS | 48.075 | 48.023 | -0.11% |
+| Best sample TPS | 48.075 | 48.558 | +1.00% |
+| p99 token gap | 0.02490 s | 0.02481 s | diagnostic only |
+| Quality controls | 3/3 pass | 3/3 pass | unchanged |
+
+One of the three candidate samples contained a 3.943-second token stall.  The
+other two samples were approximately 48 TPS, which is indistinguishable from
+the stable baseline and far below the campaign acceptance threshold.  The
+candidate therefore has no demonstrated decode gain, while its mean result is
+materially worse because of the stall.
+
+**Decision: rejected.** Preserve the raw quality and benchmark artifacts at
+`qwen35moe-q4-hipmath-20260901T081500Z` on LAN-223, but remove the experimental
+compiler flag from the branch.  Further work should target the measured Q4_K
+and Q5_K routed-MoE vector kernels, not generic compiler flags.
