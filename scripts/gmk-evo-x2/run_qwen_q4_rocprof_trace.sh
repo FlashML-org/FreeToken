@@ -56,6 +56,21 @@ wait_for_models() {
     return 1
 }
 
+# Wait for the scheduler's explicit ready record, not merely the frontend
+# listener.  Uvicorn answers `/v1/models` before the model scheduler has built
+# its expert banks, and requests during that interval correctly return HTTP 503.
+wait_for_scheduler_ready() {
+    local log_file="$1"
+    local attempts="$2"
+    for _ in $(seq 1 "${attempts}"); do
+        if [[ -f "${log_file}" ]] && rg -Fq 'API server is ready to serve' "${log_file}"; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 # Wait for a test listener to disappear before reusing the GPU or port.
 wait_for_port_clear() {
     for _ in $(seq 1 45); do
@@ -142,6 +157,7 @@ normal_was_stopped=1
 FREETOKEN_Q4_SOURCE_DIR="${SOURCE_DIR}" FREETOKEN_Q4_EXTENSION_CACHE_DIR="${EXTENSION_CACHE}" \
     bash "${Q4_LAUNCHER}" start "${PREWARM_DIR}" 0.25 0
 wait_for_models "${Q4_PORT}" 120 "${PREWARM_DIR}/models.json"
+wait_for_scheduler_ready "${PREWARM_DIR}/server.log" 120
 
 # Force one short deterministic request so startup and kernel compilation occur
 # before tracing.  The response is retained as evidence, not scored for TPS.
@@ -170,6 +186,7 @@ setsid nohup bash "${PROFILER_WRAPPER}" -d "${PROFILE_DIR}/rocprof" -f rocpd \
 profile_pid="$!"
 printf '%s\n' "${profile_pid}" >"${PROFILE_PID_FILE}"
 wait_for_models "${Q4_PORT}" 120 "${PROFILE_DIR}/models.json"
+wait_for_scheduler_ready "${PROFILE_LOG}" 120
 
 # Generate one bounded greedy request.  Its fixed shape gives the trace a clear
 # prefill and decode region while avoiding a variable reasoning-stream workload.
