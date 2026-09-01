@@ -533,3 +533,35 @@ matrix and concurrent workload with a fresh exact-Q4 reference before it can
 replace the 47.960-TPS baseline.  Preserve the quality artifacts
 `qwen-router-c08-quality-20260901T181143Z` and
 `qwen-router-c09-full-quality-20260901T183253Z` on GMKtec EVO-X2.
+
+### C10: router-only exact-Q4 API and concurrency matrix
+
+The clean router-only checkout then completed the fixed five-sample API matrix
+and the three-round concurrency controls.  This is the same checkout that
+passed C09 quality, with the rejected decode-wave experiment excluded.  The
+benchmark used the exact Q4 model, a fixed 48-line prompt, a 256-token single
+decode, and the model's valid tokenizer.  It was served only on the isolated
+loopback candidate port while the ordinary NVFP4 API was stopped by the
+recovery controller.
+
+| Workload | Mean throughput | p99 TTFT | p99 token gap |
+| --- | ---: | ---: | ---: |
+| Single request, five samples | 48.282 decode tokens/s | 0.432 s | 24.26 ms |
+| Concurrent 1, three rounds | 40.138 aggregate tokens/s | 0.436 s | 40.67 ms |
+| Concurrent 2, three rounds | 57.913 aggregate tokens/s | 0.854 s | 53.63 ms |
+| Concurrent 4, three rounds | 81.456 aggregate tokens/s | 1.174 s | 76.45 ms |
+
+The single-request result is 0.67 percent above the accepted 47.960-token/s
+baseline.  That is within normal run-to-run variation and below the campaign's
+minimum promotion gate of a repeatable one percent gain.  The candidate is
+therefore quality-qualified and load-stable, but it is not a new performance
+baseline and must not be promoted on this evidence alone.
+
+The controller stopped the candidate, restarted the ordinary NVFP4 API, and
+verified `status: ok`.  The recovered server PID, process-group ID, and session
+ID were identical, and no listener remained on the candidate port.  Preserve
+the complete artifact `qwen-router-c10-api-20260901T185412Z` on GMKtec EVO-X2.
+
+**Decision: do not promote.** Retain the current HIP Triton router as a
+quality-qualified route, but focus the next iteration on data movement and
+expert-cache work, where an end-to-end gain remains plausible.
