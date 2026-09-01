@@ -130,6 +130,11 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    # GLM-5.3-Flash (model_type glm5_next): hybrid KDA(34)+MLA/DSA(11) + mHC + NVFP4 experts.
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+    ),
 }
 
 

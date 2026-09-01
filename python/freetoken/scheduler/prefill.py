@@ -176,6 +176,14 @@ class PrefillAdder:
                 "Multimodal prompts must fit in a single prefill chunk; increase "
                 "--max-extend-tokens or shrink the prompt."
             )
+        mm_embeds = pending_req.mm_embeds
+        if mm_embeds is not None and cached_len > 0 and pending_req.cache_key_ids is not None:
+            # A cache hit may cover leading images (whole or partial spans -- content
+            # hashes guarantee a matched span is the SAME image). The extend only
+            # scatters the remaining placeholder rows; drop the covered ones. Image
+            # positions are exactly the negative key ids.
+            covered = int((pending_req.cache_key_ids[:cached_len] < 0).sum())
+            mm_embeds = mm_embeds[covered:]
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -184,10 +192,11 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=pending_req.mm_embeds,
+            mm_embeds=mm_embeds,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
+        req.cache_key_ids = pending_req.cache_key_ids
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
@@ -245,7 +254,13 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                cache_key_ids=getattr(req, "cache_key_ids", None),
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

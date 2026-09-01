@@ -23,6 +23,51 @@ from .effort import (
 logger = init_logger(__name__)
 
 
+def _expand_image_tokens(prompt: str, images: list) -> str:
+    """Expand multimodal placeholders in template order, mirroring
+    Glm5NextProcessor: the k-th ``<|image|>`` becomes grid.prod/merge^2 image
+    tokens; the k-th ``<|video|>`` becomes one frame block per temporal unit
+    (``<|begin_of_image|>`` + h*w/merge^2 image tokens + ``<|end_of_image|>`` +
+    "T.T seconds"). Placeholder kinds/counts must match the request payloads;
+    the model asserts the same token-count invariant at prefill."""
+    import re
+
+    from freetoken.models.glm5_next.image_process import IMAGE_TOKEN, MERGE
+
+    VIDEO_TOKEN = "<|video|>"
+    parts = re.split(r"(<\|image\|>|<\|video\|>)", prompt)
+    n_ph = sum(1 for p in parts if p in (IMAGE_TOKEN, VIDEO_TOKEN))
+    if n_ph != len(images):
+        raise ValueError(
+            f"prompt renders {n_ph} multimodal placeholders but the request "
+            f"carries {len(images)} payloads"
+        )
+    it = iter(images)
+    out = []
+    for p in parts:
+        if p == IMAGE_TOKEN:
+            d = next(it)
+            if d.get("kind", "image") != "image":
+                raise ValueError("placeholder order mismatch: expected an image payload")
+            t, gh, gw = d["grid"]
+            out.append(IMAGE_TOKEN * ((t * gh * gw) // (MERGE * MERGE)))
+        elif p == VIDEO_TOKEN:
+            d = next(it)
+            if d.get("kind") != "video":
+                raise ValueError("placeholder order mismatch: expected a video payload")
+            t, gh, gw = d["grid"]
+            per_unit = (gh * gw) // (MERGE * MERGE)
+            ts = d.get("ts") or [k * 1.0 for k in range(t)]
+            out.append("".join(
+                f"<|begin_of_image|>{IMAGE_TOKEN * per_unit}<|end_of_image|>"
+                f"{ts[k]:.1f} seconds"
+                for k in range(t)
+            ))
+        else:
+            out.append(p)
+    return "".join(out)
+
+
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
 
@@ -60,6 +105,9 @@ class TokenizeManager:
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
+            images = getattr(msg, "images", None)
+            if images:
+                prompt = _expand_image_tokens(prompt, images)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --

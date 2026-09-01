@@ -37,13 +37,28 @@ class MLAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        layer_ids=None,
     ) -> None:
         self._latent_dim = latent_dim
+        # Hybrid linear-attention models (GLM-5.3: 34 KDA + 11 MLA/DSA) back only the
+        # full-attention layers here; ``layer_ids`` remaps global layer id -> dense slab
+        # (MHAKVCache pattern), so the (majority) linear layers cost no latent slab.
+        if layer_ids is None:
+            self._layer_map = None
+        else:
+            num_layers = len(layer_ids)
+            m = [-1] * (max(layer_ids) + 1)
+            for dense, g in enumerate(layer_ids):
+                m[g] = dense
+            self._layer_map = m
         self._num_layers = num_layers
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
         self._alloc(num_pages)
+
+    def _dense(self, layer_id: int) -> int:
+        return layer_id if self._layer_map is None else self._layer_map[layer_id]
 
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
@@ -56,7 +71,7 @@ class MLAKVCache(BaseKVCachePool):
     # -- views ------------------------------------------------------------------
     def k_cache(self, layer_id: int) -> torch.Tensor:
         """Paged latent view ``[num_pages, page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(self._num_pages, self._page_size, -1)
+        return self._kv_buffer[0, self._dense(layer_id)].view(self._num_pages, self._page_size, -1)
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
         # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
@@ -64,7 +79,7 @@ class MLAKVCache(BaseKVCachePool):
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(-1, self._latent_dim)
+        return self._kv_buffer[0, self._dense(layer_id)].view(-1, self._latent_dim)
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -141,10 +156,13 @@ class DSAKVCache(MLAKVCache):
         device: torch.device,
         index_head_dim: int,
         num_index_layers: int,
+        layer_ids=None,
+        index_kpool: int = 1,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
-        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device)
+        self._index_kpool = index_kpool
+        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device, layer_ids=layer_ids)
 
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step: rebuild can never leave the pool with a
@@ -159,9 +177,20 @@ class DSAKVCache(MLAKVCache):
             dtype=torch.bfloat16,
             device=self._device,
         )
+        # k-pool (GLM-5.3): raw gate-score slab (same row addressing as the key slab) and
+        # the pooled-key slab, where pool p's key is stored at the PHYSICAL ROW OF ITS FIRST
+        # TOKEN (rows[kpool*p]); scoring gathers via the strided pool-row snapshot.
+        if self._index_kpool > 1:
+            self._gate_buffer = torch.zeros_like(self._index_k_buffer)
+            self._pool_k_buffer = torch.zeros_like(self._index_k_buffer)
+        else:
+            self._gate_buffer = None
+            self._pool_k_buffer = None
 
     def rebuild(self, num_pages: int) -> None:
         self._index_k_buffer = None
+        self._gate_buffer = None
+        self._pool_k_buffer = None
         super().rebuild(num_pages)
 
     def unit_bytes(self) -> tuple[int, int]:
@@ -170,7 +199,13 @@ class DSAKVCache(MLAKVCache):
         kv, swa = super().unit_bytes()
         idx = self._index_k_buffer
         tokens = self._num_pages * self._page_size
-        return kv + int(idx.numel() * idx.element_size()) // tokens, swa
+        per = int(idx.numel() * idx.element_size()) // tokens
+        # k-pool slabs (gate + pooled keys) ride the same token budget -- count them or the
+        # sizing pass over-allocates and the alloc OOMs (caught by the dummy e2e run).
+        if self._gate_buffer is not None:
+            per += int(self._gate_buffer.numel() * self._gate_buffer.element_size()) // tokens
+            per += int(self._pool_k_buffer.numel() * self._pool_k_buffer.element_size()) // tokens
+        return kv + per, swa
 
     def index_k_cache(self, slot: int) -> torch.Tensor:
         """Row-flat index keys for a full-indexer layer slot: ``[rows, index_head_dim]``."""
@@ -178,6 +213,20 @@ class DSAKVCache(MLAKVCache):
 
     def store_index_k(self, k: torch.Tensor, out_loc: torch.Tensor, slot: int) -> None:
         self._index_k_buffer[slot][out_loc] = k
+
+    # ----- k-pool slabs (GLM-5.3; None-guarded when index_kpool == 1) -----
+    def gate_cache(self, slot: int) -> torch.Tensor:
+        return self._gate_buffer[slot]
+
+    def store_gate(self, g: torch.Tensor, out_loc: torch.Tensor, slot: int) -> None:
+        self._gate_buffer[slot][out_loc] = g
+
+    def pool_k_cache(self, slot: int) -> torch.Tensor:
+        return self._pool_k_buffer[slot]
+
+    def store_pool_k(self, k: torch.Tensor, rows: torch.Tensor, slot: int) -> None:
+        """Scatter pooled keys at the pools' first-token physical rows (int64 rows)."""
+        self._pool_k_buffer[slot][rows] = k
 
 
 __all__ = ["MLAKVCache", "DSAKVCache"]

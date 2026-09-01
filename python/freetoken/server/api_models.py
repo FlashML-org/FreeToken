@@ -10,6 +10,7 @@ class MessageContent(BaseModel):
     type: str
     text: str | None = None
     image_url: Any | None = None
+    video_url: Any | None = None
     audio_url: Any | None = None
 
 

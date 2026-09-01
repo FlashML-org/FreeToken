@@ -72,6 +72,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Preprocessed images in template order: list of (pixel_values np [P, D] fp32,
+    # grid (t, gh, gw)). The tokenize worker expands the k-th <|image|> placeholder
+    # to that image's token count and forwards the pixels on the UserMsg.
+    images: List[Any] | None = None
 
 
 @dataclass

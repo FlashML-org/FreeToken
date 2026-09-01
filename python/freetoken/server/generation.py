@@ -137,6 +137,8 @@ class GenSpec:
     messages: list[dict[str, Any]]                       # normalized, template-ready
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Preprocessed images in template order (see TokenizeMsg.images); None = text-only.
+    images: list[Any] | None = None
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
 
@@ -198,7 +200,16 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        if any(
+            isinstance(p, dict)
+            and p.get("type") in ("image_url", "image", "video_url", "video")
+            for p in content
+        ):
+            # Multimodal message: keep the structured part list (payload stripped) so
+            # the chat template's image branch emits its placeholder tokens.
+            m["content"] = _mm_content_parts(content)
+        else:
+            m["content"] = _flatten_text_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -228,6 +239,60 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+def _mm_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype == "text":
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype in ("image_url", "image"):
+            out.append({"type": "image_url"})  # payload travels separately (GenSpec.images)
+        elif ptype in ("video_url", "video"):
+            out.append({"type": "video_url"})
+        else:
+            raise ValueError(f"Unsupported content part type in multimodal message: {ptype}")
+    return out
+
+
+def extract_images(messages: list[dict[str, Any]]) -> list[Any]:
+    """Decode + preprocess every image content part (data URI / http URL), in template
+    order. Returns [] for text-only conversations. Raises ValueError on a bad payload
+    (adapters map it to a 400 like any other malformed message)."""
+    images: list[Any] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                from freetoken.models.glm5_next.image_process import (
+                    decode_image_part,
+                    preprocess_image,
+                )
+
+                img = decode_image_part(part.get("image_url") or part.get("image"))
+                pixels, grid = preprocess_image(img)
+                # Transport-safe payload: the ZMQ msgpack codec only carries
+                # primitives/bytes/1-D tensors -- raw fp32 bytes + a grid list ride
+                # both hops (api -> tokenizer -> scheduler) unchanged.
+                images.append({"kind": "image", "pix": pixels.tobytes(), "grid": list(grid)})
+            elif isinstance(part, dict) and part.get("type") in ("video_url", "video"):
+                from freetoken.models.glm5_next.image_process import (
+                    decode_video_part,
+                    preprocess_video,
+                )
+
+                frames, ts = decode_video_part(part.get("video_url") or part.get("video"))
+                pixels, grid, unit_ts = preprocess_video(frames, ts)
+                images.append({
+                    "kind": "video",
+                    "pix": pixels.tobytes(),
+                    "grid": list(grid),
+                    "ts": [float(t) for t in unit_ts],
+                })
+    return images
 
 
 def _flatten_text_parts(parts: list[Any]) -> str:
@@ -269,6 +334,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=spec.images,
         )
     )
     return uid

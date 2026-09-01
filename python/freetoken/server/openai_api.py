@@ -34,6 +34,7 @@ from .generation import (
     generate_events,
     generate_full,
     prerender_error,
+    extract_images,
     render_messages,
     resolve_sampling,
     submit_generation,
@@ -66,8 +67,10 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    raw_messages = [m.model_dump(exclude_none=True) for m in req.messages]
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages(raw_messages),
+        images=extract_images(raw_messages) or None,
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,

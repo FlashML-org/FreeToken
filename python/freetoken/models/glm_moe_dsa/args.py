@@ -35,6 +35,12 @@ class GlmMoeDsaArgs:
     index_head_dim: int
     index_topk: int
     indexer_types: Tuple[str, ...]
+    # DSA k-pool compression (GLM-5.3): `index_kpool` consecutive tokens are scored as ONE
+    # candidate (softmax(gate+ape)-weighted key average); selected pools expand back to raw
+    # token indices and the in-progress tail pool is always selected. 1 = per-token scoring
+    # (GLM-5.2; every field below is inert then).
+    index_kpool: int = 1
+    index_kpool_always_select_tail: bool = True
 
     @property
     def qk_head_dim(self) -> int:

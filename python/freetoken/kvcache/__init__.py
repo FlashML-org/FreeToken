@@ -213,6 +213,9 @@ def create_kvcache_pool(
             return DSAKVCache(
                 latent_dim=spec.head_dim,
                 num_layers=model_config.num_layers,
+                layer_ids=layer_ids,
+                index_kpool=int(getattr(
+                    getattr(model_config, "glm_dsa_args", None), "index_kpool", 1) or 1),
                 num_pages=num_pages,
                 page_size=page_size,
                 dtype=dtype,
@@ -223,6 +226,7 @@ def create_kvcache_pool(
         return MLAKVCache(
             latent_dim=spec.head_dim,
             num_layers=model_config.num_layers,
+            layer_ids=layer_ids,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
