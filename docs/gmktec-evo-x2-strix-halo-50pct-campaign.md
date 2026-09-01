@@ -594,3 +594,25 @@ candidate yet.  The next iteration must stop the normal service, reproduce the
 fused-expert fault with serialized kernel dispatch and a minimal shape, compare
 the candidate with the accepted source, then repair or replace the failing
 kernel before any cache-copy throughput claim is considered.
+
+### C12: accepted-source fused-MoE fault reproduction
+
+The mandatory isolated reproduction was run against the accepted source,
+not the upstream cache candidate.  The ordinary NVFP4 API was stopped through
+the recovery controller, and the smallest failing test was launched in its own
+session with serialized ROCm dispatch.  The test failed in 3.42 seconds with a
+HIP illegal-memory-access fault in `fused_moe_kernel` on the float16 grouped
+MoE shape: 4 tokens, 37 experts, hidden size 32, intermediate size 24, and
+top-k 4.  The exact source revision, test output, exit status, stop log, and
+recovery log are saved in `fused-moe-c12-baseline-20260901T191320Z` on GMKtec
+EVO-X2.
+
+This establishes that the failure predates the upstream cache-copy candidate.
+It also rules out a simple test-runner race because serialized dispatch reports
+the same faulting `fused_moe_kernel`.  The normal NVFP4 API was restored by the
+controller and again returned `status: ok` after its normal cold load.
+
+**Decision: repair prerequisite confirmed.** The next code change must add a
+ROCm-safe grouped-MoE selection or correct the kernel bounds issue for this
+shape, backed by the isolated reproducer.  The upstream cache candidate remains
+on hold until that repair passes and no longer faults the target ROCm runtime.
