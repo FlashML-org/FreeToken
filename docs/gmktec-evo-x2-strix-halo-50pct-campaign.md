@@ -420,15 +420,44 @@ generation, stop, source-revision, and policy fields are recovered and frozen.
 
 #### C06.1 source-architecture audit
 
-The first C06 source audit rejected a parameter-only port before it consumed
-GPU time.  FreeToken's original ROCm GGUF MoE implementation already selects
-eight 32-lane waves with 8 by 128 tiles for the Q4_K, Q5_K, Q6_K, and Q8_0
-formats.  Those are the same broad RDNA4 launch choices that current llama.cpp
-selects for single-vector work.  Reapplying that geometry would therefore be a
-duplicate change, not a new optimization hypothesis.
+The source audit separated FreeToken's prefill and decode dispatches.  The
+prefill-oriented `moe.cuh` kernels already select eight 32-lane waves with 8
+by 128 tiles for the relevant ROCm formats.  The qualified single-token Qwen
+decode path, however, calls `ggml_moe_a8_vec`, whose `moe_vec.cuh` Q4_K,
+Q5_K, Q6_K, and Q8_0 wrappers still launch one wave per block.  Current
+llama.cpp selects eight waves for those simple RDNA4 single-vector helpers.
 
-The next implementation must instead isolate one deeper difference from the
-modern llama.cpp component: reduction structure, shared-memory staging, or
-the current MMVQ packed-input interface.  It must retain FreeToken's
-expert-bank layout and prove tensor equality before any server benchmark.  No
-new launch-dimension-only candidate is authorized by this audit.
+The resulting C06 candidate changes only that decode dispatcher.  It retains
+FreeToken's expert-bank layout, activation packing, vector-dot helpers, row
+mapping, and CUDA behavior.  Tensor equality remains mandatory before the
+candidate can consume server benchmark time.  This distinction prevents an
+already-tuned prefill geometry from being confused with the still-unported
+decode geometry.
+
+#### C06.2 decode-wave candidate screen
+
+The HIP-only C06 candidate was built in an isolated source tree and executed
+against the real layer-0 packed expert slices from the exact Qwen Q4_K model.
+It changed only the four decode wrapper launches from one 32-lane wave to
+eight 32-lane waves, matching the family-specific direction seen in current
+llama.cpp.  CUDA behavior and all model-visible semantics remained untouched.
+
+| Projection | Baseline device time | C06 device time | Change |
+| --- | ---: | ---: | ---: |
+| Gate Q4_K | 21.970 microseconds | 23.107 microseconds | +5.18% slower |
+| Up Q4_K | 21.864 microseconds | 23.531 microseconds | +7.62% slower |
+| Down Q5_K | 20.624 microseconds | 21.672 microseconds | +5.08% slower |
+| Three projections | 64.459 microseconds | 68.311 microseconds | +5.98% slower |
+
+The candidate compiled natively with the ROCm 10 runtime and used 30 warmup
+iterations plus 300 measured repetitions.  It failed the microbenchmark gate
+before tensor-equivalence or HTTP testing was warranted: every traced
+projection regressed by more than the allowed one-percent ceiling.  The
+likely mechanism is that these relatively small routed-expert matrices do not
+provide enough parallel work to repay the added wave coordination.
+
+**Decision: rejected.** C06 is retained only on the isolated experimental
+branch and is not merged into the AMD port.  The protected GMKtec EVO-X2 Qwen
+service was restarted immediately after the screen; its health endpoint must
+return `status: ok` before this iteration is closed.  The immutable screen
+artifact is `qwen35moe-q4-c06-micro-20260901T174907Z` on GMKtec EVO-X2.
