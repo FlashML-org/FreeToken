@@ -47,27 +47,53 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _hip_offload_arch() -> str:
+    return (
+        os.environ.get("TVM_FFI_ROCM_ARCH_LIST")
+        or os.environ.get("PYTORCH_ROCM_ARCH")
+        or os.environ.get("FREETOKEN_GFX_ARCH")
+        or "gfx1201"
+    ).split()[0]
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
-    host_cxx = _host_compiler()
-    if host_cxx is not None:
-        # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
-        # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
-        # default (CXX unset -> g++) can be a gcc too new for the torch headers.
-        cxx_path = shutil.which(host_cxx) or host_cxx
-        extra_cuda_cflags += ["-ccbin", cxx_path]
-        os.environ["CXX"] = cxx_path
-        os.environ["CC"] = _c_compiler_for(cxx_path)
+    is_hip = getattr(torch.version, "hip", None) is not None
+    extra_include_paths = [str(_CSRC)]
+    if is_hip:
+        # --expt-relaxed-constexpr / -ccbin are nvcc-only; hipcc rejects them.
+        extra_cuda_cflags = [
+            "-O3",
+            "-DUSE_ROCM",
+            "-D__HIP_PLATFORM_AMD__=1",
+            f"--offload-arch={_hip_offload_arch()}",
+        ]
+        shim = _CSRC / "jit_shim"
+        extra_include_paths = [str(shim), str(_CSRC)]
+        for key in ("ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+            root = os.environ.get(key)
+            if root and os.path.isdir(os.path.join(root, "include")):
+                extra_include_paths.append(os.path.join(root, "include"))
+    else:
+        extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+        host_cxx = _host_compiler()
+        if host_cxx is not None:
+            # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
+            # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
+            # default (CXX unset -> g++) can be a gcc too new for the torch headers.
+            cxx_path = shutil.which(host_cxx) or host_cxx
+            extra_cuda_cflags += ["-ccbin", cxx_path]
+            os.environ["CXX"] = cxx_path
+            os.environ["CC"] = _c_compiler_for(cxx_path)
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        extra_include_paths=extra_include_paths,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )

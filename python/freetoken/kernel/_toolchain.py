@@ -42,6 +42,15 @@ def torch_cuda_major() -> int | None:
     return int(cuda.split(".")[0]) if cuda else None
 
 
+def torch_is_hip() -> bool:
+    try:
+        import torch
+
+        return bool(getattr(torch.version, "hip", None))
+    except Exception:
+        return False
+
+
 @functools.cache
 def check_nvcc_matches_torch() -> None:
     """Refuse to nvcc-compile kernels across CUDA majors.
@@ -49,6 +58,8 @@ def check_nvcc_matches_torch() -> None:
     nvcc-built binaries link libcudart.so.<nvcc major>; at runtime only the
     torch wheel's own CUDA runtime is guaranteed to be loadable.
     """
+    if torch_is_hip():
+        return
     if os.getenv(ALLOW_MISMATCH_ENV, "").strip().lower() in _TRUE_VALUES:
         return
     torch_major = torch_cuda_major()

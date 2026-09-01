@@ -66,6 +66,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
     set_assigned_gpu(targets[args.tp_info.rank])
 
+    from freetoken.runtime.gpu import apply_amd_runtime_env, require_gpu
+
+    apply_amd_runtime_env()
+    require_gpu()
+
     import torch
     from freetoken.scheduler import Scheduler
 

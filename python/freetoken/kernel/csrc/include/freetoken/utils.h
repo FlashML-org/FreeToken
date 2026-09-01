@@ -2,7 +2,7 @@
 
 // ref:
 // https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")
 #pragma push_macro("__builtin_LINE")

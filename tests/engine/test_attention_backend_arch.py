@@ -116,3 +116,33 @@ def test_fa_backend_rejects_cc12(monkeypatch):
     monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (12, 0))
     with pytest.raises(RuntimeError, match="12.x"):
         FlashAttentionBackend(SimpleNamespace(head_dim=128))
+
+
+def test_auto_backend_is_triton_on_hip(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    monkeypatch.setattr(gpu, "gcn_arch", lambda index=None: "gfx1201")
+    monkeypatch.setattr(gpu, "hip_graph_replay_safe", lambda arch=None: False)
+    gpu.vendor.cache_clear()
+    # Even if NVIDIA cubin packages are importable, auto must not pick them.
+    _patch_env(monkeypatch, major=12, flashinfer=True, sgl=True)
+    config = _engine_config(attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+    assert config.cuda_graph_max_bs == 0
+    gpu.vendor.cache_clear()
+
+
+def test_explicit_fi_rejected_on_hip(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    gpu.vendor.cache_clear()
+    _patch_env(monkeypatch, major=12, flashinfer=True, sgl=True)
+    config = _engine_config(attention_backend="fi")
+    with pytest.raises(RuntimeError, match="NVIDIA-only"):
+        _adjust_config(config)
+    gpu.vendor.cache_clear()

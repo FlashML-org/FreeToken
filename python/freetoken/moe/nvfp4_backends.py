@@ -213,6 +213,16 @@ def select_nvfp4_backend(
         raise ValueError(
             f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer or triton"
         )
+    from freetoken.runtime.gpu import is_hip, nvidia_only_error
+
+    if is_hip():
+        if requested in ("marlin", "flashinfer"):
+            raise nvidia_only_error(
+                f"--nvfp4-backend={requested}",
+                hint="Use --nvfp4-backend triton (or auto).",
+            )
+        return "triton"
+
     if requested == "triton":
         return "triton"
     if activation != "silu":

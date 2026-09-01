@@ -1,5 +1,27 @@
 #include <cstdint>
+#if defined(USE_ROCM)
+#include <hip/hip_runtime_api.h>
+#define cudaMallocHost hipHostMalloc
+#define cudaFreeHost hipHostFree
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostRegister hipHostRegister
+#define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaGetDevice hipGetDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrUnifiedAddressing hipDeviceAttributeUnifiedAddressing
+#define cudaDevAttrCanUseHostPointerForRegisteredMem \
+  hipDeviceAttributeCanUseHostPointerForRegisteredMem
+#define cudaDriverGetVersion hipDriverGetVersion
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
 
 namespace {

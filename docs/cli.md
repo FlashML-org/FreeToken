@@ -12,6 +12,7 @@ ft <command> [args]
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
+| `ft gpu` | Print detected GPU vendor / gfx arch (AMD HIP or NVIDIA CUDA) |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports

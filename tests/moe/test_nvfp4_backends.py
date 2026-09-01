@@ -427,6 +427,21 @@ def test_nvfp4_backend_selection():
         select_nvfp4_backend(cpu, None, "bogus")
 
 
+def test_nvfp4_hip_rejects_nvidia_donors(monkeypatch):
+    from freetoken.moe.nvfp4_backends import select_nvfp4_backend
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    gpu.vendor.cache_clear()
+    fake = torch.device("cuda")
+    assert select_nvfp4_backend(fake, 4096, "auto") == "triton"
+    with pytest.raises(RuntimeError, match="NVIDIA-only"):
+        select_nvfp4_backend(fake, 4096, "marlin")
+    with pytest.raises(RuntimeError, match="NVIDIA-only"):
+        select_nvfp4_backend(fake, 4096, "flashinfer")
+    gpu.vendor.cache_clear()
+
+
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache

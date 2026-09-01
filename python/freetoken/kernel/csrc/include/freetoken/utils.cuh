@@ -5,6 +5,10 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#if defined(__HIP_PLATFORM_AMD__)
+#include <freetoken/hip_compat.cuh>
+#endif
+
 #include <concepts>
 #include <cstddef>
 #include <source_location>
@@ -44,13 +48,21 @@ namespace PDL {
 
 template <bool kUsePDL> __always_inline __device__ void wait() {
   if constexpr (kUsePDL) {
+#if defined(__HIP_PLATFORM_AMD__)
+    // Programmatic Dependent Launch is NVIDIA-only; HIP builds compile with
+    // kUsePDL=false. A true instantiation is a no-op rather than illegal PTX.
+#else
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   }
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
   if constexpr (kUsePDL) {
+#if defined(__HIP_PLATFORM_AMD__)
+#else
     asm volatile("griddepcontrol.launch_dependents;" :::);
+#endif
   }
 }
 
@@ -115,6 +127,9 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if defined(__HIP_PLATFORM_AMD__)
+    (void)use_pdl;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +138,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 

@@ -51,6 +51,10 @@ def _flashinfer_available() -> bool:
 
 
 def _sgl_flash_attn_available() -> bool:
+    from freetoken.runtime.gpu import is_hip
+
+    if is_hip():
+        return False
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
@@ -118,7 +122,22 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
-    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
+    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
+
+    HIP: Triton is the only in-tree backend. NVIDIA cubin packages (flashinfer /
+    sgl_kernel) must not win auto-select and then crash on AMD.
+    """
+    from freetoken.runtime.gpu import is_hip
+
+    if is_hip():
+        if _backend_parts_serve("triton", required) and _backend_requirements_met("triton"):
+            return "triton"
+        raise RuntimeError(
+            "No HIP attention backend can serve attention types "
+            f"{sorted(t.value for t in required)}. The in-tree AMD path is "
+            "--attention-backend triton (see docs/amd.md). ZLUDA is not supported."
+        )
+
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
@@ -149,6 +168,21 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
     )
+
+
+def _hip_rejects_nvidia_attn(part: str) -> RuntimeError | None:
+    """NVIDIA-only attention backends must fail cleanly on AMD, not crash in cubins."""
+    from freetoken.runtime.gpu import is_hip, nvidia_only_error
+
+    if not is_hip():
+        return None
+    info = attention_backend_info(part)
+    if info.requires_flashinfer or info.requires_sgl_kernel or info.requires_sm100:
+        return nvidia_only_error(
+            f"Attention backend {part!r}",
+            hint="Use --attention-backend triton.",
+        )
+    return None
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -196,6 +230,9 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     # never resolves to one of these when its package is missing, so this only fires for
     # explicit --attention-backend choices.
     for part in backend_parts:
+        hip_err = _hip_rejects_nvidia_attn(part)
+        if hip_err is not None:
+            raise hip_err
         info = attention_backend_info(part)
         if info.requires_flashinfer and not _flashinfer_available():
             raise RuntimeError(
@@ -287,6 +324,10 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        from freetoken.runtime.gpu import apply_amd_runtime_env, require_gpu
+
+        apply_amd_runtime_env()
+        require_gpu()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
@@ -1264,6 +1305,7 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 
+    graphs_unspecified = config.cuda_graph_max_bs is None
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
@@ -1327,6 +1369,19 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+
+    from freetoken.runtime.gpu import hip_graph_replay_safe, is_hip
+
+    if is_hip() and graphs_unspecified and not hip_graph_replay_safe():
+        # gfx1201 MoE/GGUF HIP kernels have TDR'd under graph replay (#82). Linux
+        # on R9700 is unverified; default eager. FREETOKEN_HIP_GRAPH_REPLAY=1 or an
+        # explicit --cuda-graph-max-bs re-enables capture.
+        override("cuda_graph_max_bs", 0)
+        logger.warning_rank0(
+            "HIP gfx1201: defaulting --cuda-graph-max-bs 0 (graph replay is "
+            "unsafe on this ISA until confirmed on-box). Set "
+            "FREETOKEN_HIP_GRAPH_REPLAY=1 to try graphs."
+        )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

@@ -19,7 +19,67 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM"]
 DEFAULT_LDFLAGS = []
+
+
+def _is_hip_build() -> bool:
+    """True when this process should emit hipcc flags, not nvcc.
+
+    Prefer the torch wheel (``torch.version.hip``). A leftover ``ROCM_HOME`` on
+    an NVIDIA box must not flip the CUDA JIT path to ``--offload-arch``.
+    """
+    try:
+        import torch
+
+        if getattr(torch.version, "hip", None):
+            return True
+        if getattr(torch.version, "cuda", None):
+            return False
+    except Exception:
+        pass
+    return bool(
+        os.environ.get("HIP_PATH") or os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
+    )
+
+
+def _rocwmma_include_dirs() -> List[str]:
+    """rocWMMA headers if the SDK is installed (needed for some gfx1201 GEMMs)."""
+    dirs: List[str] = []
+    for key in ("ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        root = os.environ.get(key)
+        if not root:
+            continue
+        for rel in ("include", "include/rocwmma"):
+            path = pathlib.Path(root) / rel
+            if path.is_dir():
+                dirs.append(str(path))
+    opt = pathlib.Path("/opt/rocm/include")
+    if opt.is_dir():
+        dirs.append(str(opt))
+    return dirs
+
+
+def _hip_offload_arches() -> List[str]:
+    raw = (
+        os.getenv("TVM_FFI_ROCM_ARCH_LIST")
+        or os.getenv("PYTORCH_ROCM_ARCH")
+        or os.getenv("FREETOKEN_GFX_ARCH")
+        or ""
+    )
+    arches = [a for a in raw.replace(";", " ").replace(",", " ").split() if a]
+    if arches:
+        return arches
+    return ["gfx1201"]
+
+
+def _hip_cflags(extra: List[str]) -> List[str]:
+    flags = list(DEFAULT_HIP_CFLAGS)
+    for arch in _hip_offload_arches():
+        flags.append(f"--offload-arch={arch}")
+    for inc in _rocwmma_include_dirs():
+        flags.append(f"-I{inc}")
+    return flags + extra
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -30,6 +90,8 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
+    if _is_hip_build():
+        return _hip_cflags(extra)
     flags = DEFAULT_CUDA_CFLAGS + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:

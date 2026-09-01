@@ -13,6 +13,7 @@ in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
 | `kvcache/`   | `freetoken.kvcache` — paged pools (incl. DSV4's), rebuild, cache-cost accounting; the three prefix caches live in `kvcache/radix/` behind a shared reference model (see its README) |
 | `tokenizer/` | `freetoken.tokenizer` — tokenize/detokenize request plumbing, thinking-mode resolution |
 | `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating |
+| `runtime/`   | `freetoken.runtime.gpu` — AMD/NVIDIA vendor detect, iGPU hide, gfx arch (CPU mocks) |
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
 | `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/q4_0) |
 | `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks) |
@@ -35,6 +36,11 @@ uv run pytest tests/kvcache/         # one subsystem
 
 GPU-dependent tests skip themselves when CUDA is unavailable. Marlin NVFP4 tests
 skip unless `vllm` is importable (dedicated venv with `vllm>=0.14,<0.15`).
+
+AMD/HIP unit tests (`tests/runtime/test_gpu.py`, `tests/kernels/test_hip_compat.py`,
+`tests/kernels/test_pinned_hip_fallback.py`) are CPU-only mocks. They do **not**
+stand in for an R9700 e2e run — see [docs/amd.md](../docs/amd.md) for the on-box
+checklist. Do not treat a green CI as “we ran on gfx1201”.
 
 `needs_weights`-marked tests skip unless the env var pointing at a real local
 checkpoint is set:

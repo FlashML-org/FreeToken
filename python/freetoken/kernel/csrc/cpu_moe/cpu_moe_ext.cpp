@@ -29,7 +29,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(USE_ROCM)
+#include <hip/hip_runtime_api.h>
+#define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaStream_t hipStream_t
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
 
 #if defined(__linux__)

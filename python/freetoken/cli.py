@@ -17,6 +17,7 @@ Commands:
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  gpu         Print detected GPU vendor / gfx arch (AMD HIP or NVIDIA CUDA)
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -90,6 +91,14 @@ def _run_bench(argv: list[str]) -> int:
     return 2
 
 
+def _run_gpu(argv: list[str]) -> int:
+    from freetoken.runtime.gpu import apply_amd_runtime_env, describe
+
+    apply_amd_runtime_env()
+    print(describe())
+    return 0
+
+
 COMMANDS = {
     "serve": "_run_serve",
     "shell": "_run_shell",
@@ -98,6 +107,7 @@ COMMANDS = {
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
     "bench": "_run_bench",
+    "gpu": "_run_gpu",
 }
 
 

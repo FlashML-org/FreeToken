@@ -23,6 +23,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
+    "Environment :: GPU :: AMD ROCm",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -78,6 +79,9 @@ fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
+# Marker extra: do not install this with [accel]. ROCm torch must come from
+# AMD's index (docs/amd.md), not the cu130 pins below.
+rocm = []
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
 # core transformers>=5.5 requirement. It is therefore not a lockable extra and is left

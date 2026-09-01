@@ -23,11 +23,26 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
+    # flashinfer ships NVIDIA cubins only; never treat it as available on HIP.
+    try:
+        from freetoken.runtime.gpu import is_hip
+
+        if is_hip():
+            return False
+    except Exception:
+        pass
     return _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
+    try:
+        from freetoken.runtime.gpu import is_hip
+
+        if is_hip():
+            return False
+    except Exception:
+        pass
     return _importable("sgl_kernel")
 
 
@@ -42,7 +57,10 @@ def driver_cuda_version() -> int | None:
     try:
         from freetoken.kernel.pinned import _load_pinned_extension
 
-        version = int(_load_pinned_extension().driver_cuda_version())
+        ext = _load_pinned_extension()
+        if ext is None or not hasattr(ext, "driver_cuda_version"):
+            return None
+        version = int(ext.driver_cuda_version())
     except Exception:
         return None
     return version or None  # 0 == no driver installed
