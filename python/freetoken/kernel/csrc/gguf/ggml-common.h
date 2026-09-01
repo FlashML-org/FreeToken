@@ -8,17 +8,7 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
-// Each GGUF matrix-vector row is mathematically independent, so this launch
-// dimension changes only how many rows share one CUDA or HIP block.  NVIDIA's
-// upstream default of one 32-thread row leaves half of an RDNA wavefront idle.
-// On HIP, launching two rows creates one full 64-lane wavefront while retaining
-// the same per-row quantization, dot-product, reduction, and output store.
-// Keep CUDA at its upstream geometry until it receives independent validation.
-#if defined(USE_ROCM)
-#define GGML_CUDA_MMV_Y 2
-#else
 #define GGML_CUDA_MMV_Y 1
-#endif
 
 // Data Structures
 // QK = number of values after dequantization
