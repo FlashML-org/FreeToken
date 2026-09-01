@@ -12,6 +12,11 @@ set -euo pipefail
 readonly ARTIFACT_DIR="${1:?usage: run_qwen_scheduler_baseline.sh ARTIFACT_DIR}"
 readonly ROOT_DIR="/home/david/freetoken-amd"
 readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
+# Keep benchmark code independent from the source checkout serving the normal
+# API. A deployed server checkout can intentionally stay frozen while a newer
+# isolated checkout supplies the reviewed benchmark harness. This override
+# changes neither the target URL nor the model selected below.
+readonly BENCHMARK_SOURCE_DIR="${GMK_EVO_X2_QWEN_BENCHMARK_SOURCE_DIR:-${SOURCE_DIR}}"
 readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
 # Preserve the original FreeToken service as the default while permitting an
 # explicitly named, isolated local control to reuse this exact workload.  The
@@ -31,8 +36,12 @@ for _ in $(seq 1 48); do
     PROMPT+="${BASE_PROMPT}"
 done
 
-export PYTHONPATH="${SOURCE_DIR}/python"
-cd "${SOURCE_DIR}"
+# Refuse a stale deployment explicitly instead of failing later with Python's
+# unhelpful file-not-found message. This makes source provenance visible in the
+# artifact-producing command and prevents an accidental benchmark substitution.
+test -f "${BENCHMARK_SOURCE_DIR}/benchmarks/gmk_evo_x2/run_api_benchmark.py"
+export PYTHONPATH="${BENCHMARK_SOURCE_DIR}/python"
+cd "${BENCHMARK_SOURCE_DIR}"
 
 # Forced-length greedy decoding yields a comparable stream interval. Qwen's
 # reasoning stream is explicitly disabled because this measures final-token
