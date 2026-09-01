@@ -289,3 +289,25 @@ kernel's coverage or reduction mapping on this HIP path.  Preserve the failed
 quality artifact at `qwen35moe-q4-vdr4-20260901T084500Z` on LAN-223, revert the
 source candidate, and restore the protected normal Qwen service before the
 next investigation.
+
+### C04: shared-activation two-row Q4_K and Q5_K routed-MoE vectors
+
+The next candidate retained the established two-chunk vector-dot mapping and
+separate XOR reduction for each output row.  Instead of changing quantization
+coverage, one HIP logical wave computed two adjacent rows for a route and
+shared the selected expert and Q8_1 activation address.  It built in clean
+worktree `3ffb1c6`, passed all three deterministic Qwen API controls, and ran
+the fixed warmup plus three scored 256-token API samples.
+
+| Measure | Stable baseline | C04 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Mean decode TPS | 47.960 | 47.745 | -0.45% |
+| Median decode TPS | 48.075 | 47.833 | -0.50% |
+| p99 token gap | 0.02490 s | 0.02489 s | diagnostic only |
+| Quality controls | 3/3 pass | 3/3 pass | unchanged |
+
+**Decision: rejected.** Correctness was preserved, but sharing the activation
+address did not offset the extra live accumulator and register pressure.  The
+result is below baseline and below the one-percent acceptance floor.  Preserve
+the artifact at `qwen35moe-q4-k2row-20260901T093500Z` on LAN-223 and revert the
+candidate source.
