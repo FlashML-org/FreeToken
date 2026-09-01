@@ -492,3 +492,44 @@ artifact `qwen-router-c07-20260901T180707Z` on GMKtec EVO-X2 as a diagnostic,
 but retain the reference route for the exact-Q4 quality baseline.  The normal
 GMKtec EVO-X2 service remained on its existing configuration and returned
 `status: ok` after the diagnostic.
+
+#### C07 correction and C08-C09 quality requalification
+
+The C07 dispatch conclusion was superseded by a source and deployment audit.
+The active service source was older than the branch under test, while the
+current branch's router policy selects the in-tree HIP Triton router by
+default.  The upstream router-policy change is therefore not an untested new
+kernel, but it does expose a branch-versus-deployment qualification gap that
+had to be closed before making a performance claim.
+
+First, a quality-only isolated Q4 window using the current branch's router
+path passed all three deterministic controls.  A second isolated window used a
+clean router-only checkout, excluding the rejected decode-wave modification,
+and expanded the test scope:
+
+| Control | Result | Key evidence |
+| --- | --- | --- |
+| Exact response, arithmetic, structured JSON | 3 of 3 pass | deterministic visible outputs |
+| Multi-turn state retention | 3 of 3 pass | maximum TTFT 0.846 s; p99 token gap 24.20 ms |
+| Fresh-prefix retrieval | 1 of 1 pass | 1,556 reported prompt tokens; TTFT 5.344 s |
+| Higher-context fresh-prefix retrieval | 1 of 1 pass | 5,656 reported prompt tokens; TTFT 22.594 s |
+
+The higher-context control is below the 8,192-token serving limit because its
+single request must also reserve output capacity.  A 16K control is outside
+this qualified server configuration and is not represented as a passed test.
+
+The C09 window also discovered that an older recovery launcher had created a
+healthy but non-dedicated process group.  The controller refused to stop it,
+as designed.  After verifying that the group contained only the FreeToken
+frontend and its own worker children, it was replaced using the dedicated
+`setsid` launcher.  The restored service reported `status: ok`, and its server
+PID, process-group ID, and session ID were all identical.  This repair is a
+reliability prerequisite for later time-share tests, not a throughput result.
+
+**Decision: performance eligible, not yet accepted.** The current HIP Triton
+router configuration has cleared the available deterministic, state, long-
+context, and recovery gates.  It must still complete the fixed five-sample API
+matrix and concurrent workload with a fresh exact-Q4 reference before it can
+replace the 47.960-TPS baseline.  Preserve the quality artifacts
+`qwen-router-c08-quality-20260901T181143Z` and
+`qwen-router-c09-full-quality-20260901T183253Z` on GMKtec EVO-X2.
