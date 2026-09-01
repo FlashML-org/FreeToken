@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from freetoken.distributed import reset_tp_info, set_tp_info
+from freetoken.moe import host_banks as hb
 from freetoken.moe.host_banks import (
+    DEFAULT_BANK_SHARE_NEED_BYTES,
     HostBank,
     alloc_layer_banks,
+    default_bank_share_dir,
+    normalize_bank_share_dir,
     prepare_shared_banks,
+    require_share_dir_capacity,
     resolve_bank_share_dir,
 )
 
@@ -43,15 +49,43 @@ def test_prepare_shared_banks_tp2(tmp_path, monkeypatch):
     try:
         monkeypatch.delenv("FREETOKEN_BANK_SHARE_DIR", raising=False)
         monkeypatch.delenv("FREETOKEN_BANK_SHARE", raising=False)
-        d = prepare_shared_banks(port=1919)
-        assert d == "/tmp/freetoken-banks-1919"
-        monkeypatch.setenv("FREETOKEN_BANK_SHARE_DIR", str(tmp_path))
-        assert prepare_shared_banks(port=1919) == str(tmp_path)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        d = prepare_shared_banks(port=1919, need_bytes=0)
+        assert d == str(tmp_path / "cache" / "freetoken" / "banks-1919")
+        assert not d.startswith("/tmp/freetoken-banks")
+        monkeypatch.setenv("FREETOKEN_BANK_SHARE_DIR", str(tmp_path / "disk"))
+        assert prepare_shared_banks(port=1919, need_bytes=0) == str(tmp_path / "disk")
         monkeypatch.setenv("FREETOKEN_BANK_SHARE", "0")
-        assert prepare_shared_banks(port=1919) is None
+        assert prepare_shared_banks(port=1919, need_bytes=0) is None
         assert resolve_bank_share_dir() is None
     finally:
         reset_tp_info()
+
+
+def test_default_bank_share_dir_is_not_tmp(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    d = default_bank_share_dir(1919)
+    assert d == str(tmp_path / "xdg" / "freetoken" / "banks-1919")
+    assert DEFAULT_BANK_SHARE_NEED_BYTES == 43 * 256 * 13_369_344
+
+
+def test_normalize_rejects_dotdot():
+    with pytest.raises(RuntimeError, match=r"\.\."):
+        normalize_bank_share_dir("/var/tmp/../etc/freetoken")
+
+
+def test_require_share_dir_rejects_tmpfs(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_fs_type", lambda path: "tmpfs")
+    monkeypatch.setattr(hb, "_fs_free_bytes", lambda path: 200 * (1 << 30))
+    with pytest.raises(RuntimeError, match="tmpfs"):
+        require_share_dir_capacity(str(tmp_path), need_bytes=DEFAULT_BANK_SHARE_NEED_BYTES)
+
+
+def test_require_share_dir_rejects_small_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_fs_type", lambda path: "ext4")
+    monkeypatch.setattr(hb, "_fs_free_bytes", lambda path: 10 * (1 << 30))
+    with pytest.raises(RuntimeError, match="too small|has 10"):
+        require_share_dir_capacity(str(tmp_path), need_bytes=DEFAULT_BANK_SHARE_NEED_BYTES)
 
 
 def test_anonymous_mmap_when_tp1(monkeypatch):

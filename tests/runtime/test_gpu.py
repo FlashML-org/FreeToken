@@ -39,18 +39,84 @@ def test_vendor_forced(monkeypatch):
     assert not gpu.is_cuda()
 
 
-def test_vendor_cuda_wheel_on_amd_sysfs(monkeypatch, tmp_path):
+def test_vendor_cuda_wheel_plus_igpu_sysfs_is_nvidia(monkeypatch, tmp_path):
+    """9950X Granite Ridge (0x1002 iGPU) + CUDA wheel is a normal NVIDIA box."""
     drm = tmp_path / "card0" / "device"
     drm.mkdir(parents=True)
     (drm / "vendor").write_text("0x1002\n")
+    (drm / "boot_vga").write_text("1\n")
+    (drm / "mem_info_vram_total").write_text(str(512 << 20) + "\n")
     monkeypatch.delenv("FREETOKEN_GPU_VENDOR", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("FREETOKEN_INCLUDE_IGPU", raising=False)
     monkeypatch.setattr(gpu, "_hip_library_name", lambda: None)
     monkeypatch.setattr(gpu, "_torch", lambda: SimpleNamespace(version=SimpleNamespace(hip=None, cuda="13.0")))
-    monkeypatch.setattr(gpu, "_amd_hardware_present", lambda: True)
+    monkeypatch.setattr(gpu, "hip_enumerate_devices", lambda: [])
+    orig_sysfs = gpu._sysfs_amd_devices
+    monkeypatch.setattr(gpu, "_sysfs_amd_devices", lambda drm_root="/sys/class/drm": orig_sysfs(str(tmp_path)))
+    gpu.vendor.cache_clear()
+    assert gpu.vendor() is gpu.Vendor.NVIDIA
+    assert gpu.require_gpu() is gpu.Vendor.NVIDIA
+    # CUDA_VISIBLE_DEVICES=0 is an NVIDIA ordinal, not drm card0 (the iGPU).
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    gpu.vendor.cache_clear()
+    assert gpu.vendor() is gpu.Vendor.NVIDIA
+
+
+def test_vendor_cuda_wheel_on_discrete_amd_is_cuda_on_amd(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_GPU_VENDOR", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gpu, "_hip_library_name", lambda: None)
+    monkeypatch.setattr(gpu, "_torch", lambda: SimpleNamespace(version=SimpleNamespace(hip=None, cuda="13.0")))
+    monkeypatch.setattr(
+        gpu,
+        "hip_enumerate_devices",
+        lambda: [
+            {
+                "index": 0,
+                "name": "AMD Radeon AI PRO R9700",
+                "arch": "gfx1201",
+                "total_bytes": 32 << 30,
+                "hidden_igpu": False,
+            }
+        ],
+    )
     gpu.vendor.cache_clear()
     assert gpu.vendor() is gpu.Vendor.CUDA_ON_AMD
     with pytest.raises(RuntimeError, match="ZLUDA"):
         gpu.require_gpu()
+
+
+def test_vendor_cuda_wheel_hip_visible_discrete_amd(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_GPU_VENDOR", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gpu, "_hip_library_name", lambda: None)
+    monkeypatch.setattr(gpu, "_torch", lambda: SimpleNamespace(version=SimpleNamespace(hip=None, cuda="13.0")))
+    monkeypatch.setattr(
+        gpu,
+        "hip_enumerate_devices",
+        lambda: [
+            {"index": 0, "name": "AMD Radeon Graphics", "arch": "gfx1036", "hidden_igpu": True},
+            {"index": 1, "name": "AMD Radeon AI PRO R9700", "arch": "gfx1201", "hidden_igpu": False},
+        ],
+    )
+    gpu.vendor.cache_clear()
+    assert gpu.vendor() is gpu.Vendor.CUDA_ON_AMD
+
+
+def test_sysfs_igpu_not_discrete(tmp_path):
+    card = tmp_path / "card0" / "device"
+    card.mkdir(parents=True)
+    (card / "vendor").write_text("0x1002\n")
+    (card / "boot_vga").write_text("1\n")
+    (card / "mem_info_vram_total").write_text(str(512 << 20) + "\n")
+    devs = gpu._sysfs_amd_devices(str(tmp_path))
+    assert len(devs) == 1
+    assert devs[0]["hidden_igpu"] is True
 
 
 def test_require_gpu_none(monkeypatch):

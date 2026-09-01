@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import math
 import mmap
 import os
@@ -71,29 +72,140 @@ def born_pinned_default() -> bool:
     return False
 
 
+# DeepSeek-V4-Flash-0731 ds_fp4 floor: 43 × 256 × 13_369_344. Used when the
+# model config is not available yet. Not a benchmark.
+DEFAULT_BANK_SHARE_NEED_BYTES = 43 * 256 * 13_369_344  # 147_169_738_752 ≈ 137.1 GiB
+
+_TMPFS_TYPES = frozenset({"tmpfs", "ramfs"})
+
+
+def default_bank_share_dir(port: int) -> str:
+    """Disk cache dir for shared banks — never ``/tmp`` (often tmpfs).
+
+    ``$XDG_CACHE_HOME/freetoken/banks-{port}`` or ``~/.cache/freetoken/banks-{port}``.
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = os.path.expanduser(xdg) if xdg else os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(root, "freetoken", f"banks-{port}")
+
+
+def normalize_bank_share_dir(raw: str) -> str:
+    """Expand ``~`` and reject a trivial ``..`` path escape."""
+    text = raw.strip()
+    if not text or "\x00" in text:
+        raise RuntimeError("FREETOKEN_BANK_SHARE_DIR is empty or contains a NUL")
+    expanded = os.path.expanduser(text)
+    if ".." in expanded.replace("\\", "/").split("/"):
+        raise RuntimeError(
+            "FREETOKEN_BANK_SHARE_DIR must not contain '..' "
+            f"(got {raw!r}); pass an absolute disk path"
+        )
+    return os.path.abspath(expanded)
+
+
+def _fs_type(path: str) -> str:
+    """Filesystem type from ``/proc/self/mounts`` (Linux). Empty if unknown."""
+    probe = path
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        probe = os.path.realpath(probe)
+    except OSError:
+        probe = os.path.abspath(probe)
+    best = ""
+    fstype = ""
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, typ = parts[1].replace("\\040", " "), parts[2]
+                if probe == mnt or probe.startswith(mnt.rstrip("/") + "/") or mnt == "/":
+                    if len(mnt) >= len(best):
+                        best = mnt
+                        fstype = typ
+    except OSError:
+        return ""
+    return fstype
+
+
+def _fs_free_bytes(path: str) -> int | None:
+    probe = path
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        st = os.statvfs(probe)
+    except OSError:
+        return None
+    return int(st.f_bavail) * int(st.f_frsize)
+
+
+def require_share_dir_capacity(path: str, *, need_bytes: int) -> None:
+    """Fail if ``path`` is tmpfs or has less than ``need_bytes`` free.
+
+    File-backed mmap on tmpfs still counts against the tmpfs cap (~50% RAM on
+    systemd ``/tmp``). ``need_bytes <= 0`` skips the check (unit tests).
+    """
+    if need_bytes <= 0:
+        return
+    fstype = _fs_type(path)
+    free = _fs_free_bytes(path)
+    need_gib = need_bytes / (1 << 30)
+    if fstype in _TMPFS_TYPES:
+        raise RuntimeError(
+            f"FREETOKEN_BANK_SHARE_DIR={path} is on {fstype}, which cannot hold "
+            f"the ~{need_gib:.1f} GiB expert pool (tmpfs counts against RAM; "
+            f"systemd /tmp is often ~50% of RAM). Set FREETOKEN_BANK_SHARE_DIR "
+            f"to a disk with ≥{need_gib:.1f} GiB free "
+            f"(e.g. $HOME/.cache/freetoken/banks-1919 or /data/freetoken/banks-1919)."
+        )
+    if free is not None and free < need_bytes:
+        free_gib = free / (1 << 30)
+        raise RuntimeError(
+            f"FREETOKEN_BANK_SHARE_DIR={path} has {free_gib:.1f} GiB free, "
+            f"need ≥{need_gib:.1f} GiB for the shared expert pool"
+            f"{f' (fstype={fstype})' if fstype else ''}. "
+            f"Set FREETOKEN_BANK_SHARE_DIR to a disk with enough space."
+        )
+
+
 def resolve_bank_share_dir() -> str | None:
     """Directory for file-backed shared expert banks, or None (anonymous mmap).
 
     TP>1 on ~192 GB RAM cannot afford two copies of the ~137 GiB DSV4 pool.
     ``FREETOKEN_BANK_SHARE=0`` disables sharing. ``FREETOKEN_BANK_SHARE_DIR``
-    selects the directory; :func:`prepare_shared_banks` sets a default.
+    selects the directory; :func:`prepare_shared_banks` defaults to the user
+    cache on disk, not ``/tmp``.
     """
     if os.environ.get("FREETOKEN_BANK_SHARE", "").strip().lower() in ("0", "false", "no", "off"):
         return None
     raw = os.environ.get("FREETOKEN_BANK_SHARE_DIR", "").strip()
     if raw:
-        return raw
+        return normalize_bank_share_dir(raw)
     from freetoken.distributed import try_get_tp_info
 
     tp = try_get_tp_info()
     if tp is not None and tp.size > 1:
-        port = os.environ.get("FREETOKEN_BANK_SHARE_PORT", "1919")
-        return f"/tmp/freetoken-banks-{port}"
+        port = int(os.environ.get("FREETOKEN_BANK_SHARE_PORT", "1919"))
+        return default_bank_share_dir(port)
     return None
 
 
-def prepare_shared_banks(*, port: int) -> str | None:
-    """Set ``FREETOKEN_BANK_SHARE_DIR`` for TP>1 so all ranks map one pool."""
+def prepare_shared_banks(*, port: int, need_bytes: int | None = None) -> str | None:
+    """Set ``FREETOKEN_BANK_SHARE_DIR`` for TP>1 so all ranks map one pool.
+
+    Defaults to ``$XDG_CACHE_HOME/freetoken/banks-{port}`` (or ``~/.cache/...``),
+    never ``/tmp``. Refuses tmpfs and filesystems with less than ``need_bytes``
+    free. Files are ``0600``; the directory is created ``0700`` and must not be
+    world-writable.
+    """
     from freetoken.distributed import try_get_tp_info
 
     tp = try_get_tp_info()
@@ -105,10 +217,19 @@ def prepare_shared_banks(*, port: int) -> str | None:
             "(~137 GiB × ranks). Dual-card DSV4 on ~192 GB RAM will likely OOM."
         )
         return None
-    if not os.environ.get("FREETOKEN_BANK_SHARE_DIR"):
-        os.environ["FREETOKEN_BANK_SHARE_DIR"] = f"/tmp/freetoken-banks-{port}"
-    d = os.environ["FREETOKEN_BANK_SHARE_DIR"]
-    os.makedirs(d, exist_ok=True)
+    raw = os.environ.get("FREETOKEN_BANK_SHARE_DIR", "").strip()
+    d = normalize_bank_share_dir(raw) if raw else default_bank_share_dir(port)
+    os.environ["FREETOKEN_BANK_SHARE_DIR"] = d
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.stat(d)
+    if st.st_mode & 0o002:
+        raise RuntimeError(
+            f"FREETOKEN_BANK_SHARE_DIR={d} is world-writable; "
+            f"use a user-owned disk path (mode 0700)"
+        )
+    require_share_dir_capacity(
+        d, need_bytes=DEFAULT_BANK_SHARE_NEED_BYTES if need_bytes is None else need_bytes
+    )
     return d
 
 
@@ -141,7 +262,16 @@ def _map_shared_file(path: str, asize: int, *, create: bool) -> mmap.mmap:
     fd = os.open(path, flags, 0o600)
     try:
         if create:
-            os.ftruncate(fd, asize)
+            try:
+                os.ftruncate(fd, asize)
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    raise RuntimeError(
+                        f"shared bank {path}: ENOSPC truncating {asize / (1 << 30):.1f} GiB. "
+                        f"FREETOKEN_BANK_SHARE_DIR is on a filesystem that is too small "
+                        f"(tmpfs /tmp is not a disk). Set it to a disk with enough free space."
+                    ) from exc
+                raise
         else:
             st = os.fstat(fd)
             if st.st_size < asize:
@@ -633,9 +763,13 @@ __all__ = [
     "alloc_layer_banks",
     "born_pinned_default",
     "pin_banks",
+    "DEFAULT_BANK_SHARE_NEED_BYTES",
+    "default_bank_share_dir",
+    "normalize_bank_share_dir",
     "prepare_shared_banks",
     "read_file_into",
     "read_range_into",
     "requested_residency",
+    "require_share_dir_capacity",
     "resolve_bank_share_dir",
 ]

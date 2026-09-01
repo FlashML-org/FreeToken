@@ -81,7 +81,10 @@ def vendor() -> Vendor:
         # Wheel provenance only — do not call torch.cuda.is_available() here;
         # that initializes the runtime and makes HIP_VISIBLE_DEVICES mutation useless.
         if getattr(torch.version, "cuda", None):
-            if _amd_hardware_present():
+            # A 9950X (Granite Ridge 0x1002 iGPU) + NVIDIA dGPU is a normal
+            # CUDA box. CUDA_ON_AMD only if this process would actually run on
+            # a *discrete* AMD GPU after iGPU hide (or HIP_VISIBLE points at one).
+            if _cuda_wheel_targets_discrete_amd():
                 return Vendor.CUDA_ON_AMD
             return Vendor.NVIDIA
     except Exception:
@@ -93,21 +96,102 @@ def vendor() -> Vendor:
 
 
 def _amd_hardware_present() -> bool:
-    """HIP runtime or an AMD PCI device (sysfs), without initializing torch.cuda."""
+    """HIP runtime or an AMD PCI device (sysfs), without initializing torch.cuda.
+
+    Any ``0x1002`` counts, including the Granite Ridge iGPU. Do **not** use this
+    alone to decide ``CUDA_ON_AMD`` — see :func:`_cuda_wheel_targets_discrete_amd`.
+    """
     if _hip_library_name() is not None:
         return True
-    drm = "/sys/class/drm"
+    return bool(_sysfs_amd_devices())
+
+
+def _read_sysfs(path: str) -> str | None:
     try:
-        for name in os.listdir(drm):
-            path = os.path.join(drm, name, "device", "vendor")
-            if not os.path.isfile(path):
-                continue
-            with open(path, encoding="ascii") as fh:
-                if fh.read().strip().lower() == "0x1002":
-                    return True
+        with open(path, encoding="ascii", errors="replace") as fh:
+            return fh.read().strip()
     except OSError:
-        pass
-    return False
+        return None
+
+
+def _sysfs_amd_devices(drm: str = "/sys/class/drm") -> list[dict]:
+    """AMD GPUs from sysfs. Does not initialize ``torch.cuda``.
+
+    Indices are drm-card order among AMD devices (not NVIDIA CUDA ordinals).
+    """
+    out: list[dict] = []
+    try:
+        names = sorted(
+            n for n in os.listdir(drm)
+            if n.startswith("card") and n[4:].isdigit()
+        )
+    except OSError:
+        return out
+    for name in names:
+        dev = os.path.join(drm, name, "device")
+        vendor = _read_sysfs(os.path.join(dev, "vendor"))
+        if vendor is None or vendor.lower() != "0x1002":
+            continue
+        product = (
+            _read_sysfs(os.path.join(dev, "product_name"))
+            or _read_sysfs(os.path.join(dev, "label"))
+            or ""
+        )
+        vram_raw = _read_sysfs(os.path.join(dev, "mem_info_vram_total"))
+        try:
+            total_bytes = int(vram_raw) if vram_raw else None
+        except ValueError:
+            total_bytes = None
+        arch = _arch_from_name(product)
+        hidden = is_igpu(name=product, arch=arch, total_bytes=total_bytes) and not include_igpu()
+        if not hidden and not include_igpu() and not product:
+            # Nameless 0x1002 + boot VGA + small VRAM: Granite Ridge / Raphael iGPU.
+            boot = _read_sysfs(os.path.join(dev, "boot_vga"))
+            if boot == "1" and (total_bytes is None or total_bytes < 4 * (1 << 30)):
+                hidden = True
+                product = "AMD Radeon Graphics"
+        idx = len(out)
+        out.append(
+            {
+                "index": idx,
+                "name": product or f"AMD GPU {idx}",
+                "arch": arch,
+                "total_bytes": total_bytes,
+                "uuid": None,
+                "hidden_igpu": hidden,
+            }
+        )
+    return out
+
+
+def _amd_devices_no_torch() -> list[dict]:
+    """HIP ctypes first (real HIP ordinals), else sysfs. No ``torch.cuda`` init."""
+    hip = hip_enumerate_devices()
+    if hip:
+        return hip
+    return _sysfs_amd_devices()
+
+
+def _cuda_wheel_targets_discrete_amd() -> bool:
+    """True when a CUDA torch wheel would be asked to run on a discrete AMD GPU.
+
+    A CUDA wheel + NVIDIA dGPU + AMD iGPU in sysfs is ``Vendor.NVIDIA``.
+    ``CUDA_VISIBLE_DEVICES`` on a CUDA (non-HIP) wheel names NVIDIA devices —
+    those integers are **not** remapped onto AMD drm/HIP indices.
+    ``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` are AMD ordinals.
+    """
+    devices = _amd_devices_no_torch()
+    raw = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("ROCR_VISIBLE_DEVICES")
+    if raw is not None:
+        if raw.strip() == "":
+            return False
+        keep: set[int] = set()
+        for part in raw.split(","):
+            p = part.strip()
+            if p.lstrip("-").isdigit():
+                keep.add(int(p))
+        return any(d["index"] in keep and not d.get("hidden_igpu") for d in devices)
+    return any(not d.get("hidden_igpu") for d in devices)
 
 
 def is_hip() -> bool:
@@ -205,9 +289,11 @@ def require_gpu() -> Vendor:
     v = vendor()
     if v is Vendor.CUDA_ON_AMD:
         raise RuntimeError(
-            "This process loaded a CUDA PyTorch wheel on AMD hardware. Native HIP "
-            "is required (ZLUDA is not supported — FlashML-org/FreeToken#60). "
-            "Install a ROCm torch build and see docs/amd.md."
+            "This process loaded a CUDA PyTorch wheel but a discrete AMD GPU is "
+            "visible (after iGPU hide). Native HIP is required (ZLUDA is not "
+            "supported — FlashML-org/FreeToken#60). Install a ROCm torch build "
+            "and see docs/amd.md. A CUDA wheel + NVIDIA dGPU + AMD iGPU is fine "
+            "(that stays the CUDA path)."
         )
     if v is Vendor.NONE:
         raise RuntimeError(

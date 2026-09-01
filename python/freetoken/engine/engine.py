@@ -352,13 +352,22 @@ class Engine:
 
         self.tp_cpu_group = self._init_communication(config)
         if config.tp_info.size > 1:
-            from freetoken.moe.host_banks import prepare_shared_banks
+            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+            from freetoken.moe.host_banks import DEFAULT_BANK_SHARE_NEED_BYTES, prepare_shared_banks
 
-            share_dir = prepare_shared_banks(port=getattr(config, "server_port", 1919))
+            need = None
+            try:
+                need = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+            except Exception:
+                need = None
+            need = need or DEFAULT_BANK_SHARE_NEED_BYTES
+            share_dir = prepare_shared_banks(
+                port=getattr(config, "server_port", 1919), need_bytes=need
+            )
             if share_dir:
                 logger.info_rank0(
                     f"TP={config.tp_info.size}: shared expert banks at {share_dir} "
-                    f"(one ~137 GiB DSV4 pool across ranks; set FREETOKEN_BANK_SHARE=0 to disable)"
+                    f"({need / (1 << 30):.1f} GiB pool; set FREETOKEN_BANK_SHARE=0 to disable)"
                 )
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
