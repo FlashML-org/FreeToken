@@ -362,7 +362,7 @@ def parse_args(
         ),
     )
 
-    kv_capacity_group.add_argument(
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         choices=list(KV_CACHE_DTYPES),
