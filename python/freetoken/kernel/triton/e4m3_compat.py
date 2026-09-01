@@ -37,6 +37,23 @@ def _env_force() -> bool:
     return os.environ.get("FREETOKEN_FORCE_E4M3_EMU", "").lower() in ("1", "true", "yes", "on")
 
 
+def _hip_forces_e4m3_emu() -> bool:
+    """HIP/gfx1201: Triton native fp8e4nv is unverified. Emulate unless opted in."""
+    if os.environ.get("FREETOKEN_HIP_E4M3_NATIVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    try:
+        from freetoken.runtime.gpu import is_hip
+
+        return is_hip()
+    except Exception:
+        return False
+
+
 FORCE_EMU = _env_force()
 
 if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
@@ -57,7 +74,7 @@ def e4m3_native() -> bool:
             "the process starts (with its own TRITON_CACHE_DIR)"
         )
     if _native is None:
-        if FORCE_EMU:
+        if FORCE_EMU or _hip_forces_e4m3_emu():
             _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
@@ -85,7 +102,7 @@ def e4m3_native_cx():
     Delegates to ``target_info`` (reads the active driver's target, so
     cross-compilation tests that patch ``driver.active.get_current_target``
     resolve consistently)."""
-    return not FORCE_EMU and target_info.cuda_capability_geq(8, 9)
+    return not FORCE_EMU and not _hip_forces_e4m3_emu() and target_info.cuda_capability_geq(8, 9)
 
 
 @jit

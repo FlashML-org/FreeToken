@@ -277,6 +277,69 @@ def test_trtllm_page_size_coercion_is_part_aware(monkeypatch):
     assert config.page_size == 64
 
 
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("full", "triton"),
+        ("swa", "triton"),
+        ("dsv4", "dsv4_sparse"),
+        ("mla", "dsa"),
+        ("dsa", "dsa"),
+        ("bsa", "m3_sparse"),
+        ("qsa", "qsa_sparse"),
+    ],
+)
+def test_hip_auto_uses_in_tree_triton_backends(monkeypatch, kind, expected):
+    """HIP must not pick flashinfer/sgl cubins; DSV4-Flash lands on dsv4_sparse."""
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    gpu.vendor.cache_clear()
+    _patch_env(monkeypatch, major=12, flashinfer=True, sgl=True)
+    config = _config(kind, attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == expected
+    gpu.vendor.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("dsv4", "dsv4_sparse"),
+        ("mla", "dsa"),
+        ("bsa", "m3_sparse"),
+        ("qsa", "qsa_sparse"),
+        ("full", "triton"),
+    ],
+)
+def test_hip_explicit_triton_aliases_type_backend(monkeypatch, kind, expected):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    gpu.vendor.cache_clear()
+    _patch_env(monkeypatch, major=12, flashinfer=True, sgl=True)
+    config = _config(kind, attention_backend="triton")
+    _adjust_config(config)
+    assert config.attention_backend == expected
+    gpu.vendor.cache_clear()
+
+
+def test_hip_dsv4_triton_sets_window_page_size(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    gpu.vendor.cache_clear()
+    _patch_env(monkeypatch)
+    config = _config("dsv4", attention_backend="triton")
+    _adjust_config(config)
+    assert config.attention_backend == "dsv4_sparse"
+    assert config.page_size == 128
+    gpu.vendor.cache_clear()
+
+
 def test_validate_rejects_more_than_two_parts():
     from argparse import ArgumentTypeError
 

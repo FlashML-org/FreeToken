@@ -109,6 +109,15 @@ def test_graph_replay_unsafe_on_gfx1201(monkeypatch):
     assert gpu.hip_graph_replay_safe("gfx1201") is True
 
 
+def test_hip_triton_alias_maps_dsv4_mla_bsa():
+    from freetoken.attention import AttnType, hip_triton_alias
+
+    assert hip_triton_alias(frozenset({AttnType.DSV4})) == "dsv4_sparse"
+    assert hip_triton_alias(frozenset({AttnType.MLA})) == "dsa"
+    assert hip_triton_alias(frozenset({AttnType.BSA})) == "m3_sparse"
+    assert hip_triton_alias(frozenset({AttnType.FULL})) == "triton"
+
+
 def test_describe_lists_zluda_unsupported(monkeypatch):
     monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "none")
     gpu.vendor.cache_clear()

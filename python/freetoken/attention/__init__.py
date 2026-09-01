@@ -87,6 +87,15 @@ def create_fa_backend(config: ModelConfig):
     ),
 )
 def create_triton_backend(config: ModelConfig):
+    from freetoken.runtime.gpu import is_hip
+
+    # NVIDIA keeps ``triton`` as the generic FULL/SWA backend (capability matrix).
+    # On HIP, ``--attention-backend triton`` is the portable alias for the in-tree
+    # Triton impl of DSV4 / MLA+DSA / BSA / QSA (no flashinfer/sgl cubins).
+    if is_hip():
+        alias = hip_triton_alias(_attn_types_from_config(config))
+        if alias != "triton":
+            return SUPPORTED_ATTENTION_BACKENDS[alias](config)
     from .triton import TritonAttentionBackend
 
     return TritonAttentionBackend(config)
@@ -143,6 +152,38 @@ def create_qsa_sparse_backend(config: ModelConfig):
     return QSASparseAttnBackend(config)
 
 
+def _attn_types_from_config(config) -> frozenset[AttnType]:
+    """Backend-driving attention types on a model config (group-spec walk)."""
+    specs_fn = getattr(config, "kv_cache_group_specs", None)
+    if specs_fn is None:
+        if getattr(config, "dsv4_args", None) is not None:
+            return frozenset({AttnType.DSV4})
+        if getattr(config, "glm_dsa_args", None) is not None:
+            return frozenset({AttnType.MLA, AttnType.DSA})
+        return frozenset({AttnType.FULL})
+    types = frozenset(
+        spec.attn_type for spec in specs_fn() if spec.attn_type.backend_driven
+    )
+    return types or frozenset({AttnType.FULL})
+
+
+def hip_triton_alias(required: frozenset[AttnType]) -> str:
+    """In-tree Triton backend that serves ``required`` on HIP (no NVIDIA cubins).
+
+    ``--attention-backend triton`` on AMD remaps to these names. NVIDIA auto-select
+    still uses the type-specific names (``dsv4_sparse``, ``dsa``, …) first.
+    """
+    if AttnType.DSV4 in required:
+        return "dsv4_sparse"
+    if required & {AttnType.MLA, AttnType.DSA}:
+        return "dsa"
+    if AttnType.BSA in required:
+        return "m3_sparse"
+    if AttnType.QSA in required:
+        return "qsa_sparse"
+    return "triton"
+
+
 def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 
@@ -189,6 +230,7 @@ __all__ = [
     "AttentionSpec",
     "attention_backend_info",
     "create_attention_backend",
+    "hip_triton_alias",
     "SUPPORTED_ATTENTION_BACKENDS",
     "validate_attn_backend",
 ]

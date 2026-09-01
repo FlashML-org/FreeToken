@@ -124,14 +124,18 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     types. Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
 
-    HIP: Triton is the only in-tree backend. NVIDIA cubin packages (flashinfer /
-    sgl_kernel) must not win auto-select and then crash on AMD.
+    HIP: the in-tree Triton implementation for each attention type (generic
+    ``triton`` for FULL/SWA, ``dsv4_sparse`` / ``dsa`` / ``m3_sparse`` /
+    ``qsa_sparse`` for those families). NVIDIA cubin packages must not win
+    auto-select and then crash on AMD.
     """
+    from freetoken.attention import hip_triton_alias
     from freetoken.runtime.gpu import is_hip
 
     if is_hip():
-        if _backend_parts_serve("triton", required) and _backend_requirements_met("triton"):
-            return "triton"
+        name = hip_triton_alias(required)
+        if _backend_parts_serve(name, required) and _backend_requirements_met(name):
+            return name
         raise RuntimeError(
             "No HIP attention backend can serve attention types "
             f"{sorted(t.value for t in required)}. The in-tree AMD path is "
@@ -1368,6 +1372,18 @@ def _adjust_config(config: EngineConfig):
             _resolve_auto_attention_backend(required_attn_types),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+    elif config.attention_backend == "triton":
+        from freetoken.attention import hip_triton_alias
+        from freetoken.runtime.gpu import is_hip
+
+        if is_hip():
+            alias = hip_triton_alias(required_attn_types)
+            if alias != "triton":
+                override("attention_backend", alias)
+                logger.info_rank0(
+                    f"HIP: --attention-backend triton -> {alias} "
+                    "(in-tree Triton; no NVIDIA cubins)"
+                )
     _validate_attention_backend_choice(config, override, required_attn_types)
 
     from freetoken.runtime.gpu import hip_graph_replay_safe, is_hip
