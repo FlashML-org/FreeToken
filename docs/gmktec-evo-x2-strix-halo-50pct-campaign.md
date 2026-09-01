@@ -1,9 +1,9 @@
-# LAN-223 Strix Halo 50 percent performance campaign
+# GMKtec EVO-X2 Strix Halo 50 percent performance campaign
 
 ## Objective
 
 Increase the client-visible steady-state decode speed of the native ROCm/HIP
-FreeToken Qwen3.6-35B-A3B Q4 service on LAN-223 by up to 50 percent over the
+FreeToken Qwen3.6-35B-A3B Q4 service on GMKtec EVO-X2 by up to 50 percent over the
 currently accepted exact-Q4 baseline, while retaining equivalent output quality
 and operational reliability.
 
@@ -31,7 +31,7 @@ such.
 
 ## Scope boundaries
 
-- Target host: LAN-223 only, Radeon 8060S `gfx1151`.
+- Target host: GMKtec EVO-X2 only, Radeon 8060S `gfx1151`.
 - Target runtime: native FreeToken ROCm/HIP path only.
 - Target model: the exact qualified Qwen3.6-35B-A3B Q4_K_M artifact.
 - Candidate servers bind only to loopback test ports in isolated clean
@@ -238,7 +238,7 @@ samples.
 **Decision: rejected.** The candidate is numerically safe in the screened
 controls, but its 0.25 percent gain is below the one percent acceptance floor
 and is within normal run-to-run variation.  The change was reverted in
-`0a1b709`; its complete candidate artifact remains on LAN-223 for comparison.
+`0a1b709`; its complete candidate artifact remains on GMKtec EVO-X2 for comparison.
 
 ### C02: opt-in HIP unsafe-math optimizations
 
@@ -264,7 +264,7 @@ candidate therefore has no demonstrated decode gain, while its mean result is
 materially worse because of the stall.
 
 **Decision: rejected.** Preserve the raw quality and benchmark artifacts at
-`qwen35moe-q4-hipmath-20260901T081500Z` on LAN-223, but remove the experimental
+`qwen35moe-q4-hipmath-20260901T081500Z` on GMKtec EVO-X2, but remove the experimental
 compiler flag from the branch.  Further work should target the measured Q4_K
 and Q5_K routed-MoE vector kernels, not generic compiler flags.
 
@@ -286,7 +286,7 @@ failed.
 
 **Decision: rejected for correctness.** The wider vector ratio changes the
 kernel's coverage or reduction mapping on this HIP path.  Preserve the failed
-quality artifact at `qwen35moe-q4-vdr4-20260901T084500Z` on LAN-223, revert the
+quality artifact at `qwen35moe-q4-vdr4-20260901T084500Z` on GMKtec EVO-X2, revert the
 source candidate, and restore the protected normal Qwen service before the
 next investigation.
 
@@ -309,7 +309,7 @@ the fixed warmup plus three scored 256-token API samples.
 **Decision: rejected.** Correctness was preserved, but sharing the activation
 address did not offset the extra live accumulator and register pressure.  The
 result is below baseline and below the one-percent acceptance floor.  Preserve
-the artifact at `qwen35moe-q4-k2row-20260901T093500Z` on LAN-223 and revert the
+the artifact at `qwen35moe-q4-k2row-20260901T093500Z` on GMKtec EVO-X2 and revert the
 candidate source.
 
 ### C05: wider HIP Q8_0 vector-dot ratio
@@ -330,13 +330,13 @@ passed all three deterministic Qwen API controls.
 **Decision: rejected.** The wider Q8 work ratio is numerically safe but slows
 the end-to-end Q4 workload.  The extra per-lane work does not repay its
 occupancy and register cost on gfx1151.  Preserve the artifact at
-`qwen35moe-q4-q8vdr4-20260901T104200Z` on LAN-223 and revert the candidate.
+`qwen35moe-q4-q8vdr4-20260901T104200Z` on GMKtec EVO-X2 and revert the candidate.
 
 ### C06: modern MMVQ component replacement investigation
 
 The prior candidates establish that changing local launch dimensions or
 per-lane work ratios in the older vendored GGUF kernels does not produce a
-safe gain on gfx1151.  LAN-223 reports a 32-lane HIP warp, so the existing
+safe gain on gfx1151.  GMKtec EVO-X2 reports a 32-lane HIP warp, so the existing
 32-thread logical reduction is not accidentally running at half its physical
 wave width.
 
@@ -370,7 +370,7 @@ not extrapolation from CUDA-oriented paper results.
 
 #### C06 baseline: exact packed-expert microbenchmark
 
-The new screening harness completed its initial LAN-223 baseline with real
+The new screening harness completed its initial GMKtec EVO-X2 baseline with real
 packed bytes from layer 0 of the qualified Qwen GGUF.  It copied the eight
 routed expert slices only, used the production `ggml_moe_a8_vec` binding, and
 excluded model load, HTTP, router, scheduler, and JIT time from GPU-event
@@ -386,4 +386,4 @@ measurements.
 This is a selection baseline, not server TPS.  It makes later component work
 auditable: a candidate must improve this real-shape screen and still pass all
 end-to-end quality, latency, and recovery gates.  The artifact is
-`qwen35moe-q4kq5k-microbaseline-20260901T141100Z` on LAN-223.
+`qwen35moe-q4kq5k-microbaseline-20260901T141100Z` on GMKtec EVO-X2.

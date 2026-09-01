@@ -1,9 +1,9 @@
-# LAN-223 native ROCm validation, 2026-08-28
+# GMKtec EVO-X2 native ROCm validation, 2026-08-28
 
 ## Result
 
 This validation passed the first release gate for the AMD port.  FreeToken
-served both required MoE models through the OpenAI-compatible API on LAN-223's
+served both required MoE models through the OpenAI-compatible API on GMKtec EVO-X2's
 Radeon 8060S (`gfx1151`) using a native HIP and ROCm execution path.
 
 This is not a CPU fallback or a Vulkan result.  The serving process uses the
@@ -15,7 +15,7 @@ needs correctness before graph capture tuning.
 
 | Item | Value |
 | --- | --- |
-| Host | LAN-223, `david-Gmktec-x2-2` |
+| Host | GMKtec EVO-X2, `david-Gmktec-x2-2` |
 | GPU | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
 | System ROCm installation | ROCm 10.0 at `/opt/rocm-10.0` |
 | PyTorch wheel | `2.13.0+rocm10.0.0` |
@@ -34,7 +34,7 @@ llama-swap service, model configuration, or production endpoint was changed.
 | `nvidia/Qwen3.6-35B-A3B-NVFP4` | vendor model snapshot used for this run | Triton attention, MoE offload, native Triton NVFP4, serial expert load | HTTP 200, `AMD ROCm FreeToken ready.` in 1.54 s | HTTP 200, SSE chunks and `[DONE]` |
 | `google/gemma-4-26B-A4B-it-qat-q4_0-gguf` | `d1c082be9cf3c8a514acf63b8761f4b41935842e` | Triton attention, MoE offload, serial expert load, HIP GGUF JIT | HTTP 200, `native hip api works` in 341.304 ms | HTTP 200, SSE chunks and `[DONE]` |
 
-Raw evidence remains on LAN-223 in these isolated artifact directories:
+Raw evidence remains on GMKtec EVO-X2 in these isolated artifact directories:
 
 ```text
 /home/david/freetoken-amd/artifacts/qwen36-nvfp4-serial-hip-prefill/
@@ -93,7 +93,7 @@ final concise answer and stopped at 26 tokens.  That makes the output-rate
 comparison useful as a warm streaming rate, but not a quality or exact
 end-to-end task comparison.  The raw llama.cpp evidence is retained under
 `/home/david/freetoken-amd/artifacts/llamacpp-vulkan-gemma4-q4-tps/` on
-LAN-223.
+GMKtec EVO-X2.
 
 ## Same-model ROCm 10 and HIP comparison
 
@@ -141,7 +141,7 @@ reasoning text.  FreeToken stopped after a concise 20-token answer.  This
 makes the output-rate comparison a useful streaming measurement, but it is
 not an exact answer-quality or equal-completion-length evaluation.
 
-Raw artifacts are retained only on LAN-223:
+Raw artifacts are retained only on GMKtec EVO-X2:
 
 ```text
 /home/david/freetoken-amd/artifacts/llamacpp-rocm10-gemma4-q4-tps/
@@ -242,7 +242,7 @@ The retained raw evidence is:
 The historical llama.cpp reference was useful for identifying the original
 gap, but it was not collected alongside the accepted 4,096-slot FreeToken
 configuration.  A new five-run control was therefore run immediately after
-that configuration investigation, without changing LAN-223, stopping any
+that configuration investigation, without changing GMKtec EVO-X2, stopping any
 user process, or enabling a production service.  Each trial launched a fresh
 `llama-server` from the ROCm 10 `b10141` build with all layers on `gfx1151`,
 Flash Attention enabled, one parallel slot, and `-c 8320`.  The server reports
@@ -273,7 +273,7 @@ This is a close result for decode rate, but it does **not** meet the stated
 criterion of meeting or exceeding llama.cpp.  The remaining performance work
 is therefore directed at the HIP decode path and the source of the FreeToken
 tail stall, rather than a claim of parity.  The raw llama.cpp evidence is
-retained on LAN-223 at:
+retained on GMKtec EVO-X2 at:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/llamacpp-current-host-context8320-20260829T013730Z/
@@ -285,7 +285,7 @@ After the comparison, upstream `main` advanced from `9ef3651` to `a05c265`
 with Qwen 3.8 support and engine or cache changes.  The AMD branch was rebased
 onto that current upstream revision without a conflict, rather than leaving a
 performance result attached to an obsolete upstream base.  The rebased branch
-was then installed into the isolated LAN-223 virtual environment so its native
+was then installed into the isolated GMKtec EVO-X2 virtual environment so its native
 HIP pinned-memory extension was built from the rebased source.  The source
 checkout used for that validation was deliberately separate from the earlier
 test checkout, preventing an uncommitted working-tree change from becoming
@@ -402,7 +402,7 @@ It preserves FreeToken's flattened token/top-k route IDs, packed expert-bank
 layout, Q8_1 activation layout, and BF16 public output contract.  CUDA retains
 the established generic path.
 
-The dedicated LAN-223 microbenchmark uses the verified Gemma 4 26B A4B Q4_0
+The dedicated GMKtec EVO-X2 microbenchmark uses the verified Gemma 4 26B A4B Q4_0
 geometry: 128 experts, top-k 8, hidden width 2816, intermediate width 704, and
 one decode token.  Five runs with 2,000 timed calls each measured a 73.509 us
 baseline median for the gate/up plus down pair and a 64.340 us candidate median,
@@ -433,7 +433,7 @@ observable API result.  It remains approximately 7.5 percent below the
 matched llama.cpp client-TPS reference, so it is an incremental port
 improvement rather than completion of the performance objective.
 
-Artifacts are retained on LAN-223:
+Artifacts are retained on GMKtec EVO-X2:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/q4-moe-microbench-20260828T231332Z/
@@ -708,7 +708,7 @@ injected a second LLVM and rocprofiler SDK beside the SDK bundled with the
 PyTorch ROCm wheel.  That historical failure is retained in
 `rocprof-gfx1151*/` and `rocprof-launch-gfx1151-v2/` under the raw artifact
 directory.  It was subsequently repaired by
-[`scripts/lan223-rocprof-wheel-sdk.sh`](../scripts/lan223-rocprof-wheel-sdk.sh),
+[`scripts/gmk-evo-x2-rocprof-wheel-sdk.sh`](../scripts/gmk-evo-x2-rocprof-wheel-sdk.sh),
 which directs the host profiler front end to the wheel's matching SDK.  The
 repaired launch produced FreeToken kernel traces, including the active
 `moe_vec_q4_0_hip_two_rows` kernel.  Traces are diagnostic evidence only and
@@ -797,7 +797,7 @@ evidence is retained at:
 
 ### Current host-interference qualifier
 
-A read-only LAN-223 health capture at 2026-08-29T02:41:15Z found no GPU reset,
+A read-only GMKtec EVO-X2 health capture at 2026-08-29T02:41:15Z found no GPU reset,
 thermal problem, or active FreeToken server.  The Radeon 8060S was idle at
 30 C after the test.  It did, however, identify two pre-existing user-owned
 filesystem scans in uninterruptible `D` state: one scanning `/home/david`,
@@ -823,7 +823,7 @@ the interference.
 ### Current review-branch static validation
 
 The current upstream-review commit `6c6198b10d9fb6a9c93e0aa94a05ac4144ec061d`
-was validated directly on LAN-223 after the I/O evidence capture tooling was
+was validated directly on GMKtec EVO-X2 after the I/O evidence capture tooling was
 added.  The check completed without starting an inference server or changing
 host state:
 
@@ -840,10 +840,10 @@ The raw output and commit metadata are retained at:
 ```
 
 A temporary high-performance DPM governor test could not be run because the
-non-root LAN-223 account cannot write `power_dpm_force_performance_level`;
+non-root GMKtec EVO-X2 account cannot write `power_dpm_force_performance_level`;
 automatic mode was unchanged.
 
-Raw campaign artifacts are retained on LAN-223:
+Raw campaign artifacts are retained on GMKtec EVO-X2:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-optimization-2026-08-28/
@@ -852,7 +852,7 @@ Raw campaign artifacts are retained on LAN-223:
 ## Deep-investigation baseline and profiler repair
 
 The reproducible read-only baseline is captured by
-[`../scripts/lan223-capture-baseline.sh`](../scripts/lan223-capture-baseline.sh).
+[`../scripts/gmk-evo-x2-capture-baseline.sh`](../scripts/gmk-evo-x2-capture-baseline.sh).
 The first baseline was written to:
 
 ```text
@@ -861,7 +861,7 @@ The first baseline was written to:
 
 ### Test-checkout repair and revalidated shipping baseline
 
-During the follow-on investigation, the isolated LAN-223 source checkout was
+During the follow-on investigation, the isolated GMKtec EVO-X2 source checkout was
 found at `61a1505`.  That commit contained the subsequently rejected
 two-block-residency Q4_0 MoE experiment.  The authoritative branch had already
 reverted that experiment at `b77825d` and documented the rejection at
@@ -951,7 +951,7 @@ The 0.14 percent TPS change is smaller than the observed run-to-run variation,
 does not close the gap to the 60.42 client TPS ROCm 10 llama.cpp reference,
 and changes the deterministic greedy response hash.  The candidate was
 therefore reverted and is not a shipping option.  Raw evidence remains on
-LAN-223 at:
+GMKtec EVO-X2 at:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/fp32-intermediate-20260828T230126Z/
@@ -972,7 +972,7 @@ SDK from `/opt/rocm-10.0`, causing `import torch` to abort with duplicate LLVM
 registration for `spirv-expand-step`.  The failure was reproduced with a
 minimal PyTorch import, so it is not caused by FreeToken.
 
-`scripts/lan223-rocprof-wheel-sdk.sh` repairs the launch path without editing
+`scripts/gmk-evo-x2-rocprof-wheel-sdk.sh` repairs the launch path without editing
 the host installation.  It keeps the host `rocprofv3` front end but passes
 `--rocm-root` for the wheel's `_rocm_sdk_core`, making the profiler use the
 same library identities as PyTorch.  The repair was validated by profiling a
@@ -1040,7 +1040,7 @@ line `API server is ready to serve` before submitting requests.
    PyTorch wheel omits Thrust.  It passes that path as a compiler system
    include, avoiding an attempted hipify write into the ROCm installation.
 6. The same JIT adds a system ROCm library directory only when the wheel SDK
-   lacks the unversioned `libamdhip64.so` linker name.  On LAN-223 this allowed
+   lacks the unversioned `libamdhip64.so` linker name.  On GMKtec EVO-X2 this allowed
    the native `gfx1151` object and shared module to compile and link.
 
 ## Known limitations and follow-up work
@@ -1072,7 +1072,7 @@ this change.
 The earlier five-run comparison was repeated after the two identified
 user-space filesystem scans had been stopped with the operator's explicit
 authorization.  This is the decision-quality comparison: it uses the same
-LAN-223 `gfx1151` device, ROCm 10 runtime, 14 GB Gemma 4 26B A4B Q4_0 GGUF,
+GMKtec EVO-X2 `gfx1151` device, ROCm 10 runtime, 14 GB Gemma 4 26B A4B Q4_0 GGUF,
 cached AIME-25 problem 0, greedy OpenAI-compatible streamed request, and
 128-token generation limit on each runner.  Every scored sample starts a
 fresh server, makes one excluded warm request, then makes one scored request.
@@ -1100,7 +1100,7 @@ percent higher.  Therefore the AMD port is proven functional and stable but
 does not yet meet the requested requirement to match or exceed the optimized
 llama.cpp control.
 
-The raw, per-run result and server-log bundles remain on LAN-223:
+The raw, per-run result and server-log bundles remain on GMKtec EVO-X2:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/clean-host-freetoken-matrix-20260829T030633Z/
@@ -1142,7 +1142,7 @@ and is explicitly excluded.  The valid four-row result then set
 This establishes a stricter rule for all remaining performance work: every
 source-changing HIP candidate must compile in a unique extension-cache path,
 and the artifact must contain the resulting shared module before API timing is
-accepted.  The immutable raw bundles are on LAN-223:
+accepted.  The immutable raw bundles are on GMKtec EVO-X2:
 
 ```text
 /home/david/freetoken-amd/artifacts/amd-deep-investigation-2026-08-28/hip-moe-q4-occupancy-retry-20260829T032503Z/

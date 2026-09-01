@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from benchmarks.lan223_qwen.run_api_benchmark import (
+from benchmarks.gmk_evo_x2.run_api_benchmark import (
     StreamObservation,
     iter_sse_events,
     load_tokenizer,

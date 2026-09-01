@@ -47,7 +47,7 @@ restore_production() {
         # serial NVFP4 expert groups on LAN-223. Retrying the launcher while
         # its listener already exists only produces a misleading refusal and
         # wastes the short recovery window.
-        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+        bash "${PRODUCTION_DIR}/scripts/gmk-evo-x2/start_qwen_recovery_server.sh" \
             | tee -a "${ARTIFACT_DIR}/recovery.log" || true
         # The protected model normally needs roughly six to eight minutes from
         # a cold recovery. Wait a bounded eight minutes for the authoritative
@@ -127,7 +127,7 @@ if [[ "${FREETOKEN_GEMMA4_VISION_DEBUG:-}" == "1" ]]; then
     tr '\0' '\n' <"/proc/${candidate_pid}/environ" | \
         grep '^FREETOKEN_GEMMA4_VISION_DEBUG=' >"${ARTIFACT_DIR}/vision-debug-env.txt" || true
 fi
-PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_text.py \
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_text.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
     >"${ARTIFACT_DIR}/quality.log" 2>&1
@@ -150,13 +150,13 @@ if [[ "${MODE}" == "vision" ]]; then
         # without changing the normal short candidate-control behavior.
         image_verify_args+=(--repetitions "${FREETOKEN_GEMMA4_IMAGE_REPETITIONS}")
     fi
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_image.py \
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_image.py \
         --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
         --stream "${image_verify_args[@]}" --artifact "${ARTIFACT_DIR}/image-quality.json" \
         >"${ARTIFACT_DIR}/image-quality.log" 2>&1
     # The long-response fixture supplies an output-length quality gate, which
     # makes its stream timing suitable for a visual decode-TPS measurement.
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_visual_tps.py \
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_visual_tps.py \
         --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
         --artifact "${ARTIFACT_DIR}/visual-tps.json" \
         >"${ARTIFACT_DIR}/visual-tps.log" 2>&1

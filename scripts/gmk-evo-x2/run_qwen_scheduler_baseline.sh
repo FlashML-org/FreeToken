@@ -38,7 +38,7 @@ cd "${SOURCE_DIR}"
 # reasoning stream is explicitly disabled because this measures final-token
 # decoding, not variable-length internal reasoning. A warmup is retained but
 # saved separately by the harness before the three scored samples.
-"${VENV_PYTHON}" benchmarks/lan223_qwen/run_api_benchmark.py \
+"${VENV_PYTHON}" benchmarks/gmk_evo_x2/run_api_benchmark.py \
     --model "${MODEL_NAME}" \
     --tokenizer "${MODEL_DIR}" \
     --base-url "${BASE_URL}" \

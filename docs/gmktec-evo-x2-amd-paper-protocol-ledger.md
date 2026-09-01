@@ -1,10 +1,10 @@
-# LAN-223 paper protocol ledger
+# GMKtec EVO-X2 paper protocol ledger
 
 This ledger records which FreeToken paper fields are available before a result
 is called a strict replication. The primary paper is `2608.16157v1.pdf` in the
 project root. The upstream summary is `docs/upstream-qwen-paper-protocol.md`.
 
-| Field | Paper evidence | State | LAN-223 consequence |
+| Field | Paper evidence | State | GMKtec EVO-X2 consequence |
 | --- | --- | --- | --- |
 | Models | Qwen3.6-35B-A3B, DeepSeek-V4-Flash, GLM-5.2 | Confirmed | Qwen is primary AMD qualification model |
 | RTX 4060 row | RTX 4060 Laptop 8 GB, Core i9-13900H, LPDDR5 32 GiB, PCIe 4.0 x8 | Confirmed | Hardware reference only |
@@ -23,5 +23,4 @@ project root. The upstream summary is `docs/upstream-qwen-paper-protocol.md`.
 ## Decision rule
 
 Until every missing row is resolved from released artifacts or the authors,
-call the result `LAN-223 paper-inspired`, never `paper replication`.
-
+call the result `GMKtec EVO-X2 paper-inspired`, never `paper replication`.

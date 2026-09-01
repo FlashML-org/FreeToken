@@ -129,10 +129,10 @@ fork unless the upstream maintainers request them.
 
 The completed 2026-08-28 native HIP validation, exact evaluated-system environment,
 API evidence, command shapes, and known limitations are documented in
-[`lan223-rocm-validation-2026-08-28.md`](lan223-rocm-validation-2026-08-28.md).
+[`host-identity canary-rocm-validation-2026-08-28.md`](host-identity canary-rocm-validation-2026-08-28.md).
 The post-repair Gemma vision, Qwen API, matched runner, and clean-memory
 endurance evidence is documented separately in
-[`lan223-rocm-validation-2026-08-30.md`](lan223-rocm-validation-2026-08-30.md).
+[`host-identity canary-rocm-validation-2026-08-30.md`](host-identity canary-rocm-validation-2026-08-30.md).
 
 ## Public reproduction interface
 

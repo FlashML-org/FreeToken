@@ -1,4 +1,4 @@
-# LAN-223 Gemma4 Q4 text control, 2026-08-30
+# GMKtec EVO-X2 Gemma4 Q4 text control, 2026-08-30
 
 The native ROCm/HIP FreeToken GGUF path was qualified against the on-host
 `gemma-4-26B_q4_0-it.gguf` text model. The test was isolated on port 1923 and
@@ -18,7 +18,7 @@ insertion. The server and local GGUF tokenizer agreed on 30 prompt tokens.
 | Completion tokens | 4 |
 | Steady decode TPS | 57.05 |
 
-The preserved LAN-223 evidence is
+The preserved GMKtec EVO-X2 evidence is
 `/home/david/freetoken-amd/artifacts/gemma4-gguf-text-20260830T035542Z/quality.json`.
 This proves text-only loader, template, OpenAI-compatible completion API,
 token accounting, and a deterministic basic quality response. It does not yet

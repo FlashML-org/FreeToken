@@ -38,7 +38,7 @@ restore_production() {
         # Start only once. The serial NVFP4 Qwen load on LAN-223 lasts minutes;
         # retrying its launcher after the listener exists merely reports a
         # refusal and shortens the useful ready-status wait.
-        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+        bash "${PRODUCTION_DIR}/scripts/gmk-evo-x2/start_qwen_recovery_server.sh" \
             | tee -a "${ARTIFACT_DIR}/recovery.log" || true
         # Keep the benchmark process alive until Qwen is actually serving, up
         # to the known cold-start envelope, not merely until health answers.
@@ -87,7 +87,7 @@ done
 test -s "${ARTIFACT_DIR}/health.json"
 
 cd "${CHECKOUT}"
-PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_text.py \
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_text.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
     >"${ARTIFACT_DIR}/quality.log" 2>&1
@@ -98,7 +98,7 @@ if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
     # FreeToken after a multimodal implementation change.
     image_verify_args+=(--extended)
 fi
-PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_image.py \
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_image.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
     --max-tokens 128 --stream "${image_verify_args[@]}" --artifact "${ARTIFACT_DIR}/image-quality.json" \
     >"${ARTIFACT_DIR}/image-quality.log" 2>&1
@@ -107,7 +107,7 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gg
 # optional reasoning channel. Gemma4 through llama.cpp may emit a substantial
 # reasoning trace before visible content, so 1,024 tokens establishes whether
 # the runtime can complete the user-visible response at all.
-PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_gemma4_gguf_visual_tps.py \
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_visual_tps.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
     --max-tokens 1024 --artifact "${ARTIFACT_DIR}/visual-tps.json" \
     >"${ARTIFACT_DIR}/visual-tps.log" 2>&1

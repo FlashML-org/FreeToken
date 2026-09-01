@@ -42,7 +42,7 @@ restore_production() {
     # Avoid a duplicate recovery when the production endpoint survived a setup
     # failure.  The recovery helper owns the production command and its logs.
     if ! timeout 5 curl -fsS "http://127.0.0.1:${PRODUCTION_PORT}/health" >/dev/null; then
-        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" \
+        bash "${PRODUCTION_DIR}/scripts/gmk-evo-x2/start_qwen_recovery_server.sh" \
             | tee "${ARTIFACT_DIR}/recovery.log"
     fi
 }
@@ -83,7 +83,7 @@ grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log"
 # Persist the request body, final text, exact prompt hash, server usage, and
 # first-token/decode timings in one self-contained JSON control artifact.
 PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" \
-    scripts/lan223/verify_qwen_raw_prompt_quality.py \
+    scripts/gmk-evo-x2/verify_qwen_raw_prompt_quality.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${SERVED_MODEL}" \
     --tokenizer "${TOKENIZER_PATH}" --decode "${DECODE_TOKENS}" \
     --artifact "${ARTIFACT_DIR}/raw-quality.json" \

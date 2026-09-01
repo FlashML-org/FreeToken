@@ -24,7 +24,7 @@ restore_production() {
     test_pid="$(port_pid "${TEST_PORT}")"
     [[ -z "${test_pid}" ]] || kill "${test_pid}" || true
     if ! timeout 5 curl -fsS "http://127.0.0.1:${PRODUCTION_PORT}/health" >/dev/null; then
-        bash "${PRODUCTION_DIR}/scripts/lan223/start_qwen_recovery_server.sh" | tee "${ARTIFACT_DIR}/recovery.log"
+        bash "${PRODUCTION_DIR}/scripts/gmk-evo-x2/start_qwen_recovery_server.sh" | tee "${ARTIFACT_DIR}/recovery.log"
     fi
 }
 trap restore_production EXIT
@@ -47,7 +47,7 @@ done
 test -s "${ARTIFACT_DIR}/health.json"
 
 cd "${HARNESS_DIR}"
-PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/lan223/verify_qwen_raw_prompt_quality.py \
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_qwen_raw_prompt_quality.py \
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${SERVED_MODEL}" \
     --tokenizer "${TOKENIZER_PATH}" --decode "${DECODE_TOKENS}" \
     --artifact "${ARTIFACT_DIR}/raw-quality.json" >"${ARTIFACT_DIR}/raw-quality.log" 2>&1

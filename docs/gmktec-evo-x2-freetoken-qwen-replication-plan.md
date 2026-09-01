@@ -1,8 +1,8 @@
-# LAN-223 FreeToken Qwen replication and Strix Halo optimization plan
+# GMKtec EVO-X2 FreeToken Qwen replication and Strix Halo optimization plan
 
 ## Decision and success statement
 
-This plan targets only LAN-223, a Ryzen AI Max+ 395 with Radeon 8060S
+This plan targets only GMKtec EVO-X2, a Ryzen AI Max+ 395 with Radeon 8060S
 (`gfx1151`) and shared LPDDR5X memory.  It does not alter LAN-199, LAN-215,
 llama-swap, or any production model service.
 
@@ -13,7 +13,7 @@ replicate is 39.3 generated tokens per second on an 8 GB RTX 4060 laptop.
 This is a model-specific reference, not a general statement that all FreeToken
 models fit in 8 GB of VRAM.
 
-The program is successful only when LAN-223 can run the documented Qwen
+The program is successful only when GMKtec EVO-X2 can run the documented Qwen
 workload through the native ROCm and HIP FreeToken server with:
 
 1. A fully recorded, exact model and workload contract.
@@ -41,7 +41,7 @@ DRAM, and a PCIe link.  Its MoE policy can retain hot experts in VRAM while
 placing other experts in host memory, fetching misses or computing selected
 misses on the CPU.
 
-LAN-223 has UMA.  Its CPU and Radeon 8060S access the same memory pool.  This
+GMKtec EVO-X2 has UMA.  Its CPU and Radeon 8060S access the same memory pool.  This
 can remove PCIe-copy cost and can permit a larger hot-expert cache than an 8 GB
 discrete GPU.  It can also be worse if the CPU fallback, GPU compute, KV cache,
 and operating system contend for the same LPDDR5X channels.  A direct copy of
@@ -52,10 +52,10 @@ needs a measured UMA policy.
 
 ### Scope and safety
 
-- Maintain a LAN-223 host allowlist in every benchmark launcher and refuse any
+- Maintain a GMKtec EVO-X2 host allowlist in every benchmark launcher and refuse any
   other hostname or IP address before contacting a server.
 - Use an isolated work directory under `/home/david/freetoken-amd/artifacts/`.
-- Bind experiments to loopback or a non-production LAN-223 test port.
+- Bind experiments to loopback or a non-production GMKtec EVO-X2 test port.
 - Do not change llama-swap configuration, routes, model aliases, startup
   services, or model files used by production services.
 - Store credentials only as environment-variable references.  Do not save,
@@ -105,7 +105,7 @@ short.  Resolve, rather than assume:
 - TTFT definition and whether server-internal timing or client-observed timing
   is used.
 
-Do not label a LAN-223 result as a reproduction until all fields are known or
+Do not label a GMKtec EVO-X2 result as a reproduction until all fields are known or
 explicitly listed as unavailable from the authors.
 
 ### 0.2 Define a metric dictionary before testing
@@ -127,14 +127,14 @@ one runtime's internal timing to the other's HTTP timing.
 
 ### 0.3 Create the baseline protocol package
 
-Create a versioned benchmark package under `benchmarks/lan223_qwen/` with:
+Create a versioned benchmark package under `benchmarks/gmk_evo_x2/` with:
 
 - A static JSON request corpus and expected tokenizer counts.
 - A local API client that captures raw SSE timestamps using a monotonic clock.
 - A warmup runner, a cold-start runner, a fixed-length decode runner, and a
   multi-turn agentic runner.
 - A process guard that checks the host identity and fails closed outside
-  LAN-223.
+  GMKtec EVO-X2.
 - Telemetry collection with timestamps aligned to each request.
 - A manifest writer and checksum verifier.
 - A result parser that emits JSON, CSV, and a Markdown table without changing
@@ -147,7 +147,7 @@ Create a versioned benchmark package under `benchmarks/lan223_qwen/` with:
 ### 1.1 Use the exact primary model path
 
 The main candidate is the official `nvidia/Qwen3.6-35B-A3B-NVFP4` checkpoint
-already supported upstream and validated functionally on LAN-223.  Preserve
+already supported upstream and validated functionally on GMKtec EVO-X2.  Preserve
 the original model directory as read-only.  Build any FreeToken fast-weight
 conversion once, checksum it, and reuse it across every trial.
 
@@ -161,7 +161,7 @@ Use three types of evidence:
 
 1. **FreeToken NVIDIA reference**: upstream FreeToken on supported NVIDIA
    hardware when available.  Fix greedy decoding and retain raw token IDs.
-2. **Independent AMD control**: llama.cpp ROCm on LAN-223 using a compatible
+2. **Independent AMD control**: llama.cpp ROCm on GMKtec EVO-X2 using a compatible
    Qwen quantization and a carefully documented template.  It is a quality
    control, not a performance proxy when the format differs.
 3. **Model-level evaluation**: a small, fixed benchmark suite with exact
@@ -194,7 +194,7 @@ The gate before performance tuning is:
 - Where cross-runtime byte identity is impossible, the quality suite must show
   no statistically meaningful regression relative to the selected reference.
 
-## Phase 2: establish unoptimized but comparable LAN-223 baselines
+## Phase 2: establish unoptimized but comparable GMKtec EVO-X2 baselines
 
 ### 2.1 Baseline matrix
 
@@ -375,7 +375,7 @@ evidence, and a documented accept or reject decision.
 ### 6.1 Replication trial
 
 Once protocol fields are resolved, run the exact paper-matched Qwen workload
-on LAN-223 with the selected stable configuration:
+on GMKtec EVO-X2 with the selected stable configuration:
 
 - At least five independent warm-server samples.
 - At least three cold-start samples, reported separately.
@@ -400,7 +400,7 @@ Only after a successful replication trial, test claimed advantages of UMA:
 - Sustained throughput with no thermal or memory-pressure degradation.
 
 Use the NVIDIA reference as a published comparison point, not as a reason to
-hide protocol differences.  A claim that LAN-223 exceeds the NVIDIA result
+hide protocol differences.  A claim that GMKtec EVO-X2 exceeds the NVIDIA result
 requires a same-model, same-precision, same-workload, same-TPS-definition
 comparison, or a clearly bounded claim such as "higher end-to-end warm decode
 TPS on this specified request."
@@ -439,7 +439,7 @@ Publish a reproducibility bundle in the fork containing:
 
 Before updating the existing upstream pull request, split changes into focused
 commits: portable HIP correctness, instrumentation and tests, and optionally a
-portable AMD optimization.  Keep LAN-223-specific evidence and tuning defaults
+portable AMD optimization.  Keep GMKtec EVO-X2-specific evidence and tuning defaults
 in this fork unless upstream maintainers request them.  Do not claim general
 AMD support from a single `gfx1151` result.
 
@@ -462,7 +462,7 @@ AMD support from a single `gfx1151` result.
 
 1. Resolve the authors' 39.3 TPS protocol and freeze the Qwen benchmark
    contract.
-2. Implement the LAN-223-only harness and manifest schema before altering
+2. Implement the GMKtec EVO-X2-only harness and manifest schema before altering
    another performance kernel.
 3. Re-run the current Qwen NVFP4 baseline with five samples, correct telemetry,
    and quality canaries.

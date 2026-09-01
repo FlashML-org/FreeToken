@@ -1,8 +1,8 @@
-# LAN-223 Qwen router and cache optimization, 2026-08-29
+# GMKtec EVO-X2 Qwen router and cache optimization, 2026-08-29
 
 ## Scope
 
-This record covers only the isolated FreeToken server on LAN-223's Radeon 8060S
+This record covers only the isolated FreeToken server on GMKtec EVO-X2's Radeon 8060S
 (`gfx1151`). It did not start, stop, unmask, or reconfigure llama-swap or the
 production llama.cpp service. All server instances bound only to `127.0.0.1:1919`.
 
@@ -10,7 +10,7 @@ production llama.cpp service. All server instances bound only to `127.0.0.1:1919
 
 FreeToken's vendored Triton softmax top-k router was evaluated on ROCm.
 Qwen3.6 NVFP4 uses 256 experts and selects eight experts per token. On
-LAN-223, the candidate matched the PyTorch reference in the isolated router
+GMKtec EVO-X2, the candidate matched the PyTorch reference in the isolated router
 test and reduced router-only latency at the production shape.
 
 | Router microbenchmark | PyTorch reference | HIP Triton | Speedup |
@@ -28,7 +28,7 @@ therefore rejected and ROCm retains the exact PyTorch router.
 The Qwen API harness sends greedy sampling and `reasoning_effort=none`. This
 is required because otherwise Qwen can stream its reasoning trace until the
 output cap before returning a final answer. The exact-answer canary returned
-`LAN223` on warmup and scored requests, proving API transport and parser
+`host-identity canary` on warmup and scored requests, proving API transport and parser
 behavior only. It is not an end-to-end model-quality acceptance test.
 
 The sustained-decode workload is a 1,212-prompt-token, repeated scheduler
@@ -50,11 +50,11 @@ an independently justified numerical reason and task-level quality is proven.
 ### Current quality restoration proof
 
 After restoring the exact PyTorch router, the same AIME-25 problem zero was
-warmed once and measured once against the live LAN-223 server. The checkpoint
+warmed once and measured once against the live GMKtec EVO-X2 server. The checkpoint
 used greedy sampling, a thinking-enabled template, and a forced 128-token
 decode. The 54-token prompt produced the historic output SHA-1
 `0acef4eab6f4` exactly. The dedicated script
-`scripts/lan223/verify_qwen_aime_quality.py` now makes this a repeatable
+`scripts/gmk-evo-x2/verify_qwen_aime_quality.py` now makes this a repeatable
 quality gate for every future performance candidate.
 
 The gate now records client-visible timing from the same streamed request. Three
@@ -76,7 +76,7 @@ that the rejected Triton router should be restored.
 
 ## Calibration and rejected alternatives
 
-`ft bench bw` measured Qwen NVFP4's real expert kernels on LAN-223. The CPU
+`ft bench bw` measured Qwen NVFP4's real expert kernels on GMKtec EVO-X2. The CPU
 expert path reached 4.8 GB/s, while HIP expert gather reached 92.5 GB/s. That
 is a 0.05x CPU-to-gather ratio, so the calibration selected `offload`, not
 `hybrid`. CPU and GPU hybrid execution is therefore not a sound optimization
@@ -90,7 +90,7 @@ ROCm graph capture was accepted and completed for batch size one, but reduced
 sustained decode throughput by about 1.2 percent. It remains disabled in the
 accepted isolated launcher.
 
-## Evidence locations on LAN-223
+## Evidence locations on GMKtec EVO-X2
 
 ```text
 /home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260829T085317Z/
@@ -126,7 +126,7 @@ throughput protocol.
 PyTorch ROCm wheel because the wheel does not provide the ROCProfiler SDK
 attachment registration thread. The evidence was instead captured by launching
 the same isolated Qwen command directly through the wheel-compatible
-`scripts/lan223-rocprof-wheel-sdk.sh` wrapper. That run created the native
+`scripts/gmk-evo-x2-rocprof-wheel-sdk.sh` wrapper. That run created the native
 ROCm SQLite trace below and passed the deterministic AIME output gate.
 
 ```text
@@ -138,7 +138,7 @@ The profiler recorded 353,457 dispatches. Its 15.61 decode TPS is intrusive
 trace overhead, not serving performance and must never be compared with the
 unprofiled client TPS rows in this report.
 
-The added `scripts/lan223/inspect_rocprof_db.py` is a standard-library,
+The added `scripts/gmk-evo-x2/inspect_rocprof_db.py` is a standard-library,
 read-only companion for that evidence. It opens the SQLite artifact with
 `mode=ro&immutable=1`, inventories ROCm's version-specific table names, and
 aggregates a requested final kernel window without altering the database or
@@ -225,7 +225,7 @@ quality, not merely a different kernel that happens to pass one output check.
 
 The current source passed the native focused regression suite after these
 experiments: `22 passed, 11 skipped` in
-`tests/kernels/test_fp8_pertensor_linear.py` on LAN-223.
+`tests/kernels/test_fp8_pertensor_linear.py` on GMKtec EVO-X2.
 
 ### Hardware counters and NVFP4 follow-up
 
@@ -256,7 +256,7 @@ equally strict screen at Qwen's actual eight-route shapes: gate/up `[1024,
 | Gate/up | 8 waves | Changed | 0.0557 ms | Rejected: exact output changed |
 | Down | 8, 16, or 32 output rows; 2, 4, or 8 waves | Matched | No faster result | Rejected: no repeatable gain |
 
-The helper `scripts/lan223/bench_nvfp4_marlin_decode.py` creates layout-correct
+The helper `scripts/gmk-evo-x2/bench_nvfp4_marlin_decode.py` creates layout-correct
 NVFP4 banks and evaluates the production decode kernel directly. It deliberately
 uses raw output SHA-1 as the first gate, so numerically faster variants cannot
 leak into a full-model reload merely because they are faster.
@@ -265,7 +265,7 @@ leak into a full-model reload merely because they are faster.
 
 The AMD branch merged FreeToken upstream commit `58f4b9e`, which fixes an
 NVIDIA Ada row-wise W8A8 prefill issue. The merge is current-main compatible
-and does not alter LAN-223's ROCm W8A16 dense decode route, but it was still
+and does not alter GMKtec EVO-X2's ROCm W8A16 dense decode route, but it was still
 validated from a fresh isolated server launch rather than inferred from source
 inspection. The combined focused native test suite completed with `28 passed,
 22 skipped`.
@@ -298,7 +298,7 @@ geometry, so the AMD branch adds a documented profile: 40 MoE layers, 256
 experts per layer, top-8 routing, hidden size 2048, intermediate size 512, and
 the production six-bank NVFP4 layout.
 
-On LAN-223, with a 513-slot cache, one active token and all eight routed experts
+On GMKtec EVO-X2, with a 513-slot cache, one active token and all eight routed experts
 missing, the benchmark copied 13.5 MiB in 0.097 ms, or 146.8 GB/s. Across all
 40 MoE layers, its documented extrapolation is 3.87 ms per decode token. The
 all-hit case took 0.023 ms. This is a native HIP measurement using the actual
@@ -349,9 +349,9 @@ optimization. Reproducible workload and sensor artifacts are retained at:
 
 ### Reusable gfx1151 C++ and HIP cache
 
-LAN-223 initially had no `freetoken_kernel_cache` package and therefore no
+GMKtec EVO-X2 initially had no `freetoken_kernel_cache` package and therefore no
 formal prebuilt helper-kernel inventory. The AMD branch now includes
-`scripts/lan223/build_rocm_kernel_cache.sh`. It validates the native HIP
+`scripts/gmk-evo-x2/build_rocm_kernel_cache.sh`. It validates the native HIP
 runtime and gfx1151 device, derives a source-revision-scoped cache path, and
 compiles the complete explicit model catalog with four bounded compiler jobs.
 The startup script resolves that cache and sets `FREETOKEN_DISABLE_JIT=1`, so a
@@ -370,7 +370,7 @@ ROCm 10 build produced all 80 valid catalog modules for gfx1151:
 /home/david/freetoken-amd/cache/kernel-cache-rocm-gfx1151-d6ee8cef479c/
 ```
 
-`scripts/lan223/verify_rocm_kernel_cache.py` then loaded every one of those 80
+`scripts/gmk-evo-x2/verify_rocm_kernel_cache.py` then loaded every one of those 80
 modules with `FREETOKEN_DISABLE_JIT=1`. This verifies ABI-compatible loading
 through the installed Python, TVM FFI, ROCm 10 and HIP runtime, which a shared
 object file count alone cannot prove. The verifier neither starts a model nor
@@ -502,7 +502,7 @@ quality result, and scheduler samples, are retained at:
 
 The Qwen checkpoint carries calibrated `input_scale` tensors, so a W8A8
 hipBLASLt replacement was investigated as a possible way to replace the
-memory-bound W8A16 dense decode kernel. LAN-223 is running ROCm 10.0 with
+memory-bound W8A16 dense decode kernel. GMKtec EVO-X2 is running ROCm 10.0 with
 hipBLASLt 1.4 and PyTorch `2.13.0+rocm10.0.0`, but the route is not available
 for this model and GPU. PyTorch's native `_scaled_mm` call on gfx1151 rejects
 the operation before dispatch, reporting that it is supported only on CUDA
@@ -548,7 +548,7 @@ the complete hipcc command and timing JSON for later component work:
 
 ### System-level performance-policy audit
 
-LAN-223's CPU governor is already `performance`. The Radeon 8060S reports the
+GMKtec EVO-X2's CPU governor is already `performance`. The Radeon 8060S reports the
 standard `auto` GPU performance policy at idle, where shader and SoC clocks
 fall to 600 MHz while memory remains at 1,000 MHz. This is not evidence of a
 decode throttle: the earlier fixed API workload recorded 100 percent GPU use,
@@ -566,7 +566,7 @@ quality and TPS gates as kernel candidates.
 #### DPM-policy measurement contract and setup failure
 
 The DPM experiment uses
-`scripts/lan223/run_qwen_dpm_policy_benchmark.sh`. It requires an interactive
+`scripts/gmk-evo-x2/run_qwen_dpm_policy_benchmark.sh`. It requires an interactive
 sudo credential in the terminal that invokes it because the host caches sudo
 authorization per terminal. The script requests a named temporary policy,
 records the pre-run policy, delegates the fixed three-sample 256-token Qwen
@@ -578,7 +578,7 @@ The policy log lives in a newly-created parent evidence directory. The harness
 receives a distinct, absent `benchmark` child directory because its immutable
 artifact contract intentionally fails if that exact directory already exists.
 This separation is enforced by a unit test in
-`tests/benchmarks/test_lan223_qwen_benchmark.py`.
+`tests/benchmarks/test_gmk_evo_x2_benchmark.py`.
 
 An initial manual attempt at `2026-08-29T18:30:35Z` correctly changed the GPU
 from `auto` to `high` and restored it to `auto`, but created the harness
@@ -629,7 +629,7 @@ The complete high-policy evidence is retained at:
 
 ### Same-base-model ROCm 10 llama.cpp control
 
-LAN-223's original llama-swap Qwen control was `Qwen3.6-27B-Q4_K_M`, which is
+GMKtec EVO-X2's original llama-swap Qwen control was `Qwen3.6-27B-Q4_K_M`, which is
 not the model served by FreeToken and cannot establish same-model Qwen parity.
 For a controlled comparison, the isolated directory
 `models/controls/qwen36-35b-a3b-unsloth-a483e9e6/` now contains
@@ -642,7 +642,7 @@ For a controlled comparison, the isolated directory
 The control used the existing ROCm 10 llama.cpp `b10141` binary at commit
 `0d47ea742`, AMD Clang 23, full GPU offload, Flash Attention, one slot, an
 8,192-token context, Q8 KV cache, loopback port 1921, and normal GPU `auto`
-policy. `scripts/lan223/run_qwen_llamacpp_rocm_control.sh` starts this server
+policy. `scripts/gmk-evo-x2/run_qwen_llamacpp_rocm_control.sh` starts this server
 only for the run, delegates to the same fixed Qwen scheduler harness as
 FreeToken, saves raw server and client evidence, and terminates the temporary
 server through an `EXIT` trap. It never changes llama-swap or the production

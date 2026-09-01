@@ -1,4 +1,4 @@
-# LAN-223 Gemma 4 Q4 GGUF vision control
+# GMKtec EVO-X2 Gemma 4 Q4 GGUF vision control
 
 ## Scope
 
@@ -10,7 +10,7 @@ Qwen on `127.0.0.1:1919` on every exit path.
 
 ## Build and runtime contract
 
-- Host: LAN-223, Radeon 8060S (`gfx1151`) unified-memory GPU.
+- Host: GMKtec EVO-X2, Radeon 8060S (`gfx1151`) unified-memory GPU.
 - Backend: native ROCm/HIP and Triton. No CUDA compatibility path was used.
 - Text GGUF: `gemma-4-26B_q4_0-it.gguf`.
 - Vision projector: sibling `gemma-4-26B-it-mmproj.gguf`.
@@ -26,7 +26,7 @@ Qwen on `127.0.0.1:1919` on every exit path.
 
 ## Evidence
 
-Latest artifact directory on LAN-223:
+Latest artifact directory on GMKtec EVO-X2:
 
 `/home/david/freetoken-amd/artifacts/gemma4-gguf-vision-20260830T045559Z`
 
@@ -50,11 +50,11 @@ execution, image-token replacement, and OpenAI response formatting.
 
 ## Reproduction
 
-From the isolated checkout on LAN-223, first ensure the protected server health
+From the isolated checkout on GMKtec EVO-X2, first ensure the protected server health
 is exactly `status: ok`, then run:
 
 ```bash
-bash scripts/lan223/run_gemma4_gguf_text_control.sh \
+bash scripts/gmk-evo-x2/run_gemma4_gguf_text_control.sh \
   /home/david/freetoken-amd/validation-qwen-gguf-d1dd473 vision
 ```
 
@@ -65,7 +65,7 @@ already-running isolated candidate:
 
 ```bash
 PYTHONPATH=python /home/david/freetoken-amd/.venv/bin/python \
-  scripts/lan223/verify_gemma4_gguf_image.py \
+  scripts/gmk-evo-x2/verify_gemma4_gguf_image.py \
   --base-url http://127.0.0.1:1923 \
   --model gemma4-26b-q4-amd \
   --artifact /tmp/gemma4-image-quality.json

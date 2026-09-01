@@ -8,17 +8,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from benchmarks.lan223_qwen.run_api_benchmark import (
+from benchmarks.gmk_evo_x2.run_api_benchmark import (
     nearest_rank_percentile,
     numeric_summary,
     parse_args,
     require_expected_host,
 )
-from benchmarks.lan223_qwen.run_quality_suite import evaluate_check
-from benchmarks.lan223_qwen.run_multiturn_state_suite import nearest_rank
-from benchmarks.lan223_qwen.run_long_context_control import build_prompt
-from benchmarks.lan223_qwen.run_concurrent_api_control import parse_args as parse_concurrent_args
-from benchmarks.lan223_qwen.summarize_qwen_gguf_endurance import summarize
+from benchmarks.gmk_evo_x2.run_quality_suite import evaluate_check
+from benchmarks.gmk_evo_x2.run_multiturn_state_suite import nearest_rank
+from benchmarks.gmk_evo_x2.run_long_context_control import build_prompt
+from benchmarks.gmk_evo_x2.run_concurrent_api_control import parse_args as parse_concurrent_args
+from benchmarks.gmk_evo_x2.summarize_qwen_gguf_endurance import summarize
 
 
 class RequireExpectedHostTests(unittest.TestCase):
@@ -141,7 +141,7 @@ class DpmPolicyWrapperTests(unittest.TestCase):
         """Policy logs use a parent while the immutable harness receives `benchmark`."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_dpm_policy_benchmark.sh"
+        wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_dpm_policy_benchmark.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('readonly BENCHMARK_DIR="${ARTIFACT_ROOT}/benchmark"', contents)
@@ -156,7 +156,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """A restart must not silently shrink the usable cache back to 2,068 tokens."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        recovery = repository_root / "scripts" / "lan223" / "start_qwen_recovery_server.sh"
+        recovery = repository_root / "scripts" / "gmk-evo-x2" / "start_qwen_recovery_server.sh"
         contents = recovery.read_text(encoding="utf-8")
 
         self.assertIn('readonly KV_RESERVE_TOKENS="${FREETOKEN_KV_RESERVE_TOKENS:-8192}"', contents)
@@ -167,7 +167,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
 
         repository_root = Path(__file__).resolve().parents[2]
         recovery = repository_root / "scripts" / "lan223" / "start_qwen_recovery_server.sh"
-        stopper = repository_root / "scripts" / "lan223" / "stop_qwen_recovery_server.sh"
+        stopper = repository_root / "scripts" / "gmk-evo-x2" / "stop_qwen_recovery_server.sh"
 
         self.assertIn('setsid nohup "${VENV_PYTHON}" -m freetoken.cli serve', recovery.read_text(encoding="utf-8"))
         contents = stopper.read_text(encoding="utf-8")
@@ -180,7 +180,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """The extended Q4 battery must fail closed and restore the protected service."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        controller = repository_root / "scripts" / "lan223" / "run_qwen_gguf_timeshare_endurance.sh"
+        controller = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_gguf_timeshare_endurance.sh"
         contents = controller.read_text(encoding="utf-8")
 
         self.assertIn('FREETOKEN_Q4_SOURCE_DIR:?set FREETOKEN_Q4_SOURCE_DIR', contents)
@@ -196,7 +196,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """A failed candidate must not prevent the normal service from recovering."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        launcher = repository_root / "scripts" / "lan223" / "launch_qwen_gguf_qualified.sh"
+        launcher = repository_root / "scripts" / "gmk-evo-x2" / "launch_qwen_gguf_qualified.sh"
         contents = launcher.read_text(encoding="utf-8")
 
         self.assertIn('kill -0 "${recorded_pid}" 2>/dev/null || exit 0', contents)
@@ -216,7 +216,7 @@ class QwenRecoveryContextTests(unittest.TestCase):
         """Repeated state tests must not begin from a swapped memory condition."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_multiturn_battery.sh"
+        wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_multiturn_battery.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('readonly MAX_SWAP_KIB="${LAN223_BATTERY_MAX_SWAP_KIB:-64}"', contents)
@@ -286,7 +286,7 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         """The control must terminate its own port-1921 child and reuse Qwen inputs."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_control.sh"
+        wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_llamacpp_rocm_control.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('readonly BASE_URL="http://127.0.0.1:1921/v1"', contents)
@@ -299,7 +299,7 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         """A port-1919 HTTP response is insufficient while FreeToken is loading."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_timeshare_control.sh"
+        wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_qwen_llamacpp_rocm_timeshare_control.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('"status":"ok"', contents)
@@ -311,7 +311,7 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         """Gemma must start from a clean state without changing host swap policy."""
 
         repository_root = Path(__file__).resolve().parents[2]
-        wrapper = repository_root / "scripts" / "lan223" / "run_gemma4_gguf_text_control.sh"
+        wrapper = repository_root / "scripts" / "gmk-evo-x2" / "run_gemma4_gguf_text_control.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
         self.assertIn('sudo swapoff -a', contents)

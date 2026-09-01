@@ -1,8 +1,8 @@
-# LAN-223 ROCm validation results, 2026-08-30
+# GMKtec EVO-X2 ROCm validation results, 2026-08-30
 
 ## Scope
 
-This report records post-repair validation of the native FreeToken ROCm/HIP port on the LAN-223 Radeon 8060S. It covers the OpenAI-compatible API, Gemma 4 vision correctness, Qwen reliability, a controlled llama.cpp ROCm comparison, and a strict multi-turn endurance run. It is local hardware evidence, not a reproduction of the FreeToken paper's NVIDIA results.
+This report records post-repair validation of the native FreeToken ROCm/HIP port on the GMKtec EVO-X2 Radeon 8060S. It covers the OpenAI-compatible API, Gemma 4 vision correctness, Qwen reliability, a controlled llama.cpp ROCm comparison, and a strict multi-turn endurance run. It is local hardware evidence, not a reproduction of the FreeToken paper's NVIDIA results.
 
 ## Reproduction boundary
 
@@ -48,7 +48,7 @@ The deterministic visible-output suite passed on both FreeToken and llama.cpp:
 
 | Check | FreeToken | llama.cpp ROCm |
 | --- | --- | --- |
-| exact `LAN223` output | pass | pass |
+| exact `host-identity canary` output | pass | pass |
 | `17 * 19 = 323` | pass | pass |
 | exact JSON fields `status=ok`, `value=7` | pass | pass |
 
@@ -77,7 +77,7 @@ Long-context retrieval used an exact early marker, three samples at each size, a
 
 ## Matched workload comparison with llama.cpp
 
-Both runners executed the same fixed scheduler prompt, 256 requested output tokens, greedy decoding, one concurrent request, one 8,192-token slot, and three measured samples after warmup on LAN-223. The values are decode TPS, not aggregate concurrent throughput.
+Both runners executed the same fixed scheduler prompt, 256 requested output tokens, greedy decoding, one concurrent request, one 8,192-token slot, and three measured samples after warmup on GMKtec EVO-X2. The values are decode TPS, not aggregate concurrent throughput.
 
 | Runner | Model format | Successful samples | Median decode TPS |
 | --- | --- | ---: | ---: |
@@ -117,13 +117,13 @@ strict matched workload.
 
 FreeToken's additional caller-rendered, 512-token raw-prompt control produced
 511 visible completion tokens at 48.487 TPS and 433.11 ms TTFT. The standard
-visible-output quality suite passed its exact `LAN223`, arithmetic `323`, and
+visible-output quality suite passed its exact `host-identity canary`, arithmetic `323`, and
 strict JSON controls. A temporary GPU `high` DPM policy was also tested with
 the loaded Q4 server, but it reduced mean decode throughput to 47.287 TPS while
 quality still passed. The normal `auto` policy therefore remains the accepted
 policy for this configuration.
 
-The exact-Q4 evidence is retained on LAN-223 at
+The exact-Q4 evidence is retained on GMKtec EVO-X2 at
 `/home/david/freetoken-amd/artifacts/qwen35moe-gguf-full-control-20260830T141438Z/`
 and
 `/home/david/freetoken-amd/artifacts/qwen35b-llamacpp-rocm10-q4matched-20260830T142002Z-retry/`.
@@ -264,7 +264,7 @@ Raw evidence is retained under
 `/home/david/freetoken-amd/artifacts/qwen35moe-gguf-process-scoped-endurance-20260830T153333Z/`,
 including each request JSON, per-session telemetry, and the machine-generated
 `summary.json`. The reusable verifier is
-`benchmarks/lan223_qwen/summarize_qwen_gguf_endurance.py`.
+`benchmarks/gmk_evo_x2/summarize_qwen_gguf_endurance.py`.
 
 ## Full-context MoE cache telemetry
 
@@ -288,7 +288,7 @@ previous rejection of a larger static MoE cache: prior 0.38-memory-ratio
 testing reduced misses but did not produce a sustained TPS gain. Cache capacity
 alone is therefore not a justified route to closing the current llama.cpp gap.
 
-The telemetry and restoration evidence is retained on LAN-223 at
+The telemetry and restoration evidence is retained on GMKtec EVO-X2 at
 `/home/david/freetoken-amd/artifacts/qwen-cache-stats-driver-20260830T135236Z/`.
 The restored normal service returned the required AIME SHA-1
 `0acef4eab6f4`, at 28.60 visible decode TPS, 399.08 ms TTFT, and 38.49 ms p99
@@ -296,13 +296,13 @@ stream-event gap.
 
 ## Regression tests
 
-The focused regression suite passed 21 tests on LAN-223:
+The focused regression suite passed 21 tests on GMKtec EVO-X2:
 
 ```text
 tests/server/test_message_wire.py
 tests/tokenizer/test_gemma4_image.py
 tests/models/test_gemma4_mmproj_mapping.py
-tests/benchmarks/test_lan223_qwen_benchmark.py
+tests/benchmarks/test_gmk_evo_x2_benchmark.py
 ```
 
 ## Remaining work

@@ -112,14 +112,14 @@ fi
 LAN223_QWEN_BASE_URL="${BASE_URL}" \
 LAN223_QWEN_MODEL_NAME="${MODEL_NAME}" \
 LAN223_QWEN_TOKENIZER_DIR="${TOKENIZER_DIR}" \
-    bash "${SOURCE_DIR}/scripts/lan223/run_qwen_scheduler_baseline.sh" "${BENCHMARK_DIR}"
+    bash "${SOURCE_DIR}/scripts/gmk-evo-x2/run_qwen_scheduler_baseline.sh" "${BENCHMARK_DIR}"
 
 if [[ "${LAN223_QWEN_QUALITY_SUITE:-}" == "1" ]]; then
     # The optional suite uses only deterministic visible-output controls.  Keep
     # it opt-in so the normal throughput control remains unchanged, while a
     # paired quality campaign can run against this exact temporary ROCm server.
     PYTHONPATH="${SOURCE_DIR}/python" "${ROOT_DIR}/.venv/bin/python" \
-        "${SOURCE_DIR}/benchmarks/lan223_qwen/run_quality_suite.py" \
+        "${SOURCE_DIR}/benchmarks/gmk_evo_x2/run_quality_suite.py" \
         --base-url "${BASE_URL}" \
         --model "${MODEL_NAME}" \
         --expected-host "david-Gmktec-x2-2" \

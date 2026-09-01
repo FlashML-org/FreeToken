@@ -26,7 +26,7 @@ readonly ARTIFACT_ROOT="${2:-/home/david/freetoken-amd/artifacts/qwen-dpm-${TEMP
 # collisions and preserve evidence integrity.
 readonly BENCHMARK_DIR="${ARTIFACT_ROOT}/benchmark"
 readonly ROOT_DIR="/home/david/freetoken-amd"
-readonly HARNESS="${ROOT_DIR}/source-qwen-harness-d6ee8ce/scripts/lan223/run_qwen_scheduler_baseline.sh"
+readonly HARNESS="${ROOT_DIR}/source-qwen-harness-d6ee8ce/scripts/gmk-evo-x2/run_qwen_scheduler_baseline.sh"
 readonly POLICY_LOG="${ARTIFACT_ROOT}/dpm-policy.txt"
 
 # Fail before a policy change if an operator supplied a reused artifact root.

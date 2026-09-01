@@ -1,10 +1,10 @@
-# LAN-223 Q4 hardening execution plan
+# GMKtec EVO-X2 Q4 hardening execution plan
 
 ## Objective
 
 Close the remaining reliability, performance, readiness, endurance, and
 publication gaps in the native ROCm/HIP Qwen Q4 path without disrupting the
-protected LAN-223 NVFP4 loopback service except during a recorded, reversible
+protected GMKtec EVO-X2 NVFP4 loopback service except during a recorded, reversible
 time-share window.
 
 ## Non-negotiable controls

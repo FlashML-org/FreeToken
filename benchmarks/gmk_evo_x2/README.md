@@ -10,7 +10,7 @@ Run a quality canary on LAN-223 from the isolated FreeToken environment after
 the server is already warm:
 
 ```bash
-python benchmarks/lan223_qwen/run_api_benchmark.py \
+python benchmarks/gmk_evo_x2/run_api_benchmark.py \
   --model qwen3.6-35b-a3b-nvfp4 \
   --tokenizer /home/david/freetoken-amd/models/Qwen3.6-35B-A3B-NVFP4 \
   --base-url http://127.0.0.1:1919/v1 \
@@ -23,7 +23,7 @@ prompt and opt into throughput mode. This sends `ignore_eos=true` so all samples
 produce the same requested decode length:
 
 ```bash
-python benchmarks/lan223_qwen/run_api_benchmark.py \
+python benchmarks/gmk_evo_x2/run_api_benchmark.py \
   --model qwen3.6-35b-a3b-nvfp4 \
   --tokenizer /home/david/freetoken-amd/models/Qwen3.6-35B-A3B-NVFP4 \
   --base-url http://127.0.0.1:1919/v1 \

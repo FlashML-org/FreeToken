@@ -1,4 +1,4 @@
-# LAN-223 Qwen Q4 raw-prompt control, 2026-08-30
+# GMKtec EVO-X2 Qwen Q4 raw-prompt control, 2026-08-30
 
 This report records an apples-to-apples ROCm 10 comparison between the AMD
 FreeToken port and llama.cpp. It is a quality and steady-state decode control,
@@ -6,7 +6,7 @@ not a throughput claim for cold startup or a production service benchmark.
 
 ## Host and runtime
 
-- Host: LAN-223, AMD Strix Halo `gfx1151`, 56 GiB unified GPU memory.
+- Host: GMKtec EVO-X2, AMD Strix Halo `gfx1151`, 56 GiB unified GPU memory.
 - FreeToken runtime: native ROCm 10 and HIP execution path, Triton attention,
   offload MoE backend, serial expert loading, Q4_K_M GGUF.
 - llama.cpp runtime: ROCm 10 `llama-server`, full GPU layer offload, Flash
@@ -49,13 +49,13 @@ explicitly proves the two valid bases, whose sum is 70, matching the fixed
 ground truth. A future quality gate should either provide a larger token budget
 or use a prompt that requests a concise answer after the reasoning trace.
 
-## Evidence locations on LAN-223
+## Evidence locations on GMKtec EVO-X2
 
 - FreeToken: `/home/david/freetoken-amd/artifacts/qwen-gguf-raw-20260830T032253Z/raw-quality.json`
 - FreeToken with HIP router: `/home/david/freetoken-amd/artifacts/qwen-gguf-raw-20260830T033941Z/raw-quality.json`
 - llama.cpp: `/home/david/freetoken-amd/artifacts/qwen-llama-raw-20260830T033324Z/raw-quality.json`
 
 The two self-restoring control runners are
-`scripts/lan223/run_qwen_gguf_raw_control.sh` and
-`scripts/lan223/run_qwen_llamacpp_raw_control.sh`. They reserve the GPU only
+`scripts/host-identity canary/run_qwen_gguf_raw_control.sh` and
+`scripts/host-identity canary/run_qwen_llamacpp_raw_control.sh`. They reserve the GPU only
 temporarily and invoke the production recovery helper on exit.

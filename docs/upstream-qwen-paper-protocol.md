@@ -33,7 +33,7 @@ Primary sources:
 The published HTML establishes the hardware, model format, metric type, and
 workload classes. It does not identify the following fields for the 39.3 TPS
 row. They must be resolved from released artifacts, the authors, or marked
-unavailable before calling the LAN-223 result a strict replication:
+unavailable before calling the GMKtec EVO-X2 result a strict replication:
 
 | Field | State | Required action |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ unavailable before calling the LAN-223 result a strict replication:
 | TPS definition and reported statistic | Resolved at paper level | Per-request mean decode TPS and per-request mean TTFT. Retain the client-side formula and raw timestamps. |
 | Expert cache, KV allocation, CPU thread count, and selected backend | Unknown | Recover the launch configuration or state that parity is approximate. |
 
-## Current LAN-223 comparison status
+## Current GMKtec EVO-X2 comparison status
 
 Existing evidence proves native HIP functional serving for
 `nvidia/Qwen3.6-35B-A3B-NVFP4` and a prior controlled warm output rate around
