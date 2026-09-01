@@ -316,9 +316,18 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Kimi-K3 (kimi_linear) payload. This records the mixed KDA/MLA layer map,
+    # latent-routed-expert geometry, SiTU constants, and attention residual block
+    # size. Keeping it explicit prevents a superficially similar Qwen/GLM config
+    # from being accepted and producing plausible-looking but invalid output.
+    kimi_k3_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Linear-attention implementations opt out until they can snapshot recurrent
+    # state at radix chunk boundaries. The engine then selects the correct naive
+    # cache instead of failing on the first real prompt.
+    supports_hybrid_radix: bool = True
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()

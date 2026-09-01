@@ -69,22 +69,33 @@ def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
+    moe_cache_size: int | None = None,
+    moe_top_k: int = 0,
 ) -> List[int]:
     if cuda_graph_bs is not None:
-        return cuda_graph_bs
+        candidates = cuda_graph_bs
+    else:
+        free_memory_gb = free_memory / (1 << 30)
+        if cuda_graph_max_bs is None:
+            if free_memory_gb > 80:  # H200
+                cuda_graph_max_bs = 256
+            else:
+                cuda_graph_max_bs = 160
 
-    free_memory_gb = free_memory / (1 << 30)
-    if cuda_graph_max_bs is None:
-        if free_memory_gb > 80:  # H200
-            cuda_graph_max_bs = 256
-        else:
-            cuda_graph_max_bs = 160
+        if cuda_graph_max_bs < 1:
+            return []
 
-    if cuda_graph_max_bs < 1:
-        return []
+        candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+        candidates = [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
-    candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
-    return [bs for bs in candidates if bs <= cuda_graph_max_bs]
+    if moe_cache_size is not None and moe_top_k > 0:
+        # flashlib validates K>cache by calling torch.unique. That debug guard is
+        # correct in eager mode but is not CUDA-graph capturable. Every individual
+        # MoE layer owns at most num_experts distinct ids and the offload cache has
+        # at least that many slots, so larger batches remain valid eager forwards;
+        # omit only graph shapes whose padded routing rows cross the cache size.
+        candidates = [bs for bs in candidates if bs * moe_top_k <= moe_cache_size]
+    return candidates
 
 
 def get_free_memory(device: torch.device) -> int:
@@ -105,11 +116,16 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        moe_top_k: int = 0,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
+            moe_cache_size=(
+                moe_offload_cache.cache_size if moe_offload_cache is not None else None
+            ),
+            moe_top_k=moe_top_k,
         )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0

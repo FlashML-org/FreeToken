@@ -70,8 +70,14 @@ inline bf16_t f32_to_bf16(float f) {
 // ACT_SWIGLUOAI is the clamped (up + 1) swiglu (gpt-oss "swigluoai" /
 // MiniMax-M3): gate/up are combined jointly with the runtime alpha/limit
 // scalars, so it is handled in the do_pass1 epilogue (act_apply never sees it;
-// the mxfp4 kernel additionally fuses its own copy of the same math).
-enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2, ACT_SWIGLUOAI = 3 };
+// the mxfp4 kernel additionally fuses activation-specific math).
+enum ActKind {
+  ACT_SILU = 0,
+  ACT_GELU = 1,
+  ACT_GELU_TANH = 2,
+  ACT_SWIGLUOAI = 3,
+  ACT_SITU = 4,
+};
 
 inline float act_apply(int act, float x) {
   if (act == ACT_SILU) return x / (1.0f + std::exp(-x));
@@ -1605,6 +1611,7 @@ struct CpuMoeExecutor {
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool situ = act == ACT_SITU;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
@@ -1620,6 +1627,13 @@ struct CpuMoeExecutor {
         else if (up < -lim) up = -lim;
         const float glu = gate / (1.0f + std::exp(-gate * alpha));
         g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+      } else if (situ) {
+        // Kimi-K3 SiTU. The executor's two activation scalars carry beta and
+        // linear_beta for this activation (4 and 25 in the public checkpoint).
+        const float gate_situ = alpha * std::tanh(gate / alpha) /
+                                (1.0f + std::exp(-gate));
+        const float up_situ = lim * std::tanh(up / lim);
+        g_row[i] = f32_to_bf16(gate_situ * up_situ);
       } else {
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
@@ -1667,7 +1681,7 @@ struct CpuMoeExecutor {
     }
   }
 
-  // ----------------------------- mxfp4 (gpt-oss) -----------------------------
+  // ----------------------------- mxfp4 ---------------------------------------
   // Transposed split-K layout (N innermost), so the GEMV streams K and accumulates
   // a contiguous block of N output columns -> cache-line-efficient, no repack, no
   // extra host memory. Pass 1 fuses gate_up + clamped-swiglu(+bias); pass 2 fuses
@@ -1705,11 +1719,18 @@ struct CpuMoeExecutor {
     for (int j = 0; j < nunit; ++j) {
       float gate = gu[2 * j] + bf16_to_f32(bias_e[2 * j]);
       float up = gu[2 * j + 1] + bf16_to_f32(bias_e[2 * j + 1]);
-      if (gate > lim) gate = lim;
-      if (up > lim) up = lim;
-      else if (up < -lim) up = -lim;
-      const float glu = gate / (1.0f + std::exp(-gate * alpha));  // gate * sigmoid(alpha*gate)
-      g_row[i0 + j] = f32_to_bf16(glu * (up + 1.0f));
+      if (act == ACT_SITU) {
+        const float gate_situ = alpha * std::tanh(gate / alpha) /
+                                (1.0f + std::exp(-gate));
+        const float up_situ = lim * std::tanh(up / lim);
+        g_row[i0 + j] = f32_to_bf16(gate_situ * up_situ);
+      } else {
+        if (gate > lim) gate = lim;
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
+        const float glu = gate / (1.0f + std::exp(-gate * alpha));
+        g_row[i0 + j] = f32_to_bf16(glu * (up + 1.0f));
+      }
     }
   }
 
@@ -2143,8 +2164,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
   // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI
-  // accepts id 3 without error and silently computes the wrong activation
+  // accepts newer ids without error and silently computes the wrong activation
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
-  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SITU); });
 }

@@ -219,6 +219,7 @@ def create_kvcache_pool(
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=spec.layer_ids,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
@@ -227,6 +228,7 @@ def create_kvcache_pool(
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=spec.layer_ids,
         )
 
     return MHAKVCache(

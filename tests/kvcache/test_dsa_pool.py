@@ -125,6 +125,26 @@ def test_mla_pool_selected_by_group_spec():
     assert isinstance(mla, MLAKVCache) and not isinstance(mla, DSAKVCache)
 
 
+def test_mla_pool_backs_only_declared_global_layer_ids():
+    """Hybrid linear/MLA models must not allocate latent KV for linear layers."""
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+
+    pool = MLAKVCache(
+        latent_dim=LATENT,
+        num_layers=8,
+        num_pages=4,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        layer_ids=(3, 7),
+    )
+    assert pool._kv_buffer.shape == (1, 2, 4, 1, 1, LATENT)
+    assert pool.latent_rows(3).shape == (4, LATENT)
+    assert pool.latent_rows(7).shape == (4, LATENT)
+    with pytest.raises(KeyError, match="no paged KV storage"):
+        pool.latent_rows(0)
+
+
 def test_rebuild_shrink_and_engine_wiring():
     """Shrink-direction rebuild (both slabs) + the engine-facing rebuild_from_config
     (usable pages in, +1 dummy page added by the pool)."""

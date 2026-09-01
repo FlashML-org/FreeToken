@@ -420,6 +420,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            moe_top_k=config.model_config.num_experts_per_tok,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -913,6 +914,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            moe_top_k=config.model_config.num_experts_per_tok,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -1287,10 +1289,18 @@ def _adjust_config(config: EngineConfig):
             override("cache_type", "swa_radix")
 
     if has_linear_attention:
-        override(
-            "cache_type",
-            _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
-        )
+        if not getattr(model_config, "supports_hybrid_radix", True):
+            if getattr(config, "cache_type", "radix") != "naive":
+                logger.warning_rank0(
+                    f"{getattr(model_config, 'model_type', 'model')} does not support "
+                    "linear-state radix snapshots yet; using cache_type='naive'."
+                )
+            override("cache_type", "naive")
+        else:
+            override(
+                "cache_type",
+                _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
+            )
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

@@ -119,6 +119,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
     ),
+    "KimiK3ForConditionalGeneration": ModelSpec(
+        "freetoken.models.kimi_k3",
+        "KimiK3ForCausalLM",
+    ),
+    "KimiLinearForCausalLM": ModelSpec(
+        "freetoken.models.kimi_k3",
+        "KimiK3ForCausalLM",
+    ),
     "Glm4MoeForCausalLM": ModelSpec(
         "freetoken.models.glm4_moe",
         "Glm4MoeForCausalLM",

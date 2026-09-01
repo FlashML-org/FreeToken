@@ -29,3 +29,13 @@ python benchmarks/bench_offload_cache_copy.py
 
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
+
+## Published qualification results
+
+The full Kimi-K3 (`moonshotai/Kimi-K3`) qualification on four NVIDIA H200s is
+recorded in [kimi_k3_vast_h200_20260824.md](kimi_k3_vast_h200_20260824.md),
+with machine-readable values in
+[kimi_k3_vast_h200_20260824.json](kimi_k3_vast_h200_20260824.json).  It
+includes cold-start milestones, streaming trials, and an all-successful
+concurrency sweep through 16 simultaneous requests. These are serving-path
+measurements, not a cross-hardware comparison.

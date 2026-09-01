@@ -123,6 +123,16 @@ WORKLOADS: dict[str, Workload] = {
     "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
+    # Public Kimi-K3 checkpoint: 896 routed experts, top-16, 3584 latent expert
+    # hidden, 3072 expert intermediate, compressed-tensors MXFP4,
+    # SiTU(beta=4, linear_beta=25). The surrounding resident BF16 projections
+    # perform the 7168 <-> 3584 conversion.
+    # The synthetic-bank cap keeps this calibration below 2 GiB while preserving
+    # the real per-expert geometry and the expert-miss memory path.
+    "kimi-k3": Workload(
+        "kimi-k3", 3584, 3072, 896, 16, ("mxfp4_triton",),
+        activation="situ", swiglu_alpha=4.0, swiglu_limit=25.0,
+    ),
 }
 
 # Per-dtype canonical geometries for the TUNING bench (`--dtype`). The hybrid-vs-offload choice is

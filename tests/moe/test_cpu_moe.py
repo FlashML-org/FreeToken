@@ -339,6 +339,58 @@ def test_cpu_decode_mxfp4_matches_gpu_splitk(bs):
     assert rel < 4e-2, f"mxfp4 bs={bs} rel err {rel.item()}"
 
 
+@pytest.mark.parametrize("bs", [1, 4])
+def test_cpu_decode_mxfp4_kimi_situ_matches_gpu_splitk(bs):
+    """CPU and Triton MXFP4 paths implement the same Kimi-K3 SiTU epilogue."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts
+
+    torch.manual_seed(400 + bs)
+    L, E, H, I, top_k = 2, 8, 256, 256, 2
+    layer = 1
+    beta, linear_beta = 4.0, 25.0
+    dev = torch.device("cuda")
+    cache = _make_mxfp4_cache(L, E, H, I, seed=29)
+
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="situ",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=bs,
+        device=dev,
+        swiglu_alpha=beta,
+        swiglu_limit=linear_beta,
+    )
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    weights = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    cpu_out = ex.decode(layer, hidden, weights, ids).float()
+    torch.cuda.synchronize()
+
+    banks = cache.bank_sources
+    gpu_out = run_mxfp4_splitk_decode_experts(
+        hidden,
+        weights,
+        ids.clone(),
+        banks["gate_up_blocks"][layer].to(dev),
+        banks["gate_up_scales"][layer].to(dev),
+        banks["gate_up_bias"][layer].to(dev),
+        banks["down_blocks"][layer].to(dev),
+        banks["down_scales"][layer].to(dev),
+        banks["down_bias"][layer].to(dev),
+        top_k=top_k,
+        hidden_act_alpha=beta,
+        swiglu_limit=linear_beta,
+        activation="situ",
+    ).float()
+
+    rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
+    assert rel < 4e-2, f"mxfp4 SiTU bs={bs} rel err {rel.item()}"
+
+
 def _make_dsfp4_cache(L, E, H, I, seed=0):
     """Random DeepSeek-V4 ``ds_fp4`` banks (row-major e2m1 + e8m0/32, no global)."""
     torch.manual_seed(seed)
