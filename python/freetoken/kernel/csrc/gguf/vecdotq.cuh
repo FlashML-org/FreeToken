@@ -164,15 +164,7 @@ vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u, const half2& 
 #endif
 }
 
-#if defined(USE_ROCM)
-// Q8_0 vector matrix multiply is the largest single kernel family in the
-// representative Q4 trace.  Each HIP lane can safely consume four contiguous
-// int8 groups because the Q8 dot helper is parameterized by this ratio; CUDA
-// keeps its known two-group mapping until independently validated.
-#define VDR_Q8_0_Q8_1_MMVQ 4
-#else
 #define VDR_Q8_0_Q8_1_MMVQ 2
-#endif
 #define VDR_Q8_0_Q8_1_MMQ 8
 
 template <int vdr>
