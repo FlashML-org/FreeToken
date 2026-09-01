@@ -616,3 +616,57 @@ controller and again returned `status: ok` after its normal cold load.
 ROCm-safe grouped-MoE selection or correct the kernel bounds issue for this
 shape, backed by the isolated reproducer.  The upstream cache candidate remains
 on hold until that repair passes and no longer faults the target ROCm runtime.
+
+### C13-C20: grouped-MoE root cause, repair, and candidate safety checks
+
+The first repair narrowed the second grouped projection to its actual flattened
+storage layout.  That removes a real stride and bounds hazard, but the minimal
+reproducer still failed at the first projection.  The next diagnostic compared
+the two alignment implementations directly.  The compact alignment kernel
+returned valid sorted token IDs while assigning every padded block to expert
+zero, even when the routed experts were distinct.  Its outputs therefore could
+not safely select grouped expert weights on this AMD runtime.
+
+The ROCm path now selects the staged in-tree alignment implementation, which
+returned the expected distinct expert IDs for the same route.  The repaired
+minimal reproducer passed, followed by the four-shape parity group and a new
+regression test that asserts every routed expert is represented in the padded
+alignment output.  The saved GPU artifacts are
+`fused-moe-c13-stride-20260901T192*Z`,
+`fused-moe-c14-align-20260901T193029Z`,
+`fused-moe-c15-alt-align-20260901T193812Z`,
+`fused-moe-c16-align-fix-20260901T194538Z`,
+`fused-moe-c17-full-parity-20260901T195315Z`, and
+`fused-moe-c18-regression-suite-20260901T200025Z` on GMKtec EVO-X2.
+
+The candidate containing the upstream cache-copy plan was then merged with the
+repair into isolated source revision `340ed31`.  Its focused safety suite
+passed 5 tests with 34 intentionally deselected, and its direct fused-copy
+comparison matched the legacy per-bank copy for 0, 1, 4, and 8 cache misses.
+Those artifacts are `upstream-cache-c19-safety-20260901T200857Z` and
+`upstream-cache-c20-fused-copy-20260901T201650Z`.
+
+**Decision: safety gate passed, performance gate not yet passed.** The repair
+is eligible for model quality requalification.  No throughput claim follows
+from these unit and direct-copy tests alone.
+
+### C21-C22: revision-matched reusable HIP cache
+
+The integrated candidate had no reusable cache for source revision `340ed31`.
+The first maintenance wrapper found a helper-file execute-bit defect before it
+ran the builder, so it produced no benchmark result and recovery was corrected
+immediately by invoking the reviewed helpers through Bash.  The normal service
+then completed its measured serial cold recovery in 5 minutes 57 seconds.
+
+The corrected isolated build compiled all 82 explicit C++ and HIP cache modules
+for AMD Radeon 8060S Graphics with HIP `7.15.26333`, writing them under
+`kernel-cache-rocm-gfx1151-340ed31`.  The subsequent verifier loaded all 82
+modules with `FREETOKEN_DISABLE_JIT=1` and reported `status: passed`.  The
+artifact `upstream-cache-c22-build-20260901T203402Z` retains the build log,
+strict verifier output, and recovery record on GMKtec EVO-X2.
+
+**Decision: reusable-cache gate passed.** Future runs of this exact candidate
+must point at this revision-matched cache and retain JIT disabled.  This avoids
+per-run native kernel compilation without pretending that a cache from a
+different source revision is ABI-safe.  The Q4 model itself is not recompiled
+by this process.
