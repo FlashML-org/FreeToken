@@ -9,6 +9,14 @@ import pytest
 from freetoken.kernel import pinned
 
 
+def _ctype_int(value) -> int:
+    if hasattr(value, "value"):
+        return int(value.value or 0)
+    if isinstance(value, (bytes, bytearray)):
+        return int.from_bytes(value, "little")
+    return int(value)
+
+
 class _FakeHip:
     def __init__(self, identity: bool = True, register_status: int = 0):
         self.identity = identity
@@ -17,14 +25,14 @@ class _FakeHip:
         self.last_dev = None
 
     def hipHostRegister(self, addr, nbytes, flags):
-        self.registered.append((int(addr), int(nbytes), int(flags)))
+        self.registered.append((_ctype_int(addr), _ctype_int(nbytes), _ctype_int(flags)))
         return self.register_status
 
     def hipHostUnregister(self, addr):
         return 0
 
     def hipHostGetDevicePointer(self, out, host, flags):
-        host_i = host.value if isinstance(host, ctypes.c_void_p) else int(host)
+        host_i = _ctype_int(host)
         val = host_i if self.identity else host_i + 0x2000
         ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p)).contents.value = val
         self.last_dev = val
