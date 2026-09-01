@@ -458,6 +458,6 @@ provide enough parallel work to repay the added wave coordination.
 
 **Decision: rejected.** C06 is retained only on the isolated experimental
 branch and is not merged into the AMD port.  The protected GMKtec EVO-X2 Qwen
-service was restarted immediately after the screen; its health endpoint must
-return `status: ok` before this iteration is closed.  The immutable screen
+service was restarted immediately after the screen and its health endpoint
+returned `status: ok` before the iteration was closed.  The immutable screen
 artifact is `qwen35moe-q4-c06-micro-20260901T174907Z` on GMKtec EVO-X2.
