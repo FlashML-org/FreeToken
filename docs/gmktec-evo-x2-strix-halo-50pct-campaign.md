@@ -721,3 +721,28 @@ harness-configuration failure.  The candidate startup also rebuilt its
 checkout-local GGUF HIP extension, not the GGUF model.  A later promotion
 requires a revision-matched reusable extension cache and a strict no-JIT
 verification for that checkout.
+
+### C27: corrected single-stream graph qualification
+
+The graph candidate was repeated after normal-service recovery with the
+OpenAI-compatible `/v1` endpoint.  It passed all three deterministic controls,
+captured batch size one in 3.26 seconds using the already-built checkout-local
+GGUF HIP extension, and kept 22.81 GiB of GPU-visible memory free after graph
+capture.
+
+The fixed short canary matrix measured 49.477 decode tokens/s across three
+samples, 3.16 percent above the accepted 47.960-token/s baseline.  Its mean
+warm TTFT was 0.343 s and token-gap p99 was 24.54 ms.  This result alone was
+not sufficient for promotion.  The independent scheduler-shaped three-sample
+matrix measured 48.278 decode tokens/s, essentially equal to the previously
+qualified non-graph control at 48.282 decode tokens/s.  Its mean warm TTFT was
+0.430 s and token-gap p99 was 24.41 ms.
+
+**Decision: reject graph replay as a throughput promotion.** It is functionally
+correct on the AMD path, but its apparent short-canary gain did not reproduce
+on the scheduler-shaped workload and therefore fails the campaign requirement
+for a repeatable gain above normal variation.  Keep the new launcher parameter
+defaulted to zero for reproducible future investigation, but do not enable it
+for normal service.  Preserve `q4-c27-graph-bs1-v1-20260901T213143Z` on
+GMKtec EVO-X2.  The verified candidate process group was stopped, its loopback
+ports were clear, and normal NVFP4 service recovery was started.
