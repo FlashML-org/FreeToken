@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -103,10 +104,11 @@ void signal_flag(uintptr_t flag_addr) {
 
 // ---- TableFile: platform seam for on-disk files ----
 
-// Read up to len (EOF may short it); fewer than need bytes is an error.
+// Read at least need bytes; len is the larger aligned span the request must keep.
+// Resuming past need is not safe: a read that crossed EOF ends at an unaligned offset.
 void pread_min(int fd, uint8_t *buf, int64_t len, int64_t need, int64_t off) {
   int64_t done = 0;
-  while (done < len) {
+  while (done < need) {
     ssize_t got = ::pread(fd, buf + done, len - done, off + done);
     if (got < 0) {
       if (errno == EINTR) continue;
@@ -167,7 +169,7 @@ class TableFile {
 class BatchReader {
  public:
   virtual ~BatchReader() = default;
-  virtual const char *name() const = 0;
+  virtual std::string name() const = 0;
   virtual unsigned capacity() const = 0;
   virtual void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
                       int64_t off) = 0;
@@ -179,7 +181,13 @@ class BatchReader {
 class ThreadPoolBatchReader final : public BatchReader {
  public:
   ThreadPoolBatchReader() {
-    const unsigned n = std::max(1u, std::min(kReaderThreads, std::thread::hardware_concurrency()));
+    // these threads block on I/O, not compute, so the core count is only a default
+    unsigned n = std::max(1u, std::min(kReaderThreads, std::thread::hardware_concurrency()));
+    if (const char *env = std::getenv("FREETOKEN_PLE_READER_THREADS")) {
+      // kBatchEntries is the submit depth, so threads past it never get a read
+      const int v = std::atoi(env);
+      if (v > 0) n = std::min((unsigned)v, kBatchEntries);
+    }
     for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { work(); });
   }
 
@@ -192,7 +200,7 @@ class ThreadPoolBatchReader final : public BatchReader {
     for (auto &w : workers_) w.join();
   }
 
-  const char *name() const override { return "pread-pool"; }
+  std::string name() const override { return "pread-pool x" + std::to_string(workers_.size()); }
   unsigned capacity() const override { return kBatchEntries; }
 
   void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
@@ -318,7 +326,7 @@ class IoUringBatchReader final : public BatchReader {
     if (fd_ >= 0) ::close(fd_);
   }
 
-  const char *name() const override { return "io_uring"; }
+  std::string name() const override { return "io_uring"; }
   unsigned capacity() const override { return entries_; }
 
   void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,

@@ -197,7 +197,7 @@ class DiskRowTable:
         if batch.is_decode:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
-                bs = batch.size
+                bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
