@@ -107,6 +107,11 @@ def create_dsv4_sparse_backend(config: ModelConfig):
     BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
 )
 def create_dsa_backend(config: ModelConfig):
+    # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
+    if any(s.mla and s.index_ratio > 1 for s in config.kv_cache_group_specs()):
+        from .dsa_indexer_kpool import Glm5NextDSABackend
+
+        return Glm5NextDSABackend(config)
     from .dsa import DSAAttnBackend
 
     return DSAAttnBackend(config)

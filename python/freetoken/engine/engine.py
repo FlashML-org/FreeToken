@@ -216,13 +216,19 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 "Use --attention-backend fi (or triton) instead."
             )
 
-    if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
-        # The MLA backend's row addressing (latent scatter, DSA index keys, sparse
-        # top-k page indices) assumes page_size == 1 throughout; reject explicitly
-        # like the SWA models do rather than corrupting addressing silently.
-        raise ValueError(
-            f"latent-KV MLA models require --page-size 1, got {config.page_size}."
+    if required & {AttnType.MLA, AttnType.DSA}:
+        # Plain MLA/DSA runs on page_size 1; the kpool indexer layout needs 64.
+        _kpool_ratio = max(
+            (s.index_ratio for s in model_config.kv_cache_group_specs() if s.mla),
+            default=1,
         )
+        want_page = 64 if _kpool_ratio > 1 else 1
+        if config.page_size != want_page:
+            logger.warning_rank0(
+                f"Page size {config.page_size} is auto-adjusted to {want_page} "
+                f"for latent-KV attention."
+            )
+            override("page_size", want_page)
 
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -1137,6 +1143,7 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    "swiglu_clamp",
 )
 
 

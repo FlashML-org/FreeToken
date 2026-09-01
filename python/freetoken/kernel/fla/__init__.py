@@ -21,15 +21,37 @@ Provenance: https://github.com/sgl-project/sglang, ``python/sglang/srt/layers/at
 stripped/inlined on vendoring). Keep ``chunk_delta_h.py``'s single fixed ``triton.Config`` — restoring
 upstream's multi-config autotune corrupts the in-place state pool. Tune via the env knobs
 ``SGLANG_GDN_CHUNK_H_BV`` / ``SGLANG_GDN_CHUNK_H_NUM_WARPS`` / ``SGLANG_GDN_CHUNK_H_NUM_STAGES``.
+
+KDA (GLM-5.3-Flash Kimi Delta Attention) kernels are vendored separately from vLLM's
+``third_party/flash_linear_attention`` (same fla lineage): ``kda.py`` (chunked prefill +
+fused gate cumsum + recurrent decode wrapper), ``kda_chunk_delta_h.py`` (exp2-gate chunk
+recurrence), ``fused_recurrent.py`` (pool-indexed decode kernel with in-kernel KDA gate),
+``solve_tril.py``. Public entry points:
+- ``chunk_kda_with_fused_gate`` -- chunked prefill from raw gate logits; gathered initial
+  state in, final state out (scatter back to the pool is the caller's job).
+  WARNING: clobbers the ``v`` argument (the output is written into that buffer to save
+  an allocation, as in vLLM where v is an ephemeral projection). Never pass a tensor
+  that is read again afterwards.
+- ``fused_recurrent_kda`` -- decode; per-slot state read/write via ``ssm_state_indices``,
+  gate + beta-sigmoid + q/k l2norm computed in-kernel. The per-token state store reads
+  ``ssm_state_indices`` as a CONTIGUOUS [N, T] block; materialize, never ``expand()``.
 """
 from freetoken.kernel.fla.chunk import chunk_gated_delta_rule
 from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+)
+from freetoken.kernel.fla.kda import (
+    chunk_kda_with_fused_gate,
+    fused_kda_gate,
+    fused_recurrent_kda,
 )
 from freetoken.kernel.fla.layernorm_gated import rms_norm_gated
 
 __all__ = [
     "chunk_gated_delta_rule",
     "fused_sigmoid_gating_delta_rule_update",
+    "chunk_kda_with_fused_gate",
+    "fused_kda_gate",
+    "fused_recurrent_kda",
     "rms_norm_gated",
 ]

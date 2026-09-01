@@ -20,18 +20,24 @@ def vision_load_enabled() -> bool:
 
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
-    a ModelOpt FP4 build, else the lowercased algo string (``"none"`` when unquantized). Models
-    with mixed-precision configs (e.g. qwen3_5_moe) need their own detector."""
+    a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
+    (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, e.g.
+    RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
+    unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
+    own detector."""
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return "none"
-    if isinstance(quant, dict):
-        algo = quant.get("quant_algo") or quant.get("quant_method")
-    else:
-        algo = getattr(quant, "quant_algo", None) or getattr(quant, "quant_method", None)
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    algo = get("quant_algo") or get("quant_method")
     if algo is None:
         return "none"
-    return "nvfp4" if "fp4" in str(algo).lower() else str(algo).lower()
+    if "fp4" in str(algo).lower():
+        return "nvfp4"
+    # exact "nvfp4" (not the "fp4" substring) so MXFP4 exports don't misroute
+    if "nvfp4" in str(get("format") or "").lower():
+        return "nvfp4"
+    return str(algo).lower()
 
 
 def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
@@ -97,8 +103,9 @@ class KVCacheGroupSpec:
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
-    # QSA compression: one index-key row per index_ratio tokens (1 keeps the BSA/DSA
-    # per-token slab). The pool factory and the cost model divide by the same value.
+    # Grouped index-key compression: one index-key row per ``index_ratio`` tokens
+    # (QSA groups, glm5_next kpool pools; 1 keeps the per-token BSA/DSA slab). The
+    # pool factory and the KV cost model divide by the same value.
     index_ratio: int = 1
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
@@ -137,8 +144,9 @@ class FullAttentionGroupConfig(BaseAttentionGroupConfig):
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
-    # QSA compression ratio (> 1 -> AttnType.QSA): index-key rows are per token group,
-    # so the index slab costs index_head_dim * num_index_layers * 2 // index_ratio per token.
+    # Grouped index-key compression ratio (see KVCacheGroupSpec.index_ratio).
+    # GQA + ratio > 1 -> AttnType.QSA (Qwen3.8); MLA + ratio > 1 -> the glm5_next
+    # kpool DSA layout (attn type stays DSA; the pool factory branches on mla).
     index_ratio: int = 1
 
 
@@ -165,6 +173,9 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     conv_kernel_dim: int
     # Output-gate activation name ("silu", "sigmoid"), forwarded to rms_norm_gated.
     output_gate: str
+    # "gdn" and "kda" share the same state geometry (one LinearStatePool serves
+    # both); the variant selects the kernels.
+    variant: Literal["gdn", "kda"] = "gdn"
 
 
 @dataclass(frozen=True)
@@ -307,6 +318,10 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): NoPE-MLA dims, the kpool indexer
+    # geometry, the KDA head config, and the mHC knobs. Opaque to model-agnostic engine
+    # code; None for every other model.
+    glm5_args: Any | None = None
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
