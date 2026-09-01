@@ -267,3 +267,25 @@ materially worse because of the stall.
 `qwen35moe-q4-hipmath-20260901T081500Z` on LAN-223, but remove the experimental
 compiler flag from the branch.  Further work should target the measured Q4_K
 and Q5_K routed-MoE vector kernels, not generic compiler flags.
+
+### C03: four-chunk HIP Q4_K and Q5_K vector work
+
+The model-shape inventory confirmed that every routed gate and up projection is
+Q4_K with 512 input values and 2,048 output values, while the routed down
+projection is Q5_K with 2,048 inputs and 512 outputs.  The candidate doubled
+the per-lane vector-dot ratio from two to four only under HIP, preserving the
+packed weight layout and reduction expression while reducing the number of
+chunks each lane processes.
+
+The exact-Q4 candidate built in clean worktree `921ec3f` and reached its
+loopback endpoint.  It failed all three deterministic visible-output controls:
+the exact canary emitted a control token, the arithmetic control emitted an
+incorrect sentence, and the JSON control was not valid JSON.  No throughput
+claim was measured or retained because the mandatory quality precondition
+failed.
+
+**Decision: rejected for correctness.** The wider vector ratio changes the
+kernel's coverage or reduction mapping on this HIP path.  Preserve the failed
+quality artifact at `qwen35moe-q4-vdr4-20260901T084500Z` on LAN-223, revert the
+source candidate, and restore the protected normal Qwen service before the
+next investigation.
