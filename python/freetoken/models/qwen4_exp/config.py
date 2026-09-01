@@ -163,6 +163,21 @@ def parse_config(hf_config: Any) -> ModelConfig:
             assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
             expert_quant = "fp8_block"
             attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "mixed_precision":
+            # modelopt MIXED_PRECISION: the quant algo is declared per module in
+            # ``quantized_layers`` rather than once at the top level. The community
+            # NVFP4-FP8 build of Qwen3.8-Flash-Next quantizes the routed experts to NVFP4
+            # (read natively by the offload cache) and the dense attn/GDN projections to
+            # 128x128 block-FP8; the block-FP8 dense weights are dequantized to bf16 at load
+            # (see weight.py ``_load_maybe_block_fp8``), so every non-expert module is bf16.
+            quantized = get("quantized_layers") or {}
+            experts_nvfp4 = any(
+                ".mlp.experts" in str(module)
+                and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
+                for module, spec in quantized.items()
+            )
+            expert_quant = "nvfp4" if experts_nvfp4 else "none"
+            attn_quant = dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])
