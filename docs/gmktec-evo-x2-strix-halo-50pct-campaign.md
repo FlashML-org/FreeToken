@@ -461,3 +461,34 @@ branch and is not merged into the AMD port.  The protected GMKtec EVO-X2 Qwen
 service was restarted immediately after the screen and its health endpoint
 returned `status: ok` before the iteration was closed.  The immutable screen
 artifact is `qwen35moe-q4-c06-micro-20260901T174907Z` on GMKtec EVO-X2.
+
+### C07: upstream Triton-router audit
+
+Upstream FreeToken advanced its default router policy in commit `e05cff8`,
+which routes `fused_topk` through the in-tree Triton implementation.  This was
+investigated as a possible scheduler-overhead improvement because routing runs
+once per MoE layer during decode.
+
+The isolated HIP router diagnostic completed without loading a model or
+changing the normal service.  On the Qwen shape of 256 experts and top-k 8,
+the Triton implementation matched the PyTorch reference IDs and weights in the
+diagnostic and reduced synchronized router time as follows:
+
+| Tokens | PyTorch router | Triton router | Microbenchmark speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.02415 ms | 0.01664 ms | 1.45x |
+| 4 | 0.02442 ms | 0.01811 ms | 1.35x |
+
+This is not a new production candidate.  The present Q4 production source
+intentionally keeps the PyTorch router on ROCm because a prior end-to-end
+Qwen canary changed despite isolated router parity.  The upstream change
+modifies only the dispatch policy, not the router kernel or its arithmetic, so
+it does not address that quality failure.  Repeating a full API test without a
+source-level numerical fix would therefore consume a protected-service window
+without testing a new hypothesis.
+
+**Decision: rejected as already disproven.** Preserve the router timing
+artifact `qwen-router-c07-20260901T180707Z` on GMKtec EVO-X2 as a diagnostic,
+but retain the reference route for the exact-Q4 quality baseline.  The normal
+GMKtec EVO-X2 service remained on its existing configuration and returned
+`status: ok` after the diagnostic.
