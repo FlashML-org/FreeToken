@@ -13,14 +13,19 @@ set -euo pipefail
 
 # Require a deliberate lifecycle action instead of guessing whether a caller
 # intended to start a service or release the GPU for a llama.cpp control.
-readonly ACTION="${1:?usage: launch_qwen_gguf_qualified.sh start|stop ARTIFACT_DIR [MEMORY_RATIO]}"
+readonly ACTION="${1:?usage: launch_qwen_gguf_qualified.sh start|stop ARTIFACT_DIR [MEMORY_RATIO] [CUDA_GRAPH_MAX_BS]}"
 # Require a caller-owned evidence directory.  The script writes only its PID
 # file and server log there, so every test run preserves its own provenance.
-readonly ARTIFACT_DIR="${2:?usage: launch_qwen_gguf_qualified.sh start|stop ARTIFACT_DIR [MEMORY_RATIO]}"
+readonly ARTIFACT_DIR="${2:?usage: launch_qwen_gguf_qualified.sh start|stop ARTIFACT_DIR [MEMORY_RATIO] [CUDA_GRAPH_MAX_BS]}"
 # Keep the memory-safe recovery profile as the explicit default.  Callers may
 # supply a different ratio for a recorded experiment, never for a silent
 # production configuration change.
 readonly MEMORY_RATIO="${3:-0.25}"
+# Leave decode graph replay disabled unless an experiment explicitly requests a
+# bounded capture size.  The production profile and every existing qualified
+# baseline therefore retain the exact eager-decode behavior.  A value of one
+# captures only the single-stream decode shape used by this Q4 benchmark.
+readonly CUDA_GRAPH_MAX_BS="${4:-0}"
 
 # Keep durable models, kernel caches, and artifacts separate from the checked
 # out source so source switching cannot delete benchmark evidence or weights.
@@ -106,6 +111,7 @@ validate_paths() {
     [[ -f "${MODEL_PATH}" ]] || { echo "missing Q4 model: ${MODEL_PATH}" >&2; return 1; }
     [[ -x "${ROOT_DIR}/.venv/bin/python" ]] || { echo "missing benchmark Python" >&2; return 1; }
     [[ "${MEMORY_RATIO}" =~ ^0\.[0-9]+$|^1\.0+$ ]] || { echo "invalid memory ratio: ${MEMORY_RATIO}" >&2; return 1; }
+    [[ "${CUDA_GRAPH_MAX_BS}" =~ ^[0-9]+$ ]] || { echo "invalid CUDA graph max batch size: ${CUDA_GRAPH_MAX_BS}" >&2; return 1; }
 }
 
 case "${ACTION}" in
@@ -144,7 +150,7 @@ case "${ACTION}" in
             --attention-backend triton --moe-backend offload --nvfp4-backend triton \
             --expert-load serial --moe-cache-auto --memory-ratio "${MEMORY_RATIO}" \
             --max-seq-len-override 8192 --kv-reserve-tokens 8192 \
-            --cuda-graph-max-bs 0 --disable-pynccl --disable-moe-prefill-overlap \
+            --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" --disable-pynccl --disable-moe-prefill-overlap \
             >"${LOG_FILE}" 2>&1 &
         echo "$!" >"${PID_FILE}"
         ;;
