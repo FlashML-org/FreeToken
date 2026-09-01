@@ -51,18 +51,7 @@ def _hip_gguf_cflags() -> list[str]:
     target = _hip_target_arch()
     if target and not os.environ.get("PYTORCH_ROCM_ARCH"):
         os.environ["PYTORCH_ROCM_ARCH"] = target
-    flags = ["-O3"]
-    # This is deliberately opt-in because it allows the compiler to make
-    # floating-point transformations that are unsuitable for the portable
-    # default.  It is useful for a controlled ROCm performance candidate: the
-    # value becomes part of PyTorch's extension cache key, so the candidate
-    # cannot silently reuse a conservative binary.  ``-funsafe-math-
-    # optimizations`` is narrower than ``-ffast-math`` and matches the HIP
-    # optimization used by current llama.cpp builds without enabling its
-    # additional finite-math assumptions.
-    if os.environ.get("FREETOKEN_HIP_GGUF_FAST_MATH") == "1":
-        flags.append("-funsafe-math-optimizations")
-    return flags
+    return ["-O3"]
 
 
 def _hip_thrust_include() -> str | None:

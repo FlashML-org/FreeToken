@@ -33,10 +33,3 @@ def test_hip_gguf_flags_preserve_an_explicit_multi_target_choice(monkeypatch):
     assert gguf._hip_gguf_cflags() == ["-O3"]
     assert gguf._hip_target_arch() == "gfx1100"
     assert os.environ["PYTORCH_ROCM_ARCH"] == "gfx1100;gfx1151"
-
-
-def test_hip_gguf_fast_math_is_an_explicit_experiment(monkeypatch):
-    """The aggressive HIP candidate is unavailable unless an operator enables it."""
-    monkeypatch.setenv("FREETOKEN_HIP_GGUF_FAST_MATH", "1")
-
-    assert gguf._hip_gguf_cflags() == ["-O3", "-funsafe-math-optimizations"]
