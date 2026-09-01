@@ -367,3 +367,23 @@ does not support promising a 50-percent single-user decode gain from it: the
 current accepted FreeToken exact-Q4 result is already within 1.78 percent of
 the matched llama.cpp ROCm control.  Any larger claim requires measured proof,
 not extrapolation from CUDA-oriented paper results.
+
+#### C06 baseline: exact packed-expert microbenchmark
+
+The new screening harness completed its initial LAN-223 baseline with real
+packed bytes from layer 0 of the qualified Qwen GGUF.  It copied the eight
+routed expert slices only, used the production `ggml_moe_a8_vec` binding, and
+excluded model load, HTTP, router, scheduler, and JIT time from GPU-event
+measurements.
+
+| Projection | Quantization | Exact shape | Mean device time |
+| --- | --- | --- | ---: |
+| Gate | Q4_K | 512 to 2,048, eight selected experts | 21.970 microseconds |
+| Up | Q4_K | 512 to 2,048, eight selected experts | 21.864 microseconds |
+| Down | Q5_K | 2,048 to 512, eight selected experts | 20.624 microseconds |
+| Three projections | mixed | one routed token's screen workload | 64.459 microseconds |
+
+This is a selection baseline, not server TPS.  It makes later component work
+auditable: a candidate must improve this real-shape screen and still pass all
+end-to-end quality, latency, and recovery gates.  The artifact is
+`qwen35moe-q4kq5k-microbaseline-20260901T141100Z` on LAN-223.
