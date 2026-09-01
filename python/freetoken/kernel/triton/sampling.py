@@ -555,13 +555,12 @@ def _topk_target(top_k, B, dev):
     return torch.full((B,), float(int(top_k)), device=dev, dtype=torch.float32)
 
 
-def _topk_thr_ksum(probs, top_k):
-    """Return (threshold[B], kept_sum[B]) for a top-k keep: x >= threshold."""
+def _topk_thr_ksum(probs, target):
+    """Return threshold, buffered sum, and candidate count."""
     B, V = probs.shape
     dev = probs.device
     G, CHUNK = _plan(B, V)
     grid = (B * G,)
-    target = _topk_target(top_k, B, dev)
     rmax = torch.zeros(B, device=dev, dtype=torch.float32)
     _rmax_pass[grid](probs, rmax, V, G, CHUNK, probs.stride(0), BLOCK_SIZE=2048, num_warps=8)
     buf = torch.empty(B * _CAP, device=dev, dtype=torch.float32)
@@ -570,16 +569,40 @@ def _topk_thr_ksum(probs, top_k):
     thr = torch.empty(B, device=dev, dtype=torch.float32)
     ksum = torch.empty(B, device=dev, dtype=torch.float32)
     _refine_topk[(B,)](buf, cnt, rmax, target, thr, ksum, _CAP, _KR, _KBINS, 2048)
-    return thr, ksum
+    return thr, ksum, cnt
+
+
+def _exact_top_k_renorm_probs(probs, target):
+    """Exact fallback for rows the fixed-size candidate buffer cannot represent."""
+    _, V = probs.shape
+    target = target.to(torch.int64)
+    active_target = torch.where(target < V, target, 0)
+    max_top_k = max(1, int(active_target.max().item()))
+    values, indices = torch.topk(probs, max_top_k, dim=-1)
+    keep = torch.arange(max_top_k, device=probs.device).unsqueeze(0) < active_target.unsqueeze(1)
+    values = torch.where(keep, values, 0.0)
+    denom = values.sum(dim=-1, keepdim=True)
+    values = values / torch.where(denom > 0, denom, torch.ones_like(denom))
+    out = torch.zeros_like(probs).scatter_(1, indices, values)
+    return torch.where((target >= V).unsqueeze(1), probs, out)
 
 
 def top_k_renorm_probs(probs, top_k):
     probs = probs.float()
     B, V = probs.shape
+    if not isinstance(top_k, torch.Tensor) and int(top_k) >= V:
+        return probs
     dev = probs.device
+    target = _topk_target(top_k, B, dev)
+    if (target >= V).any().item():
+        return _exact_top_k_renorm_probs(probs, target)
     G, CHUNK = _plan(B, V)
     grid = (B * G,)
-    thr, ksum = _topk_thr_ksum(probs, top_k)
+    thr, _, cnt = _topk_thr_ksum(probs, target)
+    if ((cnt < target) | (cnt > _CAP)).any().item():
+        return _exact_top_k_renorm_probs(probs, target)
+    ksum = torch.zeros(B, device=dev, dtype=torch.float32)
+    _ksum_pass[grid](probs, thr, ksum, V, G, CHUNK, probs.stride(0))
     out = torch.empty_like(probs)
     _write_pass[grid](probs, out, thr, ksum, V, G, CHUNK, probs.stride(0))
     return out
