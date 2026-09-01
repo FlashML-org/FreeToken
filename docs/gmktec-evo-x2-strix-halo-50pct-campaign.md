@@ -387,3 +387,48 @@ This is a selection baseline, not server TPS.  It makes later component work
 auditable: a candidate must improve this real-shape screen and still pass all
 end-to-end quality, latency, and recovery gates.  The artifact is
 `qwen35moe-q4kq5k-microbaseline-20260901T141100Z` on GMKtec EVO-X2.
+
+### C06 execution contract: selective modern MMVQ port
+
+The next iteration is deliberately limited to the modern llama.cpp component
+surface that is relevant to this Qwen artifact: the Q4_K and Q5_K routed
+expert helpers, Q6_K and Q8_0 dense helpers, and the architecture-aware MMVQ
+launch selection.  It does not alter the GGUF packing, router semantics,
+quantization, sampling, cache capacity, model files, ROCm installation, or
+normal service configuration.
+
+The candidate may advance only in this order:
+
+1. Compile in an isolated source tree with a separate ROCm kernel cache.
+2. Match the accepted implementation on real packed Qwen expert tensors before
+   starting an HTTP server.  Any element mismatch rejects the candidate.
+3. Improve the real-shape device microbenchmark by at least 1 percent for a
+   traced hot projection without regressing another traced hot projection by
+   more than 1 percent.
+4. Pass the three deterministic API controls, the functional quality suite,
+   long-context retrieval, and multi-turn state-retention suite.
+5. Beat 47.960 mean decode TPS by at least 1 percent across repeated
+   fixed-workload API samples, with no worse p99 token gap or recovery result.
+6. Run the matched llama.cpp control again only after FreeToken clears its own
+   acceptance gate.  A useful cross-runtime win is at least 51.3 TPS, roughly
+   five percent above the current 48.831 TPS control, rather than an outcome
+   inside ordinary run-to-run variation.
+
+The NVIDIA NVFP4 lane remains separate.  It cannot claim comparison with the
+published 39.3 TPS RTX 4060 result until the authors' workload, cache, warmup,
+generation, stop, source-revision, and policy fields are recovered and frozen.
+
+#### C06.1 source-architecture audit
+
+The first C06 source audit rejected a parameter-only port before it consumed
+GPU time.  FreeToken's original ROCm GGUF MoE implementation already selects
+eight 32-lane waves with 8 by 128 tiles for the Q4_K, Q5_K, Q6_K, and Q8_0
+formats.  Those are the same broad RDNA4 launch choices that current llama.cpp
+selects for single-vector work.  Reapplying that geometry would therefore be a
+duplicate change, not a new optimization hypothesis.
+
+The next implementation must instead isolate one deeper difference from the
+modern llama.cpp component: reduction structure, shared-memory staging, or
+the current MMVQ packed-input interface.  It must retain FreeToken's
+expert-bank layout and prove tensor equality before any server benchmark.  No
+new launch-dimension-only candidate is authorized by this audit.
