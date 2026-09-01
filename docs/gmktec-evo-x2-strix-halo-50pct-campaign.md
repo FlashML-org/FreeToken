@@ -804,3 +804,41 @@ on GMKtec EVO-X2, including raw quality, per-token timing, HIP build, and
 recovery evidence.  The isolated process was stopped; a stale executable bit
 on the normal recovery start helper was corrected before normal-service
 recovery was launched.
+
+### C30: ROCprof lifecycle qualification
+
+The next optimization decision requires a kernel and memory-copy trace of the
+same Q4 control, not an inference-rate estimate from a profiler.  ROCprofv3
+was therefore launched through the ROCm SDK bundled with the active PyTorch
+wheel.  That avoids loading a second LLVM runtime from the system ROCm tree.
+The normal NVFP4 server was stopped only after a healthy API check and was
+restarted after every isolated candidate attempt.
+
+The first attempt exposed two setup defects before inference: a source checkout
+that did not register the Qwen GGUF architecture, followed by a Qwen-capable
+checkout without its required native pinned-memory extension.  The native
+extension was then built from that checkout with the installed ROCm 10 HIP
+toolchain and successfully imported.  This is build provenance, not a model
+conversion or a change to the protected service.
+
+The next run reached the Q4 OpenAI-compatible API and built the checkout-local
+GGUF HIP kernel on its first real request.  Its resulting decode output was
+intentionally excluded from performance comparison because the profiler uses a
+system-memory intercept queue and the request included one-time compilation.
+A warm-cache repetition completed one 900-token bounded workload in the
+configured collection interval.  The server's diagnostic decode log was about
+30 tokens/s under profiling, versus the qualified unprofiled control near 48
+tokens/s.  This demonstrates that ROCprof output must not be used as a TPS
+measurement.
+
+**Decision: no C30 performance claim.** The candidate and all verified helper
+processes were stopped, the disposable loopback listener was confirmed absent,
+and the normal NVFP4 API was healthy again.  The forced recovery prevented the
+profiler from finalizing a usable `rocpd` database, so the trace cannot yet be
+used to rank kernels or justify a code change.  Preserve
+`q4-c30d-profile-default-20260901T223610Z`,
+`q4-c30e-profile-default-20260901T223951Z`, and
+`q4-c30f-profile-warm-cache-20260901T224449Z` as provenance.  The next action
+is a documented controller that prewarms the exact isolated cache, runs a
+bounded workload during collection, requests graceful profiler finalization,
+and verifies the resulting database before normal-service recovery.
