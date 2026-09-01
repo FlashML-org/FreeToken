@@ -746,3 +746,26 @@ defaulted to zero for reproducible future investigation, but do not enable it
 for normal service.  Preserve `q4-c27-graph-bs1-v1-20260901T213143Z` on
 GMKtec EVO-X2.  The verified candidate process group was stopped, its loopback
 ports were clear, and normal NVFP4 service recovery was started.
+
+### C28: two-row GGUF MMV grouping screen
+
+The prior ROCm trace showed that Q4_K and Q5_K routed-expert vector kernels
+dominate decode GPU time.  A narrow HIP compile-time experiment therefore
+made the MMV output-row grouping explicit.  The default remains one row, while
+the isolated candidate used exactly two rows per workgroup through
+`FREETOKEN_GGUF_MMV_Y=2`.  Host-side validation tests passed 3 of 3 before GPU
+use.  The candidate compiled into a dedicated extension-cache directory, and
+the HIP build log records `-DGGML_CUDA_MMV_Y=2` for `gfx1151`.
+
+The two-row candidate passed all three deterministic Q4 quality controls, but
+its fixed three-sample throughput mean was 47.954 decode tokens/s.  This is
+effectively equal to, and fractionally below, the 47.960-token/s baseline.
+Mean warm TTFT was 0.350 s and token-gap p99 was 24.76 ms.
+
+**Decision: reject the two-row MMV grouping.** The configuration preserves
+quality but does not create a measurable single-stream decode gain.  Keep the
+compile switch defaulted to one row and retain it only as a reproducible
+diagnostic control.  Preserve `q4-c28-mmv-y2-20260901T214526Z` on GMKtec
+EVO-X2.  The candidate was stopped through its verified process group, its
+loopback ports were confirmed clear, and normal NVFP4 service recovery was
+started.
