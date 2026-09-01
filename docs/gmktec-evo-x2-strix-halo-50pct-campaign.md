@@ -565,3 +565,32 @@ the complete artifact `qwen-router-c10-api-20260901T185412Z` on GMKtec EVO-X2.
 **Decision: do not promote.** Retain the current HIP Triton router as a
 quality-qualified route, but focus the next iteration on data movement and
 expert-cache work, where an end-to-end gain remains plausible.
+
+### C11: upstream expert-cache copy-plan audit
+
+Upstream's newer expert-cache copy-plan changes were merged only into a
+disposable source checkout.  The candidate preserves the qualified in-tree
+router path and adds the upstream copy-plan and AOT-catalog corrections.  Two
+stale test expectations were found and corrected in that disposable checkout:
+the router test expected a retired reference dispatch policy, and the AOT test
+expected two unsupported legacy copy shapes to be compiled even though the
+upstream code intentionally filters them out.
+
+The corrected CPU-side controls passed: three host-residency and locked-layer
+copy tests, plus two strict AOT-grid selection tests.  The normal NVFP4 API
+reported `status: ok` after the checks.  The saved CPU evidence is
+`upstream-cache-c11-retry-20260901T191217Z` on GMKtec EVO-X2.
+
+However, the focused ROCm fused-MoE suite also produced an illegal-memory-
+access fault in `fused_moe_kernel` while testing the disposable candidate.
+The failed test process was a separate one-process group and was terminated;
+GPU utilization returned from 100 percent to 5 percent, and the ordinary API
+remained healthy.  This failure cannot be attributed to the copy-plan change
+because that fused-expert test path was not changed by the upstream copy-plan
+commit.  It is nevertheless a real safety failure on the target ROCm stack.
+
+**Decision: safety-blocked.** Do not merge or benchmark the upstream cache
+candidate yet.  The next iteration must stop the normal service, reproduce the
+fused-expert fault with serialized kernel dispatch and a minimal shape, compare
+the candidate with the accepted source, then repair or replace the failing
+kernel before any cache-copy throughput claim is considered.
