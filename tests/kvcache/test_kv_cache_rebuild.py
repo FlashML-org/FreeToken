@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import pytest
 import torch
-
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 
@@ -15,8 +15,13 @@ def _mha_pool(num_pages=4):
 
     _init_tp()
     return MHAKVCache(
-        num_kv_heads=8, num_layers=3, head_dim=64,
-        num_pages=num_pages, page_size=16, dtype=torch.float16, device=torch.device("cpu"),
+        num_kv_heads=8,
+        num_layers=3,
+        head_dim=64,
+        num_pages=num_pages,
+        page_size=16,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
     )
 
 
@@ -50,26 +55,83 @@ def test_mla_and_dsa_rebuild_from_config_and_unit_bytes():
     from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
 
     latent, idx_dim, layers, n_idx = 80, 32, 2, 1
-    mla = MLAKVCache(latent_dim=latent, num_layers=layers, num_pages=8, page_size=1,
-                     dtype=torch.bfloat16, device=torch.device("cpu"))
+    mla = MLAKVCache(
+        latent_dim=latent,
+        num_layers=layers,
+        num_pages=8,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
     mla.rebuild_from_config(config=None, num_pages=20)
     assert mla.latent_rows(0).shape[0] == 21  # 20 usable + 1 dummy page
     assert mla.unit_bytes() == (layers * latent * 2, 0)
 
-    dsa = DSAKVCache(latent_dim=latent, num_layers=layers, num_pages=8, page_size=1,
-                     dtype=torch.bfloat16, device=torch.device("cpu"),
-                     index_head_dim=idx_dim, num_index_layers=n_idx)
+    dsa = DSAKVCache(
+        latent_dim=latent,
+        num_layers=layers,
+        num_pages=8,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        index_head_dim=idx_dim,
+        num_index_layers=n_idx,
+    )
     dsa.rebuild_from_config(config=None, num_pages=20)
     assert dsa.latent_rows(0).shape[0] == 21 and dsa.index_k_cache(0).shape[0] == 21
     # the index slab's per-token bytes ride on top of the latent slab's, each floored on its own
     assert dsa.unit_bytes() == (layers * latent * 2 + n_idx * idx_dim * 2, 0)
 
 
+def test_mla_hybrid_layer_map_allocates_only_paged_kv_layers():
+    from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
+
+    latent, idx_dim = 80, 32
+    layer_ids = (3, 7, 11)
+    mla = MLAKVCache(
+        latent_dim=latent,
+        num_layers=12,
+        num_pages=8,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        layer_ids=layer_ids,
+    )
+    assert mla._kv_buffer.shape == (1, len(layer_ids), 8, 1, 1, latent)
+    assert mla.num_layers == 12
+    assert mla.latent_rows(7).shape == (8, latent)
+    with pytest.raises(KeyError, match="no paged KV storage"):
+        mla.latent_rows(4)
+    assert mla.unit_bytes() == (len(layer_ids) * latent * 2, 0)
+
+    dsa = DSAKVCache(
+        latent_dim=latent,
+        num_layers=12,
+        num_pages=8,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        index_head_dim=idx_dim,
+        num_index_layers=2,
+        layer_ids=layer_ids,
+    )
+    assert dsa._kv_buffer.shape == (1, len(layer_ids), 8, 1, 1, latent)
+    assert dsa.index_k_cache(1).shape == (8, idx_dim)
+    assert dsa.unit_bytes() == (
+        len(layer_ids) * latent * 2 + 2 * idx_dim * 2,
+        0,
+    )
+
+
 def _hybrid_groups():
     from freetoken.models.config import KVCacheGroupSpec
 
-    full = KVCacheGroupSpec(name="full", layer_ids=(0, 2), num_kv_heads=8, head_dim=64, sliding_window=None)
-    swa = KVCacheGroupSpec(name="swa", layer_ids=(1,), num_kv_heads=8, head_dim=64, sliding_window=128)
+    full = KVCacheGroupSpec(
+        name="full", layer_ids=(0, 2), num_kv_heads=8, head_dim=64, sliding_window=None
+    )
+    swa = KVCacheGroupSpec(
+        name="swa", layer_ids=(1,), num_kv_heads=8, head_dim=64, sliding_window=128
+    )
     return [full, swa]
 
 
@@ -78,8 +140,13 @@ def test_hybrid_swa_rebuild_resizes_both_groups_preserves_identity():
 
     _init_tp()
     pool = HybridSWAKVCache(
-        groups=_hybrid_groups(), num_layers=3, num_full_pages=4, page_size=16,
-        num_swa_tokens=32, dtype=torch.float16, device=torch.device("cpu"),
+        groups=_hybrid_groups(),
+        num_layers=3,
+        num_full_pages=4,
+        page_size=16,
+        num_swa_tokens=32,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
     )
     pool_id = id(pool)
     mapping_before = pool.layers_mapping
@@ -123,8 +190,11 @@ def _swa_config(cache_type: str):
 def test_hybrid_swa_rebuild_from_config_derives_the_window_per_cache_type():
     """The window size the engine used to compute for the pool: ratio x full for radix,
     concurrency x window for naive."""
-    from freetoken.kvcache.hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
-    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.kvcache.hybrid_swa_pool import (
+        HybridSWAKVCache,
+        _naive_swa_num_tokens,
+        _swa_paged_num_tokens,
+    )
 
     _init_tp()
     for cache_type, expected in (
@@ -132,8 +202,13 @@ def test_hybrid_swa_rebuild_from_config_derives_the_window_per_cache_type():
         ("naive", _naive_swa_num_tokens),
     ):
         pool = HybridSWAKVCache(
-            groups=_hybrid_groups(), num_layers=3, num_full_pages=4, page_size=16,
-            num_swa_tokens=32, dtype=torch.float16, device=torch.device("cpu"),
+            groups=_hybrid_groups(),
+            num_layers=3,
+            num_full_pages=4,
+            page_size=16,
+            num_swa_tokens=32,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
         )
         config = _swa_config(cache_type)
         pool.rebuild_from_config(config, 10)
@@ -149,15 +224,25 @@ def test_linear_state_pool_rebuild_resizes_preserves_identity_and_dtypes():
 
     _init_tp()
     group = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(0, 1, 2), num_key_heads=4, num_value_heads=8,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+        name="linear",
+        layer_ids=(0, 1, 2),
+        num_key_heads=4,
+        num_value_heads=8,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+        output_gate="silu",
     )
-    pool = LinearStatePool(group=group, num_slots=10, dtype=torch.bfloat16, device=torch.device("cpu"))
+    pool = LinearStatePool(
+        group=group, num_slots=10, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
     pid = id(pool)
     conv_dtype, rec_dtype = pool.conv_states.dtype, pool.recurrent_states.dtype
     _, _, conv_dim, km1 = pool.conv_states.shape
     _, _, v_heads, k_dim, v_dim = pool.recurrent_states.shape
-    assert pool.num_slots == 10 and pool.num_free_slots == 9  # slot 0 is the padding sink
+    assert (
+        pool.num_slots == 10 and pool.num_free_slots == 9
+    )  # slot 0 is the padding sink
 
     pool.rebuild(25)
 
@@ -178,8 +263,8 @@ def test_dsv4_rebuild_from_config_builds_the_pool_sizes_and_attaches_the_table()
     the engine used to do -- and re-points full_loc_map at the shared page table."""
     from types import SimpleNamespace
 
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_pool_sizes
     from freetoken.kvcache.dsv4_cost_model import (
+        _dsv4_pool_sizes,
         dsv4_kv_unit_bytes,
         dsv4_pool_sizes,
         dsv4_window_unit_bytes,
@@ -189,17 +274,29 @@ def test_dsv4_rebuild_from_config_builds_the_pool_sizes_and_attaches_the_table()
 
     P, mrr = 128, 1
     args = DeepseekV4Args(
-        n_layers=4, compress_ratios=(0, 4, 128, 4), max_seq_len=512,
-        head_dim=64, index_head_dim=32, window_size=P,
+        n_layers=4,
+        compress_ratios=(0, 4, 128, 4),
+        max_seq_len=512,
+        head_dim=64,
+        index_head_dim=32,
+        window_size=P,
     )
     config = SimpleNamespace(
-        max_seq_len=512, page_size=P, max_running_req=mrr, cache_type="swa_radix",
-        swa_full_tokens_ratio=0.5, swa_num_pages_override=None,
+        max_seq_len=512,
+        page_size=P,
+        max_running_req=mrr,
+        cache_type="swa_radix",
+        swa_full_tokens_ratio=0.5,
+        swa_num_pages_override=None,
         model_config=SimpleNamespace(dsv4_args=args),
     )
     pool = DSV4PagedKVCache(
         sizes=dsv4_pool_sizes(num_pages=4, args=args, swa_ratio=0.5, P=P),
-        args=args, device=torch.device("cpu"), dtype=torch.bfloat16, P=P, n_scratch=mrr + 1,
+        args=args,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        P=P,
+        n_scratch=mrr + 1,
     )
     pool._init_paged_state(mrr, True)  # the engine's create_kv_pool step
     pool.rebuild_from_config(config, 15)
@@ -207,7 +304,10 @@ def test_dsv4_rebuild_from_config_builds_the_pool_sizes_and_attaches_the_table()
     assert pool.sizes == _dsv4_pool_sizes(config, 16)  # 15 usable + 1 dummy page
     assert pool.sizes.full_token == 16 * P
     assert pool.window_pool[0].shape[0] == pool.sizes.n_win_slots
-    assert pool.unit_bytes() == (dsv4_kv_unit_bytes(args, P), dsv4_window_unit_bytes(args, P))
+    assert pool.unit_bytes() == (
+        dsv4_kv_unit_bytes(args, P),
+        dsv4_window_unit_bytes(args, P),
+    )
 
     page_table = torch.zeros((mrr + 1, 64), dtype=torch.int32)
     pool.attach_page_table(page_table)
@@ -221,13 +321,15 @@ def test_dsv4_refresh_seq_state_tracks_page_table_width():
     from types import SimpleNamespace
 
     from freetoken.engine.engine import Engine
-    from freetoken.utils import align_ceil
     from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
     from freetoken.scheduler.table import TableManager
+    from freetoken.utils import align_ceil
 
     P, mrr = 128, 4
     config = SimpleNamespace(
-        max_seq_len=65536, page_size=P, max_running_req=mrr,
+        max_seq_len=65536,
+        page_size=P,
+        max_running_req=mrr,
         model_config=SimpleNamespace(dsv4_args=SimpleNamespace(window_size=P)),
     )
     # attach_page_table only re-points the pool's full_loc_map; the decode snapshot belongs to
@@ -236,13 +338,16 @@ def test_dsv4_refresh_seq_state_tracks_page_table_width():
     pool = object.__new__(DSV4PagedKVCache)
     pool.full_loc_map = None
     eng = SimpleNamespace(
-        num_pages=489, device=torch.device("cpu"),
+        num_pages=489,
+        device=torch.device("cpu"),
         ctx=SimpleNamespace(page_table=None),
         dummy_req=SimpleNamespace(table_idx=mrr),
         kv_cache=pool,
     )
     eng.max_seq_len = min(config.max_seq_len, eng.num_pages * P)
-    eng.page_table = torch.zeros((mrr + 1, align_ceil(eng.max_seq_len, 32)), dtype=torch.int32)
+    eng.page_table = torch.zeros(
+        (mrr + 1, align_ceil(eng.max_seq_len, 32)), dtype=torch.int32
+    )
     tm = TableManager(mrr, eng.page_table)
 
     for target in (519, 489, 400, 519):  # grow, shrink back, shrink, grow again
@@ -270,7 +375,9 @@ def test_every_kv_pool_answers_the_sizing_surface():
 
     for cls in (MHAKVCache, MLAKVCache, DSAKVCache, HybridSWAKVCache, DSV4PagedKVCache):
         for hook in ("kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild"):
-            assert callable(getattr(cls, hook, None)), f"{cls.__name__} is missing {hook}"
+            assert callable(getattr(cls, hook, None)), (
+                f"{cls.__name__} is missing {hook}"
+            )
     for hook in ("kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild"):
         assert hook in DSV4PagedKVCache.__dict__, f"DSV4 lost its {hook} override"
 
@@ -284,7 +391,9 @@ def test_every_kv_pool_answers_the_rebuild_surface():
     from freetoken.kvcache.mha_pool import MHAKVCache
 
     for cls in (MHAKVCache, MLAKVCache, DSAKVCache, HybridSWAKVCache, DSV4PagedKVCache):
-        assert not cls.__abstractmethods__, f"{cls.__name__}: {sorted(cls.__abstractmethods__)}"
+        assert not cls.__abstractmethods__, (
+            f"{cls.__name__}: {sorted(cls.__abstractmethods__)}"
+        )
     # Only DSV4 rebinds the model and re-points a page table; the rest inherit the defaults.
     assert DSV4PagedKVCache.needs_rebind_on_rebuild
     assert not any(

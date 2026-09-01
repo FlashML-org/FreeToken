@@ -99,10 +99,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=-1,
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
+    p.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="CPU MoE worker threads; 0 = runtime auto-selection",
+    )
+    p.add_argument(
+        "--kv-reserve-tokens",
+        type=int,
+        default=0,
+        help="KV token floor reserved before auto-sizing the expert cache; 0 = server default",
+    )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
     p.add_argument("--gpu", default=None,
                    help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
+    p.add_argument(
+        "--disable-prefill-overlap",
+        action="store_true",
+        help="disable MoE prefill overlap (permits expert caches below 2 * num_experts)",
+    )
     p.add_argument(
         "--greedy",
         action="store_true",
@@ -187,6 +204,12 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    if args.cpu_threads > 0:
+        cmd += ["--moe-cpu-threads", str(args.cpu_threads)]
+    if args.kv_reserve_tokens > 0:
+        cmd += ["--kv-reserve-tokens", str(args.kv_reserve_tokens)]
+    if args.disable_prefill_overlap:
+        cmd.append("--disable-moe-prefill-overlap")
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:

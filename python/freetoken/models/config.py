@@ -307,6 +307,10 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) payload: KDA recurrent geometry, mHC controls and the
+    # compressed DSA indexer fields. Kept separate from glm_dsa_args because GLM-5.3 is
+    # a hybrid KDA/MLA model and its checkpoint layout is not GLM-5.2-compatible.
+    glm5_args: Any | None = None
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine

@@ -275,6 +275,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # Hybrid KDA + MLA sparse attention. KDA state and the MLA latent/index
+        # slabs bypass store_cache, so this family contributes no paged-KV row.
+        name="zai-org/GLM-5.3-Flash",
+        architecture="Glm5NextForConditionalGeneration",
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=("fp8_block",),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.
@@ -322,7 +333,13 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3_5ForConditionalGeneration",
         hidden_size=5120,
         kv_groups=((4, 256),),
-        aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
+        aliases=(
+            "Qwen/Qwen3.6-27B-FP8",
+            "nvidia/Qwen3.6-27B-NVFP4",
+            "Qwen/Qwen3.8-27B",
+            "Qwen/Qwen3.8-27B-FP8",
+            "RadixArk/Qwen3.8-27B-NVFP4",
+        ),
     ),
     AotModel(
         name="google/gemma-4-12B-it",

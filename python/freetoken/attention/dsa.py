@@ -31,9 +31,10 @@ split does not fit the generic ``forward(q, k, v)`` contract).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import Batch, get_global_ctx
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
@@ -73,8 +74,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
 
-        args = config.glm_dsa_args
-        assert args is not None, "dsa backend needs ModelConfig.glm_dsa_args (MLA dims)"
+        args = config.glm_dsa_args or config.glm5_args
+        assert args is not None, "dsa backend needs GLM MLA dimensions"
         self.config = config
         self.num_heads = config.num_qo_heads
         self.kv_lora_rank = args.kv_lora_rank
@@ -96,13 +97,29 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         # layer -> group leader (most recent "full" layer); leader -> pool slot.
         # Only built when DSA serves: the dense ablation never consults indexer_types,
         # so a checkpoint with a malformed list cannot crash the ablation.
-        self._leader: Dict[int, int] = {}
-        self._idx_slot: Dict[int, int] = {}
+        self._leader: dict[int, int] = {}
+        self._idx_slot: dict[int, int] = {}
         if self.dsa_enabled:
             lead = None
+            # Hybrid models (GLM-5.3-Flash) carry an ``indexer_types`` entry for
+            # every decoder layer, including KDA layers that never enter this
+            # backend.  The index slab is deliberately sized only for MLA/DSA
+            # layers, so enumerate that group's layer ids rather than treating a
+            # ``full`` marker on a linear-attention layer as an allocated slot.
+            if getattr(config, "glm5_args", None) is not None:
+                full_group = next(
+                    group for group in config.attention_groups if group.name == "full"
+                )
+                served_layers = set(full_group.layer_ids)
+            else:
+                # GLM-5.2 is all-MLA and several backend-level tests intentionally
+                # pass a minimal config namespace without generic group metadata.
+                served_layers = set(range(config.num_layers))
             # Capped to the SERVED layer count (dev num_layers overrides must not
             # index slots past the pool the factory sized from the same cap).
             for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+                if lid not in served_layers:
+                    continue
                 if kind == "full":
                     lead = lid
                     self._idx_slot[lid] = len(self._idx_slot)
@@ -113,7 +130,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._rows_buf: torch.Tensor | None = None
         self._kvlen_buf: torch.Tensor | None = None
         self.max_seq_len = 0
-        self.capture_bs: List[int] = []
+        self.capture_bs: list[int] = []
 
     def forward(self, q, k, v, layer_id, batch, attn_spec: AttentionSpec | None = None):
         raise NotImplementedError("MLA models use mla_forward(), not forward().")
@@ -128,7 +145,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         # active_table_idx (which the decode path's addressing requires) for
         # phase == "decode". The prefill path handles extend_len == 1 fine.
         is_decode = getattr(batch, "phase", None) == "decode"
-        qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        qo_indptr = (
+            torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        )
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
         md = DSAMetadata(
@@ -151,8 +170,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
 
         return glm_dsa_sparse_attn(
-            q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
-            counts=cnt, d_v=self.kv_lora_rank,
+            q_cat,
+            self.kvcache.latent_rows(layer_id),
+            sel,
+            self.sm_scale,
+            counts=cnt,
+            d_v=self.kv_lora_rank,
         )
 
     def mla_forward(
@@ -177,7 +200,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         if self.dsa_enabled and indexer_qkw is not None:
             # Scatter index keys unconditionally: short prefills serve through the
             # identity path TODAY, but their keys must exist once decode passes topk.
-            self.kvcache.store_index_k(indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id])
+            self.kvcache.store_index_k(
+                indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id]
+            )
 
         if md.is_decode:
             return self._decode(md, layer_id, q_nope, q_pe, indexer_qkw)
@@ -194,7 +219,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         else:
             if indexer_qkw is not None:
                 q_idx, _, w = indexer_qkw
-                s = self.dsa_decode_scores(q_idx, w, self._idx_slot[layer_id], rows, kvlen)
+                s = self.dsa_decode_scores(
+                    q_idx, w, self._idx_slot[layer_id], rows, kvlen
+                )
                 k_sel = min(self.index_topk, s.shape[-1])
                 picks = self.indexer_select_decode(
                     s.view(bs, 1, -1), valid=kvlen, topk=k_sel, offset=0
@@ -205,15 +232,21 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(
+            bs, 1, self.num_heads, self.latent_dim
+        )
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
-        self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
-        rows: torch.Tensor, positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        slot: int,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-request causal top-k: ([1, m, K] physical rows, [1, m] counts)."""
         kv_len = rows.numel()
         k_all = self.kvcache.index_k_cache(slot).index_select(0, rows.long())
@@ -223,14 +256,20 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         start_pos = int(positions[0])
         # Bound the fp32 [chunk, kv_len] logits transient (worst case is capped by the
         # model's max_position: floor 16 x 1M x 4 B = 64 MB, see _PREFILL_SCORE_BYTES).
-        chunk = max(16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(kv_len * 4, 1)))
+        chunk = max(
+            16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(kv_len * 4, 1))
+        )
         for s0 in range(0, m, chunk):
             s1 = min(s0 + chunk, m)
             scores = self.dsa_prefill_logits(q_idx[s0:s1], k_all, w[s0:s1])
             # Shared selection semantics (dsv4_indexer): token-granular == ratio 1.
             picks = self.indexer_select_prefill(
-                scores.unsqueeze(0), start_pos=start_pos + s0, seqlen=s1 - s0,
-                ratio=1, topk=k_sel, offset=0,
+                scores.unsqueeze(0),
+                start_pos=start_pos + s0,
+                seqlen=s1 - s0,
+                ratio=1,
+                topk=k_sel,
+                offset=0,
             )[0]
             sel[s0:s1] = self.dsa_map_rows(picks, rows.view(1, -1).expand(s1 - s0, -1))
         cnt = torch.clamp(positions + 1, max=k_sel).to(torch.int32)
@@ -249,7 +288,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             md.sel[layer_id] = [
                 self._select_prefill(
                     self._idx_slot[layer_id],
-                    q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
+                    q_idx[qo[i] : qo[i + 1]],
+                    w[qo[i] : qo[i + 1]],
                     page_table[r.table_idx, : r.device_len],
                     batch.positions[qo[i] : qo[i + 1]],
                 )
@@ -267,34 +307,50 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 # token at kv <= index_topk, and the ablation attends everything).
                 # One shared row list broadcast across queries (stride 0), causality
                 # through per-query counts.
-                sel = page_table[r.table_idx, : r.device_len].view(1, 1, -1).to(torch.int32)
-                cnt = (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
+                sel = (
+                    page_table[r.table_idx, : r.device_len]
+                    .view(1, 1, -1)
+                    .to(torch.int32)
+                )
+                cnt = (
+                    (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
+                )
             o[qo[i] : qo[i + 1]] = self._attend(
                 q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
-                layer_id, sel, cnt,
+                layer_id,
+                sel,
+                cnt,
             ).view(m, self.num_heads, self.kv_lora_rank)
         return o
 
     # ----- CUDA graph (decode) ----------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
         self.max_seq_len = max_seq_len
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)
         width = get_global_ctx().page_table.shape[1]
-        self._rows_buf = torch.full((max_bs, width), -1, dtype=torch.int32, device=self.device)
+        self._rows_buf = torch.full(
+            (max_bs, width), -1, dtype=torch.int32, device=self.device
+        )
         self._kvlen_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
 
     def _decode_rows(self, batch: Batch) -> torch.Tensor:
         """This decode step's per-request page-table rows [bs, W], gathered off the
         scheduler-staged ``active_table_idx`` (a device tensor -- no host loop)."""
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
-        return get_global_ctx().page_table.index_select(0, batch.active_table_idx.to(torch.int64))
+        assert batch.active_table_idx is not None, (
+            "decode batch is missing its page-table rows"
+        )
+        return get_global_ctx().page_table.index_select(
+            0, batch.active_table_idx.to(torch.int64)
+        )
 
     def _stage_decode(self, batch: Batch, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the
         metadata at them (restage-per-replay, same shape as the generic backends)."""
         md = batch.attn_metadata
-        self._rows_buf[:bs].copy_(get_global_ctx().page_table.index_select(0, table_idx))
+        self._rows_buf[:bs].copy_(
+            get_global_ctx().page_table.index_select(0, table_idx)
+        )
         self._kvlen_buf[:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         md.rows = self._rows_buf[:bs]
         md.kvlen = self._kvlen_buf[:bs]
@@ -311,7 +367,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._stage_decode(batch, bs, dummy)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        assert batch.active_table_idx is not None, (
+            "decode batch is missing its page-table rows"
+        )
         self._stage_decode(
             batch, batch.padded_size, batch.active_table_idx.to(torch.int64)
         )
