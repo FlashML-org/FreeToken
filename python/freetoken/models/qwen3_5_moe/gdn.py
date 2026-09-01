@@ -13,6 +13,36 @@ from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from .quant_linear import make_replicated_quant
 
 
+def _dflash_conv_state_steps(pre_state: torch.Tensor, conv_in: torch.Tensor) -> torch.Tensor:
+    """Rolling conv state after each token in a short DFlash verify block.
+
+    ``pre_state`` is ``[conv_dim, kernel - 1]`` and ``conv_in`` is
+    ``[verify_len, conv_dim]``. The result is ``[verify_len, conv_dim, kernel - 1]``.
+    """
+    history = torch.cat([pre_state, conv_in.transpose(0, 1).to(pre_state.dtype)], dim=-1)
+    width = pre_state.shape[-1]
+    return torch.stack(
+        [history[:, i + 1 : i + 1 + width] for i in range(conv_in.shape[0])],
+        dim=0,
+    )
+
+
+def _dflash_conv_mixed_steps(
+    pre_state: torch.Tensor,
+    conv_in: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Depthwise causal-conv outputs for a DFlash verify block without state mutation."""
+    history = torch.cat([pre_state, conv_in.transpose(0, 1).to(pre_state.dtype)], dim=-1)
+    kernel = weight.shape[-1]
+    windows = torch.stack(
+        [history[:, i : i + kernel] for i in range(conv_in.shape[0])],
+        dim=0,
+    )
+    mixed = (windows * weight.to(windows.dtype).unsqueeze(0)).sum(dim=-1)
+    return F.silu(mixed).to(conv_in.dtype)
+
+
 class _DepthwiseConv1d(BaseOP):
     """Holds the depthwise conv weight ``[conv_dim, 1, K]`` (key ``conv1d.weight``)."""
 
@@ -172,20 +202,37 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        dflash_conv_buffer = getattr(fla, "dflash_conv_states_buffer", None)
+        if batch.is_decode or dflash_conv_buffer is not None:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            if dflash_conv_buffer is not None:
+                slot = fla.cache_indices[:1].to(torch.long)
+                pre_conv_state = pool.conv_states[li].index_select(0, slot)[0]
+                dflash_conv_buffer[:, li].copy_(
+                    _dflash_conv_state_steps(pre_conv_state, conv_in)
+                )
+                mixed = _dflash_conv_mixed_steps(pre_conv_state, conv_in, self._conv_weight())
+            else:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+            recurrent_indices = getattr(fla, "dflash_recurrent_state_indices", None)
             core_out = gdn_decode_fla(
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                disable_state_update=getattr(fla, "dflash_disable_state_update", False),
+                intermediate_states_buffer=getattr(fla, "dflash_recurrent_states_buffer", None),
+                intermediate_state_indices=(
+                    recurrent_indices[li : li + 1]
+                    if recurrent_indices is not None
+                    else None
+                ),
             )
         else:
             mixed = self._conv_prefill(

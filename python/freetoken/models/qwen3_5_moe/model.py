@@ -79,12 +79,19 @@ class Qwen3_5Model(BaseOP):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, *, return_hidden_layers: set[int] | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        hidden_states: list[torch.Tensor] | None = [] if return_hidden_layers else None
+        for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if hidden_states is not None and i in return_hidden_layers:
+                hidden_states.append(x)
         x, _ = self.norm.forward_add_residual(x, residual)
+        if hidden_states is not None:
+            return x, hidden_states
         return x
 
 
@@ -109,8 +116,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
-    def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+    def forward(self, *, return_hidden_layers: set[int] | None = None) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        output = self.model.forward(get_global_ctx().batch.input_ids, return_hidden_layers=return_hidden_layers)
+        if isinstance(output, tuple):
+            hidden, hidden_states = output
+            return self.lm_head.forward(hidden), hidden_states
         return self.lm_head.forward(output)
 
 

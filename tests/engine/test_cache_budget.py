@@ -232,6 +232,49 @@ def test_adjust_config_resolves_num_tokens_generic():
     assert cfg.num_page_override == 5000
 
 
+def test_adjust_config_forces_dflash_single_request_runtime():
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import _adjust_config
+
+    model_config = SimpleNamespace(
+        single_stream_only=False, is_moe=False, expert_quant="none",
+        has_swa_attention=False, has_linear_attention=False,
+    )
+
+    class Cfg:
+        speculative_algorithm = "dflash"
+        speculative_draft_model_path = "/tmp/draft"
+        tp_info = SimpleNamespace(size=1)
+        moe_cache_auto = False
+        moe_cache_size = 0
+        moe_cache_rate = None
+        moe_backend = "auto"
+        max_running_req = 4
+        cuda_graph_max_bs = 4
+        cuda_graph_bs = [1, 2, 4]
+        max_seq_len = 1024
+        page_size = 1
+        attention_backend = "fi"
+        nvfp4_backend = "auto"
+        num_page_override = None
+        num_token_override = None
+
+        @property
+        def model_config(self):
+            return model_config
+
+    cfg = Cfg()
+    _adjust_config(cfg)
+
+    assert cfg.max_running_req == 1
+    assert cfg.cuda_graph_bs == [1]
+    assert cfg.cuda_graph_max_bs == 1
+
+
+
+
+
 def test_mha_kv_cost_simple_full_attention():
     import torch
 
