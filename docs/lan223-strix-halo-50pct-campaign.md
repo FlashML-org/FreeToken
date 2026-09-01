@@ -331,3 +331,39 @@ passed all three deterministic Qwen API controls.
 the end-to-end Q4 workload.  The extra per-lane work does not repay its
 occupancy and register cost on gfx1151.  Preserve the artifact at
 `qwen35moe-q4-q8vdr4-20260901T104200Z` on LAN-223 and revert the candidate.
+
+### C06: modern MMVQ component replacement investigation
+
+The prior candidates establish that changing local launch dimensions or
+per-lane work ratios in the older vendored GGUF kernels does not produce a
+safe gain on gfx1151.  LAN-223 reports a 32-lane HIP warp, so the existing
+32-thread logical reduction is not accidentally running at half its physical
+wave width.
+
+Current llama.cpp has evolved from the older MMVQ donor used here into an
+architecture-aware implementation.  It selects launch geometry by GPU family,
+uses a newer parameter table, and has a dedicated routed-expert vector path.
+The relevant upstream components are `ggml-cuda/mmvq.cu` and `vecdotq.cuh` in
+the current llama.cpp tree.  FreeToken's GGUF extension has a narrower PyTorch
+binding and different packed-bank interface, so copying the file wholesale
+would be unsafe.
+
+The next component lane is therefore a selective port with these gates:
+
+1. Extract only the Q4_K, Q5_K, Q6_K, and Q8_0 vector-dot helpers plus the
+   routed-expert launch geometry needed by the exact Qwen model.
+2. Preserve FreeToken's existing packed `[expert, row, row_bytes]` bank and
+   `topk_ids` interface.  Do not change quantization, routing, model files, or
+   sampling behavior.
+3. Add a model-shape microbenchmark using the actual 512-to-2,048 Q4_K gate/up
+   projections, 2,048-to-512 Q5_K down projection, and Q8_0 dense shapes.
+4. Compare candidate tensors to the accepted kernel before API startup, then
+   run the deterministic API suite.  Any mismatch is an immediate rejection.
+5. Use the full fixed API workload, tail-latency telemetry, long-context,
+   multi-turn, and recovery gates before accepting a candidate.
+
+This is the remaining software-only path with credible headroom.  The evidence
+does not support promising a 50-percent single-user decode gain from it: the
+current accepted FreeToken exact-Q4 result is already within 1.78 percent of
+the matched llama.cpp ROCm control.  Any larger claim requires measured proof,
+not extrapolation from CUDA-oriented paper results.
