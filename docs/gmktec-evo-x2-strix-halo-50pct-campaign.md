@@ -670,3 +670,54 @@ must point at this revision-matched cache and retain JIT disabled.  This avoids
 per-run native kernel compilation without pretending that a cache from a
 different source revision is ABI-safe.  The Q4 model itself is not recompiled
 by this process.
+
+### C23-C25: integrated cache and cache-residency measurements
+
+The repaired upstream cache-copy candidate at source revision `340ed31` passed
+the deterministic three-case Q4 quality suite, multi-turn state controls, and
+fresh-prefix retrieval at 1,556 and 5,656 reported prompt tokens.  Its
+revision-matched reusable HIP cache was loaded with `FREETOKEN_DISABLE_JIT=1`.
+The three-sample warm API matrix measured 47.848 decode tokens/s at memory
+ratio 0.25, 0.23 percent below the accepted 47.960-token/s Q4 baseline.
+
+Decode cache telemetry reported 40,800 layer calls with eight active experts
+per layer and a 7.45 percent miss rate.  Raising the cache-residency ratio from
+0.25 to 0.30 increased resolved cache slots from 5,470 to 7,051 but reduced
+the three-sample mean to 47.032 decode tokens/s, 1.94 percent below baseline.
+The 0.30 candidate preserved all three deterministic quality checks; its warm
+TTFT mean was 0.454 s and token-gap p99 was 24.01 ms.
+
+**Decision: reject cache-copy and larger-residency as throughput routes.** The
+copy candidate is safe and quality-preserving, but neither cache transfer nor
+additional resident experts produces a measurable decode gain on this Q4
+workload.  The low remaining miss fraction also makes a 50 percent gain from
+cache sizing implausible.  Preserve `upstream-cache-c23-q4-quality-20260901T204241Z`,
+`upstream-cache-c24-cache-telemetry-20260901T205755Z`, and
+`upstream-cache-c25-r030-20260901T210838Z` on GMKtec EVO-X2.  Each candidate
+was stopped and the normal NVFP4 API recovery controller was started after its
+window.
+
+### C26: single-stream decode graph capture
+
+The existing Q4 launcher deliberately disabled decode graph replay.  A new,
+default-off `CUDA_GRAPH_MAX_BS` launcher parameter makes a bounded graph
+experiment explicit and reproducible without changing the protected normal
+service.  The isolated Q4 candidate captured batch size one successfully,
+consuming approximately 0.25 GiB of additional GPU-visible memory and leaving
+22.81 GiB free after capture.
+
+The first quality attempt was invalid: the harness was given the API root
+instead of the required OpenAI-compatible `/v1` path, so all three requests
+received HTTP 404 before model inference.  No TPS result was collected and the
+candidate must not be classified as a quality or performance failure.  The
+candidate was stopped through its verified dedicated process group, no test
+listener remained, and normal-service recovery was started.
+
+**Decision: graph candidate remains pending.** Re-run the deterministic suite
+and fixed TPS matrix against the corrected `/v1` endpoint after verified normal
+service recovery.  The failed endpoint artifact
+`q4-c26-graph-bs1-20260901T212038Z` remains part of the provenance record as a
+harness-configuration failure.  The candidate startup also rebuilt its
+checkout-local GGUF HIP extension, not the GGUF model.  A later promotion
+requires a revision-matched reusable extension cache and a strict no-JIT
+verification for that checkout.
