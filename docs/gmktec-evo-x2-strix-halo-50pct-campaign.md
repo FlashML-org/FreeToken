@@ -842,3 +842,31 @@ used to rank kernels or justify a code change.  Preserve
 is a documented controller that prewarms the exact isolated cache, runs a
 bounded workload during collection, requests graceful profiler finalization,
 and verifies the resulting database before normal-service recovery.
+
+### C32: finalized warm-cache ROCprof trace
+
+The revised controller prewarmed the exact Q4 server before profiling, waited
+for the scheduler's explicit ready record instead of treating the frontend
+models endpoint as inference-ready, and then ran one bounded 900-token request.
+It produced a finalized 1.44 GiB `rocpd` SQLite database and the normal NVFP4
+API was healthy again after the time-share recovery.  The profiler's own queue
+intercept mode changes runtime behavior, so none of these diagnostic values are
+used as TPS measurements.
+
+The final 30-second active-dispatch window identifies the decode work that must
+be optimized.  The dominant entries were Q8 vector dot at 2,011.326 GPU ms,
+Q4_K routed-expert vector dot at 529.036 GPU ms, Q6_K vector dot at 474.200
+GPU ms, and Q5_K routed-expert vector dot at 395.507 GPU ms.  The next largest
+non-vector components were attention GEMM at 232.153 GPU ms, delta-rule fused
+gating at 173.428 GPU ms, grouped decode stage one at 82.297 GPU ms, and cache
+index copying at 74.211 GPU ms.  The trace recorded no memory-copy events in
+this final window.
+
+**Decision: prioritize the traced GGUF vector-dot path.** The existing cache
+residency and graph experiments cannot plausibly deliver the campaign target by
+themselves.  Future candidates must preserve the qualified Q4 output checks,
+change one vector-kernel dispatch or arithmetic behavior at a time, and pass
+two independent throughput matrices before promotion.  Preserve
+`q4-c32-rocprof-controller-ready-20260901T225400Z`, including the raw SQLite
+database, workload response, controller logs, and normal-service recovery
+evidence.
