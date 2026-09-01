@@ -311,3 +311,23 @@ address did not offset the extra live accumulator and register pressure.  The
 result is below baseline and below the one-percent acceptance floor.  Preserve
 the artifact at `qwen35moe-q4-k2row-20260901T093500Z` on LAN-223 and revert the
 candidate source.
+
+### C05: wider HIP Q8_0 vector-dot ratio
+
+The representative trace ranked Q8_0 vector matrix multiply as the largest
+single kernel family.  This HIP-only candidate changed its vector-dot ratio
+from two to four, which the Q8 dot helper supports directly, while retaining
+the CUDA two-group behavior.  Clean worktree `dea5d6f` built successfully and
+passed all three deterministic Qwen API controls.
+
+| Measure | Stable baseline | C05 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Mean decode TPS | 47.960 | 47.546 | -0.86% |
+| Median decode TPS | 48.075 | 47.585 | -1.02% |
+| p99 token gap | 0.02490 s | 0.02606 s | diagnostic only |
+| Quality controls | 3/3 pass | 3/3 pass | unchanged |
+
+**Decision: rejected.** The wider Q8 work ratio is numerically safe but slows
+the end-to-end Q4 workload.  The extra per-lane work does not repay its
+occupancy and register cost on gfx1151.  Preserve the artifact at
+`qwen35moe-q4-q8vdr4-20260901T104200Z` on LAN-223 and revert the candidate.
