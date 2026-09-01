@@ -47,7 +47,7 @@ def parse_gguf_config(shim:GgufConfigShim) -> ModelConfig:
         rotary_config = RotaryConfig(                      
             head_dim = gguf_metadata_llama.get(f"{arch}.rope.dimension_count",head_dim)   ,                           
             rotary_dim = gguf_metadata_llama.get(f"{arch}.rope.dimension_count",head_dim)   ,      #identical to head_dim                
-            max_position = gguf_metadata_llama.get(f"{arch}.context_length"),                                      
+            max_position = min(gguf_metadata_llama.get(f"{arch}.context_length", 8192), 8192),                                      
             base = gguf_metadata_llama.get(f"{arch}.rope.freq_base"),                                           
             scaling = None                                 
         ),      
@@ -61,6 +61,7 @@ def parse_gguf_config(shim:GgufConfigShim) -> ModelConfig:
         moe_intermediate_size = gguf_metadata_llama.get(f"{arch}.expert_feed_forward_length",dense_ffn_size),                       
         
         moe_weight_format = "q4_0", #4bit symmetric    
+        moe_enabled = expert_count > 1,
         
         shared_expert_intermediate_size= dense_ffn_size if expert_count> 1 else 0 
          
@@ -97,6 +98,12 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         
+        is_moe_expert = "exps.weight" in name
+        if is_moe_expert and not include_moe_experts:
+            continue
+        if not is_moe_expert and not include_non_moe:
+            continue
+            
         # Global Standalone Tensors
         if name == "token_embd.weight":
             yield "model.embed_tokens.qweight", t.packed()
@@ -219,7 +226,7 @@ def convert_llama_to_gguf(model, config:ModelConfig) -> None:
         embed_scale=None
     )
     
-    for layer in inner_model.layers:                 
+    for layer in inner_model.layers.op_list:                 
         swap_linear(layer.self_attn, "qkv_proj")     
         swap_linear(layer.self_attn, "o_proj")       
         
