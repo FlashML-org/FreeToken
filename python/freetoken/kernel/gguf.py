@@ -20,6 +20,10 @@ import shutil
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+# This optional switch selects only the output-row grouping of the vendored
+# GGUF MMV kernels.  It is intentionally limited to the two reviewed values
+# below because arbitrary workgroup shapes require separate kernel review.
+_HIP_GGUF_MMV_Y_ENV = "FREETOKEN_GGUF_MMV_Y"
 
 
 def _hip_target_arch() -> str | None:
@@ -51,7 +55,15 @@ def _hip_gguf_cflags() -> list[str]:
     target = _hip_target_arch()
     if target and not os.environ.get("PYTORCH_ROCM_ARCH"):
         os.environ["PYTORCH_ROCM_ARCH"] = target
-    return ["-O3"]
+    # Default to the established one-row configuration.  A two-row candidate
+    # is permitted only for a separately recorded build and must pass model
+    # quality gates before it can affect any serving configuration.
+    mmv_y = os.environ.get(_HIP_GGUF_MMV_Y_ENV, "1").strip()
+    if mmv_y not in {"1", "2"}:
+        raise RuntimeError(
+            f"{_HIP_GGUF_MMV_Y_ENV} must be 1 or 2, got {mmv_y!r}"
+        )
+    return ["-O3", f"-DGGML_CUDA_MMV_Y={mmv_y}"]
 
 
 def _hip_thrust_include() -> str | None:
