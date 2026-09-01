@@ -78,6 +78,9 @@ def enable_pynccl_distributed(
     """
     if tp_info.size == 1:
         return
+    from freetoken.distributed.collectives import require_pynccl_allowed
+
+    require_pynccl_allowed()
     from freetoken.kernel import init_pynccl
 
     comm = init_pynccl(

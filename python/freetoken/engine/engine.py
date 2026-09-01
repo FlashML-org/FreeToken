@@ -3,13 +3,12 @@ from __future__ import annotations
 import gc
 import math
 import os
-from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import destroy_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
@@ -352,6 +351,15 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        if config.tp_info.size > 1:
+            from freetoken.moe.host_banks import prepare_shared_banks
+
+            share_dir = prepare_shared_banks(port=getattr(config, "server_port", 1919))
+            if share_dir:
+                logger.info_rank0(
+                    f"TP={config.tp_info.size}: shared expert banks at {share_dir} "
+                    f"(one ~137 GiB DSV4 pool across ranks; set FREETOKEN_BANK_SHARE=0 to disable)"
+                )
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
@@ -471,31 +479,9 @@ class Engine:
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.group.WORLD
-            assert tp_cpu_group is not None
-            max_bytes = (
-                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
-            )
-            enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
-        else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
-            assert tp_cpu_group is not None
-        return tp_cpu_group
+        from freetoken.distributed.collectives import init_tp_process_group
+
+        return init_tp_process_group(config, dtype=self.dtype)
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()

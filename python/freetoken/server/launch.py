@@ -142,6 +142,22 @@ def launch_server(
     )
     logger = init_logger(__name__, "initializer")
 
+    # Hide the Granite Ridge iGPU before workers inherit the env so --gpu 0,1
+    # names the two discrete cards (visible ordinals after hide).
+    from freetoken.runtime.gpu import apply_amd_runtime_env, is_hip
+
+    apply_amd_runtime_env()
+    if is_hip() and server_args.tp_info.size > 1:
+        from freetoken.distributed.collectives import describe_hip_tp_plan, hip_tp_missing
+
+        logger.info(describe_hip_tp_plan(server_args.tp_info.size))
+        missing = hip_tp_missing(server_args.tp_info.size)
+        if missing:
+            raise SystemExit(
+                "HIP tensor parallel cannot start:\n"
+                + "\n".join(f"  - {item}" for item in missing)
+            )
+
     if server_args.gpu:
         # resolve here so a typo is one clear error before any worker spawns
         from freetoken.gpu_select import resolve_gpu_uuids

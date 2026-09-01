@@ -252,6 +252,42 @@ def usable_visible_indices() -> list[int]:
     return [d["index"] for d in list_usable_devices() if not d["hidden_igpu"]]
 
 
+def discrete_tp_devices(devices: list[dict] | None = None) -> list[dict]:
+    """Devices TP ranks bind to after iGPU hide.
+
+    On 2× R9700 + 9950X this is the two discrete cards, never Granite Ridge
+    ``gfx1036``, unless ``FREETOKEN_INCLUDE_IGPU=1``.
+    """
+    if devices is None:
+        devices = hip_enumerate_devices() or list_usable_devices()
+    if include_igpu():
+        return list(devices)
+    out: list[dict] = []
+    for d in devices:
+        hidden = d.get("hidden_igpu")
+        if hidden is None:
+            hidden = is_igpu(
+                name=str(d.get("name") or ""),
+                arch=d.get("arch"),
+                total_bytes=d.get("total_bytes"),
+            )
+        if not hidden:
+            out.append(d)
+    return out
+
+
+def tp_rank_devices(tp_size: int, devices: list[dict] | None = None) -> list[dict]:
+    """First ``tp_size`` discrete GPUs in rank order. Raises if too few remain."""
+    visible = discrete_tp_devices(devices)
+    if len(visible) < tp_size:
+        names = ", ".join(str(d.get("name") or "?") for d in visible) or "none"
+        raise RuntimeError(
+            f"TP={tp_size} needs {tp_size} discrete GPUs after hiding the iGPU; "
+            f"have {len(visible)} ({names}). Run `ft gpu`."
+        )
+    return visible[:tp_size]
+
+
 def default_visible_ordinal() -> int:
     """First non-hidden device, or 0 if nothing is listed."""
     usable = usable_visible_indices()
@@ -413,10 +449,17 @@ def describe() -> str:
         lines.append("devices: (none visible — no AMD GPU in this process)")
     for d in devs:
         flag = " [hidden iGPU]" if d["hidden_igpu"] else ""
-        gib = d["total_bytes"] / (1 << 30)
+        gib = (d["total_bytes"] or 0) / (1 << 30)
+        mem = f"{gib:.1f} GiB" if d["total_bytes"] else "-"
         lines.append(
             f"  gpu{d['index']}: {d['name']} arch={d['arch'] or '-'} "
-            f"{gib:.1f} GiB{flag}"
+            f"{mem}{flag}"
+        )
+    if is_hip():
+        ranks = discrete_tp_devices()
+        lines.append(
+            f"tp_discrete: {len(ranks)} "
+            f"({', '.join(str(d.get('name') or '?') for d in ranks) or 'none'})"
         )
     lines.append("zluda: unsupported (native HIP only; FlashML-org/FreeToken#60)")
     return "\n".join(lines)

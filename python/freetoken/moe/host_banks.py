@@ -71,27 +71,117 @@ def born_pinned_default() -> bool:
     return False
 
 
+def resolve_bank_share_dir() -> str | None:
+    """Directory for file-backed shared expert banks, or None (anonymous mmap).
+
+    TP>1 on ~192 GB RAM cannot afford two copies of the ~137 GiB DSV4 pool.
+    ``FREETOKEN_BANK_SHARE=0`` disables sharing. ``FREETOKEN_BANK_SHARE_DIR``
+    selects the directory; :func:`prepare_shared_banks` sets a default.
+    """
+    if os.environ.get("FREETOKEN_BANK_SHARE", "").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    raw = os.environ.get("FREETOKEN_BANK_SHARE_DIR", "").strip()
+    if raw:
+        return raw
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    if tp is not None and tp.size > 1:
+        port = os.environ.get("FREETOKEN_BANK_SHARE_PORT", "1919")
+        return f"/tmp/freetoken-banks-{port}"
+    return None
+
+
+def prepare_shared_banks(*, port: int) -> str | None:
+    """Set ``FREETOKEN_BANK_SHARE_DIR`` for TP>1 so all ranks map one pool."""
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    if tp is None or tp.size <= 1:
+        return None
+    if os.environ.get("FREETOKEN_BANK_SHARE", "").strip().lower() in ("0", "false", "no", "off"):
+        logger.warning(
+            "FREETOKEN_BANK_SHARE=0: each TP rank allocates its own expert banks "
+            "(~137 GiB × ranks). Dual-card DSV4 on ~192 GB RAM will likely OOM."
+        )
+        return None
+    if not os.environ.get("FREETOKEN_BANK_SHARE_DIR"):
+        os.environ["FREETOKEN_BANK_SHARE_DIR"] = f"/tmp/freetoken-banks-{port}"
+    d = os.environ["FREETOKEN_BANK_SHARE_DIR"]
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _share_create_rank() -> bool:
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    return tp is None or tp.rank == 0
+
+
+def _tp_cpu_barrier() -> None:
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _bank_share_path(share_dir: str, name: str, layer: int | None = None) -> str:
+    fname = f"{name}.bin" if layer is None else f"{name}.L{layer}.bin"
+    return os.path.join(share_dir, fname)
+
+
+def _map_shared_file(path: str, asize: int, *, create: bool) -> mmap.mmap:
+    """File-backed ``MAP_SHARED`` mmap of exactly ``asize`` bytes."""
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o600)
+    try:
+        if create:
+            os.ftruncate(fd, asize)
+        else:
+            st = os.fstat(fd)
+            if st.st_size < asize:
+                raise RuntimeError(
+                    f"shared bank {path} is {st.st_size} bytes, need {asize} "
+                    f"(rank 0 must create the file first; check FREETOKEN_BANK_SHARE_DIR)"
+                )
+        return mmap.mmap(fd, asize)
+    finally:
+        os.close(fd)
+
+
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
+    * file-backed mmap (``share_path``) -- ``MAP_SHARED`` so TP ranks map one expert
+      pool. Rank 0 creates (``create=True``); other ranks open after a barrier.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_share_path")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None,
+                 share_path: str | os.PathLike[str] | None = None,
+                 create: bool = True):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
         assert backing in ("mmap", "cuda"), backing
+        if share_path is not None and backing == "cuda":
+            raise ValueError("shared host banks require mmap backing, not cudaHostAlloc")
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
+        self._share_path = None if share_path is None else str(share_path)
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -105,7 +195,10 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            if self._share_path is not None:
+                self._buf = _map_shared_file(self._share_path, asize, create=create)
+            else:
+                self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -122,6 +215,12 @@ class HostBank:
 
     def memoryview(self) -> memoryview:
         return memoryview(self._buf)
+
+    def flush(self) -> None:
+        """Push file-backed shared pages to the inode (tests / rank handoff)."""
+        buf = self._buf
+        if hasattr(buf, "flush"):
+            buf.flush()
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
@@ -199,7 +298,25 @@ def _os_lock(addr: int, nbytes: int) -> None:
 
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
-    return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
+    share_dir = resolve_bank_share_dir()
+    if not share_dir:
+        return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
+    os.makedirs(share_dir, exist_ok=True)
+    create = _share_create_rank()
+    out: dict[str, HostBank] | None = None
+    if create:
+        out = {
+            name: HostBank(shape, dtype, share_path=_bank_share_path(share_dir, name), create=True)
+            for name, (shape, dtype) in specs.items()
+        }
+    _tp_cpu_barrier()
+    if not create:
+        out = {
+            name: HostBank(shape, dtype, share_path=_bank_share_path(share_dir, name), create=False)
+            for name, (shape, dtype) in specs.items()
+        }
+    assert out is not None
+    return out
 
 
 def alloc_layer_banks(
@@ -207,11 +324,47 @@ def alloc_layer_banks(
 ) -> dict[str, list[HostBank]]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
-    ``HostBank`` per layer per name."""
-    return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
-        for name, (shape, dtype) in specs.items()
-    }
+    ``HostBank`` per layer per name.
+
+    When ``FREETOKEN_BANK_SHARE_DIR`` is set (TP>1 default), files are
+    ``MAP_SHARED`` so ranks do not each hold a full ~137 GiB anonymous pool.
+    """
+    share_dir = resolve_bank_share_dir()
+    if not share_dir:
+        return {
+            name: [HostBank(shape, dtype) for _ in range(num_layers)]
+            for name, (shape, dtype) in specs.items()
+        }
+    os.makedirs(share_dir, exist_ok=True)
+    create = _share_create_rank()
+    out: dict[str, list[HostBank]] | None = None
+    if create:
+        out = {
+            name: [
+                HostBank(
+                    shape, dtype,
+                    share_path=_bank_share_path(share_dir, name, layer),
+                    create=True,
+                )
+                for layer in range(num_layers)
+            ]
+            for name, (shape, dtype) in specs.items()
+        }
+    _tp_cpu_barrier()
+    if not create:
+        out = {
+            name: [
+                HostBank(
+                    shape, dtype,
+                    share_path=_bank_share_path(share_dir, name, layer),
+                    create=False,
+                )
+                for layer in range(num_layers)
+            ]
+            for name, (shape, dtype) in specs.items()
+        }
+    assert out is not None
+    return out
 
 
 class _ResidencyPlan:
@@ -480,7 +633,9 @@ __all__ = [
     "alloc_layer_banks",
     "born_pinned_default",
     "pin_banks",
+    "prepare_shared_banks",
     "read_file_into",
     "read_range_into",
     "requested_residency",
+    "resolve_bank_share_dir",
 ]

@@ -77,6 +77,21 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
+def infer_tensor_parallel_size(gpu: tuple[str, ...], tensor_parallel_size: int) -> int:
+    """``--gpu 0,1`` with default ``--tp-size 1`` means TP=2.
+
+    An explicit ``--tp-size`` must still match the ``--gpu`` list length.
+    """
+    if gpu and len(gpu) > 1 and tensor_parallel_size == 1:
+        return len(gpu)
+    if gpu and len(gpu) not in (0, tensor_parallel_size):
+        raise ValueError(
+            f"--gpu has {len(gpu)} entries but --tensor-parallel-size is "
+            f"{tensor_parallel_size}; give one entry per TP rank"
+        )
+    return tensor_parallel_size
+
+
 def parse_args(
     args: List[str],
     run_shell: bool = False,
@@ -239,8 +254,10 @@ def parse_args(
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
         help=(
-            "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a GPU "
-            "UUID (GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index"
+            "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a "
+            "UUID (GPU-xxxx...) or a visible index from `ft gpu` / `rocm-smi` / "
+            "`nvidia-smi -L`. A list longer than 1 with default --tp-size 1 sets TP to "
+            "that length (e.g. --gpu 0,1). On AMD, indices are after iGPU hide."
         ),
     )
 
@@ -289,7 +306,10 @@ def parse_args(
         "--disable-pynccl",
         action="store_false",
         dest="use_pynccl",
-        help="Disable PyNCCL for tensor parallelism.",
+        help=(
+            "Disable PyNCCL for tensor parallelism (NVIDIA NCCL 2.27 path). "
+            "HIP never loads PyNCCL; AMD TP uses torch.distributed RCCL."
+        ),
     )
 
     parser.add_argument(
@@ -634,14 +654,12 @@ def parse_args(
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
-    # reject a too-long list here with a clear reason, not as a dead rank later
-    if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
-        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
-        parser.error(
-            f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
-            f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+    try:
+        kwargs["tensor_parallel_size"] = infer_tensor_parallel_size(
+            kwargs["gpu"], kwargs["tensor_parallel_size"]
         )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

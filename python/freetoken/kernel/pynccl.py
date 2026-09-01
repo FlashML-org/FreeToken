@@ -27,6 +27,9 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
+    from freetoken.distributed.collectives import require_pynccl_allowed
+
+    require_pynccl_allowed()
     return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
 
 

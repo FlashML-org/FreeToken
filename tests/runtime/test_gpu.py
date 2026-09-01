@@ -99,6 +99,15 @@ def test_apply_hides_igpu_from_visible_devices(monkeypatch):
     written = gpu.apply_amd_runtime_env()
     assert written["HIP_VISIBLE_DEVICES"] == "1,2"
     assert written["CUDA_VISIBLE_DEVICES"] == "1,2"
+    ranks = gpu.tp_rank_devices(
+        2,
+        [
+            {"index": 0, "name": "AMD Radeon Graphics", "arch": "gfx1036", "hidden_igpu": True},
+            {"index": 1, "name": "R9700", "arch": "gfx1201", "hidden_igpu": False},
+            {"index": 2, "name": "R9700", "arch": "gfx1201", "hidden_igpu": False},
+        ],
+    )
+    assert [d["index"] for d in ranks] == [1, 2]
 
 
 def test_graph_replay_unsafe_on_gfx1201(monkeypatch):
