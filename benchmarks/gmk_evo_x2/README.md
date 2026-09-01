@@ -41,3 +41,7 @@ excluded.
 Quality and fixed-length throughput are intentionally separate modes. The
 harness is not a paper replication until the exact published prompt, sampling,
 cache state, and statistic are supplied in the protocol artifact.
+Each passed sample records both decode TPS and `client_prefill_tps`.  The latter
+is prompt tokens divided by warm TTFT, so it represents the client-visible
+request-to-first-text boundary.  It is intentionally reported separately from
+any server log's internal input-throughput line, whose timing boundary differs.

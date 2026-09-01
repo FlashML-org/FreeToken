@@ -66,6 +66,22 @@ def numeric_summary(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def client_prefill_tps(prompt_tokens: int | None, warm_ttft_seconds: float | None) -> float | None:
+    """Return client-observed prompt tokens per second through the first text token.
+
+    This is deliberately an end-to-end prefill metric: it includes request
+    transport, queueing, tokenization, prefix-cache lookup, scheduling, and
+    model prefill until the first visible text token.  It is not interchangeable
+    with a server-internal input-throughput log line, which can begin and end at
+    different boundaries.  ``None`` preserves a missing usage report or an
+    absent first text token rather than manufacturing a rate.
+    """
+
+    if not isinstance(prompt_tokens, int) or warm_ttft_seconds is None or warm_ttft_seconds <= 0:
+        return None
+    return prompt_tokens / warm_ttft_seconds
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse explicit inputs so every performance-affecting choice is recorded."""
 
@@ -229,7 +245,10 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
     if generated_tokens > 1 and decode_seconds is not None and decode_seconds > 0:
         decode_tps = (generated_tokens - 1) / decode_seconds
     prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
-    input_tps = prompt_tokens / first_offset if isinstance(prompt_tokens, int) and first_offset else None
+    # Compute the client-visible prefill rate from the server-reported prompt
+    # token count and the same first-text timestamp used for warm TTFT.
+    # ``input_tps`` remains as a compatibility alias for older artifact readers.
+    observed_prefill_tps = client_prefill_tps(prompt_tokens, first_offset)
     if args.mode == "quality" and args.expected_text and text.strip() != args.expected_text:
         protocol_errors.append(
             f"quality canary mismatch: expected {args.expected_text!r}, got {text.strip()!r}"
@@ -263,7 +282,8 @@ def make_sample_artifact(args: argparse.Namespace, tokenizer: Any, sample_index:
             "warm_ttft_seconds": first_offset,
             "decode_seconds": decode_seconds,
             "decode_tps": decode_tps,
-            "input_tps": input_tps,
+            "client_prefill_tps": observed_prefill_tps,
+            "input_tps": observed_prefill_tps,
             "token_gap_seconds": token_gaps,
             "token_gap_summary_seconds": numeric_summary(token_gaps),
         },
@@ -321,6 +341,11 @@ def main(argv: list[str] | None = None) -> int:
         for sample in samples
         if sample["status"] == "passed" and sample["timing"]["warm_ttft_seconds"] is not None
     ]
+    successful_prefill_tps = [
+        sample["timing"]["client_prefill_tps"]
+        for sample in samples
+        if sample["status"] == "passed" and sample["timing"]["client_prefill_tps"] is not None
+    ]
     successful_gaps = [
         gap
         for sample in samples
@@ -332,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         "successful_samples": len(successful_tps),
         "requested_samples": args.samples,
         "decode_tps": {"samples": successful_tps, **numeric_summary(successful_tps)},
+        "client_prefill_tps": {"samples": successful_prefill_tps, **numeric_summary(successful_prefill_tps)},
         "warm_ttft_seconds": {"samples": successful_ttft, **numeric_summary(successful_ttft)},
         "token_gap_seconds": {"samples": successful_gaps, **numeric_summary(successful_gaps)},
         "failed_samples": [sample["sample_index"] for sample in samples if sample["status"] != "passed"],

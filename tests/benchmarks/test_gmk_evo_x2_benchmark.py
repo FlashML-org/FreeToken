@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from benchmarks.gmk_evo_x2.run_api_benchmark import (
+    client_prefill_tps,
     nearest_rank_percentile,
     numeric_summary,
     parse_args,
@@ -79,6 +80,14 @@ class TailMetricTests(unittest.TestCase):
         """A one-token answer must not fabricate token-gap tail statistics."""
 
         self.assertTrue(all(value is None for value in numeric_summary([]).values()))
+
+    def test_client_prefill_rate_uses_prompt_tokens_and_first_text_time(self) -> None:
+        """The reported prefill rate has the documented client-visible boundary."""
+
+        self.assertEqual(client_prefill_tps(120, 0.5), 240.0)
+        self.assertIsNone(client_prefill_tps(None, 0.5))
+        self.assertIsNone(client_prefill_tps(120, None))
+        self.assertIsNone(client_prefill_tps(120, 0.0))
 
 
 class QualitySuiteCheckTests(unittest.TestCase):

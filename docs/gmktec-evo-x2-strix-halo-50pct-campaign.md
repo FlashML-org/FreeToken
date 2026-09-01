@@ -769,3 +769,34 @@ diagnostic control.  Preserve `q4-c28-mmv-y2-20260901T214526Z` on GMKtec
 EVO-X2.  The candidate was stopped through its verified process group, its
 loopback ports were confirmed clear, and normal NVFP4 service recovery was
 started.
+
+### C29: llama.cpp RDNA4 eight-wave MMVQ policy screen
+
+The current llama.cpp ROCm implementation selects eight independent Wave32
+rows for simple one-vector MMVQ formats on RDNA4, including Q4_K, Q5_K, Q6_K,
+and Q8_0.  FreeToken's vendored Q4_K vector-dot arithmetic is otherwise the
+same as the reference implementation, so this candidate changed only the
+HIP-only launch geometry for those traced kernel families.  The default
+one-row launch remains unchanged.  The candidate required the explicit
+`FREETOKEN_GGUF_MMV_Y=8` build setting and compiled into its own revisioned
+extension-cache directory with `-DGGML_CUDA_MMV_Y=8` for `gfx1151`.
+
+The candidate source revision `05751ef` passed all three host-side validation
+tests, then passed the deterministic Q4 API controls: exact canary, arithmetic,
+and JSON schema.  The first quality request included HIP extension compilation
+and is retained as startup evidence only.  It was excluded from steady-state
+throughput.  The subsequent warm fixed scheduler matrix produced 48.374,
+48.103, and 48.357 decode tokens/s, for a 48.278 mean and 48.357 median.
+That is a 0.66 percent mean increase over the accepted 47.960-token/s
+baseline, below the campaign's one-percent promotion floor.  Warm TTFT averaged
+0.425 s and token-gap p99 was 24.91 ms.
+
+**Decision: reject the eight-wave MMVQ policy for promotion.** It preserves the
+screened output quality and is modestly faster in this one matrix, but the
+measured increase is too small to distinguish safely from host variation and
+does not meet the repeatable-gain requirement.  Do not merge the candidate
+branch or change the default.  Preserve `q4-c29-rdna4-mmvq8-20260901T215745Z`
+on GMKtec EVO-X2, including raw quality, per-token timing, HIP build, and
+recovery evidence.  The isolated process was stopped; a stale executable bit
+on the normal recovery start helper was corrected before normal-service
+recovery was launched.
