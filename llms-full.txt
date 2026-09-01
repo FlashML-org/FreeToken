@@ -1,0 +1,433 @@
+# FreeToken — Full Documentation
+
+> Concatenated llms-full.txt for AI agent ingestion. Canonical index: https://freetokens.custas.info/llms.txt
+
+This file concatenates the curated documentation linked from llms.txt. It is intended for single-fetch ingestion by Claude Code, Cursor, Copilot, and similar tools. For incremental fetches, use llms.txt.
+
+---
+
+# README — Project Overview
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-light.svg">
+    <img alt="FreeToken" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo.svg" width=65%>
+  </picture>
+</div>
+
+<p align="center">
+| <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/xzwSnMdsX"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png"><b>Community WeChat</b></a> |
+</p>
+
+
+Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
+
+## About
+
+FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
+
+- **Fast Edge-Native Runtime**: Provides efficient MoE serving with bandwidth-adaptive CPU–GPU co-execution ($q^\star$ policy), full-layer double-buffered prefill streaming, global LRU expert caching, graph-compatible execution, and the FTW fast weight format.  
+- **Semantic-Aware Caching**: Features semantic anchor checkpoints for recurrent state and KV caches, allowing agentic context edits (e.g., tool calls, thinking blocks) to avoid redundant context recomputation.  
+- **Elastic Memory Management**: Supports dynamic, runtime VRAM re-allocation between expert caches and KV memory without engine restarts or weight reloading.  
+- **Broad MoE & Ecosystem Support**: Supports frontier open-weight MoE models (e.g., DeepSeek-V4-Flash, Qwen3.6-35B-A3B, GLM-5.2) across various parameter scales and quantization formats (e.g., MXFP4, NVFP4, FP8, BF16), with Anthropic/OpenAI-compatible APIs for seamless integration with real-world coding and tool-calling agents (e.g., Codex, Claude Code, OpenCode, OpenClaw, DeepSeek Harness). 
+- **Diverse Consumer Hardware**: Scales across consumer laptops, gaming desktops, and workstation GPUs, with native support for NVIDIA RTX 30, RTX 40, and RTX 50 series GPUs.  
+
+## Getting Started
+
+### Desktop app
+
+Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
+
+<div align="center">
+  <img alt="FreeToken Desktop" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/desktop-console.png" width=92%>
+</div>
+
+### CLI
+
+Install FreeToken with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
+
+```bash
+uv pip install "freetoken[accel]"
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
+uv venv && source .venv/bin/activate
+uv pip install -e ".[accel]"
+```
+
+For More details:
+
+- [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
+- [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
+- [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
+- [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
+
+## Citation
+
+If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
+
+```bibtex
+@article{yang2026freetoken,
+  title={FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution},
+  author={Yang, Shuo and Fan, Xiaoze and Pan, Melissa and Xi, Haocheng and Wang, Zhe and Sun, Shanlin and Keutzer, Kurt and Han, Song and Zaharia, Matei and Xu, Chenfeng and Stoica, Ion},
+  journal={arXiv preprint arXiv:2608.16157},
+  year={2026}
+}
+```
+
+## Acknowledgment
+
+FreeToken was deeply inspired by [mini-sglang](https://github.com/sgl-project/mini-sglang), and
+learned the design and reused code from the following projects:
+[SGLang](https://github.com/sgl-project/sglang),
+[vLLM](https://github.com/vllm-project/vllm),
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer),
+[flash-linear-attention](https://github.com/fla-org/flash-linear-attention),
+[LightLLM](https://github.com/ModelTC/lightllm) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+## License
+
+[Apache License 2.0](https://github.com/FlashML-org/FreeToken/blob/main/LICENSE).
+
+
+---
+
+# docs/install.md
+
+# Install
+
+## Requirements
+
+- Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
+- Python >= 3.10, with [uv](https://docs.astral.sh/uv/) recommended (plain
+  `pip` + `venv` works too)
+
+## Method 1: Install from PyPI
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install "freetoken[accel]"
+```
+
+CUDA kernels are JIT-compiled on first use, need a CUDA 13 toolkit with `nvcc` on PATH.
+
+## Method 2: Install from source
+
+```bash
+git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
+uv venv && source .venv/bin/activate
+uv pip install -e ".[accel]"
+```
+
+## Verify
+
+```bash
+source .venv/bin/activate
+ft --version
+ft serve --model ~/path/to/Qwen3.6-35B-A3B
+curl http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.6-35B-A3B","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Then head to [quickstart.md](quickstart.md).
+
+
+---
+
+# docs/quickstart.md
+
+# Quick start
+
+Assumes FreeToken is installed — see [install.md](install.md).
+
+## Launch a server
+
+```bash
+ft serve --model ~/models/Qwen3.6-35B-A3B
+```
+
+`--model` also takes a Hugging Face repo id. Everything else — dtype, attention
+and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
+the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
+ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
+
+## Send a request
+
+Check what is being served:
+
+```bash
+curl http://127.0.0.1:1919/v1/models
+```
+
+Then use that id as the `model` field:
+
+```bash
+curl http://127.0.0.1:1919/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.6-35B-A3B",
+    "messages": [{"role": "user", "content": "What is a Mixture-of-Experts model?"}],
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+FreeToken serves the OpenAI API (`/v1/chat/completions`, `/v1/responses`,
+`/v1/models`) and the Anthropic API (`/v1/messages`,
+`/v1/messages/count_tokens`), so a client library for either works by pointing
+its base URL at the server. 
+
+## Chat in the terminal
+
+A simple TUI to interact with the server:
+
+```bash
+ft shell                                    # attach to the server above
+ft shell --model ~/models/Qwen3.6-35B-A3B   # start an engine and chat, one process
+```
+
+`/help` lists the in-shell commands. Attach mode needs no GPU, so it also drives
+a server on another machine (`--server URL`).
+
+## Use a coding agent
+
+```bash
+ft launch claude   # claude / codex / dsh / hermes / openclaw / opencode
+```
+
+Writes that agent's provider config, installs its CLI if missing, and starts it
+against your server. `--dry-run` previews the changes.
+
+
+---
+
+# docs/models.md
+
+# Supported models
+
+FreeToken loads HF safetensors checkpoints directly (plus native GGUF for
+Gemma-4). The checkpoints below are known-good — the prebuilt kernels are tuned
+for them; other checkpoints of the same architectures work too.
+
+| Model | HF checkpoints |
+|---|---|
+| DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
+| GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
+| GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |
+| Qwen3.8-Flash-Next | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8), [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) |
+| Qwen3.6 / Qwen3.5 MoE | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) ([-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)), [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4), [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) ([-FP8](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8)) |
+| Qwen3.8 / Qwen3.6 dense | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) ([-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)), [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) ([-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)), [nvidia/Qwen3.6-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4) |
+| Qwen3-MoE | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
+| gpt-oss | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) |
+| Gemma-4 | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
+| MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
+| Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
+
+## MoE backends
+
+`ft serve --moe-backend {auto,fused,offload,cpu,hybrid}`:
+
+- **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
+- **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
+  misses stream over PCIe.
+- **cpu** — misses are computed on the CPU instead of fetched.
+- **hybrid** — per step, fetches some misses over PCIe and computes the rest on
+  CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
+- **auto** — dense models always resolve to `fused`; MoE models resolve to
+  `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
+  recommends it.
+
+## Notes
+
+- `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
+  FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+- DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
+  authoritative model args are read from there.
+- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Multimodal checkpoints are served text-only.
+
+
+---
+
+# docs/cli.md
+
+# CLI reference
+
+```
+ft <command> [args]
+```
+
+| Command | Purpose |
+|---|---|
+| `ft serve` | Start the API server (OpenAI `/v1/*`, Anthropic `/v1/messages`, Responses) |
+| `ft shell` | Chat with a server in the terminal |
+| `ft ctl` | Query and manage a running server over HTTP |
+| `ft launch` | Configure and launch a coding agent against a server |
+| `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
+| `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
+
+`ft --version` prints the installed version (torch-free; nightly wheels carry a
+`+g<sha>` build stamp, tagged releases a bare version). Every command supports
+`--help`.
+
+## ft serve
+
+```bash
+ft serve --model <path-or-hf-id> [options]
+```
+
+`--model` is the only required flag — dtype, attention backend, MoE backend,
+MoE cache size, KV capacity, CUDA-graph sizes and the tool-call/reasoning
+parsers all resolve automatically from the checkpoint and the GPU.
+
+### Model
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
+| `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
+
+### Server & runtime
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host` | 127.0.0.1 | Bind address |
+| `--port` | 1919 | Bind port |
+| `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--max-running-requests` | 4 | Max concurrently running requests |
+| `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
+| `--max-seq-len-override` | from checkpoint | Max sequence length |
+| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+
+### Choosing a GPU
+
+For example, a machine with an RTX 5090 and an RTX 3060 Ti:
+
+```console
+$ nvidia-smi -L
+GPU 0: NVIDIA GeForce RTX 3060 Ti (UUID: GPU-2f3a9b1c-8d7e-4a05-b6c1-0e5f9a3d7b42)
+GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5)
+```
+
+```bash
+ft serve --model ... --gpu 1             # by nvidia-smi index -- the 5090
+ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefix is enough)
+```
+
+### KV cache & memory
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
+| `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+### MoE offload
+
+See [models.md](models.md#moe-backends) for what each backend does.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
+| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
+| `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
+| `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
+| `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+### API behaviour
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--sampling-defaults` | model | Fill unspecified sampling params from the checkpoint's `generation_config.json` (`none` = framework defaults) |
+| `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
+| `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
+| `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+
+## ft shell
+
+```bash
+ft shell                                    # attach to a running server
+ft shell --model ~/models/Qwen3.6-35B-A3B   # serve + chat in one process
+```
+
+- Attach mode talks to `--server URL` (default `http://127.0.0.1:1919`)
+- `/help` inside the shell lists the commands (`/think`, `/cache`, `/reset`).
+
+## ft ctl
+
+```bash
+ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
+```
+
+| Subcommand | Endpoint | Purpose |
+|---|---|---|
+| `health` | `GET /health` | Server status, model, load progress |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy |
+| `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
+| `cache` | `GET /v1/cache/status` | Cache pool table |
+| `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
+| `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
+
+## ft launch
+
+```bash
+ft launch {claude,codex,dsh,hermes,openclaw,opencode} [options] [-- <agent args>]
+```
+
+Discovers the served model via `/v1/models`, writes the agent's provider
+config, installs the agent CLI if missing, then launches it. Cloud API keys
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
+environment so the agent cannot silently fall back to a paid endpoint.
+
+| Flag | Meaning |
+|---|---|
+| `--server URL` | Server to point the agent at (default `http://127.0.0.1:1919`) |
+| `--dry-run` | Print the planned config changes and command, touch nothing |
+| `-y`, `--yes` | Approve install/config prompts |
+| `--config` | Configure without launching |
+| `--install-only` | Just install the agent CLI (needs no server) |
+| `--force-reinstall` | Re-run the agent installer |
+| `-- <args>` | Forwarded verbatim to the agent |
+
+## ft checkpoint
+
+```bash
+ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--gpu <uuid-or-index>]
+```
+
+Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
+fast-load format; point `ft serve --model` at the output dir. `--moe-backend
+offload` (default) packs experts into offload banks; `--moe-backend triton`
+keeps them dense for resident serving. See the FTW caveats in
+[models.md](models.md#notes).
+
+## ft bench bw
+
+```bash
+ft bench bw                       # once per GPU
+ft bench bw --dtype nvfp4,bf16    # only the formats you serve
+ft bench bw --gpu 1               # a specific GPU (UUID or nvidia-smi index, as for ft serve)
+```
+
+Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes a
+profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then read.
+
+- One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`.
+- Keyed on expert format + GPU, so a profile from other hardware is ignored rather than
+  misapplied. An older single `benchbw.json` still counts if its GPU name matches.
+- What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
+- `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
+  by that factor.
+
+

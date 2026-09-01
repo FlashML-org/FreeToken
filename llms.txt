@@ -1,0 +1,32 @@
+# FreeToken
+
+> Edge-native MoE serving engine for 290B+ frontier open-weight models on consumer GPUs (RTX 30/40/50), with bandwidth-adaptive CPU-GPU co-execution, elastic memory, and OpenAI/Anthropic-compatible APIs.
+
+FreeToken treats heterogeneous edge resources (GPUs, CPUs, host memory) as a unified elastic inference platform. Frontier MoE support (DeepSeek-V4-Flash, Qwen3, GLM-5.2), MXFP4/NVFP4/FP8/BF16 quantization, and seamless integration with Codex, Claude Code, OpenCode, and DeepSeek Harness.
+
+## Documentation
+
+- [Install FreeToken](https://freetokens.custas.info/docs/install): Installation via uv/pip and building from source, system requirements, and desktop app download.
+- [Quick Start](https://freetokens.custas.info/docs/quickstart): Run your first model, serve via ft serve, and chat through the API.
+- [Supported Models](https://freetokens.custas.info/docs/models): Frontier open-weight MoE models, quantization formats, and MoE backend selection.
+- [CLI Reference](https://freetokens.custas.info/docs/cli): Complete ft serve/shell/ctl/launch/checkpoint/bench reference with flags and examples.
+
+## API & SDK
+
+- [OpenAI-Compatible API](https://github.com/FlashML-org/FreeToken#about): /v1/chat/completions and /v1/models on ft serve (port 1919 by default).
+- [Anthropic-Compatible API](https://github.com/FlashML-org/FreeToken#about): /v1/messages and Responses API for tool-calling agents.
+- [GitHub Repository](https://github.com/FlashML-org/FreeToken): Source, issues, and contribution guide.
+
+## Community & Research
+
+- [Paper (arXiv:2608.16157)](https://arxiv.org/abs/2608.16157): FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution.
+- [Desktop App](https://www.flashml.ai/): GUI for Windows/Linux — run models, chat, and tune the engine.
+- [Developer Slack](https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA): FlashML developer workspace.
+- [Discord Community](https://discord.gg/xzwSnMdsX): User community and support.
+
+## Optional
+
+- [Contributing Guide](https://github.com/FlashML-org/FreeToken/blob/main/CONTRIBUTING.md): How to contribute, build, and test.
+- [Security Policy](https://github.com/FlashML-org/FreeToken/blob/main/SECURITY.md): Vulnerability reporting.
+- [Benchmarks](https://github.com/FlashML-org/FreeToken/tree/main/benchmarks): Performance evaluation scripts and results.
+- [Changelog & Releases](https://github.com/FlashML-org/FreeToken/releases): Version history and nightly wheels.

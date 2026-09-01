@@ -1,0 +1,83 @@
+# FreeToken robots.txt - https://freetokens.custas.info
+# Stance: block AI training, allow AI search/user-fetch (maximize citations, opt out of training corpora)
+# Generated 2026-09-01 via seo-ai-optimizer (stance 1)
+
+# Block AI training crawlers (model-training corpora)
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: Meta-ExternalAgent
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: AI2Bot
+Disallow: /
+
+User-agent: Diffbot
+Disallow: /
+
+# Opt out of Google & Apple AI training (search indexing unaffected - control signal only, no crawler)
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+# Allow AI search/index bots (citations in ChatGPT/Perplexity/Claude answers)
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Claude-SearchBot
+Allow: /
+
+User-agent: DuckAssistBot
+Allow: /
+
+User-agent: Amazonbot
+Allow: /
+
+# Allow on-demand/user-triggered fetchers (real-time answers when user asks assistant to fetch)
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: Claude-User
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+User-agent: Meta-ExternalFetcher
+Allow: /
+
+# Standard search crawlers
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: Applebot
+Allow: /
+
+# Default - allow all other crawlers
+User-agent: *
+Allow: /
+
+Sitemap: https://freetokens.custas.info/sitemap.xml
