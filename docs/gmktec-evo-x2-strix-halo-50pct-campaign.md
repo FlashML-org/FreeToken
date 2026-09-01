@@ -789,7 +789,11 @@ throughput.  The subsequent warm fixed scheduler matrix produced 48.374,
 48.103, and 48.357 decode tokens/s, for a 48.278 mean and 48.357 median.
 That is a 0.66 percent mean increase over the accepted 47.960-token/s
 baseline, below the campaign's one-percent promotion floor.  Warm TTFT averaged
-0.425 s and token-gap p99 was 24.91 ms.
+0.425 s and token-gap p99 was 24.91 ms.  The retained per-sample prompt-token
+and TTFT fields also yield a client-visible prefill rate of 2,852.315 prompt
+tokens/s mean, with a 2,846.519 to 2,856.972 range.  This is an end-to-end
+prompt-to-first-text measurement, not the server's narrower internal input
+throughput counter.
 
 **Decision: reject the eight-wave MMVQ policy for promotion.** It preserves the
 screened output quality and is modestly faster in this one matrix, but the
