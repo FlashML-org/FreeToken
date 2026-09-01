@@ -346,7 +346,13 @@ def fused_experts_impl(
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
-        (intermediate_cache3),
+        # The second projection consumes one flattened row for every routed
+        # token.  Present the output with the matching [M * top_k, 1, N]
+        # layout so ``fused_moe_kernel`` advances by one routed row when it
+        # receives ``top_k=1``.  Passing the original [M, top_k, N] view
+        # makes its flattened routing indices use the larger M stride, which
+        # can address past the allocated output buffer on ROCm.
+        intermediate_cache3.view(M * topk_ids.shape[1], 1, w2.shape[1]),
         curr_topk_weights,
         curr_topk_ids,
         sorted_token_ids,
