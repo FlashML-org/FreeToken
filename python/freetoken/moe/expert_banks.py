@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from freetoken.memory import effective_memory_available
 from freetoken.utils import init_logger
 
 from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
@@ -349,16 +350,10 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
     """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
     extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
     i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
-    avail = None
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    avail = int(line.split()[1]) * 1024
-                    break
-    except OSError:
-        pass
+    largest shard. Uses the effective available memory (host ``MemAvailable``, which counts
+    reclaimable cache, clamped by the process's tightest finite cgroup budget) -- the
+    OOM-relevant figure on bare metal and inside a ``--memory``-limited container alike."""
+    avail = effective_memory_available()
     if avail is None:
         return True
     try:  # resolve a hub id to its local cache dir (no-op for a local path) so glob sees the shards
