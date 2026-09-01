@@ -74,6 +74,13 @@ it exceeds 71.940 tokens per second.
 4. Archive a signed baseline manifest, API matrix, quality outputs, and
    telemetry summary before any new candidate starts.
 
+The first long battery may be deliberately concluded after a successful
+six-hour checkpoint when an active optimization window is more valuable than
+additional identical idle-duration coverage.  Such a run is always labelled
+`incomplete_checkpoint`, never reported as a completed 24-hour endurance pass.
+Before the next candidate starts, the controller must stop the Q4 service,
+restore the protected NVFP4 server, and reach a real `serving` health state.
+
 ### Stage 1: make quality difficult to accidentally regress
 
 The existing small exact suite is necessary but insufficient for aggressive
@@ -103,6 +110,14 @@ Collect the following in a dedicated Q4 candidate window:
 
 Rank candidates by end-to-end decode contribution.  Do not optimize a
 microbenchmark only because it looks slow outside the actual server trace.
+
+The trace protocol launches the disposable Q4 process through the
+wheel-compatible ROCm profiler wrapper.  The host profiler cannot safely attach
+to the running PyTorch ROCm wheel on this machine, and raw profiler throughput
+is intentionally excluded from every TPS comparison because trace collection
+is intrusive.  Capture kernel dispatch, HIP runtime, memory-copy, and KFD
+events for one warmed fixed-length decode, then use a read-only database
+aggregate to rank the final active window.
 
 ### Stage 3: run three independent optimization lanes
 
