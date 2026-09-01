@@ -204,3 +204,38 @@ The final report will separate:
 - Stable production-eligible configurations.
 - Experimental configurations that are faster but not yet reliable.
 - The remaining measured bottleneck if the 50 percent target is not reached.
+
+## Experiment log
+
+### C01: two-row HIP GGUF matrix-vector blocks
+
+The first post-checkpoint ROCm trace used the exact Qwen3.6-35B-A3B Q4_K_M
+workload and isolated Q4 server.  Its final 30-second active window ranked the
+GGUF vector kernels, rather than the NVFP4 dense FP8 path, as the primary work:
+
+| Kernel family | Calls | GPU time in traced window |
+| --- | ---: | ---: |
+| Q8_0 vector matrix multiply | 81,600 | 3,660.029 ms |
+| Q4_K routed MoE vector multiply | 20,480 | 3,103.535 ms |
+| Q5_K routed MoE vector multiply | 18,944 | 1,971.720 ms |
+| Q6_K vector matrix multiply | 512 | 920.072 ms |
+| Routed cache gather | 22,016 | 684.485 ms |
+
+The upstream matrix-vector launch used one 32-thread output row per block.
+The candidate grouped two independent rows into a 64-thread HIP block, which
+fills one RDNA wavefront while retaining the same per-row quantization and
+reduction.  It built successfully in clean worktree `218104c`, passed the
+three deterministic Qwen API controls, and completed three fixed-workload API
+samples.
+
+| Measure | Stable baseline | C01 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Mean decode TPS | 47.960 | 48.081 | +0.25% |
+| Median decode TPS | 48.075 | 48.083 | +0.02% |
+| Mean TTFT | 0.453 s | 0.439 s | diagnostic only |
+| Quality controls | 3/3 pass | 3/3 pass | unchanged |
+
+**Decision: rejected.** The candidate is numerically safe in the screened
+controls, but its 0.25 percent gain is below the one percent acceptance floor
+and is within normal run-to-run variation.  The change was reverted in
+`0a1b709`; its complete candidate artifact remains on LAN-223 for comparison.
