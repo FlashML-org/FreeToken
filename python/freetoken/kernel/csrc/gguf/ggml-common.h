@@ -8,7 +8,12 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
+// Keep one output row per workgroup by default.  Isolated ROCm experiments may
+// override this at compile time to compare a second row per workgroup without
+// changing the checked-in production default or silently changing arithmetic.
+#ifndef GGML_CUDA_MMV_Y
 #define GGML_CUDA_MMV_Y 1
+#endif
 
 // Data Structures
 // QK = number of values after dequantization
