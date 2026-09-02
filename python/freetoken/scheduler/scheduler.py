@@ -881,13 +881,12 @@ class Scheduler(SchedulerIOMixin):
     # After FREETOKEN_PROFILE_DECODE_SKIP (default 8) decode forwards, the next <steps>
     # decode forwards run under torch.profiler (CPU+GPU activities); the per-kernel table
     # and a chrome trace land in FREETOKEN_PROFILE_DIR (default /tmp). Diagnostic only.
-    _prof_state: dict = {}
 
     def _decode_profiler(self, batch):
         steps = int(os.environ.get("FREETOKEN_PROFILE_DECODE", "0") or 0)
         if steps <= 0 or batch.is_prefill:
             return None
-        st = self._prof_state
+        st = self.__dict__.setdefault("_prof_state", {})  # per instance, created on first use
         st["seen"] = st.get("seen", 0) + 1
         skip = int(os.environ.get("FREETOKEN_PROFILE_DECODE_SKIP", "8") or 8)
         if st.get("done") or st["seen"] <= skip:
@@ -903,7 +902,7 @@ class Scheduler(SchedulerIOMixin):
         return st["prof"]
 
     def _decode_profiler_finish(self, prof) -> None:
-        st = self._prof_state
+        st = self.__dict__.setdefault("_prof_state", {})
         st["left"] -= 1
         if st["left"] > 0:
             return

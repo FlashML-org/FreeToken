@@ -165,8 +165,9 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spin-barrier degrades badly when oversubscribed), halved when the topology hides
     SMT (:func:`_hidden_smt_cap`). Under TP>1 the physical cores are split into one
     contiguous slice per rank (:func:`_tp_slice`). An explicit count is honored,
-    spreading first across this rank's physical cores, then across the remaining
-    logical CPUs (so distinct hardware threads are used before any core is doubled up).
+    spreading first across this rank's physical cores, then across this rank's slice of
+    the remaining logical CPUs (so distinct hardware threads are used before any core is
+    doubled up, and two ranks never spill onto each other's cores).
     """
     try:
         allowed = sorted(os.sched_getaffinity(0))
@@ -176,8 +177,9 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     if requested and requested > 0:
         n = int(requested)
         reps = _tp_slice(phys)
-        # this rank's physical-core reps first, then the rest of the logical CPUs.
-        order = reps + [c for c in allowed if c not in set(reps)]
+        # this rank's physical-core reps first, then its slice of the other logical CPUs.
+        spill = _tp_slice([c for c in allowed if c not in set(phys)])
+        order = reps + spill
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
@@ -323,7 +325,9 @@ class CpuMoeExecutor:
         # persistent CPU coordinator that polls ready[], runs the slot's task on the
         # pool, and sets done[]. Binary per-step protocol (GPU memops: done=0, ready=1;
         # coordinator: consume ready, run, done=1; GPU waits done>=1 -- the WAIT
-        # immediate is constant, so CUDA-graph replays are safe). err[] is raised by the
+        # immediate is constant, so CUDA-graph replays are safe on CUDA; HIP capture
+        # records neither the memops nor host-function nodes, so the engine forces
+        # eager decode there -- see engine._adjust_config). err[] is raised by the
         # WATCHDOG thread when a ready flag stays unanswered (dead coordinator): it
         # poisons done to unblock the stream and raise_if_unhealthy() turns the step
         # into a loud error instead of silent stale output. Buffers are kept alive on

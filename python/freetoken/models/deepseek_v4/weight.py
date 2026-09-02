@@ -194,6 +194,12 @@ def _alloc_dsfp4_banks(model_path: str, args: DeepseekV4Args, *, persist: bool):
 
     specs = _dsfp4_specs(args)
     L = args.n_layers
+    # The pool key is (checkpoint, shard sizes/mtimes, bank specs, layer count). ds_fp4
+    # banks are written as-loaded whatever the MoE backend (expert_banks._dsfp4_banks never
+    # reads decode_target; the CPU executor and the GPU grouped GEMV both consume the native
+    # rows), so one pool serves offload, hybrid and cpu alike. A format whose host layout
+    # DOES branch on decode_target (nvfp4: native vs marlin/b12x repack) must add it to the
+    # identity before it is wired to a persistent pool.
     pool = PersistentPool.for_checkpoint(model_path, specs, L, tag="ds_fp4") if persist else None
     if pool is None:
         hb = alloc_layer_banks(specs, L)
