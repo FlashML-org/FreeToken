@@ -9,7 +9,9 @@ serve emitted garbage for prompts >= 128 tokens).
 
 Checks exactly what the grouped GEMM relies on: every real id in block ``b`` routes
 to ``expert_ids[b]``, each expert's region holds exactly its ids, padding is the
-sentinel, and the padded total matches.
+sentinel, and the padded total matches. The order of ids *within* an expert's region
+is deliberately not asserted: the multi-program scatter ranks them with atomics, so
+it differs from a stable sort (e.g. T=1024 / block 16) without being wrong.
 """
 
 from __future__ import annotations
