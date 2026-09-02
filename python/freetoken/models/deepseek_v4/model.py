@@ -43,6 +43,7 @@ from .layers import (  # noqa: F401
     RMSNorm,
     get_compress_topk_idxs,
     get_window_topk_idxs,
+    linear_fp32,
 )
 from .moe import Expert, Gate  # noqa: F401
 
@@ -75,7 +76,7 @@ class Block(nn.Module):
         shape, dtype = x.size(), x.dtype
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, hc_fn) * rsqrt
+        mixes = linear_fp32(xf, hc_fn) * rsqrt
         pre, post, comb = hc_split_sinkhorn(
             mixes.view(-1, mixes.size(-1)), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
         )
@@ -153,7 +154,7 @@ class Transformer(nn.Module):
         dim = self.args.dim
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, self.hc_head_fn) * rsqrt
+        mixes = linear_fp32(xf, self.hc_head_fn) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
         return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)

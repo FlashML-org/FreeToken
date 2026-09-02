@@ -13,6 +13,25 @@ from freetoken.kernel.triton.dsv4.norm import rms_norm
 FP8 = torch.float8_e4m3fn
 
 
+# Decode-sized fp32 GEMVs go through hipBLASLt with a 64x64 macro tile on gfx1201:
+# ONE workgroup walks the whole K loop, so hc_pre's [M<=4, 16384] x [24, 16384]^T
+# costs ~965 us per call (~1 ms x 87 calls = 82 ms of every decode step) where the
+# 1.5 MiB read is worth ~15 us. Below this M the broadcast-multiply + row reduce is
+# 14-30 us and numerically an fp32 sum of the same products; above it the GEMM's
+# fixed tile cost is amortized and the temp (M x N x K fp32) would not be.
+SMALL_M_LINEAR_MAX = 16
+
+
+def linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``F.linear`` for fp32 ``x`` [.., K] and ``weight`` [N, K] that is fast at decode M."""
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.shape[0] <= SMALL_M_LINEAR_MAX:
+        out = (x2.unsqueeze(1) * weight.unsqueeze(0)).sum(-1)
+        return out.view(*lead, weight.shape[0])
+    return F.linear(x, weight)
+
+
 class Linear(nn.Module):
     """BF16 / FP32 / block-scaled-FP8 linear (weight-only).
 
