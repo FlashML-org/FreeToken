@@ -66,13 +66,22 @@ class Qwen3_5MoE(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None):
         weight_format = (
-            "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block" else "bf16"
+            "gguf"
+            if getattr(config, "moe_weight_format", None) == "gguf"
+            else (
+                "fp8_block"
+                if getattr(config, "expert_quant", "none") == "fp8_block"
+                else "bf16"
+            )
         )
+        down_types = getattr(config, "gguf_down_quant_types", ())
+        down_type = down_types[layer_id] if weight_format == "gguf" and layer_id is not None else None
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
             renormalize=config.norm_topk_prob,
             weight_format=weight_format,
+            gguf_down_quant_type=down_type,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(

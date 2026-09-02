@@ -49,6 +49,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # down re-quantized to Q8_0 [L*E, H, row_bytes(I,Q8_0)] (a uniform format the cache
     # can hold; the source GGUF down is Q5_K/Q6_K, both >= ... 8-bit >= source precision).
     "gguf": ("gate_up", "down"),
+    # Native Qwen GGUF offload: gate_up Q4_K plus Q5_K/Q6_K down rows stored in
+    # one Q6_K-sized row stride. The loader pads only Q5_K row tails; kernels
+    # receive the exact type and explicit expert stride.
+    "gguf_native": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -99,6 +103,9 @@ _BANK_BYTES_PER_EXPERT = {
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     # gate_up Q4_K row_bytes(H, Q4_K)=H//256*144; down Q8_0 row_bytes(I, Q8_0)=I//32*34.
     "gguf": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 32) * 34,
+    # Native down rows use largest supported K-quant row (Q6_K) as uniform
+    # cache stride; Q5_K data keeps its native packed prefix.
+    "gguf_native": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 256) * 210,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
@@ -123,7 +130,8 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
-    # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
+    # "bf16" (default, dense expert weights), native GGUF layouts ("gguf" legacy Q8_0
+    # down and "gguf_native" mixed Q5_K/Q6_K down), or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
     # W4A16); or "mxfp4_triton" (gpt-oss transposed split-K GEMV decode + _t grouped

@@ -13,7 +13,10 @@ Quantized projections (full-attn q/k/v/o, GDN qkv|z and out_proj, shared-expert 
 down, the token embedding and the lm_head) stay in their native packed block layout (Q8_0
 projections, Q6_K head) and are yielded as ``.qweight`` (uint8); tiny F32 tensors (norms,
 router, GDN b/a) dequantize to bf16; GDN conv/A_log/dt_bias stay fp32. Routed experts
-(Q4_K gate/up, Q5_K/Q6_K down) go to the offload cache (``load_gguf_expert_sources``).
+(Q4_K gate/up, Q5_K/Q6_K down) stay packed. Resident mode loads them into model
+buffers; plain GPU offload uses ``load_gguf_expert_sources_native`` and retains each
+down type with a padded Q6_K row stride; CPU/hybrid/converter paths use
+``load_gguf_expert_sources`` and its legacy uniform Q8_0 down banks.
 """
 
 from __future__ import annotations
@@ -31,6 +34,8 @@ from freetoken.models.config import (
 from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_Q4_K,
+    GGML_Q5_K,
+    GGML_Q6_K,
     GGML_Q8_0,
     dequantize,
     quantize_q8_0,
@@ -53,6 +58,8 @@ def _require_tp1(what: str) -> None:
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     m = shim.metadata
+
+    down_quant_types = _gguf_down_quant_types(shim.model_path)
 
     def g(key: str):
         val = m.get(f"qwen35moe.{key}")
@@ -127,11 +134,42 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         dense_quant="gguf",
         lm_head_quant="gguf",
         moe_weight_format="gguf",
+        gguf_down_quant_types=down_quant_types,
     )
 
 
 def is_gguf_model(config: ModelConfig) -> bool:
     return getattr(config, "moe_weight_format", None) == "gguf"
+
+
+def _gguf_down_quant_types(model_path: str) -> tuple[int, ...]:
+    """Read routed down types from tensor headers without touching tensor payloads."""
+    from freetoken.models.gguf.reader import _reader
+
+    try:
+        reader = _reader(model_path)
+    except (OSError, ValueError, ImportError):
+        return ()
+    types: dict[int, int] = {}
+    for tensor in reader.tensors:
+        if not tensor.name.startswith("blk.") or not tensor.name.endswith("ffn_down_exps.weight"):
+            continue
+        layer = int(tensor.name.split(".")[1])
+        quant_type = int(tensor.tensor_type)
+        if quant_type not in (GGML_Q5_K, GGML_Q6_K):
+            raise ValueError(
+                f"{tensor.name}: resident GGUF supports Q5_K/Q6_K down experts, "
+                f"got ggml type {quant_type}"
+            )
+        prior = types.setdefault(layer, quant_type)
+        if prior != quant_type:
+            raise ValueError(f"{tensor.name}: expert down quant type changed within layer")
+    if not types:
+        return ()
+    last = max(types)
+    if set(types) != set(range(last + 1)):
+        raise ValueError(f"GGUF expert down types missing layers: expected 0..{last}, got {sorted(types)}")
+    return tuple(types[i] for i in range(last + 1))
 
 
 # --------------------------------------------------------------------------------------
@@ -146,7 +184,8 @@ def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
     embedding (Q8_0) and the (untied) lm_head (Q6_K), full-attention qkv/o (Q8_0), GDN
     in_proj_qkvz + out_proj (Q8_0; in_proj_ba stays dense bf16), and the shared-expert
     gate_up/down (Q8_0). Left dense bf16/fp32 (F32 in the GGUF): the norms, the two
-    routers, and the GDN conv1d/A_log/dt_bias. Routed experts stay on the offload cache.
+    routers, and the GDN conv1d/A_log/dt_bias. Routed experts are native-resident when
+    selected, or remain in host banks for offload.
     """
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
     from freetoken.models.gguf.dequant import GGML_Q6_K, GGML_Q8_0
@@ -156,9 +195,11 @@ def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
         quant_type=GGML_Q8_0,
+        quant_role="token_embedding",
     )
     model.lm_head = GGUFLinear(
-        config.hidden_size, config.vocab_size, GGML_Q6_K, has_bias=False
+        config.hidden_size, config.vocab_size, GGML_Q6_K, has_bias=False,
+        operation="lm_head", quant_role="lm_head",
     )
     shared_I = config.shared_expert_intermediate_size
 
@@ -166,10 +207,11 @@ def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
         if layer._is_linear:
             g = layer.linear_attn
             g.in_proj_qkvz = GGUFLinear(
-                config.hidden_size, g.conv_dim + g.value_dim, GGML_Q8_0, has_bias=False
+                config.hidden_size, g.conv_dim + g.value_dim, GGML_Q8_0,
+                has_bias=False, quant_role="gdn_qkvz"
             )
             g.out_proj = GGUFLinear(
-                g.value_dim, config.hidden_size, GGML_Q8_0, has_bias=False
+                g.value_dim, config.hidden_size, GGML_Q8_0, has_bias=False, quant_role="gdn_out"
             )
         else:
             attn = layer.self_attn
@@ -177,17 +219,20 @@ def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
                 config.hidden_size,
                 attn.num_q * attn.head_dim * 2 + 2 * attn.kv_attn_dim,
                 GGML_Q8_0,
-                has_bias=False,
+                has_bias=False, quant_role="attention_qkv",
             )
             attn.o_proj = GGUFLinear(
-                attn.qo_attn_dim, config.hidden_size, GGML_Q8_0, has_bias=False
+                attn.qo_attn_dim, config.hidden_size, GGML_Q8_0, has_bias=False,
+                quant_role="attention_output"
             )
         m = layer.mlp
         m.shared_expert.gate_up_proj = GGUFLinear(
-            config.hidden_size, 2 * shared_I, GGML_Q8_0, has_bias=False
+            config.hidden_size, 2 * shared_I, GGML_Q8_0, has_bias=False,
+            quant_role="shared_gate_up"
         )
         m.shared_expert.down_proj = GGUFLinear(
-            shared_I, config.hidden_size, GGML_Q8_0, has_bias=False
+            shared_I, config.hidden_size, GGML_Q8_0, has_bias=False,
+            quant_role="shared_down"
         )
 
 
@@ -289,21 +334,18 @@ def iter_gguf_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield (param_name, tensor) for every non-expert qwen3_5_moe param.
+    """Yield packed state tensors for Qwen3.5-MoE.
 
     Quantized projections stay packed and are yielded as ``.qweight`` (uint8); the F32
     norms/router/GDN b,a dequantize to bf16; conv1d/A_log/dt_bias stay fp32. Full-attention
     q/k/v -> ``self_attn.qkv_proj.qweight``, GDN qkv|z -> ``linear_attn.in_proj_qkvz.qweight``
     (Q8_0, concat along the output dim), GDN b|a -> ``linear_attn.in_proj_ba.weight`` (dense
-    bf16). Routed experts are skipped (offload cache).
+    bf16). Routed experts are skipped for offload and yielded as native packed banks for
+    resident mode.
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts, (
-        "qwen3.5-moe GGUF stores experts as Q4_K/Q5_K/Q6_K and only supports the offload "
-        "backend; experts are loaded into the offload cache via load_gguf_expert_sources()."
-    )
     assert include_non_moe
     _require_tp1("weight loading")
 
@@ -324,6 +366,7 @@ def iter_gguf_weights(
     qkvz_buf: dict[int, dict[str, torch.Tensor]] = {}
     ba_buf: dict[int, dict[str, torch.Tensor]] = {}
     shexp_buf: dict[int, dict[str, torch.Tensor]] = {}
+    expert_buf: dict[int, dict[str, tuple[torch.Tensor, int]]] = {}
 
     for t in iter_gguf_tensors(model_path):
         name = t.name
@@ -340,8 +383,38 @@ def iter_gguf_weights(
             continue
         if not name.startswith("blk."):
             continue
-        if any(name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
-            continue  # routed experts -> offload banks
+        expert_suffix = next((sfx for sfx in _EXPERT_SUFFIXES if name.endswith(sfx)), None)
+        if expert_suffix is not None:
+            if not include_moe_experts:
+                continue  # routed experts -> offload banks
+            layer = int(name.split(".")[1])
+            kind = {
+                "ffn_gate_exps.weight": "gate",
+                "ffn_up_exps.weight": "up",
+                "ffn_down_exps.weight": "down",
+            }[expert_suffix]
+            expected_type = (GGML_Q4_K,) if kind in ("gate", "up") else (GGML_Q5_K, GGML_Q6_K)
+            if t.ggml_type not in expected_type:
+                raise ValueError(
+                    f"{name}: expected {expected_type}, got GGML type {t.ggml_type}"
+                )
+            E = config.num_experts
+            I = config.moe_intermediate_size
+            packed = t.packed().reshape(E, I, t.row_bytes)
+            layer_buf = expert_buf.setdefault(layer, {})
+            layer_buf[kind] = (packed, t.ggml_type)
+            if {"gate", "up", "down"} <= set(layer_buf):
+                gate, gate_type = layer_buf["gate"]
+                up, up_type = layer_buf["up"]
+                down, down_type = layer_buf["down"]
+                if gate_type != GGML_Q4_K or up_type != GGML_Q4_K:
+                    raise AssertionError(f"layer {layer}: gate/up expert type is not Q4_K")
+                yield f"model.layers.{layer}.mlp.experts.gate_up_proj", torch.cat(
+                    [gate, up], dim=1
+                )
+                yield f"model.layers.{layer}.mlp.experts.down_proj", down
+                del expert_buf[layer]
+            continue
 
         layer = int(name.split(".")[1])
         suffix = name.split(".", 2)[2]
@@ -430,6 +503,8 @@ def iter_gguf_weights(
     assert not qkvz_buf, f"incomplete GDN qkvz groups: {sorted(qkvz_buf)}"
     assert not ba_buf, f"incomplete GDN ba groups: {sorted(ba_buf)}"
     assert not shexp_buf, f"incomplete shared-expert gate/up: {sorted(shexp_buf)}"
+    if include_moe_experts:
+        assert not expert_buf, f"incomplete routed expert groups: {sorted(expert_buf)}"
 
 
 # --------------------------------------------------------------------------------------
@@ -499,10 +574,79 @@ def load_gguf_expert_sources(
     return banks
 
 
+def load_gguf_expert_sources_native(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Load Qwen routed experts without Q8 conversion for GPU offload.
+
+    Q5_K and Q6_K have different packed row widths. The cache needs one shape,
+    so every down row uses a Q6_K-sized stride; Q5_K retains its 176-byte block
+    prefix and zero tail. ``ggml_moe_a8_vec_strided`` consumes the exact source
+    type and skips that tail. Converter callers stay on ``load_gguf_expert_sources``
+    because its FTW schema intentionally remains the legacy uniform Q8 layout.
+    """
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    _require_tp1("native expert banks")
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+    h_rb = row_bytes(H, GGML_Q4_K)
+    q5_rb = row_bytes(I, GGML_Q5_K)
+    q6_rb = row_bytes(I, GGML_Q6_K)
+    specs = {
+        "gate_up": ((E, 2 * I, h_rb), torch.uint8),
+        "down": ((E, H, q6_rb), torch.uint8),
+    }
+    hb = alloc_layer_banks(specs, L)
+    banks = {name: [b.tensor for b in hb[name]] for name in specs}
+
+    def _load(sink) -> None:
+        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
+        for t in iter_gguf_tensors(model_path):
+            if not t.name.startswith("blk."):
+                continue
+            layer = int(t.name.split(".")[1])
+            if t.name.endswith("ffn_gate_exps.weight"):
+                banks["gate_up"][layer][:, :I].copy_(
+                    t.packed().reshape(E, I, h_rb)
+                )
+            elif t.name.endswith("ffn_up_exps.weight"):
+                banks["gate_up"][layer][:, I:].copy_(
+                    t.packed().reshape(E, I, h_rb)
+                )
+            elif t.name.endswith("ffn_down_exps.weight"):
+                if t.ggml_type == GGML_Q5_K:
+                    packed = t.packed().reshape(E, H, q5_rb)
+                    banks["down"][layer][:, :, :q5_rb].copy_(packed)
+                elif t.ggml_type == GGML_Q6_K:
+                    banks["down"][layer].copy_(
+                        t.packed().reshape(E, H, q6_rb)
+                    )
+                else:
+                    raise ValueError(
+                        f"native GGUF down layer {layer} has unsupported type {t.ggml_type}"
+                    )
+            else:
+                continue
+            if tracker is not None:
+                tracker.note(layer)
+
+    if layer_sink is not None:
+        _load(layer_sink)
+    elif torch.cuda.is_available():
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)
+    return banks
+
+
 __all__ = [
     "parse_gguf_config",
     "iter_gguf_weights",
     "convert_qwen35moe_to_gguf",
     "is_gguf_model",
     "load_gguf_expert_sources",
+    "load_gguf_expert_sources_native",
 ]

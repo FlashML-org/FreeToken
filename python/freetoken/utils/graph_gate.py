@@ -16,6 +16,116 @@ import os
 from functools import lru_cache
 
 _CACHE_FILE = "freetoken_graph_gate.json"
+_ROCM_BLAS_VALUES = frozenset({"auto", "hipblas", "hipblaslt", "rocblas"})
+
+
+def _rocm_blas_request(value: str | None = None) -> str:
+    requested = (value if value is not None else os.environ.get("FREETOKEN_ROCM_BLAS", "auto"))
+    requested = requested.strip().lower()
+    if requested not in _ROCM_BLAS_VALUES:
+        choices = "auto, hipblas, hipblaslt, rocblas"
+        raise ValueError(f"FREETOKEN_ROCM_BLAS={requested!r}: expected {choices}")
+    return requested
+
+
+def _is_rocm() -> bool:
+    try:
+        import torch
+
+        return torch.version.hip is not None
+    except Exception:
+        return False
+
+
+def _blas_env(requested: str) -> dict[str, str]:
+    if requested in {"hipblas", "rocblas"}:
+        return {"TORCH_BLAS_PREFER_HIPBLASLT": "0"}
+    if requested == "hipblaslt":
+        return {"TORCH_BLAS_PREFER_HIPBLASLT": "1"}
+    return {}
+
+
+def _effective_blas() -> tuple[str | None, str]:
+    """Return normalized PyTorch BLAS backend plus verification detail."""
+    try:
+        import torch
+
+        if not _is_rocm():
+            return "not-applicable", "not-applicable"
+        api = getattr(torch.backends.cuda, "preferred_blas_library", None)
+        if api is None:
+            return None, "preferred_blas_library unavailable"
+        raw = api()
+        name = getattr(raw, "name", str(raw)).lower()
+        if "lt" in name:
+            return "hipblaslt", "reported by torch.backends.cuda.preferred_blas_library"
+        if "cublas" in name or "hipblas" in name:
+            return "hipblas", "reported by torch.backends.cuda.preferred_blas_library"
+        return name, "unsupported backend reported by PyTorch"
+    except Exception as exc:
+        return None, f"backend report failed: {type(exc).__name__}: {exc}"
+
+
+def rocm_blas_report(requested: str | None = None, *, gate: dict | None = None) -> dict:
+    """Describe requested/effective ROCm BLAS policy without changing process state."""
+    requested = _rocm_blas_request(requested)
+    rocm = _is_rocm()
+    gate = gate if gate is not None else (run_graph_gate() if rocm and requested == "auto" else None)
+    env = _blas_env(requested)
+    source = "explicit" if requested != "auto" else "inherited"
+    if requested == "auto" and gate and gate.get("ok") and gate.get("env"):
+        env = dict(gate["env"])
+        source = "graph_gate"
+    effective, detail = _effective_blas()
+    expected = {"hipblas": "hipblas", "rocblas": "hipblas", "hipblaslt": "hipblaslt"}.get(requested)
+    if not rocm:
+        verification = "not-applicable"
+    elif effective is None:
+        verification = "unverified"
+    elif expected is not None and effective != expected:
+        verification = "mismatch"
+    else:
+        verification = "verified"
+    try:
+        import torch
+
+        torch_version = torch.__version__
+        rocm_version = torch.version.hip
+        device = torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    except Exception:
+        torch_version = None
+        rocm_version = None
+        device = None
+    return {
+        "requested": requested,
+        "effective": effective,
+        "env": env,
+        "source": source,
+        "torch_version": torch_version,
+        "rocm_version": rocm_version,
+        "device": device,
+        "verification": verification,
+        "detail": detail,
+    }
+
+
+def resolve_rocm_blas_env(*, gate: dict | None = None) -> dict[str, str]:
+    """Resolve one BLAS env map; explicit policy overrides graph-gate auto output."""
+    requested = _rocm_blas_request()
+    if not _is_rocm():
+        return {}
+    if requested != "auto":
+        try:
+            import torch
+
+            if getattr(torch.backends.cuda, "preferred_blas_library", None) is None:
+                raise RuntimeError("torch.backends.cuda.preferred_blas_library unavailable")
+        except Exception as exc:
+            raise RuntimeError(f"explicit ROCm BLAS policy unavailable: {exc}") from exc
+        return _blas_env(requested)
+    if gate is None:
+        gate = run_graph_gate()
+    return dict(gate.get("env") or {}) if gate.get("ok") else {}
 
 
 def _cache_dir() -> str:
@@ -144,9 +254,15 @@ def graph_capture_env() -> dict[str, str]:
     capture time, where a late env write may no-op.
     """
     try:
+        requested = _rocm_blas_request()
+        if requested != "auto" and _is_rocm():
+            return resolve_rocm_blas_env()
         result = run_graph_gate()
-        env = result.get("env") or {}
-        return env if result.get("ok") else {}
+        return resolve_rocm_blas_env(gate=result)
+    except ValueError:
+        raise
+    except RuntimeError:
+        raise
     except Exception:
         return {}
 

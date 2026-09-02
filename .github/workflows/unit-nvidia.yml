@@ -59,8 +59,42 @@ jobs:
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
           uv pip install --system -e . --no-build-isolation
 
+      - name: Compile/import legacy GGUF CUDA module
+        run: |
+          PYTHONPATH=python python - <<'PY'
+          import torch
+          from freetoken.kernel import gguf
+
+          assert torch.version.hip is None, "NVIDIA job resolved a ROCm torch wheel"
+          module = gguf._module()
+          for symbol in ("ggml_dequantize", "ggml_mul_mat_vec_a8", "ggml_moe_a8_vec"):
+              assert hasattr(module, symbol), symbol
+          print("legacy GGUF CUDA module imported:", module.__name__)
+          PY
+
+      - name: Compile/import pinned single-token GGUF ABI
+        run: |
+          PYTHONPATH=python python - <<'PY'
+          from pathlib import Path
+          import torch
+          from torch.utils.cpp_extension import load
+
+          root = Path("python/freetoken/kernel/csrc/gguf")
+          module = load(
+              name="freetoken_gguf_b10434_ci",
+              sources=[str(root / "gguf_moe_gfx1100.cu"), str(root / "gguf_b10434_kernel.cu")],
+              extra_cuda_cflags=["-O3", "-DFREETOKEN_GGUF_NO_PYBIND=1"],
+              verbose=False,
+          )
+          for symbol in ("mmvq_bs1_workspace_bytes", "mmvq_bs1", "ggml_moe_mmvq_id"):
+              assert hasattr(module, symbol), symbol
+          assert module.mmvq_bs1_workspace_bytes(512, 16, 8) % 256 == 0
+          print("pinned b10434 ABI imported:", module.__name__)
+          PY
+
       - name: Run unit suite (GPU tests self-skip)
         run: |
+          set -o pipefail
           python -m pytest tests/ -m "not slow" -q -x \
             --ignore=tests/e2e --ignore=tests/dsv4 2>&1 | tail -40
 

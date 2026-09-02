@@ -297,6 +297,9 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # GGUF routed-expert down projection type per decoder layer. Populated by GGUF model
+    # adapters before resident construction; empty for every non-GGUF model.
+    gguf_down_quant_types: Tuple[int, ...] = ()
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

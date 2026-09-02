@@ -10,6 +10,116 @@ from freetoken.utils import div_even, init_logger, mem_GB
 logger = init_logger(__name__)
 
 
+def _kv_storage_type():
+    """Resolve enum lazily; importing engine.config at module load cycles through kvcache."""
+    from freetoken.engine.config import KVStorageType
+
+    return KVStorageType
+
+
+@dataclass(frozen=True)
+class KVStorageDescriptor:
+    """Immutable physical layout contract shared by allocation and accounting."""
+
+    storage_type: KVStorageType
+    block_size: int = 32
+    payload_dtype: torch.dtype = torch.bfloat16
+    scale_dtype: torch.dtype | None = None
+    contract_id: str = "native-16"
+
+    def __post_init__(self) -> None:
+        kv_type = _kv_storage_type()
+        storage_type = kv_type.parse(self.storage_type)
+        object.__setattr__(self, "storage_type", storage_type)
+        if storage_type == kv_type.Q8_0:
+            if self.block_size != 32:
+                raise ValueError("q8_0 KV storage requires block_size=32")
+            object.__setattr__(self, "payload_dtype", torch.int8)
+            object.__setattr__(self, "scale_dtype", torch.float16)
+            object.__setattr__(self, "contract_id", "llama.cpp-b10434-q8_0-row-v1")
+        elif self.scale_dtype is not None:
+            raise ValueError(f"scale dtype is only valid for q8_0, got {storage_type.value}")
+
+    @property
+    def is_quantized(self) -> bool:
+        return self.storage_type == _kv_storage_type().Q8_0
+
+    @property
+    def bytes_per_block(self) -> int:
+        if self.is_quantized:
+            return self.block_size + 2
+        return self.block_size * self.payload_dtype.itemsize
+
+    def validate_head_dim(self, head_dim: int) -> None:
+        if self.is_quantized and head_dim % self.block_size:
+            raise ValueError(
+                f"q8_0 KV storage requires head_dim divisible by {self.block_size}; "
+                f"got {head_dim}"
+            )
+
+    def row_bytes(self, head_dim: int) -> int:
+        self.validate_head_dim(head_dim)
+        if self.is_quantized:
+            return head_dim + 2 * (head_dim // self.block_size)
+        return head_dim * self.payload_dtype.itemsize
+
+    def bytes_per_token(
+        self, *, num_layers: int, num_kv_heads: int, head_dim: int, slabs: int = 2
+    ) -> int:
+        return slabs * num_layers * num_kv_heads * self.row_bytes(head_dim)
+
+
+@dataclass(frozen=True)
+class QuantizedKVView:
+    payload: torch.Tensor
+    scales: torch.Tensor
+    descriptor: KVStorageDescriptor
+
+
+def kv_storage_descriptor(config, *, head_dim: int | None = None) -> KVStorageDescriptor:
+    """Resolve one descriptor without allocating a pool."""
+    raw_type = getattr(config, "kv_storage_type", None)
+    if raw_type is None:
+        dtype = getattr(config, "dtype", torch.bfloat16)
+        kv_type = _kv_storage_type()
+        storage_type = kv_type.FP16 if dtype == torch.float16 else kv_type.BF16
+        return KVStorageDescriptor(storage_type, payload_dtype=dtype)
+    kv_type = _kv_storage_type()
+    storage_type = kv_type.parse(raw_type)
+    if storage_type == kv_type.BF16:
+        return KVStorageDescriptor(storage_type, payload_dtype=torch.bfloat16)
+    if storage_type == kv_type.FP16:
+        return KVStorageDescriptor(storage_type, payload_dtype=torch.float16)
+    descriptor = KVStorageDescriptor(storage_type)
+    if head_dim is not None:
+        descriptor.validate_head_dim(int(head_dim))
+    return descriptor
+
+
+def validate_kv_storage_config(config) -> KVStorageDescriptor:
+    """Reject unsupported storage before model/cache allocation."""
+    descriptor = kv_storage_descriptor(config)
+    if descriptor.storage_type != _kv_storage_type().Q8_0:
+        return descriptor
+    specs = tuple(getattr(config.model_config, "kv_cache_group_specs")())
+    from freetoken.attention import AttnType
+
+    unsupported = [
+        spec.name for spec in specs
+        if getattr(spec, "attn_type", AttnType.FULL) is not AttnType.FULL
+        or spec.mla or spec.index_head_dim or spec.num_index_layers
+    ]
+    if unsupported:
+        raise ValueError(
+            "q8_0 KV storage currently supports plain full-attention MHA groups only; "
+            f"unsupported groups: {', '.join(unsupported)}"
+        )
+    for spec in specs:
+        if spec.num_layers:
+            descriptor.validate_head_dim(int(spec.head_dim))
+    return descriptor
+
+
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --
@@ -25,13 +135,24 @@ def spec_kv_bytes_per_token(spec, config) -> int:
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
-    per_token = (
-        (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
-        * spec.num_layers
+    descriptor = kv_storage_descriptor(config, head_dim=spec.head_dim)
+    if descriptor.is_quantized and (spec.mla or spec.index_head_dim or spec.num_index_layers):
+        raise ValueError(f"q8_0 KV storage does not support group {spec.name!r}")
+    per_token = descriptor.bytes_per_token(
+        num_layers=spec.num_layers,
+        num_kv_heads=div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True),
+        head_dim=spec.head_dim,
+        slabs=1 if spec.mla else 2,
     )
+    if not descriptor.is_quantized:
+        # Preserve DSA/QSA index accounting for native 16-bit pools.
+        per_token = (
+            (1 if spec.mla else 2)
+            * spec.head_dim
+            * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            * config.dtype.itemsize
+            * spec.num_layers
+        )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 

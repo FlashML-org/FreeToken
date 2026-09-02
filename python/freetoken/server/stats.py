@@ -161,6 +161,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
+        "execution": dict(getattr(state, "execution", None) or {}),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),
             "prefill_tps": round(tr.prefill_tps(), 1),

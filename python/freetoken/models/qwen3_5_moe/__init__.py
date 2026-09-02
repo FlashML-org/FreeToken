@@ -4,6 +4,7 @@ from .gguf import (
     is_gguf_model,
     iter_gguf_weights,
     load_gguf_expert_sources,
+    load_gguf_expert_sources_native,
     parse_gguf_config,
 )
 from .model import Qwen3_5MoEForCausalLM
@@ -28,4 +29,5 @@ __all__ = [
     "convert_qwen35moe_to_gguf",
     "is_gguf_model",
     "load_gguf_expert_sources",
+    "load_gguf_expert_sources_native",
 ]

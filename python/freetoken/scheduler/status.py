@@ -59,6 +59,13 @@ class SchedulerStatusReporter:
                 moe_stats=moe_stats,
             )
 
+    def decode_stats_due(self, batch: Batch) -> bool:
+        """Whether next decode report will log and may safely read device counters."""
+        return (
+            batch.is_decode
+            and (self._decode_forward_count + 1) % self.decode_log_interval == 0
+        )
+
     def _report_prefill(
         self,
         batch: Batch,

@@ -260,11 +260,18 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
         )
     if dummy:
         raise NotImplementedError("gguf expert banks have no dummy path; load the real GGUF")
-    from freetoken.models.weight import load_gguf_moe_expert_sources
+    from freetoken.models.weight import (
+        load_gguf_moe_expert_sources,
+        load_gguf_moe_expert_sources_native,
+    )
 
-    sources = load_gguf_moe_expert_sources(model_path, model_config, layer_sink=layer_sink)
+    native = decode_target == "gpu" and layer_sink is None
+    loader = load_gguf_moe_expert_sources_native if native else load_gguf_moe_expert_sources
+    sources = loader(model_path, model_config, layer_sink=layer_sink)
     return ExpertBanks(
-        "gguf", {name: sources[name] for name in _BANK_SCHEMAS["gguf"]}, streamed=layer_sink is not None
+        "gguf_native" if native else "gguf",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf_native" if native else "gguf"]},
+        streamed=layer_sink is not None,
     )
 
 

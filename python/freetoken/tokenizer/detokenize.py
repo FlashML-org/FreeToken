@@ -91,6 +91,14 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        try:
+            import torch
+        except ImportError:
+            return self._detokenize(msgs)
+        with torch.profiler.record_function("detokenize"):
+            return self._detokenize(msgs)
+
+    def _detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

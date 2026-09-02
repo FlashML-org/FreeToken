@@ -156,20 +156,18 @@ def launch_server(
         from .supervisor import BackendHandle
 
         mp.set_start_method("spawn", force=True)
-        # Graph-capture variant env (Inc 6, .plans/rocm-perf-parity): the gate probes
-        # rocBLAS/prewarm variants in subprocesses and may require e.g.
-        # TORCH_BLAS_PREFER_HIPBLASLT=0 for capture to be viable. Apply it to THIS
-        # (supervisor) process before the workers are spawned so the spawned engine
-        # worker inherits it from process start — before any torch import/GEMM; a late
-        # write at capture time may no-op depending on torch's BLAS-preference caching.
-        from freetoken.utils.graph_gate import graph_capture_env
+        # Resolve one BLAS policy before workers spawn. Explicit FREETOKEN_ROCM_BLAS
+        # wins over graph-gate auto output; worker inherits env before torch import/GEMM.
+        # A late write at capture time may no-op after PyTorch caches BLAS preference.
+        from freetoken.utils.graph_gate import graph_capture_env, rocm_blas_report
 
         gate_env = graph_capture_env()
         if gate_env:
             os.environ.update(gate_env)
             logger.info(
-                f"graph-capture gate env applied to workers: {sorted(gate_env)}"
+                f"ROCm BLAS/graph env applied to workers: {sorted(gate_env)}"
             )
+        logger.info(f"BLAS policy before worker spawn: {rocm_blas_report()}")
         detach = server_args.shell_mode  # see _detach_process_group
 
         world_size = server_args.tp_info.size

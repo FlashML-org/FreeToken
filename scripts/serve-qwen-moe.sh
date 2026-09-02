@@ -6,7 +6,8 @@
 # CPU/offload cache) and the triton attention backend by default.
 #
 # Native context window: 262144 (256K) tokens (max_position_embeddings in the model).
-# Graph capture is settled as a failure on ROCm, so this runs eager kernel-launch decode.
+# Decode graph capture is probed at startup. Current gfx1100 passes the gate and uses
+# replay; unsupported/failed capture falls back to eager kernel-launch decode.
 #
 # VS CODE NOTES:
 #   - The server command is built as a bash array and launched on ONE physical
@@ -29,6 +30,28 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- .env loader: repo-local runtime defaults (FT_MODEL, FT_PORT, FT_KV_TOKENS,
+# FT_SERVED_MODEL, ...) ------------------------------------------------------------
+# Contract (see .env header): values there are DEFAULTS — a variable already set in
+# the shell wins, so one-off `FT_X=... ./serve-qwen-moe.sh` overrides still hold.
+# Runs every launch; editing .env affects the next launch only.
+if [ -f "$REPO/.env" ]; then
+    while IFS= read -r line; do
+        line="${line%%#*}"                                # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"           # ltrim
+        if [ -z "$line" ]; then continue; fi
+        key="${line%%=*}"
+        case "$key" in *[![:space:][:alnum:]_]*) continue ;; esac
+        val="${line#*=}"
+        # trim leading spaces from the value
+        val="${val#"${val%%[![:space:]]*}"}"
+        if [ -n "$key" ] && [ -z "${!key+x}" ]; then
+            export "${key}=${val}"
+        fi
+    done < "$REPO/.env"
+fi
+
 PY="${PY:-$REPO/.venv-rocm/bin/python}"
 
 MODEL="${FT_MODEL:-}"
@@ -72,12 +95,16 @@ KV_TOKENS="${FT_KV_TOKENS:-131072}"
 # other clients inherit this.
 MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
 MOE_CACHE="${FT_MOE_CACHE:-auto}"
+KV_TYPE="${FT_KV_TYPE:-bf16}" # bf16 | fp16 | q8_0; q8_0 is opt-in and full-MHA only
 LOG="${FT_LOG:-/tmp/serve_qwen_moe.log}"
+ROCPROF_BIN="${FT_ROCPROF_BIN:-}"
+ROCPROF_TRACE_DIR="${FT_ROCPROF_TRACE_DIR:-}"
+ROCPROF_LOG="${FT_ROCPROF_LOG:-/tmp/freetoken-rocprofv3.log}"
 # Advertised model id in /v1/models (--served-model-name). Copilot-fork custom
 # endpoints validate the configured model id against this list, so set it to the
 # exact id the client config declares (e.g. FT_SERVED_MODEL=qwen3.6). Empty =
 # server default (the GGUF filename).
-SERVED_MODEL="${FT_SERVED_MODEL:-}"
+SERVED_MODEL="${FT_SERVED_MODEL:-qwen3.6}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -117,6 +144,7 @@ start() {
         $( [ -n "$CPU_LAYERS" ] && echo "--moe-cpu-layers" "$CPU_LAYERS" )
         "--attention-backend" "$ATNN"
         "--num-tokens" "$KV_TOKENS"
+        "--kv-type" "$KV_TYPE"
         "--memory-ratio" "$MEMORY_RATIO"
         "--max-prefill-length" "$PREFILL_CHUNK"
         "--max-output-tokens" "$MAX_OUTPUT"
@@ -141,15 +169,33 @@ start() {
     echo "  attn    : $ATNN"
     echo "  moe     : $MOE_BACKEND"
     echo "  kv      : $KV_TOKENS tokens (gpu moe cache: ${MOE_CACHE}${MOE_CACHE:+ }$( [ "$MOE_CACHE" = auto ] && echo "kv-reserve $KV_TOKENS" || echo slots))"
+    echo "  kv type : $KV_TYPE"
     echo "  python  : $PY"
     echo "  log     : $LOG"
+
+    local -a EXEC_PREFIX=()
+    if [ -n "$ROCPROF_BIN" ]; then
+        [ -d "$ROCPROF_TRACE_DIR" ] || die "rocprof trace directory not found: $ROCPROF_TRACE_DIR"
+        [ -x "$(command -v "$ROCPROF_BIN" 2>/dev/null || true)" ] || die "rocprofiler not found: $ROCPROF_BIN"
+        EXEC_PREFIX=(
+            "$ROCPROF_BIN"
+            --runtime-trace
+            --marker-trace
+            --kernel-trace
+            --memory-copy-trace
+            --memory-allocation-trace
+            -d "$ROCPROF_TRACE_DIR"
+            --
+        )
+        echo "  profiler: ${EXEC_PREFIX[*]}"
+    fi
 
     # setsid: give the server its OWN session/process group. nohup alone only
     # ignores SIGHUP — a caller that dies (e.g. a VS Code task cancelled, an agent
     # tool timeout) still takes down the whole process group with SIGKILL/SIGTERM,
     # which silently killed the server mid model-load once already.
     cd "$REPO"
-    PYTHONPATH="$REPO/python" setsid nohup "$PY" -m freetoken.cli serve "${SERVE_ARGS[@]}" >"$LOG" 2>&1 </dev/null &
+    PYTHONPATH="$REPO/python" setsid nohup "${EXEC_PREFIX[@]}" "$PY" -m freetoken.cli serve "${SERVE_ARGS[@]}" >"$LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     echo "pid=$pid — waiting for readiness (model load takes ~3-4 min)..."

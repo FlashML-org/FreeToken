@@ -149,6 +149,26 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, TritonMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
+        if getattr(self.kvcache, "is_quantized", False):
+            from freetoken.kernel.triton.attention import q8_paged_attention
+
+            k_view = self.kvcache.k_cache_view(layer_id)
+            v_view = self.kvcache.v_cache_view(layer_id)
+            scale = spec.sm_scale if (spec := (attn_spec or AttentionSpec())).sm_scale is not None else q.shape[-1] ** -0.5
+            return q8_paged_attention(
+                q=q,
+                k_payload=k_view.payload,
+                v_payload=v_view.payload,
+                k_scales=k_view.scales,
+                v_scales=v_view.scales,
+                indptr=metadata.indptr,
+                indices=metadata.indices,
+                q_to_req=metadata.q_to_req,
+                q_positions=metadata.q_positions,
+                sm_scale=scale,
+                sliding_window=spec.sliding_window,
+            )
+
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
@@ -242,6 +262,14 @@ class TritonAttentionBackend(BaseAttnBackend):
                 [0] + seqlens_q, dtype=torch.int32, device=device
             ).cumsum_(0)
         indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+        if getattr(self.kvcache, "is_quantized", False):
+            # Duplicate physical destinations would make the captured Q8 store
+            # last-writer-wins and pair payload/scales nondeterministically.
+            from freetoken.kernel.triton.q8_kv import validate_unique_destinations
+
+            destinations = getattr(batch, "out_loc", None)
+            if destinations is not None:
+                validate_unique_destinations(destinations)
         swa_indices = None
         if getattr(self.kvcache, "swa_paged", False):
             # Global-paged SWA (naive + radix): the swa-layer gather reads swa-pool slots = full->swa

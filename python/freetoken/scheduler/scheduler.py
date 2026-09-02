@@ -25,6 +25,7 @@ from freetoken.utils import (
     load_tokenizer,
     load_toolcall_anchor_id,
 )
+from freetoken.utils.step_profiler import profiler_phase, step_profiler
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -228,26 +229,26 @@ class Scheduler(SchedulerIOMixin):
         # table_idx can have its freshly copied prompt clobbered by the prior occupant's
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
-        self.stream.wait_stream(self.engine.stream)
-        forward_input = self._schedule_next_batch()
-        ongoing_data = None
-        if forward_input is not None:
-            with self.engine_stream_ctx:  # run the batch in the engine's stream
-                self.engine.stream.wait_stream(self.stream)
-                # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
-                # cross-stream wait and before the forward reads the live slot (program order
-                # vs the prior batch's snapshot writes). Doing this on self.stream would race.
-                self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+        with step_profiler():
+            self.stream.wait_stream(self.engine.stream)
+            forward_input = self._schedule_next_batch()
+            ongoing_data = None
+            if forward_input is not None:
+                with self.engine_stream_ctx:  # run the batch in the engine's stream
+                    self.engine.stream.wait_stream(self.stream)
+                    # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
+                    # cross-stream wait and before the forward reads the live slot (program order
+                    # vs the prior batch's snapshot writes). Doing this on self.stream would race.
+                    self._restore_linear_states(forward_input.batch)
+                    ongoing_data = (forward_input, self._forward(forward_input))
 
-        # The drain issues GPU-visible writes to state the batch just launched still reads: the
-        # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
-        # sentinel scatter. DSV4 stages the page table at replay time and translates
-        # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
-        # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
-        self.stream.wait_stream(self.engine.stream)
-        self._process_last_data(last_data)
-        self._flush_abort_acks()
+            # The drain issues GPU-visible writes to state the batch just launched still reads:
+            # the page-table re-point and, for paged-SWA pools, the full->swa sentinel scatter.
+            # DSV4 stages the page table at replay time and translates full_to_window INSIDE the
+            # captured graph, so an unordered drain can redirect an in-flight forward.
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -267,15 +268,16 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
-        forward_input = self._schedule_next_batch()
-        ongoing_data = None
-        if forward_input is not None:
-            # already inside engine_stream_ctx (run_forever); restore on the engine stream
-            self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+        with step_profiler():
+            forward_input = self._schedule_next_batch()
+            ongoing_data = None
+            if forward_input is not None:
+                # already inside engine_stream_ctx (run_forever); restore on the engine stream
+                self._restore_linear_states(forward_input.batch)
+                ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(ongoing_data)
-        self._flush_abort_acks()
+            self._process_last_data(ongoing_data)
+            self._flush_abort_acks()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -300,99 +302,112 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        with profiler_phase("token_d2h_event_drain"):
+            # Call helper through class so lightweight unbound-method test stubs do not
+            # need to carry a bound helper attribute.
+            Scheduler._process_last_data_impl(self, last_data)
+
+    def _process_last_data_impl(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+        with profiler_phase("token_copy_wait"):
+            # D2H observation runs on TokenStaging.copy_stream. Query first so already-complete
+            # copies do not block CPU; synchronize remains exact fallback for slow copies.
+            query = getattr(copy_done, "query", None)
+            if query is None or not query():
+                copy_done.synchronize()
+        with profiler_phase("decode_result_accounting"):
+            reply: List[DetokenizeMsg] = []
+            new_finished_reqs: Set[Req] = set()
+            with self.cache_manager.lazy_free_region():
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        # Don't cache intermediate chunks; the full prompt is cached once when the
+                        # final chunk is processed. Caching here snapshots a handle the next chunk
+                        # already copied (overlap), so cache_req double-frees the prior chunk.
+                        if req.aborted:
+                            # Aborted mid-chunked-prefill while this chunk was in flight: the abort
+                            # popped the pending continuation (no next chunk launches), and this
+                            # drain point frees the chunk's pages/slots exactly once.
+                            self._free_req_resources(req)
+                        continue
                     if req.aborted:
-                        # Aborted mid-chunked-prefill while this chunk was in flight: the abort
-                        # popped the pending continuation (no next chunk launches), and this
-                        # drain point frees the chunk's pages/slots exactly once.
+                        # Aborted while this final-chunk prefill / decode step was in flight: free
+                        # here (the forward is drained) and finish the request. No DetokenizeMsg --
+                        # the abort ack flushed after this method stays the uid's terminal reply.
+                        self.decode_manager.remove_req(req)
                         self._free_req_resources(req)
-                    continue
-                if req.aborted:
-                    # Aborted while this final-chunk prefill / decode step was in flight: free
-                    # here (the forward is drained) and finish the request. No DetokenizeMsg --
-                    # the abort ack flushed after this method stays the uid's terminal reply.
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                    continue
-                if req in self.finished_reqs:
-                    # Overlap scheduling launched one more decode step for a request that
-                    # already terminated (filter_reqs keeps it while output budget remains,
-                    # and the next batch is scheduled before this drain runs). Its resources
-                    # are freed below/already; shipping this token would append past the
-                    # client's terminal reply.
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                        new_finished_reqs.add(req)
+                        continue
+                    if req in self.finished_reqs:
+                        # Overlap scheduling launched one more decode step for a request that
+                        # already terminated (filter_reqs keeps it while output budget remains,
+                        # and the next batch is scheduled before this drain runs). Its resources
+                        # are freed below/already; shipping this token would append past the
+                        # client's terminal reply.
+                        continue
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length.
+                    hit_length = not req.can_decode
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    # NOTE: overlap scheduling may make the request freed twice, skip second free
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif batch.is_prefill and req.table_idx != -1:
+                        # for prefill, non-chunk req, cache the prefix.
+                        # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+                        # the generic manager inserts the prefix into its radix/naive cache.
+                        # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+                        # instead of freeing them (handled above), so a freed request should
+                        # never reach this commit -- but if a future path frees one early, skip
+                        # rather than re-read the freed page-table row (and on hybrid, deref the
+                        # None'd GDN ping-pong slots).
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
-        used, total = self._kv_usage_pages()
-        mamba_slots = self._mamba_slot_usage()
-        swa_tokens = self._swa_token_usage()
+        with profiler_phase("decode_usage_snapshot"):
+            used, total = self._kv_usage_pages()
+            mamba_slots = self._mamba_slot_usage()
+            swa_tokens = self._swa_token_usage()
         if reply:
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
@@ -405,18 +420,26 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
-        self.status_reporter.report_batch(
-            batch,
-            running_reqs=len(self.decode_manager.running_reqs),
-            queue_reqs=len(self.prefill_manager.pending_list),
-            kv_used_pages=used,
-            kv_total_pages=total,
-            page_size=self.config.page_size,
-            mamba_slots=mamba_slots,
-            swa_tokens=swa_tokens,
-            moe_stats=self._moe_stats_snapshot(),
-        )
-        self.send_result(reply)
+        with profiler_phase("decode_status_report"):
+            stats_due = getattr(self.status_reporter, "decode_stats_due", None)
+            moe_stats = (
+                self._moe_stats_snapshot()
+                if stats_due is None or stats_due(batch)
+                else None
+            )
+            self.status_reporter.report_batch(
+                batch,
+                running_reqs=len(self.decode_manager.running_reqs),
+                queue_reqs=len(self.prefill_manager.pending_list),
+                kv_used_pages=used,
+                kv_total_pages=total,
+                page_size=self.config.page_size,
+                mamba_slots=mamba_slots,
+                swa_tokens=swa_tokens,
+                moe_stats=moe_stats,
+            )
+        with profiler_phase("decode_result_send"):
+            self.send_result(reply)
 
     def _moe_stats_snapshot(self) -> dict | None:
         """Per-window MoE cache hit/miss stats for the decode log line, or None when
@@ -773,6 +796,10 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        with profiler_phase("scheduler_prepare"):
+            return self._prepare_batch_impl(batch)
+
+    def _prepare_batch_impl(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -793,10 +820,11 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged(batch.reqs)
         if batch.is_prefill:
             self._gather_multimodal(batch)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
+        with profiler_phase("token_pool_gather"):
+            batch.positions = _make_positions(batch, self.device)
+            input_mapping = _make_input_tuple(batch, self.device)
+            write_mapping = _make_write_tuple(batch, self.device)
+            batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
             if batch.is_decode:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
@@ -823,7 +851,8 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        with profiler_phase("attention_metadata"):
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
