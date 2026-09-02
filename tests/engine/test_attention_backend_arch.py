@@ -146,3 +146,43 @@ def test_explicit_fi_rejected_on_hip(monkeypatch):
     with pytest.raises(RuntimeError, match="NVIDIA-only"):
         _adjust_config(config)
     gpu.vendor.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "moe_backend, cpu_layers, expect_graph_bs",
+    [
+        ("hybrid", None, 0),  # CPU executor inside the decode forward -> eager
+        ("cpu", None, 0),
+        ("offload", "0-3", 0),  # explicit CPU layers under offload -> eager
+        ("offload", None, 4),  # pure GPU offload: graphs stay as requested
+    ],
+)
+def test_hip_forces_eager_decode_for_cpu_moe_executor(
+    monkeypatch, moe_backend, cpu_layers, expect_graph_bs
+):
+    # HIP stream capture records the D2H/H2D memcpy nodes but neither the host-function
+    # node nor the stream memops that drive the CPU MoE executor, so a replayed decode
+    # graph would reuse the capture-time CPU partial (measured on ROCm 7.14 / gfx1201:
+    # tests/moe/test_cpu_moe.py::test_cpu_moe_decode_cuda_graph_replay). The config
+    # resolver must force eager decode for every backend that runs the executor.
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.runtime import gpu
+
+    monkeypatch.setenv("FREETOKEN_GPU_VENDOR", "amd")
+    monkeypatch.setenv("FREETOKEN_HIP_GRAPH_REPLAY", "1")  # the ISA gate is not the subject
+    monkeypatch.setattr(gpu, "gcn_arch", lambda index=None: "gfx1201")
+    gpu.vendor.cache_clear()
+    _patch_env(monkeypatch, major=12)
+    config = _engine_config(
+        attention_backend="triton",
+        moe_backend=moe_backend,
+        moe_cpu_layers=cpu_layers,
+        cuda_graph_max_bs=4,
+    )
+    config.model_config.is_moe = True
+    config.model_config.num_moe_layers = 10
+    config.model_config.num_experts = 8
+    config.model_config.expert_quant = "nvfp4"
+    _adjust_config(config)
+    assert config.cuda_graph_max_bs == expect_graph_bs
+    gpu.vendor.cache_clear()

@@ -700,10 +700,17 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
+        tp_size = config.tp_info.size
+        override = os.environ.get("FREETOKEN_HYBRID_FETCH_FRACTION", "").strip()
+        if override:
+            fraction = min(1.0, max(0.0, float(override)))
+            source = "FREETOKEN_HYBRID_FETCH_FRACTION"
+        else:
+            gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+            fraction = load_hybrid_fetch_fraction(
+                cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid, tp_size=tp_size
+            )
+            source = f"benched PCIe/CPU bandwidth ratio, CPU shared by TP={tp_size}"
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -715,7 +722,7 @@ class Engine:
         cache.hybrid_fetch_fraction = fraction
         logger.info_rank0(
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
-            "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
+            f"expert misses over PCIe ({source}), the rest on the CPU"
         )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -734,6 +741,19 @@ class Engine:
             raise NotImplementedError(
                 "CPU MoE backend is not yet supported for this model architecture "
                 f"(MoE layer {type(sample).__name__} is missing {required})."
+            )
+        from freetoken.runtime.gpu import is_hip
+
+        if is_hip() and (config.cuda_graph_max_bs or 0) > 0:
+            # Same rule as _adjust_config, reached here for the AUTO-assigned CPU-layer
+            # set under --moe-backend offload (resolved from the pin budget, unknown at
+            # config time). Runs before GraphRunner is built, so no graph is captured.
+            object.__setattr__(config, "cuda_graph_max_bs", 0)
+            object.__setattr__(config, "cuda_graph_bs", None)
+            logger.warning_rank0(
+                "HIP: the CPU MoE executor runs from inside the decode forward and HIP "
+                "graph replay does not re-run host-function nodes or stream memops "
+                "(stale CPU partial on replay). Forcing --cuda-graph-max-bs 0 (eager decode)."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
@@ -1426,6 +1446,27 @@ def _adjust_config(config: EngineConfig):
             "HIP gfx1201: defaulting --cuda-graph-max-bs 0 (graph replay is "
             "unsafe on this ISA until confirmed on-box). Set "
             "FREETOKEN_HIP_GRAPH_REPLAY=1 to try graphs."
+        )
+    if is_hip() and (config.cuda_graph_max_bs or 0) > 0 and (
+        config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers is not None
+    ):
+        # The CPU MoE executor is driven from inside the decode forward by stream-ordered
+        # host work: a cudaLaunchHostFunc pair, or the stream-memop flag handshake. HIP
+        # stream capture records neither (measured on ROCm 7.14 / gfx1201: the D2H/H2D
+        # memcpy nodes replay, the host node and the memops do not), so a replayed graph
+        # reads the CPU partial from the CAPTURE-time run -- stale routed experts every
+        # step, degraded output with no error. tests/moe/test_cpu_moe.py::
+        # test_cpu_moe_decode_cuda_graph_replay is the reproducer. Keep these backends
+        # eager on HIP until per-layer graph segmentation exists.
+        override("cuda_graph_max_bs", 0)
+        override("cuda_graph_bs", None)
+        logger.warning_rank0(
+            f"HIP: --moe-backend {config.moe_backend}"
+            + (" / --moe-cpu-layers" if config.moe_cpu_layers is not None else "")
+            + " runs the CPU MoE executor from inside the decode forward; HIP graph "
+            "replay does not re-run host-function nodes or stream memops, so a captured "
+            "decode would reuse the capture-time CPU partial (stale experts, silently "
+            "wrong output). Forcing --cuda-graph-max-bs 0 (eager decode)."
         )
 
     if config.moe_cache_rate is not None:

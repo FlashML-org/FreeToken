@@ -439,6 +439,18 @@ def _reference(cache, layer, hidden, ids, w, act="silu", apply_in=False):
     return out
 
 
+# HIP stream capture replays the D2H/H2D memcpy nodes but neither the cudaLaunchHostFunc
+# host node nor the stream memops (ROCm 7.14 / gfx1201): the replay reads the capture-time
+# CPU partial. The engine forces eager decode for cpu/hybrid on HIP (engine._adjust_config);
+# strict so a ROCm that starts replaying host nodes flags the guard for removal.
+_hip_graph_replay_xfail = pytest.mark.xfail(
+    torch.version.hip is not None,
+    strict=True,
+    reason="HIP graph replay does not re-run host-function nodes / stream memops",
+)
+
+
+@_hip_graph_replay_xfail
 def test_cpu_moe_decode_cuda_graph_replay():
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -509,6 +521,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+@_hip_graph_replay_xfail
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
@@ -566,6 +579,7 @@ def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     print("cpu moe cuda graph replay (mxfp4) OK")
 
 
+@_hip_graph_replay_xfail
 def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
     """DeepSeek-V4 ds_fp4 path under capture/replay: the 4-phase pipeline (input
     FP8 round-trip -> gate_up -> intermediate FP8 round-trip -> down) must recompute

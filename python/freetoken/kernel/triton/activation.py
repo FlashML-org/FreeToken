@@ -133,9 +133,13 @@ def _act_and_mul(
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
+    # `launch_pdl` is a Triton launch OPTION (not a kernel arg); the HIP backend rejects
+    # it even as False ("Keyword argument launch_pdl was specified but unrecognised"),
+    # so it is only passed where PDL is actually on.
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        **({"launch_pdl": True} if pdl else {}),
     )
     return out
 

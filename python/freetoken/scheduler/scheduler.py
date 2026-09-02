@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -868,10 +869,62 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        prof = self._decode_profiler(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if prof is not None:
+            self._decode_profiler_finish(prof)
         return forward_output
+
+    # ---- FREETOKEN_PROFILE_DECODE=<steps>: kernel-level profile of decode steps ----
+    # After FREETOKEN_PROFILE_DECODE_SKIP (default 8) decode forwards, the next <steps>
+    # decode forwards run under torch.profiler (CPU+GPU activities); the per-kernel table
+    # and a chrome trace land in FREETOKEN_PROFILE_DIR (default /tmp). Diagnostic only.
+    _prof_state: dict = {}
+
+    def _decode_profiler(self, batch):
+        steps = int(os.environ.get("FREETOKEN_PROFILE_DECODE", "0") or 0)
+        if steps <= 0 or batch.is_prefill:
+            return None
+        st = self._prof_state
+        st["seen"] = st.get("seen", 0) + 1
+        skip = int(os.environ.get("FREETOKEN_PROFILE_DECODE_SKIP", "8") or 8)
+        if st.get("done") or st["seen"] <= skip:
+            return None
+        if "prof" not in st:
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize(self.device)
+            st["prof"] = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            st["prof"].__enter__()
+            st["left"] = steps
+            logger.info(f"decode profiler: capturing {steps} decode steps")
+        return st["prof"]
+
+    def _decode_profiler_finish(self, prof) -> None:
+        st = self._prof_state
+        st["left"] -= 1
+        if st["left"] > 0:
+            return
+        torch.cuda.synchronize(self.device)
+        prof.__exit__(None, None, None)
+        st["done"] = True
+        del st["prof"]
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        rank = tp.rank if tp is not None else 0
+        out_dir = os.environ.get("FREETOKEN_PROFILE_DIR", "/tmp")
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=80)
+        path = os.path.join(out_dir, f"ft-decode-profile-rank{rank}.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(table)
+        try:
+            prof.export_chrome_trace(os.path.join(out_dir, f"ft-decode-trace-rank{rank}.json"))
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not kill the serve
+            logger.warning(f"decode profiler: chrome trace export failed: {exc}")
+        logger.info(f"decode profiler: wrote {path}")
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
