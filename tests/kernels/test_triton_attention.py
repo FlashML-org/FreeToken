@@ -781,3 +781,260 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+def _fp8_cache(k_rows: torch.Tensor, v_rows: torch.Tensor):
+    """Quantize ``[slots, heads, dim]`` KV into codes + scales, in the layout the
+    attention kernels expect."""
+    from freetoken.kernel.triton.kv_quant import alloc_codes, quantize_kv_to_cache
+
+    slots, heads, dim = k_rows.shape
+    k_cache = alloc_codes((slots, heads, dim), k_rows.device)
+    v_cache = alloc_codes((slots, heads, dim), k_rows.device)
+    k_scale = torch.zeros((slots, heads), dtype=torch.float32, device=k_rows.device)
+    v_scale = torch.zeros((slots, heads), dtype=torch.float32, device=k_rows.device)
+    quantize_kv_to_cache(
+        k=k_rows.reshape(slots, heads * dim),
+        v=v_rows.reshape(slots, heads * dim),
+        out_loc=torch.arange(slots, dtype=torch.int32, device=k_rows.device),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+    return k_cache, v_cache, k_scale, v_scale
+
+
+def _dequantized(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Host-side decode (torch's e4m3 cast), so the reference never reuses the
+    software decoder the kernel is being tested against."""
+    from freetoken.kernel.triton.kv_quant import codes_to_f32
+
+    return codes_to_f32(codes) * scale.unsqueeze(-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize(("head_dim", "num_kv_heads"), [(64, 4), (128, 2)])
+def test_decode_paged_attention_decodes_fp8_scales(head_dim: int, num_kv_heads: int):
+    """fp8 decode must equal the SAME data dequantized by hand.
+
+    Not compared against the bf16 cache: the fp8-vs-bf16 gap is quantization error,
+    already bounded in tests/kernels/test_kv_fp8.py. What this pins is that the
+    kernel applies the right scale to the right row -- a dropped or mis-indexed
+    scale is off by a factor of amax/448, which no tolerance hides.
+    """
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    batch, num_q_heads, max_kv_splits = 2, 8, 8
+    seq_lens = [6, 9]
+    total_kv = sum(seq_lens)
+    q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    # Row magnitudes far from 1, so a missing scale cannot pass by luck.
+    k_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 8.0).to(
+        torch.bfloat16
+    )
+    v_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.05).to(
+        torch.bfloat16
+    )
+    indptr = torch.tensor([0, seq_lens[0], total_kv], dtype=torch.int32, device=device)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    q_positions = torch.tensor(
+        [seq_lens[0] - 1, seq_lens[1] - 1], dtype=torch.int64, device=device
+    )
+    q_to_req = torch.arange(batch, dtype=torch.int32, device=device)
+    attn_logits = torch.empty(
+        batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=device
+    )
+    attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device)
+    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
+    sm_scale = head_dim**-0.5
+
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_rows, v_rows)
+    actual = decode_paged_attention(
+        q,
+        k_codes,
+        v_codes,
+        indptr,
+        indices,
+        q_positions,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        _dequantized(k_codes, k_scale),
+        _dequantized(v_codes, v_scale),
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    # The kernel rounds the decoded operands to the compute dtype before tl.dot; the
+    # reference stays in fp32, hence the same tolerance the bf16 tests already use.
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_paged_attention_decodes_fp8_scales():
+    """The non-tl.dot fallback kernel takes the same scales (it serves head_dim > 256
+    with a short prefill, and every decode batch when the grouped path is not used)."""
+    from freetoken.kernel.triton.attention import paged_attention
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 4
+    seq_lens = [5, 3]
+    total_kv = sum(seq_lens)
+    q = torch.randn(total_kv, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 16.0).to(
+        torch.bfloat16
+    )
+    v_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.02).to(
+        torch.bfloat16
+    )
+    indptr = torch.tensor([0, seq_lens[0], total_kv], dtype=torch.int32, device=device)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    q_to_req = torch.tensor(
+        [0] * seq_lens[0] + [1] * seq_lens[1], dtype=torch.int32, device=device
+    )
+    q_positions = torch.cat(
+        [
+            torch.arange(seq_lens[0], dtype=torch.int64, device=device),
+            torch.arange(seq_lens[1], dtype=torch.int64, device=device),
+        ]
+    )
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_rows, v_rows)
+    actual = paged_attention(
+        q,
+        k_codes,
+        v_codes,
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        head_dim**-0.5,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        _dequantized(k_codes, k_scale),
+        _dequantized(v_codes, v_scale),
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        head_dim**-0.5,
+        None,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("use_split_inputs", [False, True])
+def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
+    """Prefill over an fp8 cache.
+
+    With ``use_split_inputs`` the kernel reads a request's own new tokens from
+    ``k_extend`` (compute dtype, never quantized) and only the cached prefix from the
+    fp8 codes; without it every row is served from the codes. The reference mirrors
+    that split, so a scale leaking onto the extend path -- or failing to apply to the
+    cache path -- cannot pass.
+    """
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    torch.manual_seed(14)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 8
+    cached_lens, extend_lens = [4, 2], [3, 2]
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    total_q, total_kv = sum(extend_lens), sum(seq_lens)
+    q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+        torch.bfloat16
+    )
+    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 6.0).to(
+        torch.bfloat16
+    )
+    # Magnitudes far from 1: a dropped scale is then off by orders of magnitude.
+    k_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.3).to(
+        torch.bfloat16
+    )
+    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 30.0).to(
+        torch.bfloat16
+    )
+    qo_indptr = torch.tensor([0] + extend_lens, dtype=torch.int32, device=device).cumsum_(0)
+    kv_indptr = torch.tensor([0] + seq_lens, dtype=torch.int32, device=device).cumsum_(0)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
+    q_to_req = torch.empty(total_q, dtype=torch.int32, device=device)
+    q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
+    q_off = kv_off = 0
+    for req_idx, (cached_len, extend_len) in enumerate(zip(cached_lens, extend_lens)):
+        q_to_req[q_off : q_off + extend_len].fill_(req_idx)
+        q_positions[q_off : q_off + extend_len] = torch.arange(
+            cached_len, cached_len + extend_len, dtype=torch.int64, device=device
+        )
+        # The step's own tokens are what the engine stores at the tail of the span.
+        k_cache[kv_off + cached_len : kv_off + cached_len + extend_len] = k_extend[
+            q_off : q_off + extend_len
+        ]
+        v_cache[kv_off + cached_len : kv_off + cached_len + extend_len] = v_extend[
+            q_off : q_off + extend_len
+        ]
+        q_off += extend_len
+        kv_off += cached_len + extend_len
+    sm_scale = head_dim**-0.5
+
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_cache, v_cache)
+    k_ref = _dequantized(k_codes, k_scale).clone()
+    v_ref = _dequantized(v_codes, v_scale).clone()
+    if use_split_inputs:
+        q_off = kv_off = 0
+        for cached_len, extend_len in zip(cached_lens, extend_lens):
+            k_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = k_extend[
+                q_off : q_off + extend_len
+            ]
+            v_ref[kv_off + cached_len : kv_off + cached_len + extend_len] = v_extend[
+                q_off : q_off + extend_len
+            ]
+            q_off += extend_len
+            kv_off += cached_len + extend_len
+
+    actual = extend_paged_attention(
+        q=q,
+        k_cache=k_codes,
+        v_cache=v_codes,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=indices,
+        prefix_lens=prefix_lens,
+        max_q_len=max(extend_lens),
+        sm_scale=sm_scale,
+        k_extend=k_extend if use_split_inputs else None,
+        v_extend=v_extend if use_split_inputs else None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        k_ref,
+        v_ref,
+        kv_indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=3e-2, rtol=3e-2)

@@ -9,12 +9,16 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -29,6 +33,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_kss,
+    stride_vss,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -46,6 +52,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # e4m3 KV pool (kvcache/mha_pool.py): read codes + per-token row scales instead of
+    # 16-bit values. The bf16 branch below stays exactly as it was, instruction for
+    # instruction, for the unquantized default.
+    HAS_KV_SCALE: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -101,24 +111,66 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if HAS_KV_SCALE:
+            # The scale row is the slot the code lives in: QSA pins page_size to this
+            # kernel's PAGE_SIZE (attention/__init__.py registers page_sizes=(64,)), so
+            # slot = page * PAGE_SIZE + offset addresses k_scale/v_scale exactly.
+            scale_slot = safe_page * PAGE_SIZE + page_offset  # safe_page is int64
+            # Invalid columns mask the codes to 0.0 and the scale to 1.0, and slots that
+            # were never written read back 0.0 * 0.0 -- both buffers are zero-filled.
+            # Either way the operand stays finite, so the -inf row mask below is what
+            # decides such a column's fate rather than a NaN poisoning the row.
+            s_k = tl.load(
+                k_scale_ptr + scale_slot[None, :] * stride_kss + kv_head,
+                mask=valid[None, :],
+                other=1.0,
+            )
+            s_v = tl.load(
+                v_scale_ptr + scale_slot[:, None] * stride_vss + kv_head,
+                mask=valid[:, None],
+                other=1.0,
+            )
+            keys = (
+                kv_load_e4m3_tile_f32(
+                    k_cache_ptr
+                    + safe_page[None, :] * stride_k_block
+                    + page_offset[None, :] * stride_k_token
+                    + kv_head * stride_k_head
+                    + dim_offsets[:, None],
+                    valid[None, :],
+                )
+                * s_k
+            ).to(query.dtype)
+            values = (
+                kv_load_e4m3_tile_f32(
+                    v_cache_ptr
+                    + safe_page[:, None] * stride_v_block
+                    + page_offset[:, None] * stride_v_token
+                    + kv_head * stride_v_head
+                    + dim_offsets[None, :],
+                    valid[:, None],
+                )
+                * s_v
+            ).to(query.dtype)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -232,8 +284,10 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged K/V caches (bf16, or e4m3 + row scales)."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +301,23 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    if (k_scale is None) != (v_scale is None):
+        raise ValueError("QSA sparse attention requires both KV scale tensors")
+    if k_scale is not None:
+        # The pool hands out 1-byte e4m3 codes plus one fp32 row scale per
+        # (slot, kv_head); the kernel rebuilds that slot as
+        # page * PAGE_SIZE + page_offset, which is exact only because QSA pins
+        # page_size to PAGE_SIZE (page_sizes=(64,) in attention/__init__.py).
+        if k_cache.element_size() != 1 or v_cache.element_size() != 1:
+            raise ValueError("QSA KV scales require 1-byte e4m3 code caches")
+        if k_scale.dtype is not torch.float32 or v_scale.dtype is not torch.float32:
+            raise ValueError("QSA KV scale tensors must be float32")
+        want = (k_cache.shape[0] * k_cache.shape[1], k_cache.shape[2])
+        if k_scale.shape != want or v_scale.shape != want:
+            raise ValueError(f"QSA KV scale tensors must have shape {want}")
+        assert k_scale.stride(1) == v_scale.stride(1) == 1
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -303,6 +373,10 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        # Never dereferenced while HAS_KV_SCALE is False -- pass the caches so the
+        # launch stays type-valid without a second None-handling path.
+        k_cache if k_scale is None else k_scale,
+        v_cache if v_scale is None else v_scale,
         logical_indices,
         block_table,
         token_to_req,
@@ -317,6 +391,8 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        0 if k_scale is None else k_scale.stride(0),
+        0 if v_scale is None else v_scale.stride(0),
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -334,6 +410,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        HAS_KV_SCALE=k_scale is not None,
         num_warps=partial_warps,
         num_stages=2,
     )

@@ -9,6 +9,9 @@ from freetoken.utils import div_even, init_logger, mem_GB
 
 logger = init_logger(__name__)
 
+# One fp32 scale per (token, slab, layer, kv head) rides alongside fp8 KV codes.
+FP8_KV_SCALE_BYTES = 4
+
 
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
@@ -16,12 +19,40 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
+def kv_storage_bytes_per_elem(config) -> int:
+    """Storage bytes of ONE cached KV element under the configured quantization.
+
+    ``kv_quant == "fp8"`` stores e4m3 codes (1 byte) instead of the 16-bit compute
+    dtype; anything else is the compute dtype itself. Single source for the pool's
+    allocation, the budget math below, and the AOT kernel-shape table.
+    """
+    quant = getattr(config, "kv_quant", "none")
+    if quant == "fp8":
+        return 1
+    if quant != "none":
+        raise ValueError(f"unknown kv_quant {quant!r}")
+    return config.dtype.itemsize
+
+
+def kv_scale_bytes_per_token(spec, config) -> int:
+    """Sidecar scale bytes per token of one group: the fp8 cache keeps one fp32 scale
+    per (token, slab, layer, kv head). 0 for the unquantized pool.
+
+    Priced here rather than inside the pool so ``kv_cost`` and the pool's own
+    allocation can never disagree -- the same rule the 16-bit path follows."""
+    if getattr(config, "kv_quant", "none") != "fp8":
+        return 0
+    heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+    return (1 if spec.mla else 2) * spec.num_layers * heads * FP8_KV_SCALE_BYTES
+
+
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
-    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+    x layers, plus the fp8 scale sidecar when the cache is quantized, plus the bf16 DSA
+    index-key slab when the spec carries indexer dims. Pure per-spec arithmetic -- pool
+    families compose it over THEIR OWN groups; no family branching here. (2 bytes/elem ==
+    the torch.bfloat16 dsa_pool.DSAKVCache._alloc hardcodes; keep the two in lockstep if the
+    slab dtype ever changes.)
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
@@ -29,10 +60,14 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_storage_bytes_per_elem(config)
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+    return (
+        per_token
+        + kv_scale_bytes_per_token(spec, config)
+        + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+    )
 
 
 class BaseKVCachePool(ABC):
@@ -44,6 +79,12 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+
+    # KV storage quantization: "none" keeps the compute dtype, "fp8" keeps e4m3 codes plus
+    # one fp32 scale per (token, slab, layer, kv head). A pool that does not implement the
+    # quantized allocation/store/scale-view trio stays at "none"; create_kv_pool rejects a
+    # quantization the family does not implement, so nothing here is ever silently ignored.
+    kv_quant: str = "none"
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family
@@ -154,13 +195,36 @@ class BaseKVCachePool(ABC):
         layer_id: int,
     ) -> None: ...
 
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        """fp32 ``[num_slots, local_kv_heads]`` scale of ``k_cache(index)``, indexed by the
+        same slot; None when the pool is not quantized."""
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        """fp32 ``[num_slots, local_kv_heads]`` scale of ``v_cache(index)``; see k_scale."""
+        return None
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...
 
     @property
     @abstractmethod
-    def dtype(self) -> torch.dtype: ...
+    def dtype(self) -> torch.dtype:
+        """The pool's COMPUTE dtype: the dtype of the K/V rows a backend hands to
+        ``store_kv``, and what backends size their scratch with. A quantized (e4m3)
+        pool still answers 16-bit here -- code bytes handed to a scratch buffer end up
+        as the rhs of a ``tl.dot`` that has no fp8 path (QSA's indexer died this way at
+        graph capture). See :attr:`store_dtype` for what the buffer holds."""
+        ...
+
+    @property
+    def store_dtype(self) -> torch.dtype:
+        """Element type of the KV buffer: e4m3/uint8 codes on a quantized pool, else
+        :attr:`dtype`. Only code that touches the buffer itself needs this; attention
+        backends that cannot apply the row scales are refused a quantized pool up
+        front (``BackendInfo.supports_fp8_kv``)."""
+        return self.dtype
 
     @property
     @abstractmethod
