@@ -336,15 +336,43 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
-            )
+        self._allocate_slot_caches(self.cache_size, self.bank_sources)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def _allocate_slot_caches(
+        self, cache_size: int, sources: dict[str, list[torch.Tensor]]
+    ) -> None:
+        """Allocate per-bank GPU slot caches. Host banks stay registered; this is
+        only the active-expert working set.
+
+        On HIP, refuse a single ``torch.empty`` larger than the contiguous cap
+        (the 10.21 GiB DSV4 ``gate_up_packed`` alloc that failed with 22 GiB free).
+        NVIDIA does not apply that cap.
+        """
+        from freetoken.engine.cache_budget import hip_max_contiguous_bank_bytes, require_slot_cache_contiguous
+        from freetoken.runtime.gpu import is_hip
+
+        max_contig = None
+        if is_hip() and self.device.type == "cuda":
+            try:
+                free, _total = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                free = 0
+            if free:
+                max_contig = hip_max_contiguous_bank_bytes(int(free))
+        require_slot_cache_contiguous(cache_size, sources, max_contiguous_bytes=max_contig)
+        caches: dict[str, torch.Tensor] = {}
+        for name in self.bank_schema:
+            head = sources[name][0]
+            caches[name] = torch.empty(
+                (cache_size, *head.shape[1:]),
+                dtype=head.dtype,
+                device=self.device,
+            )
+        self.bank_caches = caches
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -467,11 +495,7 @@ class OffloadMoeCache:
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
-        for name in self.bank_schema:
-            head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
-            )
+        self._allocate_slot_caches(cache_size, self.bank_sources)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).

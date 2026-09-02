@@ -514,12 +514,30 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            hip_max_contiguous_bank_bytes,
+            max_bank_row_bytes,
+            resolve_moe_cache_auto,
+        )
+        from freetoken.runtime.gpu import is_hip
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        max_row = max_bank_row_bytes(banks.sources)
+        max_contig = None
+        if is_hip():
+            free = getattr(self, "_post_weights_free", 0) or 0
+            max_contig = hip_max_contiguous_bank_bytes(free)
+            if max_row and max_contig:
+                logger.info_rank0(
+                    f"HIP: cap MoE GPU slot cache so the largest bank tensor is "
+                    f"<= {max_contig / (1 << 30):.2f} GiB "
+                    f"({max_contig // max_row} slots); host banks stay registered "
+                    f"shmem (not copied wholesale). FREETOKEN_HIP_MOE_MAX_BANK_GIB overrides."
+                )
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -533,6 +551,8 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
+            max_bank_row_bytes=max_row,
+            max_contiguous_bytes=max_contig,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
