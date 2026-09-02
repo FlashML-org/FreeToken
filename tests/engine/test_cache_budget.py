@@ -112,6 +112,26 @@ def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     assert size == 8 and pages == 40 and overlap is True
 
 
+def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=940,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=False,
+        kv_reserve_tokens=256,
+        page_size=64,
+        quant_format="bf16",
+    )
+    assert overlap is False
+    assert (pages - 1) * 64 >= 256
+    assert size == 8 and pages == 14
+
+
 def test_resolve_auto_marlin_caps_slots():
     size, _, _ = resolve_moe_cache_auto(
         baseline_free=10_000_000, weights_bytes=0, memory_ratio=1.0,
