@@ -514,30 +514,12 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import (
-            expert_bytes_per_slot,
-            hip_max_contiguous_bank_bytes,
-            max_bank_row_bytes,
-            resolve_moe_cache_auto,
-        )
-        from freetoken.runtime.gpu import is_hip
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        max_row = max_bank_row_bytes(banks.sources)
-        max_contig = None
-        if is_hip():
-            free = getattr(self, "_post_weights_free", 0) or 0
-            max_contig = hip_max_contiguous_bank_bytes(free)
-            if max_row and max_contig:
-                logger.info_rank0(
-                    f"HIP: cap MoE GPU slot cache so the largest bank tensor is "
-                    f"<= {max_contig / (1 << 30):.2f} GiB "
-                    f"({max_contig // max_row} slots); host banks stay registered "
-                    f"shmem (not copied wholesale). FREETOKEN_HIP_MOE_MAX_BANK_GIB overrides."
-                )
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -551,8 +533,6 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
-            max_bank_row_bytes=max_row,
-            max_contiguous_bytes=max_contig,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -1067,8 +1047,25 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
     return ident["name"], ident["uuid"]
 
 
+# Measured on 2x R9700 / ROCm 7.14 (torch 2.11.0+rocm7.14.1): with expandable
+# segments the allocator dies at ~1016 physical memory handles per process, no
+# matter their size -- ROCr keeps hipMemCreate handles in a fixed
+# mem_handle_aperture and exposes no knob for it. PyTorch maps 20 MiB (large pool)
+# or 2 MiB (small pool) per handle, so the ceiling is ~20 GiB of a 32 GiB card, and
+# ~2 GiB if the tensors are small. DSV4's resident weights are hundreds of small
+# tensors; after loading them every further allocation failed with 22 GiB free.
+HIP_EXPANDABLE_SEGMENTS_HANDLE_CAP = 1016
+
+
+def expandable_segments_default() -> bool:
+    """Whether this build should default the caching allocator to expandable segments."""
+    from freetoken.runtime.gpu import is_hip
+
+    return not is_hip()
+
+
 def _ensure_expandable_segments() -> None:
-    """Default the CUDA allocator to expandable segments.
+    """Default the CUDA allocator to expandable segments (NVIDIA only).
 
     The motivating case is the offload prefill, which repeatedly dequantizes
     variable-sized NVFP4 expert blocks to BF16 (a different size per layer as the
@@ -1076,7 +1073,10 @@ def _ensure_expandable_segments() -> None:
     allocator fragments badly -- reserved memory can balloon far past the actual peak
     allocation (observed ~78GiB reserved for a <30GiB working set).
     ``expandable_segments`` lets freed regions of any size be reused, keeping
-    reserved ~= allocated, so it is applied to every run, not just offload ones.
+    reserved ~= allocated, so it is applied to every NVIDIA run, not just offload ones.
+
+    On HIP it stays off: see ``HIP_EXPANDABLE_SEGMENTS_HANDLE_CAP``. A ROCm process
+    with expandable segments cannot address most of its VRAM.
 
     Env vars are parsed once at import and ignored if set afterwards, so we apply the
     setting via the runtime API instead. Must run before the first CUDA allocation (the
@@ -1084,6 +1084,14 @@ def _ensure_expandable_segments() -> None:
     is respected and left untouched.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        return
+    if not expandable_segments_default():
+        logger.info_rank0(
+            "HIP: expandable_segments stays off -- ROCm caps physical memory handles at "
+            f"~{HIP_EXPANDABLE_SEGMENTS_HANDLE_CAP} per process (20 MiB each -> ~20 GiB; "
+            "2 MiB small-pool -> ~2 GiB), so the allocator would refuse allocations with "
+            "VRAM free. Override via PYTORCH_ALLOC_CONF."
+        )
         return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
