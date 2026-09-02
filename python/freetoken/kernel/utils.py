@@ -23,6 +23,41 @@ DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_RO
 DEFAULT_LDFLAGS = []
 
 
+def _hip_ldflags() -> List[str]:
+    """``-L<dir>`` where the linker can resolve ``-lamdhip64``.
+
+    tvm-ffi links HIP builds with ``-lamdhip64`` and takes the search path from
+    torch's ``ROCM_HOME`` guess, which falls back to the parent of ``which hipcc``.
+    With the pip ``rocm-sdk`` wheels that is the venv (``.venv/bin/hipcc``), whose
+    ``lib/`` has no HIP runtime, so every JIT kernel fails to link unless the shell
+    happened to export ``ROCM_HOME``. The wheel's own lib dir ships only the
+    versioned ``libamdhip64.so.7`` (no dev symlink), so it cannot satisfy ``-l``
+    either; a system ROCm can. Whichever dir links, the DT_NEEDED soname resolves at
+    load time to the runtime torch already mapped, so the process keeps one HIP.
+    """
+    if not _is_hip_build():
+        return []
+    candidates: List[str] = []
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as fh:
+            for line in fh:
+                path = line.rsplit(" ", 1)[-1].strip()
+                if os.path.basename(path).startswith("libamdhip64.so"):
+                    candidates.append(os.path.dirname(path))
+                    break
+    except OSError:
+        pass
+    for key in ("ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        root = os.environ.get(key)
+        if root:
+            candidates.append(os.path.join(root, "lib"))
+    candidates.append("/opt/rocm/lib")
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, "libamdhip64.so")):
+            return [f"-L{d}"]
+    return []
+
+
 def _is_hip_build() -> bool:
     """True when this process should emit hipcc flags, not nvcc.
 
@@ -285,7 +320,7 @@ def load_aot(
         cuda_files=cuda_files,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
         extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+        extra_ldflags=DEFAULT_LDFLAGS + _hip_ldflags() + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
@@ -340,7 +375,7 @@ def load_jit(
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
         extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+        extra_ldflags=DEFAULT_LDFLAGS + _hip_ldflags() + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )

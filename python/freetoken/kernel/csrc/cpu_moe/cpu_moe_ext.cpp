@@ -36,6 +36,11 @@
 #define cudaStream_t hipStream_t
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
+// CUDA's host-callback calling-convention macro (empty on Linux, __stdcall on
+// Windows); HIP's hipHostFn_t is a plain function pointer.
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
 #else
 #include <cuda_runtime_api.h>
 #endif

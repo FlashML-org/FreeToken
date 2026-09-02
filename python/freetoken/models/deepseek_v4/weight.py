@@ -20,6 +20,9 @@ import torch
 from tqdm import tqdm
 
 from freetoken.models.loader import drop_page_cache
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 from .args import DeepseekV4Args, load_args
 
@@ -172,6 +175,67 @@ _EXPERT_RE = re.compile(
 )
 
 
+def _dsfp4_specs(args: DeepseekV4Args) -> dict:
+    E, H, I = args.n_routed_experts, args.dim, args.moe_inter_dim
+    e8m0 = torch.float8_e8m0fnu
+    return {  # alloc UNPINNED, fill, then pin-after-fill (skips slow cudaHostAlloc zero-fill)
+        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
+        "down_packed": ((E, H, I // 2), torch.uint8),
+        "down_scale": ((E, H, I // 32), e8m0),
+    }
+
+
+def _alloc_dsfp4_banks(model_path: str, args: DeepseekV4Args, *, persist: bool):
+    """``(hb, banks, pool, filled)``: per-layer host banks, optionally from the persistent
+    tmpfs pool (``FREETOKEN_BANK_PERSIST_DIR``). ``filled`` means the pool already holds
+    this checkpoint's experts and no read is needed."""
+    from freetoken.moe.host_banks import PersistentPool, alloc_layer_banks, alloc_persistent_layer_banks
+
+    specs = _dsfp4_specs(args)
+    L = args.n_layers
+    pool = PersistentPool.for_checkpoint(model_path, specs, L, tag="ds_fp4") if persist else None
+    if pool is None:
+        hb = alloc_layer_banks(specs, L)
+        filled = False
+    else:
+        hb, filled = alloc_persistent_layer_banks(specs, L, pool)
+    banks = {name: [b.tensor for b in hb[name]] for name in specs}
+    return hb, banks, pool, filled
+
+
+def _pin_all_layers(hb: dict, num_layers: int) -> None:
+    """Settle every (already filled) layer through the pin pipeline."""
+    from freetoken.moe.host_banks import PinPipeline
+
+    with PinPipeline() as pins:
+        for layer in range(num_layers):
+            pins(layer, {name: hb[name][layer] for name in hb})
+
+
+def _persistent_short_circuit(hb, banks, pool, filled, num_layers: int):
+    """The two ways a persistent pool skips the checkpoint read: it is already filled,
+    or another TP rank is filling it (rank-0-only fill; wait for its release). Returns
+    the banks when the caller must NOT read, else None."""
+    from freetoken.distributed import try_get_tp_info
+    from freetoken.moe.host_banks import persistent_fill_done
+
+    if pool is None:
+        return None
+    tp = try_get_tp_info()
+    if filled:
+        logger.info_rank0(f"expert banks: persistent pool {pool.dir} matches the checkpoint -> no read")
+        _pin_all_layers(hb, num_layers)
+        return banks
+    if tp is not None and tp.rank != 0:
+        logger.info(f"expert banks: rank {tp.rank} waits for rank 0 to fill {pool.dir}")
+        persistent_fill_done(pool, filled_by_me=False)
+        _pin_all_layers(hb, num_layers)
+        return banks
+    pool.invalidate()
+    return None
+
+
 def load_dsfp4_expert_sources(
     model_path: str, args: DeepseekV4Args, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:
@@ -186,14 +250,22 @@ def load_dsfp4_expert_sources(
     completion tracker fires into it instead -- nothing here is pinned, and the sink
     may release banks it has written out, so the returned tensors are only valid
     until then (the caller owns that tradeoff).
+
+    With ``FREETOKEN_BANK_PERSIST_DIR`` (serving only) the banks are tmpfs files that
+    outlive the process: a matching pool is mapped and pinned without any read, and a
+    fresh one is read by TP rank 0 alone while the other ranks wait.
     """
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, persistent_fill_done
 
     folder = model_path
-    weight_map = _weight_map(folder)
     L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
+    I = args.moe_inter_dim
 
+    hb, banks, pool, filled = _alloc_dsfp4_banks(model_path, args, persist=layer_sink is None)
+    if (done := _persistent_short_circuit(hb, banks, pool, filled, L)) is not None:
+        return done
+
+    weight_map = _weight_map(folder)
     for shard in sorted(set(weight_map.values())):
         drop_page_cache(os.path.join(folder, shard))
 
@@ -205,16 +277,6 @@ def load_dsfp4_expert_sources(
         if int(m.group("layer")) >= L:  # skip the MTP layer (index L)
             continue
         shards[shard].append((name, m))
-
-    e8m0 = torch.float8_e8m0fnu
-    specs = {  # alloc UNPINNED, fill, then pin-after-fill (skips slow cudaHostAlloc zero-fill)
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
-    hb = alloc_layer_banks(specs, L)
-    banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)  # {w1,w2,w3} x {weight,scale} x experts
@@ -237,6 +299,8 @@ def load_dsfp4_expert_sources(
 
     expected = L * E * 6  # {w1,w2,w3} x {weight, scale}
     assert placed == expected, f"loaded {placed} expert tensors, expected {expected}"
+    if pool is not None:
+        persistent_fill_done(pool, filled_by_me=True)
     return banks
 
 
@@ -244,15 +308,8 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
-    L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
-    e8m0 = torch.float8_e8m0fnu
-    specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
+    L = args.n_layers
+    specs = _dsfp4_specs(args)
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
     for t in banks["gate_up_packed"]:  # packed e2m1; scales stay 0 (valid e8m0)
@@ -300,19 +357,13 @@ def load_dsfp4_expert_sources_parallel(
     chunked multi-threaded O_DIRECT reader instead of serial per-shard safe_open.
     ``layer_sink``: see :func:`load_dsfp4_expert_sources`."""
     from freetoken.models.weight import iter_expert_tensors_parallel
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, persistent_fill_done
 
     L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
-    e8m0 = torch.float8_e8m0fnu
-    specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
-    }
-    hb = alloc_layer_banks(specs, L)  # lazy host banks (unpinned)
-    banks = {name: [b.tensor for b in hb[name]] for name in specs}
+    I = args.moe_inter_dim
+    hb, banks, pool, filled = _alloc_dsfp4_banks(model_path, args, persist=layer_sink is None)
+    if (done := _persistent_short_circuit(hb, banks, pool, filled, L)) is not None:
+        return done
 
     def _is_expert(name: str) -> bool:
         m = _EXPERT_RE.match(name)
@@ -335,6 +386,8 @@ def load_dsfp4_expert_sources_parallel(
 
     expected = L * E * 6
     assert placed == expected, f"loaded {placed} expert tensors, expected {expected}"
+    if pool is not None:
+        persistent_fill_done(pool, filled_by_me=True)
     return banks
 
 

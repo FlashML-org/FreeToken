@@ -132,12 +132,24 @@ def kfd_system_mem_limit_bytes() -> int | None:
 
 def require_shared_pool_capacity(*, need_bytes: int, tp_size: int) -> None:
     """Fail before the load when the shmem pool cannot be resident, or when every
-    TP rank cannot register it with its GPU. ``need_bytes <= 0`` skips (unit tests)."""
+    TP rank cannot register it with its GPU. ``need_bytes <= 0`` skips (unit tests).
+
+    Bank files already in the persistent pool (:func:`persist_present_bytes`) are RAM
+    the load will map or delete, not RAM it still needs on top of MemAvailable."""
     if need_bytes <= 0:
         return
+    present = persist_present_bytes()
+    if present:
+        logger.info(
+            f"persistent banks: {present / (1 << 30):.1f} GiB already resident in "
+            f"{persist_root()} -> counted against the {need_bytes / (1 << 30):.1f} GiB pool"
+        )
+        need_bytes_avail = max(0, need_bytes - present)
+    else:
+        need_bytes_avail = need_bytes
     need_gib = need_bytes / (1 << 30)
     avail = _meminfo_bytes("MemAvailable")
-    if avail is not None and avail < need_bytes:
+    if avail is not None and avail < need_bytes_avail:
         raise RuntimeError(
             f"shared expert pool needs ~{need_gib:.1f} GiB of RAM (shmem, pinned for the "
             f"GPUs) but MemAvailable is {avail / (1 << 30):.1f} GiB. Free memory "
@@ -272,13 +284,257 @@ def _open_shared_bank(path: str, asize: int) -> mmap.mmap:
         os.close(fd)  # the mapping keeps the inode alive
 
 
+
+# ---------------------------------------------------------------------------
+# Persistent pool: the shmem banks as tmpfs FILES so they outlive the process.
+# ---------------------------------------------------------------------------
+
+PERSIST_DIR_ENV = "FREETOKEN_BANK_PERSIST_DIR"
+_PERSIST_MANIFEST = "filled.json"
+_PERSIST_VERSION = 1
+_TMPFS_TYPES = frozenset({"tmpfs", "ramfs"})
+
+
+def persist_root() -> str | None:
+    """``FREETOKEN_BANK_PERSIST_DIR``: a tmpfs directory that keeps a model's expert
+    banks resident across serve restarts, or None (memfd pool, dies with the process)."""
+    root = os.environ.get(PERSIST_DIR_ENV, "").strip()
+    return root or None
+
+
+def _fs_type(path: str) -> str | None:
+    """Filesystem type of the mount holding ``path`` (longest mount-point prefix)."""
+    best, best_type = "", None
+    try:
+        real = os.path.realpath(path)
+        with open("/proc/self/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1].replace("\\040", " ")
+                if (real == mnt or real.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best):
+                    best, best_type = mnt, parts[2]
+    except OSError:
+        return None
+    return best_type
+
+
+def persist_present_bytes() -> int:
+    """Bytes of bank files already sitting in the persist root (any model). They are RAM
+    that a load does not need on top of what is free: the same model maps them, a
+    different model deletes them first."""
+    root = persist_root()
+    if root is None or not os.path.isdir(root):
+        return 0
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if f.endswith(".bank"):
+                try:
+                    total += os.stat(os.path.join(dirpath, f)).st_size
+                except OSError:
+                    pass
+    return total
+
+
+class PersistentPool:
+    """One model's expert banks as files under ``<root>/<key>/`` on tmpfs.
+
+    tmpfs files are shmem exactly like the memfd pool (no filesystem writeback, so no
+    KFD evict/restore storm), but they outlive the serve: the next start maps the same
+    inodes and, when ``filled.json`` matches the checkpoint, skips the 12-minute fill.
+    The pool is RAM for as long as the files exist; ``rm -r`` frees it.
+
+    ``identity`` pins the contents to a checkpoint: realpath, every shard's (size,
+    mtime_ns), the bank specs and layer count. A mismatch (or a missing manifest --
+    the previous fill died half-way) refills in place.
+    """
+
+    def __init__(self, root: str, key: str, identity: dict) -> None:
+        fs = _fs_type(root)
+        if fs not in _TMPFS_TYPES:
+            raise RuntimeError(
+                f"{PERSIST_DIR_ENV}={root!r} is on {fs or 'an unknown filesystem'}, not tmpfs. "
+                f"A disk-backed bank + hipHostRegister is a KFD writeback/restore storm; use a "
+                f"tmpfs mount sized for the pool, e.g. "
+                f"'mount -o remount,size=160G /dev/shm' and {PERSIST_DIR_ENV}=/dev/shm/freetoken-banks"
+            )
+        self.root = root
+        self.key = key
+        self.dir = os.path.join(root, key)
+        self.identity = identity
+
+    @classmethod
+    def for_checkpoint(
+        cls,
+        model_path: str,
+        specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        num_layers: int,
+        *,
+        tag: str = "",
+    ) -> "PersistentPool | None":
+        root = persist_root()
+        if root is None:
+            return None
+        import hashlib
+        import json
+
+        real = os.path.realpath(model_path)
+        shards = []
+        try:
+            for name in sorted(os.listdir(real)):
+                if name.endswith((".safetensors", ".json")):
+                    st = os.stat(os.path.join(real, name))
+                    shards.append([name, st.st_size, st.st_mtime_ns])
+        except OSError:
+            shards = [[real, 0, 0]]
+        identity = {
+            "version": _PERSIST_VERSION,
+            "model": real,
+            "tag": tag,
+            "num_layers": num_layers,
+            "specs": {n: [list(shape), str(dtype)] for n, (shape, dtype) in specs.items()},
+            "shards": shards,
+        }
+        key = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+        return cls(root, key, identity)
+
+    def bank_path(self, name: str, layer: int) -> str:
+        return os.path.join(self.dir, f"{name}.L{layer:03d}.bank")
+
+    @property
+    def manifest_path(self) -> str:
+        return os.path.join(self.dir, _PERSIST_MANIFEST)
+
+    def is_filled(self) -> bool:
+        import json
+
+        try:
+            with open(self.manifest_path, encoding="utf-8") as fh:
+                return json.load(fh) == self.identity
+        except (OSError, ValueError):
+            return False
+
+    def invalidate(self) -> None:
+        """Drop the manifest before a (re)fill so a crash mid-fill never reads as filled."""
+        try:
+            os.unlink(self.manifest_path)
+        except FileNotFoundError:
+            pass
+
+    def mark_filled(self) -> None:
+        import json
+
+        tmp = self.manifest_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.identity, fh, sort_keys=True)
+        os.replace(tmp, self.manifest_path)
+
+    def prepare_dir(self) -> None:
+        """Create ``dir``; evict any OTHER model's pool under the root first (the box
+        holds one 137 GiB pool, not two)."""
+        import shutil
+
+        os.makedirs(self.root, exist_ok=True)
+        for entry in os.listdir(self.root):
+            path = os.path.join(self.root, entry)
+            if entry != self.key and os.path.isdir(path):
+                logger.warning(f"persistent banks: evicting stale pool {path}")
+                shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(self.dir, exist_ok=True)
+
+    def create_or_open(self, name: str, layer: int, asize: int) -> str:
+        """Ensure the bank file exists at ``asize`` bytes; returns its path."""
+        path = self.bank_path(name, layer)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.fstat(fd).st_size != asize:
+                self.invalidate()  # size changed -> contents are not this checkpoint's
+                try:
+                    os.ftruncate(fd, asize)
+                except OSError as exc:
+                    if exc.errno in (errno.ENOSPC, errno.ENOMEM):
+                        raise RuntimeError(
+                            f"persistent bank {path}: cannot size {asize / (1 << 30):.1f} GiB "
+                            f"({os.strerror(exc.errno)}). Grow the tmpfs mount "
+                            f"(mount -o remount,size=<pool+margin> {self.root}) or free RAM."
+                        ) from exc
+                    raise
+        finally:
+            os.close(fd)
+        return path
+
+
+def alloc_persistent_layer_banks(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int, pool: PersistentPool
+) -> tuple[dict[str, list[HostBank]], bool]:
+    """Per-layer banks backed by ``pool``'s tmpfs files: ``({name: [HostBank]*layers}, filled)``.
+
+    Rank 0 creates/sizes the files and decides ``filled`` (manifest matches the
+    checkpoint); every rank maps the same files ``MAP_SHARED``. With TP>1 the paths and
+    the verdict travel over the gloo CPU group so all ranks agree. When ``filled`` is
+    False the caller fills (rank 0 only -- see :func:`persistent_fill_done`), then
+    ``pool.mark_filled()``.
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    keys = [(name, layer) for name in specs for layer in range(num_layers)]
+    if tp is None or tp.rank == 0:
+        pool.prepare_dir()
+        filled = pool.is_filled()
+        paths = {}
+        for name, layer in keys:
+            shape, dtype = specs[name]
+            elsize = torch.empty((), dtype=dtype).element_size()
+            asize = ((math.prod(shape) * elsize + _BLK - 1) // _BLK) * _BLK
+            paths[(name, layer)] = pool.create_or_open(name, layer, asize)
+        filled = filled and pool.is_filled()  # create_or_open invalidates on a size change
+        if tp is not None and tp.size > 1:
+            _tp_cpu_broadcast({"filled": filled, "paths": [(n, l, paths[(n, l)]) for n, l in keys]})
+    else:
+        handoff = _tp_cpu_broadcast(None)
+        filled = bool(handoff["filled"])
+        paths = {(n, l): p for n, l, p in handoff["paths"]}
+        got = [(n, l) for n, l, _ in handoff["paths"]]
+        if got != keys:
+            raise RuntimeError(
+                f"persistent-bank handoff mismatch: rank 0 sent {len(got)} banks, this rank "
+                f"expected {len(keys)} (different model config across ranks?)"
+            )
+    out = {
+        name: [HostBank(shape, dtype, share_path=paths[(name, layer)]) for layer in range(num_layers)]
+        for name, (shape, dtype) in specs.items()
+    }
+    return out, filled
+
+
+def persistent_fill_done(pool: PersistentPool, *, filled_by_me: bool) -> None:
+    """Rank-0-only fill barrier for a persistent pool.
+
+    Rank 0 calls it after its fill + pin completed (``filled_by_me=True``): writes the
+    manifest, then releases the other ranks. Other ranks call it instead of filling
+    (``filled_by_me=False``) and block here until rank 0's data is in the shared pages.
+    Single-rank: writes the manifest.
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    if filled_by_me:
+        pool.mark_filled()
+    if tp is not None and tp.size > 1:
+        _tp_cpu_broadcast(True)
+
+
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
     * shared shmem (``share=True`` on rank 0, ``share_path=`` on the other ranks) --
-      one ``memfd`` mapped ``MAP_SHARED`` by every TP rank so the expert pool is
+      one ``memfd`` (or a tmpfs file of a :class:`PersistentPool`) mapped ``MAP_SHARED``
+      by every TP rank so the expert pool is
       resident once. ``share_path`` is rank 0's ``/proc/<pid>/fd/<fd>`` for the bank.
       Never a disk file: writeback of a registered file mapping is a KFD
       evict/restore storm (see :func:`prepare_shared_banks`).
