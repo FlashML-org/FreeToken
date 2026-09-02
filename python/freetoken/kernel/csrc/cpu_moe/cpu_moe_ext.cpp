@@ -572,15 +572,35 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 #endif
 
 // =====================================================================================
-// CUDA stream memory operations (driver API, resolved via dlopen -- no link-time or
-// toolchain dependence). The GPU side of the flag handshake: submit = WRITE_VALUE
-// (done[slot]=0 then ready[slot]=1), sync = WAIT_VALUE(done[slot] >= 1). The wait is
-// executed by the GPU front-end (no SM-resident kernel), so GPU "utilization" stays
+// Stream memory operations -- the GPU side of the flag handshake: submit = WRITE_VALUE
+// (done[slot]=0 then ready[slot]=1), sync = WAIT_VALUE(done[slot] >= 1).
+// CUDA: driver API resolved via dlopen (no link-time or toolchain dependence). The wait
+// is executed by the GPU front-end (no SM-resident kernel), so GPU "utilization" stays
 // truthful during CPU compute windows -- a resident spin kernel pinned it at 99%,
 // which laptop CPU/GPU dynamic power schedulers answered by clamping the CPU's max
-// frequency (GEMV workers -1.5x: the reported edge regression). Availability is
-// probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
-// vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
+// frequency (GEMV workers -1.5x: the reported edge regression).
+// HIP: hipStreamWriteValue64 / hipStreamWaitValue64 are runtime entry points in the
+// already-linked libamdhip64. CLR services the wait with a one-lane blit kernel that
+// spins on the flag (GPU_STREAMOPS_CP_WAIT=1 would use a CP barrier-value packet, but
+// that path accepts only hipMallocSignalMemory objects); torch's pinned host memory is
+// hipHostMalloc(default) = fine-grained + SVM atomics, so the CPU's release store is
+// visible to that spin. The host-func alternative costs ~0.7 ms of callback latency
+// per call on ROCm (vs ~40 us on CUDA): 2 calls x 43 layers = ~60 ms of GPU idle per
+// decode step on DeepSeek-V4-Flash before this path was wired for HIP.
+// Availability is probed functionally at startup (memops_probe); anything unsupported
+// (Windows WDDM, vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
+#if defined(USE_ROCM)
+static bool cumemop_resolve() { return true; }
+static int cumemop_write64(void* stream, unsigned long long addr, unsigned long long value) {
+  return static_cast<int>(hipStreamWriteValue64(reinterpret_cast<hipStream_t>(stream),
+                                                reinterpret_cast<void*>(addr), value, 0u));
+}
+static int cumemop_wait64_geq(void* stream, unsigned long long addr, unsigned long long value) {
+  return static_cast<int>(hipStreamWaitValue64(reinterpret_cast<hipStream_t>(stream),
+                                               reinterpret_cast<void*>(addr), value,
+                                               hipStreamWaitValueGte, ~0ULL));
+}
+#else
 #if defined(_WIN32)
 #include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
@@ -620,14 +640,21 @@ static bool cumemop_resolve() {
   }();
   return resolved;
 }
+static int cumemop_write64(void* stream, unsigned long long addr, unsigned long long value) {
+  return g_cu_write64(stream, addr, value, kCuWriteDefault);
+}
+static int cumemop_wait64_geq(void* stream, unsigned long long addr, unsigned long long value) {
+  return g_cu_wait64(stream, addr, value, kCuWaitValueGeq);
+}
+#endif
 
 // Functional probe on a scratch pinned int64: enqueue WRITE(7) + WAIT(>=7) + sync.
 // Returns true only if the whole memop path works on THIS stream/device/driver.
 static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   if (!cumemop_resolve()) return false;
   auto* s = reinterpret_cast<void*>(stream);
-  if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
-  if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
+  if (cumemop_write64(s, (unsigned long long)scratch_addr, 7ULL) != 0) return false;
+  if (cumemop_wait64_geq(s, (unsigned long long)scratch_addr, 7ULL) != 0) return false;
   return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
 }
 
@@ -654,19 +681,16 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
   auto* s = reinterpret_cast<void*>(stream);
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
-  cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
-                             kCuWriteDefault),
-                "cuStreamWriteValue64(done)");
-  cumemop_check(g_cu_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL,
-                             kCuWriteDefault),
-                "cuStreamWriteValue64(ready)");
+  cumemop_check(cumemop_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL),
+                "StreamWriteValue64(done)");
+  cumemop_check(cumemop_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL),
+                "StreamWriteValue64(ready)");
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
-                            (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
-                            kCuWaitValueGeq),
-                "cuStreamWaitValue64(done)");
+  cumemop_check(cumemop_wait64_geq(reinterpret_cast<void*>(stream),
+                                   (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL),
+                "StreamWaitValue64(done)");
 }
 
 struct DotChoice {
@@ -1297,10 +1321,20 @@ struct CpuMoeExecutor {
   std::condition_variable sync_cv;
 
   bool stop = false;
+  std::atomic<bool> stop_flag{false};  // lock-free view of `stop` for the workers' hot spin
   uint64_t cur_gen = 0;
   MoeTask* cur_task = nullptr;
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
+  // Workers spin (pause) for the next task for this long after finishing one before
+  // parking on the condvar: a futex wake-up + C-state exit costs 50-150 us per worker,
+  // paid once per MoE layer per decode step (~0.1 ms x 43 layers on DeepSeek-V4-Flash).
+  // 50 ms covers the intra-token gap between consecutive layers' tasks and the
+  // inter-token gap; an idle engine parks within 50 ms. FREETOKEN_CPU_MOE_SPIN_MS=0 or
+  // set_worker_spin_ms(0) opts out; the Python side turns it off when the pool plus the
+  // coordinator leave no CPU headroom for the launch thread (spinning workers then
+  // starve it: measured 3.1 vs 8.7 tok/s on a fully subscribed 30-vCPU guest).
+  std::atomic<int64_t> worker_spin_ns{50LL * 1000 * 1000};
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
@@ -1434,6 +1468,9 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
+    if (const char* s = getenv("FREETOKEN_CPU_MOE_SPIN_MS")) {
+      if (s[0]) worker_spin_ns = static_cast<int64_t>(std::max(0, atoi(s))) * 1000 * 1000;
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -1549,6 +1586,7 @@ struct CpuMoeExecutor {
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
+      stop_flag.store(true, std::memory_order_release);
     }
     task_cv.notify_all();
     for (auto& th : workers)
@@ -1567,6 +1605,14 @@ struct CpuMoeExecutor {
                              reinterpret_cast<bf16_t*>(y_ptr)};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
+  }
+
+  void set_worker_spin_ms(int ms) {
+    worker_spin_ns.store(static_cast<int64_t>(std::max(0, ms)) * 1000 * 1000,
+                         std::memory_order_relaxed);
+  }
+  int worker_spin_ms() const {
+    return static_cast<int>(worker_spin_ns.load(std::memory_order_relaxed) / (1000 * 1000));
   }
 
   const char* isa_name() const { return isa; }
@@ -1873,7 +1919,25 @@ struct CpuMoeExecutor {
   void worker_loop(int tid) {
     pin_self(tid);
     uint64_t my_gen = 0;
+    auto last_task = std::chrono::steady_clock::now();
     for (;;) {
+      // Hot phase: spin (pause) while decode traffic flows so the next layer's task
+      // starts without a futex wake-up; park on the condvar once the engine goes idle.
+      // The clock is consulted every 1024 polls to keep the loop cheap.
+      const int64_t spin_ns = worker_spin_ns.load(std::memory_order_relaxed);
+      if (spin_ns > 0) {
+        unsigned polls = 0;
+        while (!stop_flag.load(std::memory_order_acquire) &&
+               submitted.load(std::memory_order_acquire) == my_gen) {
+#if CPU_MOE_X86
+          _mm_pause();
+#endif
+          if ((++polls & 1023u) == 0 &&
+              (std::chrono::steady_clock::now() - last_task) >=
+                  std::chrono::nanoseconds(spin_ns))
+            break;
+        }
+      }
       MoeTask* t;
       {
         std::unique_lock<std::mutex> lk(task_mtx);
@@ -1883,6 +1947,7 @@ struct CpuMoeExecutor {
         t = cur_task;
       }
       run_task_body(t);
+      last_task = std::chrono::steady_clock::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
@@ -1967,6 +2032,22 @@ struct CpuMoeExecutor {
 
   void sync() {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+    // A decode layer's task drains in well under a millisecond: spin (pause) for the
+    // completion first so the flag coordinator answers the GPU without a futex hop;
+    // fall back to the condvar for long tasks (prefill bursts) or an opted-out spin.
+    if (worker_spin_ns.load(std::memory_order_relaxed) > 0) {
+      const auto t0 = std::chrono::steady_clock::now();
+      unsigned polls = 0;
+      while (completed.load(std::memory_order_acquire) < target) {
+#if CPU_MOE_X86
+        _mm_pause();
+#endif
+        if ((++polls & 1023u) == 0 &&
+            (std::chrono::steady_clock::now() - t0) >= std::chrono::milliseconds(5))
+          break;
+      }
+      if (completed.load(std::memory_order_acquire) >= target) return;
+    }
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
   }
@@ -2035,6 +2116,7 @@ struct CpuMoeExecutor {
     constexpr auto kHotWindow = std::chrono::milliseconds(50);
     constexpr int64_t kSleepCapUs = 2000;
     auto last_active = coord_clock::now();
+    long long stat_n = 0, stat_ns = 0, stat_routes = 0;  // FREETOKEN_CPU_MOE_STATS
     unsigned empty_polls = 0;  // unsigned: the hot-phase ++ must not overflow into UB
     int64_t sleep_us = 100;
     bool dozing = false;
@@ -2053,8 +2135,35 @@ struct CpuMoeExecutor {
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
           }
           if (t != nullptr) {
-            submit(t);
-            sync();
+            // FREETOKEN_CPU_MOE_STATS=1: every 4300 dispatches (100 decode steps of a
+            // 43-layer model) print the mean task wall time and mean routed experts per
+            // task -- the numbers that size the hybrid fetch fraction.
+            static const bool stats = [] {
+              const char* s = getenv("FREETOKEN_CPU_MOE_STATS");
+              return s && s[0] && s[0] != '0';
+            }();
+            if (stats) {
+              const auto t0 = coord_clock::now();
+              submit(t);
+              sync();
+              const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  coord_clock::now() - t0).count();
+              int routes = 0;
+              for (int i = 0; i < t->num_tokens * top_k; ++i) routes += (t->ids[i] >= 0);
+              stat_ns += ns; stat_routes += routes;
+              if (++stat_n >= 4300) {
+                std::fprintf(stderr,
+                             "[freetoken/cpu_moe] %lld tasks: mean %.0f us/task, mean %.2f "
+                             "routed experts/task (%.0f us/expert incl. fixed cost)\n",
+                             (long long)stat_n, (double)stat_ns / stat_n / 1e3,
+                             (double)stat_routes / stat_n,
+                             stat_routes ? (double)stat_ns / stat_routes / 1e3 : 0.0);
+                stat_n = 0; stat_ns = 0; stat_routes = 0;
+              }
+            } else {
+              submit(t);
+              sync();
+            }
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -2148,7 +2257,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
-      .def("isa_name", &CpuMoeExecutor::isa_name);
+      .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("set_worker_spin_ms", &CpuMoeExecutor::set_worker_spin_ms, py::arg("ms"))
+      .def("worker_spin_ms", &CpuMoeExecutor::worker_spin_ms);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));

@@ -36,14 +36,18 @@ logger = init_logger(__name__)
 # persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets a "done"
 # flag the GPU waits on at sync -- no host-func round-trip. Both GPU-side operations are
 # STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64, resolved from the
-# driver at runtime): they execute on the GPU front end with no SM-resident kernel, so
-# GPU utilization stays truthful during the CPU compute window. (The first cut used a
-# spin-wait kernel; that pinned reported utilization at 99% and laptop CPU/GPU dynamic
-# power schedulers responded by clamping the CPU frequency -- a net decode regression on
-# power-coupled edge devices.) Each (layer, decode batch size) pair gets its own flag
-# slot, so every captured decode graph rides the handshake. Where memops are unavailable
-# (Windows WDDM, vGPU, old drivers -- functionally probed at startup) or the slot
-# capacity is exceeded, decode keeps the host-func path (functional, slower). A Python
+# CUDA driver at runtime; hipStreamWriteValue64 / hipStreamWaitValue64 on HIP): on CUDA
+# they execute on the GPU front end with no SM-resident kernel, so GPU utilization stays
+# truthful during the CPU compute window. (The first cut used a spin-wait kernel; that
+# pinned reported utilization at 99% and laptop CPU/GPU dynamic power schedulers responded
+# by clamping the CPU frequency -- a net decode regression on power-coupled edge devices.
+# HIP services the wait with a one-lane blit kernel, which is still ~0.7 ms/call cheaper
+# than its host-function callback latency.) Each (layer, decode batch size) pair gets its
+# own flag slot, so every captured decode graph rides the handshake on CUDA; HIP stream
+# capture records neither host nodes nor memops, so the engine keeps these backends eager
+# there. Where memops are unavailable (Windows WDDM, vGPU, old drivers -- functionally
+# probed at startup) or the slot capacity is exceeded, decode keeps the host-func path
+# (functional, slower). A Python
 # watchdog thread turns a wedged coordinator into a loud RuntimeError (via err[] +
 # raise_if_unhealthy) instead of an indefinite stream stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
@@ -115,28 +119,73 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+def _tp_slice(cores: list[int]) -> list[int]:
+    """This rank's contiguous share of ``cores`` under TP>1.
+
+    Every TP rank runs its own executor (each computes its intermediate-dim shard of
+    every routed expert), and they all live on the same host: pinning each rank to
+    every physical core doubles the threads per core and the spin barrier degrades.
+    Contiguous slices keep a rank's workers on neighbouring cores (shared L3 / CCD).
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    if tp is None or tp.size <= 1 or len(cores) < tp.size:
+        return cores
+    per = len(cores) // tp.size
+    lo = tp.rank * per
+    hi = len(cores) if tp.rank == tp.size - 1 else lo + per
+    return cores[lo:hi]
+
+
+def _hidden_smt_cap(reps: list[int], allowed: list[int]) -> tuple[list[int], str | None]:
+    """Halve the auto worker set when sysfs shows NO SMT siblings on a wide CPU set.
+
+    A KVM/QEMU guest presents its vCPUs as ``cores=N, threads=1`` even when they land on
+    the host's SMT siblings, so "one worker per physical core" silently becomes one per
+    hardware thread. Measured (DeepSeek-V4-Flash, 30-vCPU guest on a 16-core host): 29
+    workers 3.1 tok/s, 12-14 workers 8.7-9.1 tok/s -- the GEMV is bandwidth-bound, the
+    extra workers only add barrier traffic and starve the kernel-launch thread and the
+    flag coordinator. Bare metal reports siblings and is untouched; an explicit
+    --moe-cpu-threads bypasses this."""
+    if len(reps) == len(allowed) and len(allowed) > 8:
+        half = reps[: max(1, len(reps) // 2)]
+        return half, (
+            f"no SMT topology reported for {len(allowed)} CPUs (virtualized?): "
+            f"using {len(half)} workers, override with --moe-cpu-threads"
+        )
+    return reps, None
+
+
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
     bandwidth-bound GEMV: SMT siblings only contend for a core's load ports and the
-    spin-barrier degrades badly when oversubscribed). An explicit count is honored,
-    spreading first across physical cores, then across the remaining logical CPUs
-    (so distinct hardware threads are used before any core is doubled up).
+    spin-barrier degrades badly when oversubscribed), halved when the topology hides
+    SMT (:func:`_hidden_smt_cap`). Under TP>1 the physical cores are split into one
+    contiguous slice per rank (:func:`_tp_slice`). An explicit count is honored,
+    spreading first across this rank's physical cores, then across the remaining
+    logical CPUs (so distinct hardware threads are used before any core is doubled up).
     """
-    reps = physical_core_cpus()
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = list(range(os.cpu_count() or 1))
+    phys = physical_core_cpus()
     if requested and requested > 0:
         n = int(requested)
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except AttributeError:
-            allowed = list(range(os.cpu_count() or 1))
-        # physical-core reps first, then the rest of the logical CPUs.
+        reps = _tp_slice(phys)
+        # this rank's physical-core reps first, then the rest of the logical CPUs.
         order = reps + [c for c in allowed if c not in set(reps)]
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
+    phys, note = _hidden_smt_cap(phys, allowed)
+    if note:
+        logger.info_rank0(f"cpu-moe auto thread sizing: {note}")
+    reps = _tp_slice(phys)
     return len(reps), list(reps)
 
 
@@ -241,6 +290,21 @@ class CpuMoeExecutor:
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
+        # Worker hot-spin needs headroom: the kernel-launch thread and (with flag sync) the
+        # coordinator must own a CPU each while every worker spins, plus one for the rest
+        # of the process. Without it the spinning pool starves the launch thread (measured
+        # 3.1 vs 8.7 tok/s on a fully subscribed guest); parked workers are the safe mode.
+        try:
+            online = len(os.sched_getaffinity(0))
+        except AttributeError:
+            online = os.cpu_count() or 1
+        busy = nthreads + (1 if coord_core >= 0 else 0)
+        if self._ext.worker_spin_ms() > 0 and busy + 2 > online:
+            self._ext.set_worker_spin_ms(0)
+            logger.info_rank0(
+                f"cpu-moe worker spin disabled: {busy} pinned threads leave no headroom "
+                f"on {online} CPUs (pass a smaller --moe-cpu-threads to enable it)"
+            )
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
@@ -314,7 +378,9 @@ class CpuMoeExecutor:
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
-            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
+            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
+            f"sync={'flag' if self._flag_sync else 'hostfunc'} "
+            f"spin_ms={self._ext.worker_spin_ms()}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
