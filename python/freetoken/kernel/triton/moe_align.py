@@ -89,16 +89,24 @@ def _moe_align_small(
     tl.store(num_tokens_post_pad_ptr, npp)
     tl.store(fill_counter_ptr + le, 0, mask=m_e)
 
-    # expert_ids: each expert lane writes its own padded block range (register-only)
-    for j in tl.range(0, tl.max(nblk, 0)):
-        tl.store(expert_ids_ptr + excl_blk + j, le, mask=m_e & (j < nblk))
-
     # sentinel-fill sorted[0:npp) (pre-barrier so the scatter stores win below)
     fo = tl.arange(0, FILL)
     for s in tl.range(0, npp, FILL):
         tl.store(sorted_token_ids_ptr + s + fo, sentinel, mask=s + fo < npp)
 
     tl.debug_barrier()  # cumsum/fill_counter stores visible; sentinel ordered before scatter
+
+    # expert_ids: each expert lane writes its own padded block range (register-only).
+    # The block counts are RELOADED from the cumsum scratch rather than taken from the
+    # histogram: on the AMD backend (Triton 3.8 / gfx1201) a predicate derived from a
+    # tl.histogram result -- here ``j < nblk`` -- is compiled away, so the masked stores
+    # never happen and expert_ids stays uninitialized (garbage bank rows in the GEMM).
+    # Values from the histogram flow correctly; only comparisons on them are lost.
+    blk0 = tl.load(cumsum_ptr + le, mask=m_e, other=0) // block_size
+    blk1 = tl.load(cumsum_ptr + le + 1, mask=m_e, other=0) // block_size
+    nblk_r = blk1 - blk0
+    for j in tl.range(0, tl.max(nblk_r, 0)):
+        tl.store(expert_ids_ptr + blk0 + j, le, mask=m_e & (j < nblk_r))
 
     base = tl.load(cumsum_ptr + e, mask=valid, other=0)
     rank = tl.atomic_add(fill_counter_ptr + e, 1, mask=valid)
@@ -125,14 +133,17 @@ def _fill_and_count(
     tl.store(sorted_token_ids_ptr + offs, sentinel, mask=offs < sorted_numel)
     # (b) zero the scatter fill-counter (read in the scatter kernel after a barrier)
     tl.store(fill_counter_ptr + offs, 0, mask=offs < effective_E)
-    # (c) per-program register histogram, then one merged atomic per touched bin
-    #     (vs one scattered atomic per element -- far fewer, conflict-free atomics)
+    # (c) per-program register histogram, then one merged atomic per bin. The mask is
+    #     deliberately NOT ``& (h > 0)``: on the AMD backend a predicate derived from a
+    #     tl.histogram result is compiled away and the whole atomic is dropped (counts
+    #     stay 0 -> num_tokens_post_pad 0 -> the GEMM computes nothing). Adding 0 to a
+    #     bin is harmless.
     e = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1)
     valid = (offs < numel) & (e >= 0) & (e < effective_E)
     e_h = tl.where(valid, e, HIST - 1)  # invalid -> spare top bin (>= effective_E)
     h = tl.histogram(e_h, HIST)
     le = tl.arange(0, HIST)
-    tl.atomic_add(counts_ptr + le, h, mask=(le < effective_E) & (h > 0))
+    tl.atomic_add(counts_ptr + le, h, mask=le < effective_E)
 
 
 @triton.jit
