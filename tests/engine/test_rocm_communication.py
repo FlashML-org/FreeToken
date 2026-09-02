@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import freetoken.engine.engine as engine_module
+import freetoken.kernel as kernel_module
 import freetoken.kernel.backend as kernel_backend
 import freetoken.kernel.pynccl as pynccl_module
 from freetoken.engine.engine import Engine
@@ -13,11 +14,12 @@ def _config(
     *,
     use_pynccl: bool = True,
     rank: int = 0,
+    tp_size: int = 2,
     distributed_addr: str = "tcp://127.0.0.1:29500",
 ):
     return SimpleNamespace(
         use_pynccl=use_pynccl,
-        tp_info=SimpleNamespace(size=2, rank=rank),
+        tp_info=SimpleNamespace(size=tp_size, rank=rank),
         distributed_timeout=30,
         distributed_addr=distributed_addr,
         max_forward_len=32,
@@ -79,6 +81,37 @@ def test_cuda_keeps_custom_pynccl_path(monkeypatch):
     assert result is world_group
     assert calls[0][1]["backend"] == "gloo"
     assert calls[1][0] == "pynccl"
+
+
+def test_single_rank_keeps_gloo_without_loading_pynccl(monkeypatch):
+    calls = []
+    world_group = object()
+
+    def reject_rocm_probe():
+        raise AssertionError("single-rank setup must not inspect the GPU backend")
+
+    def reject_pynccl(*_args, **_kwargs):
+        raise AssertionError("single-rank setup must not initialize PyNCCL")
+
+    def reject_new_group(**_kwargs):
+        raise AssertionError("single-rank setup must not create a second process group")
+
+    monkeypatch.setattr(kernel_backend, "is_rocm", reject_rocm_probe)
+    monkeypatch.setattr(kernel_module, "init_pynccl", reject_pynccl)
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: calls.append(("init", kwargs)),
+    )
+    monkeypatch.setattr(torch.distributed, "group", SimpleNamespace(WORLD=world_group))
+    monkeypatch.setattr(torch.distributed, "new_group", reject_new_group)
+
+    engine = SimpleNamespace(dtype=torch.float16)
+    result = Engine._init_communication(engine, _config(tp_size=1))
+
+    assert result is world_group
+    assert len(calls) == 1
+    assert calls[0][1]["backend"] == "gloo"
 
 
 def test_rocm_pynccl_loader_fails_before_linking_nccl(monkeypatch):
