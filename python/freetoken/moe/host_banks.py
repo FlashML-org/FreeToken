@@ -76,161 +76,120 @@ def born_pinned_default() -> bool:
 # model config is not available yet. Not a benchmark.
 DEFAULT_BANK_SHARE_NEED_BYTES = 43 * 256 * 13_369_344  # 147_169_738_752 ≈ 137.1 GiB
 
-_TMPFS_TYPES = frozenset({"tmpfs", "ramfs"})
+# amdgpu module parameter: KFD counts every GPU registration of host memory
+# against ONE global "resident system memory" budget (about MemTotal - MemTotal/64).
+# Two TP ranks registering the same shared pool are double-counted, so the second
+# rank's pins fail partway through the load ("SVM mapping failed, exceeds resident
+# system memory limit" in dmesg) unless the operator disables the limit.
+_KFD_NO_SYSTEM_MEM_LIMIT = "/sys/module/amdgpu/parameters/no_system_mem_limit"
 
 
-def default_bank_share_dir(port: int) -> str:
-    """Disk cache dir for shared banks — never ``/tmp`` (often tmpfs).
-
-    ``$XDG_CACHE_HOME/freetoken/banks-{port}`` or ``~/.cache/freetoken/banks-{port}``.
-    """
-    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-    root = os.path.expanduser(xdg) if xdg else os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(root, "freetoken", f"banks-{port}")
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("0", "false", "no", "off")
 
 
-def normalize_bank_share_dir(raw: str) -> str:
-    """Expand ``~`` and reject a trivial ``..`` path escape."""
-    text = raw.strip()
-    if not text or "\x00" in text:
-        raise RuntimeError("FREETOKEN_BANK_SHARE_DIR is empty or contains a NUL")
-    expanded = os.path.expanduser(text)
-    if ".." in expanded.replace("\\", "/").split("/"):
-        raise RuntimeError(
-            "FREETOKEN_BANK_SHARE_DIR must not contain '..' "
-            f"(got {raw!r}); pass an absolute disk path"
-        )
-    return os.path.abspath(expanded)
-
-
-def _fs_type(path: str) -> str:
-    """Filesystem type from ``/proc/self/mounts`` (Linux). Empty if unknown."""
-    probe = path
-    while not os.path.exists(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    try:
-        probe = os.path.realpath(probe)
-    except OSError:
-        probe = os.path.abspath(probe)
-    best = ""
-    fstype = ""
-    try:
-        with open("/proc/self/mounts", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                mnt, typ = parts[1].replace("\\040", " "), parts[2]
-                if probe == mnt or probe.startswith(mnt.rstrip("/") + "/") or mnt == "/":
-                    if len(mnt) >= len(best):
-                        best = mnt
-                        fstype = typ
-    except OSError:
-        return ""
-    return fstype
-
-
-def _fs_free_bytes(path: str) -> int | None:
-    probe = path
-    while not os.path.exists(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    try:
-        st = os.statvfs(probe)
-    except OSError:
-        return None
-    return int(st.f_bavail) * int(st.f_frsize)
-
-
-def require_share_dir_capacity(path: str, *, need_bytes: int) -> None:
-    """Fail if ``path`` is tmpfs or has less than ``need_bytes`` free.
-
-    File-backed mmap on tmpfs still counts against the tmpfs cap (~50% RAM on
-    systemd ``/tmp``). ``need_bytes <= 0`` skips the check (unit tests).
-    """
-    if need_bytes <= 0:
-        return
-    fstype = _fs_type(path)
-    free = _fs_free_bytes(path)
-    need_gib = need_bytes / (1 << 30)
-    if fstype in _TMPFS_TYPES:
-        raise RuntimeError(
-            f"FREETOKEN_BANK_SHARE_DIR={path} is on {fstype}, which cannot hold "
-            f"the ~{need_gib:.1f} GiB expert pool (tmpfs counts against RAM; "
-            f"systemd /tmp is often ~50% of RAM). Set FREETOKEN_BANK_SHARE_DIR "
-            f"to a disk with ≥{need_gib:.1f} GiB free "
-            f"(e.g. $HOME/.cache/freetoken/banks-1919 or /data/freetoken/banks-1919)."
-        )
-    if free is not None and free < need_bytes:
-        free_gib = free / (1 << 30)
-        raise RuntimeError(
-            f"FREETOKEN_BANK_SHARE_DIR={path} has {free_gib:.1f} GiB free, "
-            f"need ≥{need_gib:.1f} GiB for the shared expert pool"
-            f"{f' (fstype={fstype})' if fstype else ''}. "
-            f"Set FREETOKEN_BANK_SHARE_DIR to a disk with enough space."
-        )
-
-
-def resolve_bank_share_dir() -> str | None:
-    """Directory for file-backed shared expert banks, or None (anonymous mmap).
-
-    TP>1 on ~192 GB RAM cannot afford two copies of the ~137 GiB DSV4 pool.
-    ``FREETOKEN_BANK_SHARE=0`` disables sharing. ``FREETOKEN_BANK_SHARE_DIR``
-    selects the directory; :func:`prepare_shared_banks` defaults to the user
-    cache on disk, not ``/tmp``.
-    """
-    if os.environ.get("FREETOKEN_BANK_SHARE", "").strip().lower() in ("0", "false", "no", "off"):
-        return None
-    raw = os.environ.get("FREETOKEN_BANK_SHARE_DIR", "").strip()
-    if raw:
-        return normalize_bank_share_dir(raw)
+def bank_sharing_enabled() -> bool:
+    """TP>1 maps one shmem expert pool unless ``FREETOKEN_BANK_SHARE=0``."""
+    if _env_off("FREETOKEN_BANK_SHARE"):
+        return False
     from freetoken.distributed import try_get_tp_info
 
     tp = try_get_tp_info()
-    if tp is not None and tp.size > 1:
-        port = int(os.environ.get("FREETOKEN_BANK_SHARE_PORT", "1919"))
-        return default_bank_share_dir(port)
+    return tp is not None and tp.size > 1
+
+
+def _meminfo_bytes(key: str) -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
     return None
 
 
-def prepare_shared_banks(*, port: int, need_bytes: int | None = None) -> str | None:
-    """Set ``FREETOKEN_BANK_SHARE_DIR`` for TP>1 so all ranks map one pool.
+def _read_sysfs(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
 
-    Defaults to ``$XDG_CACHE_HOME/freetoken/banks-{port}`` (or ``~/.cache/...``),
-    never ``/tmp``. Refuses tmpfs and filesystems with less than ``need_bytes``
-    free. Files are ``0600``; the directory is created ``0700`` and must not be
-    world-writable.
+
+def kfd_system_mem_limit_bytes() -> int | None:
+    """KFD's global budget for GPU-registered host memory, or None when the
+    ``amdgpu`` limit is disabled / not present. Mirrors the kernel's
+    ``mem - (mem >> 6)`` sizing from MemTotal."""
+    param = _read_sysfs(_KFD_NO_SYSTEM_MEM_LIMIT)
+    if param is None or param.upper() in ("Y", "1"):
+        return None
+    total = _meminfo_bytes("MemTotal")
+    if total is None:
+        return None
+    return total - (total >> 6)
+
+
+def require_shared_pool_capacity(*, need_bytes: int, tp_size: int) -> None:
+    """Fail before the load when the shmem pool cannot be resident, or when every
+    TP rank cannot register it with its GPU. ``need_bytes <= 0`` skips (unit tests)."""
+    if need_bytes <= 0:
+        return
+    need_gib = need_bytes / (1 << 30)
+    avail = _meminfo_bytes("MemAvailable")
+    if avail is not None and avail < need_bytes:
+        raise RuntimeError(
+            f"shared expert pool needs ~{need_gib:.1f} GiB of RAM (shmem, pinned for the "
+            f"GPUs) but MemAvailable is {avail / (1 << 30):.1f} GiB. Free memory "
+            f"(drop page cache, stop other model servers) or use a smaller model."
+        )
+    from freetoken.runtime.gpu import is_hip
+
+    if tp_size <= 1 or not is_hip():
+        return
+    limit = kfd_system_mem_limit_bytes()
+    if limit is None:
+        return
+    need_total = need_bytes * tp_size
+    if need_total > limit:
+        raise RuntimeError(
+            f"TP={tp_size}: each rank registers the shared ~{need_gib:.1f} GiB expert pool "
+            f"with its own GPU, and KFD charges every registration against one global "
+            f"'resident system memory' budget (~{limit / (1 << 30):.1f} GiB on this host): "
+            f"{tp_size} × {need_gib:.1f} = {need_total / (1 << 30):.1f} GiB. The second rank's "
+            f"pins would fail partway through the load (dmesg: 'SVM mapping failed, exceeds "
+            f"resident system memory limit'). The pages are shared, so this is double counting; "
+            f"disable the limit:  echo Y | sudo tee {_KFD_NO_SYSTEM_MEM_LIMIT}  "
+            f"(persist with 'options amdgpu no_system_mem_limit=1' in /etc/modprobe.d/amdgpu.conf). "
+            f"FREETOKEN_BANK_SHARE=0 gives each rank a private pool instead ({tp_size}× RAM)."
+        )
+
+
+def prepare_shared_banks(*, need_bytes: int | None = None) -> str | None:
+    """Enable the TP>1 shared expert pool and run its preflights.
+
+    Returns a short description of the pool (``"memfd"``) or None when sharing is
+    off. The pool is shmem (``memfd_create``): pages never go through filesystem
+    writeback, which a disk-backed ``MAP_SHARED`` pool + ``hipHostRegister`` turned
+    into a KFD evict/restore storm that wedged the load. ``/dev/shm`` is not used
+    either: its mount is capped at ~50% of RAM.
     """
     from freetoken.distributed import try_get_tp_info
 
     tp = try_get_tp_info()
     if tp is None or tp.size <= 1:
         return None
-    if os.environ.get("FREETOKEN_BANK_SHARE", "").strip().lower() in ("0", "false", "no", "off"):
+    if _env_off("FREETOKEN_BANK_SHARE"):
         logger.warning(
             "FREETOKEN_BANK_SHARE=0: each TP rank allocates its own expert banks "
             "(~137 GiB × ranks). Dual-card DSV4 on ~192 GB RAM will likely OOM."
         )
         return None
-    raw = os.environ.get("FREETOKEN_BANK_SHARE_DIR", "").strip()
-    d = normalize_bank_share_dir(raw) if raw else default_bank_share_dir(port)
-    os.environ["FREETOKEN_BANK_SHARE_DIR"] = d
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    st = os.stat(d)
-    if st.st_mode & 0o002:
-        raise RuntimeError(
-            f"FREETOKEN_BANK_SHARE_DIR={d} is world-writable; "
-            f"use a user-owned disk path (mode 0700)"
-        )
-    require_share_dir_capacity(
-        d, need_bytes=DEFAULT_BANK_SHARE_NEED_BYTES if need_bytes is None else need_bytes
+    require_shared_pool_capacity(
+        need_bytes=DEFAULT_BANK_SHARE_NEED_BYTES if need_bytes is None else need_bytes,
+        tp_size=tp.size,
     )
-    return d
+    return "memfd"
 
 
 def _share_create_rank() -> bool:
@@ -240,48 +199,77 @@ def _share_create_rank() -> bool:
     return tp is None or tp.rank == 0
 
 
-def _tp_cpu_barrier() -> None:
+def _tp_cpu_broadcast(obj):
+    """Broadcast a picklable object from TP rank 0 over the gloo CPU group.
+
+    Never the default GPU world: a collective there on HIP makes torch guess the
+    device from the global rank ("Guessing device ID based on global rank. This
+    can cause a hang if rank to GPU mapping is heterogeneous"), and handing a few
+    ``/proc`` paths across ranks needs no GPU at all.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError(
+            "shared expert banks need torch.distributed initialized (TP>1) before the "
+            "bank build; init_tp_process_group runs first in the engine"
+        )
+    from freetoken.distributed.info import try_get_tp_cpu_group
+
+    group = try_get_tp_cpu_group()
+    if group is None and dist.get_backend() != "gloo":
+        raise RuntimeError(
+            "no gloo CPU group registered for the shared-bank handoff and the default "
+            "torch.distributed group is not gloo; init_tp_process_group registers one"
+        )
+    box = [obj]
+    dist.broadcast_object_list(box, src=0, group=group)
+    return box[0]
+
+
+def _create_shared_bank(name: str, asize: int) -> tuple[int, mmap.mmap]:
+    """shmem ``MAP_SHARED`` buffer of ``asize`` bytes: ``(fd, map)``.
+
+    The fd stays open for the bank's lifetime so ``/proc/<pid>/fd/<fd>`` keeps
+    resolving for the other TP ranks (same uid; Yama only gates ptrace *attach*,
+    not this read-mode access).
+    """
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError(
+            "shared expert banks need Linux memfd_create; set FREETOKEN_BANK_SHARE=0 "
+            "to give each TP rank a private pool on this platform"
+        )
+    fd = os.memfd_create(f"freetoken-bank-{name}", os.MFD_CLOEXEC)
     try:
-        import torch.distributed as dist
-    except Exception:
-        return
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-
-def _bank_share_path(share_dir: str, name: str, layer: int | None = None) -> str:
-    fname = f"{name}.bin" if layer is None else f"{name}.L{layer}.bin"
-    return os.path.join(share_dir, fname)
-
-
-def _map_shared_file(path: str, asize: int, *, create: bool) -> mmap.mmap:
-    """File-backed ``MAP_SHARED`` mmap of exactly ``asize`` bytes."""
-    flags = os.O_RDWR
-    if create:
-        flags |= os.O_CREAT
-    fd = os.open(path, flags, 0o600)
-    try:
-        if create:
-            try:
-                os.ftruncate(fd, asize)
-            except OSError as exc:
-                if exc.errno == errno.ENOSPC:
-                    raise RuntimeError(
-                        f"shared bank {path}: ENOSPC truncating {asize / (1 << 30):.1f} GiB. "
-                        f"FREETOKEN_BANK_SHARE_DIR is on a filesystem that is too small "
-                        f"(tmpfs /tmp is not a disk). Set it to a disk with enough free space."
-                    ) from exc
-                raise
-        else:
-            st = os.fstat(fd)
-            if st.st_size < asize:
+        try:
+            os.ftruncate(fd, asize)
+        except OSError as exc:
+            if exc.errno in (errno.ENOSPC, errno.ENOMEM):
                 raise RuntimeError(
-                    f"shared bank {path} is {st.st_size} bytes, need {asize} "
-                    f"(rank 0 must create the file first; check FREETOKEN_BANK_SHARE_DIR)"
-                )
+                    f"shared bank {name}: cannot size {asize / (1 << 30):.1f} GiB of shmem "
+                    f"({os.strerror(exc.errno)}). The pool lives in RAM; free memory or "
+                    f"use a smaller model."
+                ) from exc
+            raise
+        return fd, mmap.mmap(fd, asize)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_shared_bank(path: str, asize: int) -> mmap.mmap:
+    """Map rank 0's shmem bank (a ``/proc/<pid>/fd/<fd>`` path) ``MAP_SHARED``."""
+    fd = os.open(path, os.O_RDWR)
+    try:
+        st = os.fstat(fd)
+        if st.st_size < asize:
+            raise RuntimeError(
+                f"shared bank {path} is {st.st_size} bytes, need {asize} "
+                f"(rank 0 sizes the pool before broadcasting its paths)"
+            )
         return mmap.mmap(fd, asize)
     finally:
-        os.close(fd)
+        os.close(fd)  # the mapping keeps the inode alive
 
 
 class HostBank:
@@ -289,29 +277,36 @@ class HostBank:
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
-    * file-backed mmap (``share_path``) -- ``MAP_SHARED`` so TP ranks map one expert
-      pool. Rank 0 creates (``create=True``); other ranks open after a barrier.
+    * shared shmem (``share=True`` on rank 0, ``share_path=`` on the other ranks) --
+      one ``memfd`` mapped ``MAP_SHARED`` by every TP rank so the expert pool is
+      resident once. ``share_path`` is rank 0's ``/proc/<pid>/fd/<fd>`` for the bank.
+      Never a disk file: writeback of a registered file mapping is a KFD
+      evict/restore storm (see :func:`prepare_shared_banks`).
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_share_path")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_share_path", "_share_fd")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None,
+                 share: bool = False,
                  share_path: str | os.PathLike[str] | None = None,
-                 create: bool = True):
+                 name: str = "bank"):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
         assert backing in ("mmap", "cuda"), backing
-        if share_path is not None and backing == "cuda":
+        if share and share_path is not None:
+            raise ValueError("share=True creates the shmem bank; share_path= opens rank 0's; not both")
+        if (share or share_path is not None) and backing == "cuda":
             raise ValueError("shared host banks require mmap backing, not cudaHostAlloc")
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        self._share_path = None if share_path is None else str(share_path)
+        self._share_path: str | None = None
+        self._share_fd: int | None = None
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -325,8 +320,12 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            if self._share_path is not None:
-                self._buf = _map_shared_file(self._share_path, asize, create=create)
+            if share:
+                self._share_fd, self._buf = _create_shared_bank(name, asize)
+                self._share_path = f"/proc/{os.getpid()}/fd/{self._share_fd}"
+            elif share_path is not None:
+                self._share_path = str(share_path)
+                self._buf = _open_shared_bank(self._share_path, asize)
             else:
                 self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
@@ -334,6 +333,11 @@ class HostBank:
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
+
+    @property
+    def share_path(self) -> str | None:
+        """``/proc/<pid>/fd/<fd>`` other TP ranks open to map this bank; None if private."""
+        return self._share_path
 
     @property
     def residency(self) -> HostResidency:
@@ -347,7 +351,7 @@ class HostBank:
         return memoryview(self._buf)
 
     def flush(self) -> None:
-        """Push file-backed shared pages to the inode (tests / rank handoff)."""
+        """``msync`` the mapping (a no-op for shmem beyond the page cache; kept for tests / rank handoff)."""
         buf = self._buf
         if hasattr(buf, "flush"):
             buf.flush()
@@ -427,26 +431,25 @@ def _os_lock(addr: int, nbytes: int) -> None:
 
 
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
-    """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
-    share_dir = resolve_bank_share_dir()
-    if not share_dir:
+    """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``.
+
+    Same TP>1 shmem handoff as :func:`alloc_layer_banks`, one bank per name."""
+    if not bank_sharing_enabled():
         return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
-    os.makedirs(share_dir, exist_ok=True)
-    create = _share_create_rank()
-    out: dict[str, HostBank] | None = None
-    if create:
-        out = {
-            name: HostBank(shape, dtype, share_path=_bank_share_path(share_dir, name), create=True)
-            for name, (shape, dtype) in specs.items()
-        }
-    _tp_cpu_barrier()
-    if not create:
-        out = {
-            name: HostBank(shape, dtype, share_path=_bank_share_path(share_dir, name), create=False)
-            for name, (shape, dtype) in specs.items()
-        }
-    assert out is not None
-    return out
+    keys = list(specs)
+    if _share_create_rank():
+        out = {name: HostBank(shape, dtype, share=True, name=name) for name, (shape, dtype) in specs.items()}
+        _tp_cpu_broadcast([(name, out[name].share_path) for name in keys])
+        return out
+    handoff = _tp_cpu_broadcast(None)
+    got = [name for name, _ in handoff]
+    if got != keys:
+        raise RuntimeError(
+            f"shared expert banks: rank 0 built {got}, this rank expects {keys}; "
+            f"the TP ranks disagree on the bank layout"
+        )
+    paths = dict(handoff)
+    return {name: HostBank(shape, dtype, share_path=paths[name]) for name, (shape, dtype) in specs.items()}
 
 
 def alloc_layer_banks(
@@ -456,45 +459,35 @@ def alloc_layer_banks(
     -> one independently allocated (page-aligned, independently pin/lock-able)
     ``HostBank`` per layer per name.
 
-    When ``FREETOKEN_BANK_SHARE_DIR`` is set (TP>1 default), files are
-    ``MAP_SHARED`` so ranks do not each hold a full ~137 GiB anonymous pool.
+    TP>1 (unless ``FREETOKEN_BANK_SHARE=0``): rank 0 creates every bank as shmem
+    (``memfd``) and broadcasts their ``/proc`` paths over the gloo CPU group; the
+    other ranks map the same inodes ``MAP_SHARED``, so the pool is resident once.
     """
-    share_dir = resolve_bank_share_dir()
-    if not share_dir:
+    if not bank_sharing_enabled():
         return {
             name: [HostBank(shape, dtype) for _ in range(num_layers)]
             for name, (shape, dtype) in specs.items()
         }
-    os.makedirs(share_dir, exist_ok=True)
-    create = _share_create_rank()
-    out: dict[str, list[HostBank]] | None = None
-    if create:
+    keys = [(name, layer) for name in specs for layer in range(num_layers)]
+    if _share_create_rank():
         out = {
-            name: [
-                HostBank(
-                    shape, dtype,
-                    share_path=_bank_share_path(share_dir, name, layer),
-                    create=True,
-                )
-                for layer in range(num_layers)
-            ]
+            name: [HostBank(shape, dtype, share=True, name=f"{name}.L{layer}") for layer in range(num_layers)]
             for name, (shape, dtype) in specs.items()
         }
-    _tp_cpu_barrier()
-    if not create:
-        out = {
-            name: [
-                HostBank(
-                    shape, dtype,
-                    share_path=_bank_share_path(share_dir, name, layer),
-                    create=False,
-                )
-                for layer in range(num_layers)
-            ]
-            for name, (shape, dtype) in specs.items()
-        }
-    assert out is not None
-    return out
+        _tp_cpu_broadcast([(name, layer, out[name][layer].share_path) for name, layer in keys])
+        return out
+    handoff = _tp_cpu_broadcast(None)
+    got = [(name, layer) for name, layer, _ in handoff]
+    if got != keys:
+        raise RuntimeError(
+            f"shared expert banks: rank 0 built {len(got)} banks {got[:3]}..., this rank "
+            f"expects {len(keys)} {keys[:3]}...; the TP ranks disagree on the bank layout"
+        )
+    paths = {(name, layer): path for name, layer, path in handoff}
+    return {
+        name: [HostBank(shape, dtype, share_path=paths[(name, layer)]) for layer in range(num_layers)]
+        for name, (shape, dtype) in specs.items()
+    }
 
 
 class _ResidencyPlan:
@@ -761,15 +754,14 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "alloc_layer_banks",
+    "bank_sharing_enabled",
     "born_pinned_default",
     "pin_banks",
     "DEFAULT_BANK_SHARE_NEED_BYTES",
-    "default_bank_share_dir",
-    "normalize_bank_share_dir",
+    "kfd_system_mem_limit_bytes",
     "prepare_shared_banks",
     "read_file_into",
     "read_range_into",
     "requested_residency",
-    "require_share_dir_capacity",
-    "resolve_bank_share_dir",
+    "require_shared_pool_capacity",
 ]

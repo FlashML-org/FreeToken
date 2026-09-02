@@ -155,6 +155,7 @@ def init_tp_process_group(config: EngineConfig, *, dtype: "torch.dtype"):
     import torch.distributed as dist
 
     from freetoken.distributed.impl import enable_pynccl_distributed
+    from freetoken.distributed.info import set_tp_cpu_group
 
     timeout = timedelta(seconds=config.distributed_timeout)
     rank = config.tp_info.rank
@@ -171,6 +172,7 @@ def init_tp_process_group(config: EngineConfig, *, dtype: "torch.dtype"):
         )
         group = dist.group.WORLD
         assert group is not None
+        set_tp_cpu_group(group)
         return group
 
     if is_hip():
@@ -199,6 +201,7 @@ def init_tp_process_group(config: EngineConfig, *, dtype: "torch.dtype"):
         )
         tp_cpu_group = dist.new_group(backend="gloo")
         assert tp_cpu_group is not None
+        set_tp_cpu_group(tp_cpu_group)
         return tp_cpu_group
 
     if config.use_pynccl:
@@ -211,6 +214,7 @@ def init_tp_process_group(config: EngineConfig, *, dtype: "torch.dtype"):
         )
         tp_cpu_group = dist.group.WORLD
         assert tp_cpu_group is not None
+        set_tp_cpu_group(tp_cpu_group)
         max_bytes = config.max_forward_len * config.model_config.hidden_size * dtype.itemsize
         enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         return tp_cpu_group
@@ -224,4 +228,5 @@ def init_tp_process_group(config: EngineConfig, *, dtype: "torch.dtype"):
     )
     tp_cpu_group = dist.new_group(backend="gloo")
     assert tp_cpu_group is not None
+    set_tp_cpu_group(tp_cpu_group)
     return tp_cpu_group

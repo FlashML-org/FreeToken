@@ -97,4 +97,7 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    from freetoken.distributed.info import reset_tp_cpu_group
+
     DistributedCommunicator.plugins = []
+    reset_tp_cpu_group()

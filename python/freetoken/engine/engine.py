@@ -361,13 +361,12 @@ class Engine:
             except Exception:
                 need = None
             need = need or DEFAULT_BANK_SHARE_NEED_BYTES
-            share_dir = prepare_shared_banks(
-                port=getattr(config, "server_port", 1919), need_bytes=need
-            )
-            if share_dir:
+            pool = prepare_shared_banks(need_bytes=need)
+            if pool:
                 logger.info_rank0(
-                    f"TP={config.tp_info.size}: shared expert banks at {share_dir} "
-                    f"({need / (1 << 30):.1f} GiB pool; set FREETOKEN_BANK_SHARE=0 to disable)"
+                    f"TP={config.tp_info.size}: shared expert banks in one {pool} pool "
+                    f"({need / (1 << 30):.1f} GiB of RAM, mapped by every rank; "
+                    f"set FREETOKEN_BANK_SHARE=0 to disable)"
                 )
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
