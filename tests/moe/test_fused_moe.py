@@ -277,8 +277,8 @@ def test_fused_experts_decode_activation_and_router_weight_modes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fused_topk_non_power_of_2_k_routes_vendored_router():
-    """triton_kernels.topk builds tl.arange(0, k) (power-of-2 only); k=10 must not reach it."""
+def test_fused_topk_handles_non_power_of_2_k():
+    """A top-10 router (qwen4_exp) must route like any other k."""
     from freetoken.moe.fused import _torch_fused_topk, fused_topk
 
     gating = torch.randn(5, 64, device="cuda")
@@ -289,7 +289,7 @@ def test_fused_topk_non_power_of_2_k_routes_vendored_router():
     torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
 
 
-# The vendored triton router behind that k=10 branch; fp32 logits keep the reference top-k tie-free.
+# The in-repo triton router behind fused_topk; fp32 logits keep the reference top-k tie-free.
 # Ties get their own case below, because torch.topk does not break them by expert id.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("renormalize", [True, False])

@@ -19,7 +19,7 @@ def _torch_fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-torch softmax router matching triton_kernels.topk (Windows fallback).
+    """Pure-torch reference for the fused softmax router; tests compare the kernel against it.
 
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
     selected weights to sum to 1 -- the standard fused-MoE routing convention.

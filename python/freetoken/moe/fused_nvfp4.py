@@ -25,6 +25,7 @@ from freetoken.layers import (
     gelu_and_mul,
     gelu_tanh_and_mul,
     silu_and_mul,
+    swiglu_clamp_and_mul,
     swigluoai_and_mul,
 )
 from freetoken.moe.fused import moe_align_block_size
@@ -40,11 +41,15 @@ def _run_act(
     act_limit: float,
 ) -> None:
     """gemm1 -> gemm2 activation dispatch. ``swigluoai`` (MiniMax-M3, clamped
-    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) carries the
+    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) and
+    ``swiglu_clamp`` (GLM-5.3, same clamp without the +1 up bias) carry the
     per-model ``act_alpha``/``act_limit`` scalars; the plain *_and_mul kinds
     ignore them."""
     if activation == "swigluoai":
         swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
+        return
+    if activation == "swiglu_clamp":
+        swiglu_clamp_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
         return
     _ACT[activation](gate_up, out)
 
