@@ -55,6 +55,11 @@ def _hip_forces_e4m3_emu() -> bool:
 
 
 FORCE_EMU = _env_force()
+# Resolved once at import, like FORCE_EMU: ``e4m3_native_cx`` below runs inside
+# Triton's compile-time evaluator, which accepts module-level constants but not
+# calls into ordinary Python (ROCm Triton 3.8: "Unsupported function referenced:
+# <function _hip_forces_e4m3_emu>", raised on the first kernel launch).
+HIP_EMU = _hip_forces_e4m3_emu()
 
 if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
     os.environ["TRITON_CACHE_DIR"] = os.path.join(
@@ -73,8 +78,14 @@ def e4m3_native() -> bool:
             "import and is not part of triton's compile cache key -- set it before "
             "the process starts (with its own TRITON_CACHE_DIR)"
         )
+    if _hip_forces_e4m3_emu() != HIP_EMU:
+        raise RuntimeError(
+            "FREETOKEN_HIP_E4M3_NATIVE / the GPU vendor changed after import: the HIP "
+            "e4m3 decision is read once at import (kernels compile against it) -- set "
+            "it before the process starts"
+        )
     if _native is None:
-        if FORCE_EMU or _hip_forces_e4m3_emu():
+        if FORCE_EMU or HIP_EMU:
             _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
@@ -102,7 +113,7 @@ def e4m3_native_cx():
     Delegates to ``target_info`` (reads the active driver's target, so
     cross-compilation tests that patch ``driver.active.get_current_target``
     resolve consistently)."""
-    return not FORCE_EMU and not _hip_forces_e4m3_emu() and target_info.cuda_capability_geq(8, 9)
+    return not FORCE_EMU and not HIP_EMU and target_info.cuda_capability_geq(8, 9)
 
 
 @jit
