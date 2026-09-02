@@ -21,7 +21,8 @@ def vision_load_enabled() -> bool:
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
-    (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, e.g.
+    (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, or
+    ``format: mixed-precision`` with an nvfp4 config group, e.g.
     RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
     unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
     own detector."""
@@ -34,9 +35,19 @@ def detect_expert_quant(hf_config: Any) -> str:
         return "none"
     if "fp4" in str(algo).lower():
         return "nvfp4"
+    fmt = str(get("format") or "").lower()
     # exact "nvfp4" (not the "fp4" substring) so MXFP4 exports don't misroute
-    if "nvfp4" in str(get("format") or "").lower():
+    if "nvfp4" in fmt:
         return "nvfp4"
+    # llm-compressor writes "mixed-precision" at the top when the groups differ (GLM-5.3-Flash: nvfp4 routed experts, fp8 MTP experts); the real format then sits in each group
+    if fmt == "mixed-precision":
+        groups = get("config_groups") or {}
+        groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
+        # groups that target the experts decide; only a generic ["Linear"] group falls back to all of them
+        expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
+        for g in expert_groups or groups:
+            if "nvfp4" in str(g.get("format") or "").lower():
+                return "nvfp4"
     return str(algo).lower()
 
 

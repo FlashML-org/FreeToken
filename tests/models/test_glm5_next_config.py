@@ -121,6 +121,24 @@ _CT_NVFP4_QUANT = {
     },
 }
 
+_CT_MIXED_QUANT = {
+    # From RedHatAI/GLM-5.3-Flash-NVFP4 as published: nvfp4 routed experts plus fp8 experts on the MTP layer, so the top-level format is "mixed-precision".
+    "quant_method": "compressed-tensors",
+    "format": "mixed-precision",
+    "config_groups": {
+        "group_0": {
+            "targets": ["re:.*\\.layers\\.(?:[3-9]|[1-3][0-9]|4[0-4])\\.mlp\\.experts\\..*(gate|up|down)_proj$"],
+            "weights": {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"},
+            "format": "nvfp4-pack-quantized",
+        },
+        "group_1": {
+            "targets": ["re:.*\\.layers\\.45\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "block"},
+            "format": "float-quantized",
+        },
+    },
+}
+
 _NVFP4_QUANT = {
     # From LibertAIDAI/GLM-5.3-Flash-NVFP4 (ModelOpt weight-only NVFP4).
     "quant_algo": "NVFP4",
@@ -244,6 +262,37 @@ def test_compressed_tensors_nvfp4_detected():
     nvfp4 off the ``format`` field (quant_algo is absent for compressed-tensors)."""
     cfg = parse_config(_hf_config(_CT_NVFP4_QUANT))
     assert cfg.expert_quant == "nvfp4"
+
+
+def test_compressed_tensors_mixed_precision_detected():
+    """The published RedHatAI export says ``format: mixed-precision`` at the top and
+    ``nvfp4-pack-quantized`` only inside the routed-expert group; expert_quant must
+    still resolve to nvfp4, not to the raw quant_method."""
+    cfg = parse_config(_hf_config(_CT_MIXED_QUANT))
+    assert cfg.expert_quant == "nvfp4"
+
+
+def test_compressed_tensors_mixed_precision_reads_the_expert_group():
+    """A mixed export with nvfp4 dense layers but fp8 experts must not report nvfp4
+    experts: the group that targets the experts decides."""
+    quant = {
+        "quant_method": "compressed-tensors",
+        "format": "mixed-precision",
+        "config_groups": {
+            "group_0": {
+                "targets": ["re:.*self_attn.*_proj$"],
+                "weights": {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"},
+                "format": "nvfp4-pack-quantized",
+            },
+            "group_1": {
+                "targets": ["re:.*mlp\\.experts\\..*(gate|up|down)_proj$"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": "block"},
+                "format": "float-quantized",
+            },
+        },
+    }
+    cfg = parse_config(_hf_config(quant))
+    assert cfg.expert_quant == "compressed-tensors"
 
 
 def test_expert_source_spec_selection():
