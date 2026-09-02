@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import sys
+
 from setuptools import setup
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, ROCM_HOME, CppExtension
@@ -96,6 +98,16 @@ setup(
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
             define_macros=GPU_RUNTIME_MACROS,
         ),
+        # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        *([
+            CppExtension(
+                name="freetoken.kernel._ple_store",
+                sources=[
+                    "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                ],
+                extra_compile_args=["-O3", "-std=c++17"],
+            )
+        ] if sys.platform == "linux" else []),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

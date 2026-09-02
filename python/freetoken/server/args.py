@@ -478,6 +478,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-backend",
+        default=ServerArgs.ple_backend,
+        choices=["pinned", "disk"],
+        help=(
+            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
+            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],

@@ -169,6 +169,36 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        if engine_config.ple_backend == "disk":
+            from freetoken.utils import download_hf_weight
+
+            from .ple_disk import DiskRowTable, resolve_row_source
+
+            folder = download_hf_weight(engine_config.model_path)
+            # one WAIT node per captured graph: the flag protocol supports a single consume
+            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
+            emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
+            # hash with the state-dict-loaded constants, the same source the pinned path reads
+            constants = {
+                "num_ngram_heads": args.num_ngram_heads,
+                "layer_multipliers": emb.layer_multipliers.tolist(),
+                "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
+                "per_head_offsets": emb.ngram_heads_offsets.tolist(),
+                "eos_token_id": args.ngram_boundary_token_id,
+            }
+            disk_table = DiskRowTable(
+                resolve_row_source(folder),
+                constants,
+                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                max_extend_tokens=engine_config.max_extend_tokens,
+            )
+            self._ple_table = disk_table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(disk_table)
+            # engine enters this around every dispatch; the graph itself never waits on the disk
+            self.forward_host_ctx = disk_table.forward_host_ctx
+            return 0
+
         from .weight import load_ple_table
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
