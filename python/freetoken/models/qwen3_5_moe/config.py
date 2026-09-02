@@ -68,6 +68,82 @@ def _expert_quant(hf_config: Any) -> str:
 _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
+def _ftw_linear_storage(
+    path: str,
+) -> tuple[str, str, dict[int, str] | None, bool]:
+    """The :func:`_compressed_linear_storage` 4-tuple re-derived from an FTW index.
+
+    An FTW dir (``ft checkpoint`` output) replaces the safetensors weight_map with
+    ``freetoken_weight.json``, so index sniffing cannot run -- but the storage
+    decision is not lost, it is recorded per tensor: the FTW carries model-side
+    tensor names plus each entry's dtype, which together are unambiguous. A
+    ``uint8`` weight is packed NVFP4, a ``float8*`` weight is native fp8 (the W8A16
+    scales ride along as ``*_scale`` entries, excluded by the ``.weight`` name
+    filter), anything else is bf16. The fp8 GDN layout is additionally named
+    ``linear_attn.in_proj_qkvz`` (NVFP4/bf16 builds register the fused bf16
+    ``in_proj`` instead). A bf16-attention mixed export is indistinguishable from
+    the native NVFP4 assumption this way and keeps it -- identical to the fallback
+    that fired before this derivation existed, so nothing that loaded before
+    regresses. Missing/unreadable index keeps the same native assumption.
+    """
+    import json
+    import os
+    import re
+
+    native: tuple[str, str, dict[int, str] | None, bool] = ("nvfp4", "nvfp4", None, False)
+    ftw = os.path.join(path, "freetoken_weight.json")
+    if not os.path.isfile(ftw):
+        return native
+    try:
+        with open(ftw, encoding="utf-8") as f:
+            tensors = json.load(f).get("tensors") or []
+        dtype_of = {
+            t["name"]: str(t.get("dtype", ""))
+            for t in tensors
+            if isinstance(t, dict) and "name" in t and t.get("kind", "weight") == "weight"
+        }
+    except (OSError, ValueError):
+        return native
+    if not dtype_of:
+        return native
+
+    attn_weight_re = re.compile(r"layers\.\d+\.(?:self_attn|linear_attn)\.\w+\.weight$")
+    mlp_weight_re = re.compile(r"layers\.(\d+)\.mlp\.(?:gate_up_proj|down_proj)\.weight$")
+    attn = "nvfp4"
+    packed: set[int] = set()
+    scaled: set[int] = set()
+    plain: set[int] = set()
+    lmhead_fp8 = False
+    for name, dtype in dtype_of.items():
+        if attn_weight_re.search(name):
+            if dtype.startswith("float8"):
+                attn = "fp8"
+            elif dtype == "uint8" and attn != "fp8":
+                attn = "nvfp4"
+        mm = mlp_weight_re.search(name)
+        if mm:
+            layer = int(mm.group(1))
+            if dtype == "uint8":
+                packed.add(layer)
+            elif dtype.startswith("float8"):
+                scaled.add(layer)
+            else:
+                plain.add(layer)
+        if (
+            name == "lm_head.weight" or name.endswith(".lm_head.weight")
+        ) and dtype.startswith("float8"):
+            lmhead_fp8 = True
+    # No dense fused-MLP weights (routed-expert naming -- shared_expert/experts are
+    # excluded by the regex): keep the native assumption, as the index path does.
+    if not (packed or scaled or plain):
+        return attn, "nvfp4", None, lmhead_fp8
+    overrides = {
+        layer: ("fp8" if layer in scaled else "bf16")
+        for layer in (packed | scaled | plain) - packed
+    }
+    return attn, "nvfp4" if packed else "none", overrides or None, lmhead_fp8
+
+
 def _compressed_linear_storage(
     hf_config: Any,
 ) -> tuple[str, str, dict[int, str] | None, bool]:
@@ -82,8 +158,11 @@ def _compressed_linear_storage(
     else ``"none"``. The override map gives the storage of dense-MLP layers that are
     not packed NVFP4 (``"fp8"`` keeps them native W8A16; ``"bf16"`` dequantizes at
     load); ``None`` means every dense-MLP layer follows the fallback. When the index
-    is unavailable (a hub id before download, or a single-file checkpoint) assume
-    the official dense-NVFP4 layout (all packed, no overrides, bf16 lm_head).
+    is unavailable the checkpoint is an FTW dir if ``freetoken_weight.json`` is
+    present -- the 4-tuple is then re-derived from the FTW's per-tensor dtypes
+    (:func:`_ftw_linear_storage`); otherwise (hub id before download, single-file
+    checkpoint) assume the official dense-NVFP4 layout (all packed, no overrides,
+    bf16 lm_head).
     """
     import json
     import os
@@ -94,7 +173,7 @@ def _compressed_linear_storage(
         return "nvfp4", "nvfp4", None, False
     index = os.path.join(path, "model.safetensors.index.json")
     if not os.path.isfile(index):
-        return "nvfp4", "nvfp4", None, False
+        return _ftw_linear_storage(path)
     with open(index, encoding="utf-8") as f:
         weight_map = json.load(f).get("weight_map", {})
     keys = set(weight_map)
