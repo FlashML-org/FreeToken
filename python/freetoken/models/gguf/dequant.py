@@ -1,5 +1,5 @@
 """GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+checkpoints use: Q4_0, Q8_0, Q6_K, plus trivial F32/F16/BF16).
 
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
@@ -79,6 +79,18 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 quants; ``w = d*q``.
+
+    Unlike Q4_0 there is no offset — ggml's quantize_row_q8_0 stores
+    ``q = round(w / d)`` with ``d = max|w| / 127`` per block.
+    """
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q6_K: 256-elem super-block = 128B low nibbles + 64B high 2-bits + 16 int8
     sub-scales + fp16 ``d``. Direct vectorization of ggml's two-half loop."""
@@ -117,6 +129,7 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -148,6 +161,7 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
     "dequant_q6_k",
     "dequantize",
 ]
