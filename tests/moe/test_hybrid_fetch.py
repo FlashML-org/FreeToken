@@ -6,11 +6,12 @@ per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule
 """
 
 import json
+import os
 
 import pytest
 import torch
 
-from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
+from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
@@ -63,6 +64,25 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) is None
     # a profile from different hardware is ignored
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
+
+
+def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("FREETOKEN_BENCHBW_PATH", raising=False)
+    uuid = "GPU-2f3a9b1c-0000-1111-2222-333344445555"
+
+    def write(path, name, verdict):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"gpu": {"name": name}, "dtypes": {"bf16": verdict}}, f)
+
+    # legacy single file only: used when the name matches, ignored otherwise
+    write(default_profile_path(), "FAKE GPU", "hybrid")
+    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "hybrid"
+    assert load_backend_recommendation("bf16", gpu_name="OTHER", gpu_uuid=uuid) is None
+    # this card's own file wins over the legacy one
+    write(default_profile_path(uuid), "FAKE GPU", "offload")
+    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "offload"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

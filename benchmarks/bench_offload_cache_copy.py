@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
+from freetoken.gpu_select import assign_gpu, bind_assigned_gpu, single_gpu_arg
 from freetoken.moe.offload_cache import _BANK_SCHEMAS, OffloadMoeCache
 
 
@@ -80,7 +81,8 @@ def expert_bytes(profile: ModelProfile) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--gpu", type=single_gpu_arg, default=None,
+                        help="GPU UUID or nvidia-smi index (default: the first visible GPU)")
     parser.add_argument("--repeat", type=int, default=25)
     parser.add_argument("--models", type=str, nargs="+", default=list(MODELS), choices=list(MODELS))
     parser.add_argument(
@@ -228,8 +230,11 @@ def print_table(
 def main() -> None:
     args = parse_args()
     assert torch.cuda.is_available(), "CUDA is required"
-    torch.cuda.set_device(args.device)
-    device = torch.device("cuda")
+    try:
+        assign_gpu(args.gpu)
+        device = bind_assigned_gpu()
+    except (ValueError, RuntimeError) as e:
+        raise SystemExit(f"error: {e}") from e
 
     print("gpu", torch.cuda.get_device_name(device), flush=True)
     for name in args.models:

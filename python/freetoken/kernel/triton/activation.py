@@ -31,6 +31,8 @@ GELU_TANH = 2
 # variant lives in triton/mxfp4_moe.py):
 #   y = clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)
 SWIGLUOAI = 3
+# GLM-5.3 "swiglu_limit": swigluoai's clamped form WITHOUT the (up + 1) bias.
+SWIGLU_CLAMP = 4
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -105,6 +107,11 @@ def _act_and_mul_kernel(
         up = tl.minimum(tl.maximum(up, -limit), limit)
         act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * (up + 1.0)
+    elif ACT == 4:  # SWIGLU_CLAMP (GLM-5.3): swigluoai without the (up + 1) bias
+        gate = tl.minimum(gate, limit)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
+        y = act * up
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
         y = act * up
@@ -166,4 +173,21 @@ def swigluoai_and_mul(
     return _act_and_mul(SWIGLUOAI, x, out, alpha=alpha, limit=limit)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]
+def swiglu_clamp_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    alpha: float = 1.0,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    """GLM-5.3 clamped SwiGLU over UNINTERLEAVED halves: ``clamp(gate, max=limit) * sigmoid(alpha * gate) * clamp(up, +-limit)``."""
+    return _act_and_mul(SWIGLU_CLAMP, x, out, alpha=alpha, limit=limit)
+
+
+__all__ = [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swigluoai_and_mul",
+    "swiglu_clamp_and_mul",
+]

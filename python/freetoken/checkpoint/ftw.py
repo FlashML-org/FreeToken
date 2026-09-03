@@ -33,7 +33,6 @@ Layout on disk::
 from __future__ import annotations
 
 import json
-import logging
 import math
 import mmap
 import os
@@ -43,7 +42,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-logger = logging.getLogger(__name__)
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 INDEX_NAME = "freetoken_weight.json"
 FORMAT_TAG = "freetoken_weight"
@@ -68,18 +69,19 @@ def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
 def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
     """POSIX positional read into ``mv`` at ``offset``, looping over any short preadv.
 
-    preadv may return short (a signal, or the EOF-adjacent tail); the bare call this
-    replaces ignored the return value, so a short read silently left the tail of the
-    destination unfilled -- garbage bytes in the middle of a weight tensor with no
-    error anywhere. Resuming at the running offset stays O_DIRECT-legal: the writer
-    pads every tensor to ALIGN and cuts shards at ALIGN boundaries, so direct-IO
-    short reads land on block boundaries."""
+    preadv may return short (a signal, or the EOF-adjacent tail); the loop resumes
+    at the running offset, which stays O_DIRECT-legal: the writer pads every tensor
+    to ALIGN and cuts shards at ALIGN boundaries, so direct-IO short reads land on
+    block boundaries. EOF before the buffer is filled raises ``OSError`` — a
+    truncated shard must not silently load garbage weights."""
     done = 0
     total = len(mv)
     while done < total:
         n = os.preadv(fd, [mv[done:]], offset + done)
         if n == 0:
-            break  # EOF
+            raise OSError(
+                f"unexpected EOF reading FTW: got {done}/{total} bytes at offset {offset}"
+            )
         done += n
 
 
@@ -317,11 +319,20 @@ class FTWReader:
         if self._direct:
             def rd(job):
                 file, fo, do, ln = job
-                _pread_into(self._fd(file), dest[do:do + ln], fo)
+                try:
+                    _pread_into(self._fd(file), dest[do:do + ln], fo)
+                except OSError as e:
+                    raise OSError(f"shard {file}: {e}") from e
         else:
             def rd(job):
                 file, fo, do, ln = job
-                dest[do:do + ln] = self._map(file)[fo:fo + ln]  # memcpy from the mapping
+                mv = self._map(file)
+                if fo + ln > len(mv):
+                    raise OSError(
+                        f"unexpected EOF reading FTW: shard {file} has "
+                        f"{len(mv)} bytes, need {ln} at offset {fo}"
+                    )
+                dest[do:do + ln] = mv[fo:fo + ln]
 
         if len(jobs) <= 1:
             for j in jobs:
@@ -402,11 +413,15 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 
 
 def load_ftw_banks(
-    path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK
+    path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
+    layer_residency: list[str] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
-    entries, on the per-layer host bank contract (one pinned ``[num_experts, ...]``
+    entries, on the per-layer host bank contract (one ``[num_experts, ...]``
     HostBank per layer per bank; see ``moe.offload_cache.set_bank_sources``).
+
+    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
+    The applied labels are echoed back on ``ExpertBanks.layer_residency``.
 
     Two on-disk row layouts, distinguished per bank name (a file never mixes them for
     the same name -- checked below):
@@ -430,8 +445,21 @@ def load_ftw_banks(
     vectors, unaffected by the row split (fixed GPU residency; see
     ``cache_budget.expert_bytes_per_slot``).
     """
-    from freetoken.moe.host_banks import HostBank, PinPipeline, alloc_banks
+    from freetoken.moe.host_banks import (
+        HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
+    )
     from freetoken.utils.progress import byte_bar
+
+    residency = layer_residency or [HostResidency.PINNED.value] * num_layers
+    assert len(residency) == num_layers, (len(residency), num_layers)
+
+    # PINNED layers are born-pinned (cudaHostAlloc) where that wins (see born_pinned_default); LOCKED/PAGEABLE layers stay lazy mmaps
+    born = born_pinned_default()
+
+    def _backing(layer_id: int) -> str:
+        if born and residency[layer_id] == HostResidency.PINNED.value:
+            return "cuda"
+        return "mmap"
 
     reader = FTWReader(path)
     bank_entries = reader.entries("experts_bank")
@@ -492,10 +520,10 @@ def load_ftw_banks(
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
-            bank = HostBank((win_end - win_off,), torch.uint8)
+            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
             row_hb[name].append(bank)
             row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
-            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes))
+            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
 
     for base, by_layer in per_layer_groups.items():
         assert sorted(by_layer) == list(range(num_layers)), (
@@ -507,10 +535,10 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]))
+            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e))
+            layer_jobs.append((base, bank, e, layer_id))
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
@@ -528,16 +556,16 @@ def load_ftw_banks(
                 bar.update(e["nbytes"])
 
             def _read_row(job):
-                _name, bank, win_off, win_len, layer_bytes = job
+                _name, bank, win_off, win_len, layer_bytes, layer_id = job
                 reader.read_into(bank.memoryview(), {"global_off": win_off, "nbytes": win_len},
                                  workers=workers, chunk=chunk)
-                pins.submit(bank)
+                pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
             def _read_layer(job):
-                _name, bank, entry = job
+                _name, bank, entry, layer_id = job
                 reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
-                pins.submit(bank)
+                pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
             with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
@@ -564,10 +592,45 @@ def load_ftw_banks(
 
     from freetoken.moe.expert_banks import ExpertBanks
 
+    # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
+    applied = list(residency)
+    for banks in row_hb.values():
+        for layer_id, bank in enumerate(banks):
+            if (applied[layer_id] == HostResidency.LOCKED.value
+                    and bank.residency is not HostResidency.LOCKED):
+                applied[layer_id] = HostResidency.PAGEABLE.value
+    unpinned = [i for i, r in enumerate(applied) if r != HostResidency.PINNED.value]
+    if unpinned:
+        by_layer = [0] * num_layers
+        for name, banks in row_hb.items():
+            for layer_id, bank in enumerate(banks):
+                by_layer[layer_id] += bank.nbytes
+        locked = [i for i in unpinned if applied[i] == HostResidency.LOCKED.value]
+        pageable = [i for i in unpinned if i not in set(locked)]
+        pinned_b = sum(b for i, b in enumerate(by_layer) if i not in set(unpinned))
+        locked_b = sum(by_layer[i] for i in locked)
+        pageable_part = ""
+        if pageable:
+            pageable_b = sum(by_layer[i] for i in pageable)
+            pageable_part = (
+                f" + {pageable_b / 2**30:.2f} GiB pageable "
+                f"(lock failed, {len(pageable)} CPU layers: {pageable})"
+            )
+        logger.info(
+            f"MoE bank split residency: {pinned_b / 2**30:.2f} GiB pinned "
+            f"({'born-pinned cudaHostAlloc' if born else 'cudaHostRegister'}, "
+            f"{num_layers - len(unpinned)} GPU layers) + "
+            f"{locked_b / 2**30:.2f} GiB OS-locked ({len(locked)} CPU layers: {locked})"
+            f"{pageable_part}"
+        )
+
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
-    return ExpertBanks(reader.meta("quant_format"), sources, **alpha_kw)
+    return ExpertBanks(
+        reader.meta("quant_format"), sources, **alpha_kw,
+        layer_residency=applied,
+    )
 
 
 __all__ = [

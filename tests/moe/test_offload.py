@@ -675,3 +675,196 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     bf16 = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
     with pytest.raises(ValueError, match="num_experts"):
         bf16.validate_rebuild(3)  # below the num_experts floor
+
+
+def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
+    """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    dev = torch.device(device)
+    cache = OffloadMoeCache(
+        num_layers=num_layers, num_experts=4, cache_size=8,
+        device=dev, prefill_overlap=prefill_overlap,
+    )
+    cache.cpu_layer_ids = frozenset(locked)
+    src_dev = dev if dev.type == "cuda" else torch.device("cpu")
+    sources = {
+        # CUDA-resident pinned-layer sources keep _build_copy_plan's device_ptr happy in the CUDA variant; locked layers stay host tensors (never translated)
+        "gate_up": [
+            torch.randn(4, 32, 8, device=torch.device("cpu") if i in locked else src_dev)
+            for i in range(num_layers)
+        ],
+        "down": [
+            torch.randn(4, 8, 16, device=torch.device("cpu") if i in locked else src_dev)
+            for i in range(num_layers)
+        ],
+    }
+    residency = [
+        HostResidency.LOCKED.value if i in locked else HostResidency.PINNED.value
+        for i in range(num_layers)
+    ]
+    cache.set_bank_sources(sources, layer_residency=residency)
+    return cache, sources
+
+
+def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
+    # a layer without a device address can only decode on the CPU executor; labeling it LOCKED outside cpu_layer_ids is a wiring bug and must fail loudly
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="cpu_layer_ids"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+        )
+
+
+def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
+    # prefill overlap DMAs from registered banks; a LOCKED layer cannot feed it
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    cache.cpu_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="[Pp]refill overlap"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+        )
+
+
+def test_locked_layer_prefill_materialize_copies_whole_layer_pageable():
+    # the only movement a LOCKED layer needs: copy_missing's pageable branch copies the whole layer into slots [0, E) with position == expert id
+    # stage the state materialize_layer would (its kernel is CUDA-only; the fixture cache lives on the CPU)
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,))
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+    cache.copy_missing()
+
+    gate_up_cache, down_cache = (c for _, c in cache.banks)
+    assert torch.equal(gate_up_cache[:4], sources["gate_up"][1])
+    assert torch.equal(down_cache[:4], sources["down"][1])
+    # (The pinned layers' staged JIT path is covered by the mocked tests above.)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_copy_plan_skips_locked_layers_and_keeps_fused_path():
+    # _build_copy_plan must not resolve a device alias for a LOCKED layer; its descriptor row stays a 0 placeholder while the pinned layers keep the fused path
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
+
+    assert cache._copy_fused_ok
+    assert (cache._copy_src_ptrs[1] == 0).all(), "locked layer row must stay 0"
+    assert (cache._copy_src_ptrs[0] != 0).all(), "pinned layer rows must resolve"
+
+
+def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
+    # the pageable branch presumes materialize_layer's position == expert id; staging via ensure_experts (LRU slot remap) on a locked layer must fail loudly, not gather other experts' weights
+    # stage the state ensure_experts would (its kernel is CUDA-only; the fixture cache lives on the CPU)
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,))
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = False
+    with pytest.raises(RuntimeError, match="unpinned"):
+        cache.copy_missing()
+
+
+def test_requested_residency_routes_layer_settles(monkeypatch):
+    # the ambient plan installed by load_expert_banks must route each layer's banks by label at both slow-path settle points (PinPipeline layer sink, list-valued pin_banks) and record that it was consulted
+    # without a plan everything pins
+    import freetoken.moe.host_banks as hb
+
+    settled = []
+    monkeypatch.setattr(hb.HostBank, "pin", lambda self: settled.append("pin"))
+    monkeypatch.setattr(hb.HostBank, "lock", lambda self: settled.append("lock"))
+    banks = {
+        "gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(3)],
+        "down": [hb.HostBank((4,), torch.uint8) for _ in range(3)],
+    }
+    labels = [
+        hb.HostResidency.PINNED.value,
+        hb.HostResidency.LOCKED.value,
+        hb.HostResidency.PAGEABLE.value,
+    ]
+
+    with hb.requested_residency(labels) as plan:
+        with hb.PinPipeline() as pins:
+            for layer_id in range(3):
+                pins(layer_id, {name: per[layer_id] for name, per in banks.items()})
+    # the single drain thread settles FIFO: layer 0 pins, layer 1 locks, layer 2 passes
+    assert settled == ["pin", "pin", "lock", "lock"]
+    assert plan.applied
+
+    settled.clear()
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+    assert settled == ["pin", "lock", "pin", "lock"]  # per name: layer 0 pin, 1 lock, 2 skip
+    assert plan.applied
+
+    settled.clear()
+    hb.pin_banks(banks)  # no ambient plan -> every layer pins
+    assert settled == ["pin"] * 6
+
+
+def test_echo_residency_stamps_honored_requests_only():
+    # load_expert_banks stamps the request onto the provider's ExpertBanks only when a settle point consulted the plan; an unconsulted plan keeps None (the engine's degrade signal)
+    from freetoken.moe.expert_banks import ExpertBanks, _echo_residency
+    from freetoken.moe.host_banks import HostResidency, _ResidencyPlan
+
+    labels = [HostResidency.PINNED.value, HostResidency.LOCKED.value]
+    banks = ExpertBanks("bf16", {"gate_up": [], "down": []})
+
+    plan = _ResidencyPlan(labels)
+    plan.residency_for(1)  # a settle point consulted the plan
+    assert _echo_residency(banks, labels, plan).layer_residency == labels
+
+    stale = _ResidencyPlan(labels)  # never consulted -> keep None + warn
+    assert _echo_residency(banks, labels, stale).layer_residency is None
+    assert _echo_residency(banks, None, None) is banks
+
+
+def test_lock_failure_downgrades_echoed_residency(monkeypatch):
+    # a failed mlock leaves the bank pageable; the plan and the echoed labels must report that instead of the requested LOCKED
+    import freetoken.moe.host_banks as hb
+    from freetoken.moe.expert_banks import ExpertBanks, _echo_residency
+
+    def boom(addr, nbytes):
+        raise OSError(12, "mlock denied")
+
+    monkeypatch.setattr(hb, "_os_lock", boom)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")  # keep the pinned layer off CUDA
+    labels = [hb.HostResidency.PINNED.value, hb.HostResidency.LOCKED.value]
+
+    banks = {"gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(2)]}
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+    assert plan.actual == {1: hb.HostResidency.PAGEABLE.value}
+    echoed = _echo_residency(ExpertBanks("bf16", {}), labels, plan)
+    assert echoed.layer_residency == [
+        hb.HostResidency.PINNED.value, hb.HostResidency.PAGEABLE.value,
+    ]
+
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    with hb.requested_residency(labels) as plan2:
+        with hb.PinPipeline() as pins:
+            pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
+    assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}

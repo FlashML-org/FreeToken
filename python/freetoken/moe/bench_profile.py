@@ -1,4 +1,4 @@
-"""Torch-free reader for the ``ft bench bw`` hardware profile (``benchbw.json``).
+"""Torch-free reader for the ``ft bench bw`` hardware profile (``benchbw/<gpu-uuid>.json``).
 
 The engine consults this at MoE-backend *auto* resolution (``engine.py``) to make the
 offload-vs-hybrid choice hardware-adaptive without importing the (torch-heavy) benchmark
@@ -31,10 +31,42 @@ _QUANT_TO_BENCH_FORMAT = {
 }
 
 
-def default_profile_path() -> str:
-    """``$XDG_CACHE_HOME/freetoken/benchbw.json`` (mirrors ``benchbw.default_out_path``)."""
+def _cache_dir() -> str:
     cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache, "freetoken", "benchbw.json")
+    return os.path.join(cache, "freetoken")
+
+
+def default_profile_path(gpu_uuid: str | None = None) -> str:
+    """``$XDG_CACHE_HOME/freetoken/benchbw/<gpu-uuid>.json``, or the legacy ``benchbw.json`` without a uuid.
+
+    One file per GPU: bandwidth differs between slots.
+    """
+    if gpu_uuid:
+        return os.path.join(_cache_dir(), "benchbw", f"{gpu_uuid}.json")
+    return os.path.join(_cache_dir(), "benchbw.json")
+
+
+def latest_profile_path() -> str | None:
+    """Newest ``benchbw/*.json``, else the legacy ``benchbw.json``, else None."""
+    per_gpu = os.path.join(_cache_dir(), "benchbw")
+    newest: tuple[float, str] | None = None
+    try:
+        for name in os.listdir(per_gpu):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(per_gpu, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, path)
+    except OSError:
+        pass
+    if newest is not None:
+        return newest[1]
+    legacy = default_profile_path()
+    return legacy if os.path.isfile(legacy) else None
 
 
 def _load(path: str) -> dict | None:
@@ -45,14 +77,28 @@ def _load(path: str) -> dict | None:
         return None
 
 
-def _usable_profile(gpu_name: str | None, path: str | None) -> dict | None:
+def _usable_profile(
+    gpu_name: str | None, path: str | None, gpu_uuid: str | None = None
+) -> dict | None:
     """The cached profile, or ``None`` when there is no file / it was benched on another GPU
     (bandwidths are hardware-specific, so a mismatch is ignored rather than trusted).
 
-    ``path`` overrides the profile location (else ``FREETOKEN_BENCHBW_PATH`` then the default).
+    Lookup: explicit ``path`` (else ``FREETOKEN_BENCHBW_PATH``) -> ``benchbw/<gpu_uuid>.json`` -> legacy ``benchbw.json``.
     """
-    src = path or os.environ.get("FREETOKEN_BENCHBW_PATH") or default_profile_path()
-    prof = _load(src)
+    explicit = path or os.environ.get("FREETOKEN_BENCHBW_PATH")
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = [default_profile_path(gpu_uuid)] if gpu_uuid else []
+        candidates.append(default_profile_path())
+    prof = None
+    for src in candidates:
+        prof = _load(src)
+        if isinstance(prof, dict):
+            break
+        if os.path.exists(src):
+            # unreadable profile for this card: stay on the safe default, do not borrow the legacy file
+            return None
     if not isinstance(prof, dict):
         return None
     prof_gpu = (prof.get("gpu") or {}).get("name")
@@ -66,7 +112,10 @@ def _usable_profile(gpu_name: str | None, path: str | None) -> dict | None:
 
 
 def load_backend_recommendation(
-    quant_format: str, gpu_name: str | None = None, path: str | None = None
+    quant_format: str,
+    gpu_name: str | None = None,
+    path: str | None = None,
+    gpu_uuid: str | None = None,
 ) -> str | None:
     """Bench-recommended offload-family backend for ``quant_format`` on this GPU, or ``None``.
 
@@ -77,7 +126,7 @@ def load_backend_recommendation(
     default (offload) on ``None``.
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
-    prof = _usable_profile(gpu_name, path)
+    prof = _usable_profile(gpu_name, path, gpu_uuid)
     if prof is None:
         return None
 
@@ -105,7 +154,10 @@ def load_backend_recommendation(
 
 
 def load_hybrid_fetch_fraction(
-    quant_format: str, gpu_name: str | None = None, path: str | None = None
+    quant_format: str,
+    gpu_name: str | None = None,
+    path: str | None = None,
+    gpu_uuid: str | None = None,
 ) -> float | None:
     """Benched hybrid fetch fraction for ``quant_format``, or ``None``.
 
@@ -119,7 +171,7 @@ def load_hybrid_fetch_fraction(
     ``None`` = no usable profile; clamped to [0, 1].
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
-    prof = _usable_profile(gpu_name, path)
+    prof = _usable_profile(gpu_name, path, gpu_uuid)
     if prof is None:
         return None
     entries = [(prof.get("dtype_kernels") or {}).get(fmt)] + [

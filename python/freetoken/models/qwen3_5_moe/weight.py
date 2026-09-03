@@ -911,11 +911,17 @@ def _build_fp8_expert_banks(
 
     B = 128
     L, E, H, I, dense = _moe_dims(config)
+
+    # 16B-align the per-expert scale rows (Qwen3.8: down_scale is 20x5 bf16 = 200 B) so the
+    # fused multi-bank copy engages; the GEMMs read scales through explicit strides, so the
+    # padding is inert. Unconditional: one layout per format, shared with the byte formulas.
+    from freetoken.moe.offload_cache import fp8_block_scale_pad as _pad_cols
+
     specs = {
         "gate_up": ((E, 2 * I, H), FP8),
-        "gate_up_scale": ((E, 2 * I // B, H // B), torch.bfloat16),
+        "gate_up_scale": ((E, 2 * I // B, _pad_cols(2 * I // B, H // B)), torch.bfloat16),
         "down": ((E, H, I), FP8),
-        "down_scale": ((E, H // B, I // B), torch.bfloat16),
+        "down_scale": ((E, H // B, _pad_cols(H // B, I // B)), torch.bfloat16),
     }
     hb = None
     if pin:
@@ -950,8 +956,9 @@ def _build_fp8_expert_banks(
             (gate_up[li][e, :I] if proj == "gate" else
              gate_up[li][e, I:] if proj == "up" else down[li][e]).copy_(t)
         else:  # weight_scale_inv
-            (gate_up_scale[li][e, : I // B] if proj == "gate" else
-             gate_up_scale[li][e, I // B:] if proj == "up" else down_scale[li][e]).copy_(t)
+            (gate_up_scale[li][e, : I // B, : H // B] if proj == "gate" else
+             gate_up_scale[li][e, I // B :, : H // B] if proj == "up" else
+             down_scale[li][e, :, : I // B]).copy_(t)
         return li
 
     if parallel is None:

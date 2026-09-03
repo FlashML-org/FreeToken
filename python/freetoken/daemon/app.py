@@ -58,16 +58,41 @@ class BenchBody(BaseModel):
     args: list[str] = []
 
 
-def _bench_profile_path() -> str:
-    from freetoken.moe.bench_profile import default_profile_path  # torch-free
+def _bench_profile_path(gpu_uuid: str | None) -> str | None:
+    # per-GPU profiles and no torch here: the serve's own card when its --gpu names one, else the newest file
+    from freetoken.moe.bench_profile import default_profile_path, latest_profile_path  # torch-free
 
-    return default_profile_path()
+    if gpu_uuid:
+        path = default_profile_path(gpu_uuid)
+        if os.path.isfile(path):
+            return path
+    return latest_profile_path()
 
 
-def _read_bench_profile() -> dict | None:
-    """The engine host's cached benchbw.json (this is where the serve reads it too), or None."""
+def _serve_gpu_uuid(args: list[str]) -> str | None:
+    """The full UUID a serve's `--gpu` pins, or None when there is none or it cannot be resolved."""
+    for i, a in enumerate(args):
+        val = a[len("--gpu="):] if a.startswith("--gpu=") else (args[i + 1] if a == "--gpu" and i + 1 < len(args) else None)
+        if not val:
+            continue
+        from freetoken.gpu_select import resolve_gpu_uuids
+
+        try:
+            resolved = resolve_gpu_uuids([val])
+        except ValueError:
+            return None
+        if resolved:
+            return resolved[0]
+        # no NVML: a UUID value still keys the profile file (canonical prefix), an index cannot
+        return "GPU-" + val[len("GPU-"):] if val.upper().startswith("GPU-") else None
+    return None
+
+
+def _read_bench_profile(path: str | None) -> dict | None:
+    if path is None:
+        return None
     try:
-        with open(_bench_profile_path()) as f:
+        with open(path) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -331,19 +356,23 @@ def build_app(
                 yield _bench_sse("error", {"message": f"failed to spawn bench: {exc}"})
                 return
             tail: collections.deque = collections.deque(maxlen=8)  # last non-progress lines (errors)
+            out_path: str | None = None
             assert proc.stdout is not None
             async for raw in proc.stdout:
                 line = raw.decode(errors="replace").rstrip()
                 prog = _parse_ftbench(line)
                 if prog is not None:
                     yield _bench_sse("progress", prog)
+                elif line.startswith("FTBENCH_OUT "):
+                    out_path = line[len("FTBENCH_OUT "):]
                 elif line:
                     tail.append(line)
             rc = await proc.wait()
             if rc != 0:
                 yield _bench_sse("error", {"message": "\n".join(tail) or f"bench exited {rc}"})
                 return
-            prof = _read_bench_profile()
+            # the file this run wrote (an older engine prints no FTBENCH_OUT: newest file, as before)
+            prof = _read_bench_profile(out_path or _bench_profile_path(None))
             if prof is None:
                 yield _bench_sse("error", {"message": "bench finished but no profile was written"})
             else:
@@ -353,7 +382,23 @@ def build_app(
 
     @app.get("/bench/profile", dependencies=auth)
     async def bench_profile():
-        return await run(proxy_pool, _read_bench_profile)
+        def read() -> dict | None:
+            return _read_bench_profile(_bench_profile_path(serve_gpu_uuid()))
+
+        def serve_gpu_uuid() -> str | None:
+            # the running serve reports the full UUID of its card (/v1/stats gpus); a --gpu given as
+            # a UUID prefix would not match the profile file name
+            st = manager.status()
+            if st.get("running"):
+                try:
+                    gpus = probe.stats(st.get("port") or default_serve_port).get("gpus") or []
+                    if gpus and gpus[0].get("uuid"):
+                        return gpus[0]["uuid"]
+                except Exception:  # noqa: BLE001 -- the arg below is the fallback
+                    pass
+            return _serve_gpu_uuid(manager.serve_args())
+
+        return await run(proxy_pool, read)
 
     return app
 

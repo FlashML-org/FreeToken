@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import os
+
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.engine import _pin_budget_bytes
 
 
 def test_moe_priority_fills_experts_up_to_total():
@@ -480,3 +483,20 @@ def test_adjust_config_rope_gate_exempts_dsv4():
     cfg = _dsv4_adjust_cfg(max_seq_len_override=10_000_000)
     cfg.model_config.rotary_config = SimpleNamespace(max_position=1024)
     _adjust_config(cfg)  # must not raise
+
+
+# ---- _pin_budget_bytes: host bytes already pinned outside the expert banks ----
+
+
+def test_reserved_subtracts_from_the_cap(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "2")
+    assert _pin_budget_bytes() == 2 * 2**30
+    assert _pin_budget_bytes(reserved=2**30) == 2**30
+    assert _pin_budget_bytes(reserved=4 * 2**30) == 0
+
+
+def test_uncapped_platform_stays_uncapped(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
+        pytest.skip("WSL caps pinning")
+    assert _pin_budget_bytes(reserved=2**30) is None

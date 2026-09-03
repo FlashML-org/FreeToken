@@ -140,8 +140,10 @@ def _model_config(model_path: str):
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    torch.cuda.set_device(0)
-    torch.zeros(1, device="cuda")  # init CUDA context (pinning / nvfp4 backend pick)
+    from freetoken.gpu_select import bind_assigned_gpu
+
+    dev = bind_assigned_gpu()
+    torch.zeros(1, device=dev)  # init CUDA context (pinning / nvfp4 backend pick)
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(0, 1),
                        dtype=torch.bfloat16, moe_backend="offload")
     return cfg.model_config
@@ -176,7 +178,7 @@ def _bench_load(mode: str, model_path: str, *, parallel: bool, workers: int, chu
     s.start()
     t = time.perf_counter()
     try:
-        banks = load_expert_banks(model_path, mc, device=torch.device("cuda:0"),
+        banks = load_expert_banks(model_path, mc, device=torch.device("cuda", torch.cuda.current_device()),
                                   dtype=torch.bfloat16, parallel=parallel,
                                   workers=workers, chunk=chunk)
     except NotImplementedError as e:
@@ -220,7 +222,8 @@ def worker_build(ns):
     s = MemSampler()
     s.start()
     t = time.perf_counter()
-    idx = convert_checkpoint(ns.model, ns.ftw_dir, moe_backend="offload", shard_limit=shard_limit)
+    dev = f"cuda:{torch.cuda.current_device()}" if ns.gpu else None
+    idx = convert_checkpoint(ns.model, ns.ftw_dir, moe_backend="offload", shard_limit=shard_limit, device=dev)
     build_s = time.perf_counter() - t
     s.stop()
     print("@@RESULT@@" + json.dumps({
@@ -237,6 +240,8 @@ def _spawn(worker: str, ns):
     cmd = [sys.executable, os.path.abspath(__file__), "--_worker", worker, "--model", ns.model,
            "--workers", str(ns.workers), "--chunk-mib", str(ns.chunk_mib),
            "--shard-gib", str(ns.shard_gib), "--ftw-dir", ns.ftw_dir]
+    if ns.gpu:
+        cmd += ["--gpu", ns.gpu]
     if ns.no_drop_cache:
         cmd.append("--no-drop-cache")
     # Capture ONLY stdout (the @@RESULT@@ line); let stderr inherit the terminal so the
@@ -260,6 +265,10 @@ def main():
     p.add_argument("--no-drop-cache", action="store_true",
                    help="don't evict page cache before each read (warm comparison)")
     p.add_argument("--keep-ftw", action="store_true", help="keep + reuse the FTW dir across runs")
+    from freetoken.gpu_select import single_gpu_arg
+
+    p.add_argument("--gpu", type=single_gpu_arg, default=None,
+                   help="GPU UUID or nvidia-smi index (default: the first visible GPU)")
     p.add_argument("--_worker", default="")
     ns = p.parse_args()
 
@@ -268,7 +277,17 @@ def main():
     if not ns.ftw_dir:
         ns.ftw_dir = _default_ftw_dir(ns.model)
 
+    from freetoken.gpu_select import assign_gpu
+
+    try:
+        assign_gpu(ns.gpu)
+    except ValueError as e:
+        p.error(str(e))
+
     if ns._worker:
+        from freetoken.gpu_select import bind_assigned_gpu
+
+        bind_assigned_gpu()
         return _WORKERS[ns._worker](ns)
 
     from freetoken.checkpoint.ftw import is_ftw_checkpoint

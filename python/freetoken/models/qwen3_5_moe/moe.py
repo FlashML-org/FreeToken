@@ -69,7 +69,10 @@ class Qwen3_5MoE(BaseOP):
             "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block" else "bf16"
         )
         self.experts = make_moe_layer(
-            config, layer_id=layer_id, renormalize=True, weight_format=weight_format
+            config,
+            layer_id=layer_id,
+            renormalize=config.norm_topk_prob,
+            weight_format=weight_format,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(

@@ -100,15 +100,19 @@ def _build_jit_cache() -> None:
         "yes",
         "on",
     }
-    # Multi-arch fatbin: build a SASS cubin for every target arch so the wheel runs driver-only
-    # on any of them (no per-GPU JIT / nvcc). tvm-ffi reads TVM_FFI_CUDA_ARCH_LIST; freetoken's
-    # _cuda_cflags adds the top arch's PTX for forward-compat to newer GPUs. Default covers Ampere
-    # consumer (8.6), Ada / 40xx (8.9), Hopper (9.0), Blackwell datacenter (10.0) + consumer /
-    # 50xx (12.0). Override the set with FREETOKEN_KERNEL_CACHE_ARCHES (space-separated maj.min),
-    # or TVM_FFI_CUDA_ARCH_LIST directly. Needs an nvcc that supports every listed arch.
+    # Multi-arch fatbin: one SASS cubin per listed arch, plus the PTX of the highest one.
+    # A GPU whose arch is not listed and is below the highest one has no usable image.
+    #   8.0  -> A100, A800, A30                      (Ampere, datacenter)
+    #   8.6  -> RTX 30 series, A10, A40              (Ampere, consumer / workstation)
+    #   8.9  -> RTX 40 series, L4, L40, RTX 6000 Ada (Ada Lovelace)
+    #   9.0  -> H100, H800, H20                      (Hopper)
+    #   10.0 -> B200, B100, GB200                    (Blackwell, datacenter)
+    #   12.0 -> RTX 50 series, RTX PRO 6000 Blackwell (Blackwell, consumer / workstation)
+    # Override with FREETOKEN_KERNEL_CACHE_ARCHES (space-separated maj.min) or
+    # TVM_FFI_CUDA_ARCH_LIST directly. Needs an nvcc that supports every listed arch.
     if "TVM_FFI_CUDA_ARCH_LIST" not in os.environ:
         os.environ["TVM_FFI_CUDA_ARCH_LIST"] = os.getenv(
-            "FREETOKEN_KERNEL_CACHE_ARCHES", "8.6 8.9 9.0 10.0 12.0"
+            "FREETOKEN_KERNEL_CACHE_ARCHES", "8.0 8.6 8.9 9.0 10.0 12.0"
         )
     compile_and_package_kernels(
         out_dir=out_dir,

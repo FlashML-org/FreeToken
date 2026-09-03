@@ -77,6 +77,24 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
+# lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
+from freetoken.kernel.aot_models import fp8_block_scale_pad
+
+
+# bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
+# keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
+_BANK_BYTES_PER_EXPERT = {
+    "bf16": lambda H, I: 3 * I * H * 2,
+    "fp8_block": lambda H, I: 3 * I * H + (
+        (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
+        + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
+    ) * 2,
+    "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
+    "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
+    "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+}
+
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
@@ -162,8 +180,10 @@ class OffloadMoeCache:
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
-        self.evict_slots = torch.empty((self.num_experts,), dtype=torch.int32, device=self.device)
-        self.src_indices = torch.empty((self.num_experts,), dtype=torch.int32, device=self.device)
+        # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
+        plan_slots = max(self.num_experts, self.cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
@@ -182,10 +202,10 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
-        # Per-layer host residency (HostResidency values). The GPU movement paths
-        # (fused gather, prefill DMA) require "pinned"; other residency classes
-        # are not supported here and are rejected by set_bank_sources.
+        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
+        # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
+        self._unpinned_layers: frozenset = frozenset()
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -236,7 +256,9 @@ class OffloadMoeCache:
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
+        # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
+        self._pending_whole_layer = False
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -275,10 +297,8 @@ class OffloadMoeCache:
         repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.moe.nvfp4_backends`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
-        ``layer_residency`` labels each layer with a ``HostResidency`` value
-        (default: all pinned). Non-pinned layers have no device address, so the
-        GPU movement paths cannot serve them and they are rejected here
-        (platform-specific residency policies are not implemented).
+        ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -288,11 +308,22 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r != HostResidency.PINNED.value for r in residency):
-            raise NotImplementedError(
-                "non-pinned host bank layers need platform-specific movement "
-                "paths that are not implemented; only pinned layers are served"
-            )
+        unpinned = frozenset(
+            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
+        )
+        if unpinned:
+            if not unpinned <= self.cpu_layer_ids:
+                raise ValueError(
+                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
+                    f"cpu_layer_ids: a layer without a device address can only decode on "
+                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                )
+            if self.prefill_overlap:
+                raise ValueError(
+                    "prefill overlap DMAs from registered banks; it must be disabled "
+                    "when any layer is LOCKED/PAGEABLE (the engine does this)"
+                )
+        self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
         for name in self.bank_schema:
             per_layer = sources[name]
@@ -316,6 +347,19 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
+        self._build_fused_copy_plan()
+        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
+            return
+        for name in self.bank_schema:
+            cache = self.bank_caches[name]
+            feat = math.prod(cache.shape[1:]) * cache.element_size()
+            if feat % 128:
+                raise RuntimeError(
+                    f"MoE bank {name!r} rows are {feat} bytes (not a multiple of 128): "
+                    f"only the fused multi-bank copy can move them, but it is disabled"
+                )
+
+    def _build_fused_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
         Built once here (and on :meth:`rebuild`, which reallocates the slot caches);
@@ -344,6 +388,11 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
+                if layer_id in self._unpinned_layers:
+                    # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
+                    # a 0 placeholder keeps the descriptor shape
+                    layer_src_ptrs[layer_id].append(0)
+                    continue
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM).
@@ -429,6 +478,9 @@ class OffloadMoeCache:
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        plan_slots = max(self.num_experts, cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -439,6 +491,8 @@ class OffloadMoeCache:
         self.stat_calls.zero_()
         self.stat_fetched.zero_()
         self.stat_missing_layer.zero_()
+        # a rebuild is a cold start for the cache; carrying pre-rebuild hit/miss counts over would skew every post-rebuild stats report
+        self.lru_stats.zero_()
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
@@ -490,6 +544,11 @@ class OffloadMoeCache:
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
+
+    def is_unpinned_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
+        ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
+        return layer_id in self._unpinned_layers
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -767,6 +826,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -785,6 +845,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
@@ -793,6 +854,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
+        self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -927,6 +989,18 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if layer_id in self._unpinned_layers:
+            if not self._pending_whole_layer:
+                raise RuntimeError(
+                    f"layer {layer_id} is unpinned: its only copy is the whole-layer "
+                    f"pageable materialize (position == expert id); ensure_experts's "
+                    f"LRU slot remap cannot be honored without a device alias"
+                )
+            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
+            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
+            for per_layer, cache in self.banks:
+                cache[: self.num_experts].copy_(per_layer[layer_id])
+            return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 

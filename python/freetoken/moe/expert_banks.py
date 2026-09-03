@@ -24,9 +24,12 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .offload_cache import _BANK_SCHEMAS
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
+
+# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
+_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
 
 
 @dataclass(frozen=True)
@@ -40,8 +43,7 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
-    # Per-layer HostResidency values; None -> all pinned (the only class
-    # served; policies that assign other classes are not implemented).
+    # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
@@ -371,6 +373,38 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
     return avail > sum(sizes) + max(sizes)
 
 
+def ftw_bank_bytes(model_path: str) -> int | None:
+    """Total expert-bank bytes of an FTW checkpoint, from its metadata (no bank IO).
+    ``None`` when the checkpoint is not FTW -- callers that size things pre-load (auto split residency) then leave the load unchanged."""
+    import json
+
+    meta = os.path.join(model_path, "freetoken_weight.json")
+    if not os.path.isfile(meta):
+        return None
+    with open(meta, encoding="utf-8") as f:
+        tensors = json.load(f).get("tensors", [])
+    return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
+
+
+def bank_bytes_estimate(model_config) -> int | None:
+    """Estimated total expert-bank bytes of a raw checkpoint, from the model config alone.
+
+    Sizes the pin-budget decisions where FTW metadata is not available; ``None`` for unknown formats or missing dims (callers then skip the pre-load sizing).
+    nvfp4 uses the native-row formula, a slight over-estimate for the repacked backends."""
+    expert_quant = getattr(model_config, "expert_quant", "none")
+    fmt = expert_quant if expert_quant != "none" else (
+        getattr(model_config, "moe_weight_format", None) or "bf16"
+    )
+    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
+    layers = getattr(model_config, "num_moe_layers", None)
+    experts = getattr(model_config, "num_experts", None)
+    hidden = getattr(model_config, "hidden_size", None)
+    inter = getattr(model_config, "moe_intermediate_size", None)
+    if per_expert is None or not all((layers, experts, hidden, inter)):
+        return None
+    return layers * experts * per_expert(hidden, inter)
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -383,6 +417,7 @@ def load_expert_banks(
     chunk: int = _PARALLEL_CHUNK,
     decode_target: str = "gpu",
     layer_sink=None,
+    layer_residency: list[str] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -400,22 +435,33 @@ def load_expert_banks(
     ``layer_sink`` (the converter only): forwarded to whichever provider is picked; a
     provider only engages it (and reports ``ExpertBanks.streamed=True``) for its own
     streamable formats, so callers must check ``streamed`` rather than assume it fired.
+
+    ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
+    Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
-            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk
+            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+            layer_residency=layer_residency,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
 
+    if parallel and not _PARALLEL_READER_SUPPORTED:
+        logger.warning_rank0(
+            "expert banks: parallel O_DIRECT reader unsupported on this platform "
+            "(no os.O_DIRECT/preadv) -> serial build"
+        )
+        parallel = False
+
     auto = parallel is None
     if auto:
         from freetoken.models.weight import experts_scattered
 
-        parallel = not dummy and experts_scattered(model_path)
+        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
@@ -432,12 +478,43 @@ def load_expert_banks(
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
     # allocation) falls back to serial.
-    try:
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                   decode_target, layer_sink)
-    except NotImplementedError as exc:
-        if not parallel:
-            raise
-        logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                   decode_target, layer_sink)
+    from freetoken.moe.host_banks import requested_residency
+
+    with requested_residency(layer_residency) as residency_plan:
+        try:
+            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
+                                        decode_target, layer_sink)
+        except NotImplementedError as exc:
+            if not parallel:
+                raise
+            logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
+            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
+                                        decode_target, layer_sink)
+    return _echo_residency(banks, layer_residency, residency_plan)
+
+
+def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
+    """Stamp an honored residency request onto the ExpertBanks; keep None (and warn) when no settle point consulted the plan."""
+    if requested is None or banks.layer_residency is not None:
+        return banks
+    if plan is not None and plan.applied:
+        import dataclasses
+
+        labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
+        downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
+        if downgraded:
+            logger.warning_rank0(
+                f"--moe-cpu-layers: layers {downgraded} settled pageable instead of "
+                f"OS-locked (lock failed); they still decode on the CPU executor but "
+                f"may swap under memory pressure"
+            )
+        return dataclasses.replace(banks, layer_residency=labels)
+    from freetoken.moe.host_banks import HostResidency
+
+    if any(r != HostResidency.PINNED.value for r in requested):
+        logger.warning_rank0(
+            "--moe-cpu-layers: this checkpoint's bank loader settles banks without "
+            "per-layer residency (pre-pins everything); CPU-layer decode still works "
+            "but saves no pinned quota"
+        )
+    return banks

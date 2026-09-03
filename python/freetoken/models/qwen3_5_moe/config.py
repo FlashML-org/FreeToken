@@ -152,7 +152,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         or getattr(text, "partial_rotary_factor", None)
         or 1.0
     )
-    rotary_dim = round(head_dim * partial)
+    rotary_dim = int(head_dim * partial)
 
     # For text-only with the default rope type, partial NeoX rope needs no scaling dict
     # (the mRoPE params reduce to standard partial rope for text). Avoid carrying the
@@ -218,7 +218,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         key_head_dim=text.linear_key_head_dim,
         value_head_dim=text.linear_value_head_dim,
         conv_kernel_dim=text.linear_conv_kernel_dim,
-        output_gate=True,
+        output_gate="silu",
     )
     # Order groups by their first layer id for deterministic iteration.
     groups = tuple(
@@ -244,7 +244,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         num_experts_per_tok=getattr(text, "num_experts_per_tok", 0),
         moe_intermediate_size=getattr(text, "moe_intermediate_size", 0),
         shared_expert_intermediate_size=getattr(text, "shared_expert_intermediate_size", 0),
-        norm_topk_prob=bool(getattr(text, "norm_topk_prob", False)),
+        norm_topk_prob=True,
         moe_enabled=moe_enabled,
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),

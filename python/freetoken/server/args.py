@@ -39,6 +39,10 @@ class ServerArgs(SchedulerConfig):
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
+    # --gpu entries in TP-rank order, empty = not given
+    gpu: tuple[str, ...] = ()
+    # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
+    gpu_assigned: "tuple[str, ...] | None" = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -109,6 +113,11 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
+        from freetoken.gpu_select import gpu_arg
+
+        return gpu_arg(value)
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -138,6 +147,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3_coder"
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
@@ -179,6 +190,8 @@ def parse_args(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
             return "deepseekv32"
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3"
         if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
             return "qwen3"
         if "glm" in marker:
@@ -219,6 +232,16 @@ def parse_args(
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=_lazy_gpu_arg,
+        default=ServerArgs.gpu,
+        help=(
+            "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a GPU "
+            "UUID (GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index"
+        ),
     )
 
     parser.add_argument(
@@ -455,6 +478,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-backend",
+        default=ServerArgs.ple_backend,
+        choices=["pinned", "disk"],
+        help=(
+            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
+            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],
@@ -529,10 +562,13 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_cpu_layers,
         help=(
-            "Hybrid decode with --moe-backend offload: which MoE layers compute on the "
-            "CPU executor instead of the GPU offload/PCIe path. Explicit id list "
-            "('3,7,11'), a count ('8' = 8 layers evenly strided), or a fraction ('0.5'). "
-            "Unset = all layers on GPU."
+            "With --moe-backend offload/hybrid: which MoE layers compute on the "
+            "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
+            "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
+            "layers evenly strided), or a fraction ('0.5'). Unset = automatic where "
+            "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
+            "layers when the banks exceed the pin budget, none otherwise); '0' "
+            "forces all layers on GPU."
         ),
     )
 
@@ -607,6 +643,15 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    # reject a too-long list here with a clear reason, not as a dead rank later
+    if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
+        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
+            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+        parser.error(
+            f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
+            f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+        )
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

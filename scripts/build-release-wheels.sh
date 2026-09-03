@@ -60,7 +60,7 @@ warn_arch_override() {
     if [[ -n "${!var:-}" ]]; then
       warn "############################################################"
       warn "$var='${!var}' is set in this shell and OVERRIDES the"
-      warn "default multi-arch list (8.6 8.9 9.0 10.0 12.0, see"
+      warn "default multi-arch list (8.0 8.6 8.9 9.0 10.0 12.0, see"
       warn "freetoken-kernel-cache/build_backend.py). The kernel-cache"
       warn "wheel will only carry SASS for the listed archs — do NOT"
       warn "release it unless the narrowing is intentional."
