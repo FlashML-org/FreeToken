@@ -12,9 +12,9 @@ Design:
     redo the refine so they share the bracket. Four rounds of 256 bins bring the 2**31 range
     down to one bit pattern, so the threshold is exactly the k-th largest prob (top-k, counts)
     or the value where the descending cumulative mass reaches p (top-p, exact per-bin mass).
-    Boundary ties are clipped in token-id order, then the same kernel renormalizes or draws.
-    No candidate buffer, data-dependent shape, or host sync is needed. Results are exact up
-    to fp32 atomic summation order.
+    Every boundary tie is kept, matching flashinfer, then the same kernel renormalizes or
+    draws. No candidate buffer, data-dependent shape, or host sync is needed. Results are
+    exact up to fp32 atomic summation order.
   * If a cooperative launch is unavailable, the same exact kernel is retried with one CTA
     per row; only parallelism changes.
   * deterministic, generator and check_nan exist for flashinfer signature compatibility and are
@@ -354,35 +354,8 @@ def _bits_round(
 
 
 @triton.jit
-def _tie_prefix(local, pid, row, cta, thr, tie_ptr, bar_ptr, need, target, above, G,
-                G_POW2: tl.constexpr, MASS_TARGET: tl.constexpr):
-    tl.store(tie_ptr + pid, local)
-    _row_barrier(bar_ptr, need)
-
-    goff = tl.arange(0, G_POW2)
-    gmask = goff < G
-    counts = tl.load(tie_ptr + row * G + goff, mask=gmask, other=0, cache_modifier=".cg")
-    before = tl.sum(tl.where(goff < cta, counts, 0), 0)
-    total = tl.sum(counts, 0)
-    if MASS_TARGET:
-        remaining = tl.maximum(target - above, 0.0)
-        limit = tl.ceil(remaining / tl.maximum(thr, 1e-30)).to(tl.int32)
-    else:
-        limit = (target - above).to(tl.int32)
-    return before, tl.maximum(0, tl.minimum(limit, total))
-
-
-@triton.jit
-def _keep_mask(x, mask, thr, tie_before, tie_limit, seen):
-    eq = mask & (x == thr)
-    rank = tie_before + seen + tl.cumsum(eq.to(tl.int32), 0) - 1
-    keep = mask & ((x > thr) | (eq & (rank < tie_limit)))
-    return keep, seen + tl.sum(eq.to(tl.int32), 0)
-
-
-@triton.jit
 def _topk_fused(
-    probs_ptr, target_ptr, hist_ptr, tie_ptr, bar_ptr, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr,
+    probs_ptr, target_ptr, hist_ptr, bar_ptr, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr,
     V, G, CHUNK, row_stride,
     DRAW: tl.constexpr, G_POW2: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
 ):
@@ -401,36 +374,27 @@ def _topk_fused(
     lo, above = _bits_round(probs_ptr, base, start, end, hrow + BINS, brow, target, lo, above, 2 * G, 15, 1 << 23, BINS, BLOCK)
     lo, above = _bits_round(probs_ptr, base, start, end, hrow + 2 * BINS, brow, target, lo, above, 3 * G, 7, 1 << 15, BINS, BLOCK)
     lo, above = _bits_round(probs_ptr, base, start, end, hrow + 3 * BINS, brow, target, lo, above, 4 * G, 0, 1 << 7, BINS, BLOCK)
-    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), above, target,
-               0.0, 0, tie_ptr, brow, 5 * G, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G,
-               False, False, DRAW, G_POW2, BLOCK)
+    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow, 5 * G,
+               ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
 
 
 @triton.jit
 def _keep_tail(
-    probs_ptr, base, start, end, pid, row, cta, thr, above, target, floor_thr, floor_limit,
-    tie_ptr, bar_ptr, tie_need, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G,
-    HAS_FLOOR: tl.constexpr, MASS_TARGET: tl.constexpr, DRAW: tl.constexpr,
-    G_POW2: tl.constexpr, BLOCK: tl.constexpr,
+    probs_ptr, base, start, end, pid, row, cta, thr, bar_ptr, need,
+    ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G,
+    DRAW: tl.constexpr, G_POW2: tl.constexpr, BLOCK: tl.constexpr,
 ):
+    # Keep x >= thr over this chunk. This deliberately retains every boundary tie,
+    # matching flashinfer's top-k and top-p filtering semantics.
     s = 0.0
-    local_ties = 0
     for s0 in tl.range(start, end, BLOCK):
         offs = s0 + tl.arange(0, BLOCK)
         mask = offs < end
         x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        s += tl.sum(tl.where(mask & (x > thr), x, 0.0), 0)
-        local_ties += tl.sum((mask & (x == thr)).to(tl.int32), 0)
-
-    tie_before, tie_limit = _tie_prefix(local_ties, pid, row, cta, thr, tie_ptr, bar_ptr,
-                                        tie_need, target, above, G, G_POW2, MASS_TARGET)
-    if HAS_FLOOR:
-        tie_limit = tl.where(thr == floor_thr, tl.minimum(tie_limit, floor_limit), tie_limit)
-    selected_ties = tl.maximum(0, tl.minimum(local_ties, tie_limit - tie_before))
-    s += selected_ties.to(tl.float32) * thr
+        s += tl.sum(tl.where(mask & (x >= thr), x, 0.0), 0)
     if DRAW:
         tl.store(psum_ptr + pid, s)
-        _row_barrier(bar_ptr, tie_need + G)
+        _row_barrier(bar_ptr, need)
         goff = tl.arange(0, G_POW2)
         gmask = goff < G
         ps = tl.load(psum_ptr + row * G + goff, mask=gmask, other=0.0, cache_modifier=".cg")
@@ -438,12 +402,11 @@ def _keep_tail(
         incl = tl.sum(tl.where(goff <= cta, ps, 0.0), 0)
         tgt = tl.load(u_ptr + row) * tl.sum(ps, 0)
         last_kept = start * 0 - 1
-        seen = 0
         for s0 in tl.range(start, end, BLOCK):
             offs = s0 + tl.arange(0, BLOCK)
             mask = offs < end
             x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-            kept, seen = _keep_mask(x, mask, thr, tie_before, tie_limit, seen)
+            kept = mask & (x >= thr)
             wv = tl.where(kept, x, 0.0)
             cval = acc + tl.cumsum(wv, 0)
             idx = tl.where(cval > tgt, offs, V)
@@ -459,15 +422,13 @@ def _keep_tail(
             tl.store(tok_ptr + row, last_kept)
     else:
         tl.atomic_add(ksum_ptr + row, s)
-        _row_barrier(bar_ptr, tie_need + G)
+        _row_barrier(bar_ptr, need)
         inv = 1.0 / tl.atomic_add(ksum_ptr + row, 0.0)
-        seen = 0
         for s0 in tl.range(start, end, BLOCK):
             offs = s0 + tl.arange(0, BLOCK)
             mask = offs < end
             x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-            kept, seen = _keep_mask(x, mask, thr, tie_before, tie_limit, seen)
-            tl.store(out_ptr + base + offs, tl.where(kept, x * inv, 0.0), mask=mask)
+            tl.store(out_ptr + base + offs, tl.where(x >= thr, x * inv, 0.0), mask=mask)
 
 
 _PMBINS = 256
@@ -476,26 +437,21 @@ _PMBINS = 256
 @triton.jit
 def _pmass_round(
     probs_ptr, base, start, end, priv_ptr, mass_ptr, bar_ptr, target, lo, above, need,
-    floor_thr, floor_before, floor_limit, TOPK: tl.constexpr,
     S: tl.constexpr, WIDTH: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     # top-p round over the bit pattern: per-bin MASS (exact up to fp32 atomic order) via scatter-add into this
     # CTA's private buffer, then one reduction into the row buffer, so the bin holding the p crossing is known
     jj = tl.arange(0, BINS)
-    seen = 0
     for s0 in tl.range(start, end, BLOCK):
         offs = s0 + tl.arange(0, BLOCK)
         mask = offs < end
         x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        eligible = mask
-        if TOPK:
-            eligible, seen = _keep_mask(x, mask, floor_thr, floor_before, floor_limit, seen)
         y = x.to(tl.int32, bitcast=True)
         d = y - lo
         if WIDTH == 0:
-            inrange = eligible & (y >= lo) & (y <= _INF_BITS)
+            inrange = mask & (y >= lo) & (y <= _INF_BITS)
         else:
-            inrange = eligible & (y >= lo) & (d < WIDTH) & (y <= _INF_BITS)
+            inrange = mask & (y >= lo) & (d < WIDTH) & (y <= _INF_BITS)
         tl.atomic_add(priv_ptr + tl.where(inrange, d >> S, 0), x, mask=inrange)
     # every warp's scatter-adds must land before any thread reads the private bins back
     tl.debug_barrier()
@@ -513,7 +469,7 @@ def _pmass_round(
 
 @triton.jit
 def _topp_fused(
-    probs_ptr, tp_ptr, tk_ptr, hist_ptr, priv_ptr, mass_ptr, tie_ptr, bar_ptr, ksumk_ptr, ksum_ptr, psum_ptr, u_ptr,
+    probs_ptr, tp_ptr, tk_ptr, hist_ptr, priv_ptr, mass_ptr, bar_ptr, ksumk_ptr, ksum_ptr, psum_ptr, u_ptr,
     out_ptr, tok_ptr, V, G, CHUNK, row_stride,
     TOPK: tl.constexpr, DRAW: tl.constexpr, G_POW2: tl.constexpr, KBINS: tl.constexpr, PBINS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -528,9 +484,6 @@ def _topp_fused(
     end = tl.minimum(start + CHUNK, V)
     brow = bar_ptr + row
     lo = 0
-    thr_k = 0.0
-    tk_before = 0
-    tk_limit = 0
     if TOPK:
         tk = tl.maximum(tl.load(tk_ptr + row), 1)
         hk = hist_ptr + row * 4 * KBINS
@@ -541,21 +494,15 @@ def _topp_fused(
         lo, above_i = _bits_round(probs_ptr, base, start, end, hk + 3 * KBINS, brow, tk, lo, above_i, 4 * G, 0, 1 << 7, KBINS, BLOCK)
         thr_k = lo.to(tl.float32, bitcast=True)
         s = 0.0
-        local_ties = 0
         for s0 in tl.range(start, end, BLOCK):
             offs = s0 + tl.arange(0, BLOCK)
             mask = offs < end
             x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-            s += tl.sum(tl.where(mask & (x > thr_k), x, 0.0), 0)
-            local_ties += tl.sum((mask & (x == thr_k)).to(tl.int32), 0)
-        tk_before, tk_limit = _tie_prefix(local_ties, pid, row, cta, thr_k, tie_ptr, brow,
-                                          5 * G, tk, above_i, G, G_POW2, False)
-        selected_ties = tl.maximum(0, tl.minimum(local_ties, tk_limit - tk_before))
-        s += selected_ties.to(tl.float32) * thr_k
+            s += tl.sum(tl.where(mask & (x >= thr_k), x, 0.0), 0)
         tl.atomic_add(ksumk_ptr + row, s)
-        _row_barrier(brow, 6 * G)
+        _row_barrier(brow, 5 * G)
         target = tl.load(tp_ptr + row) * tl.atomic_add(ksumk_ptr + row, 0.0)
-        done = 6
+        done = 5
     else:
         target = tl.load(tp_ptr + row)
         done = 0
@@ -563,16 +510,15 @@ def _topp_fused(
     pp = priv_ptr + pid * 4 * PBINS
     above = 0.0
     lo, above = _pmass_round(probs_ptr, base, start, end, pp, mp, brow, target, lo, above, (done + 1) * G,
-                            thr_k, tk_before, tk_limit, TOPK, 23, 0, PBINS, BLOCK)
+                            23, 0, PBINS, BLOCK)
     lo, above = _pmass_round(probs_ptr, base, start, end, pp + PBINS, mp + PBINS, brow, target, lo, above,
-                            (done + 2) * G, thr_k, tk_before, tk_limit, TOPK, 15, 1 << 23, PBINS, BLOCK)
+                            (done + 2) * G, 15, 1 << 23, PBINS, BLOCK)
     lo, above = _pmass_round(probs_ptr, base, start, end, pp + 2 * PBINS, mp + 2 * PBINS, brow, target, lo, above,
-                            (done + 3) * G, thr_k, tk_before, tk_limit, TOPK, 7, 1 << 15, PBINS, BLOCK)
+                            (done + 3) * G, 7, 1 << 15, PBINS, BLOCK)
     lo, above = _pmass_round(probs_ptr, base, start, end, pp + 3 * PBINS, mp + 3 * PBINS, brow, target, lo, above,
-                            (done + 4) * G, thr_k, tk_before, tk_limit, TOPK, 0, 1 << 7, PBINS, BLOCK)
-    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), above, target,
-               thr_k, tk_limit, tie_ptr, brow, (done + 5) * G, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr,
-               V, G, TOPK, True, DRAW, G_POW2, BLOCK)
+                            (done + 4) * G, 0, 1 << 7, PBINS, BLOCK)
+    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow,
+               (done + 5) * G, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
 
 
 _COOPERATIVE_DISABLED = set()
@@ -595,14 +541,12 @@ def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False)
     G, CHUNK = _fused_plan(B, V, dev, force_single)
     n_hist = 4 * _KBINS if (kernel is _topk_fused or tk is not None) else 0
     n_mass = 4 * _PMBINS if kernel is _topp_fused else 0
-    # hist[B, n_hist] | mass[B, n_mass] | priv[B * G, n_mass] | tie[B * G] | bar/ksum/ksum_k/tok[B]
-    ws = torch.zeros(B * (n_hist + n_mass) + B * G * (n_mass + 1) + 4 * B, device=dev, dtype=torch.int32)
+    # hist[B, n_hist] | mass[B, n_mass] | priv[B * G, n_mass] | bar/ksum/ksum_k/tok[B]
+    ws = torch.zeros(B * (n_hist + n_mass) + B * G * n_mass + 4 * B, device=dev, dtype=torch.int32)
     hist = ws[:B * n_hist]
     mass = ws[B * n_hist:B * (n_hist + n_mass)].view(torch.float32)
     priv = ws[B * (n_hist + n_mass):B * (n_hist + n_mass) + B * G * n_mass].view(torch.float32)
-    tie_start = B * (n_hist + n_mass) + B * G * n_mass
-    tie = ws[tie_start:tie_start + B * G]
-    tail = tie_start + B * G
+    tail = B * (n_hist + n_mass) + B * G * n_mass
     bar = ws[tail:tail + B]
     ksum = ws[tail + B:tail + 2 * B].view(torch.float32)
     ksum_k = ws[tail + 2 * B:tail + 3 * B].view(torch.float32)
@@ -620,10 +564,10 @@ def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False)
     common = dict(DRAW=draw, G_POW2=_next_pow2(G), BLOCK=8192 if wide else _FUSED_BLOCK, num_warps=32 if wide else 8,
                   launch_cooperative_grid=G > 1)
     if kernel is _topk_fused:
-        _topk_fused[(B * G,)](probs, tk, hist, tie, bar, ksum, psum, u, out, tok, V, G, CHUNK, probs.stride(0),
+        _topk_fused[(B * G,)](probs, tk, hist, bar, ksum, psum, u, out, tok, V, G, CHUNK, probs.stride(0),
                               BINS=_KBINS, **common)
     else:
-        _topp_fused[(B * G,)](probs, tp, tk if tk is not None else tp, hist, priv, mass, tie, bar, ksum_k, ksum, psum, u, out, tok,
+        _topp_fused[(B * G,)](probs, tp, tk if tk is not None else tp, hist, priv, mass, bar, ksum_k, ksum, psum, u, out, tok,
                               V, G, CHUNK, probs.stride(0), TOPK=tk is not None, KBINS=_KBINS, PBINS=_PMBINS, **common)
     return res
 
