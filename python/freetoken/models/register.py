@@ -130,6 +130,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    # GLM-5.3-Flash (model_type glm5_next): hybrid KDA linear attention (34/45 layers)
+    # + NoPE-MLA/DSA with a kpool-compressed indexer (11/45), mHC x4 residual streams,
+    # 288-expert sigmoid/noaux_tc MoE; natively-multimodal wrapper config (text tower
+    # in text_config, weights under model.language_model.), served text-only.
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+    ),
+    # Text-only sibling (the text_config's own architectures entry).
+    "Glm5NextForCausalLM": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+    ),
 }
 
 

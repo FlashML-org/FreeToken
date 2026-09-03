@@ -6,11 +6,7 @@ from typing import Dict, Tuple
 
 import torch
 from freetoken.moe import BaseMoeBackend
-from freetoken.utils import div_ceil, init_logger
-
-logger = init_logger(__name__)
-
-_warned_torch_topk = False
+from freetoken.utils import div_ceil
 
 
 def _torch_fused_topk(
@@ -19,7 +15,7 @@ def _torch_fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-torch softmax router matching triton_kernels.topk (Windows fallback).
+    """Pure-torch reference for the fused softmax router; tests compare the kernel against it.
 
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
     selected weights to sum to 1 -- the standard fused-MoE routing convention.
@@ -44,52 +40,9 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from freetoken.kernel.backend import is_triton_kernels_installed
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
-    # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
-    # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
-    if not is_triton_kernels_installed():
-        global _warned_torch_topk
-        if not _warned_torch_topk:
-            _warned_torch_topk = True
-            # Once, not per call: this runs every MoE forward. On Linux a missing
-            # triton_kernels used to fail fast with ImportError; keep the misconfiguration
-            # visible without giving up the fallback that Windows needs.
-            logger.warning_rank0(
-                "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
-                "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
-            )
-        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
-
-    if topk & (topk - 1):
-        # triton_kernels.topk builds tl.arange(0, k), which must be a power of 2; a
-        # top-10 router (qwen4_exp) takes the equivalent vendored triton router instead.
-        from freetoken.kernel.triton.moe_router import fused_topk_softmax
-
-        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
-
-    from triton_kernels.topk import topk as triton_kernels_topk
-
-    logits = gating_output.float()
-    softmax_first = not renormalize
-    if softmax_first:
-        logits = torch.softmax(logits, dim=-1)
-    sparse_topk = triton_kernels_topk(
-        logits,
-        topk,
-        apply_softmax=not softmax_first,
-    )
-    if hasattr(sparse_topk, "vals"):
-        topk_weights = sparse_topk.vals
-        topk_ids = sparse_topk.indx
-    else:
-        topk_weights, topk_ids = sparse_topk[:2]
-    topk_ids = topk_ids.to(torch.int32)
-    if num_token_non_padded is not None:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
-    return topk_weights, topk_ids
+    return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
 
 def moe_align_block_size(

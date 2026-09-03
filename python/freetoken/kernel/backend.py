@@ -32,17 +32,6 @@ def is_sgl_kernel_installed() -> bool:
 
 
 @functools.cache
-def is_triton_kernels_installed() -> bool:
-    """OpenAI's ``triton_kernels`` (the fused MoE router used by ``moe.fused.fused_topk``).
-
-    Distinct from the ``triton`` runtime we always depend on: it ships with the Triton
-    source tree and has no Windows wheel. It is also not one of the six ops
-    ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
-    """
-    return _importable("triton_kernels")
-
-
-@functools.cache
 def driver_cuda_version() -> int | None:
     """Max CUDA version the installed NVIDIA driver supports (``13000`` == CUDA 13.0),
     or None if undetermined. Driver-JIT kernels (PTX compiled at runtime, e.g.

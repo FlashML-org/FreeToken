@@ -77,11 +77,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
-def fp8_block_scale_pad(rows: int, cols: int) -> int:
-    """Trailing scale-bank dim padded so per-expert row bytes are 16B-aligned (fused copy)."""
-    while (rows * cols * 2) % 16:
-        cols += 1
-    return cols
+# lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
+from freetoken.kernel.aot_models import fp8_block_scale_pad
 
 
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
@@ -350,6 +347,19 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
+        self._build_fused_copy_plan()
+        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
+            return
+        for name in self.bank_schema:
+            cache = self.bank_caches[name]
+            feat = math.prod(cache.shape[1:]) * cache.element_size()
+            if feat % 128:
+                raise RuntimeError(
+                    f"MoE bank {name!r} rows are {feat} bytes (not a multiple of 128): "
+                    f"only the fused multi-bank copy can move them, but it is disabled"
+                )
+
+    def _build_fused_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
         Built once here (and on :meth:`rebuild`, which reallocates the slot caches);
