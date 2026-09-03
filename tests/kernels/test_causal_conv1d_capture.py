@@ -60,6 +60,8 @@ def test_varlen_conv_skips_the_device_to_host_sync_when_max_seq_len_is_given(mon
 
 @requires_cuda
 def test_varlen_conv_still_derives_max_seq_len_on_device_by_default(monkeypatch):
+    import freetoken.kernel.backend as _backend
+
     device = torch.device("cuda")
     inputs = _conv_inputs(device)
     original_item = torch.Tensor.item
@@ -69,6 +71,10 @@ def test_varlen_conv_still_derives_max_seq_len_on_device_by_default(monkeypatch)
         calls.append(tuple(self.shape))
         return original_item(self)
 
+    # The sync this asserts on lives in the triton fallback; on an install with sgl_kernel
+    # the native kernel needs no max_seq_len and calls no .item(). Force the fallback so the
+    # test proves the claim on any install rather than only where the fallback is selected.
+    monkeypatch.setattr(_backend, "is_sgl_kernel_installed", lambda: False)
     monkeypatch.setattr(torch.Tensor, "item", counted_item)
 
     _call(inputs)
@@ -82,11 +88,15 @@ def test_varlen_conv_with_host_metadata_matches_the_device_derived_result():
     device = torch.device("cuda")
     inputs = _conv_inputs(device)
     baseline_states = inputs["conv_states"].clone()
+    # sgl_kernel convolves ``x`` in place (the triton fallback returns a fresh tensor), so
+    # both inputs have to be reset between the two calls being compared.
+    baseline_x = inputs["x"].clone()
 
     device_derived = _call(inputs).clone()
     device_states = inputs["conv_states"].clone()
 
     inputs["conv_states"].copy_(baseline_states)
+    inputs["x"].copy_(baseline_x)
     host_known = _call(inputs, max_seq_len=4).clone()
 
     assert torch.equal(host_known, device_derived)
@@ -98,6 +108,12 @@ def test_varlen_conv_replays_inside_a_cuda_graph():
     device = torch.device("cuda")
     inputs = _conv_inputs(device)
     baseline_states = inputs["conv_states"].clone()
+    baseline_x = inputs["x"].clone()
+
+    def reset():
+        inputs["conv_states"].copy_(baseline_states)
+        inputs["x"].copy_(baseline_x)  # sgl_kernel mutates x in place; the fallback does not
+
     expected = _call(inputs, max_seq_len=4).clone()
     expected_states = inputs["conv_states"].clone()
 
@@ -105,16 +121,16 @@ def test_varlen_conv_replays_inside_a_cuda_graph():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            inputs["conv_states"].copy_(baseline_states)
+            reset()
             _call(inputs, max_seq_len=4)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    inputs["conv_states"].copy_(baseline_states)
+    reset()
     with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
         captured = _call(inputs, max_seq_len=4)
-    inputs["conv_states"].copy_(baseline_states)
+    reset()
     graph.replay()
     torch.cuda.synchronize()
 

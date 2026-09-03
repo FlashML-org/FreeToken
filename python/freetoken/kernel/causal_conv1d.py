@@ -24,8 +24,13 @@ def causal_conv1d_varlen(
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
     max_seq_len: int | None = None,   # host-known longest extend_len; None derives it on device
 ) -> torch.Tensor:
-    """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
-    in place and refreshes ``conv_states[cache_indices]`` with each request's tail.
+    """Varlen (prefill) depthwise causal conv with silu; returns silu(conv) and refreshes
+    ``conv_states[cache_indices]`` with each request's tail.
+
+    Whether ``x`` survives depends on the backend: sgl_kernel convolves ``x`` in place and
+    returns it, while the triton fallback leaves ``x`` untouched and returns a new tensor.
+    Callers must use the returned tensor and must not rely on ``x`` afterwards (every
+    current call site builds ``x`` fresh and never reads it again).
 
     ``max_seq_len`` only sizes the triton launch grid. Deriving it from ``cu_seqlens`` costs a
     D2H sync per prefill, which is illegal under CUDA graph capture, so the scheduler passes the
