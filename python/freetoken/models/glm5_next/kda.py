@@ -183,6 +183,7 @@ class Glm5NextKDA(BaseOP):
             mixed = causal_conv1d_varlen(
                 x, self._conv_weight(), pool.conv_states[li],
                 fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
+                max_seq_len=fla.max_seq_len,  # host-known: no D2H sync sizing the launch
             ).transpose(0, 1)
             q, k, v = (
                 t.reshape(1, total, h, d).to(dtype)
