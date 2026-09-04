@@ -22,7 +22,9 @@ class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
     def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
-        if getattr(config, "expert_quant", "none") == "fp8_block":
+        if getattr(config, "expert_quant", "none") == "fp8_block" or getattr(
+            config, "dense_quant", "none"
+        ) == "fp8_block":
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )

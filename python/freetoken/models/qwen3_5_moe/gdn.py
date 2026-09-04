@@ -74,7 +74,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
         # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
-        self._block_fp8 = expert_quant == "fp8_block"
+        self._block_fp8 = expert_quant == "fp8_block" or attn_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 

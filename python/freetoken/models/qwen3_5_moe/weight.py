@@ -20,12 +20,18 @@ from freetoken.models.loader import (
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
+    load_nvfp4_ct_expert_source_banks,
+    load_nvfp4_ct_expert_source_banks_parallel,
     load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
-from .config import _compressed_tensors_nvfp4, parse_config
+from .config import (
+    _compressed_tensors_mixed_fp8block,
+    _compressed_tensors_nvfp4,
+    parse_config,
+)
 
 # Expert weights are stored pre-fused per layer: experts.gate_up_proj / experts.down_proj.
 _PACKED_EXPERT_PATTERN = re.compile(
@@ -38,7 +44,7 @@ _PACKED_EXPERT_PATTERN = re.compile(
 # head's ``mtp.layers.N.mlp.experts.*`` tensors (served text-only, dropped).
 _NVFP4_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_EXPERT_KEY_RE = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
@@ -46,6 +52,20 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
+)
+# compressed-tensors NVFP4 experts (llm-compressor): weight_packed (uint8) + weight_scale
+# (fp8-e4m3 block) + scalar weight_global_scale (quant-side; the dequant global is its
+# reciprocal, broadcast per output row). [mixed-ct block-fp8 dense + nvfp4 experts]
+_NVFP4_CT_EXPERT_KEY_RE = re.compile(
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+)
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_CT_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 compressed-tensors NVFP4 experts",
 )
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
@@ -179,6 +199,16 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
+    if _compressed_tensors_mixed_fp8block(hf_config):
+        # Mixed compressed-tensors: dense (attn/GDN/shared_expert) weights are 128x128
+        # block FP8; routed experts are packed NVFP4 and excluded from this pass (they
+        # are built by the NVFP4 offload-bank provider). [mixed-ct block-fp8 dense + nvfp4 experts]
+        yield from _iter_weights_fp8(
+            model_path, device,
+            include_non_moe=include_non_moe, include_moe_experts=False,
+            ct_scale_suffix=True,
+        )
+        return
     if _compressed_tensors_nvfp4(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
@@ -718,7 +748,7 @@ _FP8_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
 # Routed-expert checkpoint key (per-expert, un-fused). ``mtp.layers...`` is excluded by the
 # ``model.language_model.`` anchor, so the parallel reader only sees the real experts.
 _FP8_EXPERT_RE = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
 )
 
@@ -751,7 +781,8 @@ def _fp8_fuse(base: str, suf: str, tensor: torch.Tensor, buf: dict) -> tuple[str
 
 
 def _iter_weights_fp8(
-    model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool = False
+    model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool = False,
+    ct_scale_suffix: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the block-fp8 weights, renamed + fused to the model buffers.
 
@@ -774,6 +805,14 @@ def _iter_weights_fp8(
                     name = _rename(raw_name)
                     if name is None or ".mlp.experts." in name:
                         continue  # routed experts handled below / by the offload cache
+                    if ct_scale_suffix:
+                        # W8A8 activations are quantized dynamically: no stored input scales.
+                        if name.endswith((".input_scale", ".input_global_scale")):
+                            continue
+                        # compressed-tensors names block scales .weight_scale (bf16); the
+                        # block-fp8 kernels/fusion expect .weight_scale_inv.
+                        if name.endswith(".weight_scale"):
+                            name = name[: -len(".weight_scale")] + ".weight_scale_inv"
                     tensor = f.get_tensor(raw_name)
                     base, suf = _split_kind(name)
                     fused = _fp8_fuse(base, suf, tensor, fuse_buf)
@@ -1065,6 +1104,16 @@ def load_nvfp4_expert_sources(
 ) -> dict[str, torch.Tensor]:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
     output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
+    if _compressed_tensors_mixed_fp8block(cached_load_hf_config(model_path)):
+        # compressed-tensors NVFP4 layout (weight_packed/weight_scale/weight_global_scale).
+        return load_nvfp4_ct_expert_source_banks(
+            model_path,
+            config,
+            _NVFP4_CT_SOURCE_SPEC,
+            drop_page_cache=drop_page_cache,
+            primary=get_tp_info().is_primary(),
+            layer_sink=layer_sink,
+        )
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
@@ -1081,6 +1130,17 @@ def load_nvfp4_expert_sources_parallel(
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
 
+    if _compressed_tensors_mixed_fp8block(cached_load_hf_config(model_path)):
+        return load_nvfp4_ct_expert_source_banks_parallel(
+            model_path,
+            config,
+            _NVFP4_CT_SOURCE_SPEC,
+            drop_page_cache=drop_page_cache,
+            primary=get_tp_info().is_primary(),
+            workers=workers,
+            chunk=chunk,
+            layer_sink=layer_sink,
+        )
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
