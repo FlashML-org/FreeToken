@@ -89,8 +89,8 @@ def mrope_table(
     token's row, table [rows, rotary_dim] fp32 cos|sin)``.
 
     Every request also gets rows for up to ``ratio - 1`` positions before its chunk: the QSA
-    indexer ropes a pooled key at its group's FIRST token, which for a chunked text prompt sharing
-    the batch may come from the previous chunk (image prompts are never chunked). Requests without
+    indexer ropes a pooled key at its group's FIRST token, which for a chunked prompt may come
+    from the previous chunk. Requests without
     ``mrope_positions`` use their token index on all three axes, so their rows equal the rope
     cache rows exactly.
     """

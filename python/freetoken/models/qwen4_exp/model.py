@@ -110,7 +110,8 @@ class Qwen4ExpModel(BaseOP):
         hidden = self.embed_tokens.forward(input_ids)
         if batch.mm_embeds is not None:
             # image soft tokens replace the placeholder embeddings (HF order: before the
-            # hc_count repeat); the whole image run sits in this prefill chunk (prefill.py)
+            # hc_count repeat); a chunked prompt gets the rows of the placeholders inside
+            # this chunk (scheduler._gather_multimodal)
             mask = input_ids == self._image_token_id
             hidden = hidden.masked_scatter(mask.unsqueeze(-1), batch.mm_embeds.to(hidden.dtype))
         hidden = hidden.repeat(1, self.hc_count)
@@ -158,6 +159,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     @property
     def has_vision(self) -> bool:
         return hasattr(self, "visual")
+
+    @property
+    def image_token_id(self) -> int:
+        return self._config.image_token_id
 
     @torch.inference_mode()
     def encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
