@@ -171,11 +171,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            # An image prompt prefills in one chunk (its soft tokens and mRoPE table cover the
-            # whole run): wait for a pass with the budget free. Admission already refused
-            # prompts longer than the budget, so this cannot starve.
-            return None
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,

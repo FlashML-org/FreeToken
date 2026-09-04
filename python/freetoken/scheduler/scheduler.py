@@ -771,12 +771,6 @@ class Scheduler(SchedulerIOMixin):
         model = self.engine.model
         if not getattr(model, "has_vision", False):
             return "image inputs need the vision tower: start the server with FREETOKEN_LOAD_VISION=1"
-        if len(msg.input_ids) > self.prefill_budget:
-            # image prompts must prefill in one chunk (prefill.py never splits them)
-            return (
-                f"image prompts must fit in one prefill chunk: {len(msg.input_ids)} tokens > "
-                f"{self.prefill_budget} (--max-extend-tokens); use a smaller image or prompt"
-            )
         try:
             with self.engine_stream_ctx:  # ordered before the prefill that reads mm_embeds
                 msg.mm_embeds, msg.mrope_positions, msg.mrope_delta = model.prepare_mm_inputs(
@@ -852,11 +846,18 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
+        batch so the model can scatter them at image-token positions. A chunked prompt
+        contributes only the placeholders inside its current chunk. ``req.mm_embeds``
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
         carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        image_token_id = getattr(self.engine.model, "image_token_id", None)
+        parts = [
+            _mm_embeds_window(req, image_token_id)
+            for req in batch.reqs
+            if req.mm_embeds is not None
+        ]
+        parts = [p for p in parts if p.shape[0]]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
 
@@ -920,6 +921,15 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _mm_embeds_window(req, image_token_id: int) -> torch.Tensor:
+    """The rows of ``req.mm_embeds`` for this prefill window: the image placeholders in
+    ``input_ids[cached_len:]``, skipping those an earlier chunk already scattered."""
+    is_image = req.input_ids == image_token_id
+    before = int(is_image[: req.cached_len].sum())
+    within = int(is_image[req.cached_len :].sum())
+    return req.mm_embeds[before : before + within]
 
 
 def _make_rope_positions(
