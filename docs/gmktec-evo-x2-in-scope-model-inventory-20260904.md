@@ -50,6 +50,12 @@ unique runtime tensors were emitted without an unmapped-field error. This is a
 loader and tensor-admission milestone, not yet proof that the complete model
 can serve or that its outputs match llama.cpp.
 
+The ROCm-side construction probe also passed for representative linear-attention
+and full-attention layers, including the final layer. Each constructed the
+existing `Qwen3_5DenseMLP` branch with the expected dense configuration. The
+probe allocated individual layers only; full-model loading and serving remain
+separate gates.
+
 The source tree does contain model code for Qwen3.8-Flash-Next (`qwen4_exp`)
 and GLM-4.7 parser support. Source support alone does not prove that the
 archived routed checkpoints are compatible with the current AMD path.
