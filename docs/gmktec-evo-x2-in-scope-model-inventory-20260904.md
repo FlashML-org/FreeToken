@@ -33,6 +33,14 @@ returns `ValueError: GGUF architecture 'qwen35' is not supported (known:
 Qwen3.8 artifact without a deliberate dense `qwen35` loader and model-path
 implementation. A filename match is not sufficient evidence of support.
 
+The metadata comparison also rules out a simple alias to the supported Qwen3.5
+MoE GGUF path. Qwen3.8 reports 64 layers, hidden size 5,120, feed-forward size
+17,408, and no expert-count or expert-feed-forward metadata. The qualified
+Qwen3.6 MoE GGUF reports 40 layers, hidden size 2,048, 256 experts, and eight
+active experts. Qwen3.8 therefore requires a dense hybrid-attention loader and
+cannot safely reuse the current routed-expert loader by changing only the
+registry string.
+
 The source tree does contain model code for Qwen3.8-Flash-Next (`qwen4_exp`)
 and GLM-4.7 parser support. Source support alone does not prove that the
 archived routed checkpoints are compatible with the current AMD path.
