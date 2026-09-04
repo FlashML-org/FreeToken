@@ -17,6 +17,19 @@ backend, automatic expert-cache sizing, serial expert loading, and an 8,192
 token context override. No llama-swap process was found active during the
 inventory probe.
 
+## Payload admission result
+
+The read-only model-directory probe found the Qwen3.6 35B-A3B safetensors and
+NVFP4 payloads plus the Gemma 4 Q4 GGUF and vision projector. It did not find a
+Qwen3.8 27B, GLM-4.7, KAT-Coder, Laguna, or Ornith payload under the FreeToken
+model directory. Therefore the first queued Qwen3.8 qualification cannot begin
+yet: downloading or copying a checkpoint is a separate authorized staging step,
+and a load test must not be improvised with a missing artifact.
+
+The source tree does contain model code for Qwen3.8-Flash-Next (`qwen4_exp`)
+and GLM-4.7 parser support. Source support alone does not prove that the
+archived routed checkpoints are compatible with the current AMD path.
+
 ## Archived text-model routing entries
 
 These identifiers were found in archived model-routing configuration files and
@@ -63,4 +76,3 @@ backend, input and output contract, and AMD implementation scope are defined.
 4. Treat image, audio, and speech entries as separate backend projects.
 5. Run every admitted model through the cross-model matrix in
    `gmktec-evo-x2-cross-model-matrix-20260904.md`.
-
