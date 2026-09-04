@@ -232,6 +232,36 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
     """
     folder = download_hf_weight(model_path)
+    ngram_json_path = os.path.join(folder, "qwen4_ngram.json")
+    if os.path.exists(ngram_json_path):
+        with open(ngram_json_path) as f:
+            ngram_meta = json.load(f)
+        bin_path = os.path.join(folder, ngram_meta["file"])
+        rows = int(ngram_meta["rows"])
+        cols = int(ngram_meta["dim"])
+        nbytes = int(ngram_meta["nbytes"])
+        dtype_str = ngram_meta.get("dtype", "bfloat16")
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float8_e4m3fn": torch.float8_e4m3fn,
+            "fp8": torch.float8_e4m3fn,
+            "float16": torch.float16,
+        }
+        dtype = dtype_map.get(dtype_str, torch.bfloat16)
+        scale = torch.tensor(1.0, dtype=torch.float32)
+
+        bank = HostBank((rows, cols), dtype)
+        bar = byte_bar(nbytes, "Loading PLE table (binary)")
+        try:
+            buf = bank.memoryview()
+            read_range_into(buf, bin_path, file_offset=0, nbytes=nbytes,
+                            dest_offset=0, workers=workers, chunk=chunk)
+            bar.update(nbytes)
+        finally:
+            bar.close()
+        if pin and torch.cuda.is_available():
+            bank.pin()
+        return PleTable(bank=bank, weight_scale=scale)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
     rows = cols = 0

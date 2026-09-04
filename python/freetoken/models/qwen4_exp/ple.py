@@ -417,6 +417,14 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
 
+    def load_state_dict(self, state_dict: dict, *, prefix: str = "", _internal: bool = False) -> None:
+        # Pop metadata tensors if present in state_dict, otherwise keep computed buffers
+        for name in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"):
+            k = f"{prefix}.{name}" if prefix else name
+            if k in state_dict:
+                val = state_dict.pop(k)
+                getattr(self, name).copy_(val)
+
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
 
@@ -466,6 +474,11 @@ class NGramEmbedding(BaseOP):
         """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
+        device = tokens[0].device
+        if not self.layer_multipliers.is_meta and self.layer_multipliers.device != device:
+            self.layer_multipliers = self.layer_multipliers.to(device)
+            self.ngram_heads_vocab_sizes = self.ngram_heads_vocab_sizes.to(device)
+            self.ngram_heads_offsets = self.ngram_heads_offsets.to(device)
         blocks = []
         for ngram in range(2, self.ngram_size + 1):
             start = (ngram - 2) * self.heads_per_ngram

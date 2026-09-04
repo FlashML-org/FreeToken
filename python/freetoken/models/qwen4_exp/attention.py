@@ -88,6 +88,25 @@ class Qwen4ExpIndexer(BaseOP):
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
+    def load_state_dict(self, state_dict: dict, *, prefix: str = "", _internal: bool = False) -> None:
+        # Handles both self_attn.indexer.* and flat self_attn.index_* checkpoint layouts
+        parent_prefix = prefix[:-len(".indexer")] if prefix.endswith(".indexer") else prefix
+
+        for k in (f"{prefix}.index_qk_proj.weight", f"{parent_prefix}.index_qk_proj.weight"):
+            if k in state_dict:
+                self.index_qk_proj.weight = state_dict.pop(k)
+                break
+
+        for k in (f"{prefix}.q_layernorm.weight", f"{parent_prefix}.index_q_norm.weight", f"{parent_prefix}.q_layernorm.weight"):
+            if k in state_dict:
+                self.q_layernorm.weight = state_dict.pop(k)
+                break
+
+        for k in (f"{prefix}.k_layernorm.weight", f"{parent_prefix}.index_k_norm.weight", f"{parent_prefix}.k_layernorm.weight"):
+            if k in state_dict:
+                self.k_layernorm.weight = state_dict.pop(k)
+                break
+
     def forward(self, x: torch.Tensor) -> QSAIndexerInputs:
         q, k = self.index_qk_proj.forward(x).split(self._split, dim=-1)
         return QSAIndexerInputs(
