@@ -41,6 +41,15 @@ active experts. Qwen3.8 therefore requires a dense hybrid-attention loader and
 cannot safely reuse the current routed-expert loader by changing only the
 registry string.
 
+The first implementation slice now admits `qwen35` in the GGUF registry,
+maps its dense Q4_K MLP and embedding tensors, decodes the Q8_0 recurrence
+matrices, and selects the Q6_K full-attention output projection. ROCm-side
+metadata and real-file tensor-walk checks passed: the Qwen3.8 payload parsed as
+64 layers, hidden size 5,120, intermediate size 17,408, zero experts, and 659
+unique runtime tensors were emitted without an unmapped-field error. This is a
+loader and tensor-admission milestone, not yet proof that the complete model
+can serve or that its outputs match llama.cpp.
+
 The source tree does contain model code for Qwen3.8-Flash-Next (`qwen4_exp`)
 and GLM-4.7 parser support. Source support alone does not prove that the
 archived routed checkpoints are compatible with the current AMD path.
