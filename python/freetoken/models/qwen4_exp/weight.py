@@ -27,9 +27,11 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+logger = init_logger(__name__)
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -267,6 +269,11 @@ def iter_weights(
         else None
     )
     fp8 = config is not None and config.attn_quant == "fp8_dynamic"
+    if fp8:
+        logger.info(
+            "qwen4_exp dense projections: load-time per-tensor FP8 (W8A8 via _scaled_mm), "
+            "FREETOKEN_FP8_DENSE=1"
+        )
 
     def emit(name: str, tensor: torch.Tensor):
         tensor = _shard(name, tensor, config, tp.rank, tp.size)
