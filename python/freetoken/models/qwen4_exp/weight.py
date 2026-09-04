@@ -46,7 +46,8 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# ``.weight_scale_inv`` is the 128x128 block-FP8 reciprocal scale (see _load_maybe_block_fp8).
+_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -137,6 +138,26 @@ def _try_fuse(
     return None
 
 
+def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
+    """Load ``raw_name``, dequantizing 128x128 block-FP8 to bf16 when a sibling
+    ``.weight_scale_inv`` is present in the same shard; pass plain bf16 through unchanged.
+
+    The official modelopt checkpoint keeps the dense attn/GDN/HC/PLE projections bf16 (they are
+    on the quant ``ignore`` list), but some community requants -- e.g. the lovedheart NVFP4-FP8
+    build that fits Qwen3.8-Flash-Next on a 24 GB card -- store those dense weights as block-FP8.
+    Without this they reach ``_try_fuse`` as fp8 and crash on the fp8+bf16 ``torch.cat``."""
+    tensor = f.get_tensor(raw_name)
+    if raw_name.endswith(".weight"):
+        base = raw_name[: -len(".weight")]
+        if base + ".weight_scale_inv" in keyset:
+            from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+            return dequant_block_fp8(
+                tensor, f.get_tensor(base + ".weight_scale_inv")
+            ).to(torch.bfloat16)
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -169,11 +190,12 @@ def iter_weights(
         disable=not get_tp_info().is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                tensor = _load_maybe_block_fp8(f, raw_name, keyset)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
