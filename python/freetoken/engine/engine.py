@@ -620,6 +620,7 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
+                gguf_expert_types=banks.gguf_expert_types,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
@@ -1163,6 +1164,21 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt == "gguf":
+        # "gguf" is a container tag, not a layout: the checkpoint picks a ggml type per
+        # tensor and the concrete CPU format has to be recovered from the bank types.
+        # Testing the tag against _WFMT_IDS answers False for EVERY GGUF checkpoint, which
+        # silently disables the automatic residency split on hosts where CUDA pinning is
+        # quota-capped (WSL caps it near half of RAM). The symptom is not a clear refusal
+        # but cudaHostRegister failing partway through the banks.
+        from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+
+        types = getattr(model_config, "gguf_expert_types", None)
+        if not types:
+            return False
+        gate_up, down = int(types[0]), int(types[1])
+        # one weight_format serves both banks, so mixed types cannot run on the CPU path
+        return gate_up == down and gate_up in _GGML_TO_CPU_FMT
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 

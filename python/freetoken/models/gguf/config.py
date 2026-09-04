@@ -15,9 +15,17 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
-# reuses the model classes but a GGUF parse_config / iter_weights).
+# reuses the model classes but a GGUF parse_config / iter_weights). The key is the
+# value of the GGUF general.architecture metadata key.
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
+    "qwen35moe": "Qwen35MoeGGUFForCausalLM",
+    # Dense sibling (Qwen3.8-27B): same hybrid GDN/full-attention decoder, a plain SwiGLU
+    # MLP instead of routed experts. Same model classes and the same GGUF adapter; the
+    # config's expert_count is absent so moe_enabled comes out False.
+    "qwen35": "Qwen35GGUFForCausalLM",
+    "qwen3moe": "Qwen3MoeGGUFForCausalLM",
+    "deepseek4": "DeepseekV4GGUFForCausalLM",
 }
 
 

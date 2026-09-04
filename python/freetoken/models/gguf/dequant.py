@@ -1,49 +1,146 @@
-"""GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+"""GGML block-quant dequantization and type metadata.
 
-This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
-packed and are dequantized inside the borrowed ggml CUDA kernels (see
-``freetoken.kernel.gguf``). These routines are used only to (a) materialize the few
-dense F32/F16 tensors at load (norms, scales, router) via :func:`dequantize`, and
-(b) cross-check the CUDA kernels in tests. The ``BLOCK_SHAPE`` table and
-:func:`row_bytes` are the type metadata the packed (kernel) path also relies on.
+This module serves two purposes:
 
-Each ``dequant_*`` takes the raw little-endian bytes as a ``uint8`` tensor whose
-final axis spans whole blocks, and returns the values in *storage order* (ggml's
-fastest axis first); the caller reshapes to the torch shape (``dims[::-1]``). The
-math mirrors ``ggml-quants.c``.
+1. **Type metadata for the packed GPU path** (the hot path): GGUF weights stay packed
+   and are dequantized inside the borrowed ggml CUDA kernels (see ``freetoken.kernel.gguf``).
+   The ``BLOCK_SHAPE`` table and :func:`row_bytes` are shared by ``GGUFLinear``,
+   ``GGUFEmbedding``, and expert-bank loaders for weight allocation and unpacking.
+
+2. **Pure-torch reference dequantizers** (CPU/test path): The :func:`dequantize` function
+   and helper ``dequant_*`` routines materialize F32/F16 tensors at load (norms, scales,
+   router) and cross-check CUDA kernels in tests. These implement only Q4_0 and Q6_K;
+   the missing types are handled by the CUDA kernels in production.
+
+``BLOCK_SHAPE`` covers all 21 types (F32, F16, BF16, STD_K, IQ); ``dequantize()`` and
+``_DEQUANT`` cover Q4_0 and Q6_K only.
+
+Each ``dequant_*`` takes raw little-endian bytes as a ``uint8`` tensor whose final axis
+spans whole blocks, and returns values in *storage order* (ggml's fastest axis first);
+the caller reshapes to torch shape (``dims[::-1]``). The math mirrors ``ggml-quants.c``.
 """
 
 from __future__ import annotations
 
 import torch
 
-# ggml_type enum values (subset present in these checkpoints).
+# ggml_type enum values. Mirrors the ggml.h enum in llama.cpp.
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q4_1 = 3
+GGML_Q5_0 = 6
+GGML_Q5_1 = 7
 GGML_Q8_0 = 8
+GGML_Q2_K = 10
+GGML_Q3_K = 11
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ4_NL = 20
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
 GGML_BF16 = 30
 
-# (block numel, bytes per block) per ggml type.
+# (block numel, bytes per block) per ggml type. Derived from block structs in
+# python/freetoken/kernel/csrc/gguf/ggml-common.h (lines 18-192).
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_F32: (1, 4),
     GGML_F16: (1, 2),
-    GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
+    GGML_Q4_1: (32, 20),
+    GGML_Q5_0: (32, 22),
+    GGML_Q5_1: (32, 24),
     GGML_Q8_0: (32, 34),
+    GGML_Q2_K: (256, 84),
+    GGML_Q3_K: (256, 110),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ3_S: (256, 110),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
+    GGML_IQ1_M: (256, 56),
+    GGML_BF16: (1, 2),
 }
 
 GGML_NAME = {
     GGML_F32: "F32",
     GGML_F16: "F16",
-    GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
+    GGML_Q4_1: "Q4_1",
+    GGML_Q5_0: "Q5_0",
+    GGML_Q5_1: "Q5_1",
     GGML_Q8_0: "Q8_0",
+    GGML_Q2_K: "Q2_K",
+    GGML_Q3_K: "Q3_K",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ3_S: "IQ3_S",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
+    GGML_IQ1_M: "IQ1_M",
+    GGML_BF16: "BF16",
 }
+
+# CUDA kernel dispatch: which types each C function handles.
+# Mirrors switch (type) in ggml_get_to_cuda (dequantize.cuh:541)
+DEQUANT_TYPES = frozenset({
+    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
+    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
+})
+
+# Mirrors switch (type) in ggml_mul_mat_vec_a8 (gguf_kernel.cu:116)
+MMVQ_TYPES = frozenset({
+    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
+    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
+})
+
+# Mirrors switch (type) in ggml_mul_mat_a8 (gguf_kernel.cu:219)
+# I-quants do not have an MMQ (large-batch matmul) kernel.
+MMQ_TYPES = frozenset({
+    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+})
+
+# Mirrors switch (type) in ggml_moe_a8_vec (gguf_kernel.cu:577)
+MOE_VEC_TYPES = frozenset({
+    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
+    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
+})
+
+# Mirrors switch (type) in ggml_moe_a8 (gguf_kernel.cu:369), whose coverage ggml_moe_get_block_size (gguf_kernel.cu:835) mirrors
+# I-quants do not have an MMQ (grouped MoE large-batch) kernel.
+MOE_MMQ_TYPES = frozenset({
+    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
+})
+
+# Unquantized types: no dequantization needed, handled by separate path in layers/gguf.py.
+GGML_UNQUANTIZED = frozenset({GGML_F32, GGML_F16, GGML_BF16})
 
 
 def row_bytes(numel: int, ggml_type: int) -> int:
@@ -122,7 +219,12 @@ _DEQUANT = {
 
 
 def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize ``raw`` (uint8) of any supported ggml type to flat ``out_dtype``."""
+    """Dequantize ``raw`` (uint8) in pure torch (Q4_0, Q6_K, F32/F16/BF16 only).
+
+    This is the CPU reference path for loading norms and scales. The packed GPU path
+    (GGUFLinear, GGUFEmbedding, expert banks) dequantizes all 21 types via CUDA kernels;
+    see ``BLOCK_SHAPE`` for the full type list.
+    """
     if ggml_type == GGML_F32:
         return raw.view(torch.float32).to(out_dtype)
     if ggml_type == GGML_F16:
@@ -132,7 +234,9 @@ def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> tor
     fn = _DEQUANT.get(ggml_type)
     if fn is None:
         raise NotImplementedError(
-            f"dequant for ggml type {GGML_NAME.get(ggml_type, ggml_type)} not implemented"
+            f"pure-torch dequant for ggml type {GGML_NAME.get(ggml_type, ggml_type)} "
+            f"not implemented (only Q4_0 and Q6_K supported in CPU path; "
+            f"other types use CUDA kernels via GGUFLinear)"
         )
     return fn(raw, out_dtype)
 
@@ -140,12 +244,34 @@ def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> tor
 __all__ = [
     "GGML_F32",
     "GGML_F16",
-    "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q4_1",
+    "GGML_Q5_0",
+    "GGML_Q5_1",
     "GGML_Q8_0",
+    "GGML_Q2_K",
+    "GGML_Q3_K",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
+    "GGML_IQ2_XXS",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
+    "GGML_IQ1_S",
+    "GGML_IQ4_NL",
+    "GGML_IQ3_S",
+    "GGML_IQ2_S",
+    "GGML_IQ4_XS",
+    "GGML_IQ1_M",
+    "GGML_BF16",
     "GGML_NAME",
     "BLOCK_SHAPE",
+    "DEQUANT_TYPES",
+    "MMVQ_TYPES",
+    "MMQ_TYPES",
+    "MOE_VEC_TYPES",
+    "MOE_MMQ_TYPES",
+    "GGML_UNQUANTIZED",
     "row_bytes",
     "dequant_q4_0",
     "dequant_q6_k",

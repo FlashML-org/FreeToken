@@ -115,6 +115,34 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF (mixed IQ3_S/Q4_K) qwen35moe: same model classes, GGUF config + weight loaders.
+    "Qwen35MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    # Dense qwen35 GGUF (Qwen3.8-27B): same package and classes, moe_enabled==False.
+    "Qwen35GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    # GGUF qwen3moe: simpler than qwen3.5moe (full attention, no GDN/shared expert, plain
+    # norms), same model class as qwen3_moe HF, GGUF config + weight loaders.
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "DeepseekV4GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v4",
+        "DeepseekV4ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",

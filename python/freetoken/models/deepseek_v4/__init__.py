@@ -15,6 +15,13 @@ addressed by page tables, and sparse attention is a physical-slot gather (see
 
 from .args import DeepseekV4Args, load_args
 from .config import parse_config
+from .gguf import (
+    convert_deepseek4_to_gguf,
+    is_gguf_model,
+    iter_gguf_weights,
+    parse_gguf_config,
+)
+from .gguf_experts import gguf_expert_types, load_gguf_expert_sources
 from .model import DeepseekV4ForCausalLM
 from .weight import iter_weights, load_dsfp4_expert_sources
 
@@ -25,4 +32,10 @@ __all__ = [
     "DeepseekV4ForCausalLM",
     "iter_weights",
     "load_dsfp4_expert_sources",
+    "parse_gguf_config",
+    "iter_gguf_weights",
+    "convert_deepseek4_to_gguf",
+    "is_gguf_model",
+    "gguf_expert_types",
+    "load_gguf_expert_sources",
 ]

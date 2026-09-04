@@ -49,6 +49,10 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # For quant_format == "gguf": the (gate_up, down) ggml types the checkpoint used.
+    # Carried here so the engine can hand them to OffloadMoeCache, which hands them to
+    # the MoE kernels -- a GGUF bank's row stride is a property of the file, not the format.
+    gguf_expert_types: tuple[int, int] | None = field(default=None)
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -278,9 +282,73 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
+def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    """Native GGUF routed experts of any MMVQ-capable ggml type (generalizes ``q4_0``).
+
+    Like the q4_0 provider, the packed block bytes are streamed to the GPU and dequantized
+    inside the borrowed ggml MoE kernels -- no bf16 expert copy is ever materialized. The
+    difference is that the row stride depends on the ggml type the checkpoint picked per
+    bank, so the loader also reports ``(gate_up, down)`` types for the cache and kernels.
+
+    The per-arch loader is resolved from the model package (the GGUF tensor layout is
+    architecture-specific), mirroring ``_model_setup_override``'s resolution.
+    """
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf: the checkpoint is a single packed "
+            "file (not safetensors), so the common reader does not apply"
+        )
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    spec = get_model_spec(model_config.architectures[0])
+    loader = _load_attr(spec.module, "load_gguf_expert_sources")
+    types_fn = _load_attr(spec.module, "gguf_expert_types")
+
+    sink = None if dummy else layer_sink
+    types = types_fn(model_path, model_config.num_layers)
+    # One pool per bank is shared by every layer, and moe_vec.cuh addresses it without a
+    # padding allowance, so a bank whose type varies by layer cannot be served. Reject it
+    # here with the layers named rather than reading every block at the wrong offset.
+    resolved = {}
+    for name in ("gate_up", "down"):
+        distinct = sorted(set(types[name]))
+        if len(distinct) != 1:
+            from freetoken.models.gguf.dequant import GGML_NAME
+
+            spread = {
+                GGML_NAME.get(t, t): [i for i, x in enumerate(types[name]) if x == t]
+                for t in distinct
+            }
+            raise NotImplementedError(
+                f"GGUF expert bank {name!r} mixes ggml types across layers ({spread}). "
+                f"The offload slot pool is a single allocation shared by every layer and "
+                f"moe_vec.cuh addresses it as expert * nrows * (ncols / qk) with no padding "
+                f"allowance, so one pool cannot hold two row strides. "
+                f"llama.cpp's mixed quant levels (the *_M and *_XXS families) raise the "
+                f"precision of the first few layers' ffn_down_exps, which is what trips this. "
+                f"Re-quantize with `llama-quantize --pure` to get one type throughout, or pick "
+                f"a level that is already uniform."
+            )
+        resolved[name] = distinct[0]
+
+    sources = loader(model_path, model_config, layer_sink=sink)
+    return ExpertBanks(
+        "gguf",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf"]},
+        streamed=sink is not None,
+        gguf_expert_types=(resolved["gate_up"], resolved["down"]),
+    )
+
+
 def _model_setup_override(model_config):
     architectures = getattr(model_config, "architectures", None)
     if not architectures:
+        return None
+    # A model package's setup_offload_expert_banks is written for that model's *safetensors*
+    # quantization (qwen3_5_moe's is the NVFP4 loader). A GGUF checkpoint of the same
+    # architecture shares the module but not the bank layout, so the override would silently
+    # hijack the gguf path and fail deep in an NVFP4 reader. Route "gguf" to _gguf_banks.
+    if getattr(model_config, "expert_quant", "none") == "gguf":
         return None
 
     from freetoken.models.register import _load_attr, get_model_spec
@@ -301,6 +369,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "gguf": _gguf_banks,
 }
 
 
@@ -395,12 +464,25 @@ def bank_bytes_estimate(model_config) -> int | None:
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
     )
-    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     layers = getattr(model_config, "num_moe_layers", None)
     experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
-    if per_expert is None or not all((layers, experts, hidden, inter)):
+    if not all((layers, experts, hidden, inter)):
+        return None
+    if fmt == "gguf":
+        # Not a fixed f(H, I) like the other formats: the row stride depends on the ggml
+        # type the checkpoint chose per bank, so size it from row_bytes directly.
+        types = getattr(model_config, "gguf_expert_types", None)
+        if types is None:
+            return None
+        from freetoken.models.gguf.dequant import row_bytes
+
+        t_gate_up, t_down = types
+        per = 2 * inter * row_bytes(hidden, t_gate_up) + hidden * row_bytes(inter, t_down)
+        return layers * experts * per
+    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
+    if per_expert is None:
         return None
     return layers * experts * per_expert(hidden, inter)
 
