@@ -21,13 +21,42 @@ if TYPE_CHECKING:
 class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
-    def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
+    def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int,
+                 layer_id: int | None = None):
+        # Mixed compressed-tensors exports store some dense-MLP layers in a different
+        # precision than dense_quant (unsloth: most layers packed NVFP4, a few FP8):
+        # the per-layer override (dense_mlp_storage) wins when it covers this layer.
+        storage = "bf16"
+        overrides = getattr(config, "dense_mlp_storage", None)
+        if overrides is not None and layer_id is not None and layer_id in overrides:
+            storage = overrides[layer_id]
+        elif getattr(config, "dense_quant", "none") == "nvfp4":
+            storage = "nvfp4"
+        # storage == "fp8": mixed exports (unsloth) store this dense-MLP layer weight-only
+        # FP8 (per-row scale) -- keep it native W8A16, the same classes the fp8-split GDN
+        # uses, instead of the bf16 dequant (halves this layer's memory).
+        if storage == "fp8":
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                Fp8PerTensorColMerged,
+                Fp8PerTensorLinear,
+            )
+
+            self.gate_up_proj = Fp8PerTensorColMerged(
+                hidden_size, [intermediate_size, intermediate_size], has_bias=False
+            )
+            # down_proj: input = intermediate, output = hidden (in_features, out_features)
+            # -> weight [hidden, intermediate], matching the other branches
+            # (Nvfp4DenseLinear / LinearRowParallel both take (intermediate, hidden)).
+            self.down_proj = Fp8PerTensorLinear(
+                intermediate_size, hidden_size, has_bias=False
+            )
+            return
         if getattr(config, "expert_quant", "none") == "fp8_block":
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Fp8BlockLinear(intermediate_size, hidden_size, has_bias=False)
-        elif getattr(config, "dense_quant", "none") == "nvfp4":
+        elif storage == "nvfp4":
             # NVFP4 checkpoint: keep the shared expert's NVFP4 weights native (W4A16).
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
 
@@ -48,12 +77,13 @@ class _SharedExpert(BaseOP):
 class Qwen3_5DenseMLP(_SharedExpert):
     """Dense (non-MoE) SwiGLU MLP for dense Qwen3.x checkpoints (e.g. 27B): ``gate_up_proj``
     (fused gate|up) + ``down_proj`` at full ``intermediate_size``. Same structure (and quant
-    dispatch) as the shared expert -- NVFP4 (W4A16) when ``dense_quant=="nvfp4"``, else bf16 --
-    so it reuses ``_SharedExpert`` directly and keeps the state-dict keys flat
+    dispatch) as the shared expert -- NVFP4 (W4A16) when ``dense_quant=="nvfp4"`` (or the
+    per-layer ``dense_mlp_storage`` override says so), else bf16 -- so it reuses
+    ``_SharedExpert`` directly and keeps the state-dict keys flat
     (``...layers.N.mlp.{gate_up_proj,down_proj}``)."""
 
-    def __init__(self, config: ModelConfig):
-        super().__init__(config, config.hidden_size, config.intermediate_size)
+    def __init__(self, config: ModelConfig, layer_id: int | None = None):
+        super().__init__(config, config.hidden_size, config.intermediate_size, layer_id)
 
 
 class Qwen3_5MoE(BaseOP):
@@ -76,7 +106,7 @@ class Qwen3_5MoE(BaseOP):
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(
-            config, config.hidden_size, config.shared_expert_intermediate_size
+            config, config.hidden_size, config.shared_expert_intermediate_size, layer_id
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 

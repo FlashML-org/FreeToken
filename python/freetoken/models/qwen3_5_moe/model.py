@@ -49,7 +49,7 @@ class Qwen3_5DecoderLayer(BaseOP):
             self.self_attn = Qwen3_5Attention(config, layer_id)
         # Dense variants (num_experts==0, e.g. Qwen3.6-27B) use a plain SwiGLU MLP instead of
         # the routed MoE block; both expose ``forward(hidden)->hidden`` and the same key prefix.
-        self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config)
+        self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config, layer_id)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -99,6 +99,16 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        elif getattr(config, "lm_head_quant", "none") == "fp8_pertensor":
+            # unsloth's mixed export stores lm_head as weight-only FP8 (per-row scale):
+            # keep it native W8A16 -- the bf16 dequant of this ~2.5 GB matrix would both
+            # double the memory and be the single largest load-time materialization.
+            from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorLinear
+
+            assert not config.tie_word_embeddings, "FP8 lm_head assumes untied embeddings"
+            self.lm_head = Fp8PerTensorLinear(
+                in_features=config.hidden_size, out_features=config.vocab_size
             )
         else:
             self.lm_head = ParallelLMHead(
