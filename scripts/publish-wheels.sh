@@ -12,6 +12,12 @@
 # install error and a retry) is the safer failure. Requires `gh` authenticated
 # with write access to the target repo.
 #
+# After the upload, writes `engine-<platform>.json` to the release: the pair's URLs,
+# sha256 and sizes under a fixed asset name, so a Desktop resolves the pair with one
+# static download (no api.github.com, no per-IP rate limit) and scans the asset list
+# only when the manifest is missing. One file per platform -- the linux nightly and a
+# hand-run windows publish never touch each other's manifest.
+#
 # Environment:
 #   FREETOKEN_WEB_REPO   target repo  (default: FlashML-org/FreeToken-Web)
 #   FREETOKEN_WEB_TAG    release tag  (default: beta)
@@ -89,6 +95,52 @@ for w in "${wheels[@]}"; do
   say "uploading $(basename "$w")"
   gh release upload "$TAG" "$w" -R "$REPO"
 done
+
+# The manifest is written LAST so it never names a wheel that is not there yet. The
+# Desktop compares asset basenames, so the URL is spelled the way GitHub's
+# browser_download_url spells it: `+` percent-encoded.
+asset_url() { printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$TAG" "${1//+/%2B}"; }
+wheel_json() {
+  local w="$1" name size sha
+  name="${w##*/}"
+  size="$(wc -c <"$w" | tr -d ' ')"
+  sha="$(sha256sum "$w" | cut -d' ' -f1)"
+  printf '{"name": "%s", "url": "%s", "sha256": "%s", "size": %s}' "$name" "$(asset_url "$name")" "$sha" "$size"
+}
+manifest_dir="$(mktemp -d)"
+trap 'rm -rf "$manifest_dir"' EXIT
+while IFS= read -r p; do
+  rt=""; kc=""
+  for w in "${wheels[@]}"; do
+    case "${w##*/}" in
+      freetoken-*"$p"*.whl) rt="$w" ;;
+      freetoken_kernel_cache-*"$p"*.whl) kc="$w" ;;
+    esac
+  done
+  rt_name="${rt##*/}"
+  # freetoken-<version>-<python>-<abi>-<platform>.whl
+  version="$(cut -d- -f2 <<<"$rt_name")"
+  python_tag="$(cut -d- -f3 <<<"$rt_name")"
+  commit="$(grep -oE '\+g[0-9a-f]{7,}' <<<"$rt_name" | head -1 | sed 's/^+g//' || true)"
+  cuda="$(grep -oE '\+cu[0-9]+' <<<"${kc##*/}" | head -1 | sed 's/^+//' || true)"
+  manifest="$manifest_dir/engine-$p.json"
+  cat >"$manifest" <<JSON
+{
+  "schema": 1,
+  "channel": "$TAG",
+  "platform": "$p",
+  "version": "$version",
+  "commit": "$commit",
+  "published": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "python": "$python_tag",
+  "cuda": "$cuda",
+  "runtime": $(wheel_json "$rt"),
+  "kernel_cache": $(wheel_json "$kc")
+}
+JSON
+  say "uploading engine-$p.json (version $version)"
+  gh release upload "$TAG" "$manifest" -R "$REPO" --clobber
+done <<<"$platforms"
 
 say "release now carries:"
 gh api "repos/$REPO/releases/tags/$TAG" \
