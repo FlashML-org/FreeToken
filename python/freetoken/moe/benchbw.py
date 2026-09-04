@@ -56,6 +56,7 @@ from freetoken.gpu_select import (
     single_gpu_arg,
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.memory import effective_memory_available
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
 from freetoken.utils import init_logger
 
@@ -153,29 +154,10 @@ def default_out_path(gpu_uuid: str | None = None) -> str:
     return default_profile_path(gpu_uuid)
 
 
-def _cgroup_mem_headroom() -> int | None:
-    """Free bytes under this process's cgroup v2 memory limit, or None if unlimited."""
-    try:
-        with open("/sys/fs/cgroup/memory.max") as f:
-            raw = f.read().strip()
-        if raw == "max":
-            return None
-        limit = int(raw)
-        with open("/sys/fs/cgroup/memory.current") as f:
-            used = int(f.read().strip())
-        return max(0, limit - used)
-    except (OSError, ValueError):
-        return None
-
-
 def _available_ram_bytes() -> int:
-    """Free host RAM, clamped to the cgroup memory limit so a container isn't over-estimated."""
-    try:
-        host = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):
-        host = 8 << 30
-    cg = _cgroup_mem_headroom()
-    return min(host, cg) if cg is not None else host
+    """Effective free RAM, retaining the legacy fallback only when probing is absent."""
+    available = effective_memory_available()
+    return (8 << 30) if available is None else available
 
 
 # ============================== ceilings (hardware) ==============================
