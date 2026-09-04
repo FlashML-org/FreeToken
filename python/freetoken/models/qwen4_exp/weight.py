@@ -215,7 +215,9 @@ def iter_weights(
     from .config import parse_config
 
     tp = get_tp_info()
-    config = parse_config(cached_load_hf_config(model_path))
+    # The sharding geometry needs the HF config; TP=1 never shards, so keep the plain path free
+    # of a config load (synthetic test checkpoints carry no model_type).
+    config = parse_config(cached_load_hf_config(model_path)) if tp.size > 1 else None
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
