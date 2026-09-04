@@ -474,7 +474,14 @@ def _iter_weights_attn_fp8(
                     raw_base = raw_name[: -len(".weight")]
                     has_s2 = raw_base + ".weight_scale_2" in keyset
                     has_s = raw_base + ".weight_scale" in keyset
-                    if has_s and not has_s2:  # per-tensor FP8 dense projection
+                    # Native FP8 (W8A16) only for the attn/GDN projections: those have
+                    # fp8 linears in the model. Any other per-tensor FP8 .weight (the
+                    # MoE shared_expert on a mixed checkpoint whose experts are NVFP4,
+                    # e.g. Apodex-1.1-mini) has no fp8 module -- let it fall through to
+                    # bf16 dequant + the shared-expert gate/up fusion below.
+                    if has_s and not has_s2 and (
+                        ".self_attn." in base or ".linear_attn." in base
+                    ):
                         w = f.get_tensor(raw_name)  # fp8-e4m3, kept verbatim
                         sc = f.get_tensor(raw_base + ".weight_scale")
                         # modelopt's calibrated activation scale: kept (not dropped with the
