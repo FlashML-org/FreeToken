@@ -10,7 +10,9 @@ set -euo pipefail
 
 readonly CHECKOUT="${1:?usage: run_gemma4_llamacpp_vision_control.sh ISOLATED_CHECKOUT}"
 readonly ROOT_DIR="/home/david/freetoken-amd"
-readonly PRODUCTION_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
+# Use the maintained recovery checkout so a matched llama.cpp control cannot
+# finish with the protected Qwen API unavailable because of a retired path.
+readonly PRODUCTION_DIR="${ROOT_DIR}/source-qwen-recovery-d6ee8cef479c"
 readonly LLAMA_SERVER="${ROOT_DIR}/llama.cpp-rocm10-b10141/build-rocm10-clang/bin/llama-server"
 readonly MODEL_PATH="${ROOT_DIR}/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf"
 readonly MMPROJ_PATH="${ROOT_DIR}/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B-it-mmproj.gguf"
@@ -91,6 +93,32 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma
     --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
     >"${ARTIFACT_DIR}/quality.log" 2>&1
+
+if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
+    # Reuse the identical fixed-length matrix used by the native FreeToken
+    # control.  The wrapper remains opt-in so the normal vision quality gate
+    # does not silently become a longer benchmark.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_gguf_text_matrix.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
+        --gguf "${MODEL_PATH}" --samples "${FREETOKEN_GEMMA4_MATRIX_SAMPLES:-5}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --artifact "${ARTIFACT_DIR}/text-matrix.json" \
+        >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
+fi
+if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_concurrency.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
+        --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --artifact "${ARTIFACT_DIR}/concurrency.json" \
+        >"${ARTIFACT_DIR}/concurrency.log" 2>&1
+fi
+if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
+        --artifact "${ARTIFACT_DIR}/long-context.json" \
+        >"${ARTIFACT_DIR}/long-context.log" 2>&1
+fi
 image_verify_args=()
 if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
     # Keep the normal llama.cpp reference quick, but permit the identical
