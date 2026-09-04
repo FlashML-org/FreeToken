@@ -358,7 +358,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     except FileNotFoundError:
         pass
 
-    intermediate_size = int(value("feed_forward_length"))
+    # Dense qwen35 stores one feed-forward width. The MoE GGUF stores only
+    # routed and shared expert widths, so its generic dense width remains zero.
+    intermediate_size = int(value("feed_forward_length")) if not is_moe else 0
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
