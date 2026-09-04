@@ -15,10 +15,18 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    init_logger,
+    is_rocm,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -28,6 +36,52 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+
+def _cuda_graph_disabled(config: EngineConfig) -> bool:
+    return config.cuda_graph_bs == [] or (
+        config.cuda_graph_bs is None and config.cuda_graph_max_bs == 0
+    )
+
+
+def _auto_hybrid_allowed_before_rocm_probe(config: EngineConfig) -> bool:
+    """Auto cannot verify the HIP replay handshake before constructing an executor."""
+    return not is_rocm() or _cuda_graph_disabled(config)
+
+
+def _disable_unsafe_rocm_cpu_moe_graph(config: EngineConfig, executor) -> bool:
+    """Disable graph capture when ROCm CPU/Hybrid MoE lacks a replay-safe handshake.
+
+    This runs after the executor's real capture/replay capability probe and before
+    ``GraphRunner`` is constructed. An empty explicit batch list is the canonical graph-off
+    setting; max_bs is cleared too so later rebuilds cannot silently turn capture back on.
+    """
+    if (
+        not is_rocm()
+        or executor is None
+        or executor.graph_capture_safe
+        or _cuda_graph_disabled(config)
+    ):
+        return False
+    object.__setattr__(config, "cuda_graph_bs", [])
+    object.__setattr__(config, "cuda_graph_max_bs", 0)
+    logger.warning_rank0(
+        "ROCm CPU/Hybrid MoE stream-memory synchronization did not pass capture/replay; "
+        "disabling CUDA Graph and continuing in the correct eager path"
+    )
+    return True
+
+
+def _cpu_moe_flag_slots_per_layer(config: EngineConfig, free_memory: int) -> int:
+    """Cover every configured graph batch size while retaining eager headroom."""
+    from freetoken.moe.cpu_executor import _FLAG_SLOTS_PER_LAYER
+
+    graph_batch_sizes = _determine_cuda_graph_bs(
+        cuda_graph_bs=config.cuda_graph_bs,
+        cuda_graph_max_bs=config.cuda_graph_max_bs,
+        free_memory=free_memory,
+    )
+    return max(_FLAG_SLOTS_PER_LAYER, len(set(graph_batch_sizes)))
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -313,6 +367,7 @@ class Engine:
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        self._init_free_memory = init_free_memory
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -333,6 +388,10 @@ class Engine:
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        # cpu/hybrid and offload + --moe-cpu-layers all attach the same executor.
+        # Auto may select hybrid from a bandwidth profile before GPU init; at this point
+        # it is safe only if the native handshake was verified or graphs are disabled.
+        _disable_unsafe_rocm_cpu_moe_graph(config, self.cpu_moe_executor)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -683,8 +742,20 @@ class Engine:
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # round a batch up to the largest explicitly captured size.  Derive both
+        # scratch capacity and handshake slots from the same resolved list that
+        # GraphRunner will use (explicit cuda_graph_bs takes precedence over max_bs).
+        graph_batch_sizes = _determine_cuda_graph_bs(
+            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            free_memory=self._init_free_memory,
+        )
+        max_tokens = max(
+            config.max_running_req,
+            config.cuda_graph_max_bs or 0,
+            max(graph_batch_sizes, default=0),
+            1,
+        )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -694,6 +765,9 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
+            flag_slots_per_layer=_cpu_moe_flag_slots_per_layer(
+                config, self._init_free_memory
+            ),
             swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
             swiglu_limit=getattr(sample, "swiglu_limit", None),
         )
@@ -1363,7 +1437,17 @@ def _adjust_config(config: EngineConfig):
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
-            if not _cpu_moe_act_ok:
+            if not _auto_hybrid_allowed_before_rocm_probe(config):
+                # The capability probe needs a constructed CPU executor, which auto
+                # selection does not have yet. Keep auto fail-closed on ROCm when graph
+                # capture is enabled; explicit cpu/hybrid still probes the native path,
+                # while graph-off auto configurations may safely use eager hybrid.
+                logger.info_rank0(
+                    "benchbw profile recommends hybrid, but ROCm CUDA Graph is enabled "
+                    "and the native flag handshake has not been verified yet; staying "
+                    "on offload"
+                )
+            elif not _cpu_moe_act_ok:
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
                     f"support this model's expert activation "

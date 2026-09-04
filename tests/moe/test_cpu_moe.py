@@ -4,9 +4,9 @@ Part 1 -- numerical alignment: the CPU SwiGLU MoE GEMV vs FreeToken's production
 GPU decode kernels (bf16/nvfp4/mxfp4/ds_fp4) on identical banks and routing across
 batch sizes (fp32-accumulate, so the only spread is reduction order -> tight tol).
 
-Part 2 -- CUDA-graph capture/replay: the cudaLaunchHostFunc submit/sync host nodes
-end to end (eager decode, capture, replay with *new* data -> result tracks the new
-routing, i.e. the dependency flows through the pinned buffers, not baked-in).
+Part 2 -- CUDA-graph capture/replay: the native flag handshake end to end (eager
+decode, capture, replay with *new* data -> result tracks the new routing, i.e. the
+dependency flows through the pinned buffers, not baked-in).
 """
 
 from __future__ import annotations
@@ -502,15 +502,136 @@ def test_cpu_moe_decode_cuda_graph_replay():
         assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
         slot = ex._flag_slots[(layer, bs)]
         assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
+        assert ex._ext.flag_done_value(slot) == 1, "completion flag at rest"
+        assert ex._ext.flag_ready_value(slot) == 0, "doorbell must be consumed"
         assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")
 
 
+@pytest.mark.skipif(getattr(torch.version, "hip", None) is None, reason="ROCm guard")
+def test_rocm_cpu_moe_capture_without_flag_sync_fails_closed(monkeypatch):
+    """ROCm must never capture the known-unsafe hipLaunchHostFunc fallback."""
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    monkeypatch.setattr(cpu_executor, "_FLAG_SYNC", False)
+    cache = _make_cache(1, 4, 64, 32)
+    dev = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    executor = cpu_executor.CpuMoeExecutor(
+        cache,
+        top_k=2,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=2,
+        max_tokens=1,
+        device=dev,
+    )
+    hidden = torch.randn(1, 64, device=dev, dtype=torch.bfloat16)
+    ids = torch.randint(0, 4, (1, 2), device=dev, dtype=torch.int32)
+    weights = torch.rand(1, 2, device=dev, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="not CUDA-graph safe on ROCm"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            hidden.add_(0)  # keep capture valid when the executor rejects its own nodes
+            executor.decode(0, hidden, weights, ids)
+
+
+@pytest.mark.skipif(getattr(torch.version, "hip", None) is None, reason="ROCm guard")
+def test_rocm_graph_memop_param_storage_is_bounded_across_rebuilds():
+    """Rebuilding graphs must reuse executor-owned HIP batch-op parameters.
+
+    ROCm 7.14 retains each graph node's ``paramArray`` pointer.  The executor keeps
+    one immutable submit array per flag slot plus one shared wait array, so graph
+    rebuilds must neither invalidate those addresses nor append new storage.
+    """
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(37)
+    L, E, H, I, top_k, bs = 1, 4, 64, 32, 2, 1
+    cache = _make_cache(L, E, H, I)
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    executor = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=2,
+        max_tokens=bs,
+        device=torch.device("cuda"),
+    )
+    if not executor._flag_sync:
+        pytest.skip("native ROCm graph handshake unavailable")
+
+    hidden = torch.randn(bs, H, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, E, (bs, top_k), device="cuda", dtype=torch.int32)
+    weights = torch.rand(bs, top_k, device="cuda", dtype=torch.float32)
+    executor.decode(0, hidden, weights, ids)  # materialize the task and flag slot
+    torch.cuda.synchronize()
+
+    expected_params = 2 * executor._flag_capacity + 1
+    assert executor._ext.graph_memop_param_count() == expected_params
+    for _ in range(16):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = executor.decode(0, hidden, weights, ids)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        assert executor._ext.graph_memop_param_count() == expected_params
+        del graph, out
+
+
+@pytest.mark.skipif(getattr(torch.version, "hip", None) is None, reason="ROCm guard")
+def test_rocm_graph_memops_support_more_than_sixteen_batch_sizes():
+    """Every configured graph size gets a native slot, including size sets > 16."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(41)
+    batch_sizes = list(range(1, 20))
+    L, E, H, I, top_k = 1, 4, 64, 32, 2
+    cache = _make_cache(L, E, H, I)
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    executor = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=2,
+        max_tokens=max(batch_sizes),
+        device=torch.device("cuda"),
+        flag_slots_per_layer=len(batch_sizes),
+    )
+    if not executor._flag_sync:
+        pytest.skip("native ROCm graph handshake unavailable")
+
+    for bs in batch_sizes:
+        hidden = torch.randn(bs, H, device="cuda", dtype=torch.bfloat16)
+        ids = torch.randint(0, E, (bs, top_k), device="cuda", dtype=torch.int32)
+        weights = torch.rand(bs, top_k, device="cuda", dtype=torch.float32)
+        executor.decode(0, hidden, weights, ids)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = executor.decode(0, hidden, weights, ids)
+        graph.replay()
+        torch.cuda.synchronize()
+        slot = executor._flag_slots[(0, bs)]
+        assert executor._ext.flag_served_count(slot) >= 2
+        assert torch.isfinite(out).all()
+        del graph, out
+
+    assert len(executor._flag_slots) == len(batch_sizes)
+    assert executor._ext.graph_memop_param_count() == 2 * len(batch_sizes) + 1
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
-    """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
+    """gpt-oss mxfp4 path under capture/replay: the handshake must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts
