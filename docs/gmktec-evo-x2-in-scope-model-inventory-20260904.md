@@ -19,12 +19,19 @@ inventory probe.
 
 ## Payload admission result
 
-The read-only model-directory probe found the Qwen3.6 35B-A3B safetensors and
-NVFP4 payloads plus the Gemma 4 Q4 GGUF and vision projector. It did not find a
-Qwen3.8 27B, GLM-4.7, KAT-Coder, Laguna, or Ornith payload under the FreeToken
-model directory. Therefore the first queued Qwen3.8 qualification cannot begin
-yet: downloading or copying a checkpoint is a separate authorized staging step,
-and a load test must not be improvised with a missing artifact.
+The read-only FreeToken model-directory probe found the Qwen3.6 35B-A3B
+safetensors and NVFP4 payloads plus the Gemma 4 Q4 GGUF and vision projector.
+The archived model store also contains a Qwen3.8 27B Q4_K_M GGUF, but it is not
+under the FreeToken model directory. GLM-4.7, KAT-Coder, Laguna, and Ornith
+payloads are likewise outside that directory. No model was copied or loaded
+during this inventory step.
+
+The Qwen3.8 27B payload was checked with FreeToken's metadata-only GGUF
+admission path. Its `general.architecture` is `qwen35`, and the current parser
+returns `ValueError: GGUF architecture 'qwen35' is not supported (known:
+['gemma4'])`. The current GGUF registry therefore cannot qualify this archived
+Qwen3.8 artifact without a deliberate dense `qwen35` loader and model-path
+implementation. A filename match is not sufficient evidence of support.
 
 The source tree does contain model code for Qwen3.8-Flash-Next (`qwen4_exp`)
 and GLM-4.7 parser support. Source support alone does not prove that the
