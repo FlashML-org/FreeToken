@@ -219,6 +219,11 @@ class OffloadMoELayer(MoELayer):
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Offload MoE: each rank computes the full expert output (banks are not TP-sharded),
+        so no all-reduce is needed — the result is already the complete output."""
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,

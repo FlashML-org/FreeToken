@@ -9,6 +9,7 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+from freetoken.utils import div_even
 from freetoken.models.loader import (
     CT_SCALE_SUFFIXES,
     ShardReader,
@@ -79,6 +80,77 @@ _FUSIONS: dict[str, tuple[str, ...]] = {
         ".mlp.gate_proj.weight", ".mlp.up_proj.weight",
     ),
 }
+
+
+def _shard_tp(tensor: torch.Tensor, *, rank: int, world_size: int, dim: int) -> torch.Tensor:
+    """Simple chunk sharding along ``dim``."""
+    if world_size == 1:
+        return tensor
+    return tensor.chunk(world_size, dim=dim)[rank].clone()
+
+
+def _shard_tp_parts(
+    tensor: torch.Tensor,
+    part_sizes: tuple[int, ...],
+    *,
+    rank: int,
+    world_size: int,
+    local_part_sizes: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Per-part column-parallel sharding (dim=0). Each part is sharded independently,
+    matching ``LinearColParallelMerged``'s per-output-size sharding.
+
+    When ``local_part_sizes`` is provided, parts where ``local < full`` but
+    ``local * world != full`` are replicated by head index (``rank % num_heads``),
+    for GQA KV head replication when ``num_kv < tp_size``."""
+    if world_size == 1:
+        return tensor
+    shards: list[torch.Tensor] = []
+    offset = 0
+    for i, full_size in enumerate(part_sizes):
+        chunk = tensor[offset:offset + full_size]
+        local_size = full_size // world_size if local_part_sizes is None else local_part_sizes[i]
+        if local_size >= full_size:
+            shards.append(chunk.clone())
+        elif local_size * world_size == full_size:
+            shards.append(chunk.chunk(world_size, dim=0)[rank].clone())
+        else:
+            num_heads = full_size // local_size
+            head_idx = rank * num_heads // world_size
+            shards.append(chunk[head_idx * local_size:(head_idx + 1) * local_size].clone())
+        offset += full_size
+    return torch.cat(shards, dim=0)
+
+
+def _maybe_shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Apply TP sharding to a non-fused weight based on its state-dict key suffix.
+    Fused projections (qkv_proj, in_proj, gate_up_proj) are handled by ``_try_fuse``
+    → ``_shard_tp_parts`` in ``iter_weights`` before reaching here.
+    conv1d.weight is also handled in ``iter_weights`` (needs config for sub-part sizes)."""
+    tp = get_tp_info()
+    if tp.size == 1:
+        return tensor
+    if name.endswith((".o_proj.weight", ".down_proj.weight", ".out_proj.weight")):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=1)
+    if name.endswith(("embed_tokens.weight", "lm_head.weight")):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=0)
+    if name.endswith(("A_log", "dt_bias")):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=0)
+    # Routed expert weights (3D stacked: [num_experts, ...]) — resident mode only.
+    # gate_up_proj is [num_experts, 2*intermediate, hidden] = [gate, up] fused on dim=1.
+    # Must shard gate and up independently (like _shard_tp_parts on dim=1).
+    # down_proj is [num_experts, hidden, intermediate] — single dim, simple chunk on dim=2.
+    if name.endswith("experts.gate_up_proj"):
+        intermediate = tensor.shape[1] // 2
+        gate = tensor[:, :intermediate, :]
+        up = tensor[:, intermediate:, :]
+        return torch.cat([
+            gate.chunk(tp.size, dim=1)[tp.rank].clone(),
+            up.chunk(tp.size, dim=1)[tp.rank].clone(),
+        ], dim=1)
+    if name.endswith("experts.down_proj"):
+        return _shard_tp(tensor, rank=tp.rank, world_size=tp.size, dim=2)
+    return tensor
 
 
 def _dequant_fp8_weight(weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
@@ -154,8 +226,8 @@ def _is_gemma_norm(name: str) -> bool:
 
 def _try_fuse(
     name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
-) -> tuple[str, torch.Tensor] | tuple[()] | None:
-    """buffer a fusion part; return merged ``(name, tensor)`` once all parts arrive,
+) -> tuple[str, torch.Tensor, tuple[int, ...]] | tuple[()] | None:
+    """buffer a fusion part; return merged ``(name, tensor, part_sizes)`` once all parts arrive,
     ``()`` while incomplete, ``None`` if not a fusion part."""
     for fused_suffix, parts in _FUSIONS.items():
         for idx, part in enumerate(parts):
@@ -165,7 +237,18 @@ def _try_fuse(
                 slots[idx] = tensor
                 if len(slots) == len(parts):
                     del buf[key]
-                    return key, torch.cat([slots[i] for i in range(len(parts))], dim=0)
+                    tensors = [slots[i] for i in range(len(parts))]
+                    part_sizes = tuple(t.shape[0] for t in tensors)
+                    # in_proj_qkv is itself a fusion of [q, k, v] with sizes
+                    # (key_dim, key_dim, value_dim). value_dim == z_size, and
+                    # key_dim = (qkv_size - value_dim) // 2. Expand qkv into
+                    # its sub-parts so _shard_tp_parts shards each independently.
+                    if key.endswith(".in_proj.weight") and len(part_sizes) == 4:
+                        qkv_size, z_size, b_size, a_size = part_sizes
+                        value_dim = z_size
+                        key_dim = (qkv_size - value_dim) // 2
+                        part_sizes = (key_dim, key_dim, value_dim, z_size, b_size, a_size)
+                    return key, torch.cat(tensors, dim=0), part_sizes
                 return ()
     return None
 
@@ -210,8 +293,6 @@ def iter_weights(
         )
         return
     tp_info = get_tp_info()
-    if tp_info.size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
 
     # Pure-NVFP4 checkpoint (bf16 attn): the dense MLP projections (shared_expert) are still
     # stored as packed FP4 -- keep them native (W4A16) when dense_quant=="nvfp4" rather than
@@ -259,7 +340,8 @@ def iter_weights(
                         shared_buf=nvfp4_shared_buf,
                     )
                     if emit is not _NOT_DENSE_NVFP4:
-                        yield from emit
+                        for ename, etensor in emit:
+                            yield ename, _maybe_shard(ename, etensor)
                         continue
 
                 tensor = _load_maybe_quantized(f, raw_name, keyset)
@@ -272,20 +354,43 @@ def iter_weights(
                     if "gate" in slots and "up" in slots:
                         merged = torch.cat([slots["gate"], slots["up"]], dim=0)
                         del shared_buf[prefix]
-                        yield f"{prefix}.mlp.shared_expert.gate_up_proj.weight", merged
+                        merged_name = f"{prefix}.mlp.shared_expert.gate_up_proj.weight"
+                        gate_size = slots["gate"].shape[0]
+                        up_size = slots["up"].shape[0]
+                        yield merged_name, _shard_tp_parts(merged, (gate_size, up_size), rank=tp_info.rank, world_size=tp_info.size)
                     continue
 
                 # fuse q/k/v -> qkv_proj and GDN in_proj_{qkv,z,b,a} -> in_proj
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
-                        yield fused
+                        fused_name, fused_tensor, part_sizes = fused
+                        # For qkv_proj: compute local part sizes with KV head replication
+                        # when num_kv_heads < tp_size (GQA replication).
+                        local_part_sizes = None
+                        if fused_name.endswith(".qkv_proj.weight"):
+                            num_kv = config.num_kv_heads
+                            head_dim = config.head_dim
+                            local_kv = div_even(num_kv, tp_info.size, allow_replicate=True) * head_dim
+                            local_q = div_even(part_sizes[0], tp_info.size)
+                            local_part_sizes = (local_q, local_kv, local_kv)
+                        yield fused_name, _shard_tp_parts(
+                            fused_tensor, part_sizes, rank=tp_info.rank, world_size=tp_info.size,
+                            local_part_sizes=local_part_sizes)
                     continue
 
                 if _is_gemma_norm(name):
                     tensor = tensor + 1.0  # (1 + weight) baked into the stored weight
 
-                yield name, tensor
+                if name.endswith("conv1d.weight") and tp_info.size > 1:
+                    g = config.linear_attention_group()
+                    if g is not None:
+                        key_dim = g.num_key_heads * g.key_head_dim
+                        value_dim = g.num_value_heads * g.value_head_dim
+                        tensor = _shard_tp_parts(tensor, (key_dim, key_dim, value_dim),
+                                                 rank=tp_info.rank, world_size=tp_info.size)
+
+                yield name, _maybe_shard(name, tensor)
 
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"

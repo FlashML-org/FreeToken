@@ -9,11 +9,15 @@ from freetoken.models.quant_linear import (
     make_col_merged_quant,
     make_replicated,
     make_replicated_quant,
+    make_row_parallel,
+    make_row_parallel_quant,
 )
 
 __all__ = [
     "make_col_merged_quant",
     "make_replicated_quant",
+    "make_row_parallel_quant",
     "make_replicated",
     "make_col_merged",
+    "make_row_parallel",
 ]

@@ -59,10 +59,14 @@ class LinearColParallelMerged(_LinearTPImpl):
         input_size: int,
         output_sizes: List[int],
         has_bias: bool,
+        local_output_sizes: List[int] | None = None,
     ):
         # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        if local_output_sizes is not None:
+            tp_output_sizes = local_output_sizes
+        else:
+            tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)

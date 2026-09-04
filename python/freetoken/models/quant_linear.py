@@ -12,8 +12,11 @@ from __future__ import annotations
 
 
 def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
-                          output_sizes: list[int], has_bias: bool = False):
+                          output_sizes: list[int], has_bias: bool = False,
+                          local_output_sizes: list[int] | None = None):
     """Column-merged linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16."""
+    if local_output_sizes is not None and (expert_quant != "none" or attn_quant != "none"):
+        raise NotImplementedError("local_output_sizes (GQA KV replication) not yet supported for quantized checkpoints")
     if expert_quant == "fp8_block":
         from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 
@@ -28,7 +31,8 @@ def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
         return Nvfp4DenseColMerged(in_f, output_sizes, has_bias)
     from freetoken.layers import LinearColParallelMerged
 
-    return LinearColParallelMerged(in_f, output_sizes, has_bias=has_bias)
+    return LinearColParallelMerged(in_f, output_sizes, has_bias=has_bias,
+                                   local_output_sizes=local_output_sizes)
 
 
 def make_replicated_quant(expert_quant: str, attn_quant: str, in_f: int, out_f: int,
@@ -51,6 +55,21 @@ def make_replicated_quant(expert_quant: str, attn_quant: str, in_f: int, out_f: 
     return LinearReplicated(in_f, out_f, has_bias=has_bias)
 
 
+def make_row_parallel_quant(expert_quant: str, attn_quant: str, in_f: int, out_f: int,
+                            has_bias: bool = False):
+    """Row-parallel linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16.
+    Shards the input dimension by tp_size and all-reduces on forward."""
+    if expert_quant == "fp8_block":
+        raise NotImplementedError("row-parallel Fp8BlockLinear not yet implemented")
+    if attn_quant == "fp8_pertensor":
+        raise NotImplementedError("row-parallel Fp8PerTensorLinear not yet implemented")
+    if attn_quant == "nvfp4":
+        raise NotImplementedError("row-parallel Nvfp4DenseLinear not yet implemented")
+    from freetoken.layers import LinearOProj
+
+    return LinearOProj(in_f, out_f, has_bias=has_bias)
+
+
 def make_replicated(config, in_f: int, out_f: int, has_bias: bool = False):
     """Config-driven replicated linear: ``Fp8BlockLinear`` under block-fp8, ``Fp8PerTensorLinear``
     under per-tensor-fp8 attention, ``Nvfp4DenseLinear`` under nvfp4, else ``LinearReplicated``."""
@@ -60,19 +79,30 @@ def make_replicated(config, in_f: int, out_f: int, has_bias: bool = False):
     )
 
 
-def make_col_merged(config, in_f: int, output_sizes: list[int], has_bias: bool = False):
+def make_col_merged(config, in_f: int, output_sizes: list[int], has_bias: bool = False,
+                     local_output_sizes: list[int] | None = None):
     """Config-driven column-merged linear: ``Fp8BlockColMerged`` under block-fp8,
     ``Fp8PerTensorColMerged`` under per-tensor-fp8 attention, ``Nvfp4DenseColMerged`` under
     nvfp4, else ``LinearColParallelMerged``."""
     return make_col_merged_quant(
         getattr(config, "expert_quant", "none"), getattr(config, "attn_quant", "none"),
-        in_f, output_sizes, has_bias,
+        in_f, output_sizes, has_bias, local_output_sizes=local_output_sizes,
+    )
+
+
+def make_row_parallel(config, in_f: int, out_f: int, has_bias: bool = False):
+    """Config-driven row-parallel linear: ``LinearOProj`` (bf16); quant variants TBD."""
+    return make_row_parallel_quant(
+        getattr(config, "expert_quant", "none"), getattr(config, "attn_quant", "none"),
+        in_f, out_f, has_bias,
     )
 
 
 __all__ = [
     "make_col_merged_quant",
     "make_replicated_quant",
+    "make_row_parallel_quant",
     "make_replicated",
     "make_col_merged",
+    "make_row_parallel",
 ]
