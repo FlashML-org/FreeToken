@@ -343,3 +343,94 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+def test_gemma4_partial_opener_does_not_leak_into_content():
+    # A call block that never completes leaves an opener prefix in the text. The
+    # prose before it is real content; the marker is protocol framing and must not
+    # reach the client.
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    result = parser.parse_non_stream("Let me check that.<|tool_call")
+
+    assert result.normal_text == "Let me check that."
+    assert result.calls == []
+
+
+def test_gemma4_truncated_call_does_not_leak_into_content():
+    # Generation cut mid-arguments: a well-formed opener, no closer, nothing
+    # parseable. Content must be empty rather than the raw block.
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    result = parser.parse_non_stream('<|tool_call>call:get_weather{city:<|"|>Par')
+
+    assert result.normal_text == ""
+    assert result.calls == []
+
+
+def test_gemma4_malformed_opener_does_not_leak_into_content():
+    # The opener's closing '>' is missing, so find() misses and the whole block
+    # used to be surfaced verbatim.
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    result = parser.parse_non_stream(
+        '<|tool_call call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+    )
+
+    assert "<|tool_call" not in result.normal_text
+
+
+def test_gemma4_streaming_partial_opener_does_not_leak_at_finish():
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    texts, calls = _feed(parser, ["Let me check that.", "<|tool_call"])
+
+    surfaced = "".join(texts) + parser.finish_stream()
+    assert "<|tool_call" not in surfaced
+    # The prose is real content: scrubbing the marker must not take it with it.
+    assert surfaced == "Let me check that."
+    assert calls == []
+
+
+def test_gemma4_partial_opener_after_a_parsed_call_does_not_leak():
+    # The shape #203 reports: a correctly parsed tool_calls array AND a stray marker
+    # in content. The tail after the last closer is surfaced as content, and
+    # has_tool_call() misses a partial opener, so the marker rode along.
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    result = parser.parse_non_stream(
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|><|tool_call'
+    )
+
+    assert len(result.calls) == 1
+    assert "<|tool_call" not in result.normal_text
+
+
+def test_gemma4_prose_after_a_parsed_call_still_surfaces():
+    # Guard for the fix above: scrubbing the tail must not swallow real trailing text.
+    parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
+
+    result = parser.parse_non_stream(
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>\nAnything else?'
+    )
+
+    assert len(result.calls) == 1
+    assert "Anything else?" in result.normal_text
+
+
+@pytest.mark.parametrize("parser_name", ["qwen25", "mistral", "deepseekv32", "minimax"])
+def test_unparsed_block_keeps_trailing_prose(parser_name):
+    # A detector that surfaces raw text for an unparseable block must keep doing so:
+    # returning "" here would hand the client an empty message instead of the answer.
+    blocks = {
+        "qwen25": "<tool_call>\n{not valid json}\n</tool_call>\n",
+        "mistral": "[TOOL_CALLS] [{bad json}]\n",
+        "deepseekv32": "<｜DSML｜function_calls>garbage\n",
+        "minimax": "<minimax:tool_call>garbage\n",
+    }
+    parser = FunctionCallParser(TOOLS, tool_call_parser=parser_name)
+
+    result = parser.parse_non_stream(blocks[parser_name] + "Here is the answer: 42.")
+
+    assert result.calls == []
+    assert "Here is the answer: 42." in result.normal_text
