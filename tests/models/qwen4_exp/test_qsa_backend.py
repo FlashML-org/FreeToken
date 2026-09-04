@@ -4,7 +4,8 @@
     tokens every complete block is selected, so QSA IS dense attention: the selection must be
     exactly the causal prefix and the layer output must match ``TorchDenseQSAReference`` (fp32)
     and a flashinfer dense run over the same pool;
-(b) chunked prefill at unaligned cut points equals one-shot prefill (the dual-source compress);
+(b) chunked prefill at unaligned cut points matches one-shot prefill to bf16 tolerance (the
+    dual-source compress);
 (c) a captured decode replay equals the eager decode step.
 """
 
@@ -133,7 +134,11 @@ def test_flashinfer_dense_matches_the_sparse_path():
 @requires_cuda
 @pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
 def test_chunked_prefill_matches_one_shot(cut: int):
-    """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
+    """Cut points that are not multiples of index_ratio exercise the dual-source compress.
+
+    Not bit for bit: the projections see a different M (5000 vs 5000 - cut rows) and cuBLAS
+    may pick a different kernel per shape, so the indexer's q and k round differently and a
+    few rows flip one block at the top-k margin. Same tolerance as the oracle tests above."""
     config = parsed_config()
     fixture = Fixture(config, num_pages=512)
     attn = fixture.layer(QSA_LAYER)
@@ -145,7 +150,7 @@ def test_chunked_prefill_matches_one_shot(cut: int):
     attn.forward(x[:cut], fixture.batch([head], "prefill"))
     tail = fixture.req(1, cut, length)
     got = attn.forward(x[cut:], fixture.batch([tail], "prefill"))
-    assert torch.equal(got, one_shot[cut:])
+    torch.testing.assert_close(got.float(), one_shot[cut:].float(), rtol=2e-2, atol=2e-2)
 
 
 @requires_cuda
