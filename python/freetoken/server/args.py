@@ -586,6 +586,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--skip-prefill-warmup",
+        action="store_false",
+        dest="prefill_warmup",
+        default=ServerArgs.prefill_warmup,
+        help=(
+            "Skip the startup prefill warmup forwards. The first request at each "
+            "new size then pays the Triton compile/load cost mid-request."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

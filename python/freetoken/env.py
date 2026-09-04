@@ -75,6 +75,8 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # cap the longest prefill warmup forward; 0 = the engine's own chunk cap
+    WARMUP_MAX_LEN = EnvInt(0)
 
     def __new__(cls):
         # single instance
