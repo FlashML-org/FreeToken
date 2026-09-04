@@ -13,7 +13,13 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+_TOKENIZER_ARCH = {
+    "gemma4": "gemma4_text",
+    # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries. The llama
+    # converter is sentencepiece-shaped and encodes a space as U+2581; against a
+    # GPT2-BPE vocab that silently DROPS every space on detokenization.
+    "deepseek4": "qwen2",
+}
 
 
 def load_gguf_tokenizer(model_path: str):
