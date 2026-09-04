@@ -1,12 +1,11 @@
-# GMKtec EVO-X2 NVFP4 Marlin warp-8 candidate rejection
+# GMKtec EVO-X2 NVFP4 Marlin warp-count candidate rejection
 
 ## Candidate
 
-This isolated candidate kept the production Marlin output tile at `BLOCK_N=16`
-and changed only the decode launch configuration from four warps to eight
-warps. It used the same Qwen3.6 NVFP4 checkpoint, native HIP runtime, cache
-policy, API workload, and deterministic quality gates as the qualified
-configuration.
+This isolated candidate retained the production Marlin output tile
+(`BLOCK_N=16`) and changed only the decode launch warp count from four to eight.
+It used the same Qwen3.6 NVFP4 checkpoint, native HIP runtime, offload cache,
+API workload, and deterministic quality gates as the qualified control.
 
 ## Performance observation
 
@@ -18,29 +17,28 @@ median decode TPS 30.238741
 stdev             0.014834
 ```
 
-This is retained as an observation only because the candidate failed quality.
+The AIME request itself reported 30.764005 decode TPS and 389.508 ms TTFT.
+These numbers are retained as diagnostic observations only.
 
 ## Quality result
 
 The exact canary, arithmetic, and JSON checks passed. The deterministic AIME
-check failed:
+hash failed:
 
 ```text
 expected output SHA-1: cd580f4978fb
 observed output SHA-1: 1cae5bae914f
-observed decode TPS:   30.764005
-observed TTFT:         389.508 ms
 ```
 
-The raw artifacts are preserved under:
+The raw artifacts remain under:
 
 ```text
 /home/david/freetoken-amd/artifacts/nvfp4-marlin-api-candidate-20260904T182532Z/
 ```
 
-## Recovery verification
+## Recovery
 
-The isolated process stopped normally. The recovery launcher restored the
+The candidate process stopped normally. The recovery launcher restored the
 production setting:
 
 ```text
@@ -52,8 +50,7 @@ The protected Qwen service returned `status: ok` and
 
 ## Decision
 
-**Rejected.** Changing only the warp count still changed the deterministic
-model output, so the observed 30.2446 TPS cannot be accepted as a
-quality-preserving improvement. Future candidates must retain both tile and
-warp geometry unless their numerical effects are explicitly understood and
-the complete quality suite passes.
+**Rejected.** Changing only the warp count changes the deterministic model
+output. The measured speed increase is not admissible as a quality-preserving
+optimization. Future work must preserve the current launch geometry and target
+memory scheduling or orchestration overhead instead.
