@@ -45,10 +45,39 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
+# Image resize bounds in pixels (Qwen2-VL processor ``size``). The cap bounds the prompt: at
+# patch 16 / merge 2 one soft token covers 32x32 pixels, so the default is ~1000 tokens per
+# image and a 4000x3000 photo is downscaled instead of costing 11k tokens.
+IMAGE_MIN_PIXELS = 4 * 28 * 28
+IMAGE_MAX_PIXELS = int(os.getenv("FREETOKEN_IMAGE_MAX_PIXELS", str(1280 * 28 * 28)))
+
+
+def _expand_image_tokens(
+    input_ids: torch.Tensor, image_token_id: int, counts: list[int]
+) -> torch.Tensor:
+    """Replace the i-th ``image_token_id`` placeholder with ``counts[i]`` copies."""
+    hits = (input_ids == image_token_id).nonzero().flatten().tolist()
+    if len(hits) != len(counts):
+        raise ValueError(
+            f"{len(hits)} image placeholders in the rendered prompt for {len(counts)} images"
+        )
+    pieces, prev = [], 0
+    for hit, n in zip(hits, counts, strict=True):
+        pieces.append(input_ids[prev:hit])
+        pieces.append(torch.full((n,), image_token_id, dtype=input_ids.dtype))
+        prev = hit + 1
+    pieces.append(input_ids[prev:])
+    return torch.cat(pieces)
+
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, model_path: str | None = None
+    ) -> None:
         self.tokenizer = tokenizer
+        # image requests need the checkpoint's image processor + placeholder id (worker only)
+        self._model_path = model_path
+        self._vision: tuple[Any, int] | None = None
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
@@ -73,6 +102,45 @@ class TokenizeManager:
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
+
+    def tokenize_one(self, msg: TokenizeMsg) -> tuple[torch.Tensor, dict[str, Any] | None]:
+        """``tokenize`` for one message plus, when it carries images, the vision processor's
+        outputs (``pixel_values`` fp32 [patches, C*T*P*P], ``image_grid_thw`` [N, 3]) with every
+        ``<|image_pad|>`` placeholder expanded to its image's soft-token count."""
+        input_ids = self.tokenize([msg])[0]
+        if not msg.images:
+            return input_ids, None
+        import io
+
+        from PIL import Image
+
+        processor, image_token_id = self._vision_processor()
+        images = [Image.open(io.BytesIO(data)).convert("RGB") for data in msg.images]
+        out = processor(images=images, return_tensors="pt")
+        grid = out["image_grid_thw"]
+        counts = (grid.prod(-1) // processor.merge_size**2).tolist()
+        # pixel_values stay fp32 on the wire (numpy cannot carry bf16); the tower casts them
+        return _expand_image_tokens(input_ids, image_token_id, counts), {
+            "pixel_values": out["pixel_values"],
+            "image_grid_thw": grid,
+        }
+
+    def _vision_processor(self) -> tuple[Any, int]:
+        if self._vision is None:
+            if self._model_path is None:
+                raise ValueError("image inputs are not supported here")
+            from freetoken.utils.hf import cached_load_hf_config
+            from transformers import AutoImageProcessor
+
+            image_token_id = getattr(cached_load_hf_config(self._model_path), "image_token_id", None)
+            if image_token_id is None:
+                raise ValueError("this model has no image placeholder token")
+            processor = AutoImageProcessor.from_pretrained(
+                self._model_path,
+                size={"shortest_edge": IMAGE_MIN_PIXELS, "longest_edge": IMAGE_MAX_PIXELS},
+            )
+            self._vision = (processor, int(image_token_id))
+        return self._vision
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can

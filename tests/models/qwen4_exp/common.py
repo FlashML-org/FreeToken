@@ -206,6 +206,8 @@ class Fixture:
             cached_len=cached_len,
             device_len=device_len,
             extend_len=device_len - cached_len,
+            mrope_positions=None,
+            mrope_delta=0,
         )
 
     def step(self, req: SimpleNamespace) -> None:
@@ -231,6 +233,8 @@ class Fixture:
             is_prefill=phase == "prefill",
             is_decode=phase == "decode",
             positions=positions,
+            rope_positions=None,  # text-only: the layer falls back to positions
+            mrope_cos_sin=None,
             out_loc=out_loc,
             attn_metadata=None,
             active_table_idx=torch.tensor(

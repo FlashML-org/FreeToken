@@ -72,6 +72,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Encoded image files, in the order their ``{"type": "image"}`` parts appear in ``text``.
+    images: List[bytes] | None = None
 
 
 @dataclass

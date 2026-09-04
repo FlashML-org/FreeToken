@@ -88,6 +88,10 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # mRoPE: rope position per token (positions + Req.mrope_delta), or -- when mrope_cos_sin is
+    # set (a prefill batch with image tokens) -- the token's row in that per-token cos|sin table.
+    rope_positions:   torch.Tensor | None = None  # [T] int32
+    mrope_cos_sin:    torch.Tensor | None = None  # [T, rotary_dim] fp32 or None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -296,6 +300,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        md.rope_positions = (
+            batch.positions if batch.rope_positions is None else batch.rope_positions
+        )
+        md.mrope_cos_sin = batch.mrope_cos_sin
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -338,10 +346,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        if md.rope_positions is not md.positions:
+            # Rope the pooled key at its group's FIRST token (HF: cos/sin indexed by group start).
+            # That token's rope position / table row sits at the same offset from this token's as
+            # the token indices do. Decode groups that close after an image are text (the chat
+            # template puts >= 4 tokens after <|vision_end|>), so ``first + delta`` is exact.
+            first = first + (md.rope_positions - md.positions)
         qsa_index_norm_rope(
             pooled,
             first,
-            self._index_rope_cache(),
+            self._index_rope_cache() if md.mrope_cos_sin is None else md.mrope_cos_sin,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -366,8 +380,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         )
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            md.rope_positions,
+            self._index_rope_cache() if md.mrope_cos_sin is None else md.mrope_cos_sin,
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),

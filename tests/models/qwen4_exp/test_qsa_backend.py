@@ -174,6 +174,7 @@ def test_decode_graph_replay_matches_eager():
     capture_batch = SimpleNamespace(
         padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
         is_prefill=False, is_decode=True, positions=static["positions"],
+        rope_positions=None, mrope_cos_sin=None,
         out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None,
     )
     fixture.backend.prepare_for_capture(capture_batch)
