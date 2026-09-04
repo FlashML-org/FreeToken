@@ -140,6 +140,46 @@ def routed_experts_fp4(
 _GROUPED_MIN_ROUTES = 768
 
 
+def _prefill_cfg(routes: int, num_rows: int) -> dict:
+    """Tile config for the grouped prefill GEMM.
+
+    sm_90 keeps the shipped constants: one static config for every density, the
+    kernel being dequant-floor-bound means per-expert padding at BLOCK_M=64 costs
+    the same as tighter tiles, and 64 is the wgmma-wide M tile.
+
+    sm_89 has no wgmma, so nothing pins M to 64 -- and without that floor the
+    moe_align padding BLOCK_M=64 pays becomes the dominant term at low route
+    density. Measured on main, on an RTX 6000 Ada (142 SM, 96 MiB L2, 960 GB/s)
+    at DSV4 TP=2 geometry, 288 configs per shape, every one checked against the
+    sm_90 config's output (0 numeric rejections):
+
+        routes  rows/expert   shipped     sm_89 best               gain
+          1536      6    gate_up   4.233 ms  BM16  BN64  BK128 w4  2.376 ms  +43.9%
+          1536      6    down      2.298 ms  BM16  BN128 BK128 w4  1.121 ms  +51.2%
+          6144     24    gate_up   5.305 ms  BM32  BN128 BK128 w8  3.375 ms  +36.4%
+          6144     24    down      2.665 ms  BM32  BN128 BK128 w4  1.444 ms  +45.8%
+         24576     96    gate_up  11.098 ms  BM128 BN128 BK128 w8  6.587 ms  +40.6%
+         24576     96    down      5.648 ms  BM128 BN128 BK64  w8  3.420 ms  +39.5%
+
+    The optimum tracks routes-per-expert (the padding term), so M is picked from
+    it rather than fixed. num_stages barely moves the result on sm_89 (stages=1
+    wins or ties at four of the six shapes), so it stays 1 -- the win is tile
+    shape, not pipelining.
+    """
+    if torch.cuda.get_device_capability()[0] >= 9:
+        return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                    GROUP_SIZE_M=8, num_warps=8, num_stages=1)
+    per_expert = routes / max(1, num_rows)
+    if per_expert <= 12:
+        bm, bn = 16, 64
+    elif per_expert <= 48:
+        bm, bn = 32, 128
+    else:
+        bm, bn = 128, 128
+    return dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=128,
+                GROUP_SIZE_M=8, num_warps=8, num_stages=1)
+
+
 def _grouped_prefill(
     a: torch.Tensor,             # [A_rows, K] compute dtype (FP8 round-tripped)
     packed_cache: torch.Tensor,  # [S, N, K//2] uint8
@@ -207,13 +247,7 @@ def routed_experts_fp4_prefill(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
     routes = T * top_k
-    # One static config for every density (no autotune): the kernel is
-    # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
-    # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
-    cfg = dict(
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
-        num_warps=8, num_stages=1,
-    )
+    cfg = _prefill_cfg(routes, num_rows)
     sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
     tw = topk_weights.reshape(-1).contiguous()
 
