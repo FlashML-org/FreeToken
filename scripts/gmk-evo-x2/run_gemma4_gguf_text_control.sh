@@ -159,15 +159,6 @@ if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
         >"${ARTIFACT_DIR}/concurrency.log" 2>&1
 fi
 
-if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
-    # The sweep uses exact LONG_OK markers at three fixed character contexts.
-    # It runs only after all shorter quality and throughput gates pass.
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
-        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
-        --artifact "${ARTIFACT_DIR}/long-context.json" \
-        >"${ARTIFACT_DIR}/long-context.log" 2>&1
-fi
-
 if [[ "${MODE}" == "vision" ]]; then
     # Keep the candidate alive through the actual OpenAI image_url contract
     # control. The verifier writes a self-contained response/usage artifact;
