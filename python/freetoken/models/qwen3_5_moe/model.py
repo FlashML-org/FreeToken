@@ -110,8 +110,15 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        ctx = get_global_ctx()
+        output = self.model.forward(ctx.batch.input_ids)
+        # Project only the rows the sampler reads. engine.forward_batch slices
+        # logits[:batch.size] (one row per request, the first rows of the forward
+        # window); the remaining rows are overlap context. Running the vocab GEMM on
+        # the whole window allocates M x vocab bf16 (a default 8192-token chunk at
+        # Qwen3.8's 248k vocab is 3.79 GiB -- a guaranteed OOM on 32 GB cards)
+        # and spends ~M x vocab x hidden FLOPs whose results nobody consumes.
+        return self.lm_head.forward(output[: ctx.batch.size])
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]
