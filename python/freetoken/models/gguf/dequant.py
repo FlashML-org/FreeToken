@@ -23,7 +23,15 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q3_K = 11
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ2_XXS = 16
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -33,7 +41,15 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q3_K: (256, 110),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
 }
 
 GGML_NAME = {
@@ -42,7 +58,15 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q3_K: "Q3_K",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
 }
 
 
@@ -115,9 +139,65 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def _dequant_gguf_py(raw: torch.Tensor, out_dtype: torch.dtype, ggml_type: int) -> torch.Tensor:
+    """Reference dequant for the K-/IQ-quants, delegated to gguf-py.
+
+    gguf-py carries numpy decoders for every ggml type (it cannot *quantize* the
+    K/IQ formats, but decoding is all the reference path needs); porting the bit
+    math here would only duplicate it.
+    """
+    import gguf
+    import numpy as np
+
+    out = gguf.quants.dequantize(
+        raw.detach().cpu().contiguous().numpy(), gguf.GGMLQuantizationType(ggml_type)
+    )
+    return torch.from_numpy(np.asarray(out)).to(raw.device, out_dtype).reshape(-1)
+
+
+def dequant_q3_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_Q3_K)
+
+
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_Q4_K)
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_Q5_K)
+
+
+def dequant_iq2_xxs(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_IQ2_XXS)
+
+
+def dequant_iq3_xxs(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_IQ3_XXS)
+
+
+def dequant_iq1_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_IQ1_S)
+
+
+def dequant_iq2_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_IQ2_S)
+
+
+def dequant_iq4_xs(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    return _dequant_gguf_py(raw, out_dtype, GGML_IQ4_XS)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q3_K: dequant_q3_k,
+    GGML_Q4_K: dequant_q4_k,
+    GGML_Q5_K: dequant_q5_k,
+    GGML_IQ2_XXS: dequant_iq2_xxs,
+    GGML_IQ3_XXS: dequant_iq3_xxs,
+    GGML_IQ1_S: dequant_iq1_s,
+    GGML_IQ2_S: dequant_iq2_s,
+    GGML_IQ4_XS: dequant_iq4_xs,
 }
 
 
@@ -141,13 +221,13 @@ __all__ = [
     "GGML_F32",
     "GGML_F16",
     "GGML_BF16",
-    "GGML_Q4_0",
+    "GGML_Q4_0", "GGML_Q4_K", "GGML_Q5_K", "GGML_IQ2_XXS", "GGML_IQ3_XXS", "GGML_IQ1_S", "GGML_IQ4_XS",
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
-    "dequant_q6_k",
+    "dequant_q6_k", "dequant_q4_k", "dequant_q5_k", "dequant_iq2_xxs", "dequant_iq3_xxs", "dequant_iq1_s", "dequant_iq4_xs",
     "dequantize",
 ]

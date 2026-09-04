@@ -1207,6 +1207,8 @@ class Glm47Detector(BaseFormatDetector):
     Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
     """
     toolcall_opener = "<tool_call>"
+    _preserve_string_whitespace = False
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -1232,6 +1234,36 @@ class Glm47Detector(BaseFormatDetector):
         """Check if the text contains a GLM-4.7 format tool call."""
         return self.bot_token in text
 
+    def _argument_is_string(self, key: str, param_config: Dict) -> bool:
+        """Whether an XML argument uses the incremental string path.
+
+        Poolside V1 follows JSON Schema literally: only an explicit
+        ``type: string`` preserves the raw value. GLM keeps its legacy loose
+        aliases and defaults for backward compatibility.
+        """
+        if self._preserve_string_whitespace:
+            schema = param_config.get(key, {})
+            return isinstance(schema, dict) and schema.get("type") == "string"
+        return self._schema_param_type(key, param_config, "loose") in (
+            "string",
+            "str",
+            "enum",
+        )
+
+    def _convert_xml_argument(
+        self, value: str, key: str, param_config: Dict, func_name: str
+    ):
+        raw = value.strip()
+        if self._preserve_string_whitespace:
+            schema = param_config.get(key, {})
+            if isinstance(schema, dict) and "type" in schema:
+                return self._convert_param_value(raw, key, param_config, func_name)
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return raw
+        return self._convert_param_value(raw, key, param_config, func_name)
+
     def _parse_xml_arguments(self, arg_text: str, param_config: Dict | None = None, func_name: str = "") -> dict:
         """
         Parse XML-style arguments into a dictionary.
@@ -1249,12 +1281,17 @@ class Glm47Detector(BaseFormatDetector):
         matches = self.func_arg_regex.findall(arg_text)
         for key, value in matches:
             key = key.strip()
-            value = value.strip()
             if param_config and key in param_config:
+                if self._preserve_string_whitespace and self._argument_is_string(
+                    key, param_config
+                ):
+                    args[key] = value
+                    continue
                 # Schema-first: the declared type wins (a string-typed "5" stays "5").
-                args[key] = self._convert_param_value(value, key, param_config, func_name)
+                args[key] = self._convert_xml_argument(value, key, param_config, func_name)
                 continue
             # Undeclared parameter: legacy loose typing.
+            value = value.strip()
             try:
                 parsed_value = json.loads(value)
                 args[key] = parsed_value
@@ -1271,7 +1308,9 @@ class Glm47Detector(BaseFormatDetector):
         :return: StreamingParseResult with normal_text and parsed calls.
         """
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        normal_text = text[:idx] if idx != -1 else text
+        if idx != -1 and not self._preserve_string_whitespace:
+            normal_text = normal_text.strip()
 
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -1464,8 +1503,7 @@ class Glm47Detector(BaseFormatDetector):
                     continue
                 lead = "{" if not self._args_started else ","
                 self._args_started = True
-                ptype = self._schema_param_type(self._g_key, self._g_config, "loose")
-                if ptype in ("string", "str", "enum"):
+                if self._argument_is_string(self._g_key, self._g_config):
                     _emit(lead + json.dumps(self._g_key, ensure_ascii=False) + ':"')
                     self._g_lead_trimmed = False
                     self._g_mode = "pstr"
@@ -1475,7 +1513,7 @@ class Glm47Detector(BaseFormatDetector):
                 continue
 
             if mode == "pstr":
-                if not self._g_lead_trimmed:
+                if not self._preserve_string_whitespace and not self._g_lead_trimmed:
                     trimmed = buf.lstrip()
                     if trimmed != buf:
                         self._buffer = trimmed
@@ -1491,7 +1529,11 @@ class Glm47Detector(BaseFormatDetector):
                         _emit(self._json_escape_chunk(emit_now))
                         self._buffer = buf[len(emit_now):]
                     break
-                tail = buf[:end].rstrip()
+                tail = (
+                    buf[:end]
+                    if self._preserve_string_whitespace
+                    else buf[:end].rstrip()
+                )
                 _emit(self._json_escape_chunk(tail) + '"')
                 _update_prev()
                 self._buffer = buf[end + len(self._G_VAL_CLOSE):]
@@ -1505,7 +1547,9 @@ class Glm47Detector(BaseFormatDetector):
                 if mode == "pbuf":
                     raw = buf[:end].strip()
                     if self._g_key in self._g_config:
-                        converted = self._convert_param_value(raw, self._g_key, self._g_config, "")
+                        converted = self._convert_xml_argument(
+                            raw, self._g_key, self._g_config, ""
+                        )
                     else:
                         try:
                             converted = json.loads(raw)
@@ -1535,6 +1579,16 @@ class Glm47Detector(BaseFormatDetector):
         if self.prev_tool_call_arr and residual.strip() == "":
             return ""
         return residual
+
+
+class PoolsideV1Detector(Glm47Detector):
+    """Poolside V1 tool protocol used by Laguna.
+
+    Its envelope matches GLM-4.7, but string arguments are raw text. Preserve
+    leading/trailing whitespace so source code and patches survive parsing.
+    """
+
+    _preserve_string_whitespace = True
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -3532,6 +3586,7 @@ class FunctionCallParser:
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
         "muse_glimmer": MuseGlimmerDetector,
+        "poolside_v1": PoolsideV1Detector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
