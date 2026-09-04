@@ -42,9 +42,8 @@ def _cuda_version_suffix() -> str:
     cuda_version = getattr(torch.version, "cuda", None)
     if not cuda_version:
         return ""
-    # The tag advertises torch's CUDA; the cache .so link nvcc's libcudart.
-    # Only a matching major makes both statements true at once.
-    _check_toolchain()
+    # The tag advertises torch's CUDA. The wheel-build hook validates nvcc before
+    # compiling; metadata and sdist hooks deliberately remain compiler-free.
     return f"+cu{cuda_version.replace('.', '')}"
 
 
@@ -74,6 +73,7 @@ def _selected_specs() -> list[str] | None:
 
 
 def _build_jit_cache() -> None:
+    _check_toolchain()
     _ensure_freetoken_importable()
     from freetoken.kernel.aot import compile_and_package_kernels
 
