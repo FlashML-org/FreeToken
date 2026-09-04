@@ -56,6 +56,8 @@ def test_in_proj_splits_into_fp8_qkvz_and_bf16_ba_per_rank():
     _assert_e4m3_close(w8.float() * scale, t[:128].float(), scale)
     ba = out["model.layers.3.linear_attn.in_proj_ba.weight"]
     assert ba.dtype == torch.bfloat16 and torch.equal(ba, t[128:])
+    # its own storage: a view would keep the whole bf16 in_proj alive next to the fp8 copy
+    assert ba.untyped_storage().data_ptr() != t.untyped_storage().data_ptr()
 
 
 def test_other_projections_gain_a_scale_and_the_rest_pass_through():
