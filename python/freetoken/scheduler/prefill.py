@@ -48,6 +48,13 @@ class PrefillAdder:
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
 
+    def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
+        """Return the token-equivalent cost of the additional KV pages for a request."""
+        page_size = self.cache_manager.page_size
+        return (
+            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
+        ) * page_size
+
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
             return None
@@ -58,12 +65,14 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_size = self._kv_reservation_size(
+            req.input_len + req.output_len, cached_len
+        )
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -166,7 +175,12 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        # CacheManager allocates each request independently in whole pages. Reserve the same
+        # page span here; charging raw tokens can admit several short requests against one page
+        # even though allocate_paged() needs a separate page for each request.
+        self.reserved_size += self._kv_reservation_size(
+            pending_req.input_len + pending_req.output_len, cached_len
+        )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
