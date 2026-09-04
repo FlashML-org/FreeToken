@@ -121,3 +121,15 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | P5 | Tail-latency matrix and 24-hour endurance | Qwen long-context and 1/2/4/8-client tail controls are complete, and C142 completed the separate 1,440-session minute-cadence endurance qualification with zero candidate and host swap. The remaining P5 work is consolidation into one standardized cold/warm and concurrency matrix, plus any exact 24-hour wall-clock protocol required for publication. Gemma still needs its equivalent tail and endurance evidence. |
 | P6 | 284B capacity manifest | Blocked pending clean-memory assessment; current host has 64 GB RAM, not the paper desktop's 192 GiB system RAM plus 32 GB VRAM |
 | P7 | Strict NVIDIA reference run | Blocked on reference hardware and missing paper fields |
+
+## 2026-09-04 transfer and offload prototypes
+
+| UTC date | Evidence | Category | Outcome |
+|---|---|---|---|
+| 2026-09-04 | `docs/gmktec-evo-x2-rocm-transfer-prototype.md` | Contiguous ROCm transfer | Read-only PyTorch ROCm 10 prototype measured 79.79 GB/s host-to-device and 70.24 GB/s device-to-host for 64 MiB copies. This is a best-case bulk-copy bound. |
+| 2026-09-04 | `docs/gmktec-evo-x2-expert-block-prototype.md` | Serialized scattered expert-like transfers | Random synchronized 64 KiB blocks reached 5.009 GB/s, while 4 KiB blocks reached 0.167 GB/s. Independent small misses are rejected as an offload strategy. |
+| 2026-09-04 | `docs/gmktec-evo-x2-batched-expert-transfer-prototype.md` | Grouped expert-like transfers | Grouping 16 blocks raised transfer-only throughput to 29.79 GB/s, but total round throughput was 12.84 GB/s after CPU staging. Batching is necessary but not sufficient. |
+| 2026-09-04 | `docs/gmktec-evo-x2-overlap-prototype.md` | Naive stream overlap | Per-group stream and event orchestration regressed wall time and was rejected. |
+| 2026-09-04 | `docs/gmktec-evo-x2-persistent-overlap-prototype.md` | Persistent double-buffered overlap | Persistent streams and buffer reuse still regressed wall time, so Python-level overlap is rejected as the primary strategy. |
+| 2026-09-04 | `docs/gmktec-evo-x2-hip-gather-prototype.md` | Compiled device-side gather | A compiled HIP gather from device memory reached 281.916 GB/s, establishing a fast kernel-side ceiling. |
+| 2026-09-04 | `docs/gmktec-evo-x2-mapped-host-gather.md` | Mapped-host descriptor gather | One HIP descriptor-driven kernel gathered 64 random 64 KiB blocks from mapped host memory at 112.908 GB/s. This is the first credible low-level direction for reducing host intervention, but it is not model-TPS evidence. |
