@@ -21,13 +21,13 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -137,6 +137,58 @@ def _try_fuse(
     return None
 
 
+def _shard_rows(
+    t: torch.Tensor, parts: list[tuple[int, int]], rank: int, world: int
+) -> torch.Tensor:
+    """Column-parallel slice (dim 0) of a ``[part0 | part1 | ...]`` fusion; ``parts`` gives each
+    part as ``(heads, rows_per_head)``. Heads split evenly across ranks; a part with fewer heads
+    than ranks (GQA kv) replicates head ``rank * heads // world``, the ``div_even(...,
+    allow_replicate=True)`` convention of the TP-aware layers."""
+    out, off = [], 0
+    for heads, rows in parts:
+        local = div_even(heads, world, allow_replicate=True)
+        first = rank * heads // world
+        out.append(t[off + first * rows : off + (first + local) * rows])
+        off += heads * rows
+    assert off == t.shape[0], f"fusion parts {parts} cover {off} rows, tensor has {t.shape[0]}"
+    return torch.cat(out, dim=0)
+
+
+def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.Tensor:
+    """TP shard of one state-dict tensor (fused projections included); identity at TP=1.
+
+    Column-parallel (dim 0, by head): attention ``qkv_proj`` [q|gate per head | k | v], GDN
+    ``in_proj`` [q | k | v | z | b | a] and the matching ``conv1d`` channels, ``A_log`` /
+    ``dt_bias``, shared-expert ``gate_up_proj``. Row-parallel (dim 1): ``o_proj``,
+    ``out_proj``, shared-expert ``down_proj``. Vocab rows: ``embed_tokens`` / ``lm_head``.
+    Everything else (router, indexer, norms, HC, PLE, shared-expert gate) is replicated.
+    """
+    if world == 1:
+        return t
+    if name.endswith(".self_attn.qkv_proj.weight"):
+        q = (config.num_qo_heads, 2 * config.head_dim)
+        kv = (config.num_kv_heads, config.head_dim)
+        return _shard_rows(t, [q, kv, kv], rank, world)
+    if ".linear_attn." in name:
+        g = config.linear_attention_group()
+        k = (g.num_key_heads, g.key_head_dim)
+        v = (g.num_value_heads, g.value_head_dim)
+        if name.endswith(".in_proj.weight"):
+            return _shard_rows(t, [k, k, v, v, (v[0], 1), (v[0], 1)], rank, world)
+        if name.endswith(".conv1d.weight"):
+            return _shard_rows(t, [k, k, v], rank, world)
+        if name.endswith((".A_log", ".dt_bias")):
+            return _shard_rows(t, [(v[0], 1)], rank, world)
+        if name.endswith(".out_proj.weight"):
+            return t.chunk(world, dim=1)[rank].clone()
+        return t
+    if name.endswith(".shared_expert.gate_up_proj.weight"):
+        half = t.shape[0] // 2
+        return _shard_rows(t, [(half, 1), (half, 1)], rank, world)
+    # o_proj / down_proj: dim 1; embed_tokens / lm_head: vocab rows; others unchanged.
+    return shard_tensor(name, t, rank=rank, world_size=world, num_kv_heads=None)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -157,16 +209,18 @@ def iter_weights(
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
 
+    from .config import parse_config
+
+    tp = get_tp_info()
+    config = parse_config(cached_load_hf_config(model_path))
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=not tp.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -177,9 +231,10 @@ def iter_weights(
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
-                        yield fused
+                        name, tensor = fused
+                        yield name, _shard(name, tensor, config, tp.rank, tp.size)
                     continue
-                yield name, tensor
+                yield name, _shard(name, tensor, config, tp.rank, tp.size)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 
