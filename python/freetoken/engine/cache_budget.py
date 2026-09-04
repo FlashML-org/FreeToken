@@ -118,7 +118,9 @@ def resolve_moe_cache_auto(
     """
     budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
     max_slots = 992 if quant_format == "nvfp4_marlin" else total_experts
-    kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
+    # Every pool keeps page 0 as an unreachable dummy/sentinel. The CLI floor is expressed in
+    # usable tokens, so reserve that internal page in addition to the user-visible capacity.
+    kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size) + 1
     return plan_cache_budget(
         budget_bytes=budget_bytes,
         per_expert_bytes=per_expert_bytes,

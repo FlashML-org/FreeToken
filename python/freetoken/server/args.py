@@ -537,7 +537,10 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "Usable KV-cache token floor reserved before --moe-cache-auto fills experts "
+            "(the internal dummy page is additional)."
+        ),
     )
 
     parser.add_argument(
