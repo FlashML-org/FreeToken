@@ -37,6 +37,13 @@ The bounded inventory found the following relevant payloads:
 - No DeepSeek-V4-Flash checkpoint.
 - No GLM-5.2 checkpoint.
 
+The official DeepSeek repository metadata lists 46 safetensors shards. Read-only
+HTTP `HEAD` requests to every shard reported a combined `Content-Length` of
+159,617,149,040 bytes, or approximately 148.66 GiB (decimal conversion) for
+the model payload alone. This excludes the tokenizer, runtime allocations,
+expert-cache policy, KV cache, allocator slack, and any duplicate conversion
+buffers.
+
 ## Paper-model decision
 
 The official DeepSeek model card identifies DeepSeek-V4-Flash as 284B total
