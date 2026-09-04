@@ -43,6 +43,11 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # mRoPE (qwen4_exp image prompts): ``[3, prompt_len]`` T/H/W rope positions of the prompt
+    # tokens (CPU) and the offset decode adds to a token index (``max_pos + 1 - prompt_len``,
+    # <= 0). None / 0 for text-only prompts, where rope position == token index.
+    mrope_positions: torch.Tensor | None = None
+    mrope_delta: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -135,6 +140,12 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Rope positions per token (``positions + Req.mrope_delta``); the same tensor as ``positions``
+    # when no request in the batch carries an image. Set by the scheduler / graph buffer.
+    rope_positions: torch.Tensor | None = field(default=None, init=False)
+    # Prefill batches with image tokens: per-token mRoPE cos|sin rows ``[T, rotary_dim]`` (fp32)
+    # that the attention layers use as the rope cache with ``positions = arange(T)``.
+    mrope_cos_sin: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

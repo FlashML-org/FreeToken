@@ -164,8 +164,14 @@ class Qwen4ExpAttention(BaseOP):
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
+        # mRoPE: rope_positions is positions + the request's delta (text after an image), or
+        # row indices into batch.mrope_cos_sin for a prefill batch that carries image tokens.
+        rope_pos = batch.positions if batch.rope_positions is None else batch.rope_positions
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self._local_qo_dim), k.view(-1, self._local_kv_dim)
+            rope_pos,
+            q.view(-1, self._local_qo_dim),
+            k.view(-1, self._local_kv_dim),
+            cos_sin_cache=batch.mrope_cos_sin,
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

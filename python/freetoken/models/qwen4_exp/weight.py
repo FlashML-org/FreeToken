@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is dropped unless vision is opted in (``FREETOKEN_LOAD_VISION=1``), then it loads as ``visual.*``.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Iterator
 
 import safetensors
 import torch
+from freetoken.models.config import vision_load_enabled
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
@@ -100,8 +101,13 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    if raw_name.startswith(("model.visual.", "visual.")):
+        # the tower's HF module keys, under the model's ``visual`` op (opt-in, else dropped)
+        if not vision_load_enabled():
+            return None
+        return "visual." + raw_name.split("visual.", 1)[1]
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -163,7 +169,7 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     ``out_proj``, shared-expert ``down_proj``. Vocab rows: ``embed_tokens`` / ``lm_head``.
     Everything else (router, indexer, norms, HC, PLE, shared-expert gate) is replicated.
     """
-    if world == 1:
+    if world == 1 or name.startswith("visual."):
         return t
     if name.endswith(".self_attn.qkv_proj.weight"):
         q = (config.num_qo_heads, 2 * config.head_dim)

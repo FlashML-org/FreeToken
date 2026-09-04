@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next decoder stack (text-only).
+"""Qwen3.8-Flash-Next decoder stack (text, plus images when the vision tower is loaded).
 
 The residual state is ``R [T, hc_count*hidden]`` end to end: the embedding is repeated over the
 ``hc_count`` streams, every layer mixes them down to one ``[T, hidden]`` block input and injects
@@ -99,6 +99,7 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._image_token_id = config.image_token_id
 
     @property
     def ple_layers(self) -> List[PLELayer]:
@@ -106,7 +107,13 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = self.embed_tokens.forward(input_ids)
+        if batch.mm_embeds is not None:
+            # image soft tokens replace the placeholder embeddings (HF order: before the
+            # hc_count repeat); the whole image run sits in this prefill chunk (prefill.py)
+            mask = input_ids == self._image_token_id
+            hidden = hidden.masked_scatter(mask.unsqueeze(-1), batch.mm_embeds.to(hidden.dtype))
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -126,6 +133,7 @@ class Qwen4ExpModel(BaseOP):
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
+        self._inv_freq: torch.Tensor | None = None
         self.model = Qwen4ExpModel(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -141,7 +149,71 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if config.vision_config is not None:  # FREETOKEN_LOAD_VISION=1
+            from .vision import Qwen4ExpVisionTower
+
+            self.visual = Qwen4ExpVisionTower(config.vision_config)
         super().__init__()
+
+    @property
+    def has_vision(self) -> bool:
+        return hasattr(self, "visual")
+
+    @torch.inference_mode()
+    def encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Vision tower + merger on processor outputs: ``[num_image_tokens, hidden]`` (device)."""
+        if not self.has_vision:
+            raise RuntimeError("image inputs need the vision tower: start with FREETOKEN_LOAD_VISION=1")
+        return self.visual.forward(pixel_values, grid_thw)
+
+    def prepare_mm_inputs(
+        self, input_ids: torch.Tensor, mm_inputs: dict
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """One prompt's ``(mm_embeds [n, hidden] on device, mrope_positions [3, L] CPU, mrope_delta)``."""
+        from .mrope import rope_index
+
+        grid = mm_inputs["image_grid_thw"]
+        embeds = self.encode_images(mm_inputs["pixel_values"], grid)
+        image_token_id = self._config.image_token_id
+        n = int((input_ids == image_token_id).sum())
+        if n != embeds.shape[0]:
+            raise ValueError(f"{n} image placeholder tokens for {embeds.shape[0]} image features")
+        pos, delta = rope_index(
+            input_ids, grid, image_token_id, self._config.qwen4_args.spatial_merge_size
+        )
+        return embeds, pos, delta
+
+    def mrope_table(self, reqs, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rope_positions, mrope_cos_sin)`` for a prefill batch with image tokens; see
+        :func:`mrope.mrope_table`."""
+        from .mrope import mrope_table
+
+        return mrope_table(
+            reqs,
+            self._config.qwen4_args.index_ratio,
+            self._inv_freq_on(device),
+            self._config.qwen4_args.mrope_section,
+            device,
+        )
+
+    def _inv_freq_on(self, device: torch.device) -> torch.Tensor:
+        """Attention rope frequencies (fp32, the RotaryEmbedding formula) on ``device``."""
+        if self._inv_freq is None or self._inv_freq.device != device:
+            rc = self._config.rotary_config
+            self._inv_freq = 1.0 / (
+                rc.base
+                ** (torch.arange(0, rc.rotary_dim, 2, dtype=torch.float, device=device) / rc.rotary_dim)
+            )
+        return self._inv_freq
+
+    def mrope_cos_sin(self, positions: torch.Tensor) -> torch.Tensor:
+        """``[T, rotary_dim]`` fp32 cos|sin rows for 3-D ``positions [3, T]`` (same frequencies as
+        the attention rope cache, so text rows equal the cache rows bit for bit)."""
+        from .mrope import mrope_cos_sin
+
+        return mrope_cos_sin(
+            positions, self._inv_freq_on(positions.device), self._config.qwen4_args.mrope_section
+        )
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""

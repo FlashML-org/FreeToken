@@ -14,6 +14,8 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import time
 from collections.abc import AsyncIterator
@@ -139,6 +141,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    images: list[bytes] = field(default_factory=list)    # encoded image files, in message order
 
     @property
     def parse_tools(self) -> bool:
@@ -187,18 +190,23 @@ def resolve_sampling(
     )
 
 
-def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def render_messages(
+    messages: list[dict[str, Any]], images: list[bytes] | None = None
+) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
-    return [_render_message(m) for m in messages]
+    content parts to a string and decode tool-call arguments from JSON. Shared by all adapters.
+
+    ``images`` (OpenAI chat only): accept ``image_url`` parts, decode them (``data:`` URLs) into
+    the list in message order and keep ``{"type": "image"}`` parts in the content for the
+    template. Without it a non-text part raises ValueError (text-only adapters)."""
+    return [_render_message(m, images) for m in messages]
 
 
-def _render_message(message: dict[str, Any]) -> dict[str, Any]:
+def _render_message(message: dict[str, Any], images: list[bytes] | None = None) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_parts(content, images)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -228,6 +236,48 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+# Decoded image bytes above this are refused (a 4000x3000 JPEG is ~3 MiB; PNGs a few times that).
+IMAGE_MAX_BYTES = 16 << 20
+
+
+def _render_parts(parts: list[Any], images: list[bytes] | None) -> str | list[dict[str, Any]]:
+    """Text-only part lists flatten to a string (unchanged behaviour); a list carrying images keeps
+    ``{"type": "text"}`` / ``{"type": "image"}`` parts, which the chat template renders as text and
+    one ``<|image_pad|>`` placeholder per image (expanded by the tokenizer worker)."""
+    if images is None or not any(
+        isinstance(p, dict) and p.get("type") == "image_url" for p in parts
+    ):
+        return _flatten_text_parts(parts)
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype == "text":
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype == "image_url":
+            images.append(_decode_image_url(part.get("image_url")))
+            out.append({"type": "image"})
+        else:
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    return out
+
+
+def _decode_image_url(image_url: Any) -> bytes:
+    """OpenAI ``image_url`` part -> image file bytes. Only inline ``data:`` URLs: fetching a remote
+    URL from the server would be an outbound request on the client's behalf."""
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise ValueError("image_url must be a data: URL (base64-encoded image); remote URLs are not fetched")
+    header, sep, payload = url.partition(",")
+    if not sep or ";base64" not in header:
+        raise ValueError("image_url data: URL must be base64-encoded")
+    if len(payload) > IMAGE_MAX_BYTES * 4 // 3 + 4:
+        raise ValueError(f"image exceeds {IMAGE_MAX_BYTES >> 20} MiB")
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"image_url data: URL is not valid base64: {exc}") from exc
 
 
 def _flatten_text_parts(parts: list[Any]) -> str:
@@ -269,6 +319,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=spec.images or None,
         )
     )
     return uid
