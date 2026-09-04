@@ -16,6 +16,9 @@ Three layers of guarantee:
    capability patched to sm_80/86/89/120 and every triton launch forced into
    warmup (compile-only), the full wrapper->kernel paths -- uint8 views, PDL
    gates, e4m3 branches -- must compile for the foreign arch.
+4. A cache-key guard: the @constexpr_function probes must not reference plain
+   python functions. triton's AST walk rejects that, and it disables every kernel
+   that branches on e4m3 native-ness at once, so the failure is not local.
 """
 
 from __future__ import annotations
@@ -39,6 +42,32 @@ _MMA_TOL = dict(rtol=5e-2, atol=0.5)
 
 def _native_cc() -> bool:
     return torch.cuda.get_device_capability() >= (8, 9)
+
+
+def test_constexpr_probe_never_references_a_host_function():
+    """triton hashes an @constexpr_function by walking its AST (runtime/jit.py:
+    cache_key -> record_reference), and a bare reference to a plain python function
+    raises "Unsupported function referenced: <function e4m3_native ...>". Making
+    e4m3_native_cx defer to the host probe did exactly that, and it took out EVERY
+    kernel that branches on e4m3 native-ness at once (here: the PLE gather, inside
+    CUDA graph capture). Modules (``target_info.cuda_capability_geq``) survive the
+    walk, functions do not -- so unifying the two probes has to go the other way: the
+    code that owns a buffer follows the buffer (tests/kernels/test_kv_fp8.py)."""
+    import inspect
+
+    from freetoken.kernel.triton import e4m3_compat
+
+    lines = inspect.getsource(e4m3_compat).splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("def e4m3_native_cx("))
+    body = []
+    for line in lines[start + 1:]:
+        if line and not line.startswith((" ", "\t")):
+            break
+        body.append(line)
+    assert "e4m3_native(" not in "\n".join(body), (
+        "a constexpr_function may not call a host function: triton's cache-key walk "
+        "rejects it and every e4m3 kernel stops compiling"
+    )
 
 
 # ======================================================================================
@@ -228,6 +257,60 @@ def _emit_all(path: str) -> None:
     out["nv_moe_prefill"] = f32(fused_experts_nvfp4(
         hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids, S))
 
+    # fp8 KV cache: the fused quantize+scatter writer the pools call in store_kv, and the
+    # QSA sparse reader that turns codes + row scales back into operands. Codes are plain
+    # bytes on every arch (kv_quant.kv_codes_dtype), so comparing them as BYTES is what
+    # pins a native run and a forced-EMU run to the very same encoding, and the two
+    # QSA runs -- one over codes, one over the same real numbers pre-rounded into bf16 --
+    # must produce identical bits: the reader casts back to the query dtype before the
+    # dot, so any decode difference lands on the comparison instead of hiding in a
+    # tolerance.
+    from freetoken.kernel.triton.kv_quant import (
+        alloc_codes, codes_to_f32, quantize_kv_to_cache,
+    )
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    slots, kvh, hd, page = 128, 2, 64, 64
+    kv_in = (torch.randn(slots, kvh * hd, device=dev, dtype=torch.float32) * 4.0).to(
+        torch.bfloat16
+    )
+    k_codes = alloc_codes((slots, kvh, hd), dev)
+    v_codes = alloc_codes((slots, kvh, hd), dev)
+    k_sc = torch.zeros((slots, kvh), dtype=torch.float32, device=dev)
+    v_sc = torch.zeros_like(k_sc)
+    quantize_kv_to_cache(
+        k=kv_in,
+        v=kv_in.flip(-1).contiguous(),
+        out_loc=torch.arange(slots, dtype=torch.int32, device=dev),
+        k_cache=k_codes,
+        v_cache=v_codes,
+        k_scale=k_sc,
+        v_scale=v_sc,
+    )
+    out["kvfp8_codes"] = k_codes.view(torch.uint8).to(torch.int16).cpu()
+    out["kvfp8_scale"] = k_sc.cpu()
+
+    pages = slots // page
+    kc4, vc4 = k_codes.view(pages, page, kvh, hd), v_codes.view(pages, page, kvh, hd)
+    q = torch.randn(2, 2 * kvh, hd, device=dev, dtype=torch.bfloat16)
+    sel = (
+        torch.arange(2 * page, dtype=torch.int32, device=dev)[None, :]
+        .repeat(2, 1)
+        .contiguous()
+    )
+    table = torch.arange(pages, dtype=torch.int32, device=dev)[None, :].contiguous()
+    t2r = torch.zeros(2, dtype=torch.int32, device=dev)
+    out["kvfp8_qsa"] = f32(qsa_sparse_paged_attention(
+        q, kc4, vc4, sel, table, t2r, k_scale=k_sc, v_scale=v_sc))
+    # The very same numbers, pre-rounded into a bf16 cache. The reader casts its
+    # dequantized operands to the query dtype before tl.dot, so the two runs must end up
+    # bit-identical (asserted where launches really execute: tests/kernels/test_qsa_fp8.py
+    # -- the compile gate below runs warmup-only, where outputs are never written).
+    out["kvfp8_qsa_bf16"] = f32(qsa_sparse_paged_attention(
+        q,
+        (codes_to_f32(kc4) * k_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
+        (codes_to_f32(vc4) * v_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
+        sel, table, t2r))
     torch.save(out, path)
 
 

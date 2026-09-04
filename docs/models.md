@@ -41,3 +41,9 @@ for them; other checkpoints of the same architectures work too.
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Multimodal checkpoints are served text-only.
+- `--kv-cache-dtype fp8` (see [cli.md](cli.md#fp8-kv-cache)) covers the plain paged,
+  hybrid-SWA and QSA sparse KV pools — gpt-oss, Qwen3/3.5/3.6, GLM-4.x, Gemma-4,
+  MiniMax-M2.5, Muse-Glimmer, Llama/Qwen2/Mistral, Qwen3.8-Flash-Next (on QSA only the
+  selected K/V rows are read back as codes; block selection keeps 16-bit index keys).
+  MLA/DSA (GLM-5.2), DeepSeek-V4's tiered pool and MiniMax-M3's block-sparse pool stay
+  16-bit and reject it.

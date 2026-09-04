@@ -59,6 +59,12 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
+    # KV-cache storage quantization: "none" stores the compute dtype, "fp8" stores e4m3
+    # codes plus one fp32 scale per (token, slab, layer, kv head) -- about 2x the tokens
+    # per GiB, at a small accuracy cost. --kv-cache-dtype; resolved from "auto" by
+    # _adjust_config, which also refuses it on a pool family or attention backend that
+    # cannot read the scales.
+    kv_quant: str = "none"
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as

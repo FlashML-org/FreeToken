@@ -108,7 +108,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
+        # The pool's COMPUTE dtype, never its store dtype (the contract lives in
+        # kvcache/base.py). These buffers feed the indexer -- qsa_index_norm_rope and
+        # qsa_mqa_paged -- whose tl.dot has no fp8 path, so an e4m3 q_index does not
+        # fail here, it fails at CUDA-graph capture with "Unsupported rhs dtype
+        # fp8e4nv". --kv-cache-dtype fp8 quantizes only the KV tiers; the index tiers
+        # stay 16-bit by design (kvcache/qsa_pool.py).
         self.dtype = self.kvcache.dtype
+        assert self.dtype.itemsize == 2, (
+            f"QSA block selection needs a 16-bit compute dtype, got {self.dtype} -- "
+            "the KV pool must report its compute dtype, not e4m3 codes"
+        )
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -282,6 +292,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        # Scale tensors only exist on an fp8 pool (k_scale returns None otherwise); the
+        # index tier stays bf16 either way, so _select above is quantization-agnostic.
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -290,6 +302,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

@@ -114,10 +114,38 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+# --kv-cache-dtype spellings -> the stored EngineConfig.kv_quant value.
+KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8"}
+
+
+def _resolve_kv_quant(value: str | None) -> str:
+    """Normalize a --kv-cache-dtype spelling to EngineConfig.kv_quant."""
+    key = (value or "auto").strip().lower()
+    if key not in KV_QUANT_ALIASES:
+        raise ValueError(
+            f"unknown --kv-cache-dtype {value!r}; expected one of "
+            f"{', '.join(sorted(KV_QUANT_ALIASES))}"
+        )
+    return KV_QUANT_ALIASES[key]
+
+
+def _backend_supports_kv_quant(name: str, kv_quant: str) -> bool:
+    """Whether every comma part of an attention-backend string can read a quantized
+    KV pool (an unquantized pool needs nothing from the backend)."""
+    if kv_quant == "none":
+        return True
+    return all(
+        attention_backend_info(part.strip()).supports_fp8_kv for part in name.split(",")
+    )
+
+
+def _resolve_auto_attention_backend(
+    required: frozenset[AttnType], *, kv_quant: str = "none"
+) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
-    whose packages are installed, and whose every comma part serves ALL required
-    types. Reproduces the historical hardware tree for FULL-only models:
+    whose packages are installed, whose every comma part serves ALL required
+    types, and which can decode a quantized KV cache when one is configured.
+    Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
@@ -144,10 +172,18 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
             continue
         if not _backend_requirements_met(name):
             continue
+        if not _backend_supports_kv_quant(name, kv_quant):
+            continue
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine."
+        f"{sorted(t.value for t in required)} on this machine"
+        + (
+            f" with a {kv_quant} KV cache"
+            if kv_quant != "none"
+            else ""
+        )
+        + "."
     )
 
 
@@ -191,6 +227,23 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"backend {part!r} does not consume the per-call AttentionSpec that "
                 f"SWA models require, got {config.attention_backend!r}."
             )
+
+    # A quantized KV pool is only readable by a backend that applies its per-(token,
+    # head) scales; one that hands the cache to an external kernel would silently
+    # attend to raw e4m3 codes. Rejected here, before any weight is resident.
+    kv_quant = getattr(config, "kv_quant", "none")
+    if not _backend_supports_kv_quant(config.attention_backend, kv_quant):
+        fp8_backends = [
+            name
+            for name in ("trtllm", "fi", "fa", "triton")
+            if required <= attention_backend_info(name).supported_types
+            and attention_backend_info(name).supports_fp8_kv
+        ]
+        raise ValueError(
+            f"--kv-cache-dtype {kv_quant} needs an attention backend that decodes the KV "
+            f"scales; {config.attention_backend!r} does not. Valid for this model: "
+            f"{', '.join(fp8_backends) or 'none'} (or use --kv-cache-dtype bf16)."
+        )
 
     # An explicitly-selected backend may require a package that isn't installed. Auto
     # never resolves to one of these when its package is missing, so this only fires for
@@ -1301,6 +1354,27 @@ def _adjust_config(config: EngineConfig):
     # lists, then validate whatever is now selected (explicit or auto) -- every
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
+    # Resolve KV quantization BEFORE the backend tree: a quantized pool narrows both
+    # which pool families are usable and which backend auto may pick.
+    kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
+    override("kv_quant", kv_quant)
+    if kv_quant != "none":
+        # fp8 codes are wired through the pools that hand their rows to a Triton
+        # kernel: the plain paged and hybrid-SWA ones, plus the QSA sparse pool, whose
+        # index tier stays bf16 -- only the selected tokens come back as codes.
+        # Everything else (MLA's absorbed cache, DSA/DSV4/BSA sparse) has kernels that
+        # assert on 16-bit rows, and kvcache/__init__.py rejects fp8 for those families
+        # at pool creation.
+        quant_unsupported = required_attn_types - {
+            AttnType.FULL, AttnType.SWA, AttnType.QSA,
+        }
+        if quant_unsupported:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_quant} is implemented for the plain paged, "
+                "hybrid-SWA and QSA sparse KV pools; this model also needs "
+                f"{', '.join(sorted(t.value for t in quant_unsupported))} attention "
+                "(use --kv-cache-dtype bf16)."
+            )
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
     if (
         required_attn_types & {AttnType.BSA, AttnType.QSA}
@@ -1328,7 +1402,7 @@ def _adjust_config(config: EngineConfig):
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(required_attn_types, kv_quant=kv_quant),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
