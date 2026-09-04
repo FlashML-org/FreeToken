@@ -77,11 +77,12 @@ FreeToken used the OpenAI chat protocol and passed the exact `LONG_OK` marker:
 The 16,384-character request failed closed at the configured 8,192-token
 context ceiling.
 
-The llama.cpp control did not produce a valid visible answer at 4K or 8K.  A
-second parser captured its reasoning channel, but that channel contained only a
-short prompt fragment and no `LONG_OK` marker.  The 16K request returned HTTP
-400.  Therefore no llama.cpp long-context TTFT or TPS claim is accepted.  The
-raw artifacts document this as a response-contract and context-boundary issue.
+With llama.cpp's explicit `--reasoning off --reasoning-budget 0` flags, the
+4,096- and 8,192-character requests also passed visible `LONG_OK` checks.  They
+reported 1.866 and 1.992 s TTFT, 1,354.65 and 2,526.23 client prefill tokens/s,
+and 63.36 and 47.80 decode tokens/s.  The 16K request remained rejected at the
+8,192-token context ceiling.  Earlier default-reasoning attempts are retained
+as protocol diagnostics, not mixed into this accepted comparison.
 
 ## Quality and multimodal evidence
 

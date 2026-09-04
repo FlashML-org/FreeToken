@@ -79,6 +79,7 @@ export LD_LIBRARY_PATH="/opt/rocm-10.0/llvm/lib:/opt/rocm-10.0/lib${LD_LIBRARY_P
 "${LLAMA_SERVER}" -m "${MODEL_PATH}" -mm "${MMPROJ_PATH}" --mmproj-offload \
     --alias "${MODEL_NAME}" -ngl all -c 8192 -np 1 -b 2048 -ub 512 \
     -ctk q8_0 -ctv q8_0 -fa on --jinja --no-context-shift --no-warmup \
+    --reasoning off --reasoning-budget 0 \
     --host 127.0.0.1 --port "${TEST_PORT}" >"${ARTIFACT_DIR}/server.log" 2>&1 &
 candidate_pid=$!
 for _ in {1..240}; do
