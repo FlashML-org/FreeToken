@@ -268,7 +268,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -295,6 +295,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = 64
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -317,21 +318,23 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     engine._weights_bytes = 1_000_000
     engine._pool_cls = MHAKVCache  # __init__ skipped -> install the generic pool family
 
-    size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+    captured = {}
 
-    # cross-check against the same pure functions, proving the kwarg mapping is faithful
-    from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
-    from freetoken.kvcache.mha_pool import MHAKVCache
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 8, 64, True
 
-    cache_per_page, fixed, _, _ = MHAKVCache.kv_cost(StubConfig())
-    expected = resolve_moe_cache_auto(
-        baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
-        cache_per_page=cache_per_page, fixed_cache_size=fixed,
-        per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=16, quant_format="bf16",
+    monkeypatch.setattr(
+        "freetoken.engine.cache_budget.resolve_moe_cache_auto", fake_resolve
     )
-    assert (size, pages, overlap) == expected
+    got = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+
+    assert got == (8, 64, True)
+    assert captured["kv_reserve_tokens"] == 64 * 16
+    assert captured["page_size"] == 16
+    assert captured["num_experts"] == 4
+    assert captured["total_experts"] == 8
+    assert captured["per_expert_bytes"] == 512 + 256
 
 
 # ---------------------------------------------------------------------------
