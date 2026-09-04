@@ -6,7 +6,10 @@ set -euo pipefail
 readonly CHECKOUT="${1:?usage: run_gemma4_gguf_text_control.sh ISOLATED_CHECKOUT}"
 readonly MODE="${2:-text}"
 readonly ROOT_DIR="/home/david/freetoken-amd"
-readonly PRODUCTION_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
+# Bind recovery to the maintained Qwen source tree. The historical harness
+# checkout was intentionally retired, so referring to it would let a Gemma
+# control finish with the protected API still unavailable.
+readonly PRODUCTION_DIR="${ROOT_DIR}/source-qwen-recovery-d6ee8cef479c"
 readonly MODEL_PATH="${ROOT_DIR}/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf"
 readonly TEST_PORT="1923"
 readonly PRODUCTION_PORT="1919"
@@ -131,6 +134,49 @@ PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma
     --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
     --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
     >"${ARTIFACT_DIR}/quality.log" 2>&1
+
+if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
+    # The short arithmetic gate above remains mandatory.  This opt-in matrix
+    # runs only after quality passes and records fixed-length warmup, prefill,
+    # decode, TTFT, and token-gap evidence in the same immutable artifact.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_gguf_text_matrix.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --gguf "${MODEL_PATH}" --samples "${FREETOKEN_GEMMA4_MATRIX_SAMPLES:-5}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --artifact "${ARTIFACT_DIR}/text-matrix.json" \
+        >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
+    # Run concurrency only after single-request quality and matrix evidence.
+    # Every request remains local, fixed-length, and fully represented in the
+    # immutable artifact for later tail-latency review.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_concurrency.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --artifact "${ARTIFACT_DIR}/concurrency.json" \
+        >"${ARTIFACT_DIR}/concurrency.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
+    # The sweep uses exact LONG_OK markers at three fixed character contexts.
+    # It runs only after all shorter quality and throughput gates pass.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --artifact "${ARTIFACT_DIR}/long-context.json" \
+        >"${ARTIFACT_DIR}/long-context.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_ENDURANCE:-}" == "1" ]]; then
+    # Run repeated quality requests only after the shorter quality gate.  The
+    # harness stops on the first failed session and never restarts the server.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_endurance.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --sessions "${FREETOKEN_GEMMA4_SESSIONS:-30}" --interval "${FREETOKEN_GEMMA4_INTERVAL:-1}" \
+        --artifact "${ARTIFACT_DIR}/endurance.json" \
+        >"${ARTIFACT_DIR}/endurance.log" 2>&1
+fi
 
 if [[ "${MODE}" == "vision" ]]; then
     # Keep the candidate alive through the actual OpenAI image_url contract
