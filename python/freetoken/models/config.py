@@ -91,6 +91,66 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     return saw_nvfp4
 
 
+def _nvfp4_global_reciprocal(hf_config: Any) -> bool:
+    """Whether the routed-experts' per-tensor global scale needs to be reciprocated
+    at load time.
+
+    llm-compressor stores the QUANT-side scale (the multiplier baked into the local
+    fp8 scales before the FP4 cast); the dequant kernel divides by it, so the loader
+    must reciprocate 1/x. Modelopt's NVFP4 stores the DEQUANT-side divisor directly
+    and the kernel multiplies (no transform).
+
+    The ``format: nvfp4-pack-quantized`` string on the config_group is set by BOTH
+    exporters, so it alone can't disambiguate. The ground-truth signal is the on-disk
+    tensor naming: llm-compressor uses ``weight_packed`` + ``weight_global_scale`` +
+    ``input_global_scale``; modelopt uses ``weight`` + ``weight_scale_2`` + ``input_scale``.
+    We probe the safetensors index for one routed-expert tensor and pick the convention
+    from its sibling suffixes.
+
+    Returns True (reciprocate) for llm-compressor naming, False (use as-is) for
+    modelopt naming. Returns False when nothing is found (caller can't decide, so the
+    bank loader keeps the on-disk value verbatim -- the modelopt default)."""
+    # Cheap pre-check: ``quant_method`` should be compressed-tensors for either case.
+    quant = getattr(hf_config, "quantization_config", None)
+    if not quant:
+        return False
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False
+
+    # Probe the safetensors index for an expert tensor and inspect its sibling suffixes.
+    # Cheap read (one json parse) and bounds-checked (only the first hit is needed).
+    try:
+        from pathlib import Path as _Path
+        from freetoken.utils.hf import download_hf_weight as _download
+        folder = _Path(_download(hf_config._name_or_path
+                                 if hasattr(hf_config, "_name_or_path") else None))
+        idx_path = folder / "model.safetensors.index.json"
+        if not idx_path.exists():
+            return False  # single-file or no index -- fall back to safe default
+        import json as _json
+        weight_map = _json.loads(idx_path.read_text())["weight_map"]
+    except Exception:
+        return False  # any read error -- don't reciprocate (modelopt default is safer)
+
+    # Find one expert key in any shard; the suffix names reveal the layout.
+    has_packed = False       # llm-compressor writes weight_packed
+    has_scale2 = False       # modelopt writes weight_scale_2
+    for name in weight_map:
+        if ".mlp.experts." in name and ".gate_proj." in name:
+            has_packed = has_packed or name.endswith(".weight_packed")
+            has_scale2 = has_scale2 or name.endswith(".weight_scale_2")
+            if has_packed or has_scale2:
+                break
+    # Disambiguate: llm-compressor uses weight_packed (and weight_global_scale); modelopt
+    # uses weight + weight_scale_2 directly. A safetensors checkpoint that has weight_packed
+    # for routed experts is llm-compressor; one that has weight_scale_2 is modelopt.
+    if has_packed:
+        return True
+    return False
+
+
+
 @dataclass(frozen=True)
 class RotaryConfig:
     head_dim: int
@@ -270,6 +330,11 @@ class ModelConfig:
     expert_quant: str = "none"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
     nvfp4_backend: str = "triton"
+    # Reciprocate the per-tensor NVFP4 expert global scale at load (llm-compressor NVFP4
+    # stores the QUANT-side scale; the dequant kernel multiplies by the DEQUANT-side value,
+    # so we read 1/x from disk). False for modelopt NVFP4 (dequant-side value is on disk).
+    # See ``_nvfp4_global_reciprocal`` for the heuristic.
+    nvfp4_global_reciprocal: bool = False
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
     # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate

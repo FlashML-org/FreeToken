@@ -3,43 +3,41 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from freetoken.layers import (
-    BaseOP,
-    LinearColParallelMerged,
-    LinearReplicated,
-    LinearRowParallel,
-    make_moe_layer,
-    silu_and_mul,
-)
-
-from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged, Fp8BlockLinear
+from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer, silu_and_mul
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
 class _SharedExpert(BaseOP):
-    """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
+    """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``.
+    The quant type follows ``dense_quant`` (NVFP4 W4A16 for modelopt/shared_expert NVFP4
+    and dense Qwen3.6-27B; per-tensor FP8 W8A8 for llm-compressor mixed-precision Ornith),
+    then ``attn_quant`` (per-tensor FP8 when shared_expert is in the FP8 group), then
+    ``expert_quant`` (block FP8), else bf16. The dispatch lives in models/quant_linear.py
+    so every dense col-merged linear (attn, GDN, shared_expert) picks the same kernel."""
 
     def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
-        if getattr(config, "expert_quant", "none") == "fp8_block":
-            self.gate_up_proj = Fp8BlockColMerged(
-                hidden_size, [intermediate_size, intermediate_size], has_bias=False
-            )
-            self.down_proj = Fp8BlockLinear(intermediate_size, hidden_size, has_bias=False)
-        elif getattr(config, "dense_quant", "none") == "nvfp4":
-            # NVFP4 checkpoint: keep the shared expert's NVFP4 weights native (W4A16).
-            from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
+        from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 
-            self.gate_up_proj = Nvfp4DenseColMerged(
-                hidden_size, [intermediate_size, intermediate_size], has_bias=False
-            )
-            self.down_proj = Nvfp4DenseLinear(intermediate_size, hidden_size, has_bias=False)
-        else:
-            self.gate_up_proj = LinearColParallelMerged(
-                hidden_size, [intermediate_size, intermediate_size], has_bias=False
-            )
-            self.down_proj = LinearRowParallel(intermediate_size, hidden_size, has_bias=False)
+        # ``dense_quant`` wins for the NVFP4 path (shared_expert NVFP4 in modelopt mixed
+        # precision and in dense Qwen3.6-27B); ``attn_quant`` for FP8 paths.
+        # The factory's pre-NVFP4 check (``expert_quant == "fp8_block"``) still fires for
+        # block-fp8 models; per-tensor FP8 takes the attn_quant path; everything else bf16.
+        dense_quant = getattr(config, "dense_quant", "none")
+        attn_quant = getattr(config, "attn_quant", "none")
+        expert_quant = getattr(config, "expert_quant", "none")
+        # For NVFP4 dense, the factory's check is on ``attn_quant``; promote ``dense_quant``
+        # to ``attn_quant`` for the call so a single dispatch covers both. Block-fp8 and
+        # per-tensor-fp8 are unchanged.
+        fused_attn = "nvfp4" if dense_quant == "nvfp4" else attn_quant
+        self.gate_up_proj = make_col_merged_quant(
+            expert_quant, fused_attn, hidden_size,
+            [intermediate_size, intermediate_size], has_bias=False,
+        )
+        self.down_proj = make_replicated_quant(
+            expert_quant, fused_attn, intermediate_size, hidden_size, has_bias=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
