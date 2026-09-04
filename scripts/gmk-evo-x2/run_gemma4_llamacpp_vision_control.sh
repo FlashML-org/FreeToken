@@ -105,20 +105,6 @@ if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
         --artifact "${ARTIFACT_DIR}/text-matrix.json" \
         >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
 fi
-if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_concurrency.py \
-        --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
-        --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
-        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
-        --artifact "${ARTIFACT_DIR}/concurrency.json" \
-        >"${ARTIFACT_DIR}/concurrency.log" 2>&1
-fi
-if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
-        --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
-        --artifact "${ARTIFACT_DIR}/long-context.json" \
-        >"${ARTIFACT_DIR}/long-context.log" 2>&1
-fi
 image_verify_args=()
 if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
     # Keep the normal llama.cpp reference quick, but permit the identical
