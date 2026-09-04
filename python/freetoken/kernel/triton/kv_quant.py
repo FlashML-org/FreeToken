@@ -89,7 +89,9 @@ def _kv_quant_scatter_kernel(
     k_scale,
     v_scale,
     idx_ptr,
-    stride_xs,  # source row pitch, in elements (the qkv slice is wider than one row)
+    stride_xs,  # K source row pitch, in elements (the qkv slice is wider than one row)
+    stride_vx,  # V source row pitch. K and V need not share one: a .clamp() on one side
+                # leaves it densely packed, so reusing K's pitch reads V off its rows.
     stride_kd,  # K cache row pitch, in elements (== HEADS * D)
     stride_vd,
     stride_ks,  # scale row pitch, in elements (== HEADS)
@@ -105,9 +107,9 @@ def _kv_quant_scatter_kernel(
     d = tl.arange(0, BLOCK_D)
     mask = d < D
 
-    src = t * stride_xs + h * D + d
-    xk = tl.load(k_src + src, mask=mask, other=0.0).to(tl.float32)
-    xv = tl.load(v_src + src, mask=mask, other=0.0).to(tl.float32)
+    off = h * D + d
+    xk = tl.load(k_src + t * stride_xs + off, mask=mask, other=0.0).to(tl.float32)
+    xv = tl.load(v_src + t * stride_vx + off, mask=mask, other=0.0).to(tl.float32)
 
     # 448 == e4m3 finite max; 1e-10 is the amax floor of the activation quant in
     # kernel/triton/fp8_block_linear.py (literals keep the kernel self-contained).
@@ -172,6 +174,7 @@ def quantize_kv_to_cache(
         v_scale,
         out_loc,
         k.stride(0),
+        v.stride(0),
         k_cache.stride(0),
         v_cache.stride(0),
         k_scale.stride(0),
