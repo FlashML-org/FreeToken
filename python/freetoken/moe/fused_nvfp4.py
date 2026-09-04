@@ -25,6 +25,7 @@ from freetoken.layers import (
     gelu_and_mul,
     gelu_tanh_and_mul,
     silu_and_mul,
+    swiglu_clamp_and_mul,
     swigluoai_and_mul,
 )
 from freetoken.moe.fused import moe_align_block_size
@@ -40,11 +41,15 @@ def _run_act(
     act_limit: float,
 ) -> None:
     """gemm1 -> gemm2 activation dispatch. ``swigluoai`` (MiniMax-M3, clamped
-    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) carries the
+    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) and
+    ``swiglu_clamp`` (GLM-5.3, same clamp without the +1 up bias) carry the
     per-model ``act_alpha``/``act_limit`` scalars; the plain *_and_mul kinds
     ignore them."""
     if activation == "swigluoai":
         swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
+        return
+    if activation == "swiglu_clamp":
+        swiglu_clamp_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
         return
     _ACT[activation](gate_up, out)
 
@@ -61,6 +66,12 @@ _DECODE_WARPS = 4
 _DECODE_MARLIN_BLOCK_N = 16
 _DECODE_MARLIN_BLOCK_KW = 16
 _DECODE_MARLIN_WARPS = 4
+# Deep-K variant: at K > 2048 (qwen4_exp gate_up, K=2560) a narrower N tile with the whole
+# K strip in one program iteration measures ~13% faster (18.6 vs 21.0us); short-K shapes
+# regress under it, so the split is by K, not by gemm position.
+_DECODE_MARLIN_DEEPK_BLOCK_N = 8
+_DECODE_MARLIN_DEEPK_BLOCK_KW = 128
+_DECODE_MARLIN_DEEPK_THRESHOLD = 2048
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -129,7 +140,10 @@ def _decode_gemm_marlin(
     packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
     scale = e4m3_kernel_view(scale)
     total_routes = M * top_k
-    grid = (total_routes, triton.cdiv(N, _DECODE_MARLIN_BLOCK_N))
+    deep_k = K > _DECODE_MARLIN_DEEPK_THRESHOLD
+    block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
+    block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
         _e2m1_lut(a.device.index),
@@ -141,8 +155,8 @@ def _decode_gemm_marlin(
         c.stride(0), c.stride(1), c.stride(2),
         topk_weights.stride(0), topk_weights.stride(1),
         topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_SIZE_N=_DECODE_MARLIN_BLOCK_N,
-        BLOCK_SIZE_KW=_DECODE_MARLIN_BLOCK_KW,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_KW=block_kw,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,

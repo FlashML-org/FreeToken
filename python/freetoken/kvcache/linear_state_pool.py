@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
-from freetoken.models.config import LinearGatedDeltaGroupConfig
+from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
 from freetoken.utils import div_even
 
 _SSM_DTYPES = {
@@ -35,6 +37,11 @@ class LinearStatePool:
     Indexed by ``Req.table_idx`` (0..max_running_req), the same per-request slot the
     page table uses, so the scheduler's existing admit/free of ``table_idx`` covers the
     state's lifetime. One fixed slot per running request; no paging, no eviction.
+
+    A model can declare extra per-request tensors on the same slots through
+    ``ModelConfig.slot_states`` (see ``SlotStateSpec``); they advance, snapshot, COW and
+    rebuild with the GDN state and are read back through ``slot_state(name, layer_id)``.
+    Consumers must re-read them each forward: ``rebuild`` replaces the tensors.
     """
 
     def __init__(
@@ -44,6 +51,7 @@ class LinearStatePool:
         dtype: torch.dtype,
         device: torch.device,
         tp_size: int | None = None,
+        slot_states: tuple[SlotStateSpec, ...] = (),
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
@@ -70,12 +78,46 @@ class LinearStatePool:
         )
         self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
 
+        self._slot_specs = tuple(slot_states)
+        names = [spec.name for spec in self._slot_specs]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate slot_state names: {names}")
+        self._state_layer_index = {
+            spec.name: {lid: i for i, lid in enumerate(spec.layer_ids)}
+            for spec in self._slot_specs
+        }
+        self.slot_states: dict[str, torch.Tensor] = self._alloc_slot_states(num_slots)
+
         # Free-list allocator over slots 1..num_slots-1 (slot 0 reserved as a padding sink,
         # sglang MambaPool convention). Live working slots, ping-pong track slots, and
         # radix-tree-donated snapshots are all drawn from this single free-list, so memory
         # flows between them by demand. Unused by the op harness (which assigns slots by hand).
         self.padding_slot = 0
         self._free_slots: list[int] = list(range(1, num_slots))
+
+    def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
+        return {
+            spec.name: torch.full(
+                (max(1, len(spec.layer_ids)), num_slots, *spec.shape),
+                spec.fill_value,
+                dtype=spec.dtype if spec.dtype is not None else self._conv_dtype,
+                device=self._device,
+            )
+            for spec in self._slot_specs
+        }
+
+    def has_slot_state(self, name: str) -> bool:
+        return name in self.slot_states
+
+    def slot_state(self, name: str, layer_id: int | None = None) -> torch.Tensor:
+        """One declared sibling state, ``[num_slots, *shape]``; ``layer_id`` picks the layer row."""
+        t = self.slot_states[name]
+        if layer_id is None:
+            assert not self._state_layer_index[name], (
+                f"slot_state {name!r} is per-layer, pass layer_id"
+            )
+            return t[0]
+        return t[self._state_layer_index[name][layer_id]]
 
     @property
     def num_free_slots(self) -> int:
@@ -110,6 +152,7 @@ class LinearStatePool:
         device = self._device
         self.conv_states = None
         self.recurrent_states = None
+        self.slot_states = {}
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
@@ -121,6 +164,7 @@ class LinearStatePool:
             dtype=rec_dtype,
             device=device,
         )
+        self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
 
@@ -138,12 +182,16 @@ class LinearStatePool:
             slots = torch.as_tensor(slots, dtype=torch.long, device=self._device)
         self.conv_states[:, slots] = 0
         self.recurrent_states[:, slots] = 0
+        for spec in self._slot_specs:
+            self.slot_states[spec.name][:, slots] = spec.fill_value
 
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
         ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""
         self.conv_states[:, dst].copy_(self.conv_states[:, src])
         self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
+        for t in self.slot_states.values():
+            t[:, dst].copy_(t[:, src])
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
@@ -161,6 +209,8 @@ class LinearStatePool:
         """Zero a slot across all linear layers (new request takes this table_idx)."""
         self.conv_states[:, table_idx].zero_()
         self.recurrent_states[:, table_idx].zero_()
+        for spec in self._slot_specs:
+            self.slot_states[spec.name][:, table_idx] = spec.fill_value
 
     @property
     def num_linear_layers(self) -> int:
@@ -180,6 +230,8 @@ class LinearStatePool:
             self.conv_states[:, 0].numel() * self.conv_states.element_size()
             + self.recurrent_states[:, 0].numel() * self.recurrent_states.element_size()
         )
+        for t in self.slot_states.values():
+            per += t[:, 0].numel() * t.element_size()
         return int(per)
 
 
@@ -187,15 +239,22 @@ def linear_state_bytes_per_req(
     group: LinearGatedDeltaGroupConfig,
     tp_size: int,
     dtype: torch.dtype,
+    slot_states: tuple[SlotStateSpec, ...] = (),
 ) -> int:
-    """Linear-state bytes for one request across all linear layers (TP-local)."""
+    """Linear-state bytes for one request across all linear layers (TP-local), plus any
+    declared slot_states."""
     n_layers, local_conv_dim, local_v_heads = _linear_local_dims(group, tp_size)
 
     conv_elems = local_conv_dim * (group.conv_kernel_dim - 1)
     rec_elems = local_v_heads * group.key_head_dim * group.value_head_dim
     conv_bytes = conv_elems * dtype.itemsize  # conv state in model dtype
     rec_bytes = rec_elems * ssm_state_dtype().itemsize  # recurrent state (default fp32)
-    return int(n_layers * (conv_bytes + rec_bytes))
+    total = n_layers * (conv_bytes + rec_bytes)
+
+    for spec in slot_states:
+        item = (spec.dtype if spec.dtype is not None else dtype).itemsize
+        total += max(1, len(spec.layer_ids)) * math.prod(spec.shape) * item
+    return int(total)
 
 
 __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
@@ -206,10 +265,16 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     slot count). The engine adds this to the KV family's fixed cost when budgeting --
     the state pool is a sibling pool, not a KV tier."""
     linear_group = config.model_config.linear_attention_group()
+    slot_states = getattr(config.model_config, "slot_states", ())
     if linear_group is None:
+        if slot_states:
+            raise ValueError("slot_states ride the linear-state slots; model has no linear group")
         return 0
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
-    return linear_state_bytes_per_req(linear_group, config.tp_info.size, config.dtype) * slots
+    per_req = linear_state_bytes_per_req(
+        linear_group, config.tp_info.size, config.dtype, slot_states
+    )
+    return per_req * slots
 
 
 def _linear_pool_num_slots(config) -> int:

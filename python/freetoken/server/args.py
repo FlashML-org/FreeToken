@@ -147,6 +147,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3_coder"
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
@@ -188,6 +190,8 @@ def parse_args(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
             return "deepseekv32"
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3"
         if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
             return "qwen3"
         if "glm" in marker:
@@ -470,6 +474,16 @@ def parse_args(
             "The MoE backend to use. 'auto' resolves a MoE model to the offload family "
             "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
             "'fused' experts must be requested explicitly."
+        ),
+    )
+
+    parser.add_argument(
+        "--ple-backend",
+        default=ServerArgs.ple_backend,
+        choices=["pinned", "disk"],
+        help=(
+            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
+            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
         ),
     )
 

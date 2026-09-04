@@ -37,7 +37,7 @@ UID = 2
 def _pool(num_slots=16):
     g = LinearGatedDeltaGroupConfig(
         name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
     )
     return LinearStatePool(group=g, num_slots=num_slots, dtype=torch.bfloat16,
                            device=torch.device("cpu"), tp_size=1)

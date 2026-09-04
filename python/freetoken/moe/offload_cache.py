@@ -77,11 +77,18 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
+# lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
+from freetoken.kernel.aot_models import fp8_block_scale_pad
+
+
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
-    "fp8_block": lambda H, I: 3 * I * H + ((2 * I // 128) * (H // 128) + (H // 128) * (I // 128)) * 2,
+    "fp8_block": lambda H, I: 3 * I * H + (
+        (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
+        + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
+    ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
@@ -340,6 +347,19 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
+        self._build_fused_copy_plan()
+        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
+            return
+        for name in self.bank_schema:
+            cache = self.bank_caches[name]
+            feat = math.prod(cache.shape[1:]) * cache.element_size()
+            if feat % 128:
+                raise RuntimeError(
+                    f"MoE bank {name!r} rows are {feat} bytes (not a multiple of 128): "
+                    f"only the fused multi-bank copy can move them, but it is disabled"
+                )
+
+    def _build_fused_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
         Built once here (and on :meth:`rebuild`, which reallocates the slot caches);
