@@ -224,7 +224,9 @@ def _fp8_dense(
         w8, scale = _quantize_per_tensor(t[:qkvz])
         yield base + "in_proj_qkvz.weight", w8
         yield base + "in_proj_qkvz.weight_scale", scale
-        yield base + "in_proj_ba.weight", t[qkvz:].contiguous()
+        # clone, not contiguous(): a contiguous row slice IS contiguous, so .contiguous() would
+        # hand back a view that keeps the whole bf16 in_proj (36 x 42 MB per rank) resident
+        yield base + "in_proj_ba.weight", t[qkvz:].clone()
     elif name.endswith(_FP8_DENSE_SUFFIXES):
         w8, scale = _quantize_per_tensor(t)
         yield name, w8
