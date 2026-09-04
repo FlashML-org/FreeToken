@@ -1,0 +1,93 @@
+name: Bug report (Desktop app)
+description: Something does not work in the FreeToken Desktop app.
+labels: ["bug", "Desktop"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening an issue, please read the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84) and the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79). Most install and runtime problems are answered in the FAQ. Reports missing the information below may be closed until it is provided; see [CONTRIBUTING.md](https://github.com/FlashML-org/FreeToken/blob/main/CONTRIBUTING.md#reporting-issues).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you start
+      options:
+        - label: I have read the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84) and my problem is not answered there.
+          required: true
+        - label: I have read the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and this is not already planned there.
+          required: true
+        - label: I have searched [existing issues](https://github.com/FlashML-org/FreeToken/issues?q=is%3Aissue) and found no duplicate.
+          required: true
+        - label: I have restarted the Desktop app to pick up the latest update and the problem still happens.
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Desktop app version
+      description: Shown in the app's settings / about page.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - Ubuntu
+        - Debian
+        - Fedora
+        - Arch Linux
+        - Other Linux
+    validations:
+      required: true
+  - type: input
+    id: os_detail
+    attributes:
+      label: OS details
+      description: Distribution version (e.g. Ubuntu 24.04), kernel, desktop environment, or anything unusual about the system.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: "GPU model, VRAM, driver version (`nvidia-smi`). Mention other GPUs in the machine. Only NVIDIA GPUs are supported today; AMD support is on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79), please do not open an issue for it."
+      placeholder: RTX 4060 Laptop 8GB, driver 580.xx
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU and system RAM
+      placeholder: i9-13900H, 32GB
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Checkpoint
+      description: The exact Hugging Face or ModelScope ID, not just the model name.
+      placeholder: Qwen/Qwen3.6-35B-A3B-FP8
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Model settings
+      description: The settings used when loading the model (context length, backend, any changed defaults).
+  - type: textarea
+    id: log
+    attributes:
+      label: Engine log
+      description: "**Logs → Server status → Copy** in the app, pasted as text, not a screenshot."
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Proxies, unusual setups, or anything that may matter.

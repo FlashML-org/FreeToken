@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a feature or improvement. For a model or checkpoint that does not load, use "Support Model Checkpoint" instead.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening an issue, please check the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84). If your request is already on the Roadmap, please do not open a new issue for it. Features not on the Roadmap should start as an issue, not a PR; see [CONTRIBUTING.md](https://github.com/FlashML-org/FreeToken/blob/main/CONTRIBUTING.md).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you start
+      options:
+        - label: I have read the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and this is not already planned there.
+          required: true
+        - label: I have read the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84).
+          required: true
+        - label: I have searched [existing issues](https://github.com/FlashML-org/FreeToken/issues?q=is%3Aissue) and found no duplicate.
+          required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Applies to
+      options:
+        - Desktop app
+        - Engine
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+      description: The use case, and why current FreeToken does not cover it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
