@@ -41,6 +41,13 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Disk tier (--moe-disk-tier, see moe/disk_tier.py): "off" = classic behavior.
+    # When "on", experts [0, expert_ram_experts) per layer stay pinned in RAM and the
+    # rest are fetched from the original checkpoint on slot-cache miss. Requires the
+    # native NVFP4 layout, gpu decode target, no prefill overlap, no cuda graphs.
+    moe_disk_tier: str = "off"
+    expert_ram_experts: int = 0
+    disk_fetch_workers: int = 8
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

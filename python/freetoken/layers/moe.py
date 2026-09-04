@@ -311,6 +311,9 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        if (cache.disk_tier_enabled and self.layer_id == 0
+                and os.environ.get("FT_DISK_TIER_VERIFY")):
+            cache._disk_tier.verify_decode_mapping(cache, self.layer_id, topk_ids)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -397,7 +400,12 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
-        cache.materialize_layer(self.layer_id)
+        if cache.disk_tier_enabled:
+            # Disk tier: stream only the RAM-resident prefix + fetch the routed
+            # disk-resident experts (identity slots, so topk_ids pass through).
+            cache.materialize_layer(self.layer_id, topk_ids)
+        else:
+            cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(
             cache,

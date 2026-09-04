@@ -79,7 +79,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_pinned_bytes", "_locked")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -104,11 +104,19 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            self._pinned_bytes = asize
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # MAP_PRIVATE, not CPython's default MAP_SHARED: on a shared anonymous mapping a
+            # *read* fault allocates a page (no zero-page sharing) and MADV_DONTNEED is ignored,
+            # so an untouched region is only free by convention and a freed one never comes back.
+            # Private anonymous gives both for real: reads map the shared zero page, and
+            # release_range() actually returns memory. Nothing needs the mapping to be shared --
+            # the loaders are thread pools and ranks are mp-spawned, each with its own banks.
+            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
+            self._pinned_bytes = 0
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
 
@@ -140,11 +148,52 @@ class HostBank:
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+        self._pinned_bytes = len(self._buf)
 
+    def pin_prefix(self, nrows: int) -> None:
+        """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
+
+        The unpinned tail keeps its filled pages until :meth:`release_range` drops
+        them; nothing may DMA from the tail (the disk tier's miss filter guarantees
+        the GPU never copies those rows)."""
+        if self._pinned:
+            return
+        from freetoken.kernel.pinned import host_register
+
+        row_bytes = self.nbytes // self.tensor.shape[0]
+        nbytes = nrows * row_bytes
+        try:
+            host_register(self.addr, nbytes)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
+            ) from exc
+        self._pinned = True
+        self._pinned_bytes = nbytes
+
+    def release_range(self, offset: int, nbytes: int) -> None:
+        """Free a byte range of the backing mapping with MADV_DONTNEED.
+
+        The bank is a MAP_PRIVATE anonymous mapping, so dropping a range frees the
+        pages outright and a later read faults the shared zero page again; every
+        existing pointer and torch view stays valid (the mapping is never replaced).
+
+        The range must be page-aligned and must not overlap the pinned prefix:
+        dropping pages under a cudaHostRegister'd range corrupts silently, so it is
+        asserted here rather than left to the caller (the disk tier's unpinned tails).
+        """
+        assert offset % _BLK == 0 and nbytes % _BLK == 0, (
+            "release_range: page-aligned range required")
+        assert offset >= self._pinned_bytes, (
+            f"release_range: [{offset}, {offset + nbytes}) overlaps the pinned prefix "
+            f"[0, {self._pinned_bytes})")
+        if nbytes:
+            self._buf.madvise(mmap.MADV_DONTNEED, offset, nbytes)
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
+        (This frees memory only because the mapping is MAP_PRIVATE; the kernel ignores MADV_DONTNEED on shared ones.)"""
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)
@@ -289,7 +338,8 @@ class PinPipeline:
     A clean context-manager exit drains the queue and re-raises the first settle failure.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, prefix_rows: int | None = None) -> None:
+        self._prefix_rows = prefix_rows
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
@@ -308,9 +358,16 @@ class PinPipeline:
                 continue  # drain without settling after a failure
             bank, residency, plan, layer_id = item
             try:
-                _settle(bank, residency)
-                if plan is not None and residency == HostResidency.LOCKED.value:
-                    plan.record(layer_id, bank.residency.value)
+                if self._prefix_rows is not None:
+                    # Disk tier: pin only the RAM-resident expert prefix; the
+                    # disk-resident tail is released by the caller. Takes
+                    # precedence over the residency label (H2D needs the
+                    # prefix page-locked regardless).
+                    bank.pin_prefix(self._prefix_rows)
+                else:
+                    _settle(bank, residency)
+                    if plan is not None and residency == HostResidency.LOCKED.value:
+                        plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 

@@ -13,6 +13,7 @@ from .config import parse_config
 from .model import Qwen4ExpForCausalLM
 from .weight import (
     iter_weights,
+    nvfp4_expert_source_spec,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
     load_ple_table,
@@ -24,7 +25,7 @@ from .weight import (
 # load_nvfp4_expert_sources via the model spec.
 from freetoken.models.qwen3_5_moe.weight import setup_offload_expert_banks
 
-__all__ = [
+__all__ = ["nvfp4_expert_source_spec", 
     "Qwen4ExpForCausalLM",
     "iter_weights",
     "load_nvfp4_expert_sources",

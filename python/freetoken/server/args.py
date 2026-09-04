@@ -548,6 +548,39 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-tier",
+        default=ServerArgs.moe_disk_tier,
+        choices=["off", "on"],
+        help=(
+            "NVMe tier for MoE experts (see moe/disk_tier.py): experts beyond "
+            "--expert-ram-experts per layer stay on disk in the original checkpoint "
+            "and are fetched on slot-cache miss. Requires native NVFP4 banks. "
+            "v0 preconditions (all enforced at once at boot): --moe-backend offload "
+            "(gpu decode), --disable-moe-prefill-overlap, --cuda-graph-max-bs 0, "
+            "and 0 < --expert-ram-experts < num_experts."
+        ),
+    )
+    parser.add_argument(
+        "--expert-ram-experts",
+        type=int,
+        default=ServerArgs.expert_ram_experts,
+        help=(
+            "With --moe-disk-tier on: experts per layer kept pinned in RAM "
+            "(0 < N < num_experts; the rest are disk-resident). Keep "
+            "N * (smallest bank row bytes) page-aligned (a multiple of 4096) or "
+            "the small scale banks' tail rows stay resident instead of released "
+            "(warns, does not abort). The rule is per-model: e.g. Qwen3.8-Flash-Next "
+            "needs a multiple of 8, Ornith-1.5-35B a multiple of 2."
+        ),
+    )
+    parser.add_argument(
+        "--disk-fetch-workers",
+        type=int,
+        default=ServerArgs.disk_fetch_workers,
+        help="Disk-tier O_DIRECT fetch threads (default 8).",
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

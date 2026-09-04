@@ -12,11 +12,12 @@ from .vision import Gemma4MultimodalEmbedder, Gemma4VisionModel
 from .weight import (
     iter_weights,
     iter_weights_parallel,
+    nvfp4_expert_source_spec,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
 )
 
-__all__ = [
+__all__ = ["nvfp4_expert_source_spec", 
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4MultimodalEmbedder",

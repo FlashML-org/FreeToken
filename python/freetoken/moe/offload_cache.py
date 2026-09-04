@@ -154,6 +154,9 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # Disk tier (None when off): a moe.disk_tier.DiskTier that fetches
+        # disk-resident slot-cache misses before the PCIe copy path.
+        self._disk_tier = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -509,6 +512,8 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if self._disk_tier is not None:
+            self._disk_tier.refresh(self)  # slot caches were reallocated
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -850,7 +855,19 @@ class OffloadMoeCache:
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
 
-    def materialize_layer(self, layer_id: int) -> None:
+    @property
+    def disk_tier_enabled(self) -> bool:
+        return self._disk_tier is not None
+
+    def materialize_layer(self, layer_id: int, expert_ids: torch.Tensor | None = None) -> None:
+        if self._disk_tier is not None:
+            # Disk tier: stream only the RAM-resident prefix, then fetch the routed
+            # disk-resident experts into their identity slots (needs the routing).
+            assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
+            self._pending_src_layer = layer_id
+            self._pending_whole_layer = True
+            self._disk_tier.materialize_layer(self, layer_id, expert_ids)
+            return
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
@@ -985,11 +1002,25 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+        """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
+        original checkpoint before the PCIe copy path (see moe/disk_tier.py)."""
+        from freetoken.moe.disk_tier import DiskTier
+
+        assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
+        assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
+        assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
+        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers)
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self._unpinned_layers:
+        if self._disk_tier is not None:
+            # Fetch this layer's disk-resident misses into their slots, then shrink the
+            # miss list to the RAM-resident remainder for the PCIe copy below.
+            self._disk_tier.fetch_pending(self, layer_id)
+        elif layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
@@ -1001,6 +1032,13 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
+        if (self._disk_tier is not None and layer_id == 0
+                and os.environ.get("FT_DISK_TIER_VERIFY")
+                and not torch.cuda.is_current_stream_capturing()):
+            print(f"[copy-miss] layer={layer_id} fused={self._copy_fused_ok} "
+                  f"n={int(self.num_indices.item())} "
+                  f"evict={self.evict_slots[:4].cpu().tolist()} "
+                  f"src={self.src_indices[:4].cpu().tolist()}", flush=True)
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -1016,18 +1054,21 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
-            return
+        else:
+            from freetoken.kernel import fast_index_copy_jit
 
-        from freetoken.kernel import fast_index_copy_jit
-
-        for per_layer, cache in self.banks:
-            fast_index_copy_jit(
-                cache,
-                self.evict_slots,
-                per_layer[layer_id],
-                self.src_indices,
-                self.num_indices,
-            )
+            for per_layer, cache in self.banks:
+                fast_index_copy_jit(
+                    cache,
+                    self.evict_slots,
+                    per_layer[layer_id],
+                    self.src_indices,
+                    self.num_indices,
+                )
+        if (self._disk_tier is not None and layer_id == 0
+                and self._pending_whole_layer
+                and os.environ.get("FT_DISK_TIER_VERIFY")):
+            self._disk_tier.verify_ram(self, layer_id)
 
 
 def iter_offload_moe_layers(model) -> Iterator:

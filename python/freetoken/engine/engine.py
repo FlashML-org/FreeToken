@@ -565,6 +565,29 @@ class Engine:
                 "(locked layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
+        disk_tier = None
+        if config.moe_disk_tier == "on":
+            from freetoken.moe.disk_tier import DiskTierSpec
+
+            E = config.model_config.num_experts
+            # Collect ALL unmet preconditions and raise once: each used to surface as a
+            # separate boot-time ValueError, costing a full boot per missing flag.
+            problems = []
+            if not 0 < config.expert_ram_experts < E:
+                problems.append(
+                    f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
+            if decode_target != "gpu":
+                problems.append(
+                    "--moe-disk-tier v0 requires the gpu decode path (--moe-backend offload)")
+            if config.moe_prefill_overlap:
+                problems.append("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
+            if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+                problems.append(
+                    "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
+            if problems:
+                raise ValueError(
+                    "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))
+            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -590,6 +613,7 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                disk_tier=disk_tier,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -626,6 +650,21 @@ class Engine:
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            if banks.disk_index is not None:
+                cache.attach_disk_tier(
+                    banks.disk_index, banks.disk_ram_experts,
+                    workers=config.disk_fetch_workers)
+                logger.info_rank0(
+                    f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
+                    f"experts/layer pinned in RAM; the rest fetched from "
+                    f"{config.model_path} on slot-cache miss")
+            elif disk_tier is not None:
+                # The loader released experts [K, E) but no fetcher came back: serving would
+                # multiply by zeroed rows and log nothing. Fail where the flag was set.
+                raise NotImplementedError(
+                    "--moe-disk-tier on: this checkpoint's expert provider returned no disk "
+                    "index, so experts released at load would never be refetched "
+                    f"(quant_format={banks.quant_format!r})")
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)

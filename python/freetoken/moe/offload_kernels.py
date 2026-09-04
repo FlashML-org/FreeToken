@@ -188,7 +188,10 @@ def _ensure_experts_hybrid_cpu(
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
 
 
-def _materialize_layer_gpu(cache, layer_id: int) -> None:
+def _materialize_layer_gpu(cache, layer_id: int, materialize_count: int | None = None) -> None:
+    # materialize_count < num_experts: the disk tier's RAM-resident prefix only; the
+    # flat-id base still uses the full num_experts (the id space is layer * E + expert).
+    count = cache.num_experts if materialize_count is None else materialize_count
     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
@@ -200,6 +203,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         cache.num_indices,
         layer_id,
         cache.num_experts,
+        count,
         cache.cache_size,
         BLOCK=block,
     )
@@ -257,11 +261,12 @@ def _materialize_layer_kernel(
     num_indices_ptr,
     layer_id: tl.constexpr,
     num_experts: tl.constexpr,
+    materialize_count: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     off = tl.arange(0, BLOCK)
-    expert_mask = off < num_experts
+    expert_mask = off < materialize_count
     slot_mask = off < cache_size
     slot = off
 
@@ -282,7 +287,7 @@ def _materialize_layer_kernel(
     tl.store(usage_ptr + slot, step, mask=expert_mask)
     tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
     tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
-    tl.store(num_indices_ptr, num_experts)
+    tl.store(num_indices_ptr, materialize_count)
 
 
 

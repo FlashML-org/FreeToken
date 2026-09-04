@@ -293,6 +293,20 @@ def load_moe_expert_sources(
     )
 
 
+def nvfp4_moe_expert_source_spec(model_path: str, model_config):
+    """The family's ``Nvfp4ExpertSourceSpec`` for this checkpoint, or None if it has none.
+
+    The disk tier indexes the same rows the loader placed, so it needs the very spec the
+    family loader used -- which only the family knows (glm5_next picks between a
+    compressed-tensors and a modelopt naming per checkpoint). None means the family has no
+    NVFP4 expert source spec at all, which the caller must treat as "no disk tier here"
+    rather than silently continue.
+    """
+    _config, spec = _spec_for_model_path(model_path)
+    getter = _model_override(spec, "nvfp4_expert_source_spec")
+    return None if getter is None else getter(model_path, model_config)
+
+
 def load_nvfp4_moe_expert_sources(
     model_path: str,
     model_config,
@@ -302,12 +316,14 @@ def load_nvfp4_moe_expert_sources(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    disk_tier=None,
 ) -> dict:
     """Load (or fabricate, with ``dummy=True``) packed NVFP4 expert source banks.
     ``parallel=True`` uses the model's ``load_nvfp4_expert_sources_parallel`` (common
     chunked multi-threaded O_DIRECT reader). ``layer_sink``: see
     ``models.nvfp4_banks.load_nvfp4_expert_source_banks``; forwarded to the per-model
-    loader, which forwards it on."""
+    loader, which forwards it on. ``disk_tier`` (a ``moe.disk_tier.DiskTierSpec``)
+    pins only the first ``ram_experts`` experts per layer and releases the rest."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
         builder = (
@@ -319,9 +335,10 @@ def load_nvfp4_moe_expert_sources(
         if loader is None:  # no parallel reader -> let the caller fall back to serial
             raise NotImplementedError(
                 f"{spec.module} provides no load_nvfp4_expert_sources_parallel")
-        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink)
+        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink,
+                      disk_tier=disk_tier)
     loader = _load_attr(spec.module, "load_nvfp4_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
+    return loader(model_path, model_config, layer_sink=layer_sink, disk_tier=disk_tier)
 
 
 def load_q4_0_moe_expert_sources(
