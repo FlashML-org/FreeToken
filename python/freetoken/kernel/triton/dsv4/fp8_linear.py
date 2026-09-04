@@ -71,10 +71,12 @@ def _act_quant_fp8_kernel(
     e = _log2_ceil(amax * (1.0 / 448.0))                # [BLOCK_M]
     s = tl.exp2(e.to(tl.float32))
     y = tl.clamp(x / s[:, None], -448.0, 448.0)
+    # See fp8_block_linear: triton's float8e4nv downcast double-rounds one-sided
+    # (toward zero), so round onto the grid in fp32 first and let the (now exact)
+    # downcast follow.
+    y = round_e4m3(y)  # emu path keeps these grid values in the wrapper's bf16 buffer
     if e4m3_native_cx():
         y = y.to(tl.float8e4nv)
-    else:
-        y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
     tl.store(
         y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yn,
         y, mask=m_mask[:, None],
@@ -130,9 +132,9 @@ def _act_quant_inplace_kernel(
     q = tl.clamp(x / s[:, None], FP8_MIN, FP8_MAX)
     if FP4:
         q = _round_fp4(q)
-    elif e4m3_native_cx():
-        q = q.to(tl.float8e4nv).to(tl.float32)
     else:
+        # No fp8 round-trip on the native path: it only ever *re*-quantized an
+        # already-grid value, and triton's downcast double-rounds rather than RNE.
         q = round_e4m3(q)
     optrs = o_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_on
     y = (q * s[:, None]).to(optrs.dtype.element_ty)
