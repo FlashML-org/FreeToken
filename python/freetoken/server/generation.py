@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -177,12 +178,21 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    resolved_temperature = pick(temperature, "temperature", 0.0)
+    if not math.isfinite(resolved_temperature) or resolved_temperature < 0:
+        raise ValueError(f"temperature must be a finite number >= 0, got {resolved_temperature}")
+    resolved_top_p = pick(top_p, "top_p", 1.0)
+    if not math.isfinite(resolved_top_p) or not 0 < resolved_top_p <= 1:
+        raise ValueError(f"top_p must be in (0, 1], got {resolved_top_p}")
+    resolved_top_k = pick(top_k, "top_k", -1)
+    if resolved_top_k != -1 and resolved_top_k < 1:
+        raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
     return SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
-        temperature=pick(temperature, "temperature", 0.0),
-        top_k=pick(top_k, "top_k", -1),
-        top_p=pick(top_p, "top_p", 1.0),
+        temperature=resolved_temperature,
+        top_k=resolved_top_k,
+        top_p=resolved_top_p,
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
     )
 
