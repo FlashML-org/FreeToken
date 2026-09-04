@@ -44,6 +44,13 @@ the model payload alone. This excludes the tokenizer, runtime allocations,
 expert-cache policy, KV cache, allocator slack, and any duplicate conversion
 buffers.
 
+The official `config.json` reports 43 hidden layers, 256 routed experts, one
+shared expert, and six routed experts active per token. The hidden size is
+4,096. This confirms that the 13B activated-parameter figure does not reduce
+the storage requirement to 13B parameters: the complete routed-expert pool is
+still part of the 148.66 GiB checkpoint and must be streamed, cached, or
+otherwise retained by the serving system.
+
 ## Paper-model decision
 
 The official DeepSeek model card identifies DeepSeek-V4-Flash as 284B total
