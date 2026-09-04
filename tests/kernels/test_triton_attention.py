@@ -106,6 +106,257 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
     assert captured["sinks"] is sinks
 
 
+@pytest.mark.parametrize("quant_name", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("dispatch", ["decode", "extend", "paged"])
+def test_triton_backend_forwards_quantized_payload_scales_and_layout(
+    monkeypatch, quant_name: str, dispatch: str
+):
+    """The backend-to-kernel handoff is part of the quantized cache data path.
+
+    Q8 payloads retain the logical shape, so omitting their scales does not fail a
+    shape check: it silently makes attention consume raw int8 codes. Sub-byte payloads
+    additionally need their packed physical dimension preserved while K/V extension
+    tensors retain the logical dimension.
+    """
+    from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
+    from freetoken.kvcache.quant import resolve_kv_quant
+    from freetoken.kernel.triton import attention as attention_kernels
+
+    quant = resolve_kv_quant(quant_name)
+    logical_d = 32
+    physical_d = quant.physical_head_dim(logical_d)
+    num_slots, num_kv_heads = 4, 1
+
+    class FakeQuantizedKVCache:
+        def __init__(self):
+            self.device = torch.device("cpu")
+            self.quant = quant
+            # Keep a page axis so the test also verifies that payload and scale slabs
+            # are flattened consistently by the backend.
+            self.k = torch.empty(2, 2, num_kv_heads, physical_d, dtype=quant.storage_dtype)
+            self.v = torch.empty_like(self.k)
+            self.ks = torch.empty(2, 2, num_kv_heads, 1, dtype=torch.float16)
+            self.vs = torch.empty_like(self.ks)
+            self.stored = False
+
+        def store_kv(self, k, v, out_loc, layer_id):
+            self.stored = True
+
+        def k_cache(self, layer_id):
+            return self.k
+
+        def v_cache(self, layer_id):
+            return self.v
+
+        def k_scale(self, layer_id):
+            return self.ks
+
+        def v_scale(self, layer_id):
+            return self.vs
+
+    kv_cache = FakeQuantizedKVCache()
+    monkeypatch.setattr(
+        "freetoken.attention.triton.get_global_ctx",
+        lambda: SimpleNamespace(kv_cache=kv_cache),
+    )
+
+    captured = {}
+
+    def fake_attention(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.zeros_like(kwargs["q"])
+
+    monkeypatch.setattr(attention_kernels, "decode_paged_attention", fake_attention)
+    monkeypatch.setattr(attention_kernels, "extend_paged_attention", fake_attention)
+    monkeypatch.setattr(attention_kernels, "paged_attention", fake_attention)
+
+    is_decode = dispatch == "decode"
+    q_dtype = torch.float32 if dispatch == "paged" else torch.bfloat16
+    metadata = TritonMetadata(
+        cu_seqlens_q_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+        indices=torch.tensor([0, 1], dtype=torch.int32),
+        q_to_req=torch.tensor([0, 1], dtype=torch.int32),
+        q_positions=torch.tensor([0, 0], dtype=torch.int64),
+        is_decode=is_decode,
+        prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+        max_q_len=1,
+    )
+    batch = SimpleNamespace(
+        attn_metadata=metadata,
+        out_loc=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    q = torch.randn(2, 2, logical_d, dtype=q_dtype)
+    k = torch.randn(2, logical_d, dtype=q_dtype)
+    v = torch.randn(2, logical_d, dtype=q_dtype)
+
+    backend = TritonAttentionBackend(SimpleNamespace())
+    out = backend.forward(q, k, v, 0, batch)
+
+    assert kv_cache.stored
+    assert out.shape == q.shape
+    assert captured["k_cache"].shape == (num_slots, num_kv_heads, physical_d)
+    assert captured["v_cache"].shape == (num_slots, num_kv_heads, physical_d)
+    assert captured["k_scale"].shape == (num_slots, num_kv_heads, 1)
+    assert captured["v_scale"].shape == (num_slots, num_kv_heads, 1)
+    assert captured["layout"] == quant.layout
+    if dispatch == "extend":
+        assert captured["k_extend"].shape == (2, num_kv_heads, logical_d)
+        assert captured["v_extend"].shape == (2, num_kv_heads, logical_d)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="quantized Triton KV needs CUDA")
+def test_q8_store_and_decode_attention_match_oracles():
+    """GPU regression for the complete generation-critical Q8 path.
+
+    This checks the store payload/scales independently, including a V tensor whose
+    strides differ from K, then checks decode attention against those stored values
+    dequantized by the PyTorch oracle.
+    """
+    from freetoken.kernel.triton.attention import decode_paged_attention
+    from freetoken.kernel.triton.kv_quant import store_kv_quant
+    from freetoken.kvcache.quant import Q8_0
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    num_tokens, num_slots = 12, 19
+    num_kv_heads, num_q_heads, head_dim = 2, 4, 128
+    k = torch.randn(
+        num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    # Deliberately use distinct token/head/D strides to guard the V-specific source
+    # addressing in the fused K+V store kernel.
+    v_backing = torch.randn(
+        num_tokens, num_kv_heads, head_dim * 2, device=device, dtype=torch.bfloat16
+    )
+    v = v_backing[..., ::2]
+    indices = torch.randperm(num_slots, device=device)[:num_tokens].to(torch.int32)
+    k_cache = torch.empty(
+        num_slots, num_kv_heads, head_dim, device=device, dtype=Q8_0.storage_dtype
+    )
+    v_cache = torch.empty_like(k_cache)
+    k_scale = torch.empty(
+        num_slots, num_kv_heads, head_dim // 32, device=device, dtype=torch.float16
+    )
+    v_scale = torch.empty_like(k_scale)
+
+    store_kv_quant(k_cache, k_scale, v_cache, v_scale, indices, k, v, Q8_0)
+
+    expected_k_payload, expected_k_scale = Q8_0.quantize(k)
+    expected_v_payload, expected_v_scale = Q8_0.quantize(v)
+    dst = indices.to(torch.long)
+    torch.testing.assert_close(k_cache[dst], expected_k_payload, atol=0, rtol=0)
+    torch.testing.assert_close(v_cache[dst], expected_v_payload, atol=0, rtol=0)
+    torch.testing.assert_close(k_scale[dst], expected_k_scale, atol=0, rtol=0)
+    torch.testing.assert_close(v_scale[dst], expected_v_scale, atol=0, rtol=0)
+
+    seq_lens = [5, 7]
+    batch = len(seq_lens)
+    q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    indptr = torch.tensor([0, 5, 12], dtype=torch.int32, device=device)
+    q_positions = torch.tensor([4, 6], dtype=torch.int64, device=device)
+    q_to_req = torch.arange(batch, dtype=torch.int32, device=device)
+    max_kv_splits = 8
+    attn_logits = torch.empty(
+        batch, num_q_heads, max_kv_splits, head_dim, device=device, dtype=torch.float32
+    )
+    attn_lse = torch.empty(
+        batch, num_q_heads, max_kv_splits, device=device, dtype=torch.float32
+    )
+    num_kv_splits = torch.full(
+        (batch,), max_kv_splits, device=device, dtype=torch.int32
+    )
+    sm_scale = head_dim**-0.5
+
+    actual = decode_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        indptr,
+        indices,
+        q_positions,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        layout=Q8_0.layout,
+    )
+    k_dequant = torch.zeros(
+        num_slots, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_dequant = torch.zeros_like(k_dequant)
+    k_dequant[dst] = Q8_0.dequantize(k_cache[dst], k_scale[dst]).to(torch.bfloat16)
+    v_dequant[dst] = Q8_0.dequantize(v_cache[dst], v_scale[dst]).to(torch.bfloat16)
+    expected = _reference_paged_attention(
+        q,
+        k_dequant,
+        v_dequant,
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="quantized Triton KV needs CUDA")
+@pytest.mark.parametrize("quant_name", ["q8_0", "q4_0", "q6_0"])
+def test_quantized_paged_attention_matches_dequantized_oracle(quant_name: str):
+    """Every packed layout must interpret _load_kv offsets exactly once."""
+    from freetoken.kernel.triton.attention import paged_attention
+    from freetoken.kvcache.quant import resolve_kv_quant
+
+    quant = resolve_kv_quant(quant_name)
+    torch.manual_seed(12)
+    device = torch.device("cuda")
+    num_tokens, num_q_heads, num_kv_heads, head_dim = 12, 4, 2, 128
+    q = torch.randn(2, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(
+        num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    k_cache, k_scale = quant.quantize(k)
+    v_cache, v_scale = quant.quantize(v)
+    indptr = torch.tensor([0, 5, 12], dtype=torch.int32, device=device)
+    indices = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    q_to_req = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    q_positions = torch.tensor([4, 6], dtype=torch.int64, device=device)
+    sm_scale = head_dim**-0.5
+
+    actual = paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        layout=quant.layout,
+    )
+    expected = _reference_paged_attention(
+        q,
+        quant.dequantize(k_cache, k_scale).to(torch.bfloat16),
+        quant.dequantize(v_cache, v_scale).to(torch.bfloat16),
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("head_dim", [256, 512])
 @pytest.mark.parametrize("sliding_window", [None, 3])

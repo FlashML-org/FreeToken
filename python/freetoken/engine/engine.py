@@ -151,6 +151,44 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     )
 
 
+def _validate_kv_cache_dtype(config, model_config) -> None:
+    """Gate --kv-cache-dtype against what the quantized path actually implements.
+
+    Quantized KV storage lives in the triton attention kernels and the MHA/hybrid-SWA
+    pools. Every other backend reads the KV slabs through its own kernels (flashinfer's
+    ``kv_data_type``, trtllm's fp8 path) which this has not been wired into, and the
+    MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations here,
+    at config time, rather than letting a wrong-dtype tensor reach a kernel.
+    """
+    quant = getattr(config, "kv_quant", None)
+    if quant is None or not quant.enabled:
+        return
+
+    from freetoken.kvcache.quant import BLOCK
+
+    backends = [p.strip() for p in config.attention_backend.split(",")]
+    if any(b != "triton" for b in backends):
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} needs the triton attention backend, but the "
+            f"resolved backend is {config.attention_backend!r}. Pass "
+            "--attention-backend triton, or drop --kv-cache-dtype."
+        )
+
+    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    if any(s.mla or s.index_head_dim > 0 for s in specs):
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} does not support MLA/DSA latent KV pools "
+            "(their slabs alias K and V and carry an index tier); use --kv-cache-dtype auto."
+        )
+    bad = [s for s in specs if s.head_dim % BLOCK]
+    if bad:
+        names = ", ".join(f"{s.name} (head_dim {s.head_dim})" for s in bad)
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} needs every head_dim to be a multiple of "
+            f"{BLOCK}, the quantization block; this model has {names}."
+        )
+
+
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
     """Config-time type x backend capability check for the resolved (or explicit)
     backend string: every comma part must serve every required type and have its
@@ -1332,6 +1370,7 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    _validate_kv_cache_dtype(config, model_config)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
