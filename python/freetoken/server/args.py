@@ -32,6 +32,11 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Grow KV at request boundaries, funding each growth by shrinking the GPU MoE expert
+    # cache. Currently restricted to single-request serving.
+    enable_kv_ladder: bool = False
+    # KV tokens per ladder rung. The automatic startup reserve is twice this value.
+    ladder_step_size: int = 32_768
     # Report the prefix-cache hit in each response's usage block (OpenAI
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
@@ -264,6 +269,27 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
         help="Default max output tokens for requests that omit one (default 32k).",
+    )
+
+    parser.add_argument(
+        "--enable-kv-ladder",
+        action="store_true",
+        default=ServerArgs.enable_kv_ladder,
+        help=(
+            "Start KV at two ladder steps and grow it by one step whenever "
+            "prompt + max output reaches the current bound, shrinking the MoE cache to fit. "
+            "Requires --moe-cache-auto, --max-running-requests 1, and TP=1."
+        ),
+    )
+
+    parser.add_argument(
+        "--ladder-step-size",
+        type=_positive_int,
+        default=ServerArgs.ladder_step_size,
+        help=(
+            "KV tokens per automatic ladder step (default 32768); the ladder starts with "
+            "twice this capacity. Only used with --enable-kv-ladder."
+        ),
     )
 
     parser.add_argument(
@@ -690,6 +716,21 @@ def parse_args(
     )
     if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
+
+    if kwargs["enable_kv_ladder"]:
+        if kwargs["max_running_req"] != 1:
+            parser.error("--enable-kv-ladder requires --max-running-requests 1")
+        if kwargs["tensor_parallel_size"] != 1:
+            parser.error("--enable-kv-ladder currently requires --tensor-parallel-size 1")
+        if kwargs["moe_backend"] in ("cpu", "fused"):
+            parser.error("--enable-kv-ladder requires the offload or hybrid MoE backend")
+        if not kwargs["moe_cache_auto"]:
+            parser.error("--enable-kv-ladder requires --moe-cache-auto")
+        # --moe-cache-auto consumes this floor during startup, giving the ladder its first
+        # 2x-step rung without a wasteful post-startup graph recapture.
+        kwargs["kv_reserve_tokens"] = max(
+            kwargs["kv_reserve_tokens"], 2 * kwargs["ladder_step_size"]
+        )
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]
