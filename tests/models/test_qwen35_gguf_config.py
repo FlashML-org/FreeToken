@@ -78,3 +78,40 @@ def test_qwen35moe_gguf_rejects_an_invalid_ssm_value_head_partition():
         assert "value-head groups" in str(exc)
     else:
         raise AssertionError("expected malformed Gated DeltaNet geometry to be rejected")
+
+
+def test_qwen35_dense_gguf_metadata_maps_to_dense_hybrid_geometry():
+    """Qwen3.8's qwen35 metadata selects the existing dense hybrid model branch."""
+    base = _qwen35moe_shim()
+    metadata = {
+        key.replace("qwen35moe.", "qwen35.", 1): value
+        for key, value in base.metadata.items()
+        if "expert_" not in key and key != "qwen35moe.expert_count"
+    }
+    metadata.update(
+        {
+            "qwen35.block_count": 64,
+            "qwen35.embedding_length": 5120,
+            "qwen35.feed_forward_length": 17408,
+            "qwen35.attention.head_count": 24,
+            "qwen35.attention.head_count_kv": 4,
+            "qwen35.ssm.inner_size": 6144,
+            "qwen35.ssm.time_step_rank": 48,
+        }
+    )
+    dense = GgufConfigShim(
+        architectures=["Qwen3_5MoeGGUFForCausalLM"],
+        model_path="qwen38-27b-q4-k-m.gguf",
+        model_type="qwen35",
+        metadata=metadata,
+        vocab_size=248320,
+        tie_word_embeddings=False,
+    )
+
+    config = parse_gguf_config(dense)
+
+    assert (config.num_layers, config.hidden_size, config.intermediate_size) == (64, 5120, 17408)
+    assert config.num_experts == 0
+    assert config.moe_enabled is False
+    assert config.moe_weight_format == "qwen35_dense"
+    assert config.expert_quant == "none"

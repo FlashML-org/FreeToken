@@ -173,9 +173,12 @@ def iter_gguf_weights(
     _require_weight_tp1()
 
     metadata = load_gguf_metadata(model_path)
-    gdn_num_key_heads = int(metadata["qwen35moe.ssm.group_count"])
-    gdn_num_value_heads = int(metadata["qwen35moe.ssm.time_step_rank"])
-    gdn_inner_size = int(metadata["qwen35moe.ssm.inner_size"])
+    arch = metadata.get("general.architecture")
+    prefix = "qwen35moe" if arch == "qwen35moe" else "qwen35"
+    dense_model = prefix == "qwen35"
+    gdn_num_key_heads = int(metadata[f"{prefix}.ssm.group_count"])
+    gdn_num_value_heads = int(metadata[f"{prefix}.ssm.time_step_rank"])
+    gdn_inner_size = int(metadata[f"{prefix}.ssm.inner_size"])
     if gdn_num_value_heads <= 0 or gdn_inner_size % gdn_num_value_heads:
         raise ValueError(
             "Qwen GGUF GDN metadata has an invalid value-head geometry: "
@@ -186,12 +189,13 @@ def iter_gguf_weights(
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     gdn_buf: dict[int, dict[str, torch.Tensor]] = {}
     shared_buf: dict[int, dict[str, torch.Tensor]] = {}
+    dense_buf: dict[int, dict[str, torch.Tensor]] = {}
 
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if name == "token_embd.weight":
-            if t.ggml_type != GGML_Q8_0:
-                raise ValueError(f"{name} expected Q8_0, got {t.ggml_type}")
+            if t.ggml_type not in (GGML_Q8_0, GGML_Q4_K):
+                raise ValueError(f"{name} expected Q8_0 or Q4_K, got {t.ggml_type}")
             yield "model.embed_tokens.qweight", t.packed()
             continue
         if name == "output.weight":
@@ -214,7 +218,11 @@ def iter_gguf_weights(
         base = f"model.layers.{layer}"
         if suffix in _EXPERT_SUFFIXES:
             continue
-        if suffix in _GDN_BA_SUFFIXES:
+        if dense_model and suffix in ("ffn_gate.weight", "ffn_up.weight"):
+            dense_buf.setdefault(layer, {})[suffix.removeprefix("ffn_").removesuffix(".weight")] = t.packed()
+        elif dense_model and suffix == "ffn_down.weight":
+            yield f"{base}.mlp.down_proj.qweight", t.packed()
+        elif suffix in _GDN_BA_SUFFIXES:
             # The split GGUF path keeps qkv|z packed Q8_0, while recurrence b|a
             # remains a conventional dense fused projection.  The runtime order is
             # explicitly b then a, matching Qwen3_5GatedDeltaNet._in_proj_split.
@@ -326,10 +334,17 @@ def iter_gguf_weights(
                 [slots["gate"], slots["up"]], dim=0
             )
             del shared_buf[layer]
+        slots = dense_buf.get(layer)
+        if slots is not None and all(key in slots for key in ("gate", "up")):
+            yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
+                [slots["gate"], slots["up"]], dim=0
+            )
+            del dense_buf[layer]
 
     assert not qkv_buf, f"incomplete Qwen attention QKV groups: {sorted(qkv_buf)}"
     assert not gdn_buf, f"incomplete Qwen GDN qkv/z groups: {sorted(gdn_buf)}"
     assert not shared_buf, f"incomplete Qwen shared gate/up groups: {sorted(shared_buf)}"
+    assert not dense_buf, f"incomplete Qwen dense gate/up groups: {sorted(dense_buf)}"
 
 
 class GGUFLMHead(BaseOP):
@@ -352,12 +367,16 @@ class GGUFLMHead(BaseOP):
 
 def is_gguf_model(config: ModelConfig) -> bool:
     """Return whether this model uses the Qwen packed-GGUF runtime path."""
-    return getattr(config, "moe_weight_format", None) == "q4_k_q5_k"
+    return getattr(config, "moe_weight_format", None) in {"q4_k_q5_k", "qwen35_dense"}
 
 
 def convert_qwen3_5_to_gguf(model, config: ModelConfig) -> None:
     """Replace Qwen dense projections with packed GGUF HIP operators in place."""
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+
+    dense_model = not config.moe_enabled
+    embed_quant = GGML_Q4_K if dense_model else GGML_Q8_0
+    full_output_quant = GGML_Q6_K if dense_model else GGML_Q8_0
 
     def swap_linear(owner, attr: str, quant_type: int, in_features: int, out_features: int):
         old = getattr(owner, attr)
@@ -365,7 +384,7 @@ def convert_qwen3_5_to_gguf(model, config: ModelConfig) -> None:
 
     inner = model.model
     inner.embed_tokens = GGUFEmbedding(
-        config.vocab_size, config.hidden_size, GGML_Q8_0, embed_scale=None
+        config.vocab_size, config.hidden_size, embed_quant, embed_scale=None
     )
     for layer in inner.layers.op_list:
         if layer._is_linear:
@@ -385,18 +404,19 @@ def convert_qwen3_5_to_gguf(model, config: ModelConfig) -> None:
                 config.hidden_size, sum(layer.self_attn._qkv_split),
             )
             swap_linear(
-                layer.self_attn, "o_proj", GGML_Q8_0,
+                layer.self_attn, "o_proj", full_output_quant,
                 layer.self_attn.qo_attn_dim, config.hidden_size,
             )
-        shared = layer.mlp.shared_expert
-        swap_linear(
-            shared, "gate_up_proj", GGML_Q8_0,
-            config.hidden_size, 2 * config.shared_expert_intermediate_size,
-        )
-        swap_linear(
-            shared, "down_proj", GGML_Q8_0,
-            config.shared_expert_intermediate_size, config.hidden_size,
-        )
+        if config.moe_enabled:
+            owner = layer.mlp.shared_expert
+            intermediate = config.shared_expert_intermediate_size
+            mlp_quant = GGML_Q8_0
+        else:
+            owner = layer.mlp
+            intermediate = config.intermediate_size
+            mlp_quant = GGML_Q4_K
+        swap_linear(owner, "gate_up_proj", mlp_quant, config.hidden_size, 2 * intermediate)
+        swap_linear(owner, "down_proj", mlp_quant, intermediate, config.hidden_size)
     model.lm_head = GGUFLMHead(config.vocab_size, config.hidden_size)
 
 
