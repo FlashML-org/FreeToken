@@ -8,6 +8,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 
 | UTC date | Evidence | Category | Outcome |
 | --- | --- | --- | --- |
+| 2026-09-04 | PR branch static validation | Integration validation | Both Gemma runner shell scripts passed `bash -n`; all four Gemma benchmark Python modules passed `py_compile`; required reports and harness files were present; the PR checkout was clean. |
 | 2026-08-28 | `gmk-evo-x2-rocm-validation-2026-08-28.md` | Native AMD functionality | Qwen NVFP4 and Gemma Q4 served through native ROCm/HIP API paths |
 | 2026-08-29 | `gmk-evo-x2-qwen-router-optimization-2026-08-29.md` | Local control and optimization | Rejected quality-changing router candidates; retained a safe configuration |
 | 2026-08-30 | `gmk-evo-x2-qwen-q4-raw-control-20260830.md` | Local control | FreeToken Q4 50.63 TPS versus ROCm llama.cpp 50.29 TPS on fixed raw prompt |
