@@ -7,6 +7,7 @@ import torch
 
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
+    fp8_dense_enabled,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
@@ -138,6 +139,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # FREETOKEN_FP8_DENSE=1: the bf16 attention / GDN projections are quantized at LOAD to
+    # per-tensor e4m3 and served W8A8 through cuBLASLt (layers/fp8_dynamic.py). This is a
+    # synthetic scheme for a checkpoint that ships those modules unquantized -- distinct from
+    # the QuantConfig path, which serves what the checkpoint declares. The module builders
+    # apply it only where the checkpoint has no scheme of its own, so the two never collide.
+    attn_quant = "fp8_dynamic" if fp8_dense_enabled() else "none"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
@@ -245,6 +252,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        attn_quant=attn_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )
