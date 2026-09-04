@@ -84,7 +84,7 @@ struct StoreKernel {
         .verify(v);
     TensorMatcher({L}) //
         .with_device<kDLCUDA>(device_)
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
+        .template with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
     const auto dtype_size = dtype_bytes(dtype_.unwrap());
