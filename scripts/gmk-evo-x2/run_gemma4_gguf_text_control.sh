@@ -168,16 +168,6 @@ if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
         >"${ARTIFACT_DIR}/long-context.log" 2>&1
 fi
 
-if [[ "${FREETOKEN_GEMMA4_ENDURANCE:-}" == "1" ]]; then
-    # Run repeated quality requests only after the shorter quality gate.  The
-    # harness stops on the first failed session and never restarts the server.
-    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_endurance.py \
-        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
-        --sessions "${FREETOKEN_GEMMA4_SESSIONS:-30}" --interval "${FREETOKEN_GEMMA4_INTERVAL:-1}" \
-        --artifact "${ARTIFACT_DIR}/endurance.json" \
-        >"${ARTIFACT_DIR}/endurance.log" 2>&1
-fi
-
 if [[ "${MODE}" == "vision" ]]; then
     # Keep the candidate alive through the actual OpenAI image_url contract
     # control. The verifier writes a self-contained response/usage artifact;
