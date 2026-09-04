@@ -264,7 +264,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
-    """Build the Qwen3.5 MoE runtime configuration from ``qwen35moe`` GGUF metadata.
+    """Build a Qwen3.5 hybrid runtime configuration from GGUF metadata.
 
     llama.cpp records the same hybrid decoder geometry as the official Hugging Face
     configuration, but expresses the Gated DeltaNet fields with its SSM vocabulary.
@@ -274,10 +274,16 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     for a runnable GGUF path.
     """
     metadata = shim.metadata
+    # Qwen3.8-27B uses the dense ``qwen35`` GGUF architecture, while the
+    # qualified Qwen3.6-35B-A3B control uses ``qwen35moe``. Both share the
+    # hybrid attention and Gated DeltaNet geometry, but only the latter has
+    # routed-expert fields.
+    prefix = "qwen35moe" if shim.model_type == "qwen35moe" else "qwen35"
+    is_moe = prefix == "qwen35moe"
 
     def value(key: str):
         """Read one required architecture-scoped GGUF value with a clear error."""
-        full_key = f"qwen35moe.{key}"
+        full_key = f"{prefix}.{key}"
         if full_key not in metadata:
             raise KeyError(f"missing GGUF metadata key {full_key}")
         return metadata[full_key]
@@ -352,6 +358,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     except FileNotFoundError:
         pass
 
+    intermediate_size = int(value("feed_forward_length"))
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -359,17 +366,19 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         head_dim=head_dim,
         hidden_size=hidden_size,
         vocab_size=int(shim.vocab_size),
-        intermediate_size=0,
+        intermediate_size=intermediate_size,
         hidden_act="silu",
         rms_norm_eps=float(value("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
         rotary_config=rotary,
-        num_experts=int(value("expert_count")),
-        num_experts_per_tok=int(value("expert_used_count")),
-        moe_intermediate_size=int(value("expert_feed_forward_length")),
-        shared_expert_intermediate_size=int(value("expert_shared_feed_forward_length")),
+        num_experts=int(value("expert_count")) if is_moe else 0,
+        num_experts_per_tok=int(value("expert_used_count")) if is_moe else 0,
+        moe_intermediate_size=int(value("expert_feed_forward_length")) if is_moe else 0,
+        shared_expert_intermediate_size=(
+            int(value("expert_shared_feed_forward_length")) if is_moe else 0
+        ),
         norm_topk_prob=True,
-        moe_enabled=True,
+        moe_enabled=is_moe,
         use_qk_norm=True,
         model_type="qwen3_5_moe",
         architectures=["Qwen3_5MoeForConditionalGeneration"],
@@ -377,8 +386,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attention_groups=(linear_group, full_group),
         # The Qwen3.6-35B-A3B Q4_K_M GGUF stores routed gate/up in Q4_K and
         # routed down in Q5_K. The explicit tag selects the mixed bank provider.
-        expert_quant="q4_k_q5_k",
-        moe_weight_format="q4_k_q5_k",
+        expert_quant="q4_k_q5_k" if is_moe else "none",
+        moe_weight_format="q4_k_q5_k" if is_moe else "qwen35_dense",
         gguf_q6_down_layer_ids=q6_down_layers,
         # Dense Q8_0 projections use the native GGUF operator pair.  This is distinct
         # from modelopt FP8: qkv|z remains packed GGUF while b|a stays F32.
