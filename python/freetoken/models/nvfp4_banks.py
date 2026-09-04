@@ -60,6 +60,36 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
+def _tp_slice() -> tuple[int, int] | None:
+    """``(i_local, i_lo)``: this rank's slice of the expert intermediate axis, or None at TP=1.
+
+    TP shards every routed expert along I (gate/up output rows, down input columns), so each
+    rank caches only its own half and the MoE layer all-reduces the partial sum. The expert
+    kernel sizes its banks from ``MoEConfig.local_intermediate``, which is the same split.
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    if tp is None or tp.size == 1:
+        return None
+    return tp.size, tp.rank
+
+
+def _tp_shard(role: str, tensor: torch.Tensor, inter: int, tp_size: int, tp_rank: int):
+    """This rank's I-slice of one checkpoint expert tensor. ``_global`` is a per-tensor scalar
+    and has no I axis; gate/up carry I on the row axis, down on the column axis (halved for the
+    packed FP4 codes, sixteenthed for the fp8 block scales)."""
+    if role.endswith("_global"):
+        return tensor
+    n = inter // tp_size
+    assert n % 16 == 0, f"NVFP4 TP shard {n} must cover whole 16-wide scale blocks"
+    lo = tp_rank * n
+    if role.startswith("down"):
+        d = 2 if role == "down" else 16
+        return tensor[:, lo // d : (lo + n) // d]
+    return tensor[lo : lo + n]
+
+
 def _kind_suffix(kind: str) -> str:
     return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
 
@@ -133,7 +163,19 @@ def iter_nvfp4_expert_pieces(
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    stream = _parallel() if parallel else _serial()
+    shard = _tp_slice()
+    if shard is not None:
+        tp_size, tp_rank = shard
+        inter = config.moe_intermediate_size
+        base = stream
+
+        def _sharded():
+            for name, tensor in base:
+                yield name, _tp_shard(wanted[name][2], tensor, inter, tp_size, tp_rank)
+
+        stream = _sharded()
+    return per_expert_pieces(stream, wanted.get, tensors_per_expert=9)
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
