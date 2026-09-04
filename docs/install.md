@@ -23,6 +23,18 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+## Method 3: Run the container image
+
+GitHub publishes images for `main` and version tags to GitHub Container Registry.
+Mount the directory containing a model and pass it to `ft serve`:
+
+```bash
+docker run --gpus all --rm -p 1919:1919 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/flashml-org/freetoken:latest \
+  serve --model /models/Qwen3.6-35B-A3B
+```
+
 ## Verify
 
 ```bash
