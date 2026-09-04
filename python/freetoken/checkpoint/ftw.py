@@ -462,6 +462,11 @@ def load_ftw_banks(
         return "mmap"
 
     reader = FTWReader(path)
+    auxiliary_checkpoint = reader.meta("auxiliary_checkpoint")
+    auxiliary_layer_ids = tuple(reader.meta("auxiliary_layer_ids", ()))
+    if bool(auxiliary_checkpoint) != bool(auxiliary_layer_ids):
+        reader.close()
+        raise RuntimeError("FTW auxiliary checkpoint and layer mapping must be recorded together")
     bank_entries = reader.entries("experts_bank")
     if not bank_entries:
         reader.close()
@@ -627,9 +632,24 @@ def load_ftw_banks(
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    auxiliary_kw = {}
+    if auxiliary_checkpoint:
+        auxiliary = load_ftw_banks(
+            os.path.join(path, auxiliary_checkpoint),
+            num_layers=len(auxiliary_layer_ids),
+            workers=workers,
+            chunk=chunk,
+        )
+        if auxiliary is None:
+            raise RuntimeError("FTW auxiliary checkpoint contains no expert banks")
+        auxiliary_kw = {
+            "auxiliary_quant_format": auxiliary.quant_format,
+            "auxiliary_sources": auxiliary.sources,
+            "auxiliary_layer_ids": auxiliary_layer_ids,
+        }
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
-        layer_residency=applied,
+        layer_residency=applied, **auxiliary_kw,
     )
 
 

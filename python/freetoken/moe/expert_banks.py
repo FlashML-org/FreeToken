@@ -49,6 +49,11 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # Optional banks with a different row geometry. They are serialized as a nested FTW
+    # checkpoint and mapped back to their model layers by ``auxiliary_layer_ids``.
+    auxiliary_quant_format: str | None = None
+    auxiliary_sources: dict[str, list[torch.Tensor]] | None = None
+    auxiliary_layer_ids: tuple[int, ...] = ()
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
