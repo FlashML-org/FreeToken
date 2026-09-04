@@ -36,6 +36,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # The request's stop strings (None when it has none), so the detokenizer can hold back
     # a trailing partial-stop prefix instead of streaming it and then needing to retract.
     stop_strs: list[str] | None = None
+    # Sampled-token logprobs (None unless the request asked): the chosen token's raw
+    # logprob and the top alternatives, already cut to this request's top_logprobs.
+    chosen_logprob: float | None = None
+    top_ids: list[int] | None = None
+    top_logprobs: list[float] | None = None
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0

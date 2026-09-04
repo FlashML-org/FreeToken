@@ -145,3 +145,32 @@ class DetokenizeManager:
                 del self.decode_map[msg.uid]
 
         return incremental_strs
+
+
+def build_logprobs_entry(
+    tokenizer: PreTrainedTokenizerBase,
+    token_id: int,
+    chosen_logprob: float,
+    top_ids: list[int] | None,
+    top_logprobs: list[float] | None,
+) -> dict:
+    """Neutral sampled-token logprobs entry (UserReply.logprobs). Values are the raw
+    pre-temperature logprobs the sampler computed; token text comes from a single-id
+    decode, with UTF-8 bytes alongside so clients can reassemble partial-UTF-8 pieces."""
+
+    def _fields(tid: int) -> tuple[str, list[int]]:
+        text = tokenizer.decode([tid])
+        return text, list(text.encode("utf-8"))
+
+    token, token_bytes = _fields(token_id)
+    top = []
+    for tid, logprob in zip(top_ids or [], top_logprobs or []):
+        text, data = _fields(int(tid))
+        top.append({"token_id": int(tid), "token": text, "bytes": data, "logprob": float(logprob)})
+    return {
+        "token_id": token_id,
+        "token": token,
+        "bytes": token_bytes,
+        "logprob": float(chosen_logprob),
+        "top": top,
+    }

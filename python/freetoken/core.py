@@ -25,6 +25,10 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # Sampled-token logprobs (OpenAI `logprobs`/`top_logprobs`): when on, the sampler
+    # reports the chosen token's raw (pre-temperature) logprob and top-k alternatives.
+    logprobs: bool = False
+    top_logprobs: int = 0
 
     @property
     def is_greedy(self) -> bool:

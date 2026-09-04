@@ -303,8 +303,9 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        batch, outputs = last_data[0].batch, last_data[1]
+        next_tokens_cpu = outputs.next_tokens_cpu
+        outputs.copy_done_event.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -337,6 +338,19 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+
+                row_chosen_logprob: float | None = None
+                row_top_ids: list[int] | None = None
+                row_top_logprobs: list[float] | None = None
+                if req.sampling_params.logprobs and outputs.chosen_logprobs_cpu is not None:
+                    row_chosen_logprob = float(outputs.chosen_logprobs_cpu[i].item())
+                    requested_top = req.sampling_params.top_logprobs
+                    if requested_top > 0 and outputs.top_ids_cpu is not None:
+                        row_top_ids = [int(t) for t in outputs.top_ids_cpu[i, :requested_top].tolist()]
+                        row_top_logprobs = outputs.top_logprobs_cpu[i, :requested_top].tolist()
+                    else:
+                        row_top_ids = []
+                        row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
@@ -368,6 +382,9 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        chosen_logprob=row_chosen_logprob,
+                        top_ids=row_top_ids,
+                        top_logprobs=row_top_logprobs,
                     )
                 )
 
