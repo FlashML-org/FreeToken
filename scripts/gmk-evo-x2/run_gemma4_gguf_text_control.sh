@@ -147,6 +147,27 @@ if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
         >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
 fi
 
+if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_concurrency.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" --artifact "${ARTIFACT_DIR}/concurrency.json" \
+        >"${ARTIFACT_DIR}/concurrency.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --artifact "${ARTIFACT_DIR}/long-context.json" >"${ARTIFACT_DIR}/long-context.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_ENDURANCE:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_endurance.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --sessions "${FREETOKEN_GEMMA4_SESSIONS:-30}" --interval "${FREETOKEN_GEMMA4_INTERVAL:-1}" \
+        --artifact "${ARTIFACT_DIR}/endurance.json" >"${ARTIFACT_DIR}/endurance.log" 2>&1
+fi
+
 if [[ "${MODE}" == "vision" ]]; then
     # Keep the candidate alive through the actual OpenAI image_url contract
     # control. The verifier writes a self-contained response/usage artifact;
