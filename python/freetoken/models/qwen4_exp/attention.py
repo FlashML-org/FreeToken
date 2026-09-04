@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.models.quant_linear import make_col_merged, make_replicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -121,10 +122,10 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
-        )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        # q|k|v are all quantized together (or all bf16), so the merged GEMM stays a
+        # single kernel; a modelopt MIXED_PRECISION checkpoint declares them FP8_PB_WO.
+        self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split)
+        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config

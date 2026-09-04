@@ -120,6 +120,10 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
+_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -168,16 +172,26 @@ def parse_config(hf_config: Any) -> ModelConfig:
             # ``quantized_layers`` rather than once at the top level. The community
             # NVFP4-FP8 build of Qwen3.8-Flash-Next quantizes the routed experts to NVFP4
             # (read natively by the offload cache) and the dense attn/GDN projections to
-            # 128x128 block-FP8; the block-FP8 dense weights are dequantized to bf16 at load
-            # (see weight.py ``_load_maybe_block_fp8``), so every non-expert module is bf16.
+            # 128x128 block-FP8, declared per module as ``FP8_PB_WO``.
             quantized = get("quantized_layers") or {}
             experts_nvfp4 = any(
                 ".mlp.experts" in str(module)
                 and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
                 for module, spec in quantized.items()
             )
+            # The same map declares the dense attn/GDN projections as FP8_PB_WO
+            # (per-block, weight-only FP8 with a ``weight_scale_inv`` sibling). Serve
+            # them natively instead of dequantizing at load: the four-way in_proj fusion
+            # splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM (see gdn.py), which
+            # halves the dense bytes read on every decode step.
+            dense_block_fp8 = any(
+                ".mlp.experts" not in str(module)
+                and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
+                for module, spec in quantized.items()
+            )
             expert_quant = "nvfp4" if experts_nvfp4 else "none"
-            attn_quant = dense_quant = lm_head_quant = "none"
+            attn_quant = "fp8_block" if dense_block_fp8 else "none"
+            dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])

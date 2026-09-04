@@ -83,7 +83,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
         # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
-        self._block_fp8 = expert_quant == "fp8_block"
+        # Block-fp8 dense can come from either a wholly block-fp8 checkpoint
+        # (expert_quant) or a modelopt MIXED_PRECISION one where only the dense
+        # attn/GDN projections are FP8_PB_WO while the experts are NVFP4 (attn_quant).
+        self._block_fp8 = "fp8_block" in (expert_quant, attn_quant)
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 

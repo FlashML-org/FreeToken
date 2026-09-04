@@ -2,7 +2,8 @@
 dense projections (qwen3_5_moe, muse_glimmer).
 
 Maps the model's quant config (``expert_quant`` for the dense MLP / shared-expert path,
-``attn_quant`` for attention + GatedDeltaNet projections) to the right ``BaseOP`` linear:
+``attn_quant`` for attention + GatedDeltaNet projections; block-fp8 may be declared by
+either, since a modelopt MIXED_PRECISION checkpoint block-quantizes only the dense side) to the right ``BaseOP`` linear:
 block-FP8, per-tensor-FP8 and NVFP4 implementations live under ``freetoken.kernel.triton``;
 the bf16 fallback is the framework's TP-aware ``freetoken.layers``. Only the *dispatch*
 (config -> layer class) lives here.
@@ -14,7 +15,7 @@ from __future__ import annotations
 def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
                           output_sizes: list[int], has_bias: bool = False):
     """Column-merged linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16."""
-    if expert_quant == "fp8_block":
+    if "fp8_block" in (expert_quant, attn_quant):
         from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 
         return Fp8BlockColMerged(in_f, output_sizes, has_bias)
@@ -34,7 +35,7 @@ def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
 def make_replicated_quant(expert_quant: str, attn_quant: str, in_f: int, out_f: int,
                           has_bias: bool = False):
     """Replicated linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16."""
-    if expert_quant == "fp8_block":
+    if "fp8_block" in (expert_quant, attn_quant):
         from freetoken.kernel.triton.fp8_block_linear import Fp8BlockLinear
 
         return Fp8BlockLinear(in_f, out_f, has_bias)
