@@ -39,6 +39,20 @@ Run (one backend):
 
 Run (all three backends, one server per backend):
     ... --model /path/to/model --backend offload,cpu,hybrid --json out.json
+
+Server options go after a bare "--" and are passed through verbatim to ``ft serve``
+(no script-side mirror of server flags):
+    ... --model /path/to/model --backend hybrid \
+        -- --num-tokens 131072 --kv-reserve-tokens 131072 --moe-cache-size 512
+
+Bench defaults applied only when the passthrough does not set them: ``--moe-cache-auto``
+(unless --moe-cache-size / --moe-cache-rate / --moe-cache-auto is given) and
+``--cuda-graph-max-bs 1`` (eager: pass ``-- --cuda-graph-max-bs 0``). Former script
+flags and their passthrough equivalents: --cache N -> -- --moe-cache-size N;
+--cache-rate R -> -- --moe-cache-rate R; --hybrid-fetch N -> -- --moe-hybrid-max-fetch N;
+--mem-ratio R -> -- --memory-ratio R; --gpu G -> -- --gpu G;
+--no-graph -> -- --cuda-graph-max-bs 0; --num-tokens N -> -- --num-tokens N;
+--kv-reserve-tokens N -> -- --kv-reserve-tokens N.
 """
 
 from __future__ import annotations
@@ -87,23 +101,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--problem", type=int, default=0, help="0-based AIME problem index")
     p.add_argument("--decode", type=int, default=256, help="decode tokens to measure (D)")
     p.add_argument(
-        "--cache",
-        type=int,
-        default=0,
-        help="GPU expert cache slots; 0 = auto-size from free VRAM",
-    )
-    p.add_argument("--cache-rate", type=float, default=None, help="cache slots as a fraction of L*E")
-    p.add_argument(
-        "--hybrid-fetch",
-        type=int,
-        default=-1,
-        help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
-    )
-    p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
-    p.add_argument("--gpu", default=None,
-                   help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
-    p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
-    p.add_argument(
         "--greedy",
         action="store_true",
         help="force temperature 0 (ignore the checkpoint's sampling) so ids are comparable",
@@ -115,6 +112,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait for the spawned server to become ready",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
+    p.add_argument(
+        "server_args",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Everything after a bare '--' is passed through verbatim to `ft serve` "
+            "(e.g. -- --num-tokens 131072 --kv-reserve-tokens 131072). The bench "
+            "defaults --moe-cache-auto and --cuda-graph-max-bs 1 apply only when the "
+            "passthrough does not set them."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -173,27 +180,42 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def _server_args(args: argparse.Namespace) -> list[str]:
+    """The verbatim ``ft serve`` options after '--'. argparse's REMAINDER keeps the
+    separator itself as the first element; strip it so the server sees plain options."""
+    return args.server_args[1:] if args.server_args[:1] == ["--"] else args.server_args
+
+
+def _has_flag(server_args: list[str], *names: str) -> bool:
+    """True if ``server_args`` already carries any of ``names`` (space or = form)."""
+    return any(
+        arg == name or arg.startswith(name + "=")
+        for arg in server_args
+        for name in names
+    )
+
+
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     cmd = [
         sys.executable, "-m", "freetoken.cli", "serve",
         "--model", args.model,
         "--host", "127.0.0.1", "--port", str(port),
         "--moe-backend", backend,
-        "--max-running-requests", "1",
-        "--max-seq-len-override", str(8192 + args.decode),
-        "--memory-ratio", str(args.mem_ratio),
-        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
-        "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]
-    if args.gpu:
-        cmd += ["--gpu", args.gpu]
-    if args.cache > 0:
-        cmd += ["--moe-cache-size", str(args.cache)]
-    elif args.cache_rate is not None:
-        cmd += ["--moe-cache-rate", str(args.cache_rate)]
-    else:
+    passthrough = _server_args(args)
+    # Bench-chosen defaults, applied only when the passthrough doesn't set them:
+    # single running request, the decode-budgeted seq cap, MoE cache auto-sizing,
+    # and one CUDA-graph batch size (bs=1 measurement). The server's own defaults
+    # already match the rest (memory-ratio 0.9, hybrid-max-fetch auto).
+    if not _has_flag(passthrough, "--max-running-requests"):
+        cmd += ["--max-running-requests", "1"]
+    if not _has_flag(passthrough, "--max-seq-len-override"):
+        cmd += ["--max-seq-len-override", str(8192 + args.decode)]
+    if not _has_flag(passthrough, "--moe-cache-size", "--moe-cache-rate", "--moe-cache-auto"):
         cmd.append("--moe-cache-auto")
-    return cmd
+    if not _has_flag(passthrough, "--cuda-graph-max-bs"):
+        cmd += ["--cuda-graph-max-bs", "1"]
+    return cmd + passthrough
 
 
 def die_with_log(msg: str, log_path: str) -> None:
@@ -309,10 +331,10 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
     fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
     cmd = serve_cmd(args, backend, port)
 
+    passthrough = " ".join(_server_args(args)) or "(none)"
     print(
         f"[bench] model={args.model}\n"
-        f"[bench] backend={backend} cache={args.cache or args.cache_rate or 'auto'} "
-        f"mem_ratio={args.mem_ratio} decode={args.decode} graph={not args.no_graph}\n"
+        f"[bench] backend={backend} decode={args.decode} server_args={passthrough}\n"
         f"[bench] sampling={sampling} <- {sampling_src}\n"
         f"[bench] server log: {log_path}",
         flush=True,
