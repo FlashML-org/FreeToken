@@ -6,7 +6,7 @@ Thanks for helping make FreeToken better. This page covers how to report issues 
 
 - [FAQ](https://github.com/FlashML-org/FreeToken/issues/84): kept up to date; most install and runtime problems are answered there.
 - [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79): what we are working on next.
-- [Developer Slack](https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA) for development discussion; [Community Discord](https://discord.gg/xzwSnMdsX) or [Community WeChat](https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png) for usage questions.
+- [Developer Slack](https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA) for development discussion; [Community Discord](https://discord.gg/MsA277cJzZ) or [Community WeChat](https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png) for usage questions.
 
 ## Reporting issues
 
