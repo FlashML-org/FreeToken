@@ -9,6 +9,7 @@ from freetoken.layers import BaseOP, LinearColParallelMerged, LinearOProj
 from freetoken.utils import div_even
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
+from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from freetoken.models.quant_linear import make_replicated_quant
@@ -96,17 +97,27 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
-        self._fp8 = self._block_fp8 or self._pertensor_fp8
+        self._dynamic_fp8 = attn_quant == "fp8_dynamic"  # load-time per-tensor FP8, W8A8
+        self._fp8 = self._block_fp8 or self._pertensor_fp8 or self._dynamic_fp8
 
         self._in_proj_split = [
             self._local_conv_dim, self._local_value_dim,
             self._local_num_v_heads, self._local_num_v_heads,
         ]
         if tp.size > 1:
-            assert not self._fp8 and attn_quant == "none", (
-                "qwen4_exp TP shards bf16 GDN projections only"
+            assert self._dynamic_fp8 or (not self._fp8 and attn_quant == "none"), (
+                "qwen4_exp TP shards bf16 or load-time fp8 GDN projections only"
             )
-        if self._fp8:
+        if self._dynamic_fp8:
+            self.in_proj_qkvz = Fp8DynamicColMerged(
+                hidden_size, [self.conv_dim, self.value_dim],
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
+            )
+            self.in_proj_ba = LinearColParallelMerged(
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
+            )
+        elif self._fp8:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False
@@ -131,7 +142,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        if tp.size > 1:  # row-parallel over the local v heads, all-reduce inside
+        if self._dynamic_fp8:
+            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size)
+        elif tp.size > 1:  # row-parallel over the local v heads, all-reduce inside
             self.out_proj = LinearOProj(self.value_dim, hidden_size, has_bias=False)
         else:
             self.out_proj = make_replicated_quant(
@@ -194,15 +207,15 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
+        nk, nv = self._local_num_k_heads, self._local_num_v_heads
         if self._fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
-            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b, a = torch.split(ba, [nv, nv], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
-        nk, nv = self._local_num_k_heads, self._local_num_v_heads
         kd, vd = self._local_key_dim, self._local_value_dim
         z = z.reshape(total, nv, self.head_v_dim)
         li = pool.local_index(self.layer_id)

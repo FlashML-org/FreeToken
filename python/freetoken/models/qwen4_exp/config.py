@@ -7,6 +7,7 @@ from typing import Any, Tuple
 import torch
 
 from freetoken.models.config import (
+    fp8_dense_enabled,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
@@ -179,6 +180,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
+    if attn_quant == "none" and fp8_dense_enabled():
+        # bf16 attention / GDN projections quantized at load: per-tensor e4m3 weights,
+        # W8A8 through cuBLASLt (layers/fp8_dynamic.py; the loader emits the fp8 tensors)
+        attn_quant = "fp8_dynamic"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")

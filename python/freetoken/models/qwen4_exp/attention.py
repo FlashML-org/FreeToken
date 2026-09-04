@@ -27,6 +27,7 @@ from freetoken.layers import (
     LinearOProj,
     LinearReplicated,
 )
+from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
 
@@ -135,13 +136,17 @@ class Qwen4ExpAttention(BaseOP):
         self._local_qo_dim = self._local_num_q * self.head_dim
         self._local_kv_dim = self._local_num_kv * self.head_dim
         self._qkv_split = [self._local_qo_dim * 2, self._local_kv_dim, self._local_kv_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size,
-            [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim],
-            has_bias=False,
-            local_output_sizes=self._qkv_split,
-        )
-        self.o_proj = LinearOProj(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        qkv_sizes = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        if config.attn_quant == "fp8_dynamic":  # load-time per-tensor FP8, W8A8 GEMMs
+            self.qkv_proj = Fp8DynamicColMerged(
+                config.hidden_size, qkv_sizes, local_output_sizes=self._qkv_split
+            )
+            self.o_proj = Fp8DynamicRowParallel(self.qo_attn_dim, config.hidden_size)
+        else:
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, qkv_sizes, has_bias=False, local_output_sizes=self._qkv_split
+            )
+            self.o_proj = LinearOProj(self.qo_attn_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
