@@ -176,6 +176,8 @@ class FrontendManager:
     cache_pools: Dict[str, int] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
+    # Execution mode and graph/resident telemetry delivered with readiness metadata.
+    execution: Dict[str, Any] = field(default_factory=dict)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
     # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
@@ -791,6 +793,9 @@ def cache_geometry(state: Any) -> dict:
         # Engine's exact total cache VRAM budget (all pools), from the ("meta", …) ack. 0 when
         # unknown (pre-budget engine) — the desktop then reverse-derives it from the limits.
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),
+        # Engine-owned observed storage/graph/execution metadata. Requested CLI
+        # values stay separate; benchmark gates consume this server observation.
+        "execution": dict(getattr(state, "execution", None) or {}),
         "reasoning": reasoning,
     }
     # Per-pool slider bounds, sized against the cache budget the rebuild fit-check actually
@@ -1013,6 +1018,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
+        _GLOBAL_STATE.execution = dict(meta.pop("execution", None) or {})
         _GLOBAL_STATE.unit_bytes = meta
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind

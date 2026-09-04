@@ -8,6 +8,7 @@ from .moe_impl import (
     get_fp4_lut,
     moe_align_block_size_triton,
     moe_sum_reduce_triton,
+    moe_weighted_sum_reduce_triton,
     mxfp4_fused_moe_kernel_t_triton,
     mxfp4_splitk_gemv_triton,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "gpt_oss_swiglu_triton",
     "moe_align_block_size_triton",
     "moe_sum_reduce_triton",
+    "moe_weighted_sum_reduce_triton",
     "create_pinned_tensor_like",
     "copy_to_pinned_tensor",
 ]

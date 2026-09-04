@@ -1,0 +1,213 @@
+# ROCm unit-tests gate. Per plan (rocm-perf-parity/Inc 1): the unit suite must stay
+# green on AMD hardware too — the box that serves gfx1100 is the only honest runner.
+#
+# This job runs on the self-hosted ROCm node, which is an ALWAYS-ON dev box: keep it
+# manual (workflow_dispatch) and off-hours so it never contends with local dev or
+# benchmark runs. It consumes whatever venv the runner has at .venv-rocm.
+# There is deliberately NO pull_request trigger; fork code must never reach the
+# self-hosted node (same policy as nightly-wheels.yml).
+
+name: Unit tests (ROCm, self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: "Also run the bench_decode_moe smoke after the suite"
+        type: boolean
+        default: false
+      run_final_gate:
+        description: "Run the non-optional ten-run promotion gate"
+        type: boolean
+        default: false
+      final_model_path:
+        description: "Absolute path to exact GGUF on the ROCm runner"
+        type: string
+        default: "/home/smk/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+      final_model_sha256:
+        description: "Full SHA-256 of final_model_path"
+        type: string
+        default: ""
+      final_aime_path:
+        description: "Absolute path to pinned AIME JSONL"
+        type: string
+        default: "/tmp/qwen-moe-speed-fixture/test.jsonl"
+      final_aime_revision:
+        description: "Pinned AIME dataset revision"
+        type: string
+        default: "563bb8404243c5f09de6ec262f2db674fe5bce9b"
+      final_aime_sha256:
+        description: "Full SHA-256 of final_aime_path"
+        type: string
+        default: "b4e273c02d3e7fe1b74b59eae768fc8230bfb0f79539890cb56f4361caac0331"
+      final_reference_jsonl:
+        description: "Optional matched llama.cpp/Ollama JSONL; empty forces gate=false"
+        type: string
+        default: ""
+      final_backend:
+        description: "MoE backend for final gate"
+        type: choice
+        options: [offload, cpu, hybrid]
+        default: offload
+      final_candidate_mode:
+        description: "Explicit GGUF MoE mode for final gate"
+        type: choice
+        options: [legacy, auto, gfx1100]
+        default: legacy
+      final_graph_mode:
+        description: "Decode graph mode for final gate"
+        type: choice
+        options: [replay, eager]
+        default: replay
+      final_decode:
+        description: "Exact generated token count"
+        type: string
+        default: "512"
+      final_probe_decode:
+        description: "Finite-logit/parity probe decode count"
+        type: string
+        default: "8"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-rocm
+  cancel-in-progress: false
+
+jobs:
+  rocm-unit:
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show ROCm environment
+        run: |
+          .venv-rocm/bin/python -c "import torch; print(torch.__version__, torch.version.hip)"
+          rocm-smi | head -8
+
+      - name: Compile and smoke-test gfx1100 GGUF MoE candidate
+        run: |
+          set -o pipefail
+          FREETOKEN_GGUF_MOE_IMPL=gfx1100 PYTHONPATH=python \
+            .venv-rocm/bin/python benchmarks/bench_gguf_moe_kernels.py \
+            --impl gfx1100 --iters 3 --warmup 1
+          PYTHONPATH=python .venv-rocm/bin/python -m pytest \
+            tests/kernels/test_gguf_moe.py -m slow -q
+
+      - name: Focused parity suite
+        run: |
+          PYTHONPATH=python .venv-rocm/bin/python -m pytest -q \
+            tests/engine/test_sample_capture.py \
+            tests/engine/test_sample.py \
+            tests/engine/test_graph_blas_policy.py \
+            tests/engine/test_graph_capture_env.py \
+            tests/kernels/test_gguf_dispatch.py \
+            tests/kernels/test_gguf_linear.py \
+            tests/scheduler/test_decode_handoff.py \
+            tests/utils/test_decode_benchmark_metadata.py \
+            tests/utils/test_decode_gate.py
+
+      - name: Broad suite diagnostic
+        run: |
+          set -o pipefail
+          PYTHONPATH=python .venv-rocm/bin/python -m pytest tests/ -m "not slow" -q \
+            > /tmp/ft-rocm-broad-suite.log 2>&1
+          rc=$?
+          tail -80 /tmp/ft-rocm-broad-suite.log
+          echo "broad_suite_exit=$rc" >> /tmp/ft-rocm-broad-suite.log
+          exit "$rc"
+        continue-on-error: true
+
+      - name: Optional bench smoke
+        if: ${{ inputs.run_bench }}
+        run: |
+          PYTHONPATH=python .venv-rocm/bin/python benchmarks/bench_decode_moe.py \
+            --model "${FREETOKEN_BENCH_MODEL:-/home/smk/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}" \
+            --backend offload --json /tmp/ft-rocm-ci-bench.jsonl 2>&1 | tail -20
+        continue-on-error: true
+
+  rocm-final-gate:
+    if: ${{ inputs.run_final_gate }}
+    needs: rocm-unit
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 360
+    env:
+      FINAL_MODEL_PATH: ${{ inputs.final_model_path }}
+      FINAL_MODEL_SHA256: ${{ inputs.final_model_sha256 }}
+      FINAL_AIME_PATH: ${{ inputs.final_aime_path }}
+      FINAL_AIME_REVISION: ${{ inputs.final_aime_revision }}
+      FINAL_AIME_SHA256: ${{ inputs.final_aime_sha256 }}
+      FINAL_REFERENCE_JSONL: ${{ inputs.final_reference_jsonl }}
+      FINAL_BACKEND: ${{ inputs.final_backend }}
+      FINAL_CANDIDATE_MODE: ${{ inputs.final_candidate_mode }}
+      FINAL_GRAPH_MODE: ${{ inputs.final_graph_mode }}
+      FINAL_DECODE: ${{ inputs.final_decode }}
+      FINAL_PROBE_DECODE: ${{ inputs.final_probe_decode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify pinned final inputs
+        run: |
+          test -n "$FINAL_MODEL_SHA256"
+          test -f "$FINAL_MODEL_PATH"
+          test "$(sha256sum "$FINAL_MODEL_PATH" | awk '{print $1}')" = "$FINAL_MODEL_SHA256"
+          test -f "$FINAL_AIME_PATH"
+          test "$(sha256sum "$FINAL_AIME_PATH" | awk '{print $1}')" = "$FINAL_AIME_SHA256"
+
+      - name: Run exact ten-run FreeToken gate
+        run: |
+          graph_arg=()
+          if [ "$FINAL_GRAPH_MODE" = eager ]; then
+            graph_arg=(--no-graph)
+          fi
+          FREETOKEN_GGUF_MOE_IMPL="$FINAL_CANDIDATE_MODE" \
+            PYTHONPATH=python .venv-rocm/bin/python benchmarks/bench_decode_moe.py \
+            --model "$FINAL_MODEL_PATH" \
+            --aime "$FINAL_AIME_PATH" \
+            --aime-revision "$FINAL_AIME_REVISION" \
+            --aime-sha256 "$FINAL_AIME_SHA256" \
+            --backend "$FINAL_BACKEND" \
+            --attention-backend triton \
+            --decode "$FINAL_DECODE" --repeats 10 \
+            "${graph_arg[@]}" --json /tmp/ft-rocm-final.jsonl
+
+      - name: Run finite-logit and graph parity probe
+        run: |
+          FREETOKEN_GGUF_MOE_IMPL="$FINAL_CANDIDATE_MODE" \
+            PYTHONPATH=python .venv-rocm/bin/python benchmarks/probe_qwen_moe_base.py \
+            --model "$FINAL_MODEL_PATH" \
+            --aime "$FINAL_AIME_PATH" \
+            --aime-revision "$FINAL_AIME_REVISION" \
+            --aime-sha256 "$FINAL_AIME_SHA256" \
+            --decode "$FINAL_PROBE_DECODE" \
+            --json /tmp/ft-rocm-final-probe.json
+
+      - name: Evaluate promotion gate
+        run: |
+          reference_arg=()
+          if [ -n "$FINAL_REFERENCE_JSONL" ]; then
+            test -f "$FINAL_REFERENCE_JSONL"
+            reference_arg=(--reference "$FINAL_REFERENCE_JSONL")
+          fi
+          PYTHONPATH=python .venv-rocm/bin/python benchmarks/check_decode_gate.py \
+            --freetoken /tmp/ft-rocm-final.jsonl \
+            --probe /tmp/ft-rocm-final-probe.json \
+            "${reference_arg[@]}" --json /tmp/ft-rocm-final-gate.json
+
+      - name: Upload final gate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocm-final-gate-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            /tmp/ft-rocm-final.jsonl
+            /tmp/ft-rocm-final-probe.json
+            /tmp/ft-rocm-final-gate.json
+            /tmp/ft-rocm-broad-suite.log

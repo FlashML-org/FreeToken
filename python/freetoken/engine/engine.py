@@ -16,13 +16,14 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import align_ceil, device_kind, init_logger, is_rocm, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils.step_profiler import profiler_phase
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
-from freetoken.kvcache.base import CacheRebuildRejected
+from freetoken.kvcache.base import CacheRebuildRejected, validate_kv_storage_config
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
@@ -44,6 +45,29 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
         )
 
 
+def _resolve_gguf_resident_backend(config: EngineConfig, free_bytes: int) -> None:
+    """Resolve GGUF native residency before model tensors or caches are allocated."""
+    model_config = config.model_config
+    if getattr(model_config, "moe_weight_format", None) != "gguf":
+        return
+    if not getattr(model_config, "is_moe", False) or config.moe_backend not in ("auto", "fused"):
+        return
+    from freetoken.engine.resident_budget import estimate_gguf_resident_budget, resolve_gguf_moe_backend
+
+    budget = estimate_gguf_resident_budget(config.model_path, config, free_bytes)
+    selected = resolve_gguf_moe_backend(config, free_bytes)
+    if config.moe_backend == "fused" and selected != "fused":
+        raise RuntimeError(
+            "--moe-backend fused cannot fit native GGUF residency before allocation: "
+            f"required={budget.required_bytes} free={budget.free_bytes} breakdown={budget.as_dict()}"
+        )
+    if config.moe_backend == "auto":
+        object.__setattr__(config, "moe_backend", selected)
+        logger.info_rank0(
+            f"GGUF resident preflight selected moe_backend={selected!r}: {budget.as_dict()}"
+        )
+
+
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -51,6 +75,11 @@ def _flashinfer_available() -> bool:
 
 
 def _sgl_flash_attn_available() -> bool:
+    from freetoken.utils.arch import is_rocm
+
+    # sgl_kernel is NVIDIA-only; never select it on ROCm even if a stray copy is importable.
+    if is_rocm():
+        return False
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
@@ -102,9 +131,14 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
 
 
 def _backend_requirements_met(name: str) -> bool:
+    infos = [attention_backend_info(part) for part in name.split(",")]
+    # On ROCm (AMD) only the portable backends exist: flashinfer/sgl/trtllm (and anything
+    # sm_100-gated) are NVIDIA-only, so short-circuit before probing them at all.
+    if is_rocm():
+        return all(not i.requires_flashinfer and not i.requires_sgl_kernel
+                   and not i.requires_sm100 for i in infos)
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
-    infos = [attention_backend_info(part) for part in name.split(",")]
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
@@ -197,6 +231,15 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     # explicit --attention-backend choices.
     for part in backend_parts:
         info = attention_backend_info(part)
+
+        # Module-level is_rocm (deliberately not re-imported locally): one reference for
+        # gating, so patching engine.is_rocm covers config-time validation exactly as it
+        # covers _backend_requirements_met.
+        if is_rocm() and (info.requires_flashinfer or info.requires_sgl_kernel or info.requires_sm100):
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} is NVIDIA-only and "
+                f"unavailable on this ROCm (AMD) build; use --attention-backend triton."
+            )
         if info.requires_flashinfer and not _flashinfer_available():
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
@@ -290,6 +333,87 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+class TokenStaging:
+    """Double-buffer sampled tokens across engine and scheduler streams.
+
+    Overlap scheduling drains previous CPU tokens after launching current forward, so one
+    pinned-CPU staging slot remains in use while the other is written. Reusing either slot is
+    safe only after its prior copy event was drained; the scheduler's one-step overlap provides
+    that invariant. GPU sampled output remains caller-owned, avoiding an extra device copy.
+    """
+
+    def __init__(self, device: torch.device, capacity: int) -> None:
+        if device.type != "cuda":
+            raise ValueError("TokenStaging requires CUDA device")
+        self.capacity = max(1, capacity)
+        self._next_slot = 0
+        self._cpu = [
+            torch.empty(self.capacity, dtype=torch.int32, pin_memory=True) for _ in range(2)
+        ]
+        self._events = [torch.cuda.Event(), torch.cuda.Event()]
+        # Keep D2H launch off engine stream. Next decode can consume device IDs while CPU
+        # response observation waits on copy completion independently.
+        self.copy_stream = torch.cuda.Stream(device=device)
+
+    def stage(
+        self, tokens: torch.Tensor, stream: torch.cuda.Stream
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]:
+        count = tokens.numel()
+        if count > self.capacity:
+            raise ValueError(f"token batch {count} exceeds staging capacity {self.capacity}")
+        slot = self._next_slot
+        cpu = self._cpu[slot][:count]
+        gpu = tokens.reshape(-1)
+        if gpu.dtype != torch.int32:
+            gpu = gpu.to(torch.int32)
+        event = self._events[slot]
+        with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_stream(stream)
+            cpu.copy_(gpu, non_blocking=True)
+            gpu.record_stream(self.copy_stream)
+            event.record(self.copy_stream)
+        self._next_slot = (slot + 1) % 2
+        return gpu, cpu, event
+
+
+class DeviceTokenChain:
+    """Stable graph IDs plus two-slot device handoff and CPU observation rings."""
+
+    def __init__(self, device: torch.device, capacity: int) -> None:
+        if device.type != "cuda":
+            raise ValueError("DeviceTokenChain requires CUDA device")
+        self.capacity = max(1, capacity)
+        # Graph captures need one fixed output address. Runtime handoff needs two addresses so
+        # copy-stream D2H can overlap next decode without reading a buffer being rewritten.
+        self.device_tokens = torch.empty(self.capacity, dtype=torch.int32, device=device)
+        self.sampled_indices = torch.empty(self.capacity, dtype=torch.int64, device=device)
+        self._handoff_tokens = torch.empty(
+            (2, self.capacity), dtype=torch.int32, device=device
+        )
+        self._next_handoff = 0
+        self.staging = TokenStaging(device, self.capacity)
+
+    def next_device_tokens(self) -> torch.Tensor:
+        slot = self._next_handoff
+        self._next_handoff = (slot + 1) % 2
+        return self._handoff_tokens[slot]
+
+    def publish(self, tokens: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+        """Snapshot graph output into handoff slot before asynchronous observation."""
+        del stream  # caller's engine stream orders this copy before ``stage`` wait
+        target = self.next_device_tokens()
+        flat = tokens.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        target[: flat.numel()].copy_(flat)
+        return target[: flat.numel()]
+
+    def stage(
+        self, tokens: torch.Tensor, stream: torch.cuda.Stream
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]:
+        return self.staging.stage(tokens, stream)
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -299,12 +423,24 @@ class Engine:
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        _resolve_gguf_resident_backend(config, get_free_memory(self.device))
         _adjust_config(config)
+        logger.info_rank0(f"device_kind={device_kind()} backend={self.device}")
+        from freetoken.utils.graph_gate import rocm_blas_report
+
+        self.blas_policy = rocm_blas_report()
+        if self.blas_policy["verification"] == "mismatch":
+            raise RuntimeError(
+                "requested ROCm BLAS policy was not effective: "
+                f"{self.blas_policy}"
+            )
+        logger.info_rank0(f"BLAS policy effective={self.blas_policy}")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        self.memory_phases = []
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -322,6 +458,7 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        self._memory_phase_start("load")
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -343,6 +480,7 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        self._memory_phase_end("load")
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -355,6 +493,13 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        descriptor = getattr(self.kv_cache, "storage_descriptor", None)
+        self.kv_storage_metadata = {
+            "storage_type": getattr(getattr(descriptor, "storage_type", None), "value", None),
+            "contract_id": getattr(descriptor, "contract_id", None),
+            "pointer_generation": getattr(self.kv_cache, "pointer_generation", None),
+            "unit_bytes": list(getattr(self.kv_cache, "unit_bytes", lambda: (None, None))()),
+        }
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -386,6 +531,10 @@ class Engine:
         # re-point here (and again on any table realloc). The graph-input snapshot that reads
         # through them belongs to the attention backend, built later in init_capture_graph.
         self.kv_cache.attach_page_table(self.page_table)
+        if hasattr(self, "kv_storage_metadata"):
+            self.kv_storage_metadata["pointer_generation"] = getattr(
+                self.kv_cache, "pointer_generation", None
+            )
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -396,6 +545,13 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        graph_capacity = max(config.cuda_graph_bs or [0])
+        self.token_chain = DeviceTokenChain(
+            self.device,
+            max(config.max_running_req, config.cuda_graph_max_bs or 0, graph_capacity, 1),
+        )
+        # Compatibility alias for diagnostics and existing callers.
+        self.token_staging = self.token_chain.staging
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -414,6 +570,7 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        self._memory_phase_start("capture")
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -426,10 +583,53 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            sampler=self.sampler,
+            token_chain=self.token_chain,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self._memory_phase_end("capture")
+
+    def _memory_phase_start(self, name: str) -> None:
+        """Reset allocator peaks and begin a driver-memory phase sample."""
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.reset_peak_memory_stats(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        self._active_memory_phase = (name, int(free), int(total), int(free))
+
+    def _memory_phase_poll(self) -> None:
+        active = getattr(self, "_active_memory_phase", None)
+        if active is None or not torch.cuda.is_available():
+            return
+        name, start_free, total, minimum_free = active
+        free, _ = torch.cuda.mem_get_info(self.device)
+        self._active_memory_phase = (name, start_free, total, min(minimum_free, int(free)))
+
+    def _memory_phase_end(self, name: str) -> None:
+        """Synchronize and retain allocator plus driver high-water observations."""
+        active = getattr(self, "_active_memory_phase", None)
+        if active is None or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(self.device)
+        self._memory_phase_poll()
+        _name, start_free, total, minimum_free = self._active_memory_phase
+        free, _ = torch.cuda.mem_get_info(self.device)
+        from freetoken.engine.resident_budget import phase_memory
+
+        self.memory_phases.append(
+            phase_memory(
+                name,
+                start_free_bytes=start_free,
+                end_free_bytes=int(free),
+                allocator_peak_allocated_bytes=int(torch.cuda.max_memory_allocated(self.device)),
+                allocator_peak_reserved_bytes=int(torch.cuda.max_memory_reserved(self.device)),
+                minimum_driver_free_bytes=minimum_free,
+                total_driver_bytes=total,
+            )
+        )
+        self._active_memory_phase = None
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -758,6 +958,10 @@ class Engine:
             self.model.mark_for_rebind()
         self.kv_cache.rebuild_from_config(config, num_pages, num_swa_pages=num_swa_pages)
         self.num_pages = num_pages
+        if hasattr(self, "kv_storage_metadata"):
+            self.kv_storage_metadata["pointer_generation"] = getattr(
+                self.kv_cache, "pointer_generation", None
+            )
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
@@ -919,13 +1123,24 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            sampler=self.sampler,
+            token_chain=self.token_chain,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        captured_tokens = None
+        # Scheduler owns the outer Inc2 step-profiler scope so its trace includes scheduling,
+        # graph input copies, engine forward/sample, and result drain in one window.
+        with profiler_phase("model_forward_setup"):
+            use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            if use_graph:
+                with profiler_phase("graph_replay_submission"):
+                    logits, captured_tokens = self.graph_runner.replay(batch, args)
+            else:
+                with profiler_phase("model_forward"):
+                    logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -935,10 +1150,30 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
+        singleton_device_chain = (
+            batch.is_decode
+            and batch.size == 1
+            and self.sampler.capture_safe(args)
+        )
+        if captured_tokens is None and singleton_device_chain:
+            with profiler_phase("sampler"):
+                sampled_tokens = self.sampler.sample_into_device(
+                    batch_logits,
+                    args,
+                    batch,
+                    self.token_chain.next_device_tokens()[: batch.size],
+                    self.token_chain.sampled_indices[: batch.size],
+                )
+        elif captured_tokens is None:
+            with profiler_phase("sampler"):
+                sampled_tokens = self.sampler.sample(batch_logits, args, batch)
+        else:
+            with profiler_phase("token_handoff"):
+                sampled_tokens = self.token_chain.publish(captured_tokens, self.stream)
+        with profiler_phase("token_d2h_copy"):
+            next_tokens_gpu, next_tokens_cpu, copy_done_event = self.token_chain.stage(
+                sampled_tokens, self.stream
+            )
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
@@ -1029,6 +1264,9 @@ def _ensure_expandable_segments() -> None:
     is respected and left untouched.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        return
+    if is_rocm():
+        # expandable_segments is a CUDA allocator setting with no ROCm analogue; skip it.
         return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
@@ -1229,6 +1467,7 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    validate_kv_storage_config(config)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
@@ -1332,6 +1571,11 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if getattr(config, "kv_storage_type", None) is not None and str(config.kv_storage_type) in {
+        "KVStorageType.Q8_0", "q8_0"
+    }:
+        if any(part.strip() != "triton" for part in config.attention_backend.split(",")):
+            raise ValueError("q8_0 KV storage requires --attention-backend triton")
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
@@ -1470,7 +1714,7 @@ def _adjust_config(config: EngineConfig):
 
     if (
         is_moe
-        and expert_quant not in ("none", "fp8_block")
+        and expert_quant not in ("none", "fp8_block", "gguf")
         and not is_offload_moe_backend(config.moe_backend)
     ):
         raise ValueError(

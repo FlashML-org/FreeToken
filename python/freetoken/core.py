@@ -25,6 +25,13 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # OpenAI-style presence/frequency penalties, applied over the tokens this request has
+    # generated so far (the prompt is excluded):
+    #   logits[t] -= presence_penalty * (t was generated) + frequency_penalty * count(t)
+    # Positive values push the model away from repeating itself (breaks reasoning loops);
+    # negative values encourage repetition (coherence). 0.0 = disabled.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
     @property
     def is_greedy(self) -> bool:
@@ -40,6 +47,9 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    # Prompt length at creation (see __post_init__); input_ids[prompt_len:] is the
+    # generated portion used by presence/frequency penalties.
+    prompt_len: int = 0
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
@@ -71,6 +81,11 @@ class Req:
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
+        # Length of the prompt this request was created with. Generation grows input_ids
+        # past this point (append_host), so input_ids[prompt_len:] is exactly the tokens
+        # the model has generated so far -- what presence/frequency penalties are applied
+        # over. ChunkedReq instances (which never sample) record their partial length.
+        self.prompt_len = self.device_len
 
     def _alloc_ids_buf(self) -> None:
         self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)

@@ -99,6 +99,9 @@ def _config(kind, **overrides):
 def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
     from freetoken.engine import engine
 
+    # Pin the ROCm gate like test_attention_backend_arch.py: these tests assert the
+    # NVIDIA decision tree; the host's real is_rocm() must not leak in.
+    monkeypatch.setattr(engine, "is_rocm", lambda: False)
     monkeypatch.setattr(engine, "is_sm100_family", lambda: major == 10)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: major == 9)
     monkeypatch.setattr(engine, "_flashinfer_available", lambda: flashinfer)

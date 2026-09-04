@@ -947,3 +947,136 @@ def paged_attention(
         num_stages=2,
     )
     return o
+
+
+@triton.jit
+def _q8_paged_attention_kernel(
+    q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, o_ptr,
+    indptr_ptr, indices_ptr, q_to_req_ptr, q_pos_ptr,
+    sm_scale,
+    stride_qt, stride_qh,
+    stride_kslot, stride_kh,
+    stride_vslot, stride_vh,
+    stride_ksslot, stride_ksh,
+    stride_vsslot, stride_vsh,
+    stride_ot, stride_oh,
+    GROUP: tl.constexpr, D: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr, SLIDING_WINDOW: tl.constexpr,
+):
+    """Paged causal attention that dequantizes Q8_0 rows in registers."""
+    q_tok = tl.program_id(0)
+    q_head = tl.program_id(1)
+    kv_head = q_head // GROUP
+    req = tl.load(q_to_req_ptr + q_tok)
+    kv_start = tl.load(indptr_ptr + req)
+    kv_end = tl.load(indptr_ptr + req + 1)
+    kv_len = kv_end - kv_start
+    q_pos = tl.load(q_pos_ptr + q_tok)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    block_d = offs_d // 32
+    q = tl.load(q_ptr + q_tok * stride_qt + q_head * stride_qh + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for start in range(0, kv_len, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        mask_n = (offs_n < kv_len) & (offs_n <= q_pos)
+        if SLIDING_WINDOW > 0:
+            mask_n = mask_n & ((offs_n + SLIDING_WINDOW) > q_pos)
+        if not tl.max(mask_n.to(tl.int32), axis=0) == 0:
+            slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
+            kq = tl.load(
+                k_ptr + slots[:, None] * stride_kslot + kv_head * stride_kh + offs_d[None, :],
+                mask=(offs_n[:, None] < kv_len) & mask_d[None, :], other=0,
+            ).to(tl.float32)
+            kscale = tl.load(
+                ks_ptr + slots[:, None] * stride_ksslot + kv_head * stride_ksh + block_d[None, :],
+                mask=(offs_n[:, None] < kv_len) & mask_d[None, :], other=0.0,
+            )
+            scores = tl.sum(q[None, :] * (kq * kscale), axis=1) * sm_scale
+            scores = tl.where(mask_n, scores, -float("inf"))
+            row_max = tl.max(scores, axis=0)
+            m_new = tl.maximum(row_max, m_i)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new)
+            vq = tl.load(
+                v_ptr + slots[:, None] * stride_vslot + kv_head * stride_vh + offs_d[None, :],
+                mask=(offs_n[:, None] < kv_len) & mask_d[None, :], other=0,
+            ).to(tl.float32)
+            vscale = tl.load(
+                vs_ptr + slots[:, None] * stride_vsslot + kv_head * stride_vsh + block_d[None, :],
+                mask=(offs_n[:, None] < kv_len) & mask_d[None, :], other=0.0,
+            )
+            acc = acc * alpha + tl.sum(p[:, None] * (vq * vscale), axis=0)
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            m_i = m_new
+    out = tl.where(l_i == 0.0, 0.0, acc / l_i)
+    tl.store(o_ptr + q_tok * stride_ot + q_head * stride_oh + offs_d, out.to(o_ptr.dtype.element_ty), mask=mask_d)
+
+
+def q8_paged_attention(
+    q: torch.Tensor,
+    k_payload: torch.Tensor,
+    v_payload: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    q_to_req: torch.Tensor,
+    q_positions: torch.Tensor,
+    sm_scale: float,
+    sliding_window: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Q8_0 paged attention; storage stays packed and dequantization is per tile."""
+    if q.ndim != 3 or k_payload.ndim != 3 or v_payload.ndim != 3:
+        raise ValueError("q8 attention expects q and packed K/V shaped [tokens, heads, dim]")
+    if k_payload.dtype != torch.int8 or v_payload.dtype != torch.int8:
+        raise TypeError("q8 attention payloads must be int8")
+    if k_scales.dtype != torch.float16 or v_scales.dtype != torch.float16:
+        raise TypeError("q8 attention scales must be float16")
+    batch_tokens, q_heads, head_dim = q.shape
+    kv_heads = k_payload.shape[1]
+    if q_heads % kv_heads or k_payload.shape[-1] != head_dim:
+        raise ValueError("q8 attention head geometry mismatch")
+    result = out if out is not None else torch.empty_like(q)
+    if not q.is_cuda:
+        result.zero_()
+        for token in range(batch_tokens):
+            req = int(q_to_req[token])
+            begin, end = int(indptr[req]), int(indptr[req + 1])
+            end = min(end, begin + int(q_positions[token]) + 1)
+            begin_window = max(begin, end - (sliding_window or end - begin))
+            slots = indices[begin_window:end].to(torch.long)
+            if not slots.numel():
+                continue
+            k = k_payload.index_select(0, slots).float()
+            v = v_payload.index_select(0, slots).float()
+            k = k * k_scales.index_select(0, slots).float().repeat_interleave(32, dim=-1)
+            v = v * v_scales.index_select(0, slots).float().repeat_interleave(32, dim=-1)
+            scores = torch.stack(
+                [q[token, head].float().matmul(k[:, head % kv_heads].transpose(0, 1))
+                 for head in range(q_heads)]
+            ) * sm_scale
+            probs = torch.softmax(scores, dim=-1)
+            for head in range(q_heads):
+                result[token, head] = probs[head].matmul(v[:, head % kv_heads])
+        return result
+    block_d = triton.next_power_of_2(head_dim)
+    _q8_paged_attention_kernel[(batch_tokens, q_heads)](
+        q, k_payload, v_payload, k_scales, v_scales, result,
+        indptr, indices, q_to_req, q_positions, sm_scale,
+        q.stride(0), q.stride(1),
+        k_payload.stride(0), k_payload.stride(1),
+        v_payload.stride(0), v_payload.stride(1),
+        k_scales.stride(0), k_scales.stride(1),
+        v_scales.stride(0), v_scales.stride(1),
+        result.stride(0), result.stride(1),
+        GROUP=q_heads // kv_heads, D=head_dim, BLOCK_D=block_d, BLOCK_N=32,
+        SLIDING_WINDOW=sliding_window or 0, num_warps=4, num_stages=2,
+    )
+    return result
+
+
+decode_q8_paged_attention = q8_paged_attention

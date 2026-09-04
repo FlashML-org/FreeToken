@@ -38,6 +38,7 @@ class MoELayer(BaseOP):
         apply_router_weight_on_input: bool = False,
         allocate_experts: bool = True,
         weight_format: str = "bf16",
+        gguf_down_quant_type: int | None = None,
     ):
         super().__init__()
 
@@ -53,6 +54,19 @@ class MoELayer(BaseOP):
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.weight_format = weight_format
+        self.gguf_down_quant_type = gguf_down_quant_type
+        if weight_format == "gguf":
+            from freetoken.moe.fused_gguf import MoeDecodeWork
+
+            self._gguf_workspaces = {
+                "moe_decode": MoeDecodeWork("moe_decode"),
+                "moe_prefill": MoeDecodeWork("moe_prefill"),
+            }
+            # Compatibility alias for callers that only know the old scratch name.
+            self._gguf_workspace = self._gguf_workspaces["moe_decode"]
+        else:
+            self._gguf_workspaces = {}
+            self._gguf_workspace = None
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         if allocate_experts:
             self._alloc_resident_experts(intermediate_size_per_partition)
@@ -76,6 +90,24 @@ class MoELayer(BaseOP):
             )
             self.down_proj = torch.empty(n, h, i, dtype=FP8)
             self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
+            return
+        if self.weight_format == "gguf":
+            from freetoken.models.gguf.dequant import (
+                GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, row_bytes,
+            )
+
+            if self.gguf_down_quant_type not in (GGML_Q5_K, GGML_Q6_K):
+                raise ValueError(
+                    "resident GGUF expert down type must be Q5_K/Q6_K, got "
+                    f"{self.gguf_down_quant_type!r}"
+                )
+            n, i, h = self.num_experts, self.intermediate_size, self.hidden_size
+            self.gate_up_proj = torch.empty(
+                n, 2 * i, row_bytes(h, GGML_Q4_K), dtype=torch.uint8
+            )
+            self.down_proj = torch.empty(
+                n, h, row_bytes(i, self.gguf_down_quant_type), dtype=torch.uint8
+            )
             return
         assert self.weight_format == "bf16", (
             f"no resident expert allocation for weight_format {self.weight_format!r}"
@@ -139,6 +171,22 @@ class MoELayer(BaseOP):
                 hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
                 self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
             )
+        if self.weight_format == "gguf":
+            from freetoken.moe.fused_gguf import fused_experts_gguf_native
+
+            return fused_experts_gguf_native(
+                hidden_states,
+                self.gate_up_proj,
+                self.down_proj,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                down_quant_type=self.gguf_down_quant_type,
+                is_prefill=get_global_ctx().batch.is_prefill,
+                workspace=self._gguf_workspaces[
+                    "moe_prefill" if get_global_ctx().batch.is_prefill else "moe_decode"
+                ],
+            )
         assert self.weight_format == "bf16", (
             f"no resident expert kernel for weight_format {self.weight_format!r}"
         )
@@ -171,12 +219,16 @@ class MoELayer(BaseOP):
         if self.weight_format != "bf16":
             # Quantized resident experts: generic softmax router + format kernel.
             # The bf16 path below stays on ctx.moe_backend byte-for-byte.
-            topk_weights, topk_ids = fused_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=self.top_k,
-                renormalize=self.renormalize,
-            )
+            # "moe_router" record_function label = the profiler-segmented router stage
+            # (Inc 2, .plans/rocm-perf-parity); a range object costs ~1µs and keeps the
+            # name visible in torch.profiler tables on both backends.
+            with torch.profiler.record_function("moe_router"):
+                topk_weights, topk_ids = fused_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=self.top_k,
+                    renormalize=self.renormalize,
+                )
             return self._maybe_all_reduce(
                 self._resident_gemm(hidden_states, topk_weights, topk_ids)
             )
@@ -205,6 +257,7 @@ class OffloadMoELayer(MoELayer):
         renormalize: bool = True,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        gguf_down_quant_type: int | None = None,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -217,7 +270,16 @@ class OffloadMoELayer(MoELayer):
             allocate_experts=False,
         )
         self.layer_id = layer_id
+        self.gguf_down_quant_type = gguf_down_quant_type
         self.offload_cache: OffloadMoeCache | None = None
+        if gguf_down_quant_type is not None:
+            from freetoken.moe.fused_gguf import MoeDecodeWork
+
+            self._gguf_workspaces = {
+                "moe_decode": MoeDecodeWork("moe_decode"),
+                "moe_prefill": MoeDecodeWork("moe_prefill"),
+            }
+            self._gguf_workspace = self._gguf_workspaces["moe_decode"]
 
     def forward(
         self,
@@ -531,6 +593,55 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt in ("gguf", "gguf_native"):
+            # GGUF offload keeps Q4_K gate/up. Legacy ``gguf`` converts routed
+            # down rows to Q8_0; ``gguf_native`` retains per-layer Q5_K/Q6_K
+            # rows in a Q6_K-stride cache and selects the exact kernel here.
+            from freetoken.moe.fused_gguf import fused_experts_gguf
+            from freetoken.kernel.gguf import gguf_dispatch, gguf_runtime_metadata
+
+            gate_up, down = views
+            down_type = 8 if fmt == "gguf" else self.gguf_down_quant_type
+            if down_type not in (8, 13, 14):
+                raise ValueError(f"invalid GGUF offload down type {down_type!r}")
+            phase = "moe_prefill" if is_prefill else "moe_decode"
+            arch = gguf_runtime_metadata().get("arch")
+            dispatch_metadata = {
+                "gate_up": gguf_dispatch(
+                    phase,
+                    12,
+                    gate_up.shape[1],
+                    hidden_states.shape[1],
+                    hidden_states.shape[0],
+                    arch,
+                ),
+                "down": gguf_dispatch(
+                    phase,
+                    down_type,
+                    down.shape[1],
+                    gate_up.shape[1] // 2,
+                    hidden_states.shape[0] * topk_ids.shape[1],
+                    arch,
+                ),
+            }
+            work = self._gguf_workspaces.get(
+                "moe_prefill" if is_prefill else "moe_decode"
+            )
+            return fused_experts_gguf(
+                hidden_states,
+                gate_up,
+                down,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                is_prefill=is_prefill,
+                dispatch_metadata=dispatch_metadata,
+                down_quant_type=down_type,
+                down_stride_bytes=(int(down.stride(0)) if fmt == "gguf_native" else None),
+                down_row_stride_bytes=(int(down.stride(1)) if fmt == "gguf_native" else None),
+                work=work,
+                id_space="raw" if is_prefill else "slot",
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer
@@ -598,6 +709,7 @@ def make_moe_layer(
     intermediate_size: int | None = None,
     resident_cls: type[MoELayer] | None = None,
     offload_cls: "type[OffloadMoELayer] | None" = None,
+    gguf_down_quant_type: int | None = None,
     extra_attrs: dict | None = None,
 ) -> MoELayer:
     """Build the experts layer for ``config.moe_backend`` -- the one construction
@@ -628,8 +740,11 @@ def make_moe_layer(
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
         kwargs["layer_id"] = layer_id
+        if gguf_down_quant_type is not None:
+            kwargs["gguf_down_quant_type"] = gguf_down_quant_type
     else:
         kwargs["weight_format"] = weight_format
+        kwargs["gguf_down_quant_type"] = gguf_down_quant_type
     layer = layer_cls(**kwargs)
     for name, value in (extra_attrs or {}).items():
         setattr(layer, name, value)

@@ -109,8 +109,28 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+        # GGUF checkpoints carry native block-quantized weights: swap the dense
+        # projections + embedding for GGUF-quant ops (experts stay on the offload cache).
+        from .gguf import convert_qwen35moe_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen35moe_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        output = self.model.forward(batch.input_ids)
+        if batch.is_prefill:
+            # GGUFLinear (unlike ParallelLMHead / Nvfp4LMHead) does not gather each
+            # request's final row itself, but the engine contract is [batch.size, vocab]
+            # (the logits to sample after each request's prompt). Without this gather
+            # the sampler reads the FIRST prompt position's logits: the first generated
+            # token comes from position 0, and -- worse -- differs between a fresh
+            # prefill and a radix-cache continuation of the same prompt (the restored
+            # continuation has a different first row), which made greedy output flip
+            # between server states / cache states.
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            output = output[indices]
         return self.lm_head.forward(output)
 
 

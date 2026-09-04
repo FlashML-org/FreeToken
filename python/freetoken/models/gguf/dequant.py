@@ -1,5 +1,4 @@
-"""GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+"""GGML block-quant dequantization in pure torch.
 
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
@@ -23,6 +22,8 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +34,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +45,8 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -77,6 +82,42 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def _scale_min_k4(scales: torch.Tensor, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if index < 4:
+        return scales[:, index] & 63, scales[:, index + 4] & 63
+    return (
+        (scales[:, index + 4] & 0xF) | ((scales[:, index - 4] >> 6) << 4),
+        (scales[:, index + 4] >> 4) | ((scales[:, index] >> 6) << 4),
+    )
+
+
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K: 256-element super-block with eight 32-element scale/min groups."""
+    raw = raw.reshape(-1, 144)
+    n = raw.shape[0]
+    dm = raw[:, 0:4].contiguous().view(torch.float16).to(torch.float32)
+    dall, dmin = dm[:, 0], dm[:, 1]
+    scales = raw[:, 4:16]
+    qs = raw[:, 16:144]
+    y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
+    for il in range(4):
+        s0, m0 = _scale_min_k4(scales, 2 * il)
+        s1, m1 = _scale_min_k4(scales, 2 * il + 1)
+        q = qs[:, 32 * il:32 * il + 32].to(torch.float32)
+        lo = 64 * il
+        y[:, lo:lo + 32] = q.remainder(16) * (dall * s0).unsqueeze(1) - (dmin * m0).unsqueeze(1)
+        y[:, lo + 32:lo + 64] = torch.div(q, 16, rounding_mode="floor") * (dall * s1).unsqueeze(1) - (dmin * m1).unsqueeze(1)
+    return y.reshape(-1).to(out_dtype)
+
+
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per-32-element block = fp16 scale followed by 32 signed quants."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)
+    return (q * d).reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -115,9 +156,72 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def quantize_q8_0(w: torch.Tensor) -> torch.Tensor:
+    """Quantize dense rows to packed Q8_0 blocks (``half d`` + 32 int8).
+
+    ``w``'s last dim must be a multiple of 32 (the Q8_0 block); returns the packed
+    ``[..., n/32*34]`` uint8 layout the ggml Q8_0 kernels read. Used to re-quantize
+    K-quant expert banks to a uniform 8-bit type (Q8_0 >= Q5_K/Q6_K precision, so no
+    quality loss) when the offload cache needs a single per-bank format.
+    """
+    n = w.shape[-1]
+    assert n % 32 == 0, f"Q8_0 quantize needs last dim % 32 == 0, got {n}"
+    wq = w.float().view(*w.shape[:-1], n // 32, 32)
+    d = wq.abs().amax(dim=-1, keepdim=True).clamp(min=1e-9) / 127.0
+    q = torch.round(wq / d).to(torch.int8)
+    dh = d.to(torch.float16).view(torch.uint8)  # [..., n//32, 2]
+    packed = torch.cat([dh, q.view(torch.uint8)], dim=-1)  # [..., n//32, 34]
+    return packed.reshape(*w.shape[:-1], (n // 32) * 34).contiguous()
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q5_K: 256-elem super-block = half2 dm (dall, dmin), 12B 6-bit scale/min, 32B
+    qh high-bits, 128B qs low nibbles. Mirrors ggml's dequantize_block_q5_K."""
+    raw = raw.reshape(-1, 176)
+    n = raw.shape[0]
+    dm = raw[:, 0:4].view(torch.float16).to(torch.float32)  # [n,2]
+    dall, dmin = dm[:, 0], dm[:, 1]
+    scales = raw[:, 4:16]
+    qh = raw[:, 16:48].to(torch.int32)
+    qs = raw[:, 48:176].to(torch.int32)
+
+    def _sm(j):
+        if j < 4:
+            d = scales[:, j] & 63
+            m = scales[:, j + 4] & 63
+        else:
+            d = (scales[:, j + 4] & 0xF) | ((scales[:, j - 4] >> 6) << 4)
+            m = (scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)
+        return d.to(torch.float32), m.to(torch.float32)
+
+    y = torch.zeros(n, 256, dtype=torch.float32, device=raw.device)
+    for il in range(4):
+        s0, m0 = _sm(2 * il)
+        s1, m1 = _sm(2 * il + 1)
+        d0, M0 = dall * s0, dmin * m0
+        d1, M1 = dall * s1, dmin * m1
+        bit0 = 1 << (2 * il)
+        bit1 = bit0 << 1
+        ql = qs[:, 32 * il:32 * il + 32]
+        ql0, ql1 = ql[:, 0::2], ql[:, 1::2]
+        h0, h1 = qh[:, 0::2], qh[:, 1::2]
+        v0 = (ql0 & 0xF) + ((h0 & bit0) != 0).to(torch.float32) * 16
+        v1 = (ql1 & 0xF) + ((h1 & bit0) != 0).to(torch.float32) * 16
+        even = torch.stack([v0, v1], dim=-1).reshape(n, 32)  # [v0[0],v1[0],v0[1],...]
+        y[:, 64 * il:64 * il + 32] = even * d0.unsqueeze(1) - M0.unsqueeze(1)
+        w0 = (ql0 >> 4) + ((h0 & bit1) != 0).to(torch.float32) * 16
+        w1 = (ql1 >> 4) + ((h1 & bit1) != 0).to(torch.float32) * 16
+        odd = torch.stack([w0, w1], dim=-1).reshape(n, 32)
+        y[:, 64 * il + 32:64 * il + 64] = odd * d1.unsqueeze(1) - M1.unsqueeze(1)
+    return y.reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q4_K: dequant_q4_k,
+    GGML_Q5_K: dequant_q5_k,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q8_0: dequant_q8_0,
 }
 
 
@@ -143,11 +247,17 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q4_k",
+    "dequant_q8_0",
+    "dequant_q5_k",
     "dequant_q6_k",
+    "quantize_q8_0",
     "dequantize",
 ]

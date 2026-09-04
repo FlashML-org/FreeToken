@@ -29,8 +29,30 @@
 #include <thread>
 #include <vector>
 
+#if defined(USE_HIP)
+#include <hip/hip_runtime.h>
+// HIP host functions carry no special calling convention; define the CUDA host-func
+// marker as empty so the static callback signatures below compile unchanged.
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
+
+// Stream-sync / host-func node launch, shared by both backends.
+#if defined(USE_HIP)
+#define CPU_MOE_STREAM_SYNC(s) \
+  hipStreamSynchronize(reinterpret_cast<hipStream_t>(s))
+#define CPU_MOE_LAUNCH_HOST_FUNC(s, fn, data) \
+  hipLaunchHostFunc(reinterpret_cast<hipStream_t>(s), (fn), (data))
+#else
+#define CPU_MOE_STREAM_SYNC(s) \
+  cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(s))
+#define CPU_MOE_LAUNCH_HOST_FUNC(s, fn, data) \
+  cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(s), (fn), (data))
+#endif
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -622,7 +644,7 @@ static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   auto* s = reinterpret_cast<void*>(stream);
   if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
   if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
-  return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+  return CPU_MOE_STREAM_SYNC(stream) == 0;
 }
 
 // GPU side of the flag handshake (see the block comment above): enqueued on the
@@ -1968,13 +1990,13 @@ struct CpuMoeExecutor {
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::submit_cb,
-                       reinterpret_cast<void*>(task));
+    CPU_MOE_LAUNCH_HOST_FUNC(stream, &CpuMoeExecutor::submit_cb,
+                            reinterpret_cast<void*>(task));
   }
 
   void sync_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::sync_cb,
-                       reinterpret_cast<void*>(task));
+    CPU_MOE_LAUNCH_HOST_FUNC(stream, &CpuMoeExecutor::sync_cb,
+                             reinterpret_cast<void*>(task));
   }
 
   // Register a (layer, batch-size) slot's task so the coordinator can dispatch it on a

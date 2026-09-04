@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.engine.config import KVStorageType
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
@@ -152,6 +153,12 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            or "qwen3_6" in marker
+            or "qwen3.6" in marker
+            # Qwen3-Coder and the 3.5/3.6 hybrid family share the XML invoke-block
+            # grammar (<function=name><parameter=k>v); plain "qwen" (2.x) uses the
+            # older JSON form. A bare "qwen3" marker stays JSON (qwen25) unless it's
+            # a coder variant.
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
@@ -375,6 +382,16 @@ def parse_args(
         default=ServerArgs.attention_backend,
         help="The attention backend to use. If two backends are specified,"
         " the first one is used for prefill and the second one for decode.",
+    )
+
+    parser.add_argument(
+        "--kv-storage",
+        "--kv-type",
+        dest="kv_storage_type",
+        type=lambda value: KVStorageType.parse(value),
+        choices=list(KVStorageType),
+        default=ServerArgs.kv_storage_type,
+        help="Physical KV format: bf16, fp16, or opt-in q8_0.",
     )
 
     parser.add_argument(
@@ -613,6 +630,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Capture MoE cache hit/miss counters into the decode graph and print them "
+            "in the decode log line (moe hit/miss/fetch/cpu). Off by default; the "
+            "device-side accumulation is captured into the CUDA graph."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
@@ -725,6 +753,18 @@ def parse_args(
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
+    # ROCm (AMD) has no NVIDIA-native NVFP4/Marlin path. Reject those backends at parse
+    # time with a clean error. GGUF resident fused MoE is resolved later, after metadata
+    # preflight, so it must remain selectable here.
+    from freetoken.utils.arch import is_rocm
+
+    if is_rocm():
+        nvfp4 = kwargs.get("nvfp4_backend")
+        if nvfp4 in ("marlin", "flashinfer"):
+            raise SystemExit(
+                f"--nvfp4-backend {nvfp4} is NVIDIA-only and unavailable on ROCm/AMD; "
+                f"use --nvfp4-backend triton (inline-dequant) or auto."
+            )
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")

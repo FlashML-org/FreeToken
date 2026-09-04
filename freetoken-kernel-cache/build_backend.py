@@ -40,6 +40,11 @@ def _cuda_version_suffix() -> str:
         return ""
 
     cuda_version = getattr(torch.version, "cuda", None)
+    hip_version = getattr(torch.version, "hip", None)
+    if hip_version:
+        # ROCm torch: torch.version.cuda is None; tag the cache with +rocm so it pairs
+        # only with a ROCm runtime (kernel/utils.py._arch_tags enforces the match).
+        return "+rocm"
     if not cuda_version:
         return ""
     # The tag advertises torch's CUDA; the cache .so link nvcc's libcudart.
@@ -110,7 +115,18 @@ def _build_jit_cache() -> None:
     #   12.0 -> RTX 50 series, RTX PRO 6000 Blackwell (Blackwell, consumer / workstation)
     # Override with FREETOKEN_KERNEL_CACHE_ARCHES (space-separated maj.min) or
     # TVM_FFI_CUDA_ARCH_LIST directly. Needs an nvcc that supports every listed arch.
-    if "TVM_FFI_CUDA_ARCH_LIST" not in os.environ:
+    try:
+        import torch  # noqa: PLC0415
+
+        is_rocm_build = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        is_rocm_build = False
+    if is_rocm_build:
+        # ROCm: the CUDA arch-list is meaningless; the gfx arch is passed through
+        # kernel/utils.py._arch_flags (--offload-arch), defaulting to the RX 7000
+        # (gfx1100) target. Env override for other RX 7000 SKUs / future archs.
+        os.environ.setdefault("FREETOKEN_KERNEL_CACHE_GFX", "gfx1100")
+    elif "TVM_FFI_CUDA_ARCH_LIST" not in os.environ:
         os.environ["TVM_FFI_CUDA_ARCH_LIST"] = os.getenv(
             "FREETOKEN_KERNEL_CACHE_ARCHES", "8.0 8.6 8.9 9.0 10.0 12.0"
         )

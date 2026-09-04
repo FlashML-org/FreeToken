@@ -369,3 +369,33 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     torch.cuda.synchronize()
     assert (ids[:3] != -1).all()
     assert (ids[3:] == -1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a GPU is required")
+@pytest.mark.parametrize("num_tokens,num_experts,topk", [(1, 512, 8), (7, 512, 8), (33, 512, 8)])
+def test_fused_topk_rocm_routes_to_inrepo_triton_router(
+    num_tokens, num_experts, topk, monkeypatch
+):
+    """On ROCm, fused_topk must route to the in-repo vendored triton router (never the
+    pure-torch chain -- Inc 3 of .plans/rocm-perf-parity) and match the torch reference."""
+    from freetoken.kernel.triton import moe_router as router_mod
+    from freetoken.moe.fused import _torch_fused_topk, fused_topk
+
+    routed = []
+    real = router_mod.fused_topk_softmax
+
+    def spy(*args, **kwargs):
+        routed.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(router_mod, "fused_topk_softmax", spy)
+    gen = torch.Generator(device="cuda").manual_seed(97)
+    gating = torch.randn(num_tokens, num_experts, generator=gen, device="cuda")
+
+    weights, ids = fused_topk(gating, gating, topk, renormalize=True)
+
+    assert routed, "fused_topk did not route through the in-repo triton router on ROCm"
+    ref_w, ref_i = _torch_fused_topk(gating, topk, True, None)
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)

@@ -342,6 +342,32 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_gguf_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    layer_sink=None,
+) -> dict:
+    """Load packed GGUF qwen3.5-moe expert source banks (gate_up native Q4_K, down
+    re-quantized to Q8_0). ``layer_sink`` (converter) streams each completed layer's
+    banks."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
+def load_gguf_moe_expert_sources_native(
+    model_path: str,
+    model_config,
+    *,
+    layer_sink=None,
+) -> dict:
+    """Load packed Qwen GGUF expert banks with native Q5_K/Q6_K down rows."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources_native")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:

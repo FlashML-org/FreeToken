@@ -33,6 +33,9 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # Whether this backend coexists with hybrid-linear (GDN/mamba) models. Linear
+    # layers bypass attention backend dispatch.
+    hybrid_linear_ok: bool = True
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -90,6 +93,19 @@ def create_triton_backend(config: ModelConfig):
     from .triton import TritonAttentionBackend
 
     return TritonAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "torch",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL}),
+        # Debugging/eager ground-truth backend; no package/arch requirements.
+    ),
+)
+def create_torch_backend(config: ModelConfig):
+    from .torch import TorchAttentionBackend
+
+    return TorchAttentionBackend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(

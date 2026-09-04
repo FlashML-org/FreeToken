@@ -1,0 +1,9 @@
+qwen-moe-rocm-base-speed:
+  file: qwen-moe-rocm-base-speed.md
+  description: Read before Qwen MoE ROCm base-speed work; records negative kernel/cache/dense results and validation gates.
+llamacpp-surpass-rocm-gaps:
+  file: llamacpp-surpass-rocm-gaps.md
+  description: Read before follow-up work on native GGUF residency, fused MoE kernels, and ROCm cadence gaps versus llama.cpp.
+rocm-ollama-gap-implementation:
+  file: rocm-ollama-gap-implementation.md
+  description: Read before q8/GGUF ROCm validation or promotion; records fail-closed dispatch, replay timing semantics, and separate Gate A/B evidence.

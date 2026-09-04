@@ -156,6 +156,18 @@ def launch_server(
         from .supervisor import BackendHandle
 
         mp.set_start_method("spawn", force=True)
+        # Resolve one BLAS policy before workers spawn. Explicit FREETOKEN_ROCM_BLAS
+        # wins over graph-gate auto output; worker inherits env before torch import/GEMM.
+        # A late write at capture time may no-op after PyTorch caches BLAS preference.
+        from freetoken.utils.graph_gate import graph_capture_env, rocm_blas_report
+
+        gate_env = graph_capture_env()
+        if gate_env:
+            os.environ.update(gate_env)
+            logger.info(
+                f"ROCm BLAS/graph env applied to workers: {sorted(gate_env)}"
+            )
+        logger.info(f"BLAS policy before worker spawn: {rocm_blas_report()}")
         detach = server_args.shell_mode  # see _detach_process_group
 
         world_size = server_args.tp_info.size

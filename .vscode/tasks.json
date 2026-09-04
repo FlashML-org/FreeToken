@@ -1,0 +1,63 @@
+{
+    // FreeToken server lifecycle tasks. All of them call scripts/serve-qwen-moe.sh,
+    // which builds its argv as a bash array and launches on one line — safe for the
+    // VS Code integrated shell (no backslash-newline continuations to mangle).
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "FreeToken: serve (start)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/serve-qwen-moe.sh",
+            "args": ["start"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {}
+            },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "detail": "Launch the Qwen MoE server (~3-4 min model load), then wait for readiness."
+        },
+        {
+            "label": "FreeToken: serve (stop)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/serve-qwen-moe.sh",
+            "args": ["stop"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        },
+        {
+            "label": "FreeToken: serve (status)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/serve-qwen-moe.sh",
+            "args": ["status"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "shared" }
+        },
+        {
+            "label": "FreeToken: serve (follow log)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/serve-qwen-moe.sh",
+            "args": ["log"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        },
+        {
+            "label": "FreeToken: tests (fast)",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv-rocm/bin/python",
+            "args": ["-m", "pytest", "-q", "-m", "not slow"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "PYTHONPATH": "${workspaceFolder}/python" } },
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

@@ -252,6 +252,29 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply."
+        )
+    if dummy:
+        raise NotImplementedError("gguf expert banks have no dummy path; load the real GGUF")
+    from freetoken.models.weight import (
+        load_gguf_moe_expert_sources,
+        load_gguf_moe_expert_sources_native,
+    )
+
+    native = decode_target == "gpu" and layer_sink is None
+    loader = load_gguf_moe_expert_sources_native if native else load_gguf_moe_expert_sources
+    sources = loader(model_path, model_config, layer_sink=layer_sink)
+    return ExpertBanks(
+        "gguf_native" if native else "gguf",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf_native" if native else "gguf"]},
+        streamed=layer_sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -301,6 +324,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "gguf": _gguf_banks,
 }
 
 

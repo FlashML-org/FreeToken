@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from typing import TYPE_CHECKING, List
 
@@ -8,6 +9,26 @@ import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.models.register import _load_attr, get_model_spec
 from freetoken.utils import cached_load_hf_config
+
+
+class KVStorageType(str, Enum):
+    """Physical KV-cache format, independent from model compute dtype."""
+
+    BF16 = "bf16"
+    FP16 = "fp16"
+    Q8_0 = "q8_0"
+
+    @classmethod
+    def parse(cls, value: "KVStorageType | str") -> "KVStorageType":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"unsupported KV storage {value!r}; expected one of "
+                f"{', '.join(item.value for item in cls)}"
+            ) from exc
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -20,6 +41,7 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    kv_storage_type: KVStorageType | None = None
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
@@ -82,6 +104,10 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kv_storage_type is not None:
+            object.__setattr__(self, "kv_storage_type", KVStorageType.parse(self.kv_storage_type))
 
     @cached_property
     def hf_config(self):

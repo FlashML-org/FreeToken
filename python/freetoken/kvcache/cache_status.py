@@ -194,6 +194,23 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
+    try:
+        runtime = engine.graph_runner.runtime_telemetry()
+        runtime["effective_moe_backend"] = getattr(engine.config, "moe_backend", None)
+        kv = dict(getattr(engine, "kv_storage_metadata", None) or {})
+        if kv:
+            runtime["kv_storage"] = kv
+            runtime["kv_type"] = kv.get("storage_type")
+        runtime["memory_phases"] = [
+            phase.as_dict() for phase in getattr(engine, "memory_phases", ())
+        ]
+        if runtime.get("resident_gguf") and runtime.get("effective_moe_backend") == "fused":
+            runtime["execution_class"] = "resident_fused"
+        elif runtime.get("effective_moe_backend") in {"offload", "hybrid"}:
+            runtime["execution_class"] = "offload"
+        meta["execution"] = runtime
+    except Exception:  # noqa: BLE001 -- telemetry must never block readiness
+        meta["execution"] = {}
     # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)

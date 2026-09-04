@@ -2,6 +2,9 @@
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/moe_vec.cuh
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
+// Port target cross-check: llama.cpp 7e4c0a968 (b10434),
+// ggml/src/ggml-cuda/mmvq.cu; ``moe_vec_q`` preserves Q4_K/Q5_K/Q6_K
+// packed rows and ``moe_vec_q_strided`` adds explicit cache row strides.
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void moe_vec_q(
     const void* __restrict__ vx,
@@ -239,6 +242,79 @@ static void moe_vec_q6_K_q8_1_cuda(
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+
+// Native mixed-Q5_K/Q6_K offload stores every down row at the Q6_K stride so
+// cache banks remain shape-uniform. Q5_K rows occupy their native prefix and
+// the stride-aware kernel skips the zero padding between rows/experts.
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void moe_vec_q_strided(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int* topk_ids,
+    const int topk,
+    const int ncols,
+    const int nrows,
+    const int token_stride,
+    const int64_t expert_stride_bytes,
+    const int64_t row_stride_bytes) {
+  const auto row = blockIdx.x * blockDim.y + threadIdx.y;
+  const auto token = blockIdx.z / topk;
+  const auto expert = topk_ids[blockIdx.z];
+  if (row >= nrows) return;
+
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+  float tmp = 0.0f;
+  const auto* expert_base = static_cast<const char*>(vx) +
+      static_cast<int64_t>(expert) * expert_stride_bytes;
+  const block_q_t* x = reinterpret_cast<const block_q_t*>(
+      expert_base + row * row_stride_bytes);
+  const block_q8_1* y = reinterpret_cast<const block_q8_1*>(
+      static_cast<const int*>(vy) + token * token_stride);
+  for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+    const int iby = i * (qk / QK8_1);
+    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+    tmp += vec_dot_q_cuda(&x[i], &y[iby], iqs);
+  }
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+  if (threadIdx.x == 0) dst[blockIdx.z * nrows + row] = tmp;
+}
+
+template <typename scalar_t>
+static void moe_vec_q5_K_q8_1_strided_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, const int64_t expert_stride_bytes,
+    const int64_t row_stride_bytes, cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_q_strided<scalar_t, QK_K, QI5_K, block_q5_K,
+                    VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride,
+          expert_stride_bytes, row_stride_bytes);
+}
+
+template <typename scalar_t>
+static void moe_vec_q6_K_q8_1_strided_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, const int64_t expert_stride_bytes,
+    const int64_t row_stride_bytes, cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_q_strided<scalar_t, QK_K, QI6_K, block_q6_K,
+                    VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride,
+          expert_stride_bytes, row_stride_bytes);
 }
 
 template <typename scalar_t>

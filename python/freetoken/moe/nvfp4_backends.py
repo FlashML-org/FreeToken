@@ -46,6 +46,7 @@ import os
 import torch
 
 from freetoken.utils import init_logger
+from freetoken.utils.arch import is_rocm
 
 logger = init_logger(__name__)
 
@@ -213,6 +214,17 @@ def select_nvfp4_backend(
         raise ValueError(
             f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer or triton"
         )
+    # AMD: the marlin (vLLM) and flashinfer b12x fused-MoE kernels are NVIDIA-only
+    # (NVFP4 SASS / CuTe-DSL sm120). auto -> the portable Triton inline-dequant path;
+    # a forced NVIDIA-only backend fails loudly, never silently degrades.
+    if device.type == "cuda" and is_rocm():
+        if requested in ("marlin", "flashinfer"):
+            raise RuntimeError(
+                f"--nvfp4-backend={requested} is NVIDIA-only and unavailable on this "
+                "ROCm (AMD) build; use --nvfp4-backend triton (or auto). NVFP4 checkpoints "
+                "can be converted to MXFP4 (freetoken.moe.nvfp4_to_mxfp4) on load."
+            )
+        return "triton"
     if requested == "triton":
         return "triton"
     if activation != "silu":

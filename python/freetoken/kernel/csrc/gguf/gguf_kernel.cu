@@ -1,14 +1,48 @@
-// Adatped from
+// Adapted from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
+// Algorithm cross-check: llama.cpp 7e4c0a968 (b10434),
+// ggml/src/ggml-cuda/mmvq.cu and ggml/src/ggml-cuda/ggml-cuda.cu.
+// Local HIP wrappers below preserve the GGUF packed Q4_K/Q5_K/Q6_K/Q8_0
+// contracts; native strided Q5_K/Q6_K is FreeToken-specific cache glue.
+#if defined(USE_ROCM)
+// ROCm torch hipifies these headers into c10::cuda (masquerading-as-CUDA), providing
+// c10::cuda::OptionalCUDAGuard / getCurrentCUDAStream backed by HIP. c10/cuda/CUDAGuard.h
+// itself is not directly includable on ROCm (missing a generated header).
+#include <c10/hip/HIPGuard.h>
+#include <c10/hip/HIPStream.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+using cudaStream_t = hipStream_t;
+#else
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
+
+#if defined(USE_ROCM)
+#define GGUF_DEVICE_GUARD(device) c10::cuda::OptionalCUDAGuard device_guard(device)
+#define GGUF_CURRENT_STREAM() c10::cuda::getCurrentCUDAStream()
+#else
+#define GGUF_DEVICE_GUARD(device) at::cuda::OptionalCUDAGuard device_guard(device)
+#define GGUF_CURRENT_STREAM() at::cuda::getCurrentCUDAStream()
+#endif
 
 // dont use clang-format here, it breaks the include order
 // clang-format off
 #include "dispatch.h"
 
+#if defined(USE_ROCM)
+// These are checked-in HIP translations. Do not rely on ignored/generated *.hip
+// sidecars; this selector is the active JIT source contract.
+#include "ggml-common_hip.h"
+#include "vecdotq_hip.cuh"
+#include "dequantize_hip.cuh"
+#include "mmvq_hip.cuh"
+#include "mmq_hip.cuh"
+#include "moe_hip.cuh"
+#include "moe_vec_hip.cuh"
+#else
 #include "ggml-common.h"
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
@@ -16,6 +50,7 @@
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
+#endif
 // clang-format off
 
 // Q8 gemv
@@ -77,11 +112,11 @@ torch::Tensor ggml_dequantize(
     int64_t m,
     int64_t n,
     std::optional<at::ScalarType> const& dtype) {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
+  const GGUF_DEVICE_GUARD(device_of(W));
   auto dtype_ = dtype.value_or(torch::kFloat16);
   auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
   at::Tensor DW = torch::empty({m, n}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
 
   DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
@@ -99,10 +134,10 @@ torch::Tensor ggml_mul_mat_vec_a8(
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const GGUF_DEVICE_GUARD(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
@@ -197,10 +232,10 @@ torch::Tensor ggml_mul_mat_a8(
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const GGUF_DEVICE_GUARD(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({batch, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({batch, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_a8", [&] {
@@ -344,10 +379,10 @@ torch::Tensor ggml_moe_a8(
     int64_t tokens) {
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const GGUF_DEVICE_GUARD(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({tokens * top_k, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8", [&] {
@@ -545,15 +580,43 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t top_k,
     int64_t type,
     int64_t row,
-    int64_t tokens) {
+    int64_t tokens,
+    torch::Tensor output = torch::Tensor(),
+    torch::Tensor quant_X_input = torch::Tensor()) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const GGUF_DEVICE_GUARD(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  at::Tensor Y;
+  if (output.defined()) {
+    TORCH_CHECK(output.is_cuda() && output.is_contiguous(),
+                "ggml_moe_a8_vec output must be contiguous CUDA/HIP tensor");
+    TORCH_CHECK(output.device() == W.device() && output.dtype() == X.dtype(),
+                "ggml_moe_a8_vec output device/dtype must match input/output");
+    TORCH_CHECK(output.sizes() == torch::IntArrayRef({tokens * top_k, row}),
+                "ggml_moe_a8_vec output shape mismatch");
+    Y = output;
+    // The legacy vector kernels skip invalid/padded routes. Preserve their old zero-fill
+    // contract while allowing callers to reuse fixed graph-address output storage.
+    Y.zero_();
+  } else {
+    Y = torch::zeros({tokens * top_k, row}, options);
+  }
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
-  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+  at::Tensor quant_X;
+  if (quant_X_input.defined()) {
+    TORCH_CHECK(quant_X_input.is_cuda() && quant_X_input.is_contiguous(),
+                "ggml_moe_a8_vec quant_X must be contiguous CUDA/HIP tensor");
+    TORCH_CHECK(quant_X_input.device() == W.device() &&
+                    quant_X_input.scalar_type() == torch::kInt32,
+                "ggml_moe_a8_vec quant_X device/dtype mismatch");
+    TORCH_CHECK(quant_X_input.sizes() == torch::IntArrayRef({tokens, padded / 32 * 9}),
+                "ggml_moe_a8_vec quant_X shape mismatch");
+    quant_X = quant_X_input;
+  } else {
+    quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+  }
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
     switch (type) {
@@ -809,6 +872,74 @@ torch::Tensor ggml_moe_a8_vec(
   return Y;
 }
 
+torch::Tensor ggml_moe_a8_vec_strided(
+    torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+    int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+    int64_t expert_stride_bytes, int64_t row_stride_bytes,
+    torch::Tensor output = torch::Tensor(),
+    torch::Tensor quant_X_input = torch::Tensor()) {
+  TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
+              "ggml_moe_a8_vec_strided requires CUDA/HIP tensors");
+  TORCH_CHECK(X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous(),
+              "ggml_moe_a8_vec_strided requires contiguous tensors");
+  TORCH_CHECK(type == 13 || type == 14,
+              "ggml_moe_a8_vec_strided supports Q5_K (13) and Q6_K (14), got ", type);
+  TORCH_CHECK(X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2,
+              "invalid ggml_moe_a8_vec_strided tensor ranks");
+  TORCH_CHECK(tokens == X.size(0) && top_k == topk_ids.size(1),
+              "ggml_moe_a8_vec_strided token/top-k shape mismatch");
+  TORCH_CHECK(expert_stride_bytes == W.stride(0) && row_stride_bytes == W.stride(1),
+              "weight strides must match contiguous uint8 tensor");
+  const int col = X.size(1);
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const GGUF_DEVICE_GUARD(device_of(X));
+  auto output_options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y;
+  if (output.defined()) {
+    TORCH_CHECK(output.is_cuda() && output.is_contiguous(),
+                "ggml_moe_a8_vec_strided output must be contiguous CUDA/HIP tensor");
+    TORCH_CHECK(output.device() == W.device() && output.dtype() == X.dtype(),
+                "ggml_moe_a8_vec_strided output device/dtype mismatch");
+    TORCH_CHECK(output.sizes() == torch::IntArrayRef({tokens * top_k, row}),
+                "ggml_moe_a8_vec_strided output shape mismatch");
+    Y = output;
+    Y.zero_();
+  } else {
+    Y = torch::zeros({tokens * top_k, row}, output_options);
+  }
+  auto quant_options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X;
+  if (quant_X_input.defined()) {
+    TORCH_CHECK(quant_X_input.is_cuda() && quant_X_input.is_contiguous(),
+                "ggml_moe_a8_vec_strided quant_X must be contiguous CUDA/HIP tensor");
+    TORCH_CHECK(quant_X_input.device() == W.device() &&
+                    quant_X_input.scalar_type() == torch::kInt32,
+                "ggml_moe_a8_vec_strided quant_X device/dtype mismatch");
+    TORCH_CHECK(quant_X_input.sizes() == torch::IntArrayRef({tokens, padded / 32 * 9}),
+                "ggml_moe_a8_vec_strided quant_X shape mismatch");
+    quant_X = quant_X_input;
+  } else {
+    quant_X = torch::empty({tokens, padded / 32 * 9}, quant_options);
+  }
+  cudaStream_t stream = GGUF_CURRENT_STREAM().stream();
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8_strided", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    if (type == 13) {
+      moe_vec_q5_K_q8_1_strided_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), top_k, tokens, col, row,
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+    } else {
+      moe_vec_q6_K_q8_1_strided_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), top_k, tokens, col, row,
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+    }
+  });
+  return Y;
+}
+
 int64_t ggml_moe_get_block_size(int64_t type) {
   switch (type) {
     case 2:
@@ -843,6 +974,67 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");
-  m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");
+  m.def("ggml_moe_a8_vec",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens) {
+          return ggml_moe_a8_vec(X, W, topk_ids, top_k, type, row, tokens);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"));
+  m.def("ggml_moe_a8_vec",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+           torch::Tensor output) {
+          return ggml_moe_a8_vec(X, W, topk_ids, top_k, type, row, tokens, output);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"), py::arg("output"));
+  m.def("ggml_moe_a8_vec_workspace",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+           torch::Tensor output, torch::Tensor quant_X) {
+          return ggml_moe_a8_vec(
+              X, W, topk_ids, top_k, type, row, tokens, output, quant_X);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"), py::arg("output"),
+        py::arg("quant_X"));
+  m.def("ggml_moe_a8_vec_strided",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+           int64_t expert_stride_bytes, int64_t row_stride_bytes) {
+          return ggml_moe_a8_vec_strided(
+              X, W, topk_ids, top_k, type, row, tokens,
+              expert_stride_bytes, row_stride_bytes);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"),
+        py::arg("expert_stride_bytes"), py::arg("row_stride_bytes"));
+  m.def("ggml_moe_a8_vec_strided",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+           int64_t expert_stride_bytes, int64_t row_stride_bytes,
+           torch::Tensor output) {
+          return ggml_moe_a8_vec_strided(
+              X, W, topk_ids, top_k, type, row, tokens,
+              expert_stride_bytes, row_stride_bytes, output);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"),
+        py::arg("expert_stride_bytes"), py::arg("row_stride_bytes"),
+        py::arg("output"));
+  m.def("ggml_moe_a8_vec_strided_workspace",
+        [](torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+           int64_t top_k, int64_t type, int64_t row, int64_t tokens,
+           int64_t expert_stride_bytes, int64_t row_stride_bytes,
+           torch::Tensor output, torch::Tensor quant_X) {
+          return ggml_moe_a8_vec_strided(
+              X, W, topk_ids, top_k, type, row, tokens,
+              expert_stride_bytes, row_stride_bytes, output, quant_X);
+        }, "",
+        py::arg("X"), py::arg("W"), py::arg("topk_ids"), py::arg("top_k"),
+        py::arg("type"), py::arg("row"), py::arg("tokens"),
+        py::arg("expert_stride_bytes"), py::arg("row_stride_bytes"),
+        py::arg("output"), py::arg("quant_X"));
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
 }

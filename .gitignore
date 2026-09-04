@@ -227,3 +227,13 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# torch.utils.cpp_extension ROCm hipify build artifacts (preprocessed .cu -> .hip,
+# and includes rewritten to *_hip.cuh) written next to the GGUF sources.
+python/freetoken/kernel/csrc/gguf/*.hip
+python/freetoken/kernel/csrc/gguf/*_hip.cuh
+python/freetoken/kernel/csrc/gguf/ggml-common_hip.h
+
+# local session junk
+nohup.out
+.plans/
