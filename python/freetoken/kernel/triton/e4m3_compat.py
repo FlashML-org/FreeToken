@@ -59,6 +59,14 @@ def e4m3_native() -> bool:
     if _native is None:
         if FORCE_EMU:
             _native = False
+        elif torch.version.hip is not None:
+            # torch.cuda.get_device_capability() on a HIP build returns the gfx/RDNA
+            # generation number (e.g. (11, 5) for gfx1150), not a CUDA compute
+            # capability -- comparing it against (8, 9) below is a tuple comparison
+            # over two unrelated numbering schemes and can false-positive (11 > 8).
+            # No AMD GPU has this fp8e4nv unit; e4m3_native_cx() (Triton's own,
+            # backend-aware check) already agrees this must be False.
+            _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
 
