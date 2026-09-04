@@ -364,15 +364,18 @@ class FrontendManager:
                     raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
+            try:
+                await asyncio.shield(self.abort_user(uid))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to deliver abort for user %s", uid)
             raise
 
     async def abort_user(self, uid: int):
+        claimed = self.event_map.pop(uid, None) is not None
+        self.ack_map.pop(uid, None)
+        if not claimed:
+            return
         await asyncio.sleep(0.1)
-        if uid in self.ack_map:
-            del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))

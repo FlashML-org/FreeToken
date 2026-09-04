@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -38,6 +39,8 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -144,6 +147,65 @@ def register_openai_routes(
         )])
 
 
+# How often a non-streaming handler looks at the transport while the engine
+# generates. The streaming path checks per chunk; one second bounds an abandoned
+# request's extra decode work without measurable polling overhead.
+_DISCONNECT_POLL_SECONDS = 1.0
+
+
+async def _await_watching_disconnect(awaitable, request: Request | None, state: Any, uid: int):
+    """Run an in-flight generation awaitable while watching the transport — the
+    non-streaming twin of stream_with_cancellation. Returns the awaitable's result,
+    or None when the client disconnected first: the same shielded abort_user is
+    delivered so an abandoned request stops burning decode slots instead of running
+    to max_tokens (with --max-running-requests 1 that is a full outage for its
+    remaining budget)."""
+    gen = asyncio.ensure_future(awaitable)
+    if request is None:
+        return await gen
+    try:
+        while True:
+            done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return gen.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        # The handler itself was cancelled (server shutdown): deliver the abort,
+        # then let the cancellation propagate — mirrors stream_with_cancellation.
+        try:
+            await asyncio.shield(state.abort_user(uid))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to deliver abort for user %s", uid)
+        gen.cancel()
+        raise
+    # Client gone. Claim + AbortMsg first (abort_user is a no-op once the ack
+    # loop's own cleanup has run), then wind down the drain task; its result is
+    # undeliverable either way.
+    try:
+        await asyncio.shield(state.abort_user(uid))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to deliver abort for user %s", uid)
+    gen.cancel()
+    try:
+        await gen
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — the response is undeliverable, only cleanup matters
+        pass
+    return None
+
+
+def _client_disconnected_response() -> JSONResponse:
+    # 499 — nginx's "client closed request". The client is gone; this status is
+    # for the access log, not the wire.
+    return create_error_response(
+        "client disconnected before the response was ready",
+        status_code=499,
+        err_type="client_disconnected",
+    )
+
+
 async def handle_chat_completion(
     req: ChatCompletionRequest,
     request: Request | None,
@@ -199,9 +261,13 @@ async def handle_chat_completion(
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await _await_watching_disconnect(
+            generate_full(uid, spec, state, source="/v1/chat/completions"), request, state, uid
+        )
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
+    if result is None:
+        return _client_disconnected_response()
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
     if result.reasoning:
         message["reasoning_content"] = result.reasoning
@@ -411,19 +477,29 @@ async def handle_completion(
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
         await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
-        text = ""
-        finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
-            if getattr(ack, "error", None):
-                return create_error_response(ack.error)
-            prompt_tokens += ack.prompt_tokens_delta
-            completion_tokens += ack.completion_tokens_delta
-            cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
-            if ack.finished:
-                finish_reason = getattr(ack, "finish_reason", None) or "stop"
-                break
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
+
+        async def _drain_one(uid: int = uid, index: int = index):
+            nonlocal prompt_tokens, completion_tokens, cached_tokens
+            text = ""
+            finish_reason = "stop"
+            async for ack in state.wait_for_ack(uid):
+                if getattr(ack, "error", None):
+                    return create_error_response(ack.error)
+                prompt_tokens += ack.prompt_tokens_delta
+                completion_tokens += ack.completion_tokens_delta
+                cached_tokens += ack.cached_tokens
+                text += ack.incremental_output
+                if ack.finished:
+                    finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                    break
+            return {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+
+        choice = await _await_watching_disconnect(_drain_one(), request, state, uid)
+        if choice is None:
+            return _client_disconnected_response()
+        if isinstance(choice, JSONResponse):
+            return choice
+        choices.append(choice)
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex}",
