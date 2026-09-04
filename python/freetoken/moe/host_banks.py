@@ -152,8 +152,12 @@ class HostBank:
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
-        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
+        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same. ``FREETOKEN_SKIP_BANK_LOCK=1`` deliberately leaves CPU-only layers pageable on hosts where ``mlock`` and ``cudaHostRegister`` consume the same quota."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
+            return
+        if os.environ.get("FREETOKEN_SKIP_BANK_LOCK", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
             return
         global _os_lock_failed
         if _os_lock_failed:

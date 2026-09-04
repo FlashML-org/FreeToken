@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
@@ -45,6 +46,7 @@ from .layers import (  # noqa: F401
     get_window_topk_idxs,
 )
 from .moe import Expert, Gate  # noqa: F401
+from .parallel import div_tp, tp_info, validate_tp
 
 
 class Block(nn.Module):
@@ -130,15 +132,30 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args: DeepseekV4Args):
         super().__init__()
+        # Check every tensor-parallel split before building a single layer, so a bad
+        # --tensor-parallel-size fails with one clear message, not a reshape deep in a
+        # forward. embed / head / norm / hyper-connections stay replicated.
+        validate_tp(args)
         self.args = args
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
-        self.embed = nn.Embedding(args.vocab_size, args.dim)
+        # Vocabulary parallelism. The embedding table and the output head are the two
+        # largest replicated tensors (3.0 GiB together), so each rank keeps one
+        # contiguous vocabulary block: the embedding all-reduces its masked lookup, the
+        # head all-gathers its logit slice.
+        rank, tp = tp_info()
+        self.tp_size = tp
+        self.vocab_size = args.vocab_size
+        vocab_local = div_tp(args.vocab_size, "vocab_size")
+        self.vocab_start = rank * vocab_local
+        self.vocab_local = vocab_local
+        self._comm = DistributedCommunicator() if tp > 1 else None
+        self.embed = nn.Embedding(vocab_local, args.dim)
         self.embed.weight.requires_grad_(False)
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
-        self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
+        self.head = nn.Parameter(torch.empty(vocab_local, args.dim, dtype=torch.bfloat16), requires_grad=False)
         hc_dim = hc_mult * args.dim
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
@@ -147,6 +164,33 @@ class Transformer(nn.Module):
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
             layer.attn.bind(pool, device)
+
+    def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Vocabulary-parallel lookup. Rows outside this rank's block contribute zero, so
+        the all-reduce sums exactly one real row per token. Index arithmetic only -- no
+        host sync, so a captured decode graph replays it."""
+        if self._comm is None:
+            return self.embed(input_ids)
+        local = input_ids - self.vocab_start
+        outside = (local < 0) | (local >= self.vocab_local)
+        y = self.embed(local.masked_fill(outside, 0))
+        y = y.masked_fill(outside.unsqueeze(-1), 0)
+        return self._comm.all_reduce(y)
+
+    def logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Head projection over this rank's vocabulary block, then an all-gather back to
+        the full [rows, vocab]. all_gather concatenates on dim 0, so the gathered tensor
+        is rank-major: one row block per rank, which is the vocabulary order."""
+        local = F.linear(h, self.head)  # [rows, vocab_local]
+        if self._comm is None:
+            return local
+        rows = local.shape[0]
+        gathered = self._comm.all_gather(local)  # [tp*rows, vocab_local]
+        if rows == 1:
+            return gathered.view(1, -1)[:, : self.vocab_size]
+        gathered = gathered.view(self.tp_size, rows, self.vocab_local)
+        gathered = gathered.permute(1, 0, 2).reshape(rows, self.tp_size * self.vocab_local)
+        return gathered[:, : self.vocab_size]
 
     def hc_head(self, x):
         shape, dtype = x.size(), x.dtype
@@ -172,13 +216,13 @@ class Transformer(nn.Module):
         # metadata; ``flat_positions`` [T] is the scheduler-staged batch.positions (per-token
         # ABSOLUTE position); ``last_indices`` [B] is the flattened index of each request's
         # final token -> its next-token logits row.
-        h = self.embed(input_ids)
+        h = self.embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[0, last_indices], self.head)  # [B, vocab]
+        return self.logits(h[0, last_indices])  # [B, vocab]
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -194,7 +238,7 @@ class Transformer(nn.Module):
         # in-flight replay (it mutates only the live map).
         B = input_ids.size(0)
         rows = torch.arange(B, device=input_ids.device)
-        h = self.embed(input_ids)
+        h = self.embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         # Hoist the layer-invariant per-step decode tensors (shared window-ring global slots):
         # resolved ONCE off the attention metadata (recomputed per call, so a capture records
@@ -206,7 +250,7 @@ class Transformer(nn.Module):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[:, -1], self.head)
+        return self.logits(h[:, -1])
 
 
 class DeepseekV4ForCausalLM(BaseLLMModel):

@@ -245,6 +245,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Seconds a tensor-parallel collective waits before failing. The first one is "
+            "the post-load memory all-reduce, which ranks reach minutes apart on a large "
+            "MoE checkpoint, so the default is sized for that load skew; lower it to make "
+            "a hung rank fail faster."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
@@ -509,6 +521,15 @@ def parse_args(
             "low-memory reclaimable read (slower); 'parallel' forces the fast read."
         ),
     )
+    parser.add_argument(
+        "--expert-prefetch",
+        type=_positive_int,
+        default=ServerArgs.expert_prefetch,
+        help=(
+            "Whole checkpoint shards queued ahead of placement by parallel expert "
+            "loading (default: 2). Use 1 on host-memory-constrained TP deployments."
+        ),
+    )
 
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
@@ -647,7 +668,9 @@ def parse_args(
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+            parser.error(
+                "--gpu has multiple entries; set --tensor-parallel-size to the same count"
+            )
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"

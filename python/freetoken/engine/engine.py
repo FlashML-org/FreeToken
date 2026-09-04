@@ -246,8 +246,18 @@ def _make_dummy_weight_state_dict(
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
     for key, param in model_state.items():
-        if param.dtype in fp8_dtypes:
+        if e8m0 is not None and param.dtype == e8m0:
+            # e8m0 is a bare exponent code (value = 2^(code-127)), so 127 is scale 1.0.
+            # It reports is_floating_point, but there is no normal_ kernel for it -- and a
+            # RANDOM exponent would scale a block by up to 2^127 anyway, so 1.0 is both the
+            # only fillable value and the only sane one. Without this a --dummy-weight run
+            # of any block-scaled model dies with "normal_kernel_cuda not implemented".
+            t = torch.empty(param.shape, dtype=param.dtype, device=device)
+            t.view(torch.uint8).fill_(127)
+            state_dict[key] = t
+        elif param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
@@ -290,11 +300,37 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _share_cpu_threads_across_ranks(tp_size: int) -> None:
+    """Split the machine's CPU threads across the TP ranks, before any tensor work.
+
+    torch sizes its intra-op pool from the WHOLE machine, and every rank does the same,
+    so N ranks each start a machine-sized pool and oversubscribe every core N times.
+    Measured on a 40-core / 80-thread host at TP=4: 117 threads per rank, 468 in total,
+    ~6x the hardware, all of it contending through the weight load -- which is thread-
+    bound (host-side copies into the expert banks), not disk-bound. The NVMe sat at
+    187 MB/s while the CPU ran at 92% user.
+
+    The engine already narrows threads once the pinned CPU MoE pool exists; this covers
+    everything BEFORE that, the weight load included. Honour an explicit OMP_NUM_THREADS.
+    """
+    if tp_size <= 1 or os.environ.get("OMP_NUM_THREADS"):
+        return
+    total = os.cpu_count() or tp_size
+    per_rank = max(1, total // tp_size)
+    if per_rank < torch.get_num_threads():
+        torch.set_num_threads(per_rank)
+        logger.info_rank0(
+            f"torch intra-op threads: {total} -> {per_rank} per rank "
+            f"({tp_size} ranks share this host)"
+        )
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
+        _share_cpu_threads_across_ranks(config.tp_info.size)
 
         from freetoken.gpu_select import bind_assigned_gpu
 
@@ -325,6 +361,19 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
+        # What the parameters declare vs what the load actually cost. Every byte of the gap
+        # is resident-but-unaccounted (staging buffers, per-layer scratch) and comes straight
+        # out of the MoE-cache + KV budget, so surface it instead of leaving it to arithmetic
+        # on the cache-sizing line.
+        declared = sum(t.numel() * t.element_size() for t in self.model.state_dict().values())
+        logger.info_rank0(
+            f"Weights: {mem_GB(declared)} declared by parameters, "
+            f"{mem_GB(self._weights_bytes)} measured on device "
+            f"(torch allocator holds {mem_GB(torch.cuda.memory_allocated(self.device))} live, "
+            f"{mem_GB(torch.cuda.memory_reserved(self.device))} reserved; "
+            f"peak {mem_GB(torch.cuda.max_memory_reserved(self.device))}). "
+            "A gap between 'reserved' and 'measured' is held OUTSIDE the allocator."
+        )
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -588,6 +637,7 @@ class Engine:
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
+                prefetch=config.expert_prefetch,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
@@ -1053,6 +1103,16 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
     the DSV4 decode batch size.
     """
+    if config.tp_info.size > 1:
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "DeepSeek-V4 tensor parallelism currently requires the original "
+                "safetensors checkpoint. FTW stores the TP=1 dense weights and expert "
+                "banks, so it cannot be replayed into rank-local DSV4 shapes; use the "
+                "raw checkpoint or run with --tp-size 1."
+            )
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
@@ -1221,6 +1281,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "expert_prefetch": 2,
 }
 
 

@@ -41,6 +41,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard the model over; one scheduler process per rank, mapped in `--gpu` order (default: rank `i` on `cuda:i`) |
+| `--distributed-timeout` | 1800 | Seconds a TP collective waits before failing; sized for the per-rank skew in weight-load time |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -80,6 +82,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
+| `--expert-load` / `--expert-prefetch` | auto / 2 | Expert-bank reader; parallel prefetch controls whole shards queued ahead of placement (use 1 to reduce TP host-RAM peak) |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
@@ -87,6 +90,10 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+On hosts where OS-locked and CUDA-registered memory share one quota, combine
+`--moe-cpu-layers` with `FREETOKEN_SKIP_BANK_LOCK=1`. CPU-only layer banks then
+remain pageable instead of consuming the quota needed by GPU-fetch layers.
 
 ### API behaviour
 
@@ -172,4 +179,3 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

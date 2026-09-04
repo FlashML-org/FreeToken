@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 
@@ -15,6 +16,7 @@ from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
 from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+from .parallel import div_tp, tp_size
 
 
 class Attention(nn.Module):
@@ -30,17 +32,23 @@ class Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
+        # Head parallelism: a rank owns whole o_groups, and therefore whole heads. The
+        # per-group head width (wo_a_k) is a property of one group, so it does NOT shard.
+        self.tp_size = tp_size()
+        self.n_heads = div_tp(args.n_heads, "n_heads")
+        self.n_groups = div_tp(args.o_groups, "o_groups")
+        self._comm = DistributedCommunicator() if self.tp_size > 1 else None
+
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False)
+        # wq_a / wkv / kv_norm stay replicated: the MLA latent KV is shared by every head.
         self.wq_a = Linear(self.dim, self.q_lora_rank, kind="fp8")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
@@ -48,8 +56,9 @@ class Attention(nn.Module):
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
         wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
+        wo_a_k = args.n_heads * self.head_dim // args.o_groups
         self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
+        # Row-parallel: each rank consumes its own groups and contributes a partial sum.
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
         self.softmax_scale = self.head_dim ** -0.5
 
@@ -99,10 +108,16 @@ class Attention(nn.Module):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
+        # Under TP, ``o`` holds only this rank's heads, so the grouped einsum and wo_b
+        # produce a PARTIAL sum over the full output dim. One all-reduce completes it --
+        # the single attention-side collective per block.
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b(o)
+        o = self.wo_b(o)
+        if self._comm is not None:
+            o = self._comm.all_reduce(o)
+        return o
 
     def _prefill_segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
