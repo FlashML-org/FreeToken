@@ -661,8 +661,11 @@ class Engine:
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        model_config = config.model_config
         fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
+            expert_bytes=_model_expert_bytes(cache.quant_format, model_config),
+            geometry=_model_geometry(model_config),
         )
         if fraction is None:
             cache.hybrid_max_fetch = 1
@@ -1002,6 +1005,32 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _model_geometry(model_config) -> dict | None:
+    """The served model's MoE geometry in benchbw's workload terms, or None for a dense model."""
+    try:
+        geometry = {
+            "hidden": int(model_config.hidden_size),
+            "inter": int(model_config.moe_intermediate_size),
+            "experts": int(model_config.num_experts),
+            "top_k": int(model_config.num_experts_per_tok),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return geometry if geometry["experts"] > 0 and geometry["inter"] > 0 else None
+
+
+def _model_expert_bytes(bench_fmt: str, model_config) -> int | None:
+    """Per-expert offload-bank bytes for this model in ``bench_fmt`` (the same per-format
+    sizing ``bank_bytes_estimate`` uses for the pin budget), or None for a format without one."""
+    from freetoken.moe.offload_cache import _BANK_BYTES_PER_EXPERT
+
+    geometry = _model_geometry(model_config)
+    per_expert = _BANK_BYTES_PER_EXPERT.get(bench_fmt)
+    if geometry is None or per_expert is None:
+        return None
+    return int(per_expert(geometry["hidden"], geometry["inter"]))
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
@@ -1385,7 +1414,15 @@ def _adjust_config(config: EngineConfig):
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+        # The profile is keyed on the expert format; the model's geometry / expert size picks the
+        # entry that was benched on comparable experts (a small-expert model must not inherit a
+        # verdict measured on 4x larger ones).
+        recommendation = load_backend_recommendation(
+            bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
+            expert_bytes=_model_expert_bytes(bench_fmt, model_config),
+            geometry=_model_geometry(model_config),
+        )
+        if recommendation == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
