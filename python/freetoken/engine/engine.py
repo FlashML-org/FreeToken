@@ -155,16 +155,48 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
     """Gate --kv-cache-dtype against what the quantized path actually implements.
 
     Quantized KV storage lives in the triton attention kernels and the MHA/hybrid-SWA
-    pools. Every other backend reads the KV slabs through its own kernels (flashinfer's
-    ``kv_data_type``, trtllm's fp8 path) which this has not been wired into, and the
-    MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations here,
-    at config time, rather than letting a wrong-dtype tensor reach a kernel.
+    pools. The quantized path is reachable only when every attention group routes to
+    those pools (FULL/SWA via triton), so this rejects at config time: any non-triton
+    backend, and any pool family the quant never reaches -- MLA/DSA latent slabs
+    (V aliases K), DSV4's self-priced paged pool, and the BSA/QSA index-tier pools
+    (GQA K/V + index slab, constructed without a quant arg). Some of these
+    combinations are already unreachable through the normal backend resolution
+    (dsv4_sparse/m3_sparse/qsa_sparse don't take triton's place), but this gate owns
+    the message: reject here rather than leak a downstream "backend does not support
+    dsv4" error that suggests --attention-backend triton, which the first gate would
+    then reject in turn.
     """
     quant = getattr(config, "kv_quant", None)
     if quant is None or not quant.enabled:
         return
 
     from freetoken.kvcache.quant import BLOCK
+
+    # Family gates first: name the pool family the quant cannot reach before the
+    # backend check, so these users never see "Pass --attention-backend triton" --
+    # the backend-capability gate (_validate_attention_backend_choice) would reject
+    # that suggestion for every family below.
+    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    latent = [s for s in specs if s.mla]
+    if latent:
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} does not support MLA/DSA latent KV pools "
+            "(their slabs alias K and V and carry an index tier); use --kv-cache-dtype auto."
+        )
+    # These pool families are constructed without a quant arg (kvcache/__init__.py),
+    # so the flag would be accepted and silently inert; the attn_type field is the
+    # single source the pool factory itself branches on.
+    own_pool = [
+        s for s in specs
+        if s.attn_type in (AttnType.DSV4, AttnType.BSA, AttnType.QSA)
+    ]
+    if own_pool:
+        names = ", ".join(f"{s.name} ({s.attn_type.value})" for s in own_pool)
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} is not wired into the "
+            f"{'/'.join(sorted({s.attn_type.value for s in own_pool}))} KV pools "
+            f"({names}); use --kv-cache-dtype auto."
+        )
 
     backends = [p.strip() for p in config.attention_backend.split(",")]
     if any(b != "triton" for b in backends):
@@ -174,12 +206,6 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
             "--attention-backend triton, or drop --kv-cache-dtype."
         )
 
-    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
-    if any(s.mla or s.index_head_dim > 0 for s in specs):
-        raise ValueError(
-            f"--kv-cache-dtype {quant.name} does not support MLA/DSA latent KV pools "
-            "(their slabs alias K and V and carry an index tier); use --kv-cache-dtype auto."
-        )
     bad = [s for s in specs if s.head_dim % BLOCK]
     if bad:
         names = ", ".join(f"{s.name} (head_dim {s.head_dim})" for s in bad)
