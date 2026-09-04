@@ -310,7 +310,7 @@ def iter_gguf_weights(
             shared_buf.setdefault(layer, {})["up"] = t.packed()
         elif suffix == "ffn_down_shexp.weight":
             yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
-        else:
+        elif not (dense_model and suffix in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight")):
             raise ValueError(f"unmapped Qwen3.5 GGUF tensor: {name}")
 
         slots = qkv_buf.get(layer)
