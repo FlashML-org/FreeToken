@@ -50,13 +50,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return self._zmq_addr("ipc:///tmp/freetoken_3", 93)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = self._zmq_addr("ipc:///tmp/freetoken_4", 94)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -93,6 +93,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.quant import KV_CACHE_DTYPES
     from freetoken.moe import SUPPORTED_MOE_BACKENDS
 
     def _parse_moe_cache_rate(value: str) -> float:
@@ -358,6 +359,22 @@ def parse_args(
             "Total KV-cache capacity in tokens; must be a multiple of the resolved page "
             "size (DSV4: 128 window page, TRTLLM backend: 64). Mutually exclusive with "
             "--num-pages."
+        ),
+    )
+
+    kv_capacity_group.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=list(KV_CACHE_DTYPES),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "KV-cache element storage. 'auto' keeps the compute dtype (bf16). 'q8_0' and "
+            "'fp8_e4m3' store 8 bits plus an fp16 scale per 32 elements along head_dim "
+            "(1.0625 bytes/element vs 2), and the sub-byte 'q2_0'/'q4_0'/'q6_0' pack multiple "
+            "values per byte (0.3125 / 0.5625 / 0.8125 bytes/element), and 'nvfp4' uses "
+            "the NVIDIA E2M1 4-bit float code at the same 0.5625 bytes/element density. "
+            "Frees VRAM for the MoE expert cache. Needs the triton attention backend "
+            "and head_dim divisible by 32 (q2_0/q4_0/q6_0) or 16 (nvfp4)."
         ),
     )
 

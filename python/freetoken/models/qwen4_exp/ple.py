@@ -149,6 +149,11 @@ class PinnedUVATable:
         self._device = device or torch.device("cuda", torch.cuda.current_device())
         # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
         self._table_ptr = device_ptr(weight)
+        if self._table_ptr is None:
+            raise RuntimeError(
+                "PLE host table has no device alias (pin failed?); qwen4_exp "
+                "requires the embedding table to be pinned+mapped"
+            )
         self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}

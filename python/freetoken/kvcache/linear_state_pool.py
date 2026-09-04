@@ -260,6 +260,33 @@ def linear_state_bytes_per_req(
 __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
+_GDN_CHUNK_SIZE = 64  # keep in lockstep with kernel/fla/chunk_delta_h.py CHUNK_SIZE
+
+
+def gdn_prefill_workspace_bytes(config) -> int:
+    """Peak transient VRAM of one GDN prefill forward.
+
+    ``chunk_gated_delta_rule_fwd_h`` materializes the per-chunk recurrent states for
+    the WHOLE extend at once -- ``[NT, H, V, K]`` with ``NT = ceil(extend / 64)`` --
+    plus the ``v_new`` value buffer; ~192 MiB at an 8192-token extent for
+    ornith-class geometry. The generic ``(1 - memory_ratio)`` headroom is sized for
+    CUDA graphs; without reserving this term the GDN kernel OOMs on long prefills
+    at aggressive memory ratios. 0 for non-GDN models."""
+    linear_group = config.model_config.linear_attention_group()
+    if linear_group is None:
+        return 0
+    extent = min(config.max_extend_tokens, config.max_seq_len)
+    nt = -(-extent // _GDN_CHUNK_SIZE)
+    states = (
+        nt
+        * linear_group.num_value_heads
+        * linear_group.value_head_dim
+        * linear_group.key_head_dim
+    )
+    v_new = extent * linear_group.num_value_heads * linear_group.value_head_dim
+    return (states + v_new) * config.dtype.itemsize
+
+
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
     """Total GDN state-pool bytes at ``num_slots`` PHYSICAL slots (default: the startup
     slot count). The engine adds this to the KV family's fixed cost when budgeting --

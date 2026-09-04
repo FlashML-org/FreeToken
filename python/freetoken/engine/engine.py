@@ -25,7 +25,8 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, gdn_prefill_workspace_bytes,
+    state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -149,6 +150,44 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
     )
+
+
+def _validate_kv_cache_dtype(config, model_config) -> None:
+    """Gate --kv-cache-dtype against what the quantized path actually implements.
+
+    Quantized KV storage lives in the triton attention kernels and the MHA/hybrid-SWA
+    pools. Every other backend reads the KV slabs through its own kernels (flashinfer's
+    ``kv_data_type``, trtllm's fp8 path) which this has not been wired into, and the
+    MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations here,
+    at config time, rather than letting a wrong-dtype tensor reach a kernel.
+    """
+    quant = getattr(config, "kv_quant", None)
+    if quant is None or not quant.enabled:
+        return
+
+    from freetoken.kvcache.quant import BLOCK
+
+    backends = [p.strip() for p in config.attention_backend.split(",")]
+    if any(b != "triton" for b in backends):
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} needs the triton attention backend, but the "
+            f"resolved backend is {config.attention_backend!r}. Pass "
+            "--attention-backend triton, or drop --kv-cache-dtype."
+        )
+
+    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    if any(s.mla or s.index_head_dim > 0 for s in specs):
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} does not support MLA/DSA latent KV pools "
+            "(their slabs alias K and V and carry an index tier); use --kv-cache-dtype auto."
+        )
+    bad = [s for s in specs if s.head_dim % BLOCK]
+    if bad:
+        names = ", ".join(f"{s.name} (head_dim {s.head_dim})" for s in bad)
+        raise ValueError(
+            f"--kv-cache-dtype {quant.name} needs every head_dim to be a multiple of "
+            f"{BLOCK}, the quantization block; this model has {names}."
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -350,6 +389,9 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        # reserve the GDN prefill transient (chunk recurrent states + v_new); without
+        # it long prefills OOM inside the GDN kernel when memory_ratio packs the pools
+        available_memory -= gdn_prefill_workspace_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -485,6 +527,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += gdn_prefill_workspace_bytes(config)  # GDN prefill transient
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -1031,7 +1074,11 @@ def _ensure_expandable_segments() -> None:
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        # torch 2.9+: _set_allocator_settings -> _C._cuda_setAllocatorSettings
+        try:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except AttributeError:
+            torch._C._cuda_setAllocatorSettings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
@@ -1173,7 +1220,26 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
     elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
+        if not hasattr(os, "uname"):
+            # native Windows/WDDM: pinning IS capped (driver locks ~half of RAM,
+            # shared with VirtualLock); plan with 40% of physical RAM so the
+            # CPU-layer split engages instead of over-allocating one pinned pool
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            cap = int(st.ullTotalPhys * 0.4)
+        else:
+            return None
     else:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
     return max(0, cap - reserved)
@@ -1332,6 +1398,7 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    _validate_kv_cache_dtype(config, model_config)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

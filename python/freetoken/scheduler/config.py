@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from freetoken.engine import EngineConfig
@@ -22,17 +23,25 @@ class SchedulerConfig(EngineConfig):
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
 
+    def _zmq_addr(self, ipc_path: str, tcp_port: int) -> str:
+        """IPC on POSIX; loopback TCP on Windows, where libZMQ ships no ipc://
+        transport (and the '.pid=NNN' instance suffix is invalid after a port).
+        Single instance per port -- multi-instance serving must override."""
+        if os.name == "nt":
+            return f"tcp://127.0.0.1:{tcp_port}"
+        return ipc_path + self._unique_suffix
+
     @property
     def zmq_backend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_0" + self._unique_suffix
+        return self._zmq_addr("ipc:///tmp/freetoken_0", 50)
 
     @property
     def zmq_detokenizer_addr(self) -> str:
-        return "ipc:///tmp/freetoken_1" + self._unique_suffix
+        return self._zmq_addr("ipc:///tmp/freetoken_1", 51)
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:
-        return "ipc:///tmp/freetoken_2" + self._unique_suffix
+        return self._zmq_addr("ipc:///tmp/freetoken_2", 52)
 
     @property
     def max_forward_len(self) -> int:

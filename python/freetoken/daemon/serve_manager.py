@@ -135,6 +135,13 @@ def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
     group leader so signals reach the whole worker tree via the group."""
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     logf = open(log_path, "wb", buffering=0)  # truncate: a fresh serve gets a fresh log
+    extra: dict = {}
+    if os.name == "nt":
+        # DETACHED_PROCESS: the child must not inherit the daemon console. After a serve
+        # tree terminates, that console is broken and every later child dies at DLL init
+        # (0xC0000142) with an empty log -- the "restart engine fails until daemon restart"
+        # trap. stdin/stdout/stderr are all redirected to real fds, so detaching is safe.
+        extra["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         proc = subprocess.Popen(
             argv,
@@ -143,6 +150,7 @@ def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            **extra,
         )
     finally:
         logf.close()  # the child holds its own dup; the parent must not keep this fd

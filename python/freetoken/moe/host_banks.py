@@ -173,6 +173,29 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    if os.name == "nt":
+        # Windows: VirtualLock per-region; the process working-set cap governs how
+        # much can stay resident, no RLIMIT_MEMLOCK equivalent.
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_errno=True)
+        min_ws = _os_locked_total + nbytes + (512 << 20)
+        # QUOTA_LIMITS_HARDWS_MIN_ENABLE (0x1) | HARDWS_MAX_ENABLE (0x2): pin the
+        # working-set floor so trimmed pages can't include locked ones. Best-effort.
+        try:
+            k32.SetProcessWorkingSetSizeEx(ctypes.c_void_p(-1), ctypes.c_size_t(min_ws), ctypes.c_size_t(min_ws * 2), 0x1 | 0x2)
+        except OSError:
+            pass
+        if not k32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+            err = ctypes.get_errno()
+            raise OSError(
+                err,
+                f"VirtualLock({nbytes / 2**30:.1f} GiB) failed: {os.strerror(err)} "
+                f"(the process working-set cap bounds OS-locked bytes; "
+                f"shrink --moe-cpu-layers or raise the working-set minimum)",
+            )
+        _os_locked_total += nbytes
+        return
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
@@ -256,9 +279,19 @@ def requested_residency(labels: list[str] | None):
 
 
 def _settle(bank: HostBank, residency: str) -> None:
-    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
+    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap).
+
+    A failed pin or lock downgrades silently: the bank stays as a lazy mmap, the
+    consumer treats it as PAGEABLE, and the load keeps going. Windows WDDM caps
+    cudaHostRegister near half of RAM; over-quota banks must not be fatal."""
     if residency == HostResidency.PINNED.value:
-        bank.pin()
+        try:
+            bank.pin()
+        except RuntimeError:
+            logger.warning(
+                f"bank pin failed ({bank.nbytes / 2**30:.2f} GiB); "
+                f"downgrading to PAGEABLE so the load can continue"
+            )
     elif residency == HostResidency.LOCKED.value:
         bank.lock()
 
@@ -309,17 +342,30 @@ class PinPipeline:
             bank, residency, plan, layer_id = item
             try:
                 _settle(bank, residency)
-                if plan is not None and residency == HostResidency.LOCKED.value:
+                if plan is not None:
+                    # record achieved residency for both LOCKED and PINNED so pin failures
+                    # update the plan to PAGEABLE; _build_copy_plan routes those layers
+                    # through the pageable copy path (no device alias needed)
                     plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
     def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
                plan=None, layer_id: int | None = None) -> None:
-        self._q.put((bank, residency, plan, layer_id))
+        # Windows/WDDM: cudaHostRegister must not race with address-space operations
+        # (lazy shard file-map creation in the reader) -- it fails spuriously with
+        # "out of memory" when run on a background thread. Settle inline instead;
+        # the background thread only drains the queue.
+        try:
+            _settle(bank, residency)
+            if plan is not None:
+                plan.record(layer_id, bank.residency.value)
+        except BaseException as exc:  # surfaced by wait()/__exit__
+            self._exc = exc
+        self._q.put(None)
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
+        """Layer-completion sink: settle every bank of the completed layer at its ambient :func:`requested_residency` label (inline, see submit)."""
         plan = _requested_residency
         residency = (
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)

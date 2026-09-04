@@ -23,16 +23,27 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
 
+    When ``--kv-cache-dtype`` selects a quantized storage, the per-element cost is the
+    quant spec's ``bytes_per_element`` (e.g. 0.5625 for q4_0/nvfp4, 1.0625 for q8_0)
+    instead of the compute dtype's itemsize -- the cache-budget planner would otherwise
+    price every quantized page at bf16 rates and reject configs that easily fit.
+
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    quant = getattr(config, "kv_quant", None)
+    elem_bytes = (
+        quant.bytes_per_element(config.dtype)
+        if quant is not None and quant.enabled
+        else config.dtype.itemsize
+    )
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * elem_bytes
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+    return int(per_token) + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
 class BaseKVCachePool(ABC):
