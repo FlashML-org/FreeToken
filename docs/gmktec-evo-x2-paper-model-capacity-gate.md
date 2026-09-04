@@ -39,8 +39,11 @@ The bounded inventory found the following relevant payloads:
 
 ## Paper-model decision
 
-The paper describes DeepSeek-V4-Flash as a 284B-parameter model with a native
-MXFP4 routed-expert pool of roughly 140 GB in the prefill discussion. It
+The official DeepSeek model card identifies DeepSeek-V4-Flash as 284B total
+parameters and 13B activated parameters, with FP4 plus FP8 mixed precision.
+The paper's prefill discussion describes roughly 140 GB of routed expert
+weights. The model card also lists the safetensors repository as approximately
+291B parameters and identifies the official local deployment path. The paper
 describes GLM-5.2 as a 753B-parameter model with a 433 GB checkpoint. Neither
 payload is installed on this host, and the live available-memory observation
 is far below either stated payload scale.
@@ -62,4 +65,3 @@ reproduce the paper's claim.
    run that cannot meet the paper's interactive criterion.
 4. Keep Qwen and Gemma performance optimization independent from this capacity
    gate.
-
