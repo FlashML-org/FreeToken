@@ -1,5 +1,8 @@
 # GMKtec EVO-X2 AMD FreeToken execution log
 
+The consolidated Gemma 4 comparison is in
+`gmktec-evo-x2-gemma4-comparison-report.md`.
+
 This file is append-only. Each entry records UTC time, branch and commit, test
 category, command or script, artifact location, quality result, outcome, and
 restoration result. Do not replace a failed entry with a later passing entry.
