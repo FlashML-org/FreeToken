@@ -36,6 +36,7 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -72,26 +73,51 @@ def _dequant_triton(rows: torch.Tensor, qweight_type: int, m: int, n: int) -> to
 _GGUF_BACKEND = os.environ.get("FT_GGUF_BACKEND")  # "hip" | "triton" | None
 
 
+@functools.cache
+def _capture_needs_triton() -> bool:
+    """Whether graph capture must swap to the Triton kernels on this GPU.
+
+    gfx1201 (RX 9070 XT) crashes replaying the HIP extension kernels (HIP 719 /
+    driver TDR, issue #82). gfx1200 (RX 9060 XT) replays them fine and ~4x faster
+    than the Triton GEMM (93.6 vs 24.4 tok/s eager on Qwen2.5-3B Q4_K_M), so only
+    the known-bad arch pays the Triton fallback.
+    """
+    if torch.version.hip is None:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return True  # unknown device: keep the safe fallback
+    return arch == "gfx1201"
+
+
 def _use_triton(x: torch.Tensor) -> bool:
-    """Triton path inside CUDA-graph captures: the HIP extension crashes replay
-    on RDNA4. FT_GGUF_BACKEND forces one globally."""
+    """Select Triton explicitly or for capture on an affected gfx1201 device."""
     if _GGUF_BACKEND == "triton":
         return True
     if _GGUF_BACKEND == "hip":
         return False
-    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+    return (
+        x.is_cuda
+        and torch.cuda.is_current_stream_capturing()
+        and _capture_needs_triton()
+    )
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type.
 
     Dispatch order:
-    1. Quantized under graph capture (or explicitly selected): Triton GEMM
-    2. Unquantized (F32/F16/BF16): plain torch matmul
-    3. Small-batch quantized (batch <= 6, in MMVQ_TYPES): GEMV kernel
-    4. Large-batch standard quants (in MMQ_TYPES): MMQ kernel
-    5. Large-batch with I-quants (in DEQUANT_TYPES but not MMQ_TYPES): dequant + torch matmul
+    1. Empty batch: return before selecting or importing a backend
+    2. Quantized with Triton selected: vendored Triton GGUF GEMM
+    3. Unquantized (F32/F16/BF16): plain torch matmul
+    4. Small-batch quantized (batch <= 6, in MMVQ_TYPES): HIP GEMV kernel
+    5. Large-batch standard quants (in MMQ_TYPES): HIP MMQ kernel
+    6. Large-batch I-quants: HIP dequant + torch matmul
     """
+    out_features = qweight.shape[0]
+    if x.shape[0] == 0:
+        return x.new_empty((0, out_features))
     if qweight_type not in GGML_UNQUANTIZED and _use_triton(x):
         return _gemm_triton(x, qweight, qweight_type)
     from freetoken.kernel.gguf import (
@@ -100,9 +126,6 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         ggml_mul_mat_vec_a8,
     )
 
-    out_features = qweight.shape[0]
-    if x.shape[0] == 0:
-        return x.new_empty((0, out_features))
     if qweight_type in GGML_UNQUANTIZED:
         return x @ qweight.T
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
@@ -289,7 +312,13 @@ class GGUFEmbedding(BaseOP):
         else:
             from freetoken.kernel.gguf import ggml_dequantize
 
-            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+            y = ggml_dequantize(
+                rows,
+                self._quant_type,
+                flat.shape[0],
+                self.embedding_dim,
+                torch.bfloat16,
+            )
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
