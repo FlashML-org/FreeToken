@@ -160,6 +160,7 @@ if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
         --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
         --gguf "${MODEL_PATH}" --samples "${FREETOKEN_GEMMA4_MATRIX_SAMPLES:-5}" \
         --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --prompt-repeat "${FREETOKEN_GEMMA4_PROMPT_REPEAT:-1}" \
         --artifact "${ARTIFACT_DIR}/text-matrix.json" \
         >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
 fi

@@ -110,16 +110,23 @@ def main() -> int:
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--prompt-repeat",
+        type=int,
+        default=1,
+        help="repeat the deterministic explanation sentence this many times",
+    )
     parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()
-    if args.samples < 1 or args.max_tokens < 2:
-        parser.error("samples must be positive and max-tokens must be at least two")
+    if args.samples < 1 or args.max_tokens < 2 or args.prompt_repeat < 1:
+        parser.error("samples and prompt-repeat must be positive and max-tokens must be at least two")
 
-    prompt = (
+    prompt_unit = (
         "Write a concise technical explanation of how a graphics processor executes "
         "a quantized mixture-of-experts language model. Use complete sentences and "
         "continue until the requested token limit is reached."
     )
+    prompt = " ".join(prompt_unit for _ in range(args.prompt_repeat))
     body = {
         "model": args.model,
         # A raw completion prompt is intentional here.  The server performs
@@ -145,6 +152,7 @@ def main() -> int:
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "requested_samples": args.samples,
         "max_tokens": args.max_tokens,
+        "prompt_repeat": args.prompt_repeat,
         "warmup": warmup,
         "samples": samples,
         "summary": {
