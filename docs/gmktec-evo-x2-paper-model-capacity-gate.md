@@ -114,6 +114,15 @@ This makes a bounded transfer and packing experiment worthwhile, but it does
 not make full serving feasible. The exact derived values are preserved in
 [`gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json).
 
+The executable next-stage harness is
+[`deepseek_expert_slice_benchmark.py`](../scripts/gmk-evo-x2/deepseek_expert_slice_benchmark.py).
+Its default selection is one layer and six experts, approximately 76.5 MiB of
+core routed expert weight bytes before scales and other model state. It
+requires a locally staged safetensors directory, PyTorch with ROCm, and the
+`safetensors` package. It touches no API port and records
+`protected_service_touched: false` in its output. It must be run only as an
+isolated candidate after the normal service is verified healthy.
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident

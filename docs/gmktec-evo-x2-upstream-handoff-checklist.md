@@ -83,6 +83,7 @@ performance claims separate.
 - `gmktec-evo-x2-paper-model-capacity-gate.md`
 - `gmktec-evo-x2-deepseek-capacity-gate-result-20260905.json`
 - `gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json`
+- `scripts/gmk-evo-x2/deepseek_expert_slice_benchmark.py`
 
 The checklist is a review aid. The raw benchmark artifacts remain the
 authoritative evidence for measured claims.
