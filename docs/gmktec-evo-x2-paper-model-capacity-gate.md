@@ -79,6 +79,27 @@ As an additional identity check, `config.json` is byte-for-byte identical at
 the release commit and the current model-card commit. Its SHA-256 is
 `6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`.
 
+## Reproducible metadata-only gate
+
+The repository includes
+[`deepseek_capacity_gate.py`](../scripts/gmk-evo-x2/deepseek_capacity_gate.py).
+Using the pinned payload size, 18 GiB of observed `MemAvailable`, a 2 GiB
+ROCm-reported aperture, and explicit reserves of 8 GiB for the OS, 2 GiB for
+runtime state, 2 GiB for KV cache, and 2 GiB for recovery, it produced:
+
+```text
+decision: REJECT_FULL_LOAD
+authoritative model budget: 4.000 GiB
+payload: 155.425 GiB
+authoritative deficit: 151.425 GiB
+optimistic deficit even counting the VRAM aperture: 135.425 GiB
+```
+
+The machine-readable result is
+[`gmktec-evo-x2-deepseek-capacity-gate-result-20260905.json`](gmktec-evo-x2-deepseek-capacity-gate-result-20260905.json).
+This is a metadata-only rejection. No model files were downloaded, and no
+service or model process was changed.
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident
