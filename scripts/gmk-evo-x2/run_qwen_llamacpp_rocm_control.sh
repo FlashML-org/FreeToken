@@ -92,7 +92,12 @@ echo "$!" >"${SERVER_PID_FILE}"
 # Wait for a definite local health response, reporting the preserved server log
 # if initialization fails rather than silently benchmarking a different server.
 for _ in $(seq 1 180); do
-    if curl -fsS "${BASE_URL%/v1}/health" >"${ARTIFACT_ROOT}/health-ready.json"; then
+    # HTTP 200 is not sufficient: FreeToken and llama.cpp can expose a health
+    # endpoint while weights are still loading.  Require the explicit ready
+    # state before sending benchmark traffic, otherwise the first request can
+    # receive a transient 503 and invalidate the whole comparison.
+    if curl -fsS "${BASE_URL%/v1}/health" >"${ARTIFACT_ROOT}/health-ready.json" \
+        && grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' "${ARTIFACT_ROOT}/health-ready.json"; then
         break
     fi
     if ! kill -0 "$(<"${SERVER_PID_FILE}")" 2>/dev/null; then
