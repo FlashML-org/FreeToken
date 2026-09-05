@@ -144,6 +144,9 @@ class ISOKVCache(BaseKVCachePool):
     ) -> None:
         from freetoken.kernel.iso import iso_store_cache
 
+        if self._device.type != "cuda":
+            raise NotImplementedError("ISOKVCache.store_kv requires a CUDA device")
+
         dense = self._dense(layer_id)
         n = k.shape[0]
         iso_store_cache(
