@@ -80,6 +80,104 @@ def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
     )
 
 
+def _make_full_range_fp8_block_cache(H, I, seed=0):
+    from freetoken.kernel.aot_models import fp8_block_scale_pad
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    torch.manual_seed(seed)
+    finite_codes = torch.tensor([c for c in range(256) if c not in (0x7F, 0xFF)], dtype=torch.uint8)
+
+    def rows(OUT, IN):
+        count = OUT * IN
+        codes = finite_codes.repeat((count + finite_codes.numel() - 1) // finite_codes.numel())[:count]
+        codes = codes[torch.randperm(count)].reshape(1, OUT, IN)
+        weights = alloc_pinned_tensor(1, OUT, IN, dtype=torch.float8_e4m3fn)
+        weights.copy_(codes.view(torch.float8_e4m3fn))
+        scales = alloc_pinned_tensor(
+            1, _nb(OUT), fp8_block_scale_pad(_nb(OUT), _nb(IN)), dtype=torch.bfloat16
+        )
+        scales.copy_((0.01 + 0.09 * torch.rand_like(scales)).to(torch.bfloat16))
+        return weights, scales
+
+    gu, gus = rows(2 * I, H)
+    dn, dns = rows(H, I)
+    return SimpleNamespace(
+        quant_format="fp8_block",
+        bank_sources={
+            "gate_up": [gu], "gate_up_scale": [gus],
+            "down": [dn], "down_scale": [dns],
+        },
+        num_layers=1,
+        num_experts=1,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+
+
+def _reference_fp8_gemv(weights, scales, x):
+    rows, cols = weights.shape[-2:]
+    scale = scales[0, :_nb(rows), :_nb(cols)].to(torch.float64)
+    scale = scale.repeat_interleave(BLK, 0).repeat_interleave(BLK, 1)[:rows, :cols]
+    return (weights[0].to(torch.float64) * scale) @ x.to(torch.float64)
+
+
+def test_cpu_fp8_block_matches_float64_reference():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    H, I = 259, 257  # ragged K for both GEMVs; 257 down rows exercise many reductions
+    cache = _make_full_range_fp8_block_cache(H, I, seed=20260904)
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=1,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=1,
+        max_tokens=1,
+        device=torch.device("cpu"),
+    )
+
+    hidden = torch.randn(1, H, dtype=torch.bfloat16)
+    io = ex._io_for(1)
+    io["x"].copy_(hidden)
+    io["ids"].zero_()
+    io["w"].fill_(1.0)
+    ex._ext.run_task(ex._task_for(0, 1))
+    cpu_out = io["y"][0].float().to(torch.float64)
+
+    banks = cache.bank_sources
+    gate_up = _reference_fp8_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
+    intermediate = (torch.nn.functional.silu(gate_up[:I]) * gate_up[I:])
+    expected = _reference_fp8_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
+    rel = (cpu_out - expected).abs().max() / (expected.abs().max() + 1e-6)
+    # The executor stores its result as bf16. Across 257 output rows, the measured
+    # max relative error was 3.45e-3; this margin leaves room for reduction order
+    # without accepting the materially larger error from a narrow accumulator.
+    assert rel < 5e-3, f"max relative error {rel.item()}"
+
+
+@pytest.mark.parametrize("isa", ["scalar", "avx2", "avx512", "avx512bf16"])
+def test_cpu_fp8_block_isa_override(monkeypatch, isa):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    cache = _make_fp8_block_cache(1, 1, 256, 128, seed=17)
+    monkeypatch.delenv("FREETOKEN_CPU_MOE_ISA", raising=False)
+    auto = CpuMoeExecutor(
+        cache, top_k=1, activation="silu", apply_router_weight_on_input=False,
+        num_threads=1, max_tokens=1, device=torch.device("cpu"),
+    )
+    names = ("scalar", "avx2", "avx512f", "avx512bf16")
+    auto_rank = names.index(auto.isa)
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
+    forced = CpuMoeExecutor(
+        cache, top_k=1, activation="silu", apply_router_weight_on_input=False,
+        num_threads=1, max_tokens=1, device=torch.device("cpu"),
+    )
+    assert names.index(forced.isa) == min(names.index({
+        "scalar": "scalar", "avx2": "avx2", "avx512": "avx512f",
+        "avx512bf16": "avx512bf16",
+    }[isa]), auto_rank)
+
+
 @pytest.mark.parametrize("bs", [1, 2, 5])
 def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -121,12 +219,10 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
 
 
 def test_subnormal_and_sign_decode_exactly():
-    """Every e4m3 byte must widen to the value the reference LUT gives.
+    """Check PyTorch's e4m3-to-bf16 conversion used by the CPU decoder.
 
-    The normal range comes from a shift-and-rebias trick; exp == 0 does not obey it,
-    and a wrong sign or a missing subnormal blend is invisible in an averaged GEMV.
+    The C++ decoder is exercised by ``test_cpu_fp8_block_matches_float64_reference``.
     """
-    from freetoken.kernel import _cpu_moe  # noqa: F401  (ensures the ext is importable)
 
     codes = torch.arange(256, dtype=torch.uint8)
     ref = codes.view(torch.float8_e4m3fn).float()
