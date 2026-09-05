@@ -168,3 +168,17 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | 2026-09-05 | `/home/david/freetoken-amd/artifacts/qwen-llama-raw-20260905T122310Z/raw-quality.json` | Same-checkpoint Qwen3.6 Q4_K_M GGUF llama.cpp ROCm10 raw-prompt control | The exact same Q4_K_M GGUF checkpoint, tokenizer, caller-rendered prompt, and 256-token cap were used. The expected answer path passed, with 49.3875 decode TPS across 256 generated tokens. Loaded-control TTFT was 234.038 ms. The full output hash is retained and differs from FreeToken. The protected service was restored afterward. |
 | 2026-09-05 | `/home/david/freetoken-amd/artifacts/qwen-gguf-warm-matrix-20260905T122817Z/` | Same-checkpoint Qwen3.6 Q4_K_M GGUF warmed FreeToken matrix | One loaded FreeToken server handled five consecutive caller-rendered raw-prompt requests. All five returned the expected answer path and the same output hash. Decode was 45.2713 TPS on the first request and 49.3630, 49.3096, 49.6545, and 49.4156 TPS on requests 2 through 5. Mean decode was 48.6028 TPS across all samples and 49.4357 TPS after the first request. Mean TTFT was 982.17 ms including the first request and 424.26 ms for requests 2 through 5. The protected service was restored and returned `status: ok`, `maintenance: serving`. |
 | 2026-09-05 | `/home/david/freetoken-amd/artifacts/qwen-llama-warm-matrix-20260905T124007Z/` | Same-checkpoint Qwen3.6 Q4_K_M GGUF warmed llama.cpp ROCm10 matrix | One loaded llama.cpp server handled five consecutive caller-rendered raw-prompt requests. All five returned the expected answer path and the same output hash. Decode was 48.8686 TPS on the first request and 49.1575, 49.1606, 49.1887, and 49.2019 TPS on requests 2 through 5. Mean decode was 49.1155 TPS across all samples and 49.1772 TPS after the first request. Mean TTFT was 92.07 ms including the first request and 58.83 ms for requests 2 through 5. The protected service was restored and returned `status: ok`, `maintenance: serving`. |
+
+## 2026-09-05 regression contract repair
+
+The HIP GGUF compiler helper records the reviewed default one-row launch shape
+explicitly as `-DGGML_CUDA_MMV_Y=1`. Two host-side tests still expected the
+older `-O3`-only flag list, which would have made the test contract disagree
+with the actual build key and obscured the default AMD kernel shape. Commit
+`803a3ce` updates both expectations and documents why the explicit flag is
+required. A dependency-free contract harness exercised default, explicit
+multi-target, two-row candidate, and invalid four-row rejection cases, with
+four of four checks passing. Full pytest collection on Windows remains
+environment-limited because the local test interpreter does not have PyTorch;
+the authoritative ROCm runtime and protected service remained healthy after
+the validation.
