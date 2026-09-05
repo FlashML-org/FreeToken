@@ -1806,6 +1806,17 @@ struct CpuMoeExecutor {
 
   const char* isa_name() const { return isa; }
 
+  const char* fp8_isa_name() const {
+#if CPU_MOE_X86
+#ifdef CPU_MOE_HAS_AVX512BF16
+    if (fp8dot == dot_fp8_block_avx512bf16) return "avx512bf16";
+#endif
+    if (fp8dot == dot_fp8_block_avx512f) return "avx512f";
+    if (fp8dot == dot_fp8_block_avx2) return "avx2";
+#endif
+    return "scalar";
+  }
+
   void barrier(int& local_sense) {
     local_sense ^= 1;
     if (bar_count.fetch_add(1) + 1 == num_threads) {
@@ -2417,6 +2428,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](CpuMoeExecutor& e, int v) { e.act_block = v; },
            py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("fp8_isa_name", &CpuMoeExecutor::fp8_isa_name)
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))
