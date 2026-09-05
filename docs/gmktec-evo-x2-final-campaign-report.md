@@ -135,4 +135,7 @@ admission, deterministic quality fixture, TPS matrix, and recovery evidence.
 The source branch containing the native ROCm/HIP implementation and this
 evidence set is the branch proposed in upstream PR #260. The PR remains open.
 Merge status and external maintainer review are separate from the completed
-local AMD qualification gates.
+local AMD qualification gates. The latest upstream page still shows the PR as
+open. The two Copilot build-detection findings are marked outdated and the
+branch records their fix in commit `54d6ab2`; no new actionable review request
+was visible during the latest handoff check.
