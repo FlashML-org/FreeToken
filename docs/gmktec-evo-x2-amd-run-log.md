@@ -344,3 +344,33 @@ checkout and separately distinguishes the first missing-extension run from
 the final built-extension result. The isolated worktree and compiler log are
 preserved at `/home/david/freetoken-amd/validation-e7a5a92/` and
 `/home/david/freetoken-amd/validation-e7a5a92/build-rocm-validation.log`.
+
+## 2026-09-06 NVFP4 deep-K 8x16 candidate gate
+
+The existing production deep-K NVFP4 decode shape is `BLOCK_SIZE_N=8` and
+`BLOCK_SIZE_KW=128`. A prior same-process differential screen found a
+numerically identical `8x16` shape, so the current branch now exposes
+`FREETOKEN_NVFP4_DEEPK_BLOCK_KW=16` as an opt-in experiment. The allow-list
+accepts only 16, 32, 64, or 128, and the default remains 128.
+
+The candidate ran from the exact pushed branch in an isolated worktree with
+the reusable ROCm kernel cache, JIT disabled, and the opt-in value 16. Its
+artifact is
+`/home/david/freetoken-amd/artifacts/qwen-nvfp4-deepk16-candidate-20260906T000000Z/`.
+The scheduler-shaped three-sample control completed all samples at 28.3782
+mean decode TPS. The canonical AIME gate passed with answer `70`, output SHA1
+`0acef4eab6f4`, 28.8547 decode TPS, 395.9 ms TTFT, 34.4671 ms event p50, and
+36.7199 ms event p99.
+
+The warmed four-client, three-round control also completed all twelve requests
+with deterministic responses. It recorded 52.8018 mean aggregate decode TPS,
+0.9660 seconds p99 TTFT, and 76.7122 ms p99 token gap. This is slightly below
+the prior tile32 warmed C4 result of 53.1579 TPS and 76.8555 ms p99 gap, and it
+does not approach the qualified Q5 four-row C4 profile of 94.80 TPS and 39.93
+ms p99 gap. The deep-K 8x16 candidate is therefore rejected for promotion,
+although its deterministic quality gate passed. The production default remains
+the qualified 8x128 shape.
+
+The candidate process group was terminated only after its command, model path,
+port, and process-group identity were verified. The protected Qwen service was
+then restarted and verified with `status: ok` and `maintenance: serving`.
