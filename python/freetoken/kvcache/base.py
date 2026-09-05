@@ -70,7 +70,11 @@ class BaseKVCachePool(ABC):
         num_pages = config.num_page_override
         if num_pages is None:
             num_pages = (available_memory - fixed_cache_size) // cache_per_page
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
+        assert num_pages > 1, (
+            f"Not enough memory for KV cache, try reducing --num-pages "
+            f"(available={mem_GB(available_memory)}, fixed={mem_GB(fixed_cache_size)}, "
+            f"cache_per_page={mem_GB(cache_per_page)}, computed pages={num_pages})"
+        )
         real_kv_size = num_pages * cache_per_page + fixed_cache_size
         logger.info(
             f"Allocating {num_pages * config.page_size} tokens for KV cache, "

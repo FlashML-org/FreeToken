@@ -541,6 +541,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-iso",
+        type=str,
+        choices=["off", "iso3", "iso4"],
+        default=ServerArgs.kv_cache_iso,
+        help=(
+            "IsoQuant KV-cache quantization for plain full-attention models: "
+            "iso3 = 3.125 bits/value (~5.1x vs bf16), iso4 = 4.25 bits/value (~3.8x). "
+            "Forces --attention-backend iso."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],

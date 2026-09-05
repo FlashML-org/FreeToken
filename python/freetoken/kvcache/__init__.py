@@ -117,6 +117,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_cache_iso=getattr(config, "kv_cache_iso", "off"),
     )
 
 
@@ -128,6 +129,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_cache_iso: str = "off",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -246,6 +248,22 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    if kv_cache_iso != "off":
+        # ISO3/ISO4 quantized KV (validated upstream: plain FULL attention,
+        # head_dim % 128 == 0). Same page/layer plumbing as MHAKVCache, packed rows.
+        from .iso_pool import ISOKVCache
+
+        return ISOKVCache(
+            num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_layers=model_config.num_layers,
+            head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+            device=device,
+            dtype=dtype,
+            layer_ids=layer_ids,
+            iso_fmt=kv_cache_iso,
+        )
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,

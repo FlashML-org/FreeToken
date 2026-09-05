@@ -71,7 +71,8 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`/`iso`; `prefill,decode` pair allowed; auto picks per model + GPU |
+| `--kv-cache-iso` | off | `iso3`/`iso4`: IsoQuant KV-cache quantization (3.125/4.25 bits per value, ~5.1x/~3.8x smaller KV than bf16) for plain full-attention models; forces `--attention-backend iso`. NOTE: quality is model-dependent — models with strong outlier K channels (e.g. Qwen3) degrade noticeably at iso3; validate on your workload. |
 
 ### MoE offload
 

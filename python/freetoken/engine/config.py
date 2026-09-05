@@ -20,6 +20,9 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # KV-cache quantization for plain full-attention pools: "off" (bf16) | "iso3" | "iso4"
+    # (IsoQuant: 3.125 / 4.25 bits per value; forces attention_backend="iso").
+    kv_cache_iso: str = "off"
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
