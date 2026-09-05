@@ -870,3 +870,21 @@ two independent throughput matrices before promotion.  Preserve
 `q4-c32-rocprof-controller-ready-20260901T225400Z`, including the raw SQLite
 database, workload response, controller logs, and normal-service recovery
 evidence.
+### C33: current-branch MMV-Y4 requalification
+
+The profiler-ranked vector path was rechecked against the current branch rather
+than relying on the older candidate artifact. The opt-in
+`FREETOKEN_GGUF_MMV_Y=4` build from commit `ff76ede` reached API readiness in
+an isolated checkout with 56 GiB free before model loading and 23.07 GiB free
+after initialization. Its fixed three-sample scheduler-shaped matrix passed
+all requests and measured 45.4603 mean decode TPS, 2,753.3639 mean
+client-observed prefill TPS, 0.0927 decode-TPS standard deviation, and 43.781
+ms maximum token gap. The canonical current AIME output hash was
+`3302eda43396`; the older helper's superseded `0acef4eab6f4` expectation was
+classified as a harness-version discrepancy.
+
+**Decision: reject current-branch MMV-Y4 for promotion.** It was approximately
+5.8 percent slower than the accepted current Q4 scheduler control near 48.28
+decode TPS. The default remains one row, and the Y4 switch remains opt-in for
+future architecture-specific investigation. Normal Qwen service recovery was
+verified with `status: ok` and `maintenance: serving`.
