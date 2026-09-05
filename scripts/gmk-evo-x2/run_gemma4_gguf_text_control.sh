@@ -88,6 +88,7 @@ fi
 # unified GPU-visible memory improves prefill without changing model weights or
 # the request protocol.
 readonly GEMMA_MEMORY_RATIO="${FREETOKEN_GEMMA4_MEMORY_RATIO:-0.35}"
+readonly GEMMA_MAX_RUNNING_REQUESTS="${FREETOKEN_GEMMA4_MAX_RUNNING_REQUESTS:-4}"
 
 # Refuse to evict the protected service during its multi-minute NVFP4 recovery.
 production_ready
@@ -129,6 +130,7 @@ PYTHONPATH=python TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions" \
     --model-path "${MODEL_PATH}" --served-model-name gemma4-26b-q4-amd \
     --host 127.0.0.1 --port "${TEST_PORT}" --attention-backend triton \
     --moe-backend offload --expert-load serial --moe-cache-auto --memory-ratio "${GEMMA_MEMORY_RATIO}" \
+    --max-running-requests "${GEMMA_MAX_RUNNING_REQUESTS}" \
     --max-seq-len-override 8192 --kv-reserve-tokens 2048 --cuda-graph-max-bs 0 \
     --disable-pynccl "${moe_prefill_args[@]}" >"${ARTIFACT_DIR}/server.log" 2>&1 &
 candidate_pid=$!
