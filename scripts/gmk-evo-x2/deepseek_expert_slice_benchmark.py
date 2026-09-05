@@ -34,6 +34,7 @@ def main() -> int:
     parser.add_argument("--experts", type=parse_ids, default=[0, 1, 2, 3, 4, 5])
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -41,18 +42,6 @@ def main() -> int:
         parser.error("--repeats must be at least 2")
     if not args.checkpoint.is_dir():
         parser.error("--checkpoint must be a local safetensors directory")
-
-    # Imports are delayed so metadata and --help remain usable without a GPU
-    # Python environment.  The actual benchmark requires PyTorch and the
-    # safetensors package installed in the target ROCm environment.
-    import torch
-    from safetensors import safe_open
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("No CUDA-compatible device is available; ROCm exposes HIP through torch.cuda")
-    device = torch.device(args.device)
-    if device.type != "cuda":
-        raise RuntimeError("The isolated slice benchmark requires a HIP/CUDA device")
 
     names = []
     for layer in args.layers:
@@ -72,6 +61,36 @@ def main() -> int:
     missing = [name for name in names if name not in weight_map]
     if missing:
         raise RuntimeError(f"Selected tensors are absent from the checkpoint: {missing[:3]}")
+
+    # This mode validates the exact tensor names and shard routing without
+    # importing GPU libraries or materializing any model tensor.
+    if args.metadata_only:
+        result = {
+            "scope": "metadata-only expert selection validation",
+            "checkpoint": str(args.checkpoint),
+            "layers": args.layers,
+            "experts": args.experts,
+            "selected_tensor_count": len(names),
+            "selected_tensors": [{"name": name, "shard": weight_map[name]} for name in names],
+            "protected_service_touched": False,
+            "full_model_serving_claim": False,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2))
+        return 0
+
+    # Imports are delayed so metadata and --help remain usable without a GPU
+    # Python environment.  The actual benchmark requires PyTorch and the
+    # safetensors package installed in the target ROCm environment.
+    import torch
+    from safetensors import safe_open
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA-compatible device is available; ROCm exposes HIP through torch.cuda")
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        raise RuntimeError("The isolated slice benchmark requires a HIP/CUDA device")
 
     tensors = []
     evidence = []

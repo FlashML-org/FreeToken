@@ -121,7 +121,10 @@ core routed expert weight bytes before scales and other model state. It
 requires a locally staged safetensors directory, PyTorch with ROCm, and the
 `safetensors` package. It touches no API port and records
 `protected_service_touched: false` in its output. It must be run only as an
-isolated candidate after the normal service is verified healthy.
+isolated candidate after the normal service is verified healthy. The
+`--metadata-only` mode was validated locally against the six-expert fixture in
+`tests/fixtures/deepseek_expert_index`; it selected all 36 expected tensors
+without importing GPU libraries.
 
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
