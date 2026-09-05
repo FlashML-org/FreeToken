@@ -99,6 +99,11 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
+    def _logits(self, x: torch.Tensor) -> torch.Tensor:
+        """The local vocab-shard GEMM; the seam a quantized head overrides."""
+        module = self.tied_embedding or self
+        return F.linear(x, module.weight, self.bias)
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
@@ -109,8 +114,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[indices].contiguous()
             del indices
 
-        module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        logits = self._logits(x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

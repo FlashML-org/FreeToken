@@ -138,3 +138,16 @@ def test_split_quant_path_agrees_with_the_single_program_one(n: int):
     m._quant_fused_kernel[(1,)](x, ref8, ref_scale, n, BLOCK=m._BLOCK, num_warps=8)
     assert torch.equal(got_scale, ref_scale)
     assert torch.equal(got8.view(torch.uint8), ref8.view(torch.uint8))
+
+
+def test_reader_gates_lm_head_behind_its_own_flag():
+    cfg = _cfg()
+    t = torch.randn(64, 32, dtype=torch.bfloat16)
+    assert list(dict(_fp8_dense("lm_head.weight", t, cfg, 1))) == ["lm_head.weight"]
+    out = dict(_fp8_dense("lm_head.weight", t, cfg, 1, dense=False, lm_head=True))
+    assert sorted(out) == ["lm_head.weight", "lm_head.weight_scale"]
+    assert out["lm_head.weight"].dtype == torch.float8_e4m3fn
+    # the lm_head flag alone must not pull in the dense rewrites
+    passthrough = dict(_fp8_dense("x.self_attn.qkv_proj.weight", t, cfg, 1,
+                                  dense=False, lm_head=True))
+    assert list(passthrough) == ["x.self_attn.qkv_proj.weight"]
