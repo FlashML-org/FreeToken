@@ -1,0 +1,46 @@
+{
+  "scope": "analytical transfer-only lower bound",
+  "expert_bytes": 13369344,
+  "layers": 43,
+  "active_experts_per_layer": 6,
+  "routed_bytes_per_token_at_100_percent_miss": 3449290752,
+  "routed_gib_per_token_at_100_percent_miss": 3.21240234375,
+  "measured_h2d_gib_per_second": 77.976,
+  "rows": [
+    {
+      "miss_rate": 1.0,
+      "moved_gib_per_token": 3.21240234375,
+      "transfer_seconds_per_token": 0.041197321531625114,
+      "transfer_only_tokens_per_second": 24.27342270861833
+    },
+    {
+      "miss_rate": 0.75,
+      "moved_gib_per_token": 2.4093017578125,
+      "transfer_seconds_per_token": 0.030897991148718836,
+      "transfer_only_tokens_per_second": 32.36456361149111
+    },
+    {
+      "miss_rate": 0.5,
+      "moved_gib_per_token": 1.606201171875,
+      "transfer_seconds_per_token": 0.020598660765812557,
+      "transfer_only_tokens_per_second": 48.54684541723666
+    },
+    {
+      "miss_rate": 0.25,
+      "moved_gib_per_token": 0.8031005859375,
+      "transfer_seconds_per_token": 0.010299330382906279,
+      "transfer_only_tokens_per_second": 97.09369083447332
+    }
+  ],
+  "excluded": [
+    "matrix computation",
+    "router and dispatch",
+    "attention and recurrent state",
+    "KV cache",
+    "synchronization",
+    "allocator overhead",
+    "cache lookup and eviction",
+    "D2H traffic"
+  ],
+  "full_model_serving_claim": false
+}

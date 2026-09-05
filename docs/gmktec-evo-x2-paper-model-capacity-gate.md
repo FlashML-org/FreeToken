@@ -181,6 +181,24 @@ expert IDs. Raw per-group outputs are preserved as
 `expert-route-group-0.json`, `expert-route-group-16.json`,
 `expert-route-group-32.json`, and `expert-route-group-64.json`.
 
+## Transfer-only route projection
+
+Using the measured 77.976 GiB/s H2D rate and the exact 13,369,344-byte expert
+size, a token that misses all six routed experts in all 43 layers would move
+3.2124 GiB of expert data. The transfer-only lower bound is therefore 41.20 ms
+per token, or 24.27 tokens per second. At 75 percent, 50 percent, and 25
+percent miss rates, the transfer-only ceilings are 32.36, 48.55, and 97.09
+tokens per second respectively.
+
+This result is informative but deliberately not a serving claim. It excludes
+matrix computation, routing, attention, KV state, synchronization, cache
+lookup and eviction, allocator overhead, and D2H traffic. It shows that the
+measured AMD H2D path is physically compatible with the paper's reported 22 to
+25 tok/s range even under a pessimistic all-miss transfer assumption, but it
+does not show that the complete model can fit or achieve that rate. The raw
+projection is preserved in
+[`gmktec-evo-x2-deepseek-route-transfer-projection-20260905.json`](gmktec-evo-x2-deepseek-route-transfer-projection-20260905.json).
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident
