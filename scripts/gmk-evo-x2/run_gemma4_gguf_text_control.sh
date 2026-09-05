@@ -73,6 +73,16 @@ case "${MODE}" in
     *) echo "mode must be text or vision, got ${MODE}" >&2; exit 2 ;;
 esac
 
+# Keep the conservative production-shaped setting as the default.  The
+# explicit opt-in is used only by an isolated candidate run while investigating
+# Gemma prefill and first-token latency.  Keeping the option in an array avoids
+# shell edits that can accidentally remove the command's log redirection or
+# background-process marker.
+moe_prefill_args=(--disable-moe-prefill-overlap)
+if [[ "${FREETOKEN_GEMMA4_PREFILL_OVERLAP:-0}" == "1" ]]; then
+    moe_prefill_args=()
+fi
+
 # Refuse to evict the protected service during its multi-minute NVFP4 recovery.
 production_ready
 
@@ -113,7 +123,7 @@ PYTHONPATH=python TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions" \
     --host 127.0.0.1 --port "${TEST_PORT}" --attention-backend triton \
     --moe-backend offload --expert-load serial --moe-cache-auto --memory-ratio 0.35 \
     --max-seq-len-override 8192 --kv-reserve-tokens 2048 --cuda-graph-max-bs 0 \
-    --disable-pynccl --disable-moe-prefill-overlap >"${ARTIFACT_DIR}/server.log" 2>&1 &
+    --disable-pynccl "${moe_prefill_args[@]}" >"${ARTIFACT_DIR}/server.log" 2>&1 &
 candidate_pid=$!
 for _ in {1..480}; do
     grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log" && break
