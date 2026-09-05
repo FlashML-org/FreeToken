@@ -558,7 +558,7 @@ def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int
             "expert_bytes": eb, "synth_experts": E}
 
 
-def _batch_routing(bs: int, top_k: int, E: int, steps: int, seed: int = 1234) -> list:
+def _batch_routing(bs: int, top_k: int, E: int, steps: int, seed: int = 1234) -> list[torch.Tensor]:
     """One ``[bs, top_k]`` int32 routing tensor per step, uniform-random over ``E``.
 
     Ids are distinct within a token (a router never sends one token to the same expert
@@ -580,7 +580,8 @@ def _batch_routing(bs: int, top_k: int, E: int, steps: int, seed: int = 1234) ->
     return out
 
 
-def _time_cpu_moe_batch(ex, wl: Workload, bs: int, steps: list, iters: int, warmup: int) -> float:
+def _time_cpu_moe_batch(ex, wl: Workload, bs: int, steps: list[torch.Tensor], iters: int,
+                        warmup: int) -> float:
     """Median wall time (ms) of one ``bs``-token CPU MoE decode step on ``steps``' routing."""
     io = ex._io_for(bs)
     io["x"].copy_(torch.randn(bs, wl.hidden, dtype=torch.bfloat16) * 0.1)
@@ -599,7 +600,7 @@ def _time_cpu_moe_batch(ex, wl: Workload, bs: int, steps: list, iters: int, warm
 
 
 def measure_cpu_moe_batch(fmt: str, wl: Workload, batches: tuple[int, ...], iters: int = 32,
-                          num_threads: int = 0) -> list:
+                          num_threads: int = 0) -> list[dict]:
     """CPU MoE decode cost per batch size, with and without cross-token expert dedup.
 
     The rest of this bench runs at bs=1, where dedup is inert by construction -- one token
@@ -620,8 +621,11 @@ def measure_cpu_moe_batch(fmt: str, wl: Workload, batches: tuple[int, ...], iter
     for bs in batches:
         steps = _batch_routing(bs, wl.top_k, E, warmup + iters)
         routes = bs * wl.top_k
-        # Median over the timed steps: one routing draw is a sample, not the distribution.
-        unique = int(statistics.median([len(torch.unique(t)) for t in steps[warmup:]]))
+        # Median over the timed steps: one routing draw is a sample, not the
+        # distribution. median_low, because iters is even by default and plain
+        # median would average the two middle draws into a count no draw had --
+        # 12.5 unique experts, floored to 12 by int(), which then inflates reuse.
+        unique = statistics.median_low([len(torch.unique(t)) for t in steps[warmup:]])
         row = {"batch": bs, "routes": routes, "unique": unique,
                "reuse": round(routes / unique, 2), "ms": {}, "eff_gbs": {}}
         for arm in ("off", "on"):
