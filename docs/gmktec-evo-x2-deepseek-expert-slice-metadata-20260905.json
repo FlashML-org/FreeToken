@@ -1,0 +1,29 @@
+{
+  "checkpoint_revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+  "source_files": [
+    "model.safetensors.index.json",
+    "model-00002-of-00048.safetensors header range 0-1048575"
+  ],
+  "core_geometry": {
+    "layers": 43,
+    "routed_experts_per_layer": 256,
+    "active_experts_per_token_per_layer": 6,
+    "expert_tensor_names": ["w1.weight", "w2.weight", "w3.weight"],
+    "scale_tensor_names": ["w1.scale", "w2.scale", "w3.scale"]
+  },
+  "observed_tensor_layout": {
+    "w1_weight": {"dtype": "I8", "shape": [2048, 2048], "bytes": 4194304},
+    "w2_weight": {"dtype": "I8", "shape": [4096, 1024], "bytes": 4194304},
+    "w3_weight": {"dtype": "I8", "shape": [2048, 2048], "bytes": 4194304},
+    "each_scale": {"dtype": "F8_E8M0", "w1_w3_shape": [2048, 128], "w2_shape": [4096, 64], "bytes": 262144}
+  },
+  "derived_sizes": {
+    "one_expert_bytes": 13369344,
+    "one_expert_mib": 12.75,
+    "all_experts_one_layer_gib": 3.1875,
+    "all_core_routed_experts_gib": 137.0625,
+    "six_active_experts_all_43_layers_gib": 3.22265625
+  },
+  "scope": "Core routed expert tensors only. Shared experts, attention, embeddings, MTP tensors, runtime buffers, KV cache, and allocator overhead are excluded.",
+  "decision": "A tiny-slice transfer experiment is technically meaningful, but it is not a full-model admission or serving result."
+}

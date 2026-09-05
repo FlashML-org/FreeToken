@@ -100,6 +100,20 @@ The machine-readable result is
 This is a metadata-only rejection. No model files were downloaded, and no
 service or model process was changed.
 
+## Expert-slice metadata
+
+The pinned safetensors index and a bounded header range from shard 2 provide
+enough metadata to size a production-shaped slice without downloading tensor
+payloads. Each core routed expert has three I8 matrices and three scale
+arrays totaling 13,369,344 bytes, or 12.75 MiB. The 43-layer, 256-expert core
+pool is approximately 137.0625 GiB. Six active experts per layer across all
+43 layers would touch approximately 3.22265625 GiB before attention, shared
+experts, KV cache, runtime buffers, or allocator overhead.
+
+This makes a bounded transfer and packing experiment worthwhile, but it does
+not make full serving feasible. The exact derived values are preserved in
+[`gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json).
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident
