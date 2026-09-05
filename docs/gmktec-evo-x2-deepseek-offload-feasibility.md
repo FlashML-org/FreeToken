@@ -7,9 +7,15 @@ protected service.
 
 ## Inputs
 
+The current numerical payload measurements refer to the later official
+`DeepSeek-V4-Flash-0731` repository, not automatically to the FreeToken
+paper's 284B demonstration checkpoint. The two identities must remain
+separate until the exact paper artifact or an authoritative conversion is
+identified.
+
 | Input | Value | Evidence |
 |---|---:|---|
-| Official safetensors payload | 159,617,149,040 bytes, approximately 148.66 GiB | Read-only `HEAD` measurement of all 46 shards |
+| Official `DeepSeek-V4-Flash-0731` safetensors payload | 166,886,535,336 bytes, approximately 155.43 GiB | Read-only `HEAD` measurement of all 48 shards at commit `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | Routed expert pool described by paper | Approximately 140 GB | Supplied FreeToken paper |
 | System memory available during live check | Approximately 18 GiB | `free -h` on the EVO-X2 |
 | ROCm-reported VRAM aperture | 2 GiB | `rocm-smi` on the EVO-X2 |
@@ -25,14 +31,14 @@ for arbitrary model storage.
 
 Even an impossible best case that devoted all 18 GiB of currently available
 system memory and the full 2 GiB device aperture to weights would provide only
-20 GiB of addressable working space. The official payload would still exceed
-that optimistic budget by approximately 128.66 GiB. A realistic runtime budget
+20 GiB of addressable working space. The current official payload would still
+exceed that optimistic budget by approximately 135.43 GiB. A realistic runtime budget
 is smaller because it must reserve memory for execution and KV state.
 
 The payload-to-observed-availability ratio is approximately:
 
 ```text
-148.66 GiB / 18 GiB = 8.26x
+155.43 GiB / 18 GiB = 8.64x
 ```
 
 This is a capacity deficit, not a tuning deficit.
