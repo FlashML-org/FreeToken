@@ -80,6 +80,8 @@ performance claims separate.
 - `gmktec-evo-x2-cross-model-manifest-20260905.json`
 - `gmktec-evo-x2-amd-run-log.md`
 - `gmktec-evo-x2-284b-capacity-manifest-20260904.md`
+- `gmktec-evo-x2-paper-model-capacity-gate.md`
+- `gmktec-evo-x2-deepseek-capacity-gate-result-20260905.json`
 
 The checklist is a review aid. The raw benchmark artifacts remain the
 authoritative evidence for measured claims.
