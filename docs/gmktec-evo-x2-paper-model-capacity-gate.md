@@ -75,6 +75,10 @@ report the paper's 284B label separately from the current model-card 304B label;
 the two labels are not enough by themselves to prove an exact parameter-count
 match.
 
+As an additional identity check, `config.json` is byte-for-byte identical at
+the release commit and the current model-card commit. Its SHA-256 is
+`6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`.
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident

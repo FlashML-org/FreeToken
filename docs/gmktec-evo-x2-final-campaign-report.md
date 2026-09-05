@@ -142,7 +142,9 @@ metadata discrepancy explicitly.
 The pinned release commit and the current model-card commit both expose 48
 safetensors shards totaling 166,886,535,336 bytes, approximately 155.43 GiB.
 This is the measured capacity reference for the named official repository;
-the parameter-count discrepancy must remain visible in the final report.
+the parameter-count discrepancy must remain visible in the final report. The
+`config.json` bytes are identical at both commits, with SHA-256
+`6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`.
 
 ### Additional archived model identifiers
 
