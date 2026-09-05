@@ -137,6 +137,13 @@ artifact as the paper's 284B FP4 deployment. A valid reproduction therefore
 needs the exact 284B checkpoint or an authoritative conversion recipe before
 any capacity or throughput claim is made.
 
+As a separate current-release reference, a read-only metadata refresh of
+`DeepSeek-V4-Flash-0731` at repository commit
+`7872f01b1d1fe23eabc4c98b48bffcef5a386062` found 48 safetensors shards totaling
+166,886,535,336 bytes, approximately 155.43 GiB. This is a capacity reference
+for the later official release, not proof that it is the paper's exact 284B
+artifact.
+
 ### Additional archived model identifiers
 
 Archived routing names without an admitted payload are not treated as failed

@@ -37,12 +37,13 @@ The bounded inventory found the following relevant payloads:
 - No DeepSeek-V4-Flash checkpoint.
 - No GLM-5.2 checkpoint.
 
-The official DeepSeek repository metadata lists 46 safetensors shards. Read-only
-HTTP `HEAD` requests to every shard reported a combined `Content-Length` of
-159,617,149,040 bytes, or approximately 148.66 GiB (decimal conversion) for
-the model payload alone. This excludes the tokenizer, runtime allocations,
+The current official DeepSeek repository metadata at commit
+`7872f01b1d1fe23eabc4c98b48bffcef5a386062` lists 48 safetensors shards.
+Read-only HTTP `HEAD` requests to every shard reported a combined
+`Content-Length` of 166,886,535,336 bytes, or approximately 155.43 GiB for the
+model payload alone. This excludes the tokenizer, runtime allocations,
 expert-cache policy, KV cache, allocator slack, and any duplicate conversion
-buffers.
+buffers. The measurement was refreshed on 2026-09-05.
 
 The official `config.json` reports 43 hidden layers, 256 routed experts, one
 shared expert, and six routed experts active per token. The hidden size is
@@ -53,14 +54,20 @@ otherwise retained by the serving system.
 
 ## Paper-model decision
 
-The official DeepSeek model card identifies DeepSeek-V4-Flash as 284B total
-parameters and 13B activated parameters, with FP4 plus FP8 mixed precision.
-The paper's prefill discussion describes roughly 140 GB of routed expert
-weights. The model card also lists the safetensors repository as approximately
-291B parameters and identifies the official local deployment path. The paper
-describes GLM-5.2 as a 753B-parameter model with a 433 GB checkpoint. Neither
-payload is installed on this host, and the live available-memory observation
-is far below either stated payload scale.
+The FreeToken paper identifies DeepSeek-V4-Flash as a 284B-parameter model
+with 13B activated parameters and mixed FP4 plus FP8 deployment. The current
+official `DeepSeek-V4-Flash-0731` model page is a later release that reports
+304B parameters and BF16, I64, F32, F8_E4M3, and I8 tensor types. Its raw
+configuration still confirms FP4 expert storage, 256 routed experts, six
+experts active per token, and 43 layers, but the release identity is not
+automatically the same as the paper's 284B demonstration. The paper's
+prefill discussion describes roughly 140 GB of routed expert weights. The
+paper describes GLM-5.2 as a 753B-parameter model with a 433 GB checkpoint.
+Neither payload is installed on this host, and the live available-memory
+observation is far below either stated payload scale.
+
+The exact 284B checkpoint or an authoritative conversion recipe is therefore
+still required before this gate can be converted into a reproduction test.
 
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
