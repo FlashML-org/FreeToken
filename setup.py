@@ -48,6 +48,8 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
         if not (include_dir / "hip" / "hip_runtime.h").exists():
             continue
         for library_dir in (rocm_home / "lib64", rocm_home / "lib"):
+            if os.name == "nt" and (library_dir / "amdhip64.lib").exists():
+                return [str(include_dir)], [str(library_dir)], "amdhip64"
             if (library_dir / "libamdhip64.so").exists():
                 return [str(include_dir)], [str(library_dir)], "amdhip64"
             versioned = sorted(library_dir.glob("libamdhip64.so.*"))
@@ -56,7 +58,8 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
 
     searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
     raise RuntimeError(
-        "A ROCm SDK with HIP headers and libamdhip64 is required to build on ROCm; "
+        "A ROCm SDK with HIP headers and the amdhip64 import/shared library is "
+        "required to build on ROCm; "
         f"searched: {searched}. Set ROCM_HOME to override."
     )
 
@@ -78,11 +81,17 @@ IS_ROCM = _is_rocm()
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
-    runtime_link_args = [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
+    runtime_link_args = (
+        [] if os.name == "nt" else [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
+    )
     # These extensions contain host code only. BuildExtension supplies the ROCm
     # platform defines to the C++ compiler; offload architecture flags belong on
     # HIP device sources and would be rejected by the host compiler here.
-    extra_compile = ["-O3", "-std=c++17"]
+    extra_compile = (
+        ["/O2", "/std:c++17", "/DSTRIP_ERROR_MESSAGES", "/DNOMINMAX"]
+        if os.name == "nt"
+        else ["-O3", "-std=c++17"]
+    )
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
@@ -118,7 +127,7 @@ setup(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args=extra_compile + ["-pthread"],
+            extra_compile_args=extra_compile + ([] if os.name == "nt" else ["-pthread"]),
             extra_link_args=runtime_link_args,
         ),
     ],

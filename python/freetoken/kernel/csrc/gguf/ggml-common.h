@@ -929,9 +929,9 @@ static const __device__ int8_t kvalues_iq4nl[16] = {
 
 typedef half dfloat;  // dequantize float
 typedef half2 dfloat2;
-typedef void (*dequantize_kernel_t)(const void* vx, const int ib, const int iqs, dfloat2& v);
+typedef void (*dequantize_kernel_t)(const void* vx, const int64_t ib, const int64_t iqs, dfloat2& v);
 template <typename dst_t>
-using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int k, cudaStream_t stream);
+using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int64_t k, cudaStream_t stream);
 typedef float (*vec_dot_q_cuda_t)(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs);
 typedef void (*allocate_tiles_cuda_t)(int** x_ql, half2** x_dm, int** x_qh, int** x_sc);
 typedef void (*load_tiles_cuda_t)(

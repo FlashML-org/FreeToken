@@ -11,47 +11,10 @@
 #include <source_location>
 #include <type_traits>
 
-// nvcc implicitly pulls in the CUDA runtime for .cu translation units; hipcc does
-// not do the equivalent for HIP, so it must be included explicitly here. On the
-// HIP path there is no cudaLaunchKernelEx/cudaLaunchConfig_t equivalent (that API
-// is Hopper PDL-specific), so LaunchKernel gets its own HIP-side definition below
-// instead of a name-aliasing shim -- see PDL below for why that also means
-// with_attr(true) is a no-op on this path.
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-
-using cudaError_t = hipError_t;
-constexpr hipError_t cudaSuccess = hipSuccess;
-using cudaStream_t = hipStream_t;
-
-inline const char *cudaGetErrorString(hipError_t e) { return hipGetErrorString(e); }
-inline hipError_t cudaGetLastError() { return hipGetLastError(); }
-inline hipError_t cudaFuncSetAttribute(const void *func, hipFuncAttribute attr,
-                                       int value) {
-  return hipFuncSetAttribute(func, attr, value);
-}
-constexpr hipFuncAttribute cudaFuncAttributeMaxDynamicSharedMemorySize =
-    hipFuncAttributeMaxDynamicSharedMemorySize;
-
-inline hipError_t cudaGetDevice(int *device) { return hipGetDevice(device); }
-inline hipError_t cudaDeviceGetAttribute(int *value, hipDeviceAttribute_t attr,
-                                         int device) {
-  return hipDeviceGetAttribute(value, attr, device);
-}
-inline hipError_t cudaHostGetDevicePointer(void **devPtr, void *hostPtr,
-                                           unsigned int flags) {
-  return hipHostGetDevicePointer(devPtr, hostPtr, flags);
-}
-constexpr hipDeviceAttribute_t cudaDevAttrUnifiedAddressing =
-    hipDeviceAttributeUnifiedAddressing;
-constexpr hipDeviceAttribute_t cudaDevAttrCanUseHostPointerForRegisteredMem =
-    hipDeviceAttributeCanUseHostPointerForRegisteredMem;
-
-// CUDA-only kernel-parameter annotation (passes large by-value params via constant
-// memory instead of copying them into local/generic memory first); HIP has no
-// equivalent attribute, so this just falls back to an ordinary by-value parameter.
-#define __grid_constant__
-#else
+// hip_compat.h owns the CUDA-to-HIP runtime mappings and includes the HIP runtime.
+// Keep the native CUDA include only on the NVIDIA path so the two compatibility
+// layers cannot redefine the same HIP symbols after macro expansion.
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
 #include <cuda_runtime.h>
 #endif
 

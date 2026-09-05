@@ -4,6 +4,7 @@ import importlib
 import os
 import pathlib
 import re
+from contextlib import contextmanager
 from functools import cache
 from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias, Union
 
@@ -67,21 +68,30 @@ def _hip_cflags(extra: List[str]) -> List[str]:
 
         detected = get_rocm_gfx_arch()
         arches = [detected] if detected else list(DEFAULT_ROCM_ARCHES)
+    if os.name == "nt":
+        flags += [
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-DSTRIP_ERROR_MESSAGES",
+            "-DNOMINMAX",
+            "-fno-gpu-rdc",
+            "-fms-runtime-lib=dll",
+            f"--rocm-device-lib-path={_rocm_device_library_dir()}",
+        ]
     return flags + [f"--offload-arch={arch}" for arch in arches]
 
 
-@cache
-def _rocm_link_flags() -> List[str]:
-    """Make ROCm's runtime library discoverable to JIT link commands.
+def _cpp_cflags(extra: List[str]) -> List[str]:
+    """Return host-compiler flags accepted by the current platform toolchain."""
+    if os.name == "nt":
+        return ["/std:c++20", "/O2", "/DSTRIP_ERROR_MESSAGES", "/DNOMINMAX"] + extra
+    return DEFAULT_CFLAGS + extra
 
-    Traditional ROCm installs provide ``libamdhip64.so`` under ``$ROCM_HOME/lib``.
-    ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
-    still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
-    an explicit linker search path without modifying the Python environment.
-    """
+
+def _rocm_candidates() -> List[pathlib.Path]:
     candidates: list[pathlib.Path] = []
-    if os.getenv("ROCM_HOME"):
-        candidates.append(pathlib.Path(os.environ["ROCM_HOME"]))
+    for variable in ("ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        if os.getenv(variable):
+            candidates.append(pathlib.Path(os.environ[variable]))
     try:
         from torch.utils.cpp_extension import ROCM_HOME
 
@@ -93,9 +103,73 @@ def _rocm_link_flags() -> List[str]:
     if spec and spec.submodule_search_locations:
         candidates.append(pathlib.Path(next(iter(spec.submodule_search_locations))))
     candidates.append(pathlib.Path("/opt/rocm"))
+    return list(dict.fromkeys(candidates))
 
-    for rocm_home in dict.fromkeys(candidates):
+
+@cache
+def _rocm_device_library_dir() -> pathlib.Path:
+    """Find a complete HIP device-bitcode directory for Windows hipcc."""
+    for rocm_home in _rocm_candidates():
+        candidates = [
+            rocm_home / "lib" / "llvm" / "amdgcn" / "bitcode",
+            rocm_home / "amdgcn" / "bitcode",
+        ]
+        clang_root = rocm_home / "lib" / "llvm" / "lib" / "clang"
+        if clang_root.is_dir():
+            candidates.extend(
+                version / "amdgcn" / "bitcode"
+                for version in sorted(clang_root.iterdir(), reverse=True)
+                if version.is_dir()
+            )
+        for directory in candidates:
+            if (directory / "ocml.bc").is_file() and (directory / "ockl.bc").is_file():
+                return directory
+    raise RuntimeError("Unable to locate complete ROCm device libraries for HIP JIT")
+
+
+@contextmanager
+def _windows_hip_tvm_ffi_flags(enabled: bool):
+    """Correct pinned tvm-ffi's MSVC-only default device flags process-locally."""
+    if not enabled or os.name != "nt":
+        yield
+        return
+
+    from tvm_ffi.cpp import extension
+
+    original = extension._generate_ninja_build
+
+    def generate_ninja(*args, **kwargs):
+        ninja = original(*args, **kwargs)
+        marker = "-Xcompiler /std:c++17 /O2"
+        if marker not in ninja:
+            raise RuntimeError(
+                "Pinned tvm-ffi Windows HIP defaults changed; refusing an unverified flag rewrite"
+            )
+        return ninja.replace(marker, "-std=c++17 -O2")
+
+    extension._generate_ninja_build = generate_ninja
+    try:
+        yield
+    finally:
+        extension._generate_ninja_build = original
+
+
+@cache
+def _rocm_link_flags() -> List[str]:
+    """Make ROCm's runtime library discoverable to JIT link commands.
+
+    Traditional ROCm installs provide ``libamdhip64.so`` under ``$ROCM_HOME/lib``.
+    ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
+    still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
+    an explicit linker search path without modifying the Python environment.
+    """
+    for rocm_home in _rocm_candidates():
         library_dir = rocm_home / "lib"
+        if os.name == "nt":
+            import_library = library_dir / "amdhip64.lib"
+            if import_library.is_file():
+                return [f"/LIBPATH:{library_dir}", import_library.name]
+            continue
         unversioned = library_dir / "libamdhip64.so"
         link_dir = library_dir
         if not unversioned.exists():
@@ -232,7 +306,8 @@ def _load_prebuilt(name: str) -> Module | None:
             )
         return None
 
-    so_path = cache_dir / name / f"{name}.so"
+    library_suffix = ".dll" if os.name == "nt" else ".so"
+    so_path = cache_dir / name / f"{name}{library_suffix}"
     if so_path.exists():
         import tvm_ffi
 
@@ -301,16 +376,17 @@ def load_aot(
         cuda_cflags = _cuda_cflags(extra_cuda_cflags)
         runtime_ldflags = []
 
-    return load(
-        name,
-        cpp_files=cpp_files,
-        cuda_files=cuda_files,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=cuda_cflags,
-        extra_ldflags=DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
+    with _windows_hip_tvm_ffi_flags(_is_rocm() and bool(cuda_files)):
+        return load(
+            name,
+            cpp_files=cpp_files,
+            cuda_files=cuda_files,
+            extra_cflags=_cpp_cflags(extra_cflags),
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )
 
 
 def load_jit(
@@ -363,13 +439,14 @@ def load_jit(
         cuda_cflags = _cuda_cflags(extra_cuda_cflags)
         runtime_ldflags = []
 
-    return load_inline(
-        name,
-        cpp_sources=cpp_sources,
-        cuda_sources=cuda_sources,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=cuda_cflags,
-        extra_ldflags=DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
+    with _windows_hip_tvm_ffi_flags(_is_rocm() and bool(cuda_sources)):
+        return load_inline(
+            name,
+            cpp_sources=cpp_sources,
+            cuda_sources=cuda_sources,
+            extra_cflags=_cpp_cflags(extra_cflags),
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )

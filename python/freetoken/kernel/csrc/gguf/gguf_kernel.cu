@@ -1,6 +1,7 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
@@ -21,18 +22,18 @@
 // Q8 gemv
 template <typename scalar_t>
 static __global__ void
-quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int kx, const int kx_padded) {
+quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int64_t kx, const int64_t kx_padded) {
   const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
   if (ix >= kx_padded) {
     return;
   }
   const auto iy = blockDim.y * blockIdx.y + threadIdx.y;
-  const int i_padded = iy * kx_padded + ix;
+  const int64_t i_padded = iy * kx_padded + ix;
 
   block_q8_1* y = (block_q8_1*)vy;
 
-  const int ib = i_padded / QK8_1;   // block index
-  const int iqs = i_padded % QK8_1;  // quant index
+  const int64_t ib = i_padded / QK8_1;   // block index
+  const int64_t iqs = i_padded % QK8_1;  // quant index
 
   const float xi = ix < kx ? static_cast<float>(x[iy * kx + ix]) : 0.0f;
   float amax = fabsf(xi);
@@ -58,12 +59,13 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 }
 
 template <typename scalar_t>
-static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, const int ky, cudaStream_t stream) {
+static void quantize_row_q8_1_cuda(
+    const scalar_t* x, void* vy, const int64_t kx, const int64_t ky, cudaStream_t stream) {
   const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
-  const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
-  constexpr int MAX_BLOCK_SIZE = 65535;
-  for (int off = 0; off < ky; off += MAX_BLOCK_SIZE) {
-    const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
+  const int64_t block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+  constexpr int64_t MAX_BLOCK_SIZE = 65535;
+  for (int64_t off = 0; off < ky; off += MAX_BLOCK_SIZE) {
+    const int64_t num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
@@ -80,7 +82,7 @@ torch::Tensor ggml_dequantize(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
   auto dtype_ = dtype.value_or(torch::kFloat16);
   auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
-  at::Tensor DW = torch::empty({m, n}, options);
+  at::Tensor DW = torch::zeros({m, n}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   // These kernels are vendored from sgl-kernel/llama.cpp; the guards below are a FreeToken addition
@@ -102,17 +104,18 @@ torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor X,  // input
     int64_t type,
     int64_t row) {
-  int col = X.sizes()[1];
-  int vecs = X.sizes()[0];
-  const int padded = (col + 512 - 1) / 512 * 512;
+  int64_t col = X.sizes()[1];
+  int64_t vecs = X.sizes()[0];
+  const int64_t padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({vecs, row}, options);
+  at::Tensor Y = torch::zeros({vecs, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     switch (type) {
       case 2:
         mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
@@ -195,6 +198,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
                     " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
                     "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
   return Y;
 }
@@ -204,12 +208,12 @@ torch::Tensor ggml_mul_mat_a8(
     torch::Tensor X,  // input
     int64_t type,
     int64_t row) {
-  int col = X.sizes()[1];
-  int padded = (col + 512 - 1) / 512 * 512;
-  int batch = X.sizes()[0];
+  int64_t col = X.sizes()[1];
+  int64_t padded = (col + 512 - 1) / 512 * 512;
+  int64_t batch = X.sizes()[0];
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({batch, row}, options);
+  at::Tensor Y = torch::zeros({batch, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({batch, padded / 32 * 9}, options);
@@ -356,11 +360,11 @@ torch::Tensor ggml_moe_a8(
     int64_t row,
     int64_t top_k,
     int64_t tokens) {
-  int col = X.sizes()[1];
-  int padded = (col + 512 - 1) / 512 * 512;
+  int64_t col = X.sizes()[1];
+  int64_t padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
+  at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
@@ -564,8 +568,8 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t type,
     int64_t row,
     int64_t tokens) {
-  int col = X.sizes()[1];
-  const int padded = (col + 512 - 1) / 512 * 512;
+  int64_t col = X.sizes()[1];
+  const int64_t padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::zeros({tokens * top_k, row}, options);

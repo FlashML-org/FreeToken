@@ -159,3 +159,10 @@
 #include <cuda_runtime_api.h>
 
 #endif
+
+// glibc exposes __always_inline through <sys/cdefs.h>, but that POSIX header is
+// unavailable in native Windows HIP builds. Both nvcc and hipcc provide the
+// device-aware __forceinline__ spelling, so use it as the portable fallback.
+#ifndef __always_inline
+#define __always_inline __forceinline__
+#endif
