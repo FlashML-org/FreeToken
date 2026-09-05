@@ -255,3 +255,43 @@ against `libamdhip64.so.7`. After the build, the complete focused suite passed
 15 tests, including the pinned-memory, host-bank, AOT catalog, HIP runtime,
 and GGUF flag checks. The protected serving process was not stopped or
 modified for this validation.
+
+## 2026-09-05 FP8 GEMV tile32 repeatability gate
+
+The opt-in NVFP4 FP8 GEMV output-row tile candidate was evaluated with
+`FREETOKEN_FP8_GEMV_BLOCK_N=32`, `FREETOKEN_FP8_GEMV_NUM_WARPS=1`, and
+`FREETOKEN_FP8_GEMV_SCALE_ACTIVATION=0`. The candidate used the exact
+prebuilt ROCm cache `kernel-cache-rocm-gfx1151-d6ee8cef479c` and
+`FREETOKEN_DISABLE_JIT=1`; it did not JIT compile during the model-level run.
+
+The paired current baseline completed three scheduler samples at 28.1011 mean
+decode TPS, 28.1072 median TPS, and 0.0260 TPS standard deviation. Its raw
+artifacts are preserved at
+`/home/david/freetoken-amd/artifacts/qwen-fp8-paired-baseline-20260905T170100Z/`.
+
+The corrected tile32 repeat completed three of three samples at 28.4818 mean
+decode TPS, 28.4799 median TPS, and 0.0148 TPS standard deviation. The
+candidate artifact is
+`/home/david/freetoken-amd/artifacts/qwen-fp8-tile32-nvfp4-repeat2-scheduler-20260905T192000Z/`.
+Against the paired baseline, this is a 1.35 percent mean decode improvement
+with lower variation. The earlier independent candidate run recorded 28.4019
+TPS and is preserved at
+`/home/david/freetoken-amd/artifacts/qwen-fp8-tile32-nvfp4-20260905T083800Z/`.
+
+The repeated candidate also passed the canonical AIME quality gate. It
+returned answer `70`, output SHA1 `0acef4eab6f4`, 127 completion tokens,
+28.9804 decode TPS, 394.7 ms TTFT, 34.3702 ms event p50, and 37.3475 ms
+event p99. The quality artifact is stored alongside the repeat scheduler
+artifact as `aime-quality.json`.
+
+One earlier attempt is intentionally classified as an infrastructure failure,
+not a performance result: an abbreviated cache directory omitted the required
+`freetoken__index_4096_4_128_1_false` object and the server failed closed with
+JIT disabled. The corrected exact cache path resolved this issue without
+enabling JIT. The protected Qwen service was restored afterward and returned
+`status: ok` with `maintenance: serving`.
+
+This evidence clears the repeatability and deterministic-quality gates for an
+isolated tile32 promotion review. The production launcher remains unchanged at
+tile16 until deployment policy is reviewed separately; the measured gain is
+material but far below the original 50 percent campaign aspiration.
