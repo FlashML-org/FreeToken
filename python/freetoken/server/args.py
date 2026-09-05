@@ -8,6 +8,7 @@ from typing import List, Tuple
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
+from freetoken.scheduler.config import _local_zmq_addr
 from freetoken.utils import init_logger
 
 
@@ -50,13 +51,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return self._zmq_addr(3)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = self._zmq_addr(4)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -633,6 +634,17 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if os.name == "nt":
+        try:
+            _local_zmq_addr(
+                4,
+                unique_suffix="",
+                server_port=kwargs["server_port"],
+                platform_name="nt",
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing as mp
 import os
@@ -13,6 +14,26 @@ from freetoken.utils import init_logger
 if TYPE_CHECKING:
     from .args import ServerArgs
     from .supervisor import BackendHandle
+
+
+def _configure_windows_asyncio_policy(platform_name: str | None = None) -> bool:
+    """Keep non-uvicorn asyncio consumers on an ``add_reader``-capable loop on Windows.
+
+    ``zmq.asyncio`` needs the ``add_reader`` family.  Python's default Windows proactor loop
+    does not provide it, and pyzmq's optional selector-thread fallback depends on tornado.
+    FreeToken does not otherwise require tornado, so the serve bootstrap retains the stdlib
+    selector policy for its own asyncio users. Uvicorn receives an explicit selector loop factory
+    separately because its ``Server.run`` passes that factory directly to ``asyncio.run``.
+    Non-Windows platforms retain their existing policy unchanged.
+    """
+    if (sys.platform if platform_name is None else platform_name) != "win32":
+        return False
+
+    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_factory is None:
+        raise RuntimeError("WindowsSelectorEventLoopPolicy is unavailable in this Python runtime")
+    asyncio.set_event_loop_policy(policy_factory())
+    return True
 
 
 def _report_startup_error(ack_queue: mp.Queue, exc: BaseException) -> None:
@@ -127,6 +148,7 @@ def launch_server(
     argv: list[str] | None = None,
     prog: str | None = None,
 ) -> None:
+    _configure_windows_asyncio_policy()
     from .api_server import run_api_server
     from .args import parse_args
 

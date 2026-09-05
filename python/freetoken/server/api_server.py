@@ -59,6 +59,15 @@ _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
+def _get_uvicorn_loop_factory(
+    platform_name: str | None = None,
+) -> str | Callable[[], asyncio.AbstractEventLoop]:
+    """Give uvicorn an add_reader-capable loop on Windows; retain auto elsewhere."""
+    if (os.name if platform_name is None else platform_name) != "nt":
+        return "auto"
+    return asyncio.SelectorEventLoop
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -897,7 +906,15 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            access_log=False,
+            loop=_get_uvicorn_loop_factory(),
+        )
+    )
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1037,4 +1054,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop=_get_uvicorn_loop_factory())
