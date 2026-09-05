@@ -374,3 +374,22 @@ the qualified 8x128 shape.
 The candidate process group was terminated only after its command, model path,
 port, and process-group identity were verified. The protected Qwen service was
 then restarted and verified with `status: ok` and `maintenance: serving`.
+
+## 2026-09-06 GGUF MMV-Y8 component attempt
+
+The next allowed GGUF MMV launch shape, `FREETOKEN_GGUF_MMV_Y=8`, was
+admitted only to an isolated real-weight Qwen Q4_K and Q5_K component screen.
+The protected Qwen service remained serving throughout. The native ROCm
+extension build completed, but the 30-warmup and 300-repetition component
+screen produced no JSON result after 4 minutes 48 seconds while contending for
+the same unified-memory GPU and host resources as the protected service. The
+benchmark process and its wrapper were verified by PID and command line, then
+terminated without signaling the protected service. A subsequent read-only
+health check returned `status: ok` and `maintenance: serving`.
+
+The incomplete artifact is
+`/home/david/freetoken-amd/artifacts/qwen-q4-mmv-y8-component-20260906T000000Z-build.log`.
+Because no timed kernel result or output-equality record exists, this attempt
+makes no performance or quality claim. A valid Y8 screen would require an
+isolated GPU window with the protected service stopped and a verified recovery
+afterward; Y8 remains unqualified and the production Y4 setting is unchanged.
