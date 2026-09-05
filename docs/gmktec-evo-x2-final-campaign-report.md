@@ -114,7 +114,13 @@ NVIDIA hardware is in scope.
 Not qualified. The exact 284B checkpoint is not present in the configured
 model directory. The live capacity audit recorded 59 GiB system memory, 18
 GiB available at capture, 2 GiB dedicated VRAM reported by ROCm, and no 284B
-payload. The paper's desktop configuration is materially different.
+payload. The primary paper describes DeepSeek-V4-Flash as a 284B model with
+about 13B active parameters, six selected experts from 256, and roughly 140 GB
+of FP4 expert weights, demonstrated on a 32 GB RTX 5090-class GPU. Those facts
+make the exact model payload, host-memory budget, and bandwidth behavior
+mandatory evidence before a Strix Halo reproduction can be claimed. See the
+[primary paper](https://arxiv.org/abs/2608.16157) and the local
+[`284B capacity manifest`](gmktec-evo-x2-284b-capacity-manifest-20260904.md).
 
 ### Additional archived model identifiers
 
