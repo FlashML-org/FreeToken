@@ -125,6 +125,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | P8 | Real-shape DeepSeek expert transfer slice | Completed in isolation on native ROCm: 80,216,064 bytes across six layer-0 experts and 36 tensors. The final three H2D samples averaged 76.645 GiB/s; post-cold H2D averaged 73.987 GiB/s and D2H averaged 64.073 GiB/s. The protected Qwen service remained healthy after recovery. This is transfer-path evidence only, not a 284B serving result. |
 | P9 | Larger real-shape DeepSeek expert transfer slice | Completed in isolation: 213,909,504 bytes across 16 layer-0 experts and 96 tensors. Final-three H2D averaged 77.561 GiB/s; post-cold D2H averaged 64.762 GiB/s. No material H2D collapse was observed as the batch grew. |
 | P10 | Cross-shard, multi-layer DeepSeek expert transfer slice | Completed in isolation: 160,432,128 bytes across six experts in layers 0 and 1, spanning shards 2 and 3. Final-three H2D averaged 77.976 GiB/s; post-cold D2H averaged 64.622 GiB/s. Cross-shard loading passed and the protected service remained healthy. |
+| P11 | Expert-ID route-churn transfer controls | Completed four two-layer groups: experts 0 to 5, 16 to 21, 32 to 37, and 64 to 69. Post-cold H2D ranged from 77.758 to 78.577 GiB/s and D2H from 64.720 to 64.974 GiB/s. No material expert-ID sensitivity was observed. |
 
 ## 2026-09-04 transfer and offload prototypes
 

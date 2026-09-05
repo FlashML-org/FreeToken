@@ -166,6 +166,21 @@ result across layer and shard boundaries, but it remains a transfer-only
 experiment. Raw output is preserved in
 [`gmktec-evo-x2-deepseek-expert-slice-2layer-result-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-2layer-result-20260905.json).
 
+Four additional two-layer route groups were tested to check expert-ID
+sensitivity. Post-cold H2D and D2H averages were:
+
+| Expert IDs | H2D GiB/s | D2H GiB/s |
+|---|---:|---:|
+| 0 to 5 | 77.758 | 64.738 |
+| 16 to 21 | 78.435 | 64.720 |
+| 32 to 37 | 78.577 | 64.974 |
+| 64 to 69 | 78.538 | 64.923 |
+
+The narrow spread indicates no material transfer-rate dependence on these
+expert IDs. Raw per-group outputs are preserved as
+`expert-route-group-0.json`, `expert-route-group-16.json`,
+`expert-route-group-32.json`, and `expert-route-group-64.json`.
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident

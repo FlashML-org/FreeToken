@@ -87,6 +87,10 @@ performance claims separate.
 - `gmktec-evo-x2-deepseek-expert-slice-result-20260905.json`
 - `gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json`
 - `gmktec-evo-x2-deepseek-expert-slice-2layer-result-20260905.json`
+- `expert-route-group-0.json`
+- `expert-route-group-16.json`
+- `expert-route-group-32.json`
+- `expert-route-group-64.json`
 
 The checklist is a review aid. The raw benchmark artifacts remain the
 authoritative evidence for measured claims.
