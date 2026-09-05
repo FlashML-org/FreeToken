@@ -244,6 +244,9 @@ regression contracts. Native pinned-extension tests were not counted in that
 run because the isolated checkout did not contain a freshly built host
 extension; no production service was changed.
 
+The raw compiler output and extension checksums are preserved at
+`/home/david/freetoken-amd/artifacts/rocm-host-extension-build-5a56629/`.
+
 The same isolated checkout then ran a fresh `setup.py build_ext --inplace`
 under PyTorch `2.13.0+rocm10.0.0` and HIP `7.15.26333`. The build compiled
 `_pinned_tensor`, `_cpu_moe`, and `_ple_store`; the two GPU-facing host
