@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -72,6 +73,31 @@ _DECODE_MARLIN_WARPS = 4
 _DECODE_MARLIN_DEEPK_BLOCK_N = 8
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 128
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+
+
+def _deepk_block_kw() -> int:
+    """Return the opt-in deep-K K-word tile for isolated AMD experiments.
+
+    The production default remains 128, which is the currently qualified
+    launch shape.  A small allow-list prevents an arbitrary environment value
+    from changing the CUDA-graph-compatible kernel geometry.  This hook exists
+    so a candidate such as the numerically matched 8x16 screen can be tested
+    through the real serving path without editing source between runs.
+    """
+    raw = os.environ.get("FREETOKEN_NVFP4_DEEPK_BLOCK_KW", "")
+    if not raw:
+        return _DECODE_MARLIN_DEEPK_BLOCK_KW
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "FREETOKEN_NVFP4_DEEPK_BLOCK_KW must be one of 16, 32, 64, or 128"
+        ) from exc
+    if value not in (16, 32, 64, 128):
+        raise ValueError(
+            "FREETOKEN_NVFP4_DEEPK_BLOCK_KW must be one of 16, 32, 64, or 128"
+        )
+    return value
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -142,7 +168,7 @@ def _decode_gemm_marlin(
     total_routes = M * top_k
     deep_k = K > _DECODE_MARLIN_DEEPK_THRESHOLD
     block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
-    block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    block_kw = _deepk_block_kw() if deep_k else _DECODE_MARLIN_BLOCK_KW
     grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
