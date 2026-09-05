@@ -321,6 +321,15 @@ class ModelConfig:
     moe_weight_format: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
+    # Per-layer head count (Laguna S 2.1: 48 for full, 72 for SWA layers). Generic:
+    # hybrid models whose attention width varies by layer type set this and the model
+    # module sizes its projections from it (``num_qo_heads`` stays the max, so the
+    # backends' per-layer scratch and CUDA-graph buffers fit the widest layer).
+    num_attention_heads_per_layer: tuple[int, ...] | None = None
+    # Laguna (laguna) payload (LagunaArgs): the attention output-gating mode ("per-head"
+    # vs per-element) and its per-layer types. Opaque to model-agnostic engine code;
+    # None for every other model.
+    laguna_args: Any | None = None
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.

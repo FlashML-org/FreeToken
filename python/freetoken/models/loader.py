@@ -54,7 +54,14 @@ def iter_weight_files(model_path: str) -> list[str]:
 
 
 def drop_page_cache(path: str) -> None:
-    """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM).
+
+    POSIX-only (``posix_fadvise``); a no-op on Windows, which exposes no equivalent hint
+    for another process's cached pages. The cache there is left to the OS, so host RAM
+    pressure during a large conversion is higher.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        return
     try:
         fd = os.open(path, os.O_RDONLY)
         try:

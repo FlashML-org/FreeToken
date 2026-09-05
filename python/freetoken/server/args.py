@@ -50,13 +50,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return self._socket_addr(3)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = self._socket_addr(4)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -163,6 +163,11 @@ def parse_args(
             return "deepseekv32"
         if "glm" in marker:
             return "glm47"
+        # Laguna's tool envelope is GLM-4.7's byte-for-byte (<tool_call>name +
+        # <arg_key>/<arg_value> pairs), just without the newlines between tags,
+        # which Glm47Detector already tolerates.
+        if "laguna" in marker:
+            return "glm47"
         if "mistral" in marker:
             return "mistral"
         return "llama3"
@@ -196,6 +201,12 @@ def parse_args(
             return "qwen3"
         if "glm" in marker:
             return "glm"
+        # Laguna wraps its chain-of-thought in <think>/</think> (chat_template.jinja
+        # "laguna_glm_thinking_v8"), so the generic think-tag parser applies. Its
+        # template PRE-OPENS <think> when enable_thinking (the default), leaving the
+        # model to emit only the closing tag -- see _make_reasoning_parser.
+        if "laguna" in marker:
+            return "laguna"
         # M3 first ("minimax" is a substring): <mm:think> tags + 3 thinking gears,
         # not M2's always-on implicit <think>.
         if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
@@ -455,13 +466,13 @@ def parse_args(
         type=str,
         default="auto",
         choices=[
-            "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
+            "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm", "laguna",
             "minimax", "minimax_m3", "muse_glimmer", "gemma4",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
-            "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
+            "<think> for qwen3/glm/laguna/minimax, <mm:think> for minimax-m3, ATEM to=self "
             "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
         ),
     )

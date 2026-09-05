@@ -147,7 +147,8 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        if hasattr(self._buf, "madvise"):
+            self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.

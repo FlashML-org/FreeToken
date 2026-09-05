@@ -359,6 +359,22 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
     ),
     AotModel(
+        # 1:3 full/SWA hybrid (window 512), but both groups are 8 kv heads x 128
+        # head_dim, so they share one store variant (gpt-oss precedent). Only the
+        # QUERY width differs per layer (48 full / 72 SWA), which the store kernel
+        # never sees. Routed experts keep the native "nvfp4" 6-bank layout: I=1024
+        # is narrow enough that select_nvfp4_backend resolves to the Triton
+        # inline-dequant kernels, so the marlin/b12x repacks never run.
+        name="poolside/Laguna-S-2.1-NVFP4",
+        architecture="LagunaForCausalLM",
+        hidden_size=3072,
+        kv_groups=((8, 128),),
+        top_k=10,
+        moe_intermediate_size=1024,
+        expert_formats=("nvfp4",),
+        arch_aliases=("LagunaForConditionalGeneration",),
+    ),
+    AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,
