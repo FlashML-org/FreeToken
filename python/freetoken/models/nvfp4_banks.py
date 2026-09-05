@@ -130,9 +130,13 @@ def load_nvfp4_expert_source_banks(
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
+            # modelopt's ``weight_scale_2`` and llm-compressor's ``weight_global_scale``
+            # (aliased via spec.kind_map) both carry the per-row global.
             global_shards[shard].append((name, match, bank_layer))
         elif kind in {"weight", "weight_scale"}:
             weight_shards[shard].append((name, match, bank_layer))
+        elif kind in {"input_scale", "input_global_scale"}:
+            pass  # activation scale (W4A8 / W8A8); consumed with its .weight
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
 
@@ -254,9 +258,13 @@ def load_nvfp4_expert_source_banks_parallel(
             continue
         kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
+            # modelopt names the per-row global ``weight_scale_2``; llm-compressor names it
+            # ``weight_global_scale`` (after ``_canon_kind`` maps via spec.kind_map, or alias).
             global_names_by_shard[shard].append(name)
         elif kind in {"weight", "weight_scale"}:
             weight_info[name] = (match, bank_layer)
+        elif kind in {"input_scale", "input_global_scale"}:
+            pass  # activation scale (W4A8 / W8A8); consumed with its .weight, not a bank tensor
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
 

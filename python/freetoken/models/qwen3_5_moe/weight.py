@@ -25,7 +25,7 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
-from .config import _compressed_tensors_nvfp4, parse_config
+from .config import _compressed_tensors_nvfp4, _has_moe_experts, parse_config
 
 # Expert weights are stored pre-fused per layer: experts.gate_up_proj / experts.down_proj.
 _PACKED_EXPERT_PATTERN = re.compile(
@@ -39,7 +39,8 @@ _PACKED_EXPERT_PATTERN = re.compile(
 _NVFP4_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_EXPERT_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_packed|"
+    r"weight_scale_2|weight_global_scale|input_scale|input_global_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_NVFP4_EXPERT_KEY_RE,
@@ -47,10 +48,13 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
-# Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
-# never yielded on their own.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
-
+# Suffixes of the per-tensor quant scales; consumed alongside their ``.weight`` (modelopt's
+# ``weight_scale``/``weight_scale_2``/``input_scale``; llm-compressor's ``weight_packed``/
+# ``weight_global_scale``/``input_global_scale``), never yielded on their own.
+_SCALE_SUFFIXES = (
+    ".weight_scale", ".weight_scale_2", ".weight_global_scale",
+    ".input_scale", ".input_global_scale",
+)
 # Gemma-style (1+weight) RMSNorm weights. Excludes GDN gated norm (linear_attn.norm),
 # which is a standard weight*x norm.
 _GEMMA_NORM_SUFFIXES = (
@@ -122,9 +126,12 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     if not raw_name.endswith(".weight"):
         return tensor
     base = raw_name[: -len(".weight")]
-    if base + ".weight_scale_2" in keyset:  # NVFP4 (two-level block scale)
+    # NVFP4 (two-level block scale): modelopt names the per-row global ``weight_scale_2``;
+    # llm-compressor names it ``weight_global_scale``. Either presence -> dequantize as NVFP4.
+    s2_key = next((k for k in (".weight_scale_2", ".weight_global_scale") if base + k in keyset), None)
+    if s2_key is not None:
         return _dequant_nvfp4_weight(
-            tensor, f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2")
+            tensor, f.get_tensor(base + ".weight_scale"), f.get_tensor(base + s2_key)
         )
     if base + ".weight_scale" in keyset:  # FP8 (per-tensor scale)
         return _dequant_fp8_weight(tensor, f.get_tensor(base + ".weight_scale"))
@@ -179,9 +186,11 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
-    if _compressed_tensors_nvfp4(hf_config):
+    if _compressed_tensors_nvfp4(hf_config) and not _has_moe_experts(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
-        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16. MoE compressed-tensors
+        # checkpoints (Ornith: FP8 attn + FP8 shared_expert + NVFP4 experts) fall through to
+        # the modelopt branch below -- it has the FP8 attn path and the offload expert bank.
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
@@ -251,8 +260,12 @@ def iter_weights(
 
                 # NVFP4 dense projections kept native (W4A16) where the model expects them
                 # (shared_expert); everything else dequantizes to bf16 below as before.
-                if (dense_nvfp4 or lmhead_nvfp4) and name.endswith(".weight") \
-                        and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset:
+                # Detect by either modelopt's ``weight_scale_2`` or llm-compressor's
+                # ``weight_global_scale`` -- both name the per-row global scale.
+                if (dense_nvfp4 or lmhead_nvfp4) and name.endswith(".weight") and (
+                    raw_name[: -len(".weight")] + ".weight_scale_2" in keyset
+                    or raw_name[: -len(".weight")] + ".weight_global_scale" in keyset
+                ):
                     emit = _dense_nvfp4_emit(
                         f, name[: -len(".weight")], raw_name[: -len(".weight")],
                         shared_nvfp4=dense_nvfp4, lmhead_nvfp4=lmhead_nvfp4,
@@ -303,6 +316,11 @@ _PT_FP8_FUSE: dict[str, tuple[str, ...]] = {
     ),
     ".linear_attn.in_proj_qkvz": (
         ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+    ),
+    # shared_expert gate|up merge -> shared_expert.gate_up_proj (per-tensor FP8 W8A16).
+    # Used by llm-compressor Ornith (FP8 attn/shared_expert + NVFP4 experts).
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
     ),
 }
 # bf16 (unquantized) GDN b|a projections fused -> in_proj_ba (matches the fp8 split).
@@ -368,10 +386,13 @@ _NVFP4_MLP_LAYOUTS = (
 
 def _nvfp4_parts(f, raw_base: str):
     """Load a native NVFP4 weight as ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
-    per-output-row global fp16 [O])`` -- the dense W4A16 kernels' expected buffers."""
+    per-output-row global fp16 [O])`` -- the dense W4A16 kernels' expected buffers.
+    The per-row global is ``weight_scale_2`` in modelopt and ``weight_global_scale`` in
+    llm-compressor; either is accepted."""
     w = f.get_tensor(raw_base + ".weight")            # uint8 packed FP4 (2 codes/byte)
     s = f.get_tensor(raw_base + ".weight_scale")      # fp8-e4m3 per-16 block scale
-    g2 = f.get_tensor(raw_base + ".weight_scale_2")   # per-tensor global scalar
+    g2_key = ".weight_scale_2" if raw_base + ".weight_scale_2" in f.keys() else ".weight_global_scale"
+    g2 = f.get_tensor(raw_base + g2_key)              # per-tensor global scalar
     g = g2.reshape(1).to(torch.float16).expand(w.shape[0]).contiguous()
     return w, s, g
 
@@ -544,6 +565,13 @@ def _iter_weights_attn_fp8(
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    # shared_expert gate|up merge -> shared_expert.gate_up_proj (W4A16 NVFP4).
+    # llm-compressor single-group checkpoints (kj_v2) put the shared expert in the same
+    # NVFP4 group as the routed experts; modelopt mixed_precision stores shared_expert as
+    # packed FP4 too. Fused cat on the output dim keeps each part's global scale exact.
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj": (
@@ -1060,6 +1088,31 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
 
 
+def _spec_for(config) -> Nvfp4ExpertSourceSpec:
+    """Per-checkpoint NVFP4 source spec: same key pattern + role map, with
+    ``global_reciprocal`` set from the parsed config (``ModelConfig.nvfp4_global_reciprocal``,
+    populated by ``_nvfp4_global_reciprocal`` in models/config.py). The on-disk global scale
+    is the QUANT-side scale for llm-compressor NVFP4 (the dequant kernel multiplies by the
+    DEQUANT-side value, so the loader must reciprocate 1/x from disk) and the DEQUANT-side
+    divisor for modelopt (kernel multiplies, no transform).
+
+    ``kind_map`` aliases the llm-compressor per-expert naming onto the modelopt canonical
+    kinds the bank builder dispatches on: ``weight_packed`` -> ``weight`` (uint8 packed FP4
+    bytes), ``weight_global_scale`` -> ``weight_scale_2`` (per-row global), and the
+    activation scales map to themselves (the bank builder skips them as activation-only).
+    """
+    from dataclasses import replace
+    return replace(
+        _NVFP4_SOURCE_SPEC,
+        global_reciprocal=bool(getattr(config, "nvfp4_global_reciprocal", False)),
+        kind_map={
+            "weight_packed": "weight",
+            "weight_global_scale": "weight_scale_2",
+            "input_global_scale": "input_scale",  # alias; bank builder still skips input scales
+        },
+    )
+
+
 def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, torch.Tensor]:
@@ -1068,7 +1121,7 @@ def load_nvfp4_expert_sources(
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _spec_for(config),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -1084,7 +1137,7 @@ def load_nvfp4_expert_sources_parallel(
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _spec_for(config),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,
