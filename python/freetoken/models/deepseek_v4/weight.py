@@ -20,6 +20,7 @@ import torch
 from tqdm import tqdm
 
 from freetoken.models.loader import drop_page_cache
+from freetoken.utils import download_hf_weight
 
 from .args import DeepseekV4Args, load_args
 
@@ -93,6 +94,7 @@ def iter_weights(
     if not include_non_moe:
         return
 
+    model_path = download_hf_weight(model_path)
     args = load_args(model_path, max_batch_size=1)
     reader = _ShardReader(model_path, _weight_map(model_path), device)
 
@@ -189,7 +191,7 @@ def load_dsfp4_expert_sources(
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    folder = model_path
+    folder = download_hf_weight(model_path)
     weight_map = _weight_map(folder)
     L, E = args.n_layers, args.n_routed_experts
     H, I = args.dim, args.moe_inter_dim

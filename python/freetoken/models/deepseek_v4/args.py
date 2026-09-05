@@ -80,14 +80,28 @@ class DeepseekV4Args:
 
 
 def _config_path(model_path: str) -> str:
-    """Locate the authors' ModelArgs JSON inside the checkpoint directory."""
-    candidates = [
-        os.path.join(model_path, "inference", "config.json"),
-        os.path.join(model_path, "model_args.json"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+    """Locate the authors' ModelArgs JSON inside the checkpoint directory.
+
+    ``model_path`` is either a local directory or a Hugging Face repo id (e.g. when
+    serving straight from ``--model deepseek-ai/DeepSeek-V4-Flash-0731``, unresolved
+    to a local snapshot dir). For the repo-id case, resolve each candidate filename
+    through the HF cache/hub the same way ``utils.hf`` does for ``config.json``.
+    """
+    filenames = [os.path.join("inference", "config.json"), "model_args.json"]
+    if os.path.isdir(model_path):
+        for filename in filenames:
+            path = os.path.join(model_path, filename)
+            if os.path.exists(path):
+                return path
+    else:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+
+        for filename in filenames:
+            try:
+                return hf_hub_download(repo_id=model_path, filename=filename)
+            except EntryNotFoundError:
+                continue
     raise FileNotFoundError(
         f"No DeepSeek-V4 ModelArgs JSON found under {model_path} "
         f"(looked for inference/config.json)"
