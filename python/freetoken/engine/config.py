@@ -56,6 +56,11 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # GGUF MoE implementation selector. Legacy is the generic, proven default;
+    # native ROCm candidates remain opt-in and fail closed when unavailable.
+    gguf_moe_impl: str = "legacy"
+    # Optional ROCm BLAS policy override, applied before worker torch import.
+    rocm_blas: str | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

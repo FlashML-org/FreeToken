@@ -499,6 +499,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--gguf-moe-impl",
+        default=ServerArgs.gguf_moe_impl,
+        choices=["legacy", "auto", "rdna3_mmid", "rdna3_mmvdq", "grouped_mmq"],
+        help=(
+            "GGUF MoE implementation. legacy is the generic default; native ROCm "
+            "candidates are exact-target, opt-in, and fail closed when unavailable."
+        ),
+    )
+
+    parser.add_argument(
+        "--rocm-blas",
+        default=ServerArgs.rocm_blas,
+        choices=["auto", "hipblas", "hipblaslt", "rocblas"],
+        help="ROCm BLAS policy; auto runs the isolated graph/BLAS capture gate.",
+    )
+
+    parser.add_argument(
         "--expert-load",
         default=ServerArgs.expert_load,
         choices=["auto", "serial", "parallel"],

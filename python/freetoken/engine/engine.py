@@ -17,7 +17,16 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    device_kind,
+    init_logger,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
+from freetoken.utils.step_profiler import profiler_phase
 
 from .config import EngineConfig
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
@@ -343,7 +352,23 @@ class Engine:
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        rocm_blas = getattr(config, "rocm_blas", None)
+        gguf_moe_impl = getattr(config, "gguf_moe_impl", "legacy")
+        if rocm_blas is not None:
+            os.environ["FREETOKEN_ROCM_BLAS"] = rocm_blas
+        if gguf_moe_impl != "legacy":
+            os.environ["FREETOKEN_GGUF_MOE_IMPL"] = gguf_moe_impl
         _adjust_config(config)
+        logger.info_rank0(f"device_kind={device_kind()} backend={self.device}")
+        from freetoken.utils.graph_gate import rocm_blas_report
+
+        self.blas_policy = rocm_blas_report()
+        if self.blas_policy["verification"] == "mismatch":
+            raise RuntimeError(
+                "requested ROCm BLAS policy was not effective: "
+                f"{self.blas_policy}"
+            )
+        logger.info_rank0(f"BLAS policy effective={self.blas_policy}")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -992,9 +1017,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        with profiler_phase("model_forward_setup"):
+            use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            with profiler_phase("graph_replay_submission" if use_graph else "model_forward"):
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.

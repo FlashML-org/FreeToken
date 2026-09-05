@@ -34,8 +34,10 @@ instead — it writes the JSON profile the engine reads.
 
 `bench_rocm_matrix.py` creates content-hashed workload/runtime manifests. Keep
 sampled, greedy, and teacher-forced replay lanes separate. Validate candidate
-versus incumbent evidence with `check_decode_gate.py`; missing route counters,
-finite logits, exact completion count, or full hashes rejects the gate.
+versus incumbent evidence with `check_decode_gate.py`; speed promotion accepts only
+`teacher_forced_replay` rows carrying replay schema v2, prompt/continuation hashes,
+an independent oracle ID, matching route digest, zero fallbacks, finite logits, and
+exact completion count. Sampled/greedy rows remain correctness evidence only.
 
 Use unique `TORCH_EXTENSIONS_DIR` per run. Fresh cache proves JIT hygiene, not
 correctness or speed. Promotion requires same-model A/B served results and at

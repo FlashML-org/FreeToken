@@ -132,6 +132,14 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        from freetoken.utils.arch import is_rocm
+        from freetoken.utils.graph_gate import graph_capture_status
+
+        if is_rocm() and graph_capture_status() != "pass":
+            logger.warning_rank0(
+                "ROCm graph-capture gate did not pass; using eager kernel-launch decode path"
+            )
+            return
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -187,7 +195,7 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return bool(self.graph_map) and batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

@@ -27,7 +27,11 @@ def evaluate_gate(
         for index, row in enumerate(rows):
             reasons.extend(f"{label}[{index}]: {reason}" for reason in validate_manifest(row))
             timing = row.get("timing")
-            if isinstance(timing, dict) and timing.get("lane") == "teacher_forced_replay":
+            if not isinstance(timing, dict) or timing.get("lane") != "teacher_forced_replay":
+                reasons.append(
+                    f"{label}[{index}]: speed promotion requires teacher_forced_replay lane"
+                )
+            else:
                 reasons.extend(
                     f"{label}[{index}]: {reason}" for reason in validate_replay_record(row)
                 )
@@ -40,10 +44,14 @@ def evaluate_gate(
         work = row.get("workload", {})
         observed = row.get("observed", {})
         timing = row.get("timing", {})
+        replay = row.get("replay")
+        replay = replay if isinstance(replay, dict) else {}
         return (
             work.get("model_sha256"), work.get("prompt_sha256"), work.get("token_count"),
             work.get("mtp"), json.dumps(work.get("flags"), sort_keys=True), observed.get("quant"),
             observed.get("graph_mode"), timing.get("lane"),
+            json.dumps(replay.get("route_digest"), sort_keys=True),
+            replay.get("oracle_id"),
         )
 
     all_rows = candidate + baseline
@@ -83,6 +91,27 @@ def evaluate_gate(
         "candidate_median_tok_s": candidate_median,
         "baseline_median_tok_s": baseline_median,
         "gain": gain,
+        "evidence_identity": {
+            "lane": "teacher_forced_replay",
+            "oracle_ids": sorted({
+                row.get("replay", {}).get("oracle_id")
+                for row in all_rows
+                if isinstance(row.get("replay"), dict)
+                and isinstance(row.get("replay", {}).get("oracle_id"), str)
+            }),
+            "route_digests": sorted({
+                row.get("replay", {}).get("route_digest")
+                for row in all_rows
+                if isinstance(row.get("replay"), dict)
+                and isinstance(row.get("replay", {}).get("route_digest"), str)
+            }),
+            "gpus": sorted({
+                row.get("runtime", {}).get("gpu")
+                for row in all_rows
+                if isinstance(row.get("runtime"), dict)
+                and isinstance(row.get("runtime", {}).get("gpu"), str)
+            }),
+        },
         "reasons": reasons,
     }
     return result

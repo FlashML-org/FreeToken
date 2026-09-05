@@ -25,6 +25,7 @@ from freetoken.utils import (
     load_tokenizer,
     load_toolcall_anchor_id,
 )
+from freetoken.utils.step_profiler import step_profiler
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -238,7 +239,7 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                ongoing_data = (forward_input, self._profiled_forward(forward_input))
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -272,7 +273,7 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+            ongoing_data = (forward_input, self._profiled_forward(forward_input))
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
@@ -872,6 +873,10 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _profiled_forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        with step_profiler():
+            return self._forward(forward_input)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

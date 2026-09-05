@@ -50,6 +50,8 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         ggml_dequantize,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
+        gguf_dispatch,
+        gguf_runtime_metadata,
     )
 
     out_features = qweight.shape[0]
@@ -57,6 +59,19 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return x.new_empty((0, out_features))
     if qweight_type in _UNQUANTIZED:
         return x @ qweight.T
+    if x.is_cuda and qweight_type in _MMVQ:
+        runtime = gguf_runtime_metadata()
+        dispatch = gguf_dispatch(
+            "dense", qweight_type, out_features, x.shape[1], x.shape[0], runtime["arch"]
+        )
+        if dispatch["implementation"] == "ggml_mul_mat_vec_a8":
+            return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
+        if dispatch["implementation"] == "ggml_mul_mat_a8":
+            return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
+        raise RuntimeError(
+            "GGUF dense dispatch unavailable: "
+            f"{dispatch.get('reason') or 'unknown reason'}"
+        )
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:

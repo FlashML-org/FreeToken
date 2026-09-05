@@ -137,6 +137,13 @@ def launch_server(
     )
     logger = init_logger(__name__, "initializer")
 
+    # These selectors are process-wide because GGUF/JIT dispatch happens below
+    # model construction. Set them before any scheduler worker imports torch.
+    if server_args.rocm_blas is not None:
+        os.environ["FREETOKEN_ROCM_BLAS"] = server_args.rocm_blas
+    if server_args.gguf_moe_impl != "legacy":
+        os.environ["FREETOKEN_GGUF_MOE_IMPL"] = server_args.gguf_moe_impl
+
     if server_args.gpu:
         # resolve here so a typo is one clear error before any worker spawns
         from freetoken.gpu_select import resolve_gpu_uuids
@@ -156,6 +163,22 @@ def launch_server(
         from .supervisor import BackendHandle
 
         mp.set_start_method("spawn", force=True)
+        # Apply ROCm BLAS selection before workers import torch. Late environment
+        # writes may not affect PyTorch's cached BLAS preference.
+        from freetoken.utils import device_kind
+        from freetoken.utils.graph_gate import graph_capture_env, rocm_blas_report
+
+        # Parent-side probing cannot identify each worker target for TP or --gpu.
+        # Keep graph capture eager in those cases until workers can probe themselves.
+        if device_kind() == "rocm" and (server_args.tp_info.size != 1 or server_args.gpu):
+            os.environ["FREETOKEN_ROCM_GRAPH_CAPTURE"] = "0"
+            logger.info("ROCm graph capture disabled: worker target is not parent-stable")
+
+        gate_env = graph_capture_env()
+        if gate_env:
+            os.environ.update(gate_env)
+            logger.info(f"ROCm BLAS/graph env applied to workers: {sorted(gate_env)}")
+        logger.info(f"BLAS policy before worker spawn: {rocm_blas_report()}")
         detach = server_args.shell_mode  # see _detach_process_group
 
         world_size = server_args.tp_info.size

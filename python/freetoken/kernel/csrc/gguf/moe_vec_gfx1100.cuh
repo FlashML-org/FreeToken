@@ -1,0 +1,140 @@
+// gfx1100 decode candidate for packed GGUF Q4_K/Q8_0 MoE vectors.
+//
+// This is intentionally separate from moe_vec.cuh.  The incumbent assigns
+// consecutive lanes to consecutive quant chunks.  The candidate rotates the
+// wave32 lane map by eight lanes and processes a tunable number of output rows per wave.  It
+// still consumes native packed rows and calls the shared quant math, so the
+// comparison isolates layout/occupancy from a changed quantization contract.
+#pragma once
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void moe_vec_gfx1100(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int* topk_ids,
+    const int topk,
+    const int ncols,
+    const int nrows,
+    const int token_stride) {
+  constexpr int rows_per_wave = GGML_CUDA_MMV_Y;
+  const int row = blockIdx.x * rows_per_wave + threadIdx.y;
+  const int token = blockIdx.z / topk;
+  const int expert = topk_ids[blockIdx.z];
+
+  if (row >= nrows) {
+    return;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x) & (WARP_SIZE - 1);
+  const int lanes_per_chunk = qi / vdr;
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_wave = vdr * WARP_SIZE / qi;
+  const int block_lane = lane / lanes_per_chunk;
+  const int iqs = vdr * (lane % lanes_per_chunk);
+  const block_q_t* x = static_cast<const block_q_t*>(vx) +
+      expert * nrows * blocks_per_row;
+  const block_q8_1* y = static_cast<const block_q8_1*>(
+      static_cast<const void*>(static_cast<const int*>(vy) + token * token_stride));
+
+  float tmp = 0.0f;
+  for (int i = block_lane; i < blocks_per_row; i += blocks_per_wave) {
+    const int ibx = row * blocks_per_row + i;
+    const int iby = i * (qk / QK8_1);
+    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+  }
+
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+  }
+
+  if (threadIdx.x == 0) {
+    dst[blockIdx.z * nrows + row] = tmp;
+  }
+}
+
+template <typename scalar_t>
+static void moe_vec_q4_K_q8_1_gfx1100(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_gfx1100<scalar_t, QK_K, QI4_K, block_q4_K,
+                  VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+
+template <typename scalar_t>
+static void moe_vec_q8_0_q8_1_gfx1100(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_gfx1100<scalar_t, QK8_0, QI8_0, block_q8_0,
+                  VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void moe_vec_id_gfx1100(
+    const void* __restrict__ vx, const void* __restrict__ vy,
+    scalar_t* __restrict__ dst, const int* topk_ids, const int topk,
+    const int ncols, const int nrows, const int token_stride,
+    const int64_t expert_stride_bytes, const int64_t row_stride_bytes) {
+  const int row = blockIdx.x * GGML_CUDA_MMV_Y + threadIdx.y;
+  const int route = blockIdx.z;
+  const int token = route / topk;
+  const int expert = topk_ids[route];
+  if (row >= nrows || expert < 0) return;
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_wave = vdr * WARP_SIZE / qi;
+  const int lanes_per_chunk = qi / vdr;
+  const int block_lane = threadIdx.x / lanes_per_chunk;
+  const int iqs = vdr * (threadIdx.x % lanes_per_chunk);
+  const char* expert_base = static_cast<const char*>(vx) +
+      static_cast<int64_t>(expert) * expert_stride_bytes;
+  const block_q_t* x = reinterpret_cast<const block_q_t*>(
+      expert_base + static_cast<int64_t>(row) * row_stride_bytes);
+  const block_q8_1* y = reinterpret_cast<const block_q8_1*>(
+      static_cast<const int*>(vy) + static_cast<int64_t>(token) * token_stride);
+  float tmp = 0.0f;
+  for (int i = block_lane; i < blocks_per_row; i += blocks_per_wave)
+    tmp += vec_dot_q_cuda(&x[i], &y[i * (qk / QK8_1)], iqs);
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+  if (threadIdx.x == 0) dst[route * nrows + row] = tmp;
+}
+
+#define GGUF_GFX1100_ID_LAUNCH(NAME, QK, QI, BLOCK, VDR, DOT) \
+template <typename scalar_t> \
+static void NAME(const void* vx, const void* vy, scalar_t* dst, const int* ids, \
+    const int topk, const int tokens, const int ncols, const int nrows, \
+    const int token_stride, const int64_t expert_stride, const int64_t row_stride, \
+    cudaStream_t stream) { \
+  const dim3 grid((nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y, 1, tokens * topk); \
+  const dim3 block(WARP_SIZE, GGML_CUDA_MMV_Y, 1); \
+  moe_vec_id_gfx1100<scalar_t, QK, QI, BLOCK, VDR, DOT> \
+      <<<grid, block, 0, stream>>>(vx, vy, dst, ids, topk, ncols, nrows, token_stride, \
+                                    expert_stride, row_stride); \
+}
+
+GGUF_GFX1100_ID_LAUNCH(moe_vec_q4_K_q8_1_gfx1100_id, QK_K, QI4_K, block_q4_K,
+                       VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+GGUF_GFX1100_ID_LAUNCH(moe_vec_q5_K_q8_1_gfx1100_id, QK_K, QI5_K, block_q5_K,
+                       VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+GGUF_GFX1100_ID_LAUNCH(moe_vec_q6_K_q8_1_gfx1100_id, QK_K, QI6_K, block_q6_K,
+                       VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+GGUF_GFX1100_ID_LAUNCH(moe_vec_q8_0_q8_1_gfx1100_id, QK8_0, QI8_0, block_q8_0,
+                       VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+
+#undef GGUF_GFX1100_ID_LAUNCH

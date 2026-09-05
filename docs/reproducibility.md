@@ -57,5 +57,8 @@ PYTHONPATH=benchmarks python benchmarks/check_decode_gate.py \
 ```
 
 Gate failure is correct when route counters, finite logits, exact completion,
-full hashes, lane identity, or repeat count is missing. A direct kernel timing
+full hashes, lane identity, replay schema, independent oracle ID, route digest,
+or repeat count is missing. Replay records use `freetoken-replay-manifest-v2` and
+must include `prompt_ids_sha256`, `continuation_ids_sha256`, `route_digest`, and
+`oracle_id`. Sampled and greedy rows cannot promote speed. A direct kernel timing
 does not satisfy served decode evidence.

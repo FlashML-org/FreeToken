@@ -28,7 +28,8 @@ def _rows(tmp_path, values, *, lane="teacher_forced_replay", fallback=0):
     ) for value in values]
     if lane == "teacher_forced_replay":
         rows = [build_replay_record(
-            row, prompt_ids=[1, 2, 3], continuation_ids=[4, 5, 6], route_digest="d" * 64
+            row, prompt_ids=[1, 2, 3], continuation_ids=[4, 5, 6], route_digest="d" * 64,
+            oracle_id="torch-reference-v1",
         ) for row in rows]
     return rows
 
@@ -62,3 +63,24 @@ def test_gate_rejects_nonfinite_timing(tmp_path):
     assert result["gate"] is False
     assert any("median_tok_s" in reason for reason in result["reasons"])
     assert result["gain"] is None
+
+
+@pytest.mark.parametrize("lane", ["sampled_absolute", "greedy_correctness"])
+def test_gate_rejects_non_replay_speed_lanes(tmp_path, lane):
+    result = evaluate_gate(
+        _rows(tmp_path, [110, 112, 111], lane=lane),
+        _rows(tmp_path, [100, 101, 99], lane=lane),
+    )
+    assert result["gate"] is False
+    assert any("teacher_forced_replay" in reason for reason in result["reasons"])
+
+
+def test_gate_rejects_route_digest_mismatch(tmp_path):
+    candidate = _rows(tmp_path, [110, 112, 111])
+    baseline = _rows(tmp_path, [100, 101, 99])
+    baseline[0]["replay"]["route_digest"] = "f" * 64
+
+    result = evaluate_gate(candidate, baseline)
+
+    assert result["gate"] is False
+    assert any("identity" in reason for reason in result["reasons"])

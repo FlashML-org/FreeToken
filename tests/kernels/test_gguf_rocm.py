@@ -58,6 +58,40 @@ def test_rocm_dispatch_rejects_target_outside_matrix(monkeypatch):
         kernel.gguf_dispatch("dense", GGML_Q4_0, 8, 256, 1, "gfx9999")
 
 
+def test_rocm_auto_reports_generic_fallback_for_candidate_request(monkeypatch):
+    monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")
+    report = kernel.gguf_dispatch("moe", 12, 16, 256, 1, "gfx1103", impl="auto")
+    assert report["route"] == "generic"
+    assert report["fallback_route"] == "generic"
+    assert report["implementation"] == "ggml_moe_a8_vec"
+
+
+def test_rocm_forced_candidate_rejects_non_exact_target(monkeypatch):
+    monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")
+    with pytest.raises(RuntimeError, match="exact target gfx1100"):
+        kernel.gguf_dispatch("moe", 12, 16, 256, 1, "gfx1103", impl="rdna3_mmid")
+
+
+def test_cuda_forced_candidate_never_probes_rocm(monkeypatch):
+    monkeypatch.setattr(kernel, "_runtime_backend", lambda: "cuda")
+    monkeypatch.setattr(
+        kernel,
+        "ensure_gguf_moe_candidate_ready",
+        lambda: pytest.fail("CUDA path probed ROCm candidate"),
+    )
+    with pytest.raises(RuntimeError, match="requires ROCm backend"):
+        kernel.gguf_dispatch("moe", 12, 16, 256, 1, None, impl="rdna3_mmid")
+
+
+def test_rocm_exact_candidate_route_requires_registered_abi(monkeypatch):
+    monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")
+    monkeypatch.setattr(kernel, "ensure_gguf_moe_candidate_ready", lambda: True)
+    monkeypatch.setitem(kernel._GGUF_MOE_ABI, "ggml_moe_mmvq_id", kernel._GGUF_ABI_VERSION)
+    report = kernel.gguf_dispatch("moe", 12, 16, 256, 1, "gfx1100", impl="rdna3_mmid")
+    assert report["route"] == "candidate"
+    assert report["capability_status"] == "correctness"
+
+
 def test_q4_0_reference_zero_row_is_finite():
     raw = torch.zeros((2, row_bytes(256, GGML_Q4_0)), dtype=torch.uint8)
     output = dequant_q4_0(raw, torch.float32)

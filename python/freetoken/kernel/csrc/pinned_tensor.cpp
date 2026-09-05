@@ -103,11 +103,15 @@ void host_register(int64_t addr, int64_t nbytes) {
 }
 
 int64_t driver_cuda_version() {
+#if FREETOKEN_USE_ROCM
+  return 0;
+#else
   int version = 0;  // stays 0 when no driver is installed
   const cudaError_t err = cudaDriverGetVersion(&version);
   TORCH_CHECK(err == cudaSuccess,
               "cudaDriverGetVersion failed: ", cudaGetErrorString(err));
   return version;
+#endif
 }
 
 } // namespace

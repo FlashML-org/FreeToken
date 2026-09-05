@@ -160,6 +160,38 @@ def _arch_family(arch: str | None) -> str:
     return "generic"
 
 
+def _candidate_dispatch_contract(
+    requested: str,
+    backend: str,
+    arch: str | None,
+    op: str,
+    quant_type: int,
+    tokens: int,
+) -> tuple[bool, str, str | None]:
+    """Check exact candidate identity before any candidate binding is used."""
+    if requested not in {"rdna3_mmid", "rdna3_mmvdq"}:
+        return False, "generic", None
+    if backend != "rocm":
+        return False, "unsupported", "native ROCm candidate requires ROCm backend"
+    if arch != "gfx1100":
+        return False, "unsupported", f"native candidate requires exact target gfx1100, got {arch!r}"
+    if op not in {"moe_decode", "moe"}:
+        return False, "unsupported", "native candidate is decode-only"
+    from freetoken.utils.arch import rocm_candidate_capability
+
+    capability = rocm_candidate_capability(arch)
+    if capability is None:
+        return False, "unsupported", "native candidate capability is unavailable"
+    if capability.abi != _GGUF_ABI_VERSION:
+        return False, "unsupported", "native candidate ABI does not match GGUF runtime ABI"
+    quant_name = _GGML_QUANT_NAMES.get(quant_type)
+    if quant_name not in capability.quant_types:
+        return False, "unsupported", f"native candidate does not support {quant_name or quant_type}"
+    if tokens <= 0:
+        return False, "unsupported", "native candidate requires positive token count"
+    return True, "candidate", None
+
+
 def gguf_dispatch(
     op: str,
     quant_type: int,
@@ -200,7 +232,10 @@ def gguf_dispatch(
         "cols": cols,
         "tokens": tokens,
         "implementation": "unsupported",
+        "route": "unsupported",
         "requested": requested,
+        "capability_status": None,
+        "fallback_route": "generic" if backend == "rocm" else None,
         "compile_flags": runtime["compile_flags"],
         "source_version": runtime["source_version"],
         "abi_version": _GGUF_ABI_VERSION,
@@ -243,14 +278,25 @@ def gguf_dispatch(
     elif op == "grouped_prefill":
         report["implementation"] = "ggml_moe_a8"
         report["callable"] = report["implementation"]
+        report["route"] = "generic"
     elif op in {"moe_decode", "moe"}:
+        candidate_allowed, candidate_route, candidate_reason = _candidate_dispatch_contract(
+            requested, backend, arch, op, quant_type, tokens
+        )
+        report["route"] = candidate_route
+        report["capability_status"] = "compile-only"
+        if candidate_reason is not None and requested not in {"auto", "legacy"}:
+            report["reason"] = candidate_reason
+            raise RuntimeError(
+                f"{requested} forced route rejected: {candidate_reason}; generic fallback is disabled"
+            )
         candidate_callable = {
             "rdna3_mmid": "ggml_moe_mmvq_id",
             "rdna3_mmvdq": "ggml_moe_mmvdq_id",
             "grouped_mmq": "ggml_moe_mmq_id_strided",
         }.get(requested)
         candidate_error = None
-        if requested in {"rdna3_mmid", "rdna3_mmvdq"} and backend == "rocm" and arch == "gfx1100":
+        if candidate_allowed:
             try:
                 ensure_gguf_moe_candidate_ready()
             except Exception as exc:
@@ -269,9 +315,13 @@ def gguf_dispatch(
         if available:
             report["implementation"] = requested
             report["callable"] = candidate_callable
+            report["route"] = "candidate"
+            report["capability_status"] = "correctness"
         else:
             report["implementation"] = "ggml_moe_a8_vec"
             report["callable"] = "ggml_moe_a8_vec"
+            report["route"] = "generic"
+            report["fallback_route"] = "generic"
             if requested not in {"auto", "legacy"}:
                 raise RuntimeError(
                     f"{requested} ABI callable unavailable; forced mode refuses legacy fallback"
@@ -282,6 +332,7 @@ def gguf_dispatch(
             report["reason"] = f"forced {requested} conflicts with shape policy {family}"
         else:
             report["implementation"] = "ggml_mul_mat_vec_a8" if family == "mmvq" else "ggml_mul_mat_a8"
+            report["route"] = "generic"
     else:
         report["reason"] = "unsupported operation"
     _record_dispatch(report)

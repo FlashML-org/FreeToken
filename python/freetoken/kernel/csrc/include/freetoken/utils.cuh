@@ -44,15 +44,23 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 namespace PDL {
 
 template <bool kUsePDL> __always_inline __device__ void wait() {
+#if !FREETOKEN_USE_ROCM
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
+#else
+  (void)kUsePDL;
+#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
+#if !FREETOKEN_USE_ROCM
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
+#else
+  (void)kUsePDL;
+#endif
 }
 
 } // namespace PDL
@@ -77,6 +85,23 @@ CUDA_CHECK(std::source_location location = std::source_location::current())
   return CUDA_CHECK(::cudaGetLastError(), location);
 }
 
+#if FREETOKEN_USE_ROCM
+inline auto
+HIP_CHECK(::hipError_t error,
+           std::source_location location = std::source_location::current())
+    -> void {
+  if (error != ::hipSuccess) {
+    ::host::panic(location, "HIP error: ", ::hipGetErrorString(error));
+  }
+}
+
+inline auto
+HIP_CHECK(std::source_location location = std::source_location::current())
+    -> void {
+  return HIP_CHECK(::hipGetLastError(), location);
+}
+#endif
+
 template <auto F> inline void set_smem_once(std::size_t smem_size) {
   static const auto last_smem_size = [&] {
     CUDA_CHECK(::cudaFuncSetAttribute(
@@ -89,6 +114,46 @@ template <auto F> inline void set_smem_once(std::size_t smem_size) {
       last_smem_size, " bytes");
 }
 
+#if FREETOKEN_USE_ROCM
+struct LaunchKernel {
+public:
+  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, DLDevice device,
+                        std::size_t dynamic_shared_mem_bytes = 0) noexcept
+      : m_grid(grid_dim), m_block(block_dim),
+        m_stream(resolve_device(device)), m_smem(dynamic_shared_mem_bytes) {}
+
+  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, hipStream_t stream,
+                        std::size_t dynamic_shared_mem_bytes = 0) noexcept
+      : m_grid(grid_dim), m_block(block_dim), m_stream(stream),
+        m_smem(dynamic_shared_mem_bytes) {}
+
+  static auto resolve_device(DLDevice device) -> hipStream_t {
+    return static_cast<hipStream_t>(
+        ::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  }
+
+  LaunchKernel(const LaunchKernel &) = delete;
+  LaunchKernel &operator=(const LaunchKernel &) = delete;
+
+  template <typename T, typename... Args>
+  auto operator()(T &&kernel, Args &&...args) const -> void {
+    void *arg_array[sizeof...(Args)] = {
+        const_cast<void *>(static_cast<const void *>(&args))...};
+    HIP_CHECK(::hipLaunchKernel(reinterpret_cast<const void *>(kernel), m_grid,
+                                m_block, arg_array, m_smem, m_stream));
+  }
+
+  auto with_attr(bool) -> LaunchKernel & {
+    return *this;
+  }
+
+private:
+  dim3 m_grid;
+  dim3 m_block;
+  hipStream_t m_stream;
+  std::size_t m_smem;
+};
+#else
 struct LaunchKernel {
 public:
   explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, DLDevice device,
@@ -116,10 +181,6 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
-#if FREETOKEN_USE_ROCM
-    (void)use_pdl;
-    m_config.numAttrs = 0;
-#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -128,7 +189,6 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
-#endif
     return *this;
   }
 
@@ -146,5 +206,6 @@ private:
   cudaLaunchConfig_t m_config;
   cudaLaunchAttribute m_attr_cache;
 };
+#endif
 
 } // namespace host

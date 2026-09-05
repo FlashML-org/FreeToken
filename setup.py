@@ -18,7 +18,7 @@ def _check_toolchain() -> None:
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.check_nvcc_matches_torch()
+    module.check_toolchain_matches_torch()
 
 
 def _is_rocm() -> bool:
