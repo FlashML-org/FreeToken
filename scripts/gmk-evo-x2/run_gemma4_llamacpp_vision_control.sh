@@ -113,6 +113,7 @@ if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
         --base-url "http://127.0.0.1:${TEST_PORT}" --model "${MODEL_NAME}" \
         --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
         --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" --artifact "${ARTIFACT_DIR}/concurrency.json" \
+        --prompt-repeat "${FREETOKEN_GEMMA4_PROMPT_REPEAT:-1}" \
         >"${ARTIFACT_DIR}/concurrency.log" 2>&1
 fi
 
