@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -28,7 +29,12 @@ if str(SOURCE_ROOT) not in sys.path:
 from benchmarks.bench_decode_moe import load_problem, resolve_sampling, stream_generate
 
 
-REFERENCE_SHA1 = "0acef4eab6f4"
+# Preserve the original paper-inspired Qwen contract as the default.  Other
+# qualified source/model combinations have deliberately different output
+# fingerprints, so callers must select those contracts explicitly instead of
+# silently treating a mismatch as a model-quality failure.
+DEFAULT_REFERENCE_SHA1 = "0acef4eab6f4"
+SHA1_PREFIX_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aime", default=None)
     parser.add_argument("--problem", type=int, default=0)
     parser.add_argument("--decode", type=int, default=128)
+    parser.add_argument(
+        "--expected-sha1",
+        default=DEFAULT_REFERENCE_SHA1,
+        help=(
+            "12-character lowercase SHA1 prefix for the selected quality "
+            "contract; defaults to the historical paper-inspired Qwen gate"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -48,6 +62,8 @@ def main() -> int:
     """Warm the live server, score one deterministic stream, and persist raw evidence."""
 
     args = parse_args()
+    if not SHA1_PREFIX_RE.fullmatch(args.expected_sha1):
+        raise SystemExit("--expected-sha1 must be exactly 12 lowercase hexadecimal characters")
     problem, answer = load_problem(args.aime, args.problem)
     sampling, sampling_source = resolve_sampling(args.model, greedy=True)
     with urllib.request.urlopen(args.base_url.rstrip("/") + "/v1/models", timeout=10) as response:
@@ -89,9 +105,9 @@ def main() -> int:
         "prompt_tokens": result["usage"]["prompt_tokens"],
         "completion_tokens": completion_tokens,
         "metrics": metrics,
-        "expected_output_sha1": REFERENCE_SHA1,
+        "expected_output_sha1": args.expected_sha1,
         "output_sha1": output_sha1,
-        "status": "passed" if output_sha1 == REFERENCE_SHA1 else "failed",
+        "status": "passed" if output_sha1 == args.expected_sha1 else "failed",
         "text": text,
     }
     args.artifact.parent.mkdir(parents=True, exist_ok=True)
