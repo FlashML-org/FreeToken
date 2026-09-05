@@ -9,7 +9,14 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    SingleRankProcessGroup,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    enable_single_rank_distributed,
+    set_tp_info,
+    torch_distributed_process_group_available,
+)
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
@@ -425,7 +432,16 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+    def _init_communication(
+        self, config: EngineConfig
+    ) -> torch.distributed.ProcessGroup | SingleRankProcessGroup:
+        if config.tp_info.size == 1 and not torch_distributed_process_group_available():
+            enable_single_rank_distributed()
+            logger.info_rank0(
+                "torch.distributed process groups are unavailable; using local single-rank communication"
+            )
+            return SingleRankProcessGroup()
+
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -714,6 +730,9 @@ class Engine:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
+        if isinstance(self.tp_cpu_group, SingleRankProcessGroup):
+            return free_memory, free_memory
+
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -997,7 +1016,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
+        if not isinstance(self.tp_cpu_group, SingleRankProcessGroup):
+            torch.distributed.destroy_process_group()
         destroy_distributed()
 
 

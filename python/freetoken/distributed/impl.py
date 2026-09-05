@@ -21,6 +21,43 @@ class DistributedImpl(ABC):
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
+@dataclass(frozen=True)
+class SingleRankWork:
+    """Completed work handle for single-rank process-group operations."""
+
+    def wait(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True)
+class SingleRankProcessGroup:
+    """Minimal CPU process-group contract when there is only one rank.
+
+    This deliberately implements only the operations FreeToken uses on its
+    CPU group.  It must never be selected for tensor parallel sizes above one.
+    """
+
+    def barrier(self) -> SingleRankWork:
+        return SingleRankWork()
+
+    def broadcast(self, tensor: torch.Tensor, root: int = 0) -> SingleRankWork:
+        if root != 0:
+            raise ValueError(f"single-rank broadcast root must be 0, got {root}")
+        _ = tensor
+        return SingleRankWork()
+
+
+@dataclass
+class SingleRankDistributedImpl(DistributedImpl):
+    """Identity layer collectives for tensor parallel size one."""
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,6 +105,33 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+
+def torch_distributed_process_group_available() -> bool:
+    """Whether this torch build can provide FreeToken's process-group path."""
+
+    is_available = getattr(dist, "is_available", None)
+    if not callable(is_available):
+        return False
+    try:
+        if not is_available():
+            return False
+    except Exception:
+        return False
+
+    required_apis = (
+        "init_process_group",
+        "destroy_process_group",
+        "get_world_size",
+        "all_reduce",
+    )
+    return all(callable(getattr(dist, name, None)) for name in required_apis)
+
+
+def enable_single_rank_distributed() -> None:
+    """Select identity collectives for a process with tensor parallel size one."""
+
+    DistributedCommunicator.plugins.append(SingleRankDistributedImpl())
 
 
 def enable_pynccl_distributed(
