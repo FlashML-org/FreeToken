@@ -83,6 +83,12 @@ if [[ "${FREETOKEN_GEMMA4_PREFILL_OVERLAP:-0}" == "1" ]]; then
     moe_prefill_args=()
 fi
 
+# The default preserves the qualified memory budget.  Candidate runs may raise
+# this value to test whether keeping more Gemma expert material resident in the
+# unified GPU-visible memory improves prefill without changing model weights or
+# the request protocol.
+readonly GEMMA_MEMORY_RATIO="${FREETOKEN_GEMMA4_MEMORY_RATIO:-0.35}"
+
 # Refuse to evict the protected service during its multi-minute NVFP4 recovery.
 production_ready
 
@@ -122,7 +128,7 @@ PYTHONPATH=python TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions" \
 "${vision_env[@]}" nohup "${ROOT_DIR}/.venv/bin/python" -m freetoken.cli serve \
     --model-path "${MODEL_PATH}" --served-model-name gemma4-26b-q4-amd \
     --host 127.0.0.1 --port "${TEST_PORT}" --attention-backend triton \
-    --moe-backend offload --expert-load serial --moe-cache-auto --memory-ratio 0.35 \
+    --moe-backend offload --expert-load serial --moe-cache-auto --memory-ratio "${GEMMA_MEMORY_RATIO}" \
     --max-seq-len-override 8192 --kv-reserve-tokens 2048 --cuda-graph-max-bs 0 \
     --disable-pynccl "${moe_prefill_args[@]}" >"${ARTIFACT_DIR}/server.log" 2>&1 &
 candidate_pid=$!
