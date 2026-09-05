@@ -9,7 +9,8 @@ from typing import Callable
 
 import safetensors
 import torch
-from freetoken.utils import download_hf_weight
+from freetoken.distributed import get_tp_info
+from freetoken.utils import div_even, download_hf_weight
 from tqdm import tqdm
 
 LayerToBank = Callable[[int, object], int | None]
@@ -76,6 +77,41 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
         "down_scale": ((E, H, I // 16), fp8),
         "down_global": ((E, H), torch.float16),
     }, num_layers)
+
+
+def _tp_slice(inter: int) -> tuple[int, int]:
+    """``(i_local, i_lo)``: this rank's slice of the intermediate axis. TP shards every expert
+    along I (gate/up rows, down columns), the ``stream_moe_expert_sources`` convention, so the
+    routed output is a partial sum the MoE layer all-reduces."""
+    tp = get_tp_info()
+    i_local = div_even(inter, tp.size)
+    assert i_local % 16 == 0, f"NVFP4 TP shard {i_local} must cover whole 16-wide scale blocks"
+    return i_local, tp.rank * i_local
+
+
+class _Placer:
+    """Writes one checkpoint expert tensor into its bank slot (this rank's I slice only)."""
+
+    def __init__(self, banks: dict, inter: int):
+        self.b = banks
+        self.i_local, self.i_lo = _tp_slice(inter)
+
+    def put(self, layer: int, expert: int, role: str, kind: str, tensor, global_scale=None):
+        n, lo = self.i_local, self.i_lo
+        b = self.b
+        if role == "down":  # [H, I/2] codes, [H, I/16] scales, [H] global
+            if kind == "weight":
+                b["down_packed"][layer][expert] = tensor[:, lo // 2 : (lo + n) // 2]
+            else:
+                b["down_scale"][layer][expert] = tensor[:, lo // 16 : (lo + n) // 16]
+                b["down_global"][layer][expert] = global_scale
+            return
+        rows = slice(0, n) if role == "gate" else slice(n, 2 * n)  # gate | up on the row axis
+        if kind == "weight":
+            b["gate_up_packed"][layer][expert, rows] = tensor[lo : lo + n]
+        else:
+            b["gate_up_scale"][layer][expert, rows] = tensor[lo : lo + n]
+            b["gate_up_global"][layer][expert, rows] = global_scale  # per-tensor scalar
 
 
 def load_nvfp4_expert_source_banks(
@@ -149,13 +185,9 @@ def load_nvfp4_expert_source_banks(
                 globals_map[key] = _ingest_global(spec, f.get_tensor(name))
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
-    gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
-    gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
-    down_packed = [b.tensor for b in _hb["down_packed"]]
-    down_scale = [b.tensor for b in _hb["down_scale"]]
-    down_global = [b.tensor for b in _hb["down_global"]]
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, _tp_slice(I)[0])  # unpinned; pinned after fill
+    banks = {name: [b.tensor for b in layers] for name, layers in _hb.items()}
+    place = _Placer(banks, I)
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -170,30 +202,11 @@ def load_nvfp4_expert_source_banks(
                     expert = int(match.group("expert"))
                     proj = match.group("proj")
                     role = spec.proj_to_role[proj]
+                    if role not in ("gate", "up", "down"):
+                        raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     kind = _canon_kind(spec, match.group("kind"))
-                    tensor = f.get_tensor(name)
-                    if kind == "weight":
-                        if role == "gate":
-                            gate_up_packed[bank_layer_id][expert, :I] = tensor
-                        elif role == "up":
-                            gate_up_packed[bank_layer_id][expert, I:] = tensor
-                        elif role == "down":
-                            down_packed[bank_layer_id][expert] = tensor
-                        else:
-                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
-                    else:
-                        global_scale = globals_map[(layer, expert, proj)]
-                        if role == "gate":
-                            gate_up_scale[bank_layer_id][expert, :I] = tensor
-                            gate_up_global[bank_layer_id][expert, :I] = global_scale
-                        elif role == "up":
-                            gate_up_scale[bank_layer_id][expert, I:] = tensor
-                            gate_up_global[bank_layer_id][expert, I:] = global_scale
-                        elif role == "down":
-                            down_scale[bank_layer_id][expert] = tensor
-                            down_global[bank_layer_id][expert] = global_scale
-                        else:
-                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
+                    place.put(bank_layer_id, expert, role, kind, f.get_tensor(name),
+                              None if kind == "weight" else globals_map[(layer, expert, proj)])
                     tracker.note(bank_layer_id)
                     placed += 1
             drop_page_cache(path)
@@ -207,14 +220,7 @@ def load_nvfp4_expert_source_banks(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    return banks
 
 
 def load_nvfp4_expert_source_banks_parallel(
@@ -273,13 +279,9 @@ def load_nvfp4_expert_source_banks_parallel(
                 )
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
-    gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
-    gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
-    down_packed = [b.tensor for b in _hb["down_packed"]]
-    down_scale = [b.tensor for b in _hb["down_scale"]]
-    down_global = [b.tensor for b in _hb["down_global"]]
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, _tp_slice(I)[0])  # unpinned; pinned after fill
+    banks = {name: [b.tensor for b in layers] for name, layers in _hb.items()}
+    place = _Placer(banks, I)
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -296,24 +298,8 @@ def load_nvfp4_expert_source_banks_parallel(
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
             kind = _canon_kind(spec, match.group("kind"))
-            if kind == "weight":
-                if role == "gate":
-                    gate_up_packed[bank_layer_id][expert, :I] = tensor
-                elif role == "up":
-                    gate_up_packed[bank_layer_id][expert, I:] = tensor
-                else:
-                    down_packed[bank_layer_id][expert] = tensor
-            else:
-                g = globals_map[(layer, expert, proj)]
-                if role == "gate":
-                    gate_up_scale[bank_layer_id][expert, :I] = tensor
-                    gate_up_global[bank_layer_id][expert, :I] = g
-                elif role == "up":
-                    gate_up_scale[bank_layer_id][expert, I:] = tensor
-                    gate_up_global[bank_layer_id][expert, I:] = g
-                else:
-                    down_scale[bank_layer_id][expert] = tensor
-                    down_global[bank_layer_id][expert] = g
+            place.put(bank_layer_id, expert, role, kind, tensor,
+                      None if kind == "weight" else globals_map[(layer, expert, proj)])
             tracker.note(bank_layer_id)
             placed += 1
         return placed
@@ -326,14 +312,7 @@ def load_nvfp4_expert_source_banks_parallel(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    return banks
 
 
 __all__ = [

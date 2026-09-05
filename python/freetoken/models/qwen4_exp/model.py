@@ -21,6 +21,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.config import fp8_lmhead_enabled
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -132,6 +133,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
             assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
             self.lm_head = Nvfp4LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        elif fp8_lmhead_enabled() and not config.tie_word_embeddings:
+            from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
+
+            self.lm_head = Fp8ParallelLMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
         else:
