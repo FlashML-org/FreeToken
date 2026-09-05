@@ -126,6 +126,23 @@ isolated candidate after the normal service is verified healthy. The
 `tests/fixtures/deepseek_expert_index`; it selected all 36 expected tensors
 without importing GPU libraries.
 
+## Real-shape ROCm slice result
+
+The isolated harness was run on the GMKtec EVO-X2 using the pinned shard and
+the native ROCm environment. It transferred 80,216,064 bytes, or 76.5 MiB,
+covering all six experts and all six tensors per expert for layer 0. Five
+round trips were recorded. The first H2D sample was cold at 0.863 GiB/s,
+consistent with initial mapping and page-fault overhead. The final three H2D
+samples averaged 76.645 GiB/s, while all four post-cold samples averaged
+73.987 GiB/s. D2H averaged 64.073 GiB/s across the four post-cold samples.
+
+The protected Qwen health endpoint remained healthy after the run, reporting
+`status: ok` and `maintenance: serving`. ROCm reported 28 C, 13.041 W, and
+zero GPU utilization at the post-run check. The raw result is preserved in
+[`gmktec-evo-x2-deepseek-expert-slice-result-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-result-20260905.json).
+This is evidence for the AMD transfer path only, not a full-model serving or
+quality result.
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident

@@ -122,6 +122,8 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | P6 | 284B capacity manifest and guarded admission | Metadata gate completed: the pinned official payload is 155.425 GiB and the current observed host state yields a 4 GiB authoritative model budget after explicit headroom, so the full load is rejected. The exact expert-slice harness is prepared, but no full-model quality or TPS result is claimed. |
 | P7 | Strict NVIDIA reference run | Blocked on reference hardware and missing paper fields |
 
+| P8 | Real-shape DeepSeek expert transfer slice | Completed in isolation on native ROCm: 80,216,064 bytes across six layer-0 experts and 36 tensors. The final three H2D samples averaged 76.645 GiB/s; post-cold H2D averaged 73.987 GiB/s and D2H averaged 64.073 GiB/s. The protected Qwen service remained healthy after recovery. This is transfer-path evidence only, not a 284B serving result. |
+
 ## 2026-09-04 transfer and offload prototypes
 
 | UTC date | Evidence | Category | Outcome |

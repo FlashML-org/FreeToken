@@ -1,0 +1,416 @@
+{
+  "scope": "isolated real-shape routed expert transfer only",
+  "checkpoint": "checkpoint",
+  "device": "cuda:0",
+  "layers": [
+    0
+  ],
+  "experts": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "repeats": 5,
+  "selected_tensor_count": 36,
+  "selected_bytes": 80216064,
+  "selected_mib": 76.5,
+  "tensors": [
+    {
+      "name": "layers.0.ffn.experts.0.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.1.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.2.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.3.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.4.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w1.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w1.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w2.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        4096,
+        1024
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w2.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        4096,
+        64
+      ],
+      "bytes": 262144
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w3.weight",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.int8",
+      "shape": [
+        2048,
+        2048
+      ],
+      "bytes": 4194304
+    },
+    {
+      "name": "layers.0.ffn.experts.5.w3.scale",
+      "shard": "model-00002-of-00048.safetensors",
+      "dtype": "torch.float8_e8m0fnu",
+      "shape": [
+        2048,
+        128
+      ],
+      "bytes": 262144
+    }
+  ],
+  "round_trips": [
+    {
+      "h2d_seconds": 0.08656186307780445,
+      "d2h_seconds": 0.0016152210300788283,
+      "h2d_gib_per_second": 0.863047866505034,
+      "d2h_gib_per_second": 46.251893616289806
+    },
+    {
+      "h2d_seconds": 0.001131699071265757,
+      "d2h_seconds": 0.0011570280184969306,
+      "h2d_gib_per_second": 66.01315945805572,
+      "d2h_gib_per_second": 64.56803988813533
+    },
+    {
+      "h2d_seconds": 0.0009727838914841413,
+      "d2h_seconds": 0.0011578280245885253,
+      "h2d_gib_per_second": 76.79715084099735,
+      "d2h_gib_per_second": 64.52342633229124
+    },
+    {
+      "h2d_seconds": 0.0009776739170774817,
+      "d2h_seconds": 0.0011560780694708228,
+      "h2d_gib_per_second": 76.41303500590308,
+      "d2h_gib_per_second": 64.62109542843938
+    },
+    {
+      "h2d_seconds": 0.0009737049695104361,
+      "d2h_seconds": 0.0011937960516661406,
+      "h2d_gib_per_second": 76.7245044333722,
+      "d2h_gib_per_second": 62.579392137990354
+    }
+  ],
+  "protected_service_touched": false,
+  "full_model_serving_claim": false
+}
