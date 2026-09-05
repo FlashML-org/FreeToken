@@ -194,6 +194,8 @@ ms maximum token gap. The canonical Q4 output hash was `3302eda43396`, selected
 with the verifier's explicit `--expected-sha1 3302eda43396` contract option;
 the historical `0acef4eab6f4` default remains separate. Relative to the
 accepted current Q4 control near 48.28 decode TPS, Y4 was approximately 5.8
-percent slower and was rejected for promotion. The default remains Y1. The
+percent slower and was rejected for promotion. The later active protected
+NVFP4 baseline is `cd580f4978fb`, while this artifact retains the historical
+Q4 contract `3302eda43396`. The default remains Y1. The
 protected Qwen service was restored and returned `status: ok` with
 `maintenance: serving`.

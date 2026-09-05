@@ -883,6 +883,9 @@ ms maximum token gap. The canonical Q4 AIME output hash was `3302eda43396`.
 The verifier now selects that contract explicitly with
 `--expected-sha1 3302eda43396`; the historical paper-inspired
 `0acef4eab6f4` contract remains available as the default.
+The later protected-service re-anchor is `cd580f4978fb`, so this is a
+source-matched historical Q4 quality result rather than an active NVFP4 quality
+pass.
 
 **Decision: reject current-branch MMV-Y4 for promotion.** It was approximately
 5.8 percent slower than the accepted current Q4 scheduler control near 48.28

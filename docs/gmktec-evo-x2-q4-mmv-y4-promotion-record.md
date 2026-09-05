@@ -123,11 +123,14 @@ quality verifier now accepts an explicit `--expected-sha1 3302eda43396` contract
 selector while preserving the historical paper-inspired default
 `0acef4eab6f4`. This prevents a contract mismatch from being misreported as a
 model-quality failure. The selected hash and observed hash are both retained in
-the raw artifact.
+the raw artifact. The later protected-service re-anchor recorded
+`cd580f4978fb` as the active NVFP4 baseline, so this Y4 run is a source-matched
+historical Q4 result and not an active protected-service quality pass.
 
 Against the accepted current Q4 scheduler baseline near 48.28 decode TPS, this
 current-branch Y4 result is approximately 5.8 percent slower. **Decision:
-reject Y4 for promotion on the current branch.** The compile-time option
+reject Y4 for promotion on the current branch. It also does not match the
+later active protected-service fingerprint `cd580f4978fb`. The compile-time option
 remains available only for reproduction and future architecture-specific work;
 the default remains Y1. The protected Qwen service was restored and its health
 endpoint returned `status: ok` with `maintenance: serving` after the candidate
