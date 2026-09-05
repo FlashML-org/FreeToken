@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Launch Gemma4 Q4 GGUF in an isolated GMKtec EVO-X2 control slot and restore Qwen.
+
+set -euo pipefail
+
+readonly CHECKOUT="${1:?usage: run_gemma4_gguf_text_control.sh ISOLATED_CHECKOUT}"
+readonly MODE="${2:-text}"
+readonly ROOT_DIR="/home/david/freetoken-amd"
+# Bind recovery to the maintained Qwen source tree. The historical harness
+# checkout was intentionally retired, so referring to it would let a Gemma
+# control finish with the protected API still unavailable.
+readonly PRODUCTION_DIR="${ROOT_DIR}/source-qwen-recovery-d6ee8cef479c"
+readonly MODEL_PATH="${ROOT_DIR}/models/Gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf"
+readonly TEST_PORT="1923"
+readonly PRODUCTION_PORT="1919"
+readonly ARTIFACT_DIR="${ROOT_DIR}/artifacts/gemma4-gguf-${MODE}-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${ARTIFACT_DIR}"
+
+port_pid() { ss -ltnp "( sport = :$1 )" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+production_ready() {
+    # A TCP listener and a 200 response can both exist while FreeToken is still
+    # loading its expert groups.  Inspect the authoritative health status so a
+    # temporary candidate never begins while Qwen is only partially recovered.
+    timeout 5 curl -fsS "http://127.0.0.1:${PRODUCTION_PORT}/health" | grep -q '"status":"ok"'
+}
+restore_production() {
+    local test_pid
+    test_pid="$(port_pid "${TEST_PORT}")"
+    if [[ -n "${test_pid}" ]]; then
+        # Do not race the Qwen recovery process against the temporary Gemma
+        # process still releasing its ROCm context. A bare kill followed by an
+        # immediate recovery launch intermittently produced an empty Qwen log
+        # and a dead child on GMKtec EVO-X2.
+        kill "${test_pid}" || true
+        for _ in {1..30}; do
+            kill -0 "${test_pid}" 2>/dev/null || break
+            sleep 1
+        done
+        # The port owner can exit before HIP finishes tearing down its GPU
+        # context. Give ROCm a bounded grace period before Qwen tries to claim
+        # the device, avoiding a child that dies before it can write server.log.
+        sleep 10
+    fi
+    if ! production_ready; then
+        # The recovery script is intentionally external and protects the source
+        # checkout. Verify its observable health result rather than treating a
+        # background PID or an artifact-directory print as successful recovery.
+        local recovered=0
+        # Launch exactly once. Qwen takes several minutes to load its three
+        # serial NVFP4 expert groups on GMKtec EVO-X2. Retrying the launcher while
+        # its listener already exists only produces a misleading refusal and
+        # wastes the short recovery window.
+        bash "${PRODUCTION_DIR}/scripts/gmk-evo-x2/start_qwen_recovery_server.sh" \
+            | tee -a "${ARTIFACT_DIR}/recovery.log" || true
+        # The protected model normally needs roughly six to eight minutes from
+        # a cold recovery. Wait a bounded eight minutes for the authoritative
+        # ready status, rather than mistaking a temporary loading response for
+        # success or declaring a healthy in-progress recovery a failure.
+        for _ in {1..480}; do
+            production_ready && {
+                recovered=1
+                break
+            }
+            sleep 1
+        done
+        [[ "${recovered}" == "1" ]] || echo "WARNING: Qwen recovery did not become reachable" >&2
+    fi
+}
+trap restore_production EXIT
+
+case "${MODE}" in
+    text|vision) ;;
+    *) echo "mode must be text or vision, got ${MODE}" >&2; exit 2 ;;
+esac
+
+# Keep the conservative production-shaped setting as the default.  The
+# explicit opt-in is used only by an isolated candidate run while investigating
+# Gemma prefill and first-token latency.  Keeping the option in an array avoids
+# shell edits that can accidentally remove the command's log redirection or
+# background-process marker.
+moe_prefill_args=(--disable-moe-prefill-overlap)
+if [[ "${FREETOKEN_GEMMA4_PREFILL_OVERLAP:-0}" == "1" ]]; then
+    moe_prefill_args=()
+fi
+
+# The default preserves the qualified memory budget.  Candidate runs may raise
+# this value to test whether keeping more Gemma expert material resident in the
+# unified GPU-visible memory improves prefill without changing model weights or
+# the request protocol.
+readonly GEMMA_MEMORY_RATIO="${FREETOKEN_GEMMA4_MEMORY_RATIO:-0.35}"
+readonly GEMMA_MAX_RUNNING_REQUESTS="${FREETOKEN_GEMMA4_MAX_RUNNING_REQUESTS:-4}"
+
+# Refuse to evict the protected service during its multi-minute NVFP4 recovery.
+production_ready
+
+production_pid="$(port_pid "${PRODUCTION_PORT}")"
+[[ -z "${production_pid}" ]] || kill "${production_pid}"
+for _ in {1..60}; do ss -ltn "( sport = :${PRODUCTION_PORT} )" | grep -q "${PRODUCTION_PORT}" || break; sleep 1; done
+
+# The preceding time-share and recovery tests can leave cold pages in the host
+# swap file even when enough RAM is currently free.  Qwen has released its
+# memory before this point, so cycling the already-configured swap file is a
+# bounded way to give the isolated Gemma candidate a clean measurement start.
+# This does not resize swap or change the host's vm.swappiness policy.
+sudo swapoff -a
+sudo swapon -a
+swapon --show --bytes >"${ARTIFACT_DIR}/swap-after-qwen-release.txt"
+
+cd "${CHECKOUT}"
+vision_env=()
+if [[ "${MODE}" == "vision" ]]; then
+    # This explicit opt-in causes the isolated Gemma candidate to allocate and
+    # load its sibling 1.2 GiB mmproj vision tower. Text mode preserves the
+    # normal production memory budget.
+    vision_env=(FREETOKEN_LOAD_VISION=1)
+    # The embedding fingerprint is a temporary parity aid. Preserve its explicit
+    # caller opt-in so ordinary vision controls never synchronize the device to
+    # compute debug statistics or expand the normally concise server log.
+    if [[ "${FREETOKEN_GEMMA4_VISION_DEBUG:-}" == "1" ]]; then
+        vision_env+=(FREETOKEN_GEMMA4_VISION_DEBUG=1)
+    fi
+fi
+# ``env`` is required here: an expanded Bash array is not parsed as assignment
+# words, so placing ``${vision_env[@]}`` before ``nohup`` directly would try to
+# execute the literal ``FREETOKEN_LOAD_VISION=1`` string as a program.
+env ROCM_HOME=/opt/rocm-10.0 ROCM_PATH=/opt/rocm-10.0 HIP_PATH=/opt/rocm-10.0 \
+FREETOKEN_ROCM_PREFILL_WARMUP="${FREETOKEN_ROCM_PREFILL_WARMUP:-1}" \
+PYTHONPATH=python TORCH_EXTENSIONS_DIR="${ROOT_DIR}/cache/torch_extensions" \
+"${vision_env[@]}" nohup "${ROOT_DIR}/.venv/bin/python" -m freetoken.cli serve \
+    --model-path "${MODEL_PATH}" --served-model-name gemma4-26b-q4-amd \
+    --host 127.0.0.1 --port "${TEST_PORT}" --attention-backend triton \
+    --moe-backend offload --expert-load serial --moe-cache-auto --memory-ratio "${GEMMA_MEMORY_RATIO}" \
+    --max-running-requests "${GEMMA_MAX_RUNNING_REQUESTS}" \
+    --max-seq-len-override 8192 --kv-reserve-tokens 2048 --cuda-graph-max-bs 0 \
+    --disable-pynccl "${moe_prefill_args[@]}" >"${ARTIFACT_DIR}/server.log" 2>&1 &
+candidate_pid=$!
+for _ in {1..480}; do
+    grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log" && break
+    kill -0 "${candidate_pid}" 2>/dev/null || exit 1
+    sleep 1
+done
+grep -q 'API server is ready to serve' "${ARTIFACT_DIR}/server.log"
+curl -fsS "http://127.0.0.1:${TEST_PORT}/health" >"${ARTIFACT_DIR}/health.json"
+# Capture the environment as observed by the actual candidate process, rather
+# than assuming a wrapper-level export survived ``nohup`` and multiprocessing.
+# This artifact is written only for the parity diagnostic and contains solely
+# the named boolean flag, never the server's complete environment.
+if [[ "${FREETOKEN_GEMMA4_VISION_DEBUG:-}" == "1" ]]; then
+    tr '\0' '\n' <"/proc/${candidate_pid}/environ" | \
+        grep '^FREETOKEN_GEMMA4_VISION_DEBUG=' >"${ARTIFACT_DIR}/vision-debug-env.txt" || true
+fi
+PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_text.py \
+    --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+    --gguf "${MODEL_PATH}" --artifact "${ARTIFACT_DIR}/quality.json" \
+    >"${ARTIFACT_DIR}/quality.log" 2>&1
+
+if [[ "${FREETOKEN_GEMMA4_MATRIX:-}" == "1" ]]; then
+    # The short arithmetic gate above remains mandatory.  This opt-in matrix
+    # runs only after quality passes and records fixed-length warmup, prefill,
+    # decode, TTFT, and token-gap evidence in the same immutable artifact.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_gguf_text_matrix.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --gguf "${MODEL_PATH}" --samples "${FREETOKEN_GEMMA4_MATRIX_SAMPLES:-5}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" \
+        --prompt-repeat "${FREETOKEN_GEMMA4_PROMPT_REPEAT:-1}" \
+        --artifact "${ARTIFACT_DIR}/text-matrix.json" \
+        >"${ARTIFACT_DIR}/text-matrix.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_CONCURRENCY:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_concurrency.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --clients "${FREETOKEN_GEMMA4_CLIENTS:-4}" --rounds "${FREETOKEN_GEMMA4_ROUNDS:-3}" \
+        --max-tokens "${FREETOKEN_GEMMA4_MATRIX_TOKENS:-128}" --artifact "${ARTIFACT_DIR}/concurrency.json" \
+        --prompt-repeat "${FREETOKEN_GEMMA4_PROMPT_REPEAT:-1}" \
+        >"${ARTIFACT_DIR}/concurrency.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_LONG_CONTEXT:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_long_context.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --artifact "${ARTIFACT_DIR}/long-context.json" >"${ARTIFACT_DIR}/long-context.log" 2>&1
+fi
+
+if [[ "${FREETOKEN_GEMMA4_ENDURANCE:-}" == "1" ]]; then
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/benchmark_gemma4_endurance.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --sessions "${FREETOKEN_GEMMA4_SESSIONS:-30}" --interval "${FREETOKEN_GEMMA4_INTERVAL:-1}" \
+        --artifact "${ARTIFACT_DIR}/endurance.json" >"${ARTIFACT_DIR}/endurance.log" 2>&1
+fi
+
+if [[ "${MODE}" == "vision" ]]; then
+    # Keep the candidate alive through the actual OpenAI image_url contract
+    # control. The verifier writes a self-contained response/usage artifact;
+    # only after it succeeds does the EXIT trap reclaim port 1923 and restore
+    # the protected Qwen server.
+    image_verify_args=()
+    if [[ "${FREETOKEN_GEMMA4_EXTENDED:-}" == "1" ]]; then
+        # The core three-fixture gate stays fast enough for every normal
+        # candidate. This explicit option adds color and spatial-direction
+        # regression controls after the core pipeline has already passed.
+        image_verify_args+=(--extended)
+    fi
+    if [[ -n "${FREETOKEN_GEMMA4_IMAGE_REPETITIONS:-}" ]]; then
+        # The verifier validates this as a positive integer. Keeping the value
+        # in the environment lets an operator request a repeatability campaign
+        # without changing the normal short candidate-control behavior.
+        image_verify_args+=(--repetitions "${FREETOKEN_GEMMA4_IMAGE_REPETITIONS}")
+    fi
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_image.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --stream "${image_verify_args[@]}" --artifact "${ARTIFACT_DIR}/image-quality.json" \
+        >"${ARTIFACT_DIR}/image-quality.log" 2>&1
+    # The long-response fixture supplies an output-length quality gate, which
+    # makes its stream timing suitable for a visual decode-TPS measurement.
+    PYTHONPATH=python "${ROOT_DIR}/.venv/bin/python" scripts/gmk-evo-x2/verify_gemma4_gguf_visual_tps.py \
+        --base-url "http://127.0.0.1:${TEST_PORT}" --model gemma4-26b-q4-amd \
+        --artifact "${ARTIFACT_DIR}/visual-tps.json" \
+        >"${ARTIFACT_DIR}/visual-tps.log" 2>&1
+fi

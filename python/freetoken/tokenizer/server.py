@@ -17,6 +17,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    CacheStatsBackendMsg,
+    CacheStatsMsg,
+    CacheStatsReply,
+    CacheStatsResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
@@ -194,10 +198,17 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, CacheStatsMsg):
+                    # Cache statistics are already accumulated by the backend.
+                    # The tokenizer only forwards this read-only request.
+                    send_backend.put(CacheStatsBackendMsg(request_id=m.request_id))
+                elif isinstance(m, CacheStatsResultMsg):
+                    send_frontend.put(CacheStatsReply(request_id=m.request_id, stats=m.stats))
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (CacheRebuildMsg, CacheRebuildResultMsg, CacheStatsMsg,
+                     CacheStatsResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
                 )
                 for m in pending_msg
             )
@@ -254,7 +265,13 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=t,
+                            sampling_params=msg.sampling_params,
+                            mm_pixel_values=msg.mm_pixel_values,
+                            mm_image_position_ids=msg.mm_image_position_ids,
+                        )
                         for msg, t in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))

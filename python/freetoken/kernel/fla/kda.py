@@ -1393,4 +1393,3 @@ def fused_kda_gate(
 
     y = y.view(*orig_shape, H, head_k_dim)
     return y
-

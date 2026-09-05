@@ -11,6 +11,11 @@ include the full serving path. AIME-25 prompt, checkpoint-recommended sampling.
 python benchmarks/bench_decode_moe.py --model /path/to/model --backend offload,cpu,hybrid
 ```
 
+Use `--cache N` to pin the expert-cache slot count and
+`--num-token-override N` to pin the server KV-token pool.  Supply both when
+comparing cache policies so automatic spare-VRAM allocation does not change the
+tested context capacity.
+
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
 `/var/tmp` (`--ftw-dir` overrides; roughly checkpoint-sized).

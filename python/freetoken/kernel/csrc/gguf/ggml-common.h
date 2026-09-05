@@ -8,7 +8,12 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
+// Keep one output row per workgroup by default.  Isolated ROCm experiments may
+// override this at compile time to compare a second row per workgroup without
+// changing the checked-in production default or silently changing arithmetic.
+#ifndef GGML_CUDA_MMV_Y
 #define GGML_CUDA_MMV_Y 1
+#endif
 
 // Data Structures
 // QK = number of values after dequantization
@@ -1004,7 +1009,15 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 }
 
 static __device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
-#if __has_builtin(__builtin_amdgcn_sdot4)
+#if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1150__) || defined(__gfx1151__))
+  // RDNA3-family HIP compilers can lower the signed-dot form through sudot4.
+  // The two `true` operand flags preserve the signed four-byte dot-product
+  // semantics of sdot4, while matching the intrinsic selection in the current
+  // llama.cpp HIP implementation.  This branch is intentionally limited to
+  // gfx1100/gfx1150/gfx1151 so older AMD targets and every CUDA build retain
+  // their proven implementation below.
+  c = __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#elif __has_builtin(__builtin_amdgcn_sdot4)
   c = __builtin_amdgcn_sdot4(a, b, c, false);
 #else
   const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);

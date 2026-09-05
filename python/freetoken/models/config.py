@@ -319,6 +319,11 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # Native GGUF Qwen Q4_K_M may use Q6_K down-expert rows in a small subset of
+    # layers while the remaining down rows are Q5_K.  The parser records those
+    # original layer ids so the exact auxiliary Q6_K cache can be attached only
+    # where it is needed.
+    gguf_q6_down_layer_ids: Tuple[int, ...] = ()
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

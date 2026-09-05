@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Measure warm Qwen decode throughput against the isolated GMKtec EVO-X2 FreeToken API.
+#
+# The workload is deliberately a fixed 48-times scheduler paragraph. It preserves
+# the former 733-token-class GMKtec EVO-X2 baseline shape while remaining separate from
+# the unrecovered upstream paper workload. This script neither starts nor stops a
+# server and never contacts llama-swap or any non-GMKtec EVO-X2 endpoint.
+
+set -euo pipefail
+
+# Accept a caller-supplied artifact root so each run has immutable evidence.
+readonly ARTIFACT_DIR="${1:?usage: run_qwen_scheduler_baseline.sh ARTIFACT_DIR}"
+readonly ROOT_DIR="/home/david/freetoken-amd"
+readonly SOURCE_DIR="${ROOT_DIR}/source-qwen-harness-d6ee8ce"
+# Keep benchmark code independent from the source checkout serving the normal
+# API. A deployed server checkout can intentionally stay frozen while a newer
+# isolated checkout supplies the reviewed benchmark harness. This override
+# changes neither the target URL nor the model selected below.
+readonly BENCHMARK_SOURCE_DIR="${GMK_EVO_X2_QWEN_BENCHMARK_SOURCE_DIR:-${SOURCE_DIR}}"
+readonly VENV_PYTHON="${ROOT_DIR}/.venv/bin/python"
+# Preserve the original FreeToken service as the default while permitting an
+# explicitly named, isolated local control to reuse this exact workload.  The
+# optional overrides are intentionally not exported globally, so ordinary
+# service runs remain bound to port 1919 and the validated FreeToken model.
+readonly MODEL_DIR="${GMK_EVO_X2_QWEN_TOKENIZER_DIR:-${ROOT_DIR}/models/Qwen3.6-35B-A3B-NVFP4}"
+readonly MODEL_NAME="${GMK_EVO_X2_QWEN_MODEL_NAME:-qwen3.6-35b-a3b-nvfp4-amd}"
+readonly BASE_URL="${GMK_EVO_X2_QWEN_BASE_URL:-http://127.0.0.1:1919/v1}"
+readonly EXPECTED_HOST="david-Gmktec-x2-2"
+readonly BASE_PROMPT="The scheduler manages incoming inference requests by prioritizing, batching, and assigning them to available compute resources to optimize throughput and latency. "
+
+# Form the fixed input without shell interpolation at call time. The harness
+# records its SHA-256 and checkpoint token count, so any future wording change
+# becomes visible in the result artifact rather than silently changing TPS.
+PROMPT=""
+for _ in $(seq 1 48); do
+    PROMPT+="${BASE_PROMPT}"
+done
+
+# Refuse a stale deployment explicitly instead of failing later with Python's
+# unhelpful file-not-found message. This makes source provenance visible in the
+# artifact-producing command and prevents an accidental benchmark substitution.
+test -f "${BENCHMARK_SOURCE_DIR}/benchmarks/gmk_evo_x2/run_api_benchmark.py"
+export PYTHONPATH="${BENCHMARK_SOURCE_DIR}/python"
+cd "${BENCHMARK_SOURCE_DIR}"
+
+# Forced-length greedy decoding yields a comparable stream interval. Qwen's
+# reasoning stream is explicitly disabled because this measures final-token
+# decoding, not variable-length internal reasoning. A warmup is retained but
+# saved separately by the harness before the three scored samples.
+"${VENV_PYTHON}" benchmarks/gmk_evo_x2/run_api_benchmark.py \
+    --model "${MODEL_NAME}" \
+    --tokenizer "${MODEL_DIR}" \
+    --base-url "${BASE_URL}" \
+    --expected-host "${EXPECTED_HOST}" \
+    --artifact-dir "${ARTIFACT_DIR}" \
+    --samples 3 \
+    --warmup \
+    --mode throughput \
+    --expected-text "" \
+    --max-tokens 256 \
+    --prompt "${PROMPT}" \
+    --reasoning-effort none

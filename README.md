@@ -56,6 +56,13 @@ For More details:
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 
+### AMD ROCm/HIP port
+
+The `amd-rocm-gfx1151` branch contains the native AMD ROCm/HIP port and
+`gfx1151` validation work. Read [AMD ROCm on Radeon 8060S](docs/amd-rocm-gfx1151.md)
+for scope and platform-specific boundaries, and [Reproducibility and independent
+extension](docs/reproducibility.md) for the portable public evidence workflow.
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Iterable, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
@@ -70,6 +70,10 @@ class TritonMetadata(BaseAttnMetadata):
     is_decode: bool
     prefix_lens: torch.Tensor
     max_q_len: int
+    # Per-query-token image-group ids during prefill. ``-1`` denotes normal
+    # causal text. Equal non-negative ids may attend to one another in either
+    # direction, as required by Gemma 4 image soft-token blocks.
+    image_group_ids: torch.Tensor | None = None
     attn_logits: torch.Tensor | None = None
     attn_lse: torch.Tensor | None = None
     num_kv_splits: torch.Tensor | None = None
@@ -77,6 +81,42 @@ class TritonMetadata(BaseAttnMetadata):
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
+
+
+def _image_group_ids_for_prefill(
+    reqs: Iterable[object], image_token_id: int | None
+) -> torch.Tensor | None:
+    """Return packed prefill image-group ids, or ``None`` for causal-only batches.
+
+    The scheduler packs each request's uncached suffix contiguously. Gemma 4
+    requires bidirectional attention only among the repeated soft-image tokens
+    belonging to the same image, not for surrounding text, delimiters, or a
+    second image in the same prompt. Group ids are deliberately CPU tensors
+    here because request token ids are CPU-resident until the scheduler stages
+    the forward batch.
+    """
+    if image_token_id is None:
+        return None
+    pieces: list[torch.Tensor] = []
+    next_group = 0
+    found_image = False
+    for req in reqs:
+        input_ids = req.input_ids[req.cached_len : req.device_len]
+        groups = torch.full_like(input_ids, -1, dtype=torch.int32)
+        image_mask = input_ids == image_token_id
+        if bool(image_mask.any()):
+            found_image = True
+            starts = image_mask & torch.cat(
+                (torch.ones(1, dtype=torch.bool, device=input_ids.device), ~image_mask[:-1])
+            )
+            for start in starts.nonzero(as_tuple=False).flatten().tolist():
+                end = start
+                while end < input_ids.numel() and bool(image_mask[end]):
+                    end += 1
+                groups[start:end] = next_group
+                next_group += 1
+        pieces.append(groups)
+    return torch.cat(pieces) if found_image else None
 
 
 class TritonAttentionBackend(BaseAttnBackend):
@@ -157,6 +197,9 @@ class TritonAttentionBackend(BaseAttnBackend):
         v_cache = v_raw.view(-1, kv_heads, head_dim)
 
         spec = attn_spec or AttentionSpec()
+        image_group_ids = (
+            metadata.image_group_ids if spec.multimodal_bidirectional else None
+        )
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
@@ -185,7 +228,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         if (
             (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
-            and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
+            and (
+                q.shape[-1] <= 256
+                or metadata.max_q_len >= self.prefill_tile_min_q
+                or image_group_ids is not None
+            )
         ):
             return extend_paged_attention(
                 q=q,
@@ -201,6 +248,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                image_group_ids=image_group_ids,
             )
         return paged_attention(
             q=q,
@@ -255,6 +303,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         q_positions = getattr(batch, "positions", None)
         if q_positions is None:
             q_positions = torch.zeros(num_query_tokens, dtype=torch.int64, device=device)
+        image_group_ids_cpu = (
+            _image_group_ids_for_prefill(reqs, getattr(self.config, "image_token_id", None))
+            if not is_decode
+            else None
+        )
 
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
@@ -265,6 +318,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             is_decode=is_decode,
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
+            image_group_ids=(
+                image_group_ids_cpu.to(device, non_blocking=True)
+                if image_group_ids_cpu is not None
+                else None
+            ),
             swa_indices=swa_indices,
         )
 

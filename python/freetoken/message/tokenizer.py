@@ -72,6 +72,19 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # ``None`` preserves the tokenizer's normal policy: rendered chat messages
+    # own their special tokens, while raw completion strings receive the model
+    # default.  A completion caller that has already rendered a complete prompt
+    # can set this explicitly to avoid inserting a second BOS or template token.
+    add_special_tokens: bool | None = None
+    # OpenAI ``image_url`` values aligned to marker strings in ``text``. They
+    # are decoded in the tokenizer process and never sent as arbitrary URLs to
+    # the GPU engine.
+    image_urls: List[Any] | None = None
+    # CPU image tensors prepared by the tokenizer worker. They retain their
+    # native shapes through the ZMQ wire and are encoded on the scheduler GPU.
+    mm_pixel_values: Any | None = None
+    mm_image_position_ids: Any | None = None
 
 
 @dataclass
@@ -100,6 +113,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+
+
+@dataclass
+class CacheStatsMsg(BaseTokenizerMsg):
+    """API-to-tokenizer passthrough for a read-only MoE cache-statistics snapshot."""
+
+    request_id: str
+
+
+@dataclass
+class CacheStatsResultMsg(BaseTokenizerMsg):
+    """Scheduler-to-tokenizer passthrough carrying an immutable cache-statistics snapshot."""
+
+    request_id: str
+    stats: Dict[str, Any]
 
 
 @dataclass

@@ -1,0 +1,127 @@
+\documentclass[10pt,letterpaper,twocolumn]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xurl}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue}
+
+\title{Native FreeToken Serving on AMD Strix Halo:\\A ROCm/HIP Port and Controlled Unified-Memory Evaluation}
+\author{David Bourdeau\\Independent Researcher\\\texttt{davidbourdeau@gmail.com}}
+\date{Technical white paper, release candidate v0.1.0-rc1, 30 August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large mixture-of-experts (MoE) models make capable local inference possible, but most edge-serving systems are designed and evaluated on NVIDIA discrete GPUs. We present a native ROCm/HIP port of FreeToken for AMD Strix Halo, represented by the Ryzen AI Max+ 395 with Radeon 8060S graphics (\texttt{gfx1151}). The port retains FreeToken's CUDA behavior while adding HIP extension builds, ROCm-safe architecture detection, portable Triton paths, and native model-serving validation. It executes without a CUDA compatibility layer, Vulkan substitute, or CPU-only fallback.
+
+The evaluated GMKtec EVO X2 has 64 GiB installed LPDDR5 memory and a 4 GiB firmware GPU reservation. Linux exposes 59.46 GiB host memory and ROCm exposes a 56.0 GiB coarse-grained GPU pool. The native server produces a deterministic Qwen NVFP4 AIME canary at 27.88 mean client-visible decode tokens/s. A faster NVFP4 Triton-router path was rejected because it changed deterministic model output. In a matched raw-prompt Q4\_K\_M Qwen control, FreeToken reaches 50.63 tokens/s with a quality-checked HIP router versus 50.29 tokens/s for the ROCm 10 llama.cpp control. A Gemma 4 Q4 text control reaches 57.05 tokens/s and returns the expected deterministic answer. These are native-port and bounded same-file control results, not a strict reproduction of FreeToken's published RTX 4060 result.
+\end{abstract}
+
+\section{Introduction}
+
+FreeToken shows that MoE-aware placement, caching, and execution policies can turn consumer hardware into a viable local serving platform~\cite{freetoken}. Its design addresses an important edge-inference reality: model state often exceeds device memory, execution alternates between prefill and decode, and agentic workloads repeatedly edit and extend context. The published system, however, is principally designed and evaluated around NVIDIA discrete GPUs.
+
+AMD Strix Halo changes the deployment model. Its Radeon 8060S GPU and CPU share a large LPDDR5X memory pool rather than communicating through a discrete-GPU PCIe path. This makes large local models feasible on an APU, but it does not make a CUDA-oriented runtime automatically portable or performant. A runtime must compile native extensions with HIP, avoid treating HIP's \texttt{torch.cuda} compatibility namespace as evidence of NVIDIA hardware, preserve semantics across alternate kernels, and measure CPU-GPU contention rather than assuming PCIe transfer is the principal cost.
+
+We ask a deliberately narrow question: can FreeToken's serving stack be ported to a Strix Halo \texttt{gfx1151} system as a native ROCm/HIP runtime, and what do controlled serving experiments demonstrate after the port? This work contributes a narrowly gated HIP port that preserves CUDA behavior, a validation contract that separates native execution from performance and quality claims, controlled Qwen and Gemma results, and evidence from profiling and rejected candidates that identifies the current optimization frontier.
+
+\section{Scope and Native Port}
+
+FreeToken jointly manages model layout, expert residency, CPU-GPU execution, and cache state for local MoE serving~\cite{freetoken}. Its published Qwen result reports 39.3 decode tokens/s on an 8 GiB RTX 4060 laptop. We use that work as design motivation and a protocol reference, not as an automatically comparable baseline. A strict replication would require the same checkpoint revision, workload corpus, rendered prompt, tokenization, generation and stop rules, warmup state, policy configuration, and reported statistic. Those fields have not all been recovered for the upstream RTX 4060 row. No result reported here is therefore described as a replication of that result.
+
+The port retains CUDA as a separate runtime path. On ROCm builds, setup detects HIP PyTorch and links the native extension surface against \texttt{libamdhip64} rather than CUDA runtime libraries. A compatibility header maps only the CUDA Runtime API subset used by FreeToken's pinned-memory and CPU-MoE extensions to HIP. JIT compilation removes NVCC-only flags and uses HIP-compatible launch behavior. CUDA-only optional dependencies and NVIDIA PTX inline assembly are avoided on HIP, with portable Triton paths used where validated. The port also rejects ROCm before NVIDIA SM capability checks, preventing \texttt{gfx1151} from being misclassified as an NVIDIA architecture.
+
+The resulting server preserves FreeToken's OpenAI-compatible model discovery, streaming, non-streaming, cache, and MoE interfaces. All experiments use the ROCm/HIP path. We did not use Vulkan or a CPU-only runner as an implementation substitute.
+
+\section{Experimental Methodology}
+
+Experiments ran on a GMKtec NucBox EVO X2. Table~\ref{tab:platform} reports the static environment observed on 30 August 2026. Dynamic measurements such as free memory, temperature, clocks, and active processes are retained per run in the artifact manifest rather than presented as fixed specifications.
+
+\begin{table*}[t]
+\caption{Evaluated-system hardware and software environment.}
+\label{tab:platform}
+\centering
+\small
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.28\textwidth}X}
+\toprule
+Component & Specification \\
+\midrule
+System and firmware & GMKtec NucBox EVO X2, SKU \texttt{EVO-X2-001}, hardware version 1.0, firmware EVO-X2 1.09 dated 13 September 2025 \\
+Processor & AMD Ryzen AI Max+ 395 with Radeon 8060S; 16 cores, 32 hardware threads, one NUMA node, boost enabled \\
+CPU frequency and cache & 625 MHz minimum and 5.1875 GHz maximum; 768 KiB L1d, 512 KiB L1i, 16 MiB L2, and 64 MiB L3 \\
+Installed memory & 64 GiB LPDDR5, eight 8 GiB Micron devices; 8,532 MT/s rated and 8,000 MT/s configured \\
+Memory exposure & 4 GiB firmware UMA reservation; 59.46 GiB Linux host memory; 56.0 GiB ROCm coarse-grained GPU pool \\
+GPU and HSA & Radeon 8060S, PCI ID \texttt{1002:1586}, \texttt{gfx1151}, 40 compute units, wavefront size 32, XNACK disabled, coherent host access false \\
+Operating system & Ubuntu 26.04.1 LTS, Linux 7.0.0-30-generic \\
+Toolchain & ROCm 10.0, HIP 7.15.26333, AMD Clang 23, PyTorch 2.13.0+rocm10.0.0, Triton 3.8.0 \\
+Storage & Lexar ARES 2 TB NVMe SSD \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+The firmware reservation is not the FreeToken model-memory budget. It is a preallocated UMA region. Capacity available to a request changes with host activity, runtime overhead, model weights, expert residency, and KV-cache growth.
+
+Decode throughput is client-visible streaming throughput: generated completion tokens, excluding the first generated token, divided by the interval from the first to final streamed content token. Client-observed time to first token is reported separately from runtime-internal timing. Fixed-length throughput and quality are separate modes, so a system cannot appear faster merely by ending early, emitting hidden reasoning tokens, or silently changing the request.
+
+Every accepted candidate must satisfy the applicable gates: native HIP compilation and execution, an OpenAI-compatible response, correct tokenizer accounting, deterministic-output or task-quality evidence, and preserved raw artifacts. A microbenchmark gain is not accepted if the full model changes the deterministic answer or fails to improve the end-to-end API workload.
+
+\section{Results}
+
+\subsection{Native Qwen NVFP4 serving}
+
+The native ROCm/HIP Qwen server passed a deterministic AIME canary with the reference PyTorch router. Three warm quality-matched repeats produced 26.786, 28.422, and 28.431 client-visible tokens/s, for a mean of 27.880 tokens/s. Mean warm time to first token was 409.0 ms for the 54-prompt-token and 127-completion-token request. Every run emitted the required SHA-1, \texttt{0acef4eab6f4}.
+
+A ROCm Triton top-k router improved isolated router latency by 1.62 to 1.63x for Qwen's 256-expert top-8 shape and achieved 29.186 tokens/s in a performance-only NVFP4 workload. An end-to-end greedy AIME request changed output hash, however, so this configuration is rejected for NVFP4 serving. Router-only speed and a transport canary are not quality-preserving system results.
+
+\subsection{Matched Q4 Qwen raw-prompt control}
+
+Table~\ref{tab:q4} compares FreeToken and llama.cpp~\cite{llamacpp} on the same Q4\_K\_M file, raw prompt, tokenizer count, deterministic sampling, and steady-decode rule. With the native HIP router, FreeToken reaches 50.63 tokens/s while preserving the correct derivation for the expected answer. This is 0.7\% above the llama.cpp control's 50.29 tokens/s.
+
+\begin{table}[t]
+\caption{Matched raw-prompt Qwen Q4\_K\_M control.}
+\label{tab:q4}
+\centering
+\small
+\begin{tabular}{p{0.35\columnwidth}rrr}
+\toprule
+Engine & Prompt & Generated & Tokens/s \\
+\midrule
+FreeToken AMD & 54 & 1023 & 47.12 \\
+FreeToken AMD plus HIP router & 54 & 1023 & 50.63 \\
+llama.cpp ROCm 10 & 54 & 1024 & 50.29 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is intentionally a bounded result. Both outputs remained within Qwen's reasoning trace at the 1024-token ceiling, so neither exposed the requested boxed final line. Future quality experiments should use a larger generation cap or a concise-answer task, repeated samples, and a task suite.
+
+\subsection{Gemma 4 and profiling evidence}
+
+The native Gemma GGUF path returned \texttt{323} for a fixed multiplication prompt. The client and local tokenizer agreed on 30 prompt tokens; the response used four completion tokens and reached 57.05 steady decode tokens/s. This validates the text-only loader, canonical template, OpenAI-compatible completion API, and token accounting for this fixed control. It does not alone qualify multimodal handling or long-context behavior.
+
+The Qwen NVFP4 ROCm trace recorded 353,457 dispatches. It was intrusive and measured only 15.61 tokens/s, so it is not used for throughput scoring. In the final active window, the largest GPU-time consumer was dense mixed-FP8 \texttt{\_gemv\_splitk\_kernel}, not the routed NVFP4 expert kernel. Measured times were 5,631.844 ms for \texttt{\_gemv\_splitk\_kernel}, 1,676.018 ms for \texttt{\_gemm\_kernel}, 1,566.004 ms for \texttt{\_decode\_nvfp4\_marlin\_kernel}, and 593.192 ms for \texttt{fast\_index\_copy}.
+
+The port also measured the Qwen cache-copy path. With one active token, eight routed experts missing, and a 513-slot cache, native HIP copied 13.5 MiB in 0.097 ms, or 146.8 GB/s. The all-hit case took 0.023 ms. Across 40 MoE layers, the documented all-miss extrapolation is 3.87 ms per decode token, below the approximately 35 ms end-to-end token interval of the accepted NVFP4 configuration. This does not prove copies are irrelevant, but it rules out treating cache-copy bypass as the first unvalidated optimization.
+
+\section{Limitations and Artifact Availability}
+
+This study reports a single \texttt{gfx1151} host, a small set of controlled workloads, and no 24-hour endurance result. It does not establish broad AMD support, cross-device generalization, agentic quality equivalence, or strict parity with the upstream paper. The Q4 control is the cleanest current cross-runtime result because it holds the model file and raw prompt constant, but its 0.7\% margin is too small to generalize beyond the stated workload.
+
+The AMD ROCm/HIP port is developed under Apache-2.0 at \url{https://github.com/dbourdea/FreeToken}, branch \texttt{amd-rocm-gfx1151}~\cite{freetokenamd,apache}. This release candidate is based on public branch tip \texttt{a937862f171900bd5d1d207c8ff59b40a15ce742}, verified on 30 August 2026. The white-paper package and portable reproduction tools are not yet committed to that branch, and no immutable tag or DOI exists. Before publication, commit the complete package, archive an immutable tag, and replace this statement with the tag and version DOI. The release candidate includes HIP portability tests, Qwen and Gemma controls, and the read-only collector \texttt{scripts/reproduce/collect\_host\_manifest.sh}, which redacts the hostname by default and does not change service or host configuration.
+
+The archival release must contain source and an environment lockfile, workload and scoring code, sanitized raw results and table-generation scripts, and model provenance consisting of publisher, revision, byte count, SHA-256, and license. Model weights must be obtained from their original publishers rather than redistributed without permission. The current host-specific helpers preserve a protected local service and use host-specific paths, but the public artifact now provides a parameterized host collector and the loopback-only API client \texttt{benchmarks/reproduce/run\_local\_api\_benchmark.py}. The client accepts an explicit model, tokenizer, prompt, visible-text quality gate, sample count, and artifact path; it cannot send traffic to a LAN or public address and never starts or stops a server. Future release work must add parameterized model-launch recipes while avoiding user-specific home paths, LAN addresses, or an assumed production service.
+
+
+\section{Conclusion}
+
+We ported FreeToken to native ROCm/HIP execution on AMD Strix Halo and evaluated it with claim discipline suited to an evolving edge-serving system. The port compiles and serves through HIP, preserves CUDA as a separate path, and passes deterministic Qwen and Gemma controls. In a same-file Q4 Qwen control, the native HIP router produced 50.63 tokens/s versus 50.29 tokens/s for llama.cpp ROCm 10, while a faster but output-changing NVFP4 router was rejected. The result is a reproducible foundation for UMA-aware optimization, not a claim of paper replication or universal AMD superiority.
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

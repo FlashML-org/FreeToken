@@ -1,0 +1,19 @@
+{
+  "decision": "REJECT_FULL_LOAD",
+  "payload_bytes": 166886535336,
+  "payload_gib": 155.425,
+  "mem_available_gib": 18.0,
+  "rocm_vram_aperture_gib": 2.0,
+  "reserves_gib": {
+    "os": 8.0,
+    "runtime": 2.0,
+    "kv_cache": 2.0,
+    "recovery": 2.0,
+    "total": 14.0
+  },
+  "authoritative_model_budget_gib": 4.0,
+  "optimistic_budget_including_vram_gib": 20.0,
+  "authoritative_deficit_gib": 151.425,
+  "optimistic_deficit_gib": 135.425,
+  "interpretation": "The full payload cannot be admitted with the declared headroom. Do not download or load it on this host."
+}

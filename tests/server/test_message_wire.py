@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -16,8 +18,13 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    CacheStatsBackendMsg,
+    CacheStatsMsg,
+    CacheStatsReply,
+    CacheStatsResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
@@ -51,6 +58,30 @@ def test_cache_rebuild_reply_roundtrip():
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
     assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+
+
+def test_cache_stats_messages_roundtrip():
+    """The read-only cache-statistics control path preserves nested counter data on every hop."""
+
+    request = CacheStatsMsg(request_id="stats-request")
+    backend = CacheStatsBackendMsg(request_id="stats-request")
+    result = CacheStatsResultMsg(
+        request_id="stats-request",
+        stats={"available": True, "summary": {"miss_rate": 0.25}},
+    )
+    reply = CacheStatsReply(
+        request_id="stats-request",
+        stats={"available": True, "summary": {"miss_rate": 0.25}},
+    )
+
+    assert isinstance(BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(request)), CacheStatsMsg)
+    assert isinstance(BaseBackendMsg.decoder(backend.encoder()), CacheStatsBackendMsg)
+    decoded_result = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(result))
+    decoded_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(decoded_result, CacheStatsResultMsg)
+    assert isinstance(decoded_reply, CacheStatsReply)
+    assert decoded_result.stats == reply.stats
+    assert decoded_reply.stats == reply.stats
 
 
 def test_prompt_admitted_msg_roundtrip():
@@ -122,3 +153,27 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_backend_wire_preserves_multidimensional_cpu_tensors():
+    """Gemma 4 patch data and image positions survive the tokenizer scheduler ZMQ hop."""
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        # ``mm_embeds`` is used by the in-process offline path. Online requests
+        # instead move these CPU tensors to the scheduler, where its ROCm-owned
+        # model instance runs the vision tower and projector.
+        mm_pixel_values=torch.arange(24, dtype=torch.float32).reshape(1, 2, 12),
+        mm_image_position_ids=torch.tensor([[[0, 0], [0, 1]]], dtype=torch.int64),
+    )
+    decoded = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(decoded, UserMsg)
+    assert decoded.mm_pixel_values is not None
+    assert decoded.mm_image_position_ids is not None
+    assert decoded.mm_pixel_values.shape == (1, 2, 12)
+    assert decoded.mm_pixel_values.dtype == torch.float32
+    assert decoded.mm_image_position_ids.shape == (1, 2, 2)
+    assert decoded.mm_image_position_ids.dtype == torch.int64
+    assert torch.equal(decoded.mm_pixel_values, msg.mm_pixel_values)
+    assert torch.equal(decoded.mm_image_position_ids, msg.mm_image_position_ids)

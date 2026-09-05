@@ -37,6 +37,10 @@ class UserMsg(BaseBackendMsg):
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
+    # Online multimodal requests carry CPU patch tensors over the message wire.
+    # The scheduler encodes them on its GPU before ordinary prefill admission.
+    mm_pixel_values: torch.Tensor | None = None
+    mm_image_position_ids: torch.Tensor | None = None
 
 
 @dataclass
@@ -53,3 +57,10 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class CacheStatsBackendMsg(BaseBackendMsg):
+    """Request one read-only snapshot of the MoE cache counters from the scheduler."""
+
+    request_id: str

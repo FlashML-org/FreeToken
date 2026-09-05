@@ -66,8 +66,9 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    raw_messages = [m.model_dump(exclude_none=True) for m in req.messages]
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages(raw_messages),
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -80,7 +81,21 @@ def chat_request_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        image_urls=_openai_image_urls(raw_messages),
     )
+
+
+def _openai_image_urls(messages: list[dict[str, Any]]) -> list[Any]:
+    """Extract image_url values in the same order render_messages emits markers."""
+    values: list[Any] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                values.append(part.get("image_url"))
+    return values
 
 
 def _all_tool_dicts(tools) -> list[dict[str, Any]]:
@@ -397,7 +412,12 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],
+                sampling_params=_resolve_sampling(req, model_sampling),
+                add_special_tokens=req.add_special_tokens,
+            )
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -410,7 +430,14 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+        await state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=prompt,
+                sampling_params=_resolve_sampling(req, model_sampling),
+                add_special_tokens=req.add_special_tokens,
+            )
+        )
         text = ""
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):

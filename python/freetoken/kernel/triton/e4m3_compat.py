@@ -59,6 +59,14 @@ def e4m3_native() -> bool:
     if _native is None:
         if FORCE_EMU:
             _native = False
+        elif torch.version.hip is not None:
+            # torch.cuda.get_device_capability() on a HIP build returns the gfx/RDNA
+            # generation number (e.g. (11, 5) for gfx1150), not a CUDA compute
+            # capability -- comparing it against (8, 9) below is a tuple comparison
+            # over two unrelated numbering schemes and can false-positive (11 > 8).
+            # No AMD GPU has this fp8e4nv unit; e4m3_native_cx() (Triton's own,
+            # backend-aware check) already agrees this must be False.
+            _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
 
@@ -86,6 +94,21 @@ def e4m3_native_cx():
     cross-compilation tests that patch ``driver.active.get_current_target``
     resolve consistently)."""
     return not FORCE_EMU and target_info.cuda_capability_geq(8, 9)
+
+
+@jit
+def e4m3_u8_to_f16(v):
+    """Decode an e4m3 byte to the exact fp16 value divided by 256.
+
+    The e4m3 exponent and mantissa fit losslessly in fp16 after the bit-field
+    placement below.  Callers that can move the compensating power-of-two scale
+    onto an activation use this primitive to avoid multiplying every decoded
+    weight by 256.  The caller must preserve FP32 accumulation and apply the
+    reciprocal scaling exactly once, otherwise this is not numerically
+    equivalent to :func:`e4m3_u8_to_f32`.
+    """
+    h = ((v & 0x80).to(tl.uint16) << 8) | ((v & 0x7F).to(tl.uint16) << 7)
+    return h.to(tl.float16, bitcast=True)
 
 
 @jit

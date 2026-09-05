@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    CacheStatsMsg,
+    CacheStatsReply,
     TokenizeMsg,
     UserReply,
 )
@@ -143,6 +145,9 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Read-only cache-statistics requests use the same UUID correlation pattern
+    # but never engage the rebuild maintenance gate or modify a cache allocation.
+    cache_stats_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -240,11 +245,28 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    async def cache_stats(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """Return a read-only backend cache-statistics snapshot through worker IPC."""
+
+        request_id = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.cache_stats_futures[request_id] = future
+        try:
+            await self.send_one(CacheStatsMsg(request_id=request_id))
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self.cache_stats_futures.pop(request_id, None)
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
+                continue
+            if isinstance(msg, CacheStatsReply):
+                future = self.cache_stats_futures.get(msg.request_id)
+                if future is not None and not future.done():
+                    future.set_result(msg.stats)
                 continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
@@ -815,6 +837,19 @@ async def cache_status():
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
     }
+
+
+@app.get("/v1/cache/stats")
+async def cache_stats():
+    """Read accumulated MoE cache hit and miss counters without modifying the cache."""
+
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse({"error": "server is not serving"}, status_code=503)
+    try:
+        return await state.cache_stats()
+    except TimeoutError:
+        return JSONResponse({"error": "backend cache-statistics request timed out"}, status_code=504)
 
 
 @app.post("/generate")

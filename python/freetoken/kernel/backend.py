@@ -11,6 +11,20 @@ import functools
 import importlib.util
 
 
+@functools.cache
+def is_rocm_runtime() -> bool:
+    """Return whether PyTorch is backed by HIP rather than NVIDIA CUDA.
+
+    Optional packages in this module publish CUDA binaries.  Import discovery
+    alone is insufficient on ROCm because a stale CUDA package may be present
+    in an otherwise healthy environment.  Returning ``False`` from each
+    CUDA-only capability probe preserves the existing pure-Triton fallback.
+    """
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
     # (broken parent package, or a meta_path finder that blocks the name); treat
@@ -23,12 +37,23 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
-    return _importable("flashinfer")
+    return not is_rocm_runtime() and _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
-    return _importable("sgl_kernel")
+    return not is_rocm_runtime() and _importable("sgl_kernel")
+
+
+@functools.cache
+def is_triton_kernels_installed() -> bool:
+    """OpenAI's ``triton_kernels`` (the fused MoE router used by ``moe.fused.fused_topk``).
+
+    Distinct from the ``triton`` runtime we always depend on: it ships with the Triton
+    source tree and has no Windows wheel. It is also not one of the six ops
+    ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
+    """
+    return not is_rocm_runtime() and _importable("triton_kernels")
 
 
 @functools.cache
@@ -39,6 +64,8 @@ def driver_cuda_version() -> int | None:
     toolkit version. Resolved through the ``_pinned_tensor`` extension's link-time
     cudart, so it works wherever the extension builds (including Windows) -- no dlopen
     by soname."""
+    if is_rocm_runtime():
+        return None
     try:
         from freetoken.kernel.pinned import _load_pinned_extension
 

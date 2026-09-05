@@ -12,6 +12,7 @@ through the native-Q4_0 offload-cache path.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -21,7 +22,9 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SWAAttentionGroupConfig,
+    vision_load_enabled,
 )
+from freetoken.models.gemma4.config import VisionConfig
 from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
 
 if TYPE_CHECKING:
@@ -93,6 +96,13 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         scaling=None,
     )
 
+    # llama.cpp stores Gemma 4's visual tower in a sibling ``mmproj`` GGUF rather
+    # than in the text GGUF.  Reconstruct the vision config from that file only
+    # when the explicit opt-in is enabled, preserving the text-only memory budget
+    # by default.  The values originate in the projector metadata, not guessed
+    # from the text checkpoint's geometry.
+    vision_config = _parse_gguf_vision_config(shim, hidden)
+
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -118,6 +128,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
         embedding_scale=float(hidden) ** 0.5,
+        vision_config=vision_config,
+        image_token_id=_gemma4_image_token_id(m) if vision_config is not None else None,
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -169,6 +181,142 @@ def _to_bf16(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
     return flat.reshape(t.shape)
+
+
+def find_gemma4_mmproj(model_path: str) -> str | None:
+    """Return the unique sibling Gemma4 projector GGUF, when the release supplies one.
+
+    Text GGUF releases keep the 1.2 GiB vision tower in a separate file whose name
+    includes ``mmproj``.  Text-only loading deliberately never calls this helper;
+    vision setup calls it only after the explicit ``FREETOKEN_LOAD_VISION`` opt-in.
+    A missing or ambiguous sibling remains an error for the caller to report with
+    the model path, rather than silently loading arbitrary GGUF content.
+    """
+    directory = os.path.dirname(model_path)
+    candidates = sorted(
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if name.endswith(".gguf") and "mmproj" in name.lower()
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _gemma4_image_token_id(metadata: dict) -> int:
+    """Find Gemma's image placeholder in the GGUF tokenizer without a magic id.
+
+    ``image_token_id`` is part of the original checkpoint configuration, but
+    GGUF retains the tokenizer rather than that JSON field.  The token has had
+    two spellings across Gemma converters, so accept those exact spellings and
+    reject all other image-looking vocabulary entries rather than binding an
+    unrelated token silently.
+    """
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list):
+        raise ValueError("Gemma4 GGUF vision requires tokenizer.ggml.tokens")
+    accepted = {"<|image|>"}
+    matches = [index for index, token in enumerate(tokens) if str(token) in accepted]
+    if len(matches) != 1:
+        raise ValueError(
+            "Gemma4 GGUF vision requires exactly one image placeholder token; "
+            f"found {matches} among accepted spellings {sorted(accepted)}"
+        )
+    return matches[0]
+
+
+def _parse_gguf_vision_config(shim: "GgufConfigShim", text_hidden_size: int) -> VisionConfig | None:
+    """Build :class:`VisionConfig` from the sibling Gemma4 projector GGUF.
+
+    The projector supplies its parameter dimensions.  Algorithm settings not
+    represented in the GGUF metadata follow the official Gemma4 26B-A4B vision
+    contract: 10,240 position slots, 3x3 pooling, 280 soft tokens,
+    two-dimensional RoPE theta 100, standardization, and unclipped linears.
+    Validate the cross-file projection width so a mixed text/projector directory
+    fails during startup instead of producing corrupt image embeddings.
+    """
+    if not vision_load_enabled():
+        return None
+    mmproj_path = find_gemma4_mmproj(shim.model_path)
+    if mmproj_path is None:
+        raise FileNotFoundError(
+            f"Gemma4 vision was requested but no unique sibling mmproj GGUF exists beside "
+            f"{shim.model_path!r}"
+        )
+    from freetoken.models.gguf.reader import load_gguf_metadata
+
+    metadata = load_gguf_metadata(mmproj_path)
+
+    def v(key: str):
+        value = metadata.get(f"clip.vision.{key}")
+        if value is None:
+            raise KeyError(f"missing Gemma4 projector metadata key clip.vision.{key}")
+        return value
+
+    vision_hidden = int(v("embedding_length"))
+    projection_width = int(v("projection_dim"))
+    if projection_width != text_hidden_size:
+        raise ValueError(
+            "Gemma4 projector/text width mismatch: "
+            f"mmproj={projection_width}, text={text_hidden_size}"
+        )
+    num_heads = int(v("attention.head_count"))
+    return VisionConfig(
+        hidden_size=vision_hidden,
+        num_layers=int(v("block_count")),
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=vision_hidden // num_heads,
+        intermediate_size=int(v("feed_forward_length")),
+        patch_size=int(v("patch_size")),
+        # llama.cpp's mmproj metadata does not serialize the learned table's
+        # capacity.  Gemma4's released 26B config fixes it at 10 * 1024.
+        position_embedding_size=10_240,
+        pooling_kernel_size=3,
+        rms_norm_eps=float(v("attention.layer_norm_epsilon")),
+        rope_theta=100.0,
+        hidden_act="gelu_tanh",
+        standardize=True,
+        use_clipped_linears=False,
+        soft_tokens_per_image=280,
+        text_hidden_size=text_hidden_size,
+    )
+
+
+def gemma4_mmproj_param_name(source_name: str) -> str | None:
+    """Map one llama.cpp Gemma4 projector tensor name to FreeToken's module key."""
+    if source_name == "mm.input_projection.weight":
+        return "embed_vision.embedding_projection.weight"
+    if source_name == "v.patch_embd.weight":
+        return "vision_tower.patch_embedder.input_proj.weight"
+    if source_name == "v.position_embd.weight":
+        return "vision_tower.patch_embedder.position_embedding_table"
+    if source_name == "v.std_bias":
+        return "vision_tower.std_bias"
+    if source_name == "v.std_scale":
+        return "vision_tower.std_scale"
+    if not source_name.startswith("v.blk."):
+        return None
+    prefix, suffix = source_name.rsplit(".", 1)[0], source_name.rsplit(".", 1)[1]
+    parts = prefix.split(".")
+    if len(parts) != 4 or parts[0] != "v" or parts[1] != "blk" or not parts[2].isdigit() or suffix != "weight":
+        return None
+    layer = parts[2]
+    remap = {
+        "ln1": "input_layernorm.weight",
+        "ln2": "pre_feedforward_layernorm.weight",
+        "attn_post_norm": "post_attention_layernorm.weight",
+        "ffn_post_norm": "post_feedforward_layernorm.weight",
+        "attn_q_norm": "self_attn.q_norm.weight",
+        "attn_k_norm": "self_attn.k_norm.weight",
+        "attn_q": "self_attn.q_proj.weight",
+        "attn_k": "self_attn.k_proj.weight",
+        "attn_v": "self_attn.v_proj.weight",
+        "attn_out": "self_attn.o_proj.weight",
+        "ffn_gate": "mlp.gate_proj.weight",
+        "ffn_up": "mlp.up_proj.weight",
+        "ffn_down": "mlp.down_proj.weight",
+    }
+    mapped = remap.get(parts[3])
+    return f"vision_tower.encoder.layers.{layer}.{mapped}" if mapped else None
 
 
 def _require_tp1(what: str) -> None:
@@ -296,6 +444,24 @@ def iter_gguf_weights(
 
     assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
     assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
+
+    # Gemma's text GGUF stores the vision tower in a sibling ``*-mmproj.gguf``.
+    # This stays behind the explicit vision opt-in so text-only serving never
+    # pays the startup or memory cost of the projector.
+    if config.is_multimodal:
+        mmproj_path = find_gemma4_mmproj(model_path)
+        if mmproj_path is None:
+            raise FileNotFoundError(
+                f"Gemma4 vision is enabled but no unique sibling mmproj GGUF exists beside {model_path}"
+            )
+        for t in iter_gguf_tensors(mmproj_path):
+            target = gemma4_mmproj_param_name(t.name)
+            if target is None:
+                raise ValueError(f"unmapped Gemma4 projector tensor: {t.name}")
+            tensor = _to_bf16(t)
+            if t.name == "v.patch_embd.weight":
+                tensor = tensor.flatten(1)
+            yield target, tensor
 
 
 # --------------------------------------------------------------------------------------
