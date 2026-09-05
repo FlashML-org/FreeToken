@@ -346,11 +346,13 @@ class CpuMoeExecutor:
         """DeepSeek-V3-style block-fp8: fp8-e4m3 rows + one bf16 scale per 128x128 block.
 
         ``gate_up`` [E, 2I, H] / ``down`` [E, H, I] are row-major with K contiguous, and
-        ``*_scale`` is [E, ceil(rows/128), ceil(K/128)] -- so output row ``r`` reads the
-        ``K/128`` contiguous scales starting at scale-row ``r // 128`` (the C++ side
-        recomputes that; see ``fp8_gu_scale_row``). The scale tensor is named
-        ``weight_scale_inv`` upstream but multiplies, matching the Triton reference.
+        ``*_scale`` is [E, ceil(rows/128), padded(ceil(K/128))] -- so output row ``r``
+        reads the scale row ``r // 128`` with the tensor's actual trailing stride. The
+        scale tensor is named ``weight_scale_inv`` upstream but multiplies, matching the
+        Triton reference.
         """
+        from freetoken.kernel.aot_models import fp8_block_scale_pad
+
         gu, gus = banks["gate_up"], banks["gate_up_scale"]
         dn, dns = banks["down"], banks["down_scale"]
         # torch exposes fp8 as float8_e4m3fn; the kernel reads raw bytes either way.
@@ -371,8 +373,12 @@ class CpuMoeExecutor:
         def nb(n):  # block count along one axis
             return (n + 127) // 128
 
-        assert tuple(gus[0].shape[1:]) == (nb(2 * I), nb(H)), (gus[0].shape, I, H)
-        assert tuple(dns[0].shape[1:]) == (nb(H), nb(I)), (dns[0].shape, H, I)
+        gu_rows, gu_cols = nb(2 * I), nb(H)
+        dn_rows, dn_cols = nb(H), nb(I)
+        assert gus[0].shape[1] == gu_rows and gus[0].shape[2] >= gu_cols
+        assert dns[0].shape[1] == dn_rows and dns[0].shape[2] >= dn_cols
+        assert gus[0].stride(1) >= fp8_block_scale_pad(gu_rows, gu_cols)
+        assert dns[0].stride(1) >= fp8_block_scale_pad(dn_rows, dn_cols)
         ptrs = dict(
             gate_up_ptr=self._make_table(gu).data_ptr(),
             down_ptr=self._make_table(dn).data_ptr(),
@@ -382,6 +388,8 @@ class CpuMoeExecutor:
             down_global_ptr=0,
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
+            fp8_gu_scale_stride=int(gus[0].stride(1)),
+            fp8_dn_scale_stride=int(dns[0].stride(1)),
         )
         return ptrs, (H, I)
 

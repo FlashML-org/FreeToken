@@ -1402,8 +1402,8 @@ struct CpuMoeExecutor {
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
   fp8dot_fn fp8dot;
-  // fp8_block: bf16 scale per 128x128 weight block, so a row uses (K/128) contiguous
-  // scales starting at scale-row (output row / 128). These are the row strides.
+  // fp8_block: bf16 scale per 128x128 weight block. These are the scale tensor's
+  // trailing strides, including any padding used by the host bank layout.
   int fp8_gu_scale_row = 0, fp8_dn_scale_row = 0;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
@@ -1501,7 +1501,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_)
+                 std::vector<int> core_ids_, int fp8_gu_scale_stride_,
+                 int fp8_dn_scale_stride_)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1521,6 +1522,8 @@ struct CpuMoeExecutor {
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
+        fp8_gu_scale_row(fp8_gu_scale_stride_),
+        fp8_dn_scale_row(fp8_dn_scale_stride_),
         core_ids(std::move(core_ids_)) {
     DotChoice c = select_dot();
     dot = c.fn;
@@ -1529,11 +1532,6 @@ struct CpuMoeExecutor {
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
     fp8dot = select_fp8dot();
-    if (weight_format == WF_FP8_BLOCK) {
-      // gate_up scale is [2I/128, H/128], down scale is [H/128, I/128] per expert.
-      fp8_gu_scale_row = (H + FP8_BLK - 1) / FP8_BLK;
-      fp8_dn_scale_row = (I + FP8_BLK - 1) / FP8_BLK;
-    }
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -2281,7 +2279,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    double, double, std::vector<int>, int, int>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -2290,7 +2288,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"))
+           py::arg("core_ids"), py::arg("fp8_gu_scale_stride") = 0,
+           py::arg("fp8_dn_scale_stride") = 0)
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))

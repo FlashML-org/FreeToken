@@ -31,6 +31,7 @@ def _nb(n: int) -> int:
 
 def _make_fp8_block_cache(L, E, H, I, seed=0):
     from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.kernel.aot_models import fp8_block_scale_pad
 
     torch.manual_seed(seed)
     S = L * E
@@ -38,8 +39,10 @@ def _make_fp8_block_cache(L, E, H, I, seed=0):
     def rows(OUT, IN):
         w = alloc_pinned_tensor(S, OUT, IN, dtype=torch.float8_e4m3fn)
         w.copy_((torch.randn(S, OUT, IN) * 6.0).to(torch.float8_e4m3fn))
-        s = alloc_pinned_tensor(S, _nb(OUT), _nb(IN), dtype=torch.bfloat16)
-        s.copy_((0.01 + 0.02 * torch.rand(S, _nb(OUT), _nb(IN))).to(torch.bfloat16))
+        s = alloc_pinned_tensor(
+            S, _nb(OUT), fp8_block_scale_pad(_nb(OUT), _nb(IN)), dtype=torch.bfloat16
+        )
+        s.copy_((0.01 + 0.02 * torch.rand_like(s)).to(torch.bfloat16))
         return w, s
 
     gu, gus = rows(2 * I, H)
@@ -54,6 +57,26 @@ def _make_fp8_block_cache(L, E, H, I, seed=0):
         num_experts=E,
         decode_target="cpu",
         cpu_executor=None,
+    )
+
+
+def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
+    from freetoken.kernel.aot_models import fp8_block_scale_pad
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    H, I = 2560, 640
+    cache = _make_fp8_block_cache(1, 1, H, I)
+    assert cache.bank_sources["down_scale"][0].shape[1:] == (
+        _nb(H), fp8_block_scale_pad(_nb(H), _nb(I))
+    ) == (20, 6)
+    CpuMoeExecutor(
+        cache,
+        top_k=1,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=1,
+        max_tokens=1,
+        device=torch.device("cpu"),
     )
 
 
