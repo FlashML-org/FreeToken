@@ -209,9 +209,18 @@ def test_cpu_fp8_block_isa_override(monkeypatch, isa):
     }[isa]), auto_rank)
 
 
+# FREETOKEN_CPU_MOE_ISA tier -> the name select_dot() reports for it. The env var
+# caps *down* only, so asking for a tier the CPU or the build lacks silently gives a
+# lower one; comparing against executor.isa is what turns that into a skip instead of
+# a pass that tested the same kernel four times.
+_ISA_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f",
+              "avx512bf16": "avx512bf16"}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("isa", list(_ISA_TIERS))
 @pytest.mark.parametrize("bs", [1, 2, 5])
-def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
+def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block
 
@@ -220,6 +229,8 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
     dev = torch.device("cuda")
     cache = _make_fp8_block_cache(L, E, H, I, seed=bs)
 
+    # Set before construction: the executor latches its dot kernel there.
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
     ex = CpuMoeExecutor(
         cache,
         top_k=top_k,
@@ -229,6 +240,11 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
         max_tokens=bs,
         device=dev,
     )
+    # fp8_block adds no "+vnni"/"+q4_0" tag, but split anyway so a future one does not
+    # turn every tier into a skip.
+    got = ex.isa.split("+")[0]
+    if got != _ISA_TIERS[isa]:
+        pytest.skip(f"asked for {isa}, kernel selected {got}: not supported here")
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
@@ -247,13 +263,13 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs):
     ).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
-    assert rel < 2e-2, f"bs={bs} rel err {rel.item()}"
+    assert rel < 2e-2, f"bs={bs} isa={got} rel err {rel.item()}"
 
 
-def test_subnormal_and_sign_decode_exactly():
-    """Check PyTorch's e4m3-to-bf16 conversion used by the CPU decoder.
+def test_bf16_carries_every_e4m3_byte():
+    """bf16 holds every e4m3 code exactly, which the CPU widening relies on.
 
-    The C++ decoder is exercised by ``test_cpu_fp8_block_matches_float64_reference``.
+    This checks the premise, not the kernel. ``test_cpu_fp8_block_matches_float64_reference`` covers the C++ decoder.
     """
 
     codes = torch.arange(256, dtype=torch.uint8)
