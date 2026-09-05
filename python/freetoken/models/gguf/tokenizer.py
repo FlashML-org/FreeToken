@@ -33,7 +33,7 @@ _STOP_TOKENS: dict[str, tuple[str, ...]] = {
 
 
 def load_gguf_tokenizer(model_path: str):
-    from transformers import PreTrainedTokenizerFast
+    from transformers import AddedToken, PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
 
     meta = load_gguf_metadata(model_path)
@@ -47,6 +47,21 @@ def load_gguf_tokenizer(model_path: str):
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     tokens = tok_dict["tokens"]
+    if arch in ("qwen35", "qwen35moe"):
+        # Transformers' Qwen GGUF converter hardcodes only endoftext/im_start/im_end
+        # and ignores GGUF USER_DEFINED (type 4) entries. Qwen3.5 stores its tool and
+        # thinking delimiters as type 4: keep them non-special (parsers must see them)
+        # while restoring atomic AddedToken matching at their existing vocab ids.
+        token_types = tok_dict.get("token_type", ())
+        if len(token_types) != len(tokens):
+            raise ValueError("GGUF tokenizer token_type length does not match tokens")
+        fast.add_tokens(
+            [
+                AddedToken(tokens[index], normalized=False, special=False)
+                for index, token_type in enumerate(token_types)
+                if int(token_type) == 4
+            ]
+        )
 
     def tok_for(id_key: str, default: str | None) -> str | None:
         """The token named by ``tokenizer.ggml.<id_key>``, else ``default`` if it is in the
