@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import hashlib
 import os
 import threading
 from types import ModuleType
@@ -50,6 +51,28 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 # image and a 4000x3000 photo is downscaled instead of costing 11k tokens.
 IMAGE_MIN_PIXELS = 4 * 28 * 28
 IMAGE_MAX_PIXELS = int(os.getenv("FREETOKEN_IMAGE_MAX_PIXELS", str(1280 * 28 * 28)))
+
+
+_IMAGE_KEY_BASE = 1 << 30  # image cache-key ids start above every vocabulary
+
+
+def _image_cache_ids(
+    input_ids: torch.Tensor, image_token_id: int, counts: list[int], hashes: list[int]
+) -> torch.Tensor:
+    """Prefix-cache key ids for an image prompt: ``input_ids`` with the i-th placeholder run
+    replaced by ids derived from the i-th image's content hash. Placeholders share one token id
+    across images, so keyed on raw ids a prefix hit could serve another image's KV; the derived
+    ids (``>= 2**30``, above any vocabulary, ``hash + offset`` within the run) make each run
+    unique to its image and the prompt safe to share. The model still reads ``input_ids``."""
+    ids = input_ids.clone()
+    hits = (ids == image_token_id).nonzero().flatten()
+    mask = _IMAGE_KEY_BASE - 1
+    pos = 0
+    for n, h in zip(counts, hashes, strict=True):
+        run = (torch.arange(n, dtype=torch.int64) + (h & mask)) & mask
+        ids[hits[pos : pos + n]] = (run + _IMAGE_KEY_BASE).to(ids.dtype)
+        pos += n
+    return ids
 
 
 def _expand_image_tokens(
@@ -119,10 +142,16 @@ class TokenizeManager:
         out = processor(images=images, return_tensors="pt")
         grid = out["image_grid_thw"]
         counts = (grid.prod(-1) // processor.merge_size**2).tolist()
+        hashes = [
+            int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "big")
+            for data in msg.images
+        ]
+        input_ids = _expand_image_tokens(input_ids, image_token_id, counts)
         # pixel_values stay fp32 on the wire (numpy cannot carry bf16); the tower casts them
-        return _expand_image_tokens(input_ids, image_token_id, counts), {
+        return input_ids, {
             "pixel_values": out["pixel_values"],
             "image_grid_thw": grid,
+            "cache_ids": _image_cache_ids(input_ids, image_token_id, counts, hashes),
         }
 
     def _vision_processor(self) -> tuple[Any, int]:
