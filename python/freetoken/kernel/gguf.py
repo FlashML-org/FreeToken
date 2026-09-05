@@ -87,6 +87,26 @@ def _runtime_arch() -> str | None:
     return None
 
 
+def _rocm_jit_arches() -> tuple[str, ...]:
+    """Resolve explicit or visible ROCm targets for the general GGUF JIT path."""
+    from freetoken.utils.arch import get_rocm_gfx_arch, parse_rocm_arches
+
+    raw = (
+        os.environ.get("FREETOKEN_KERNEL_CACHE_GFX")
+        or os.environ.get("FREETOKEN_ROCM_ARCH")
+        or os.environ.get("PYTORCH_ROCM_ARCH")
+    )
+    if raw:
+        return parse_rocm_arches(raw, source="ROCm JIT target")
+    detected = get_rocm_gfx_arch()
+    if detected:
+        return (detected,)
+    raise RuntimeError(
+        "ROCm GGUF JIT needs FREETOKEN_KERNEL_CACHE_GFX, FREETOKEN_ROCM_ARCH, "
+        "PYTORCH_ROCM_ARCH, or a visible AMD device"
+    )
+
+
 def gguf_runtime_metadata() -> dict:
     """Report GGUF JIT/runtime selection without compiling or mutating state."""
     backend = _runtime_backend()
@@ -355,10 +375,11 @@ def _module():
         # the kernels compile their HIP branches; drop the CUDA-only -ccbin/flag logic.
         # Explicit --offload-arch (plus PYTORCH_ROCM_ARCH) prevents torch from auto-
         # emitting ~14 gfx arches, which would multiply build time per arch.
-        gfx = os.getenv("FREETOKEN_KERNEL_CACHE_GFX", "gfx1100")
-        os.environ.setdefault("PYTORCH_ROCM_ARCH", gfx)
+        arches = _rocm_jit_arches()
+        os.environ.setdefault("PYTORCH_ROCM_ARCH", ";".join(arches))
         extra_cuda_cflags = [
-            "-O3", f"--offload-arch={gfx}", "-DUSE_HIP=1", "-DUSE_ROCM=1",
+            "-O3", *[f"--offload-arch={arch}" for arch in arches],
+            "-DUSE_HIP=1", "-DUSE_ROCM=1",
             "-DFREETOKEN_GGUF_SOURCE_VERSION=2",
             f"-I{_CSRC}",
         ]

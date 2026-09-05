@@ -19,6 +19,24 @@ def test_rocm_runtime_metadata_uses_visible_target(monkeypatch):
     assert "offload-arch=gfx1201" in metadata["compile_flags"]
 
 
+def test_rocm_jit_arches_use_explicit_targets(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_ROCM_ARCH", "gfx1151;gfx1201")
+    monkeypatch.delenv("FREETOKEN_KERNEL_CACHE_GFX", raising=False)
+    monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising=False)
+    assert kernel._rocm_jit_arches() == ("gfx1151", "gfx1201")
+
+
+def test_rocm_jit_arches_fail_without_target_or_device(monkeypatch):
+    from freetoken.utils import arch
+
+    monkeypatch.delenv("FREETOKEN_KERNEL_CACHE_GFX", raising=False)
+    monkeypatch.delenv("FREETOKEN_ROCM_ARCH", raising=False)
+    monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising=False)
+    monkeypatch.setattr(arch, "get_rocm_gfx_arch", lambda: None)
+    with pytest.raises(RuntimeError, match="ROCm GGUF JIT needs"):
+        kernel._rocm_jit_arches()
+
+
 @pytest.mark.parametrize("arch", ["gfx1100", "gfx1103", "gfx1200", "gfx1201"])
 def test_rocm_q4_dispatch_accepts_declared_wave32_families(monkeypatch, arch):
     monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")

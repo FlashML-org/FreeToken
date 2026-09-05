@@ -319,9 +319,13 @@ def jit_cache_diagnostics(name: str, build_directory: str | None = None) -> dict
             root = os.environ.get("TORCH_EXTENSIONS_DIR")
             if root is None:
                 backend = (
-                    "cpu"
-                    if torch.version.cuda is None
-                    else f"cu{torch.version.cuda.replace('.', '')}"
+                    "rocm"
+                    if _is_rocm()
+                    else (
+                        "cpu"
+                        if torch.version.cuda is None
+                        else f"cu{torch.version.cuda.replace('.', '')}"
+                    )
                 )
                 root = str(
                     pathlib.Path(get_default_build_root())

@@ -69,6 +69,22 @@ def test_hip_cflags_emit_one_offload_flag_per_arch(monkeypatch):
     assert not any(";" in flag for flag in flags)
 
 
+def test_jit_diagnostics_uses_rocm_namespace(monkeypatch, tmp_path):
+    import torch.utils.cpp_extension as cpp_extension
+
+    from freetoken.kernel import utils
+
+    monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+    monkeypatch.setattr(utils, "_is_rocm", lambda: True)
+    monkeypatch.setattr(
+        cpp_extension,
+        "get_default_build_root",
+        lambda: str(tmp_path),
+    )
+    diagnostics = utils.jit_cache_diagnostics("gguf")
+    assert diagnostics["build_directory"].endswith("_rocm/gguf")
+
+
 @pytest.mark.parametrize("value", ["gfx9999", "gfx1201;bad", "gfx1201:xnack-"])
 def test_rocm_arch_override_rejects_unknown_tokens(monkeypatch, value):
     monkeypatch.setenv("FREETOKEN_ROCM_ARCH", value)
