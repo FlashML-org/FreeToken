@@ -135,6 +135,10 @@ round trips were recorded. The first H2D sample was cold at 0.863 GiB/s,
 consistent with initial mapping and page-fault overhead. The final three H2D
 samples averaged 76.645 GiB/s, while all four post-cold samples averaged
 73.987 GiB/s. D2H averaged 64.073 GiB/s across the four post-cold samples.
+Using decimal units, the final-three H2D result is approximately 82.30 GB/s
+and the post-cold D2H result is approximately 68.80 GB/s. That is consistent
+with, but slightly more realistic than, the earlier contiguous synthetic bound
+of 79.79 GB/s H2D and 70.24 GB/s D2H.
 
 The protected Qwen health endpoint remained healthy after the run, reporting
 `status: ok` and `maintenance: serving`. ROCm reported 28 C, 13.041 W, and
