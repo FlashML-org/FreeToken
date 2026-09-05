@@ -296,27 +296,27 @@ isolated tile32 promotion review. The production launcher remains unchanged at
 tile16 until deployment policy is reviewed separately; the measured gain is
 material but far below the original 50 percent campaign aspiration.
 
-## 2026-09-05 FP8 GEMV tile32 concurrency rejection
+## 2026-09-05 FP8 GEMV tile32 concurrency gate
 
-The tile32 candidate then ran the established four-client, three-round Qwen
-concurrency control with the same 48-unit scheduler prompt, 256-token cap,
-greedy sampling, and no-JIT cache policy. The clean retry completed all three
-rounds and all twelve requests, but it failed the concurrency promotion gate.
-The complete artifact is
-`/home/david/freetoken-amd/artifacts/qwen-fp8-tile32-c4-retry2-20260905T210000Z/c4.json`.
+The tile32 candidate was evaluated with the established four-client,
+three-round Qwen concurrency control using the same 48-unit scheduler prompt,
+256-token cap, greedy sampling, and no-JIT cache policy. A first attempt ran
+without the required scheduler prewarm and produced a cold-start result with
+18.7875 seconds p99 TTFT. That result is retained as diagnostic evidence, but
+it is not valid for promotion or apples-to-apples comparison.
 
-Tile32 recorded 44.6382 mean aggregate decode TPS and 53.4258 median round
-aggregate TPS, with 18.7875 seconds p99 TTFT and 78.5973 ms p99 token gap.
-The established qualified Qwen C4 profile is approximately 94.80 aggregate
-decode TPS, 1.025 seconds p99 TTFT, and 39.93 ms p99 token gap. Although the
-candidate requests completed and their deterministic response checks passed,
-the aggregate throughput and tail latency are materially worse under
-contention. Tile32 is rejected for promotion and remains default-off.
+The valid warmed run performed the scheduler prewarm first, then completed all
+three rounds and all twelve requests. Its complete artifact is
+`/home/david/freetoken-amd/artifacts/qwen-fp8-tile32-c4-warm-20260905T220000Z/c4.json`.
+Tile32 recorded 53.1579 mean aggregate decode TPS, 53.4003 median round
+aggregate TPS, 0.9207 seconds p99 TTFT, and 76.8555 ms p99 token gap. The
+established qualified Qwen C4 profile is approximately 94.80 aggregate decode
+TPS, 1.025 seconds p99 TTFT, and 39.93 ms p99 token gap. The warmed candidate
+therefore fails the concurrency promotion gate because throughput is materially
+lower and token-gap tail latency is materially worse, despite successful
+requests and passing deterministic response checks. Tile32 remains default-off.
 
-The first C4 launch attempt failed before readiness because its parent lost the
-listener while a worker remained alive and retained about 31 percent of system
-memory. The exact candidate process group was then terminated, residual memory
-pressure was cleared, and the protected service was restarted. The clean retry
-started with 56 GiB free, reached readiness normally, completed the full C4
-matrix, and the protected service was restored afterward with
-`status: ok` and `maintenance: serving`.
+The initial cold run and the warmed run are both preserved. The exact candidate
+process group was terminated after testing, residual memory pressure was
+cleared, and the protected service was restarted. The service was subsequently
+verified with `status: ok` and `maintenance: serving`.
