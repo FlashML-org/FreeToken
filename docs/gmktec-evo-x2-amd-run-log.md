@@ -222,3 +222,24 @@ deviation, and zero failed samples. The canonical Q4 quality check passed with
 and 2,753.3639 prefill TPS, only 0.28 percent higher. Y4 is definitively
 rejected for promotion. The protected service was restored and returned
 `status: ok` with `maintenance: serving`.
+
+## 2026-09-05 upstream synchronization and ROCm guard regression
+
+The AMD branch was synchronized with the six commits newly present on
+`upstream/main`; the merge completed without conflicts and the branch is now
+zero commits behind upstream. This includes upstream's exact Triton sampling
+correction and current repository metadata without changing the AMD runtime
+scope.
+
+During the synchronization review, the ROCm test suite exposed a stale local
+assertion: the implementation correctly excludes 240-byte and 400-byte rows
+from the legacy 128-byte AOT copy catalog, but the test still asserted that
+those rows were present. Commit `8ad5b63` changes the assertion to require
+their absence, matching the implementation and strict no-JIT behavior.
+
+On the ROCm 10 environment, using the exact pushed branch, the focused guard
+run passed 5 tests. It covered HIP runtime gating, HIP GGUF build flags, the
+fused-copy grid selector, the legacy AOT catalog predicate, and the related
+regression contracts. Native pinned-extension tests were not counted in that
+run because the isolated checkout did not contain a freshly built host
+extension; no production service was changed.
