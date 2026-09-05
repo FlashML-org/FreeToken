@@ -393,3 +393,13 @@ Because no timed kernel result or output-equality record exists, this attempt
 makes no performance or quality claim. A valid Y8 screen would require an
 isolated GPU window with the protected service stopped and a verified recovery
 afterward; Y8 remains unqualified and the production Y4 setting is unchanged.
+
+The follow-up clean-window attempt did stop the protected service through its
+guarded script, but the real-weight benchmark still had not emitted its JSON
+after more than two minutes of isolated execution. The benchmark process was
+then terminated by its verified PID and the recovery server was relaunched.
+The recovery artifact is
+`/home/david/freetoken-amd/artifacts/qwen-reboot-recovery-20260905T223454Z/`,
+and the final health check returned `status: ok` with `maintenance: serving`.
+The clean-window run also makes no TPS or quality claim because it has no
+completed timed result.
