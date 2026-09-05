@@ -66,8 +66,14 @@ paper describes GLM-5.2 as a 753B-parameter model with a 433 GB checkpoint.
 Neither payload is installed on this host, and the live available-memory
 observation is far below either stated payload scale.
 
-The exact 284B checkpoint or an authoritative conversion recipe is therefore
-still required before this gate can be converted into a reproduction test.
+The paper names `deepseek-ai/DeepSeek-V4-Flash-0731` as its official
+checkpoint, and the repository history exposes a release commit
+`9e165c30e2704aec5d9d593cce3eebd58bbef1cb` that predates the current model-card
+metadata update. That release commit still contains the same 48-shard payload
+size measured above. We must pin that revision in any reproduction record and
+report the paper's 284B label separately from the current model-card 304B label;
+the two labels are not enough by themselves to prove an exact parameter-count
+match.
 
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
