@@ -7,11 +7,11 @@ protected service.
 
 ## Inputs
 
-The current numerical payload measurements refer to the later official
-`DeepSeek-V4-Flash-0731` repository, not automatically to the FreeToken
-paper's 284B demonstration checkpoint. The two identities must remain
-separate until the exact paper artifact or an authoritative conversion is
-identified.
+The current numerical payload measurements refer to the official
+`DeepSeek-V4-Flash-0731` repository. The paper names that repository as its
+official checkpoint, while the current model card reports a 304B label and the
+paper reports 284B. The reproduction must therefore pin the repository commit
+and record both labels rather than silently treating them as interchangeable.
 
 | Input | Value | Evidence |
 |---|---:|---|

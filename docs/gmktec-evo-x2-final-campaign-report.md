@@ -130,19 +130,19 @@ transport bounds, but they are not evidence that the full 284B model will fit
 or reach paper throughput. The scattered and staged measurements show why a
 real checkpoint and production-shaped expert access pattern are still required.
 
-There is also a checkpoint identity gate. The current official
-`deepseek-ai/DeepSeek-V4-Flash-0731` model card lists 304B parameters and
-BF16, I64, F32, and F8_E4M3 tensor types. It is not automatically the same
-artifact as the paper's 284B FP4 deployment. A valid reproduction therefore
-needs the exact 284B checkpoint or an authoritative conversion recipe before
-any capacity or throughput claim is made.
+There is also a checkpoint identity gate. The paper names the official
+`deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint and describes it as 284B with
+native MXFP4 routed experts. The current model card reports 304B parameters
+and BF16, I64, F32, F8_E4M3, and I8 tensor types. The repository's release
+commit `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` predates the current model-card
+update and must be pinned for a faithful reproduction. A valid capacity or
+throughput claim must record that revision and report the 284B versus 304B
+metadata discrepancy explicitly.
 
-As a separate current-release reference, a read-only metadata refresh of
-`DeepSeek-V4-Flash-0731` at repository commit
-`7872f01b1d1fe23eabc4c98b48bffcef5a386062` found 48 safetensors shards totaling
-166,886,535,336 bytes, approximately 155.43 GiB. This is a capacity reference
-for the later official release, not proof that it is the paper's exact 284B
-artifact.
+The pinned release commit and the current model-card commit both expose 48
+safetensors shards totaling 166,886,535,336 bytes, approximately 155.43 GiB.
+This is the measured capacity reference for the named official repository;
+the parameter-count discrepancy must remain visible in the final report.
 
 ### Additional archived model identifiers
 
