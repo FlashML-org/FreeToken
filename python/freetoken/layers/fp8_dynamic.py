@@ -2,10 +2,12 @@
 
 The weight is e4m3 ``[out_local, in_local]`` with one fp32 ``weight_scale`` (shape ``()``),
 produced by the model's weight reader from the bf16 checkpoint tensor (after TP sharding).
-The activation is quantized per call with a dynamic per-tensor scale: one fused Triton launch
-(amax pass, then cast) at decode sizes, a torch reduction plus a cast kernel above that. No
-host sync anywhere (the scales stay on the device), so the decode path is CUDA-graph safe;
-the branch between the two paths is on the tensor *shape*, never on its values.
+The activation is quantized per call with a dynamic per-tensor scale: one Triton launch (a
+single program walking the tensor) for tiny inputs, two above ``_SPLIT_MIN_ELEMENTS`` (a
+block-parallel amax, then a reduce+cast). Both compute the same arithmetic, so the split is
+a pure speed choice. No host sync anywhere (the scales stay on the device), so the decode
+path is CUDA-graph safe; the branch between the two paths is on the tensor *shape*, never
+on its values.
 
 Measured on an RTX 6000 Ada (sm_89, torch 2.11.0+cu130) at the qwen4_exp TP=2 shapes, per
 decode step per rank over 48 layers: bf16 cuBLAS 3.2-3.4 ms, this path 1.9 ms at M=1/8/16.
@@ -26,15 +28,21 @@ from .base import BaseOP
 
 FP8 = torch.float8_e4m3fn
 E4M3_MAX = 448.0
-_FUSED_MAX_ELEMENTS = (
-    65536  # one program handles the whole tensor below this (decode sizes)
-)
-_SCALE_FLOOR = 1e-12  # an all-zero activation (graph warmup buffers) must not give 1/0
+_BLOCK = 4096
+# One program per block above this, two launches (partial amax, then reduce+cast); below it
+# a single program walks the whole tensor. The one-program kernel is serial over the tensor,
+# so it must not be given the [T, hc_count*hidden] hyper-connection activations.
+_SPLIT_MIN_ELEMENTS = 16384
+# Partial-amax programs, and so the constexpr width of the fold in pass 2. Capping it (rather
+# than letting it follow the input) keeps BOTH split kernels to ONE compiled Triton variant:
+# the partial count is a runtime argument, so a server that sees a new prompt length does not
+# compile a new kernel mid-generation.
+_MAX_PARTS = 512
 
 
 @triton.jit
 def _quant_fused_kernel(x_ptr, out_ptr, scale_ptr, n, BLOCK: tl.constexpr):
-    """One program: max|x| over the tensor, then the cast. Decode-sized inputs only."""
+    """One program: max|x| over the tensor, then the cast. Tiny inputs only (see SPLIT_MIN)."""
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for start in range(0, n, BLOCK):
         offs = start + tl.arange(0, BLOCK)
@@ -52,12 +60,38 @@ def _quant_fused_kernel(x_ptr, out_ptr, scale_ptr, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _quant_cast_kernel(x_ptr, out_ptr, scale_ptr, n, BLOCK: tl.constexpr):
-    """Cast under a scale already on the device (prefill sizes; the amax is a torch reduction)."""
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+def _amax_partial_kernel(x_ptr, part_ptr, n, nprog, BLOCK: tl.constexpr):
+    """max|x| -> one fp32 partial per program (pass 1). Grid-strided, so ``nprog`` bounds the
+    partial count however large the tensor is."""
+    pid = tl.program_id(0)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for start in range(pid * BLOCK, n, nprog * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        v = tl.load(x_ptr + offs, mask=offs < n, other=0.0).to(tl.float32)
+        acc = tl.maximum(acc, tl.abs(v))
+    tl.store(part_ptr + pid, tl.max(acc, axis=0))
+
+
+@triton.jit
+def _reduce_cast_kernel(
+    x_ptr, out_ptr, part_ptr, scale_ptr, n, nprog,
+    MAX_PARTS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Pass 2: fold the partials to the tensor amax, then cast this program's block.
+
+    Every program repeats the (nprog-element, L2-resident) fold instead of paying a third
+    launch for it; program 0 also publishes the scale. The arithmetic is the one
+    ``_quant_fused_kernel`` uses, so both paths quantize a given tensor identically.
+    """
+    poffs = tl.arange(0, MAX_PARTS)
+    amax = tl.max(tl.load(part_ptr + poffs, mask=poffs < nprog, other=0.0), axis=0)
+    amax = tl.maximum(amax, 1e-12)
+    pid = tl.program_id(0)
+    if pid == 0:
+        tl.store(scale_ptr, amax / 448.0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
-    inv = 1.0 / tl.load(scale_ptr)
-    v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * inv
+    v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * (448.0 / amax)
     v = tl.minimum(tl.maximum(v, -448.0), 448.0)
     tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
 
@@ -66,14 +100,17 @@ def quant_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``(x_fp8, scale)`` with ``x ~= x_fp8 * scale``; ``x`` contiguous, ``scale`` fp32 ``()``."""
     n = x.numel()
     out = torch.empty_like(x, dtype=FP8)
-    if n <= _FUSED_MAX_ELEMENTS:
-        scale = torch.empty((), dtype=torch.float32, device=x.device)
-        _quant_fused_kernel[(1,)](x, out, scale, n, BLOCK=4096, num_warps=8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    if n <= _SPLIT_MIN_ELEMENTS:
+        # below this, the second launch costs more than the parallelism buys
+        _quant_fused_kernel[(1,)](x, out, scale, n, BLOCK=_BLOCK, num_warps=8)
         return out, scale
-    amax = torch.linalg.vector_norm(x, ord=float("inf")).float()
-    scale = amax.clamp_min_(_SCALE_FLOOR).div_(E4M3_MAX)
-    _quant_cast_kernel[(triton.cdiv(n, 4096),)](
-        x, out, scale, n, BLOCK=4096, num_warps=4
+    nblock = triton.cdiv(n, _BLOCK)
+    nprog = min(nblock, _MAX_PARTS)
+    part = torch.empty(nprog, dtype=torch.float32, device=x.device)
+    _amax_partial_kernel[(nprog,)](x, part, n, nprog, BLOCK=_BLOCK, num_warps=8)
+    _reduce_cast_kernel[(nblock,)](
+        x, out, part, scale, n, nprog, MAX_PARTS=_MAX_PARTS, BLOCK=_BLOCK, num_warps=8,
     )
     return out, scale
 
