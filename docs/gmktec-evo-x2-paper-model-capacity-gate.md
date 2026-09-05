@@ -156,6 +156,16 @@ it remains a single-layer transfer test rather than a model-serving result.
 Its raw output is preserved in
 [`gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json).
 
+Finally, a two-layer slice selected experts 0 through 5 from layers 0 and 1,
+spanning both shard 2 and shard 3. It transferred 153.0 MiB across 72
+tensors. The final three H2D samples averaged 77.976 GiB/s, all four
+post-cold H2D samples averaged 77.686 GiB/s, and post-cold D2H averaged
+64.622 GiB/s. Cross-shard loading completed successfully, and the protected
+service returned `status: ok` afterward. This strengthens the transfer-path
+result across layer and shard boundaries, but it remains a transfer-only
+experiment. Raw output is preserved in
+[`gmktec-evo-x2-deepseek-expert-slice-2layer-result-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-2layer-result-20260905.json).
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident
