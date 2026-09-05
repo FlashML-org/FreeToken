@@ -355,6 +355,66 @@ float dot_fp8_block_avx512bf16(const uint8_t* w, const bf16_t* x, const bf16_t* 
   return acc;
 }
 
+// AVX-512F fallback for CPUs without AVX-512-BF16. Decode directly to fp32 and widen
+// bf16 activations with a zero-extend + shift; the normal e4m3 range includes 0x7f/0xff
+// as +/-480 here, matching the Triton compatibility decoder rather than torch's NaN view.
+__attribute__((target("avx512f")))
+static inline __m512 e4m3_to_f32_x16(__m128i raw, __m512 subtab) {
+  const __m512i b = _mm512_cvtepu8_epi32(raw);
+  const __m512i mag = _mm512_and_si512(b, _mm512_set1_epi32(0x7F));
+  const __m512i sign = _mm512_slli_epi32(
+      _mm512_and_si512(b, _mm512_set1_epi32(0x80)), 24);
+  const __m512i normal_bits = _mm512_or_si512(
+      _mm512_add_epi32(_mm512_slli_epi32(mag, 20), _mm512_set1_epi32(120 << 23)), sign);
+  const __m512 normal = _mm512_castsi512_ps(normal_bits);
+  const __m512i mantissa = _mm512_and_si512(mag, _mm512_set1_epi32(7));
+  __m512 subnormal = _mm512_permutexvar_ps(mantissa, subtab);
+  subnormal = _mm512_castsi512_ps(
+      _mm512_xor_si512(_mm512_castps_si512(subnormal), sign));
+  const __mmask16 is_subnormal = _mm512_cmpeq_epi32_mask(
+      _mm512_and_si512(mag, _mm512_set1_epi32(0x78)), _mm512_setzero_si512());
+  return _mm512_mask_mov_ps(normal, is_subnormal, subnormal);
+}
+
+__attribute__((target("avx512f")))
+float dot_fp8_block_avx512f(const uint8_t* w, const bf16_t* x, const bf16_t* s, int K,
+                            const float* e4m3) {
+  const __m512 subtab = _mm512_setr_ps(
+      0.0f, 1.0f / 512, 2.0f / 512, 3.0f / 512, 4.0f / 512, 5.0f / 512, 6.0f / 512,
+      7.0f / 512, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  float acc = 0.0f;
+  int b = 0, k0 = 0;
+  for (; k0 + FP8_BLK <= K; k0 += FP8_BLK, ++b) {
+    _mm_prefetch(reinterpret_cast<const char*>(w + k0) + PF_AHEAD, _MM_HINT_T0);
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+    int chunk = 0;
+    for (int j = 0; j < FP8_BLK; j += 16, ++chunk) {
+      const __m512 wf = e4m3_to_f32_x16(
+          _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + k0 + j)), subtab);
+      const __m512 xf = _mm512_castsi512_ps(_mm512_slli_epi32(
+          _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+              reinterpret_cast<const __m256i*>(x + k0 + j))), 16));
+      if ((chunk & 3) == 0)
+        a0 = _mm512_fmadd_ps(wf, xf, a0);
+      else if ((chunk & 3) == 1)
+        a1 = _mm512_fmadd_ps(wf, xf, a1);
+      else if ((chunk & 3) == 2)
+        a2 = _mm512_fmadd_ps(wf, xf, a2);
+      else
+        a3 = _mm512_fmadd_ps(wf, xf, a3);
+    }
+    const __m512 sum = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
+    acc += _mm512_reduce_add_ps(sum) * bf16_to_f32(s[b]);
+  }
+  if (k0 < K) {  // ragged tail shares block b's scale, as the masked reference does
+    float blk = 0.0f;
+    for (int k = k0; k < K; ++k) blk += e4m3[w[k]] * bf16_to_f32(x[k]);
+    acc += blk * bf16_to_f32(s[b]);
+  }
+  return acc;
+}
+
 __attribute__((target("avx2,fma")))
 float dot_fp8_block_avx2(const uint8_t* w, const bf16_t* x, const bf16_t* s, int K,
                          const float* e4m3) {
@@ -1143,6 +1203,7 @@ fp8dot_fn select_fp8dot() {
   // The bf16 tier is the one that matters here: e4m3 widens to bf16 exactly, so
   // dpbf16_ps does the whole dot with no fp32 materialization of the weights.
   if (t >= ISA_AVX512BF16) return dot_fp8_block_avx512bf16;
+  if (t >= ISA_AVX512) return dot_fp8_block_avx512f;
   if (t >= ISA_AVX2) return dot_fp8_block_avx2;
 #endif
   (void)t;
