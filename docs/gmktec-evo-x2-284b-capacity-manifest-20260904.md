@@ -52,6 +52,24 @@ but it does not qualify a 284B model.  The next test requires the exact model
 artifact, quantization, context length, expert-loading policy, KV reservation,
 and a clean-memory run with process-scoped swap telemetry.
 
+## Primary-paper capacity facts
+
+The paper's primary text identifies DeepSeek-V4-Flash as a 284B-parameter MoE
+with approximately 13B active parameters per token and six selected experts
+from 256 routed experts across 43 layers. It states that the deployed FP4
+configuration requires roughly 140 GB of expert weights and presents the
+interactive demonstration on a 32 GB RTX 5090-class GPU. The paper also
+explains that only the active computation fits in the GPU budget while the
+complete expert pool resides in host-side storage and moves through the
+CPU-GPU path as needed.
+
+These facts explain why the local 2 GiB dedicated-VRAM reading alone does not
+decide feasibility, but they also show why the missing exact payload and a
+measured host-memory and bandwidth budget are mandatory before claiming that
+the GMKtec EVO-X2 can reproduce the paper result. Source: [FreeToken paper,
+arXiv:2608.16157](https://arxiv.org/abs/2608.16157), especially the model and
+hardware description in the introduction and evaluation setup.
+
 ## Evidence source
 
 The raw values were collected from read-only `free -h`, `swapon --show
