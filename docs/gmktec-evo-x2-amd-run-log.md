@@ -211,3 +211,14 @@ service. This is evidence that `cd580f4978fb` belongs to a different source or
 request contract, not evidence of a model regression. Future quality artifacts
 must record the exact model revision, prompt, tokenizer, sampling policy, and
 expected fingerprint together.
+## 2026-09-05 same-source MMV-Y1 control
+
+The current branch was rerun with `FREETOKEN_GGUF_MMV_Y=1` using the same
+checkout, model, scheduler workload, memory ratio, and explicit Q4 quality
+contract as the Y4 run. Three samples passed with 45.3341 mean decode TPS,
+2,682.4559 mean client-observed prefill TPS, 0.0619 decode-TPS standard
+deviation, and zero failed samples. The canonical Q4 quality check passed with
+`--expected-sha1 3302eda43396`. The paired Y4 result was 45.4603 decode TPS
+and 2,753.3639 prefill TPS, only 0.28 percent higher. Y4 is definitively
+rejected for promotion. The protected service was restored and returned
+`status: ok` with `maintenance: serving`.

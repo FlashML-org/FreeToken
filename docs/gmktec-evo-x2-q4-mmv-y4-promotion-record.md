@@ -138,3 +138,24 @@ remains available only for reproduction and future architecture-specific work;
 the default remains Y1. The protected Qwen service was restored and its health
 endpoint returned `status: ok` with `maintenance: serving` after the candidate
 stopped.
+## Same-source Y1 control
+
+To remove the remaining source-revision confounder, the same checkout and
+request contract were rerun with `FREETOKEN_GGUF_MMV_Y=1` in a separate
+isolated artifact. The three-sample scheduler-shaped control measured:
+
+- decode mean: 45.3341 TPS
+- client-observed prefill mean: 2,682.4559 TPS
+- decode standard deviation: 0.0619 TPS
+- failed samples: zero
+- quality: passed with `--expected-sha1 3302eda43396`
+
+The paired Y4 result was 45.4603 decode TPS and 2,753.3639 prefill TPS. Y4 was
+therefore only 0.28 percent faster in this same-source comparison, well below
+the one-percent promotion floor and normal run variation. **Decision:
+definitively reject Y4 as a current-branch performance promotion.**
+
+Artifacts:
+
+- Y1: `/home/david/freetoken-amd/artifacts/qwen-q4-current-mmvy1-20260905T160000Z/`
+- Y4: `/home/david/freetoken-amd/artifacts/qwen-q4-current-mmvy4-20260905T133000Z/`
