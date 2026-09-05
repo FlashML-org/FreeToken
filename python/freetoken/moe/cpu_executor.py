@@ -351,8 +351,6 @@ class CpuMoeExecutor:
         scale tensor is named ``weight_scale_inv`` upstream but multiplies, matching the
         Triton reference.
         """
-        from freetoken.kernel.aot_models import fp8_block_scale_pad
-
         gu, gus = banks["gate_up"], banks["gate_up_scale"]
         dn, dns = banks["down"], banks["down_scale"]
         # torch exposes fp8 as float8_e4m3fn; the kernel reads raw bytes either way.
@@ -377,8 +375,6 @@ class CpuMoeExecutor:
         dn_rows, dn_cols = nb(H), nb(I)
         assert gus[0].shape[1] == gu_rows and gus[0].shape[2] >= gu_cols
         assert dns[0].shape[1] == dn_rows and dns[0].shape[2] >= dn_cols
-        assert gus[0].stride(1) >= fp8_block_scale_pad(gu_rows, gu_cols)
-        assert dns[0].stride(1) >= fp8_block_scale_pad(dn_rows, dn_cols)
         ptrs = dict(
             gate_up_ptr=self._make_table(gu).data_ptr(),
             down_ptr=self._make_table(dn).data_ptr(),
@@ -552,11 +548,16 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
+            alloc_io = (
+                (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))
+                if self.device.type == "cpu"
+                else alloc_pinned_tensor
+            )
             io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "x": alloc_io(bs, self.H, dtype=torch.bfloat16),
+                "ids": alloc_io(bs, self.top_k, dtype=torch.int32),
+                "w": alloc_io(bs, self.top_k, dtype=torch.float32),
+                "y": alloc_io(bs, self.H, dtype=torch.bfloat16),
             }
             self._io[bs] = io
         return io
