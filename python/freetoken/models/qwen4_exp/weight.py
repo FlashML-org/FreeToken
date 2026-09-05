@@ -22,6 +22,7 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.qwen4_exp.config import dense_quant_mode
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -164,9 +165,6 @@ def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
-# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
-_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
-
 # Serving the dense side natively as block-FP8 changes which buffers the model expects:
 # the four-way in_proj fusion splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM
 # (see gdn.py), and each fp8 group fuses its ``weight_scale_inv`` on the same axis as its
@@ -205,26 +203,24 @@ _FUSIONS_BLOCK_FP8 = _block_fp8_fusions()
 
 
 def _dense_is_block_fp8(model_path: str) -> bool:
-    """True when the checkpoint DECLARES its dense (non-expert) modules per-block
-    weight-only FP8 -- exactly when config.py sets ``attn_quant="fp8_block"``.
+    """True when the dense (non-expert) modules will be SERVED as per-block weight-only
+    FP8 -- exactly when config.py sets ``attn_quant="fp8_block"``.
 
-    Both sides read the same declaration, so the buffers emitted here always match the
-    modules the model built. A checkpoint carrying ``weight_scale_inv`` WITHOUT declaring
-    it falls through to ``_load_maybe_block_fp8`` and is dequantized to bf16 as before.
+    The decision itself lives in :func:`~freetoken.models.qwen4_exp.config.dense_quant_mode`
+    and is only read here, so the buffers this loader emits cannot disagree with the modules
+    the model built. That matters under TP: the block-FP8 linears have no parallel variant,
+    so a rank at TP>1 downgrades to bf16, and both sides have to downgrade together.
+
+    A checkpoint carrying ``weight_scale_inv`` WITHOUT declaring the algo is not block-FP8
+    here either; it falls through to ``_load_maybe_block_fp8`` and is dequantized as before.
     """
     try:
         with open(os.path.join(model_path, "config.json"), encoding="utf-8") as fh:
             quant = json.load(fh).get("quantization_config") or {}
     except (OSError, ValueError):
         return False
-    algo = str(quant.get("quant_algo") or quant.get("quant_method") or "").lower()
-    if algo != "mixed_precision":
-        return False
-    return any(
-        ".mlp.experts" not in str(module)
-        and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
-        for module, spec in (quant.get("quantized_layers") or {}).items()
-    )
+    algo = quant.get("quant_algo") or quant.get("quant_method") or ""
+    return dense_quant_mode(algo, quant.get("quantized_layers")) == "fp8_block"
 
 
 def iter_weights(

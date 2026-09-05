@@ -6,6 +6,7 @@ from typing import Any, Tuple
 
 import torch
 
+from freetoken.distributed import try_get_tp_info
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -124,6 +125,41 @@ def _layer_types(text: Any) -> list[str]:
 _FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
 
 
+def dense_quant_mode(algo: str, quantized_layers: Any) -> str:
+    """The quantization mode the dense (non-expert) projections will actually be SERVED in.
+
+    Single source of truth for the two sides that must agree: :func:`parse_config`, which
+    decides the modules the model BUILDS, and the weight loader, which decides the buffers
+    it EMITS. They previously derived this independently from the same declaration - safe
+    only while they cannot disagree, and they can: the block-FP8 linears have no
+    tensor-parallel variant, so a rank running under TP>1 has to fall back to bf16. If only
+    one side knew that, the loaded buffers would not match the built modules.
+
+    Returns ``"fp8_block"`` only when the checkpoint declares per-block weight-only FP8 on a
+    non-expert module AND this rank can serve it; ``"none"`` otherwise (bf16, via the
+    dequantize-at-load path). A checkpoint carrying ``weight_scale_inv`` without declaring
+    the algo is "none" here and keeps the pre-existing dequant behaviour.
+    """
+    if str(algo or "").lower() != "mixed_precision":
+        return "none"
+    declared = any(
+        ".mlp.experts" not in str(module)
+        and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
+        for module, spec in (quantized_layers or {}).items()
+    )
+    if not declared:
+        return "none"
+    # Resolved here, once, so both sides downgrade together. ``Engine.__init__`` sets TP
+    # info as its very first statement, before the model config or any weight is built, so
+    # a rank always knows its size by the time this matters. try_get_tp_info is used rather
+    # than get_tp_info because config parsing also happens with no engine at all (checkpoint
+    # conversion, tooling, tests), where get_tp_info raises; unset means a single rank.
+    tp = try_get_tp_info()
+    if tp is not None and tp.size > 1:
+        return "none"
+    return "fp8_block"
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -183,14 +219,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             # (per-block, weight-only FP8 with a ``weight_scale_inv`` sibling). Serve
             # them natively instead of dequantizing at load: the four-way in_proj fusion
             # splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM (see gdn.py), which
-            # halves the dense bytes read on every decode step.
-            dense_block_fp8 = any(
-                ".mlp.experts" not in str(module)
-                and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
-                for module, spec in quantized.items()
-            )
+            # halves the dense bytes read on every decode step. Resolved through
+            # dense_quant_mode so the loader reaches the same answer, TP downgrade
+            # included - see that function.
             expert_quant = "nvfp4" if experts_nvfp4 else "none"
-            attn_quant = "fp8_block" if dense_block_fp8 else "none"
+            attn_quant = dense_quant_mode(algo, quantized)
             dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo
