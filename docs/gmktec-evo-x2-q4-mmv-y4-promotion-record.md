@@ -103,3 +103,32 @@ though decode throughput is nearly matched. The long-context test is a local
 6,056-token retrieval control and is not a reproduction of the paper's agent
 workload. The quality suite is deterministic and bounded; it does not replace
 the paper's full tool-using evaluation.
+## Current-branch requalification
+
+The opt-in Y4 flag was requalified from current AMD branch commit `ff76ede` in
+an isolated checkout with the protected service stopped through its guarded
+lifecycle. Startup reached the explicit API-ready state with 56 GiB free before
+model loading and 23.07 GiB free after initialization. The current branch then
+completed the fixed three-sample scheduler-shaped matrix:
+
+- decode mean: 45.4603 TPS
+- decode median: 45.4418 TPS
+- decode standard deviation: 0.0927 TPS
+- client-observed prefill mean: 2,753.3639 TPS
+- maximum token gap: 43.781 ms
+- failed samples: zero
+
+The canonical current Qwen quality output was produced with SHA1
+`3302eda43396`. An older helper still labels that output as a failure because
+it hard-codes the superseded reference SHA1 `0acef4eab6f4`. That wrapper result
+is retained as a harness-version discrepancy, not as a model-quality verdict.
+The current accepted quality gate is the `3302eda43396` result recorded in the
+campaign audit.
+
+Against the accepted current Q4 scheduler baseline near 48.28 decode TPS, this
+current-branch Y4 result is approximately 5.8 percent slower. **Decision:
+reject Y4 for promotion on the current branch.** The compile-time option
+remains available only for reproduction and future architecture-specific work;
+the default remains Y1. The protected Qwen service was restored and its health
+endpoint returned `status: ok` with `maintenance: serving` after the candidate
+stopped.

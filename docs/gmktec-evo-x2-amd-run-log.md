@@ -182,3 +182,18 @@ four of four checks passing. Full pytest collection on Windows remains
 environment-limited because the local test interpreter does not have PyTorch;
 the authoritative ROCm runtime and protected service remained healthy after
 the validation.
+## 2026-09-05 current-branch MMV-Y4 requalification
+
+The opt-in `FREETOKEN_GGUF_MMV_Y=4` build from commit `ff76ede` was tested in
+an isolated checkout after explicitly stopping the protected Qwen service.
+The candidate reached API readiness with 56 GiB free before model loading and
+23.07 GiB free after initialization. Three scheduler-shaped throughput samples
+completed without failure: 45.4603 mean decode TPS, 2,753.3639 mean
+client-observed prefill TPS, 0.0927 decode-TPS standard deviation, and 43.781
+ms maximum token gap. The canonical current Qwen output hash was
+`3302eda43396`; an older helper's `0acef4eab6f4` expectation was recorded as a
+harness-version mismatch rather than a quality failure. Relative to the
+accepted current Q4 control near 48.28 decode TPS, Y4 was approximately 5.8
+percent slower and was rejected for promotion. The default remains Y1. The
+protected Qwen service was restored and returned `status: ok` with
+`maintenance: serving`.
