@@ -194,8 +194,20 @@ ms maximum token gap. The canonical Q4 output hash was `3302eda43396`, selected
 with the verifier's explicit `--expected-sha1 3302eda43396` contract option;
 the historical `0acef4eab6f4` default remains separate. Relative to the
 accepted current Q4 control near 48.28 decode TPS, Y4 was approximately 5.8
-percent slower and was rejected for promotion. The later active protected
-NVFP4 baseline is `cd580f4978fb`, while this artifact retains the historical
-Q4 contract `3302eda43396`. The default remains Y1. The
+percent slower and was rejected for promotion. A prior protected NVFP4
+re-anchor recorded `cd580f4978fb` under a separate contract, while this
+artifact retains the historical Q4 contract `3302eda43396`. The default remains
+Y1. The
 protected Qwen service was restored and returned `status: ok` with
 `maintenance: serving`.
+## 2026-09-05 explicit AIME contract probe
+
+The repaired verifier was run against the healthy protected Qwen service with
+`--expected-sha1 cd580f4978fb` and preserved the complete result at
+`/home/david/freetoken-amd/artifacts/protected-aime-contract-selector-20260905T150000Z.json`.
+The request contract produced observed SHA1 `0acef4eab6f4`, so the verifier
+correctly returned `failed` for that selected expectation without changing the
+service. This is evidence that `cd580f4978fb` belongs to a different source or
+request contract, not evidence of a model regression. Future quality artifacts
+must record the exact model revision, prompt, tokenizer, sampling policy, and
+expected fingerprint together.
