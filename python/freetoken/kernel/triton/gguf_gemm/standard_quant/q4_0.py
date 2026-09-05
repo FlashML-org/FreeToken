@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..utils import select_row_tile
+
 Q4_0_BLOCK_SIZE = 32
 Q4_0_BLOCK_BYTES = 18
 
@@ -133,8 +135,9 @@ def ggml_gemm_q4_0_triton(
     X_2d = X.reshape(-1, hidden_size).contiguous()
     Y_2d = torch.empty((X_2d.shape[0], row), device=X.device, dtype=X.dtype)
 
+    block_m = select_row_tile(X_2d.shape[0])
     grid = (
-        triton.cdiv(X_2d.shape[0], Q4_0_BLOCK_M),
+        triton.cdiv(X_2d.shape[0], block_m),
         triton.cdiv(row, Q4_0_BLOCK_N),
     )
     q4_0_gemm_kernel[grid](
@@ -149,7 +152,7 @@ def ggml_gemm_q4_0_triton(
         W.stride(0),
         Y_2d.stride(0),
         Y_2d.stride(1),
-        BLOCK_M=Q4_0_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=Q4_0_BLOCK_N,
         BLOCK_K_BLOCKS=Q4_0_BLOCK_K_BLOCKS,
         num_warps=Q4_0_NUM_WARPS,

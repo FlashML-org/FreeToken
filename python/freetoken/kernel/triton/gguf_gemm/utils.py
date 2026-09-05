@@ -106,6 +106,13 @@ TRITON_SUPPORTED_ACTIVATION_DTYPES = (
 )
 
 
+def select_row_tile(rows: int) -> int:
+    """Use the smallest power-of-two row tile for small decode batches."""
+    if rows <= 0:
+        raise ValueError("GGUF GEMM row count must be positive")
+    return min(TRITON_BLOCK_M, 1 << (rows - 1).bit_length())
+
+
 @triton.jit
 def load_f16_from_u8(ptrs, mask):
     lo = tl.load(ptrs + 0, mask=mask, other=0)
@@ -275,10 +282,11 @@ def run_triton_kernel(
     extra_args: tuple = (),
 ) -> torch.Tensor:
     W, X_2d, X_shape, num_k_blocks = _validate_args(W, X, row, quant_type)
+    block_m = select_row_tile(X_2d.shape[0])
     Y_2d = torch.empty((X_2d.shape[0], row), device=X.device, dtype=X.dtype)
 
     grid = (
-        triton.cdiv(X_2d.shape[0], TRITON_BLOCK_M),
+        triton.cdiv(X_2d.shape[0], block_m),
         triton.cdiv(row, TRITON_BLOCK_N),
     )
 
@@ -295,7 +303,7 @@ def run_triton_kernel(
         Y_2d.stride(0),
         Y_2d.stride(1),
         *extra_args,
-        BLOCK_M=TRITON_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=TRITON_BLOCK_N,
         BLOCK_K_BLOCKS=TRITON_BLOCK_K_BLOCKS,
         num_warps=TRITON_NUM_WARPS,

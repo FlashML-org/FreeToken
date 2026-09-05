@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import os
 import pathlib
 from types import SimpleNamespace
@@ -55,6 +56,37 @@ def test_hip_cflags_emit_one_offload_flag_per_arch(monkeypatch):
     assert "--offload-arch=gfx1200" in flags
     assert "--offload-arch=gfx1201" in flags
     assert not any(";" in flag for flag in flags)
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    ((1, 1), (2, 2), (3, 4), (4, 4), (17, 32), (32, 32), (33, 32)),
+)
+def test_triton_gguf_row_tile_tracks_small_decode_batches(rows, expected):
+    from freetoken.kernel.triton.gguf_gemm.utils import select_row_tile
+
+    assert select_row_tile(rows) == expected
+
+
+def test_triton_gguf_row_tile_rejects_empty_batches():
+    from freetoken.kernel.triton.gguf_gemm.utils import select_row_tile
+
+    with pytest.raises(ValueError, match="positive"):
+        select_row_tile(0)
+
+
+def test_triton_gguf_launchers_apply_row_aware_tiles():
+    from freetoken.kernel.triton.gguf_gemm import utils
+    from freetoken.kernel.triton.gguf_gemm.standard_quant import q4_0
+
+    assert "block_m = select_row_tile(X_2d.shape[0])" in inspect.getsource(
+        utils.run_triton_kernel
+    )
+    assert "BLOCK_M=block_m" in inspect.getsource(utils.run_triton_kernel)
+    assert "block_m = select_row_tile(X_2d.shape[0])" in inspect.getsource(
+        q4_0.ggml_gemm_q4_0_triton
+    )
+    assert "BLOCK_M=block_m" in inspect.getsource(q4_0.ggml_gemm_q4_0_triton)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX .so/rpath compatibility contract")
