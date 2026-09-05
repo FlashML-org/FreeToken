@@ -36,6 +36,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # The request's stop strings (None when it has none), so the detokenizer can hold back
     # a trailing partial-stop prefix instead of streaming it and then needing to retract.
     stop_strs: list[str] | None = None
+    # Keep the matched stop string in the output (SamplingParams.include_stop_str_in_output).
+    keep_stop_str: bool = False
+    # Decode this request with skip_special_tokens (SamplingParams.skip_special_tokens).
+    skip_special_tokens: bool = False
     # KV page-pool usage snapshot at this step (not-evictable used/total), passed
     # through to the frontend for the shell status bar. 0/0 for owned-KV models.
     kv_used_pages: int = 0

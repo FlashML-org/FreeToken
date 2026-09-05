@@ -108,10 +108,16 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
+        # continue_final_message (an OpenAI-compatible extra, as in vLLM / SGLang): the last
+        # message is an assistant prefix the model must continue, so no generation prompt.
+        chat_template_kwargs = dict(chat_template_kwargs)
+        continue_final = bool(chat_template_kwargs.pop("continue_final_message", False))
+        if continue_final:
+            chat_template_kwargs["continue_final_message"] = True
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=not continue_final,
             **chat_template_kwargs,
         )
         assert isinstance(prompt, str)
