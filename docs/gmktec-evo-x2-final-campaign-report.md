@@ -122,6 +122,14 @@ mandatory evidence before a Strix Halo reproduction can be claimed. See the
 [primary paper](https://arxiv.org/abs/2608.16157) and the local
 [`284B capacity manifest`](gmktec-evo-x2-284b-capacity-manifest-20260904.md).
 
+The paper reports approximately 53.8 GB/s host bandwidth on its 16-core
+desktop reference. Our local transfer prototypes measured 79.79 GB/s for
+contiguous 64 MiB copies, 5.009 GB/s for serialized random 64 KiB blocks, and
+12.84 GB/s for grouped expert-like rounds after CPU staging. These are useful
+transport bounds, but they are not evidence that the full 284B model will fit
+or reach paper throughput. The scattered and staged measurements show why a
+real checkpoint and production-shaped expert access pattern are still required.
+
 ### Additional archived model identifiers
 
 Archived routing names without an admitted payload are not treated as failed
