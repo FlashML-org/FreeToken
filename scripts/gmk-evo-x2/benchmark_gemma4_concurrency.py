@@ -94,15 +94,22 @@ def main() -> int:
     parser.add_argument("--clients", type=int, default=4)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--prompt-repeat",
+        type=int,
+        default=1,
+        help="repeat the deterministic explanation sentence this many times",
+    )
     parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()
-    if args.clients < 1 or args.rounds < 1 or args.max_tokens < 2:
-        parser.error("clients and rounds must be positive and max-tokens at least two")
-    prompt = (
+    if args.clients < 1 or args.rounds < 1 or args.max_tokens < 2 or args.prompt_repeat < 1:
+        parser.error("clients, rounds, and prompt-repeat must be positive and max-tokens at least two")
+    prompt_unit = (
         "Write a concise technical explanation of how a graphics processor executes "
         "a quantized mixture-of-experts language model. Use complete sentences and "
         "continue until the requested token limit is reached."
     )
+    prompt = " ".join(prompt_unit for _ in range(args.prompt_repeat))
     body = {"model": args.model, "prompt": prompt, "max_tokens": args.max_tokens,
             "ignore_eos": True, "temperature": 0.0, "top_p": 1.0, "top_k": -1,
             "stream": True, "stream_options": {"include_usage": True}}
@@ -120,7 +127,8 @@ def main() -> int:
     total_tokens = sum(x["completion_tokens"] or 0 for x in observations)
     total_wall = sum(x["wall_s"] for x in observations)
     report = {"schema_version": 1, "control": "Gemma4 fixed-length concurrent text matrix",
-              "model": args.model, "prompt": prompt, "clients": args.clients, "rounds": args.rounds,
+              "model": args.model, "prompt": prompt, "prompt_repeat": args.prompt_repeat,
+              "clients": args.clients, "rounds": args.rounds,
               "max_tokens": args.max_tokens, "warmup": warmup, "rounds_detail": rounds,
               "summary": {"completed": sum(bool(x["completed_sse"]) for x in observations),
                           "requests": len(observations), "ttft_ms": {"mean": statistics.mean(ttft) if ttft else None, "p95": percentile(ttft, .95), "p99": percentile(ttft, .99)},
