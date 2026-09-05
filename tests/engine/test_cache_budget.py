@@ -100,6 +100,59 @@ def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     assert expert_bytes_per_slot(sources) == 512 + 256
 
 
+def test_geometry_pool_plan_fits_laguna_working_set_in_legacy_arenas():
+    from freetoken.engine.cache_budget import plan_geometry_pool_slots
+
+    q4 = (3_538_944, 1_769_472)
+    bf16 = (12_582_912, 6_291_456)
+    rows = [q4] * 39 + [bf16] * 8
+    plan = plan_geometry_pool_slots(
+        rows,
+        legacy_cache_size=298,
+        num_experts=256,
+        top_k=10,
+        max_decode_batch=1,
+    )
+
+    assert plan is not None
+    by_rows = {entry.row_bytes: entry for entry in plan}
+    assert by_rows[q4].slots >= 390
+    assert by_rows[bf16].slots >= 80
+    for bank in range(2):
+        used = sum(entry.slots * entry.row_bytes[bank] for entry in plan)
+        budget = 298 * max(row[bank] for row in rows)
+        assert used <= budget
+
+
+def test_geometry_pool_plan_falls_back_when_decode_floors_do_not_fit():
+    from freetoken.engine.cache_budget import plan_geometry_pool_slots
+
+    assert (
+        plan_geometry_pool_slots(
+            [(16, 8), (64, 32)],
+            legacy_cache_size=1,
+            num_experts=256,
+            top_k=10,
+            max_decode_batch=1,
+        )
+        is None
+    )
+
+
+def test_expert_bytes_per_slot_uses_each_banks_largest_layer():
+    sources = {
+        "gate_up": [
+            torch.zeros(4, 5, dtype=torch.uint8),
+            torch.zeros(4, 11, dtype=torch.uint8),
+        ],
+        "down": [
+            torch.zeros(4, 7, dtype=torch.uint8),
+            torch.zeros(4, 3, dtype=torch.uint8),
+        ],
+    }
+    assert expert_bytes_per_slot(sources) == 11 + 7
+
+
 def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     # baseline 1000, weights 100, ratio 0.9 -> budget = 900 - 100 - 0(fixed) = 800
     size, pages, overlap = resolve_moe_cache_auto(
@@ -408,6 +461,30 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert is_offload_moe_backend(config.moe_backend)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
+
+
+def test_adjust_config_never_auto_selects_hybrid_for_gguf(monkeypatch):
+    """A bench profile must not route GGUF banks to the absent CPU executor."""
+    from freetoken.engine.engine import _adjust_config
+
+    config = _offload_engine_config()
+    object.__setattr__(config.model_config, "expert_quant", "gguf")
+    object.__setattr__(config.model_config, "moe_weight_format", "gguf")
+    object.__setattr__(config.model_config, "hidden_act", "silu")
+    monkeypatch.setattr(
+        "freetoken.moe.bench_profile.load_backend_recommendation",
+        lambda *_args, **_kwargs: "hybrid",
+    )
+    monkeypatch.setattr("freetoken.engine.engine._profile_gpu", lambda: ("gpu", "uuid"))
+    monkeypatch.setattr(
+        "freetoken.moe.cpu_executor.compiled_extension_supports",
+        lambda _act: True,
+    )
+
+    _adjust_config(config)
+
+    assert config.moe_backend == "offload"
+    assert config.moe_cache_auto is True
 
 
 def test_page_table_width_covers_whole_trailing_pages():

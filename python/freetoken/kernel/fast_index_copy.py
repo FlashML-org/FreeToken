@@ -185,6 +185,93 @@ def fast_index_copy_multi_jit(
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
 
 
+@lru_cache(maxsize=None)
+def _jit_fast_index_copy_multi_strided_module(
+    *, num_threads: int, blocks_per_bank: int
+) -> Module:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+    return load_jit(
+        "fast_index_copy_multi_strided",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[("launch", f"&MultiStridedIndexCopyKernel<{args}>::run")],
+    )
+
+
+def fast_index_copy_multi_strided_jit(
+    dst_ptrs: torch.Tensor,
+    src_ptrs: torch.Tensor,
+    copy_bytes: torch.Tensor,
+    dst_row_strides: torch.Tensor,
+    src_row_strides: torch.Tensor,
+    dst_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    num_indices: torch.Tensor | None = None,
+    *,
+    num_threads: int = 1024,
+    blocks_per_bank: int = 8,
+) -> None:
+    """Copy compact source rows into independently strided destination rows."""
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_copy_multi_strided_module(
+        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    module.launch(
+        dst_ptrs,
+        src_ptrs,
+        copy_bytes,
+        dst_row_strides,
+        src_row_strides,
+        dst_indices,
+        src_indices,
+        num_indices,
+    )
+
+
+@lru_cache(maxsize=None)
+def _jit_fast_index_copy_rows_strided_module(
+    *, num_threads: int, blocks_per_bank: int
+) -> Module:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+    return load_jit(
+        "fast_index_copy_rows_strided",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[("launch", f"&StridedRowsCopyKernel<{args}>::run")],
+    )
+
+
+def fast_index_copy_rows_strided_jit(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    num_threads: int = 1024,
+    blocks_per_bank: int = 8,
+) -> None:
+    """Copy compact pinned-host rows into a wider 2-D CUDA destination."""
+    from freetoken.kernel.pinned import device_ptr
+
+    assert destination.is_cuda and destination.dim() == 2
+    assert source.device.type == "cpu" and source.dim() == 2 and source.is_contiguous()
+    assert destination.dtype == source.dtype == torch.uint8
+    assert destination.size(0) == source.size(0)
+    copy_bytes = source.size(1)
+    assert destination.size(1) >= copy_bytes
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_copy_rows_strided_module(
+        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    module.launch(
+        destination,
+        int(device_ptr(source)),
+        source.stride(0) * source.element_size(),
+        copy_bytes * source.element_size(),
+        source.size(0),
+    )
+
+
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:
     assert sync_flag.is_cuda
     assert sync_flag.numel() == 1

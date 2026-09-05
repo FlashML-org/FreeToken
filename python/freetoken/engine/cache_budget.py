@@ -6,6 +6,7 @@ measured quantities, so it is unit-testable without a device.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from freetoken.utils import div_ceil
@@ -23,9 +24,97 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
-    # tensor[0].numel() is the per-row element count (one expert slot); see the matching
-    # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    # The GPU slot cache has one stride per bank, chosen from that bank's largest layer
+    # row. See the matching slot-byte calculation in OffloadMoeCache.
+    return sum(
+        max(layer[0].numel() * layer.element_size() for layer in per_layer)
+        for per_layer in sources.values()
+    )
+
+
+@dataclass(frozen=True)
+class GeometryPoolPlan:
+    layer_ids: tuple[int, ...]
+    row_bytes: tuple[int, ...]
+    slots: int
+
+
+def plan_geometry_pool_slots(
+    row_bytes_by_layer: list[tuple[int, ...]],
+    *,
+    legacy_cache_size: int,
+    num_experts: int,
+    top_k: int,
+    max_decode_batch: int,
+) -> tuple[GeometryPoolPlan, ...] | None:
+    """Partition fixed max-stride bank arenas into exact-geometry decode pools.
+
+    ``legacy_cache_size`` remains the external budget denomination. Each bank owns
+    ``legacy_cache_size * max(layer_row_bytes)`` bytes; every planned class must fit
+    all bank constraints independently.
+    """
+    if not row_bytes_by_layer:
+        return ()
+    num_banks = len(row_bytes_by_layer[0])
+    if num_banks == 0 or any(len(row) != num_banks for row in row_bytes_by_layer):
+        raise ValueError("every layer must describe the same non-empty bank set")
+    if (
+        legacy_cache_size <= 0
+        or num_experts <= 0
+        or top_k <= 0
+        or max_decode_batch <= 0
+    ):
+        raise ValueError(
+            "cache size, experts, top_k, and decode batch must be positive"
+        )
+
+    grouped: dict[tuple[int, ...], list[int]] = {}
+    for layer_id, rows in enumerate(row_bytes_by_layer):
+        if any(value <= 0 for value in rows):
+            raise ValueError("geometry row bytes must be positive")
+        grouped.setdefault(tuple(rows), []).append(layer_id)
+    classes = [(rows, tuple(layer_ids)) for rows, layer_ids in grouped.items()]
+    budgets = [
+        legacy_cache_size * max(rows[bank] for rows in row_bytes_by_layer)
+        for bank in range(num_banks)
+    ]
+    floor = min(num_experts, top_k * max_decode_batch)
+    slots = [floor] * len(classes)
+
+    def used(bank: int) -> int:
+        return sum(slots[i] * classes[i][0][bank] for i in range(len(classes)))
+
+    if any(used(bank) > budgets[bank] for bank in range(num_banks)):
+        return None
+
+    targets = [
+        min(len(layer_ids) * num_experts, len(layer_ids) * top_k * max_decode_batch)
+        for _, layer_ids in classes
+    ]
+    caps = [len(layer_ids) * num_experts for _, layer_ids in classes]
+
+    def affordable(index: int) -> bool:
+        rows = classes[index][0]
+        return all(
+            used(bank) + rows[bank] <= budgets[bank] for bank in range(num_banks)
+        )
+
+    def fill(limits: list[int]) -> None:
+        while True:
+            candidates = [
+                i for i in range(len(classes)) if slots[i] < limits[i] and affordable(i)
+            ]
+            if not candidates:
+                return
+            index = min(candidates, key=lambda i: (slots[i] / limits[i], i))
+            slots[index] += 1
+
+    fill(targets)
+    fill(caps)
+    return tuple(
+        GeometryPoolPlan(layer_ids=layer_ids, row_bytes=rows, slots=slots[index])
+        for index, (rows, layer_ids) in enumerate(classes)
+    )
 
 
 def net_cache_budget_bytes(

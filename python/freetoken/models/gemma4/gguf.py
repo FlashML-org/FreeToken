@@ -48,6 +48,18 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     return full_head_dim // 4
 
 
+def _embed_quant(shim: "GgufConfigShim") -> int:
+    """ggml quant type of the token embedding table, read off the file.
+
+    Publishers differ (Google's QAT GGUF stores it Q6_K, Unsloth's Q4_0). A
+    metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table; fall
+    back to Q6_K, the type llama.cpp's own gemma4 conversion emits.
+    """
+    from freetoken.models.gguf.reader import gguf_tensor_type
+
+    return gguf_tensor_type(shim.model_path, "token_embd.weight") or GGML_Q6_K
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     m = shim.metadata
 
@@ -114,6 +126,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_enabled=True,
         expert_quant="q4_0",
         moe_weight_format="q4_0",
+        gguf_embed_quant=_embed_quant(shim),
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -230,7 +243,7 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if name == "token_embd.weight":
-            yield "model.embed_tokens.qweight", t.packed()  # Q6_K packed table
+            yield "model.embed_tokens.qweight", t.packed()  # packed table, native quant
             continue
         if name == "output_norm.weight":
             yield "model.norm.weight", _to_bf16(t)
@@ -346,6 +359,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     the routed experts (served from the offload cache).
     """
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+    embed_quant = config.gguf_embed_quant or GGML_Q6_K
 
     def swap_linear(owner, attr, quant_type=GGML_Q4_0):
         lin = getattr(owner, attr)
@@ -360,7 +374,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
+        quant_type=embed_quant,
         embed_scale=config.embedding_scale,
     )
     inner.embed_tokens = embed
@@ -372,7 +386,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         swap_linear(layer.feed_forward.shared_mlp, "down_proj")
 
     if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, embed_quant)
 
 
 # --------------------------------------------------------------------------------------

@@ -299,6 +299,21 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
+    def _report_moe_decode_stats(self, finished_reqs: Set[Req]) -> None:
+        """Log opt-in cumulative, rank-local MoE counters after a completion drain.
+
+        With overlap scheduling, the cumulative total may already include work from the
+        next launched batch; this is intentionally not a per-request snapshot.
+        """
+        if not finished_reqs or self.config.tp_info.rank != 0:
+            return
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not cache.collect_stats:
+            return
+        logger.info_rank0(
+            f"MoE decode stats (cumulative, rank-local): {cache.decode_miss_stats()}"
+        )
+
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
@@ -388,6 +403,7 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        self._report_moe_decode_stats(new_finished_reqs)
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()

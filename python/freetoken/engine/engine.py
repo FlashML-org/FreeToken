@@ -622,6 +622,14 @@ class Engine:
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                geometry_pool_top_k=getattr(
+                    config.model_config, "num_experts_per_tok", 0
+                ),
+                geometry_pool_max_batch=max(
+                    config.max_running_req,
+                    config.cuda_graph_max_bs or 0,
+                    1,
+                ),
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
@@ -1389,7 +1397,12 @@ def _adjust_config(config: EngineConfig):
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
-            if not _cpu_moe_act_ok:
+            if bench_fmt == "gguf":
+                logger.info_rank0(
+                    "benchbw profile recommends hybrid, but GGUF experts do not have a "
+                    "CPU executor; staying on offload"
+                )
+            elif not _cpu_moe_act_ok:
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
                     f"support this model's expert activation "

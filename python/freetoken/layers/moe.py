@@ -316,7 +316,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -363,7 +363,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -530,6 +530,54 @@ class OffloadMoELayer(MoELayer):
             gate_up, down = views
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "gguf":
+            # GGUF may mix native quantized layers with raw BF16 layers. Quantized
+            # rows use ggml MMVQ; BF16 rows are byte views over the same padded slot
+            # caches and go through the regular dense expert kernels.
+            from freetoken.models.gguf.dequant import GGML_BF16
+
+            gate_up, down = views
+            gu_type, dn_type = self.gguf_gate_up_type, self.gguf_down_type
+            if GGML_BF16 in (gu_type, dn_type):
+                if gu_type != GGML_BF16 or dn_type != GGML_BF16:
+                    raise ValueError(
+                        "mixed BF16/quantized projections within one GGUF expert layer"
+                    )
+                gu_bytes = self.gguf_gate_up_rows * self.hidden_size * 2
+                dn_bytes = self.gguf_down_rows * self.intermediate_size * 2
+                if gate_up.shape[1] != gu_bytes or down.shape[1] != dn_bytes:
+                    raise ValueError(
+                        "BF16 GGUF expert rows require exact dense cache strides "
+                        f"(gate_up={gate_up.shape[1]}/{gu_bytes}, "
+                        f"down={down.shape[1]}/{dn_bytes})"
+                    )
+                dense_gate_up = gate_up.view(torch.bfloat16).view(
+                    gate_up.shape[0], self.gguf_gate_up_rows, self.hidden_size
+                )
+                dense_down = down.view(torch.bfloat16).view(
+                    down.shape[0], self.gguf_down_rows, self.intermediate_size
+                )
+                impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
+                return impl(
+                    hidden_states,
+                    dense_gate_up,
+                    dense_down,
+                    topk_weights,
+                    topk_ids,
+                    self.activation,
+                    self.apply_router_weight_on_input,
+                )
+            # Mixed-type quantized GGUF experts (per-layer quant types, flat padded
+            # slot banks): geometry comes from the layer's type attributes.
+            from freetoken.moe.fused_gguf import fused_experts_gguf
+
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                gate_up_type=gu_type,
+                down_type=dn_type,
+                gate_up_rows=self.gguf_gate_up_rows,
+                down_rows=self.gguf_down_rows,
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

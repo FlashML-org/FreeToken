@@ -123,9 +123,17 @@ def ggml_moe_a8_vec(
     quant_type: int,
     row: int,
     tokens: int,
+    expert_stride_bytes: int = 0,
 ) -> torch.Tensor:
-    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``."""
-    return _module().ggml_moe_a8_vec(x, weight, topk_ids, top_k, quant_type, row, tokens)
+    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``.
+
+    ``expert_stride_bytes`` == 0 assumes dense contiguous banks; > 0 reads each
+    expert at that fixed byte offset (padded flat banks for mixed-quant models,
+    where a layer's real payload occupies the leading bytes of each expert slot).
+    """
+    return _module().ggml_moe_a8_vec(
+        x, weight, topk_ids, top_k, quant_type, row, tokens, expert_stride_bytes
+    )
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:

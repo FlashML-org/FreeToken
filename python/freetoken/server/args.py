@@ -546,6 +546,12 @@ def parse_args(
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
     )
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help="Collect device-side per-layer MoE decode hit/miss counters.",
+    )
 
     parser.add_argument(
         "--moe-cpu-threads",

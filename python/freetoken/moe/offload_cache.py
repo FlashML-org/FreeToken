@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from typing import Iterator
@@ -45,6 +44,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # Mixed-type GGUF (laguna): flat padded uint8 slots [E, stride_bytes]; the
+    # per-layer quant geometry lives on the MoE layer, not the bank shape.
+    "gguf": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -100,6 +102,45 @@ _BANK_BYTES_PER_EXPERT = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+class _GeometryPoolState:
+    """Decode-only LRU state backed by exact-width views into legacy arenas."""
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        num_experts: int,
+        cache_size: int,
+        device: torch.device,
+        layer_ids: tuple[int, ...],
+        row_bytes: tuple[int, ...],
+        bank_views: tuple[torch.Tensor, ...],
+    ) -> None:
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.cache_size = cache_size
+        self.device = device
+        self.layer_ids = layer_ids
+        self.row_bytes = row_bytes
+        self.bank_views = bank_views
+        self.slot_for_id = torch.full(
+            (num_layers, num_experts), -1, dtype=torch.int32, device=device
+        )
+        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=device)
+        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=device)
+        self.step = torch.zeros((), dtype=torch.int64, device=device)
+        self.active_mask = torch.zeros((num_experts,), dtype=torch.int32, device=device)
+        plan_slots = max(num_experts, cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=device)
+        self.num_indices = torch.zeros((1,), dtype=torch.int64, device=device)
+        self.lru_stats = torch.zeros((num_layers, N_STATS), dtype=torch.int64, device=device)
+        self.collect_stats = False
+        self.copy_dst_ptrs: torch.Tensor | None = None
+        self.copy_src_ptrs: dict[int, torch.Tensor] = {}
+        self.copy_feat_bytes: torch.Tensor | None = None
+
+
 @dataclass
 class OffloadMoeCache:
     num_layers: int
@@ -141,6 +182,10 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # Heterogeneous GGUF only. A positive top-k activates exact-geometry decode
+    # pools carved from the existing max-stride byte arenas.
+    geometry_pool_top_k: int = 0
+    geometry_pool_max_batch: int = 1
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -253,6 +298,14 @@ class OffloadMoeCache:
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
+        self._copy_payload_bytes: list[torch.Tensor] | None = None
+        self._copy_src_row_strides: list[torch.Tensor] | None = None
+        self._copy_dst_row_strides: torch.Tensor | None = None
+        self.has_heterogeneous_rows = False
+        self._geometry_pools: list[_GeometryPoolState] = []
+        self._geometry_pool_for_layer: dict[int, _GeometryPoolState] = {}
+        self._pending_geometry_pool: _GeometryPoolState | None = None
+        self._pending_geometry_prefill = False
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -282,6 +335,133 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
+    def _allocate_bank_cache(self, per_layer: list[torch.Tensor]) -> torch.Tensor:
+        head = per_layer[0]
+        row_numel = [source[0].numel() for source in per_layer]
+        if len(set(row_numel)) == 1 and all(source.shape == head.shape for source in per_layer):
+            shape = (self.cache_size, *head.shape[1:])
+        else:
+            shape = (self.cache_size, max(row_numel))
+        return torch.empty(shape, dtype=head.dtype, device=self.device)
+
+    @staticmethod
+    def _copy_compact_layer(
+        destination: torch.Tensor,
+        source: torch.Tensor,
+        *,
+        registered_host: bool = False,
+    ) -> None:
+        """Copy compact source rows into the leading bytes/elements of padded rows."""
+        dst = destination.reshape(destination.shape[0], -1)
+        src = source.reshape(source.shape[0], -1)
+        if registered_host and dst.is_cuda and dst.shape[1] != src.shape[1]:
+            from freetoken.kernel.fast_index_copy import (
+                fast_index_copy_rows_strided_jit,
+            )
+
+            fast_index_copy_rows_strided_jit(dst, src)
+            return
+        dst[:, : src.shape[1]].copy_(src, non_blocking=True)
+
+    def _init_geometry_pools(self) -> None:
+        self._geometry_pools = []
+        self._geometry_pool_for_layer = {}
+        self._pending_geometry_pool = None
+        if (
+            self.quant_format != "gguf"
+            or not self.has_heterogeneous_rows
+            or self.decode_target != "gpu"
+            or self.geometry_pool_top_k <= 0
+            or self._unpinned_layers
+        ):
+            return
+
+        from freetoken.engine.cache_budget import plan_geometry_pool_slots
+
+        rows_by_layer = [
+            tuple(
+                self.bank_sources[name][layer_id][0].numel()
+                * self.bank_sources[name][layer_id].element_size()
+                for name in self.bank_schema
+            )
+            for layer_id in range(self.num_layers)
+        ]
+        plan = plan_geometry_pool_slots(
+            rows_by_layer,
+            legacy_cache_size=self.cache_size,
+            num_experts=self.num_experts,
+            top_k=self.geometry_pool_top_k,
+            max_decode_batch=self.geometry_pool_max_batch,
+        )
+        if plan is None:
+            logger.warning(
+                "GGUF geometry decode floors do not fit the MoE byte arenas; "
+                "using the unified max-stride cache"
+            )
+            return
+
+        offsets = [0] * len(self.bank_schema)
+        for entry in plan:
+            views = []
+            for bank_index, name in enumerate(self.bank_schema):
+                arena = self.bank_caches[name].reshape(-1)
+                dtype_bytes = arena.element_size()
+                row_bytes = entry.row_bytes[bank_index]
+                if row_bytes % dtype_bytes:
+                    raise ValueError("geometry row bytes must align to the bank dtype")
+                row_elements = row_bytes // dtype_bytes
+                pool_elements = entry.slots * row_elements
+                offset = offsets[bank_index]
+                view = arena.narrow(0, offset, pool_elements).view(entry.slots, row_elements)
+                views.append(view)
+                offsets[bank_index] += pool_elements
+            pool = _GeometryPoolState(
+                num_layers=self.num_layers,
+                num_experts=self.num_experts,
+                cache_size=entry.slots,
+                device=self.device,
+                layer_ids=entry.layer_ids,
+                row_bytes=entry.row_bytes,
+                bank_views=tuple(views),
+            )
+            self._geometry_pools.append(pool)
+            for layer_id in entry.layer_ids:
+                self._geometry_pool_for_layer[layer_id] = pool
+
+        if self.device.type == "cuda":
+            from freetoken.kernel.pinned import device_ptr
+
+            for pool in self._geometry_pools:
+                pool.copy_dst_ptrs = torch.tensor(
+                    [view.data_ptr() for view in pool.bank_views],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                pool.copy_feat_bytes = torch.tensor(
+                    pool.row_bytes, dtype=torch.int64, device=self.device
+                )
+                for layer_id in pool.layer_ids:
+                    pool.copy_src_ptrs[layer_id] = torch.tensor(
+                        [
+                            device_ptr(self.bank_sources[name][layer_id])
+                            for name in self.bank_schema
+                        ],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+        self.prefill_hit_d2d = False
+        detail = ", ".join(
+            f"layers={len(pool.layer_ids)} slots={pool.cache_size} rows={pool.row_bytes}"
+            for pool in self._geometry_pools
+        )
+        logger.info("GGUF geometry decode pools: %s", detail)
+
+    def geometry_pool_sizes(self) -> dict[int, int]:
+        return {
+            layer_id: pool.cache_size
+            for layer_id, pool in self._geometry_pool_for_layer.items()
+        }
+
     def set_bank_sources(
         self,
         sources: dict[str, list[torch.Tensor]],
@@ -293,7 +473,9 @@ class OffloadMoeCache:
         Every bank is a list of ``num_layers`` tensors, one ``[num_experts, ...]``
         per layer (independent allocations, so each layer can carry its own host
         attributes); each slot cache mirrors the bank's row shape and dtype as one
-        unified GPU pool. The row layouts are produced by the weight loaders /
+        unified GPU pool. Heterogeneous banks use a flat cache whose stride is the
+        largest layer row while each host layer remains compact. The row layouts are
+        produced by the weight loaders /
         repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.moe.nvfp4_backends`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
@@ -325,24 +507,48 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self.has_heterogeneous_rows = False
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
-            for layer_id, source in enumerate(per_layer):
-                assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
-                assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
-                    name, layer_id, source.shape, source.dtype,
+            if not all(source.size(0) == self.num_experts for source in per_layer):
+                raise ValueError(
+                    f"bank {name!r} must contain {self.num_experts} experts per layer"
+                )
+            if self.quant_format == "gguf":
+                if not all(
+                    source.dim() == 2
+                    and source.dtype == torch.uint8
+                    and source.is_contiguous()
+                    for source in per_layer
+                ):
+                    raise ValueError(
+                        f"GGUF bank {name!r} requires 2-D contiguous uint8 rows"
+                    )
+            elif not all(
+                source.shape == head.shape
+                and source.dtype == head.dtype
+                and source.is_contiguous()
+                for source in per_layer
+            ):
+                raise ValueError(
+                    f"bank {name!r} requires uniform per-layer shapes and dtypes with "
+                    f"contiguous storage for quant_format={self.quant_format!r}"
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
+            self.bank_caches[name] = self._allocate_bank_cache(per_layer)
+            self.has_heterogeneous_rows |= any(
+                source.shape != head.shape for source in per_layer[1:]
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
+        if self.has_heterogeneous_rows and self.device.type == "cuda" and not self._copy_fused_ok:
+            raise ValueError(
+                "heterogeneous GGUF rows require 16-byte-aligned source payloads, "
+                "strides, and mapped host addresses"
+            )
+        self._init_geometry_pools()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
@@ -371,23 +577,38 @@ class OffloadMoeCache:
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._copy_payload_bytes = None
+        self._copy_src_row_strides = None
+        self._copy_dst_row_strides = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
-        if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
+        if self.device.type != "cuda" or not self.banks:
+            return
+        # FREETOKEN_FUSED_COPY disables the uniform multi-bank optimization. Compact
+        # heterogeneous rows still require the strided correctness path.
+        if not _FUSED_COPY and not self.has_heterogeneous_rows:
             return
         from freetoken.kernel.pinned import device_ptr
 
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
+        layer_payloads = [[] for _ in range(self.num_layers)]
+        layer_src_strides = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            feat = cache[0].numel() * cache.element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
+                payload = source[0].numel() * source.element_size()
+                src_stride = source.stride(0) * source.element_size()
+                if payload > feat or payload % 16 != 0 or src_stride % 16 != 0:
+                    return
+                layer_payloads[layer_id].append(payload)
+                layer_src_strides[layer_id].append(src_stride)
                 if layer_id in self._unpinned_layers:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
@@ -408,6 +629,15 @@ class OffloadMoeCache:
             for ptrs in layer_src_ptrs
         ]
         self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+        self._copy_payload_bytes = [
+            torch.tensor(payloads, dtype=torch.int64, device=self.device)
+            for payloads in layer_payloads
+        ]
+        self._copy_src_row_strides = [
+            torch.tensor(strides, dtype=torch.int64, device=self.device)
+            for strides in layer_src_strides
+        ]
+        self._copy_dst_row_strides = self._copy_feat_bytes
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
         self._copy_feat_bytes_host = feats
@@ -459,7 +689,11 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
-        # 2. Drop old GPU tensors (free-before-alloc).
+        # 2. Drop old GPU tensors (free-before-alloc), including geometry aliases.
+        self._geometry_pools = []
+        self._geometry_pool_for_layer = {}
+        self._pending_geometry_pool = None
+        self._pending_geometry_prefill = False
         self.banks = []
         self.bank_caches = {}
         self.cache_size = cache_size
@@ -468,12 +702,10 @@ class OffloadMoeCache:
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
-            )
+            self.bank_caches[name] = self._allocate_bank_cache(self.bank_sources[name])
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        self._init_geometry_pools()
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
@@ -572,10 +804,18 @@ class OffloadMoeCache:
         hi = lo + self.num_experts
         return self.gate_up_alpha[lo:hi], self.down_alpha[lo:hi]
 
-    def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
-        """Per-bank cache views in registration order: the full ``[S]`` slot cache
-        (decode), or its first ``n`` slots (materialized layer)."""
+    def bank_views(
+        self,
+        n: int | None = None,
+        *,
+        layer_id: int | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Per-bank decode pool or leading full-layer prefill overlay."""
         assert self.banks, "set_bank_sources must register the banks first"
+        if n is None and self._geometry_pools:
+            if layer_id is None:
+                raise ValueError("layer_id is required for geometry decode pools")
+            return self._geometry_pool_for_layer[layer_id].bank_views
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
@@ -624,6 +864,11 @@ class OffloadMoeCache:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        if self._geometry_pools:
+            from freetoken.moe.offload_kernels import reset_cache
+
+            for pool in self._geometry_pools:
+                reset_cache(pool)
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -661,7 +906,9 @@ class OffloadMoeCache:
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                self._copy_compact_layer(
+                    buffer[buffer_id], per_layer[layer_id], registered_host=True
+                )
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -690,6 +937,8 @@ class OffloadMoeCache:
             reason = "prefill overlap buffers are not initialized for this device"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
+        elif self.has_heterogeneous_rows:
+            reason = "heterogeneous source rows require the full-layer copy path"
         elif not self._copy_fused_ok:
             reason = "the fused copy plan is unavailable (bank alignment or FREETOKEN_FUSED_COPY=0)"
         elif self.cache_size <= 2 * self.num_experts:
@@ -827,7 +1076,15 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        self._pending_geometry_prefill = False
+        pool = self._geometry_pool_for_layer.get(layer_id)
+        if pool is not None:
+            pool.collect_stats = self.collect_stats
+            self._pending_geometry_pool = pool
+            ensure_experts(pool, layer_id, expert_ids)
+        else:
+            self._pending_geometry_pool = None
+            ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -851,16 +1108,30 @@ class OffloadMoeCache:
         )
 
     def materialize_layer(self, layer_id: int) -> None:
-        from freetoken.moe.offload_kernels import materialize_layer
+        from freetoken.moe.offload_kernels import materialize_layer, reset_cache
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        if self._geometry_pools:
+            for pool in self._geometry_pools:
+                reset_cache(pool)
+            self._pending_geometry_pool = None
+            self._pending_geometry_prefill = True
+            return
+        self._pending_geometry_pool = None
+        self._pending_geometry_prefill = False
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
-        reset_cache(self)
+        if self._geometry_pools:
+            for pool in self._geometry_pools:
+                reset_cache(pool)
+        else:
+            reset_cache(self)
+        self._pending_geometry_pool = None
+        self._pending_geometry_prefill = False
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
@@ -869,6 +1140,8 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
+        for pool in self._geometry_pools:
+            pool.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -903,15 +1176,52 @@ class OffloadMoeCache:
         self.stat_steps_layer[layer_id] += 1
 
     def decode_miss_stats(self) -> dict:
+        lru_stats = self.lru_stats
         if self.decode_target == "hybrid":
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
+            transferred_by_layer = self.stat_fetched_layer.tolist()
+            fetched = int(self.stat_fetched.item())
         else:
-            active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
+            if self._geometry_pools:
+                lru_stats = torch.stack(
+                    [pool.lru_stats for pool in self._geometry_pools]
+                ).sum(0)
+            active, missing, calls = (int(x) for x in lru_stats.sum(0))
+            missing_by_layer = lru_stats[:, Stat.MISS].tolist()
+            if self.decode_target == "gpu":
+                transferred_by_layer = missing_by_layer
+            elif self.decode_target == "cpu":
+                transferred_by_layer = [
+                    0 if layer_id in self.cpu_layer_ids else rows
+                    for layer_id, rows in enumerate(missing_by_layer)
+                ]
+            else:
+                transferred_by_layer = [0] * self.num_layers
+            fetched = sum(transferred_by_layer)
+        bytes_h2d = 0
+        if self.bank_sources:
+            payload_bytes_by_layer = [
+                sum(
+                    per_layer[layer_id][0].numel()
+                    * per_layer[layer_id].element_size()
+                    for per_layer in self.bank_sources.values()
+                )
+                for layer_id in range(self.num_layers)
+            ]
+            bytes_h2d = sum(
+                rows * payload_bytes
+                for rows, payload_bytes in zip(
+                    transferred_by_layer, payload_bytes_by_layer, strict=True
+                )
+            )
         return {
             "layer_calls": calls,
+            "requested_rows": active,
+            "miss_rows": missing,
+            "hit_rows": active - missing,
+            "bytes_h2d": bytes_h2d,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
             "miss_rate": (missing / active) if active else 0.0,
@@ -936,10 +1246,24 @@ class OffloadMoeCache:
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
+            fetched = self.stat_fetched_layer.tolist()
         else:
-            cols = self.lru_stats.t().tolist()
+            lru_stats = self.lru_stats
+            if self._geometry_pools:
+                lru_stats = torch.stack(
+                    [pool.lru_stats for pool in self._geometry_pools]
+                ).sum(0)
+            cols = lru_stats.t().tolist()
             active, missing, steps = cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.CALLS]
-        fetched = self.stat_fetched_layer.tolist()
+            if self.decode_target == "gpu":
+                fetched = missing
+            elif self.decode_target == "cpu":
+                fetched = [
+                    0 if layer_id in self.cpu_layer_ids else rows
+                    for layer_id, rows in enumerate(missing)
+                ]
+            else:
+                fetched = [0] * self.num_layers
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]
@@ -989,6 +1313,14 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self._pending_geometry_prefill:
+            for per_layer, cache in self.banks:
+                self._copy_compact_layer(
+                    cache[: self.num_experts],
+                    per_layer[layer_id],
+                    registered_host=True,
+                )
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -999,9 +1331,43 @@ class OffloadMoeCache:
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+                self._copy_compact_layer(cache[: self.num_experts], per_layer[layer_id])
+            return
+        pool = self._pending_geometry_pool
+        if pool is not None and not self._pending_geometry_prefill:
+            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+            assert pool.copy_dst_ptrs is not None and pool.copy_feat_bytes is not None
+            fast_index_copy_multi_jit(
+                pool.copy_dst_ptrs,
+                pool.copy_src_ptrs[layer_id],
+                pool.copy_feat_bytes,
+                pool.evict_slots,
+                pool.src_indices,
+                pool.num_indices,
+            )
             return
         if self._copy_fused_ok:
+            assert self._copy_dst_ptrs is not None and self._copy_src_ptrs is not None
+            if self.has_heterogeneous_rows:
+                from freetoken.kernel.fast_index_copy import (
+                    fast_index_copy_multi_strided_jit,
+                )
+
+                assert self._copy_payload_bytes is not None
+                assert self._copy_src_row_strides is not None
+                assert self._copy_dst_row_strides is not None
+                fast_index_copy_multi_strided_jit(
+                    self._copy_dst_ptrs,
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_payload_bytes[layer_id],
+                    self._copy_dst_row_strides,
+                    self._copy_src_row_strides[layer_id],
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                )
+                return
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
@@ -1017,6 +1383,12 @@ class OffloadMoeCache:
                 self.num_indices,
             )
             return
+
+        if self.has_heterogeneous_rows:
+            raise RuntimeError(
+                "heterogeneous expert rows require the strided fused copy plan "
+                "(CUDA device, 16-byte aligned rows, and FREETOKEN_FUSED_COPY=1)"
+            )
 
         from freetoken.kernel import fast_index_copy_jit
 
