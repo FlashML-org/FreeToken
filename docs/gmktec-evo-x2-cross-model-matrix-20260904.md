@@ -35,6 +35,7 @@ length is retained as observed telemetry rather than silently normalized.
 | Qwen3.6 35B-A3B FreeToken Q4_K_M GGUF | 1 | 54 | 255 | 50.0169 | 54.311 s cold request | Expected answer path passed; output hash differs from llama.cpp |
 | Qwen3.6 35B-A3B llama.cpp Q4_K_M GGUF ROCm 10 | 1 | 54 | 256 | 49.3875 | 234.0 ms loaded control | Expected answer path passed; output hash differs from FreeToken |
 | Qwen3.6 35B-A3B FreeToken Q4_K_M GGUF warmed matrix | 5 | 54 | 255 | 48.6028 all samples; 49.4357 samples 2 to 5 | 982.17 ms all samples; 424.26 ms samples 2 to 5 | All five output hashes match; expected answer path passed |
+| Qwen3.6 35B-A3B llama.cpp Q4_K_M GGUF warmed matrix | 5 | 54 | 256 | 49.1155 all samples; 49.1772 samples 2 to 5 | 92.07 ms all samples; 58.83 ms samples 2 to 5 | All five output hashes match; expected answer path passed |
 
 The same 22 GiB Q4_K_M GGUF checkpoint, tokenizer, caller-rendered raw
 prompt, and output harness were used. FreeToken was approximately 1.27 percent
@@ -49,7 +50,12 @@ requests. Its first scored request measured 45.2713 TPS while requests 2 to 5
 measured 49.3630, 49.3096, 49.6545, and 49.4156 TPS. This separates cold
 startup and first-request effects from the steady request path. A warmed
 five-sample llama.cpp matrix is still required before declaring a statistical
-same-format winner.
+same-format winner. The warmed llama.cpp follow-up measured 48.8686 TPS on
+the first request and 49.1575, 49.1606, 49.1887, and 49.2019 TPS on requests
+2 through 5. FreeToken's samples 2 to 5 mean was 49.4357 TPS, approximately
+0.53 percent above llama.cpp's 49.1772 TPS. Across all five samples, llama.cpp
+was approximately 1.06 percent faster because FreeToken's first request was
+slower. This is a near-parity result, not a material performance lead.
 
 The Q4 rows are practical local controls, not a same-format NVFP4 equivalence
 claim. The Q5 four-row row is the currently qualified quality-preserving
