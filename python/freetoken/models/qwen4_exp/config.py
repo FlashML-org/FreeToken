@@ -12,6 +12,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    vision_load_enabled,
 )
 
 
@@ -40,6 +41,10 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # mRoPE: which rotary frequencies follow the image H / W axes (HF mrope_section, interleaved).
+    mrope_section: Tuple[int, ...] = (11, 11, 10)
+    # Vision patch merge (2 -> one soft token per 2x2 patches); only read when vision is loaded.
+    spatial_merge_size: int = 2
 
     @property
     def index_topk_blocks(self) -> int:
@@ -233,6 +238,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
+    # Vision is opt-in (FREETOKEN_LOAD_VISION=1): the tower is ~0.9 GiB bf16 per rank.
+    vision_config = getattr(hf_config, "vision_config", None) if vision_load_enabled() else None
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -251,6 +258,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mrope_section=tuple(int(v) for v in rope_params.get("mrope_section", (11, 11, 10))),
+        spatial_merge_size=int(getattr(vision_config, "spatial_merge_size", 2)),
     )
 
     return ModelConfig(
@@ -278,7 +287,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # served text-only
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,

@@ -74,7 +74,7 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    distributed_timeout: float = 1800.0  # ranks reach the first collective minutes apart on a 100+ GiB offload load
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
