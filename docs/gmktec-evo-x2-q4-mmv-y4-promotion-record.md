@@ -118,12 +118,12 @@ completed the fixed three-sample scheduler-shaped matrix:
 - maximum token gap: 43.781 ms
 - failed samples: zero
 
-The canonical current Qwen quality output was produced with SHA1
-`3302eda43396`. An older helper still labels that output as a failure because
-it hard-codes the superseded reference SHA1 `0acef4eab6f4`. That wrapper result
-is retained as a harness-version discrepancy, not as a model-quality verdict.
-The current accepted quality gate is the `3302eda43396` result recorded in the
-campaign audit.
+The canonical Q4 quality output was produced with SHA1 `3302eda43396`. The
+quality verifier now accepts an explicit `--expected-sha1 3302eda43396` contract
+selector while preserving the historical paper-inspired default
+`0acef4eab6f4`. This prevents a contract mismatch from being misreported as a
+model-quality failure. The selected hash and observed hash are both retained in
+the raw artifact.
 
 Against the accepted current Q4 scheduler baseline near 48.28 decode TPS, this
 current-branch Y4 result is approximately 5.8 percent slower. **Decision:

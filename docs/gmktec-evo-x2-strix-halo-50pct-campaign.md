@@ -879,9 +879,10 @@ an isolated checkout with 56 GiB free before model loading and 23.07 GiB free
 after initialization. Its fixed three-sample scheduler-shaped matrix passed
 all requests and measured 45.4603 mean decode TPS, 2,753.3639 mean
 client-observed prefill TPS, 0.0927 decode-TPS standard deviation, and 43.781
-ms maximum token gap. The canonical current AIME output hash was
-`3302eda43396`; the older helper's superseded `0acef4eab6f4` expectation was
-classified as a harness-version discrepancy.
+ms maximum token gap. The canonical Q4 AIME output hash was `3302eda43396`.
+The verifier now selects that contract explicitly with
+`--expected-sha1 3302eda43396`; the historical paper-inspired
+`0acef4eab6f4` contract remains available as the default.
 
 **Decision: reject current-branch MMV-Y4 for promotion.** It was approximately
 5.8 percent slower than the accepted current Q4 scheduler control near 48.28

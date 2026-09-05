@@ -190,9 +190,9 @@ The candidate reached API readiness with 56 GiB free before model loading and
 23.07 GiB free after initialization. Three scheduler-shaped throughput samples
 completed without failure: 45.4603 mean decode TPS, 2,753.3639 mean
 client-observed prefill TPS, 0.0927 decode-TPS standard deviation, and 43.781
-ms maximum token gap. The canonical current Qwen output hash was
-`3302eda43396`; an older helper's `0acef4eab6f4` expectation was recorded as a
-harness-version mismatch rather than a quality failure. Relative to the
+ms maximum token gap. The canonical Q4 output hash was `3302eda43396`, selected
+with the verifier's explicit `--expected-sha1 3302eda43396` contract option;
+the historical `0acef4eab6f4` default remains separate. Relative to the
 accepted current Q4 control near 48.28 decode TPS, Y4 was approximately 5.8
 percent slower and was rejected for promotion. The default remains Y1. The
 protected Qwen service was restored and returned `status: ok` with
