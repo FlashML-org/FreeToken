@@ -83,3 +83,13 @@ performance claims separate.
 
 The checklist is a review aid. The raw benchmark artifacts remain the
 authoritative evidence for measured claims.
+
+## Local handoff audit
+
+The final local audit passed on 2026-09-05:
+
+- The branch worktree is clean and synchronized with its remote branch.
+- `git diff --check` passed.
+- The machine-readable manifest parses as valid JSON.
+- Every relative evidence link in this checklist and the final campaign report
+  resolves to a tracked local file.
