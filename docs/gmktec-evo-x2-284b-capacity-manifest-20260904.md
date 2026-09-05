@@ -31,6 +31,20 @@ KV cache, and swap behavior under the exact model configuration.
 A read-only search of the configured model directory found no file or directory
 matching `284B`, `280B`, or `235B`.  No 284B capacity test was therefore run.
 
+## Latest live refresh
+
+A second read-only probe on 2026-09-05T12:01:56Z confirmed the capacity
+boundary while the protected Qwen service was healthy. The host reported 59
+GiB total memory, 18 GiB available, 127 GiB configured swap with 2.0 GiB in
+use, and 769 GiB free on the model filesystem. ROCm reported the same 2 GiB
+dedicated VRAM and `gfx1151`, with 367,693,824 bytes currently used, 32.0 C,
+28.042 W, and zero percent GPU utilization. The configured model payloads were
+approximately 22 GiB for Qwen NVFP4, 67 GiB for the Qwen safetensors source,
+and 15 GiB for Gemma Q4. No DeepSeek or 284B model payload was found in the
+configured FreeToken model directory. Source-code references and archived
+configuration names are not model payloads and are not treated as admission
+evidence.
+
 ## Qualification result
 
 **INCOMPLETE.**  The current manifest establishes the memory and GPU baseline,
