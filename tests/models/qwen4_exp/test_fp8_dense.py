@@ -121,3 +121,20 @@ def test_quant_per_tensor_zero_input_is_finite():
         torch.zeros(16, 128, device="cuda", dtype=torch.bfloat16)
     )
     assert torch.isfinite(scale).item() and (x8.float() == 0).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("n", [4096, 16384, 20480, 81920, 200000])
+def test_split_quant_path_agrees_with_the_single_program_one(n: int):
+    """The two-launch path above _SPLIT_MIN_ELEMENTS must quantize bit for bit like the
+    one-program kernel: same amax (max is exact under any grouping), same arithmetic."""
+    import freetoken.layers.fp8_dynamic as m
+
+    torch.manual_seed(0)
+    x = (torch.randn(n, device="cuda") * 3.0).to(torch.bfloat16)
+    got8, got_scale = m.quant_per_tensor(x)
+    ref8 = torch.empty_like(x, dtype=m.FP8)
+    ref_scale = torch.empty((), dtype=torch.float32, device="cuda")
+    m._quant_fused_kernel[(1,)](x, ref8, ref_scale, n, BLOCK=m._BLOCK, num_warps=8)
+    assert torch.equal(got_scale, ref_scale)
+    assert torch.equal(got8.view(torch.uint8), ref8.view(torch.uint8))
