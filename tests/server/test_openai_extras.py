@@ -240,7 +240,7 @@ def test_sampling_extras_reach_sampling_params():
     sp = spec.sampling_params
     assert sp.min_p == 0.1 and sp.repetition_penalty == 1.2
     assert sp.presence_penalty == 0.5 and sp.frequency_penalty == 0.3
-    assert sp.logit_bias == {5: 100.0, 7: -3.0}  # clamped to the OpenAI range
+    assert sp.logit_bias == [[5, 100.0], [7, -3.0]]  # clamped to the OpenAI range
     assert sp.min_tokens == 3 and sp.stop_token_ids == [9]
     assert sp.include_stop_str_in_output is True and sp.skip_special_tokens is True
     assert sp.needs_logits_processing

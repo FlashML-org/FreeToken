@@ -33,8 +33,9 @@ class SamplingParams:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    # token id -> additive logit bias (OpenAI logit_bias, clamped to [-100, 100] by the API).
-    logit_bias: dict[int, float] | None = None
+    # OpenAI logit_bias as [[token id, bias], ...] (clamped to [-100, 100] by the API). A list,
+    # not a dict: the messages cross process boundaries as msgpack, which refuses int map keys.
+    logit_bias: list[list[float]] | None = None
     # No EOS / stop token before this many generated tokens (vLLM min_tokens, SGLang
     # min_new_tokens). The scheduler fills min_tokens_stop_ids with the ids to mask.
     min_tokens: int = 0

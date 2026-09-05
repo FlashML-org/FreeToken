@@ -201,8 +201,8 @@ class Sampler:
         bias_ids: list[int] = []
         bias_vals: list[float] = []
         for local, (_, p) in enumerate(picked):
-            for tid, val in (p.logit_bias or {}).items():
-                if 0 <= tid < self.vocab_size:
+            for tid, val in p.logit_bias or ():
+                if 0 <= int(tid) < self.vocab_size:
                     bias_rows.append(local)
                     bias_ids.append(int(tid))
                     bias_vals.append(float(val))

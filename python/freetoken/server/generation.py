@@ -200,9 +200,9 @@ def resolve_sampling(
         raise ValueError(f"repetition_penalty must be positive, got {resolved_rep}")
     if min_tokens < 0:
         raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
-    bias: dict[int, float] | None = None
+    bias: list[list[float]] | None = None
     if logit_bias:
-        bias = {}
+        bias = []
         for key, value in logit_bias.items():
             try:
                 tid = int(key)
@@ -210,7 +210,7 @@ def resolve_sampling(
                 raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
             if tid < 0:
                 raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
-            bias[tid] = max(-100.0, min(100.0, float(value)))  # the OpenAI range
+            bias.append([tid, max(-100.0, min(100.0, float(value)))])  # the OpenAI range
     ids = [int(t) for t in (stop_token_ids or [])]
     if any(t < 0 for t in ids):
         raise ValueError("stop_token_ids must be non-negative token ids")

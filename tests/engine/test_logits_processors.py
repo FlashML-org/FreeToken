@@ -125,7 +125,7 @@ def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
                 4,
                 presence_penalty=1.0,
                 repetition_penalty=1.5,
-                logit_bias={5: 2.0},
+                logit_bias=[[5, 2.0]],
             ),
             _req([4], [], 4, min_tokens=2, min_tokens_stop_ids=[0, 7]),
             _req(
