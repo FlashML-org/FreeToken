@@ -817,14 +817,29 @@ async def cache_status():
     }
 
 
+def _maintenance_gate(state: Any) -> JSONResponse | None:
+    """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
+    runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
+    None when serving."""
+    mstate = getattr(state, "maintenance_state", "serving")
+    if mstate == "serving":
+        return None
+    if mstate == "loading":
+        msg = "model is still loading"
+    elif mstate == "failed":
+        msg = "server unavailable: maintenance failed (restart required)"
+    else:
+        msg = "server unavailable: cache rebuild in progress"
+    return JSONResponse({"error": msg}, status_code=503)
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     log_request("/generate", req, request)
     state = get_global_state()
-    if state.maintenance_state != "serving":
-        detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
-        return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
+    if (gate := _maintenance_gate(state)) is not None:
+        return gate
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
     uid = state.new_user()
