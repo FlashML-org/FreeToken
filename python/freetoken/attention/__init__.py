@@ -80,6 +80,18 @@ def create_fa_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "iso",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL}),
+    ),
+)
+def create_iso_backend(config: ModelConfig):
+    from .iso import IsoAttentionBackend
+
+    return IsoAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "triton",
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),

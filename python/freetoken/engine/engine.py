@@ -151,6 +151,36 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     )
 
 
+def _adjust_iso_kv_cache(config, override) -> None:
+    """--kv-cache-iso validation + backend forcing (runs before attention auto-resolution)."""
+    fmt = config.kv_cache_iso
+    if fmt not in ("iso3", "iso4"):
+        raise ValueError(f"--kv-cache-iso: expected 'iso3' or 'iso4', got {fmt!r}")
+    specs = list(config.model_config.kv_cache_group_specs())
+    types = {spec.attn_type for spec in specs}
+    if types != {AttnType.FULL}:
+        raise ValueError(
+            "--kv-cache-iso supports plain full-attention pools only "
+            f"(no SWA/MLA/DSA/BSA/QSA/DSV4), got attention types: {sorted(t.value for t in types)}"
+        )
+    if getattr(config, "dtype", torch.bfloat16) != torch.bfloat16:
+        raise ValueError("--kv-cache-iso requires --dtype bfloat16 (the pack kernels read bf16)")
+    for spec in specs:
+        if spec.head_dim % 128 != 0:
+            raise ValueError(
+                f"--kv-cache-iso requires head_dim % 128 == 0, got {spec.head_dim} "
+                f"in group {spec.name!r}"
+            )
+    if config.attention_backend == "auto":
+        override("attention_backend", "iso")
+        logger.info_rank0("Auto-selected attention backend: iso (kv_cache_iso)")
+    elif config.attention_backend != "iso":
+        raise ValueError(
+            f"--kv-cache-iso {fmt} requires --attention-backend iso (or auto), "
+            f"got {config.attention_backend!r}"
+        )
+
+
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
     """Config-time type x backend capability check for the resolved (or explicit)
     backend string: every comma part must serve every required type and have its
@@ -309,6 +339,12 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        if getattr(config, "kv_cache_iso", "off") != "off":
+            # ISO-quantized KV pool (validated in _adjust_config above: plain FULL attention,
+            # so the resolved family is the MHA pool).
+            from freetoken.kvcache.iso_pool import ISOKVCache
+
+            self._pool_cls = ISOKVCache
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -1325,6 +1361,8 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    if getattr(config, "kv_cache_iso", "off") != "off":
+        _adjust_iso_kv_cache(config, override)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
