@@ -59,6 +59,48 @@
       "artifact": "/home/david/freetoken-amd/artifacts/qwen-llamacpp-paired-20260905T062500Z"
     },
     {
+      "run_id": "qwen36_q4km_gguf_freetoken_raw",
+      "model_id": "Qwen3.6-35B-A3B",
+      "runtime": "FreeToken",
+      "format": "Q4_K_M GGUF",
+      "request_shape": {
+        "samples": 1,
+        "prompt_tokens_observed": 54,
+        "completion_tokens_observed": 255,
+        "prompt_contract": "caller-rendered raw prompt via /v1/completions",
+        "completion_contract": "256-token cap",
+        "warmup_policy": "cold model initialization included in TTFT",
+        "concurrency": 1
+      },
+      "metrics": {
+        "decode_tps": 50.0169,
+        "ttft_ms": 54311.0295,
+        "quality_status": "expected answer path passed; full output hash differs from llama.cpp"
+      },
+      "artifact": "/home/david/freetoken-amd/artifacts/qwen-gguf-raw-20260905T121136Z/raw-quality.json"
+    },
+    {
+      "run_id": "qwen36_q4km_gguf_llama_cpp_raw",
+      "model_id": "Qwen3.6-35B-A3B",
+      "runtime": "llama.cpp",
+      "format": "Q4_K_M GGUF",
+      "request_shape": {
+        "samples": 1,
+        "prompt_tokens_observed": 54,
+        "completion_tokens_observed": 256,
+        "prompt_contract": "caller-rendered raw prompt via /v1/completions",
+        "completion_contract": "256-token cap",
+        "warmup_policy": "model loaded before request",
+        "concurrency": 1
+      },
+      "metrics": {
+        "decode_tps": 49.3875,
+        "ttft_ms": 234.0382,
+        "quality_status": "expected answer path passed; full output hash differs from FreeToken"
+      },
+      "artifact": "/home/david/freetoken-amd/artifacts/qwen-llama-raw-20260905T122310Z/raw-quality.json"
+    },
+    {
       "run_id": "gemma4_q4_freetoken_text",
       "model_id": "Gemma 4 26B A4B",
       "runtime": "FreeToken",

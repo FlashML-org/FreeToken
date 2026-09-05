@@ -28,6 +28,21 @@ length is retained as observed telemetry rather than silently normalized.
 | Qwen3.6 35B-A3B FreeToken Q5 four-row | 3 scheduler plus 3 C4 rounds | Fixed scheduler contract | Fixed scheduler contract | 3,130.30 | 48.20 single, 94.80 aggregate C4 | p99 TTFT 1.025 s; p99 gap 39.93 ms | Canonical AIME passed |
 | Qwen3.6 35B-A3B FreeToken Q4 MMV_Y=4 | 5 | Fixed API contract | Fixed API contract | 2,857.78 | 48.03 | Mean client TTFT about 0.424 s | Quality and API checks passed |
 
+### Same-checkpoint and same-format raw-prompt control
+
+| Model and runtime | Samples | Prompt tokens | Completion tokens | Decode TPS | TTFT | Quality result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Qwen3.6 35B-A3B FreeToken Q4_K_M GGUF | 1 | 54 | 255 | 50.0169 | 54.311 s cold request | Expected answer path passed; output hash differs from llama.cpp |
+| Qwen3.6 35B-A3B llama.cpp Q4_K_M GGUF ROCm 10 | 1 | 54 | 256 | 49.3875 | 234.0 ms loaded control | Expected answer path passed; output hash differs from FreeToken |
+
+The same 22 GiB Q4_K_M GGUF checkpoint, tokenizer, caller-rendered raw
+prompt, and output harness were used. FreeToken was approximately 1.27 percent
+faster on decode. TTFT is not a valid parity claim in this pair because the
+FreeToken measurement includes its cold model initialization while llama.cpp
+was already loaded. The two responses both reached the expected answer path,
+but their full output hashes differ, so this run is a performance control and
+not proof of bit-identical generation.
+
 The Q4 rows are practical local controls, not a same-format NVFP4 equivalence
 claim. The Q5 four-row row is the currently qualified quality-preserving
 optimization and is not directly comparable to the Q4 llama.cpp row without a
