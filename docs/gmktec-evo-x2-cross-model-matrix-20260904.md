@@ -34,6 +34,7 @@ length is retained as observed telemetry rather than silently normalized.
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Qwen3.6 35B-A3B FreeToken Q4_K_M GGUF | 1 | 54 | 255 | 50.0169 | 54.311 s cold request | Expected answer path passed; output hash differs from llama.cpp |
 | Qwen3.6 35B-A3B llama.cpp Q4_K_M GGUF ROCm 10 | 1 | 54 | 256 | 49.3875 | 234.0 ms loaded control | Expected answer path passed; output hash differs from FreeToken |
+| Qwen3.6 35B-A3B FreeToken Q4_K_M GGUF warmed matrix | 5 | 54 | 255 | 48.6028 all samples; 49.4357 samples 2 to 5 | 982.17 ms all samples; 424.26 ms samples 2 to 5 | All five output hashes match; expected answer path passed |
 
 The same 22 GiB Q4_K_M GGUF checkpoint, tokenizer, caller-rendered raw
 prompt, and output harness were used. FreeToken was approximately 1.27 percent
@@ -42,6 +43,13 @@ FreeToken measurement includes its cold model initialization while llama.cpp
 was already loaded. The two responses both reached the expected answer path,
 but their full output hashes differ, so this run is a performance control and
 not proof of bit-identical generation.
+
+The warmed FreeToken follow-up used one loaded server and five consecutive
+requests. Its first scored request measured 45.2713 TPS while requests 2 to 5
+measured 49.3630, 49.3096, 49.6545, and 49.4156 TPS. This separates cold
+startup and first-request effects from the steady request path. A warmed
+five-sample llama.cpp matrix is still required before declaring a statistical
+same-format winner.
 
 The Q4 rows are practical local controls, not a same-format NVFP4 equivalence
 claim. The Q5 four-row row is the currently qualified quality-preserving

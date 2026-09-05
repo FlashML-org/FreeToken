@@ -101,6 +101,29 @@
       "artifact": "/home/david/freetoken-amd/artifacts/qwen-llama-raw-20260905T122310Z/raw-quality.json"
     },
     {
+      "run_id": "qwen36_q4km_gguf_freetoken_warmed_matrix",
+      "model_id": "Qwen3.6-35B-A3B",
+      "runtime": "FreeToken",
+      "format": "Q4_K_M GGUF",
+      "request_shape": {
+        "samples": 5,
+        "prompt_tokens_observed": 54,
+        "completion_tokens_observed": 255,
+        "prompt_contract": "caller-rendered raw prompt via /v1/completions",
+        "completion_contract": "256-token cap",
+        "warmup_policy": "one loaded server; first scored request retained and samples 2 to 5 reported separately",
+        "concurrency": 1
+      },
+      "metrics": {
+        "mean_decode_tps_all_samples": 48.6028,
+        "mean_decode_tps_samples_2_to_5": 49.4357,
+        "mean_ttft_ms_all_samples": 982.1695,
+        "mean_ttft_ms_samples_2_to_5": 424.2563,
+        "quality_status": "passed; all five output hashes matched"
+      },
+      "artifact": "/home/david/freetoken-amd/artifacts/qwen-gguf-warm-matrix-20260905T122817Z"
+    },
+    {
       "run_id": "gemma4_q4_freetoken_text",
       "model_id": "Gemma 4 26B A4B",
       "runtime": "FreeToken",
