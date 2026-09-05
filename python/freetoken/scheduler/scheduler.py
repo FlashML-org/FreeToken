@@ -342,7 +342,7 @@ class Scheduler(SchedulerIOMixin):
                 hit_length = not req.can_decode
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
+                ) or next_token in req.sampling_params.stop_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
                     if not hit_eos and req.sampling_params.stop_strs
@@ -368,6 +368,8 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        keep_stop_str=req.sampling_params.include_stop_str_in_output,
+                        skip_special_tokens=req.sampling_params.skip_special_tokens,
                     )
                 )
 
@@ -520,6 +522,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            sp = msg.sampling_params
+            if sp.min_tokens > 0:
+                # min_tokens: the sampler masks these ids while the output is shorter.
+                sp.min_tokens = min(sp.min_tokens, sp.max_tokens)
+                sp.min_tokens_stop_ids = sorted(set(self.eos_token_ids) | set(sp.stop_token_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

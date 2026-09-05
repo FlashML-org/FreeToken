@@ -174,3 +174,44 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "completion_tokens_total": tr.completion_tokens_total,
         },
     }
+
+
+
+def prometheus_text(doc: dict) -> str:
+    """The /v1/stats document as Prometheus text exposition (gauges and counters)."""
+    lines: list[str] = []
+
+    def gauge(name: str, value, help_text: str, kind: str = "gauge") -> None:
+        if value is None:
+            return
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        lines.append(f"{name} {value}")
+
+    model = doc.get("model") or {}
+    model_id = str(model.get("id") or model.get("name") or "").replace('"', "'")
+    lines.append("# HELP freetoken_info Server identity.")
+    lines.append("# TYPE freetoken_info gauge")
+    lines.append(f'freetoken_info{{instance_id="{doc.get("instance_id")}",model="{model_id}"}} 1')
+    gauge("freetoken_uptime_seconds", doc.get("uptime_s"), "Seconds since the server became ready.")
+    req = doc.get("requests") or {}
+    gauge("freetoken_requests_active", req.get("active"), "Requests in flight.")
+    gauge("freetoken_requests_completed_total", req.get("completed"), "Requests completed.", "counter")
+    gauge("freetoken_request_latency_p95_milliseconds", req.get("p95_ms"), "p95 request latency over the recent window.")
+    gauge("freetoken_ttft_mean_milliseconds", req.get("ttft_mean_ms"), "Mean time to first token over the recent window.")
+    gauge("freetoken_prompt_tokens_total", req.get("prompt_tokens_total"), "Prompt tokens processed.", "counter")
+    gauge("freetoken_completion_tokens_total", req.get("completion_tokens_total"), "Tokens generated.", "counter")
+    tp = doc.get("throughput") or {}
+    gauge("freetoken_decode_tokens_per_second", tp.get("decode_tps"), "Decode throughput, sliding window.")
+    gauge("freetoken_prefill_tokens_per_second", tp.get("prefill_tps"), "Prefill throughput, sliding window.")
+    for pool in ("kv", "swa"):
+        p = doc.get(pool)
+        if p:
+            gauge(f"freetoken_{pool}_pages_used", p.get("used_pages"), f"{pool} pages in use.")
+            gauge(f"freetoken_{pool}_pages_total", p.get("total_pages"), f"{pool} pages in the pool.")
+    mamba = doc.get("mamba")
+    if mamba:
+        gauge("freetoken_mamba_slots_used", mamba.get("used_slots"), "GDN state slots in use.")
+        gauge("freetoken_mamba_slots_total", mamba.get("total_slots"), "GDN state slots in the pool.")
+    gauge("freetoken_vram_bytes", doc.get("vram_bytes"), "GPU memory in use by the engine.")
+    return "\n".join(lines) + "\n"

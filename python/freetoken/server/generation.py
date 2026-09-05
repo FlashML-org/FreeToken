@@ -111,6 +111,7 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -126,6 +127,7 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 @dataclass
@@ -163,9 +165,19 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    min_p: float | None = None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    repetition_penalty: float | None = None,
+    logit_bias: dict[str, float] | dict[int, float] | None = None,
+    min_tokens: int = 0,
+    stop_token_ids: list[int] | None = None,
+    include_stop_str_in_output: bool = False,
+    skip_special_tokens: bool | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
-    filling unspecified fields from the checkpoint's recommended defaults."""
+    filling unspecified fields from the checkpoint's recommended defaults. Range errors
+    raise ValueError (the adapters answer 400)."""
 
     def pick(value, key, framework):
         return value if value is not None else model_sampling.get(key, framework)
@@ -177,14 +189,50 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
-    return SamplingParams(
+    resolved_min_p = float(pick(min_p, "min_p", 0.0))
+    resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
+    if not 0.0 <= resolved_min_p <= 1.0:
+        raise ValueError(f"min_p must be in [0, 1], got {resolved_min_p}")
+    for name, value in (("presence_penalty", presence_penalty), ("frequency_penalty", frequency_penalty)):
+        if not -2.0 <= float(value) <= 2.0:
+            raise ValueError(f"{name} must be in [-2, 2], got {value}")
+    if resolved_rep <= 0.0:
+        raise ValueError(f"repetition_penalty must be positive, got {resolved_rep}")
+    if min_tokens < 0:
+        raise ValueError(f"min_tokens must be >= 0, got {min_tokens}")
+    bias: dict[int, float] | None = None
+    if logit_bias:
+        bias = {}
+        for key, value in logit_bias.items():
+            try:
+                tid = int(key)
+            except (TypeError, ValueError):
+                raise ValueError(f"logit_bias keys must be token ids, got {key!r}") from None
+            if tid < 0:
+                raise ValueError(f"logit_bias token id must be >= 0, got {tid}")
+            bias[tid] = max(-100.0, min(100.0, float(value)))  # the OpenAI range
+    ids = [int(t) for t in (stop_token_ids or [])]
+    if any(t < 0 for t in ids):
+        raise ValueError("stop_token_ids must be non-negative token ids")
+    params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        min_p=resolved_min_p,
+        presence_penalty=float(presence_penalty),
+        frequency_penalty=float(frequency_penalty),
+        repetition_penalty=resolved_rep,
+        logit_bias=bias,
+        min_tokens=int(min_tokens),
+        stop_token_ids=ids,
+        include_stop_str_in_output=bool(include_stop_str_in_output),
     )
+    if skip_special_tokens is not None:
+        params.skip_special_tokens = bool(skip_special_tokens)
+    return params
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -558,6 +606,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
     pending = ""
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
@@ -653,6 +702,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -735,6 +785,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
     )
 
 
@@ -745,6 +796,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    reasoning_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -753,6 +805,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        reasoning_tokens = max(reasoning_tokens, getattr(ack, "reasoning_tokens", 0))
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -779,4 +832,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
     )
