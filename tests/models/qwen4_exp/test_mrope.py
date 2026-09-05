@@ -159,3 +159,25 @@ def test_mrope_cos_sin_matches_hf():
     table = mrope_cos_sin(pos[:, 0], rotary.inv_freq.float(), SECTION)
     torch.testing.assert_close(table[:, :32], cos[0, :, :32], atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(table[:, 32:], sin[0, :, :32], atol=1e-5, rtol=1e-5)
+
+
+def test_image_cache_ids():
+    from freetoken.tokenizer.tokenize import _image_cache_ids
+
+    ids = _expand_image_tokens(
+        torch.tensor([1, IMAGE, 2, IMAGE, 3], dtype=torch.int32), IMAGE, [3, 2]
+    )
+    a = _image_cache_ids(ids, IMAGE, [3, 2], [0xAAAA, 0xBBBB])
+    b = _image_cache_ids(ids, IMAGE, [3, 2], [0xAAAA, 0xCCCC])
+    text = ids != IMAGE
+    assert a.dtype == ids.dtype and torch.equal(
+        a[text], ids[text]
+    )  # text ids untouched
+    assert bool((a[~text] >= 1 << 30).all())  # never a vocabulary id
+    assert torch.equal(a[:5], b[:5]) and not torch.equal(
+        a[5:7], b[5:7]
+    )  # keyed per image
+    assert torch.equal(
+        a, _image_cache_ids(ids, IMAGE, [3, 2], [0xAAAA, 0xBBBB])
+    )  # deterministic
+    assert len(set(a[1:4].tolist())) == 3  # one run, distinct ids per position

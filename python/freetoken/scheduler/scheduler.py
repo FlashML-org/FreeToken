@@ -847,10 +847,10 @@ class Scheduler(SchedulerIOMixin):
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
         batch so the model can scatter them at image-token positions. A chunked prompt
-        contributes only the placeholders inside its current chunk. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
+        contributes only the placeholders inside its current chunk; ``req.mm_embeds`` is
+        kept (not cleared) so later chunks can slice theirs. Image prompts take part in the
+        prefix cache through ``req.cache_ids`` (per-image content hash, see
+        ``tokenizer.tokenize._image_cache_ids``): a hit skips the cached placeholders too."""
         image_token_id = getattr(self.engine.model, "image_token_id", None)
         parts = [
             _mm_embeds_window(req, image_token_id)

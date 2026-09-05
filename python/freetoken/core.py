@@ -48,6 +48,9 @@ class Req:
     # <= 0). None / 0 for text-only prompts, where rope position == token index.
     mrope_positions: torch.Tensor | None = None
     mrope_delta: int = 0
+    # Prefix-cache key ids (image prompts: placeholder runs replaced per image content hash);
+    # None when input_ids are the key. Same length as input_ids, sliced with it.
+    cache_ids: torch.Tensor | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

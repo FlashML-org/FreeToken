@@ -43,6 +43,9 @@ class UserMsg(BaseBackendMsg):
     mm_inputs: dict | None = None
     mrope_positions: torch.Tensor | None = None
     mrope_delta: int = 0
+    # Prefix-cache key ids for image prompts: placeholder runs replaced per image content
+    # hash (tokenizer.tokenize._image_cache_ids); None for text prompts (input_ids are the key).
+    cache_ids: torch.Tensor | None = None
 
 
 @dataclass

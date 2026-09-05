@@ -80,6 +80,18 @@ def _send_generation_replies(
     _put_user_replies(send_frontend, terminal_errors)
 
 
+def _backend_msg(msg, t) -> UserMsg:
+    mm_inputs = getattr(t, "mm_inputs", None)
+    cache_ids = mm_inputs.pop("cache_ids", None) if mm_inputs else None
+    return UserMsg(
+        uid=msg.uid,
+        input_ids=t,
+        sampling_params=msg.sampling_params,
+        mm_inputs=mm_inputs,
+        cache_ids=cache_ids,
+    )
+
+
 def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
@@ -257,13 +269,7 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(
-                            uid=msg.uid,
-                            input_ids=t,
-                            sampling_params=msg.sampling_params,
-                            mm_inputs=getattr(t, "mm_inputs", None),
-                        )
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        _backend_msg(msg, t) for msg, t in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

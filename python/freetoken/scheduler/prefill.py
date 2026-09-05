@@ -182,6 +182,11 @@ class PrefillAdder:
             mm_embeds=pending_req.mm_embeds,
             mrope_positions=pending_req.mrope_positions,
             mrope_delta=pending_req.mrope_delta,
+            cache_ids=(
+                None
+                if pending_req.cache_ids is None
+                else pending_req.cache_ids[: cached_len + chunk_size]
+            ),
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -249,6 +254,7 @@ class PrefillManager:
                 mm_embeds=req.mm_embeds,
                 mrope_positions=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                cache_ids=req.cache_ids,
             )
         )
 
