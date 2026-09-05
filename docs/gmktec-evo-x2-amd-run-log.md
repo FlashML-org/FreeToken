@@ -320,3 +320,27 @@ The initial cold run and the warmed run are both preserved. The exact candidate
 process group was terminated after testing, residual memory pressure was
 cleared, and the protected service was restarted. The service was subsequently
 verified with `status: ok` and `maintenance: serving`.
+
+## 2026-09-06 exact-branch ROCm host-extension regression
+
+The pushed `amd-rocm-gfx1151` head at commit `e7a5a92` was fetched into an
+isolated validation worktree on the GMKtec EVO-X2. The protected Qwen service
+was not stopped or modified. Under PyTorch `2.13.0+rocm10.0.0`, ROCm
+`/opt/rocm-10.0`, HIP `7.15.26333`, and `FREETOKEN_USE_ROCM=1`,
+`setup.py build_ext --inplace` compiled and linked `_pinned_tensor`,
+`_cpu_moe`, and `_ple_store`. The GPU-facing extensions linked against
+`libamdhip64.so`.
+
+After the native build, the exact-branch focused suite ran with the worktree
+on `PYTHONPATH` and completed 13 of 13 tests:
+
+```
+tests/utils/test_rocm_runtime.py tests/kernels/test_pinned_tensor.py
+13 passed in 2.51s
+```
+
+This closes the earlier false failure caused by importing an older deployment
+checkout and separately distinguishes the first missing-extension run from
+the final built-extension result. The isolated worktree and compiler log are
+preserved at `/home/david/freetoken-amd/validation-e7a5a92/` and
+`/home/david/freetoken-amd/validation-e7a5a92/build-rocm-validation.log`.
