@@ -85,6 +85,7 @@ performance claims separate.
 - `gmktec-evo-x2-deepseek-expert-slice-metadata-20260905.json`
 - `scripts/gmk-evo-x2/deepseek_expert_slice_benchmark.py`
 - `gmktec-evo-x2-deepseek-expert-slice-result-20260905.json`
+- `gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json`
 
 The checklist is a review aid. The raw benchmark artifacts remain the
 authoritative evidence for measured claims.

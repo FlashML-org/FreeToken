@@ -123,6 +123,7 @@ restoration result. Do not replace a failed entry with a later passing entry.
 | P7 | Strict NVIDIA reference run | Blocked on reference hardware and missing paper fields |
 
 | P8 | Real-shape DeepSeek expert transfer slice | Completed in isolation on native ROCm: 80,216,064 bytes across six layer-0 experts and 36 tensors. The final three H2D samples averaged 76.645 GiB/s; post-cold H2D averaged 73.987 GiB/s and D2H averaged 64.073 GiB/s. The protected Qwen service remained healthy after recovery. This is transfer-path evidence only, not a 284B serving result. |
+| P9 | Larger real-shape DeepSeek expert transfer slice | Completed in isolation: 213,909,504 bytes across 16 layer-0 experts and 96 tensors. Final-three H2D averaged 77.561 GiB/s; post-cold D2H averaged 64.762 GiB/s. No material H2D collapse was observed as the batch grew. |
 
 ## 2026-09-04 transfer and offload prototypes
 

@@ -147,6 +147,15 @@ zero GPU utilization at the post-run check. The raw result is preserved in
 This is evidence for the AMD transfer path only, not a full-model serving or
 quality result.
 
+A second isolated run expanded the same layer to 16 experts, or 204.0 MiB and
+96 tensors. The final three H2D samples averaged 77.561 GiB/s, all four
+post-cold H2D samples averaged 77.346 GiB/s, and post-cold D2H averaged 64.762
+GiB/s. The protected service again returned `status: ok` after the run. This
+larger slice shows no material H2D collapse as the transfer batch grows, but
+it remains a single-layer transfer test rather than a model-serving result.
+Its raw output is preserved in
+[`gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json`](gmktec-evo-x2-deepseek-expert-slice-16-result-20260905.json).
+
 Therefore the large-model demonstrations are **not currently actionable** on
 this host. A model download must not be treated as the next step. Before any
 attempt, we need the exact checkpoint, quantization, required host-resident
