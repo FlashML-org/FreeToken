@@ -124,6 +124,7 @@ admission, deterministic quality fixture, TPS matrix, and recovery evidence.
 
 ## Reproduction index
 
+- [`gmktec-evo-x2-upstream-handoff-checklist.md`](gmktec-evo-x2-upstream-handoff-checklist.md)
 - [`gmktec-evo-x2-campaign-completion-audit.md`](gmktec-evo-x2-campaign-completion-audit.md)
 - [`gmktec-evo-x2-cross-model-matrix-20260904.md`](gmktec-evo-x2-cross-model-matrix-20260904.md)
 - [`gmktec-evo-x2-cross-model-manifest-20260905.json`](gmktec-evo-x2-cross-model-manifest-20260905.json)
