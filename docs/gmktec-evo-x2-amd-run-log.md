@@ -243,3 +243,12 @@ fused-copy grid selector, the legacy AOT catalog predicate, and the related
 regression contracts. Native pinned-extension tests were not counted in that
 run because the isolated checkout did not contain a freshly built host
 extension; no production service was changed.
+
+The same isolated checkout then ran a fresh `setup.py build_ext --inplace`
+under PyTorch `2.13.0+rocm10.0.0` and HIP `7.15.26333`. The build compiled
+`_pinned_tensor`, `_cpu_moe`, and `_ple_store`; the two GPU-facing host
+extensions were explicitly compiled with `FREETOKEN_USE_ROCM=1` and linked
+against `libamdhip64.so.7`. After the build, the complete focused suite passed
+15 tests, including the pinned-memory, host-bank, AOT catalog, HIP runtime,
+and GGUF flag checks. The protected serving process was not stopped or
+modified for this validation.
