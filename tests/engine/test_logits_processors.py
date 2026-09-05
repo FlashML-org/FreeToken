@@ -87,7 +87,9 @@ def test_min_tokens_masks_the_stop_ids_of_the_row_only():
 
 def test_min_p_drops_tokens_below_the_fraction_of_the_top_probability():
     logits = torch.log(torch.tensor([[0.5, 0.3, 0.1, 0.05, 0.03, 0.01, 0.005, 0.005]]))
-    plan = _plan([0], min_p=torch.tensor([[0.2]]))
+    plan = _plan(
+        [0], min_p=torch.tensor([[0.15]])
+    )  # threshold 0.075, between 0.1 and 0.05
     out = apply_logits_processors(logits, plan, V)
     kept = torch.isfinite(out[0])
     assert kept.tolist() == [True, True, True, False, False, False, False, False]
@@ -110,12 +112,13 @@ def _req(
 
 def test_prepare_builds_no_plan_without_processors_and_a_plan_with_them():
     sampler = Sampler(CPU, V)
-    plain = SimpleNamespace(reqs=[_req([1, 2], [3], 4, temperature=0.7)])
+    plain = SimpleNamespace(reqs=[_req([1, 2], [3], 4)])
     assert sampler.prepare(plain).plan is None
 
+    # all greedy: the argmax path runs on the CPU, the sampling kernels need a GPU
     batch = SimpleNamespace(
         reqs=[
-            _req([1, 2], [3], 4, temperature=0.7),
+            _req([1, 2], [3], 4),
             _req(
                 [1, 2],
                 [3, 3],
