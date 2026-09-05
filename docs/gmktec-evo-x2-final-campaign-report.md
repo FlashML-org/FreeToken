@@ -130,6 +130,13 @@ transport bounds, but they are not evidence that the full 284B model will fit
 or reach paper throughput. The scattered and staged measurements show why a
 real checkpoint and production-shaped expert access pattern are still required.
 
+There is also a checkpoint identity gate. The current official
+`deepseek-ai/DeepSeek-V4-Flash-0731` model card lists 304B parameters and
+BF16, I64, F32, and F8_E4M3 tensor types. It is not automatically the same
+artifact as the paper's 284B FP4 deployment. A valid reproduction therefore
+needs the exact 284B checkpoint or an authoritative conversion recipe before
+any capacity or throughput claim is made.
+
 ### Additional archived model identifiers
 
 Archived routing names without an admitted payload are not treated as failed

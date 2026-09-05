@@ -70,6 +70,17 @@ the GMKtec EVO-X2 can reproduce the paper result. Source: [FreeToken paper,
 arXiv:2608.16157](https://arxiv.org/abs/2608.16157), especially the model and
 hardware description in the introduction and evaluation setup.
 
+## Checkpoint identity warning
+
+The current official Hugging Face model page for
+`deepseek-ai/DeepSeek-V4-Flash-0731` identifies the released checkpoint as
+**304B parameters** and lists BF16, I64, F32, and F8_E4M3 tensor types. That is
+not automatically the same artifact as the paper's 284B FP4 deployment. The
+paper reproduction therefore requires the exact 284B checkpoint or an
+authoritative conversion recipe, not merely the current model-card name.
+Source: [official DeepSeek-V4-Flash-0731 model
+card](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731).
+
 ## Evidence source
 
 The raw values were collected from read-only `free -h`, `swapon --show
