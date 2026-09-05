@@ -143,6 +143,35 @@ def register_openai_routes(
             default_reasoning_effort=default_effort,
         )])
 
+    @app.get("/v1/models/{model_id:path}")
+    async def v1_model(model_id: str):
+        """Retrieve metadata for the currently served model.
+
+        OpenAI-compatible clients may use this endpoint to validate a model
+        name before sending completion requests.
+        """
+        state = get_state()
+        served_model_id = _served_model_name(state)
+
+        if model_id != served_model_id:
+            return create_error_response(
+                f"The model '{model_id}' does not exist",
+                status_code=404,
+                err_type="invalid_request_error",
+                param="model",
+                code="model_not_found",
+            )
+
+        ctx = _model_context_length(state)
+        efforts, default_effort = await _effort_fields(state)
+        return ModelCard(
+            id=served_model_id,
+            root=state.config.model_path,
+            max_model_len=ctx,
+            context_length=ctx,
+            supported_reasoning_efforts=efforts,
+            default_reasoning_effort=default_effort,
+        )
 
 async def handle_chat_completion(
     req: ChatCompletionRequest,
