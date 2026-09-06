@@ -74,8 +74,8 @@ _GGUF_BACKEND = os.environ.get("FT_GGUF_BACKEND")  # "hip" | "triton" | None
 
 
 @functools.cache
-def _capture_needs_triton() -> bool:
-    """Whether graph capture must swap to the Triton kernels on this GPU.
+def _capture_needs_triton(device_index: int) -> bool:
+    """Whether graph capture must swap to Triton on one visible GPU.
 
     gfx1201 (RX 9070 XT) crashes replaying the HIP extension kernels (HIP 719 /
     driver TDR, issue #82). gfx1200 (RX 9060 XT) replays them fine and ~4x faster
@@ -85,7 +85,7 @@ def _capture_needs_triton() -> bool:
     if torch.version.hip is None:
         return False
     try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
     except Exception:
         return True  # unknown device: keep the safe fallback
     return arch == "gfx1201"
@@ -97,11 +97,12 @@ def _use_triton(x: torch.Tensor) -> bool:
         return True
     if _GGUF_BACKEND == "hip":
         return False
-    return (
-        x.is_cuda
-        and torch.cuda.is_current_stream_capturing()
-        and _capture_needs_triton()
-    )
+    if not x.is_cuda or not torch.cuda.is_current_stream_capturing():
+        return False
+    device_index = x.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _capture_needs_triton(device_index)
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:

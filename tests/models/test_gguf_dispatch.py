@@ -16,7 +16,7 @@ Dispatch order (from python/freetoken/layers/gguf.py:46-75):
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +33,39 @@ from freetoken.models.gguf.dequant import (
     BLOCK_SHAPE,
 )
 from freetoken.layers.gguf import _MMVQ_SAFE, fused_mul_mat_gguf
+
+
+def test_capture_fallback_tracks_the_input_tensor_device(monkeypatch):
+    import freetoken.layers.gguf as gguf_layers
+
+    queried_devices = []
+
+    def device_properties(device_index):
+        queried_devices.append(device_index)
+        arch = (
+            "gfx1201:sramecc-:xnack-"
+            if device_index == 1
+            else "gfx1200:sramecc-:xnack-"
+        )
+        return SimpleNamespace(gcnArchName=arch)
+
+    monkeypatch.setattr(gguf_layers, "_GGUF_BACKEND", None)
+    monkeypatch.setattr(gguf_layers.torch.version, "hip", "7.2.1")
+    monkeypatch.setattr(gguf_layers.torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(gguf_layers.torch.cuda, "get_device_properties", device_properties)
+    gguf_layers._capture_needs_triton.cache_clear()
+
+    try:
+        assert gguf_layers._use_triton(
+            SimpleNamespace(is_cuda=True, device=torch.device("cuda", 1))
+        )
+        assert not gguf_layers._use_triton(
+            SimpleNamespace(is_cuda=True, device=torch.device("cuda", 0))
+        )
+    finally:
+        gguf_layers._capture_needs_triton.cache_clear()
+
+    assert queried_devices == [1, 0]
 
 
 @pytest.fixture
