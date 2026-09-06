@@ -73,7 +73,11 @@ def _hip_cflags(extra: List[str]) -> List[str]:
     flags = DEFAULT_HIP_CFLAGS + extra
     from freetoken.utils.arch import parse_rocm_arches
 
-    raw_arches = os.getenv("FREETOKEN_ROCM_ARCH") or os.getenv("PYTORCH_ROCM_ARCH", "")
+    raw_arches = (
+        os.getenv("FREETOKEN_ROCM_ARCH")
+        or os.getenv("PYTORCH_ROCM_ARCH")
+        or os.getenv("FREETOKEN_KERNEL_CACHE_GFX", "")
+    )
     arches = list(parse_rocm_arches(raw_arches)) if raw_arches else []
     if not arches:
         from freetoken.utils.arch import get_rocm_gfx_arch

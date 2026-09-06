@@ -501,7 +501,7 @@ def parse_args(
     parser.add_argument(
         "--gguf-moe-impl",
         default=ServerArgs.gguf_moe_impl,
-        choices=["legacy", "auto", "rdna3_mmid", "rdna3_mmvdq", "grouped_mmq"],
+        choices=["legacy", "auto", "gfx1100", "rdna3_mmid", "rdna3_mmvdq", "grouped_mmq"],
         help=(
             "GGUF MoE implementation. legacy is the generic default; native ROCm "
             "candidates are exact-target, opt-in, and fail closed when unavailable."

@@ -96,6 +96,18 @@ def test_hip_cflags_emit_one_offload_flag_per_arch(monkeypatch, torch_module):
     assert not any(";" in flag for flag in flags)
 
 
+def test_hip_cflags_honor_kernel_cache_target(monkeypatch, torch_module):
+    monkeypatch.delenv("FREETOKEN_ROCM_ARCH", raising=False)
+    monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising=False)
+    monkeypatch.setenv("FREETOKEN_KERNEL_CACHE_GFX", "gfx1100")
+
+    from freetoken.kernel.utils import _hip_cflags
+
+    flags = _hip_cflags([])
+
+    assert "--offload-arch=gfx1100" in flags
+
+
 def test_jit_diagnostics_uses_rocm_namespace(monkeypatch, tmp_path, torch_module):
     import torch.utils.cpp_extension as cpp_extension
 

@@ -90,13 +90,26 @@ torch::Tensor ggml_moe_a8_vec_gfx1100(
     int64_t top_k, int64_t type, int64_t row, int64_t tokens) {
   TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
               "gfx1100 GGUF MoE candidate requires CUDA/HIP tensors");
+  TORCH_CHECK(X.device() == W.device() && X.device() == topk_ids.device(),
+              "gfx1100 GGUF MoE candidate tensors must share device");
   TORCH_CHECK(X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous(),
               "gfx1100 GGUF MoE candidate requires contiguous tensors");
   TORCH_CHECK(type == 8 || type == 12,
               "gfx1100 candidate supports Q8_0 (8) and Q4_K (12), got ", type);
   TORCH_CHECK(X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2,
               "invalid gfx1100 GGUF MoE tensor ranks");
+  TORCH_CHECK(X.scalar_type() == torch::kFloat || X.scalar_type() == torch::kHalf ||
+                  X.scalar_type() == torch::kBFloat16,
+              "gfx1100 GGUF MoE candidate supports F32/F16/BF16 activations");
+  TORCH_CHECK(tokens > 0 && top_k > 0 && tokens == X.size(0) &&
+                  topk_ids.size(0) == tokens && topk_ids.size(1) == top_k &&
+                  row > 0 && row == W.size(1) && W.size(0) > 0,
+              "gfx1100 GGUF MoE token/top-k/weight shape mismatch");
   const int col = X.sizes()[1];
+  const int64_t qk = type == 12 ? QK_K : QK8_0;
+  const int64_t block_bytes = type == 12 ? sizeof(block_q4_K) : sizeof(block_q8_0);
+  TORCH_CHECK(col > 0 && col % qk == 0 && W.size(2) >= (col / qk) * block_bytes,
+              "gfx1100 GGUF MoE candidate requires aligned columns and packed row extent");
   const int padded = (col + 512 - 1) / 512 * 512;
   const GGUF_DEVICE_GUARD(device_of(X));
   auto output_options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
@@ -112,12 +125,12 @@ torch::Tensor ggml_moe_a8_vec_gfx1100(
       moe_vec_q4_K_q8_1_gfx1100<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), stream);
+          quant_X.stride(0), W.size(0), stream);
     } else {
       moe_vec_q8_0_q8_1_gfx1100<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), stream);
+          quant_X.stride(0), W.size(0), stream);
     }
   });
   return Y;
@@ -132,13 +145,17 @@ torch::Tensor ggml_moe_mmvq_id(
     torch::Tensor quant_X_input = torch::Tensor()) {
   TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
               "ggml_moe_mmvq_id requires CUDA/HIP tensors");
+  TORCH_CHECK(X.device() == W.device() && X.device() == topk_ids.device(),
+              "ggml_moe_mmvq_id tensors must share device");
   TORCH_CHECK(X.is_contiguous() && topk_ids.is_contiguous(),
               "ggml_moe_mmvq_id requires contiguous activation/ID tensors");
   TORCH_CHECK(W.dim() == 3 && W.scalar_type() == torch::kUInt8 && W.stride(2) == 1,
               "ggml_moe_mmvq_id requires packed uint8 [E,rows,bytes] weights");
   TORCH_CHECK(X.dim() == 2 && topk_ids.dim() == 2 && topk_ids.scalar_type() == torch::kInt,
               "invalid ggml_moe_mmvq_id tensor ranks or ID dtype");
-  TORCH_CHECK(tokens == X.size(0) && top_k == topk_ids.size(1),
+  TORCH_CHECK(tokens > 0 && top_k > 0 && tokens == X.size(0) &&
+                  topk_ids.size(0) == tokens && top_k == topk_ids.size(1) &&
+                  row > 0 && row == W.size(1) && W.size(0) > 0,
               "ggml_moe_mmvq_id token/top-k shape mismatch");
   TORCH_CHECK(type == 8 || type == 12 || type == 13 || type == 14,
               "ggml_moe_mmvq_id supports Q4_K/Q5_K/Q6_K/Q8_0, got ", type);
@@ -147,6 +164,13 @@ torch::Tensor ggml_moe_mmvq_id(
   TORCH_CHECK(expert_stride_bytes == W.stride(0) && row_stride_bytes == W.stride(1),
               "GGUF expert/row strides must match the supplied packed bank");
   const int col = X.size(1);
+  const int64_t qk = type == 8 ? QK8_0 : QK_K;
+  const int64_t block_bytes = type == 8 ? sizeof(block_q8_0) :
+      (type == 12 ? sizeof(block_q4_K) :
+       (type == 13 ? sizeof(block_q5_K) : sizeof(block_q6_K)));
+  TORCH_CHECK(col > 0 && col % qk == 0 &&
+                  W.size(2) >= (col / qk) * block_bytes,
+              "ggml_moe_mmvq_id requires aligned columns and packed row extent");
   const int padded = (col + 512 - 1) / 512 * 512;
   const GGUF_DEVICE_GUARD(device_of(X));
   auto output_options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
@@ -182,22 +206,22 @@ torch::Tensor ggml_moe_mmvq_id(
       moe_vec_q4_K_q8_1_gfx1100_id<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<const int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, W.size(0), stream);
     } else if (type == 13) {
       moe_vec_q5_K_q8_1_gfx1100_id<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<const int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, W.size(0), stream);
     } else if (type == 14) {
       moe_vec_q6_K_q8_1_gfx1100_id<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<const int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, W.size(0), stream);
     } else {
       moe_vec_q8_0_q8_1_gfx1100_id<scalar_t>(
           W.data_ptr(), quant_X.data_ptr(), static_cast<scalar_t*>(Y.data_ptr()),
           static_cast<const int*>(topk_ids.data_ptr()), top_k, tokens, col, row,
-          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, W.size(0), stream);
     }
   });
   return Y;
@@ -256,20 +280,24 @@ torch::Tensor ggml_moe_gate_up_swiglu_id(
     torch::Tensor quant_X_input = torch::Tensor()) {
   TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
               "ggml_moe_gate_up_swiglu_id requires CUDA/HIP tensors");
+  TORCH_CHECK(X.device() == W.device() && X.device() == topk_ids.device(),
+              "ggml_moe_gate_up_swiglu_id tensors must share device");
   TORCH_CHECK(X.is_contiguous() && topk_ids.is_contiguous(),
               "ggml_moe_gate_up_swiglu_id requires contiguous activation/ID tensors");
   TORCH_CHECK(W.dim() == 3 && W.scalar_type() == torch::kUInt8 && W.stride(2) == 1,
               "ggml_moe_gate_up_swiglu_id requires packed uint8 [E,2I,bytes] weights");
   TORCH_CHECK(X.dim() == 2 && topk_ids.dim() == 2 && topk_ids.scalar_type() == torch::kInt,
               "invalid ggml_moe_gate_up_swiglu_id tensor ranks or ID dtype");
-  TORCH_CHECK(tokens == X.size(0) && top_k == topk_ids.size(1) &&
-                  nrows * 2 == W.size(1),
+  TORCH_CHECK(tokens > 0 && top_k > 0 && nrows > 0 && tokens == X.size(0) &&
+                  topk_ids.size(0) == tokens && top_k == topk_ids.size(1) &&
+                  nrows * 2 == W.size(1) && W.size(0) > 0,
               "ggml_moe_gate_up_swiglu_id shape mismatch");
   TORCH_CHECK(id_space == "raw" || id_space == "slot",
               "ggml_moe_gate_up_swiglu_id id_space must be raw or slot");
   const int col = X.size(1);
   TORCH_CHECK(col > 0 && col % QK_K == 0 && row_stride_bytes >=
                   (col / QK_K) * static_cast<int64_t>(sizeof(block_q4_K)) &&
+                  W.size(2) >= (col / QK_K) * static_cast<int64_t>(sizeof(block_q4_K)) &&
                   expert_stride_bytes >= W.size(1) * row_stride_bytes,
               "ggml_moe_gate_up_swiglu_id requires aligned columns and valid strides");
   const GGUF_DEVICE_GUARD(device_of(X));
@@ -428,13 +456,16 @@ torch::Tensor ggml_moe_mmvdq_id(
     const std::string& id_space, torch::Tensor output = torch::Tensor()) {
   TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
               "ggml_moe_mmvdq_id requires CUDA/HIP tensors");
+  TORCH_CHECK(X.device() == W.device() && X.device() == topk_ids.device(),
+              "ggml_moe_mmvdq_id tensors must share device");
   TORCH_CHECK(X.is_contiguous() && topk_ids.is_contiguous(),
               "ggml_moe_mmvdq_id requires contiguous activation/ID tensors");
   TORCH_CHECK(W.dim() == 3 && W.scalar_type() == torch::kUInt8 && W.stride(2) == 1,
               "ggml_moe_mmvdq_id requires packed uint8 [E,rows,bytes] weights");
   TORCH_CHECK(X.dim() == 2 && topk_ids.dim() == 2 && topk_ids.scalar_type() == torch::kInt,
               "invalid ggml_moe_mmvdq_id tensor ranks or ID dtype");
-  TORCH_CHECK(tokens == X.size(0) && top_k == topk_ids.size(1),
+  TORCH_CHECK(tokens > 0 && top_k > 0 && tokens == X.size(0) &&
+                  topk_ids.size(0) == tokens && top_k == topk_ids.size(1),
               "ggml_moe_mmvdq_id token/top-k shape mismatch");
   TORCH_CHECK(type == 12 || type == 13 || type == 14,
               "ggml_moe_mmvdq_id supports Q4_K/Q5_K/Q6_K, got ", type);
@@ -448,7 +479,8 @@ torch::Tensor ggml_moe_mmvdq_id(
               "ggml_moe_mmvdq_id requires QK_K-aligned columns and matching rows");
   const int block_bytes = type == 12 ? sizeof(block_q4_K) :
       (type == 13 ? sizeof(block_q5_K) : sizeof(block_q6_K));
-  TORCH_CHECK(row_stride_bytes >= (col / QK_K) * block_bytes &&
+  TORCH_CHECK(W.size(0) > 0 && row > 0 && W.size(2) >= (col / QK_K) * block_bytes &&
+                  row_stride_bytes >= (col / QK_K) * block_bytes &&
                   expert_stride_bytes >= row * row_stride_bytes,
               "GGUF MMVDQ strides are smaller than packed row extent");
   const GGUF_DEVICE_GUARD(device_of(X));

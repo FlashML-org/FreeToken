@@ -17,13 +17,13 @@ static __global__ void moe_vec_gfx1100(
     const int topk,
     const int ncols,
     const int nrows,
-    const int token_stride) {
+    const int token_stride, const int experts) {
   constexpr int rows_per_wave = GGML_CUDA_MMV_Y;
   const int row = blockIdx.x * rows_per_wave + threadIdx.y;
   const int token = blockIdx.z / topk;
   const int expert = topk_ids[blockIdx.z];
 
-  if (row >= nrows) {
+  if (row >= nrows || expert < 0 || expert >= experts) {
     return;
   }
 
@@ -59,28 +59,28 @@ template <typename scalar_t>
 static void moe_vec_q4_K_q8_1_gfx1100(
     const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
     const int top_k, const int tokens, const int ncols, const int nrows,
-    const int token_stride, cudaStream_t stream) {
+    const int token_stride, const int experts, cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_gfx1100<scalar_t, QK_K, QI4_K, block_q4_K,
                   VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(
-          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride, experts);
 }
 
 template <typename scalar_t>
 static void moe_vec_q8_0_q8_1_gfx1100(
     const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
     const int top_k, const int tokens, const int ncols, const int nrows,
-    const int token_stride, cudaStream_t stream) {
+    const int token_stride, const int experts, cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_gfx1100<scalar_t, QK8_0, QI8_0, block_q8_0,
                   VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(
-          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride, experts);
 }
 
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
@@ -89,12 +89,13 @@ static __global__ void moe_vec_id_gfx1100(
     const void* __restrict__ vx, const void* __restrict__ vy,
     scalar_t* __restrict__ dst, const int* topk_ids, const int topk,
     const int ncols, const int nrows, const int token_stride,
-    const int64_t expert_stride_bytes, const int64_t row_stride_bytes) {
+    const int64_t expert_stride_bytes, const int64_t row_stride_bytes,
+    const int experts) {
   const int row = blockIdx.x * GGML_CUDA_MMV_Y + threadIdx.y;
   const int route = blockIdx.z;
   const int token = route / topk;
   const int expert = topk_ids[route];
-  if (row >= nrows || expert < 0) return;
+  if (row >= nrows || expert < 0 || expert >= experts) return;
   const int blocks_per_row = ncols / qk;
   const int blocks_per_wave = vdr * WARP_SIZE / qi;
   const int lanes_per_chunk = qi / vdr;
@@ -120,12 +121,12 @@ template <typename scalar_t> \
 static void NAME(const void* vx, const void* vy, scalar_t* dst, const int* ids, \
     const int topk, const int tokens, const int ncols, const int nrows, \
     const int token_stride, const int64_t expert_stride, const int64_t row_stride, \
-    cudaStream_t stream) { \
+    const int experts, cudaStream_t stream) { \
   const dim3 grid((nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y, 1, tokens * topk); \
   const dim3 block(WARP_SIZE, GGML_CUDA_MMV_Y, 1); \
   moe_vec_id_gfx1100<scalar_t, QK, QI, BLOCK, VDR, DOT> \
       <<<grid, block, 0, stream>>>(vx, vy, dst, ids, topk, ncols, nrows, token_stride, \
-                                    expert_stride, row_stride); \
+                                    expert_stride, row_stride, experts); \
 }
 
 GGUF_GFX1100_ID_LAUNCH(moe_vec_q4_K_q8_1_gfx1100_id, QK_K, QI4_K, block_q4_K,

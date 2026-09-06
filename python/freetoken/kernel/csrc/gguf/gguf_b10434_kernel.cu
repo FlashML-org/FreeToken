@@ -21,7 +21,7 @@ constexpr int64_t align256(int64_t value) { return (value + kAlign - 1) / kAlign
 
 int64_t mmvq_bs1_workspace_bytes(int64_t hidden, int64_t rows, int64_t channels) {
   TORCH_CHECK(hidden > 0 && rows > 0 && channels > 0, "MMVQ shape must be positive");
-  TORCH_CHECK(hidden % 32 == 0, "MMVQ b10434 ABI requires hidden dimension divisible by 32");
+  TORCH_CHECK(hidden % 512 == 0, "MMVQ b10434 ABI requires hidden dimension divisible by 512");
   const int64_t activation = align256((hidden / 32) * 36);
   const int64_t output = align256(channels * rows * static_cast<int64_t>(sizeof(float)));
   return activation + output;
@@ -46,8 +46,8 @@ torch::Tensor mmvq_bs1(
               mmvq_bs1_workspace_bytes(x.size(1), rows, channels), "MMVQ workspace too small");
   TORCH_CHECK(workspace.scalar_type() == torch::kUInt8 && workspace.dim() == 1,
               "MMVQ workspace must be a contiguous uint8 byte buffer");
-  TORCH_CHECK(quant_type == 2 || quant_type == 8 || quant_type == 12 ||
-              quant_type == 13 || quant_type == 14, "unsupported GGUF quant type");
+  TORCH_CHECK(quant_type == 8 || quant_type == 12 || quant_type == 13 || quant_type == 14,
+              "MMVQ b10434 ABI supports Q8_0/Q4_K/Q5_K/Q6_K only, got ", quant_type);
   TORCH_CHECK(weight.dim() == 3 && weight.size(1) == rows && weight.size(0) >= channels,
               "MMVQ weight must be [experts, rows, row_bytes]");
   // The linked b10434 candidate currently uses the upstream 512-column Q8_1 tile.

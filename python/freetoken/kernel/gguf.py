@@ -53,8 +53,8 @@ def mmvq_bs1_workspace_bytes(hidden: int, rows: int, channels: int) -> int:
     hidden, rows, channels = int(hidden), int(rows), int(channels)
     if min(hidden, rows, channels) <= 0:
         raise ValueError("MMVQ b10434 shape must be positive")
-    if hidden % 32:
-        raise ValueError("MMVQ b10434 hidden dimension must be divisible by 32")
+    if hidden % 512:
+        raise ValueError("MMVQ b10434 hidden dimension must be divisible by 512")
     align = lambda value: (value + 255) // 256 * 256
     return align(hidden // 32 * 36) + align(channels * rows * 4)
 
@@ -270,6 +270,8 @@ def gguf_dispatch(
         }
         report["implementation"] = "ggml_moe_a8" if tokens > limit and grouped else "ggml_moe_a8_vec"
         report["callable"] = report["implementation"]
+        report["route"] = "generic"
+        report["capability_status"] = "compile-only"
         report["reason"] = (
             "multi-token grouped path"
             if tokens > limit and grouped
@@ -316,7 +318,9 @@ def gguf_dispatch(
             report["implementation"] = requested
             report["callable"] = candidate_callable
             report["route"] = "candidate"
-            report["capability_status"] = "correctness"
+            # Numeric self-tests prove only the extension ABI and fixture shapes. A
+            # model-level replay gate is still required before advertising correctness.
+            report["capability_status"] = "compile-only"
         else:
             report["implementation"] = "ggml_moe_a8_vec"
             report["callable"] = "ggml_moe_a8_vec"
@@ -512,8 +516,11 @@ def _gfx1100_supported() -> bool:
     if torch.version.hip is None or not torch.cuda.is_available():
         return False
     try:
-        return torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName == "gfx1100"
-    except AttributeError:
+        from freetoken.utils.arch import rocm_arch_capability
+
+        arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+        return rocm_arch_capability(arch).target == "gfx1100"
+    except (AttributeError, RuntimeError, ValueError):
         return False
 
 
@@ -574,7 +581,36 @@ def _candidate_module():
 
 
 def _candidate_self_test(module) -> None:
-    """Exercise both candidate quant paths and synchronize before graph capture."""
+    """Compare candidate fixtures against independent dense dequant references."""
+    from freetoken.models.gguf.dequant import dequantize
+
+    def reference_moe(x, weight, route_ids, top_k, quant_type):
+        dense = dequantize(weight, quant_type, torch.float32).reshape(
+            weight.shape[0], weight.shape[1], -1
+        )
+        routes = route_ids.reshape(-1).tolist()
+        return torch.stack([
+            x[index // top_k].float() @ dense[int(expert)].transpose(0, 1)
+            for index, expert in enumerate(routes)
+        ])
+
+    def reference_fused(x, weight, route_ids, top_k, nrows):
+        dense = dequantize(weight, 12, torch.float32).reshape(weight.shape[0], weight.shape[1], -1)
+        routes = route_ids.reshape(-1).tolist()
+        result = []
+        for index, expert in enumerate(routes):
+            values = dense[int(expert)]
+            token = x[index // top_k].float()
+            gate = token @ values[:nrows].transpose(0, 1)
+            up = token @ values[nrows : 2 * nrows].transpose(0, 1)
+            result.append(torch.nn.functional.silu(gate) * up)
+        return torch.stack(result)
+
+    def assert_reference(actual, expected, name):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=0.15, atol=0.5, msg=name
+        )
+
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(1100)
     ids = torch.arange(8, dtype=torch.int32).reshape(1, 8).to(device)
@@ -584,6 +620,7 @@ def _candidate_self_test(module) -> None:
     q4[..., 4:16] = torch.randint(1, 64, (8, 16, 12), generator=generator, dtype=torch.uint8).to(device)
     q4[..., 16:] = torch.randint(0, 255, (8, 16, 128), generator=generator, dtype=torch.uint8).to(device)
     q4_out = module.ggml_moe_a8_vec_gfx1100(x, q4, ids, 8, 12, 16, 1)
+    assert_reference(q4_out, reference_moe(x, q4, ids, 8, 12), "Q4_K compact candidate")
     inter = torch.randn(8, 128, generator=generator, dtype=torch.bfloat16).to(device)
     q8_blocks = torch.zeros((8, 16, 4, 34), dtype=torch.uint8, device=device)
     q8_blocks[..., :2] = torch.tensor([128, 63], dtype=torch.uint8, device=device)
@@ -591,24 +628,28 @@ def _candidate_self_test(module) -> None:
         0, 255, (8, 16, 4, 32), generator=generator, dtype=torch.uint8
     ).to(device)
     q8 = q8_blocks.reshape(8, 16, 136)
-    q8_out = module.ggml_moe_a8_vec_gfx1100(inter, q8, ids, 1, 8, 16, 8)
     route_ids = ids.reshape(-1, 1)
+    q8_out = module.ggml_moe_a8_vec_gfx1100(inter, q8, route_ids, 1, 8, 16, 8)
+    assert_reference(q8_out, reference_moe(inter, q8, route_ids, 1, 8), "Q8_0 compact candidate")
     id_out = torch.empty((8, 16), dtype=inter.dtype, device=device)
     id_qx = torch.empty((8, 144), dtype=torch.int32, device=device)
     id_out = module.ggml_moe_mmvq_id_workspace(
         inter, q8, route_ids, 1, 8, 16, 8,
         int(q8.stride(0)), int(q8.stride(1)), "slot", id_out, id_qx
     )
+    assert_reference(id_out, reference_moe(inter, q8, route_ids, 1, 8), "Q8_0 ID candidate")
     mmvdq_out = module.ggml_moe_mmvdq_id(
         x, q4, ids, 8, 12, 16, 1,
         int(q4.stride(0)), int(q4.stride(1)), "slot"
     )
+    assert_reference(mmvdq_out, reference_moe(x, q4, ids, 8, 12), "Q4_K MMVDQ candidate")
     fused_out = module.ggml_moe_gate_up_swiglu_id_workspace(
         x, q4, ids, 8, 8, 1,
         int(q4.stride(0)), int(q4.stride(1)), "slot",
         torch.empty((8, 8), dtype=x.dtype, device=device),
         torch.empty((1, 144), dtype=torch.int32, device=device),
     )
+    assert_reference(fused_out, reference_fused(x, q4, ids, 8, 8), "Q4_K fused candidate")
     # Exercise the pinned b10434 caller-owned ABI separately from the model-facing
     # BF16 candidate output. This catches module binding and workspace slicing before
     # graph capture, without allocating inside the measured model path.
@@ -622,6 +663,7 @@ def _candidate_self_test(module) -> None:
     abi_out = torch.empty((8, 16), dtype=torch.float32, device=device)
     abi_result = module.mmvq_bs1(abi_x, abi_q4, abi_out, abi_workspace, 12, 16, 8, ids)
     torch.cuda.synchronize(device)
+    assert_reference(abi_result, reference_moe(abi_x, abi_q4, ids, 8, 12), "b10434 candidate")
     if (
         not torch.isfinite(q4_out).all()
         or not torch.isfinite(q8_out).all()

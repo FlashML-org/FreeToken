@@ -35,7 +35,6 @@ class TorchAttentionBackend(BaseAttnBackend):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
-        self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
 
     def _build_metadata(self, batch: Batch) -> TorchMetadata:
         ctx = get_global_ctx()
@@ -73,6 +72,11 @@ class TorchAttentionBackend(BaseAttnBackend):
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
         kv_heads, head_dim = k_raw.shape[-2:]
+        q_heads = q.shape[1]
+        if q_heads <= 0 or q_heads % kv_heads:
+            raise ValueError(
+                f"attention query/KV head mismatch: query={q_heads}, cache={kv_heads}"
+            )
         if head_dim != q.shape[-1]:
             raise ValueError(f"attention head_dim mismatch: cache={head_dim}, query={q.shape[-1]}")
         metadata = batch.attn_metadata
@@ -82,9 +86,9 @@ class TorchAttentionBackend(BaseAttnBackend):
         v_all = v_raw.view(-1, kv_heads, head_dim)[metadata.indices]
         spec = attn_spec or AttentionSpec()
         scale = spec.sm_scale if spec.sm_scale is not None else head_dim ** -0.5
-        group = self.num_q_heads // kv_heads
+        group = q_heads // kv_heads
         output = torch.empty(
-            (q.shape[0], self.num_q_heads, head_dim), dtype=q.dtype, device=q.device
+            (q.shape[0], q_heads, head_dim), dtype=q.dtype, device=q.device
         )
         q_offset = k_offset = 0
         for lq, lk, cached in zip(metadata.seqlens_q, metadata.seqlens_k, metadata.cached_lens):

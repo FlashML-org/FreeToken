@@ -66,6 +66,19 @@ def test_rocm_auto_reports_generic_fallback_for_candidate_request(monkeypatch):
     assert report["implementation"] == "ggml_moe_a8_vec"
 
 
+def test_gfx1100_gate_normalizes_runtime_suffix(monkeypatch):
+    monkeypatch.setattr(kernel.torch.version, "hip", "7.0")
+    monkeypatch.setattr(kernel.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(kernel.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        kernel.torch.cuda,
+        "get_device_properties",
+        lambda _device: type("Props", (), {"gcnArchName": "gfx1100:sramecc-:xnack-"})(),
+    )
+
+    assert kernel._gfx1100_supported()
+
+
 def test_rocm_forced_candidate_rejects_non_exact_target(monkeypatch):
     monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")
     with pytest.raises(RuntimeError, match="exact target gfx1100"):
@@ -89,7 +102,19 @@ def test_rocm_exact_candidate_route_requires_registered_abi(monkeypatch):
     monkeypatch.setitem(kernel._GGUF_MOE_ABI, "ggml_moe_mmvq_id", kernel._GGUF_ABI_VERSION)
     report = kernel.gguf_dispatch("moe", 12, 16, 256, 1, "gfx1100", impl="rdna3_mmid")
     assert report["route"] == "candidate"
-    assert report["capability_status"] == "correctness"
+    assert report["capability_status"] == "compile-only"
+
+
+def test_rocm_prefill_reports_generic_route(monkeypatch):
+    monkeypatch.setattr(kernel, "_runtime_backend", lambda: "rocm")
+    report = kernel.gguf_dispatch("moe_prefill", 12, 16, 256, 32, "gfx1100")
+    assert report["route"] == "generic"
+    assert report["capability_status"] == "compile-only"
+
+
+def test_b10434_workspace_rejects_unaligned_hidden_dimension():
+    with pytest.raises(ValueError, match="divisible by 512"):
+        kernel.mmvq_bs1_workspace_bytes(256, 16, 8)
 
 
 def test_q4_0_reference_zero_row_is_finite():

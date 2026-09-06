@@ -58,6 +58,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from bench_rocm_matrix import runtime_identity, sha256_path, sha256_text
+
 # Applied for every field the checkpoint's generation_config.json does not specify.
 FALLBACK_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
 
@@ -69,6 +71,7 @@ AIME_FILE = "test.jsonl"
 BOXED_INSTRUCTION = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
+_MODEL_SHA_CACHE: dict[str, tuple[tuple[int, int], str]] = {}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -86,6 +89,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--problem", type=int, default=0, help="0-based AIME problem index")
     p.add_argument("--decode", type=int, default=256, help="decode tokens to measure (D)")
+    p.add_argument(
+        "--mode",
+        choices=("fresh", "resident"),
+        default="fresh",
+        help="fresh server per measurement, or one resident server for all repeats",
+    )
+    p.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="measured runs per backend; resident mode reuses one server",
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="discarded requests before measured runs",
+    )
     p.add_argument(
         "--cache",
         type=int,
@@ -115,7 +136,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait for the spawned server to become ready",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.repeats < 1:
+        p.error("--repeats must be positive")
+    if args.warmup < 0:
+        p.error("--warmup must be non-negative")
+    if args.decode < 2:
+        p.error("--decode must be at least 2 for arrival-window timing")
+    if args.mode == "resident" and args.repeats < 3:
+        p.error("resident mode requires --repeats >= 3")
+    if args.mode == "resident" and args.warmup != 1:
+        p.error("resident mode requires exactly one discarded --warmup request")
+    return args
 
 
 def load_problem(path: str | None, index: int) -> tuple[str, str]:
@@ -223,11 +255,14 @@ def pump_output(src, log_f) -> None:
     """Mirror the server's output to our terminal while keeping the log file complete.
 
     Raw byte chunks (read1, not line-buffered) so \\r progress bars render live."""
-    for chunk in iter(lambda: src.read1(65536), b""):
-        log_f.write(chunk)
-        log_f.flush()
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.flush()
+    try:
+        for chunk in iter(lambda: src.read1(65536), b""):
+            log_f.write(chunk)
+            log_f.flush()
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+    finally:
+        log_f.close()
 
 
 def stop_server(proc: subprocess.Popen) -> None:
@@ -301,53 +336,61 @@ def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
 
 
-def run_one(args: argparse.Namespace, backend: str) -> dict:
-    problem, answer = load_problem(args.aime, args.problem)
-    sampling, sampling_src = resolve_sampling(args.model, args.greedy)
+def start_server(
+    args: argparse.Namespace, backend: str
+) -> tuple[str, subprocess.Popen, str, threading.Thread, float]:
+    """Start one server and return its origin, process, log path, and pump thread."""
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
     cmd = serve_cmd(args, backend, port)
-
     print(
         f"[bench] model={args.model}\n"
         f"[bench] backend={backend} cache={args.cache or args.cache_rate or 'auto'} "
-        f"mem_ratio={args.mem_ratio} decode={args.decode} graph={not args.no_graph}\n"
-        f"[bench] sampling={sampling} <- {sampling_src}\n"
+        f"mem_ratio={args.mem_ratio} decode={args.decode} graph={not args.no_graph} "
+        f"mode={args.mode} repeats={args.repeats} warmup={args.warmup}\n"
         f"[bench] server log: {log_path}",
         flush=True,
     )
+    log_f = os.fdopen(fd, "wb")
+    started = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+    )
+    pump = threading.Thread(target=pump_output, args=(proc.stdout, log_f), daemon=True)
+    pump.start()
+    try:
+        wait_ready(origin, proc, log_path, args.server_timeout)
+    except BaseException:
+        stop_server(proc)
+        pump.join(timeout=10)
+        log_f.close()
+        raise
+    return origin, proc, log_path, pump, time.perf_counter() - started
 
-    with os.fdopen(fd, "wb") as log_f:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        pump = threading.Thread(target=pump_output, args=(proc.stdout, log_f), daemon=True)
-        pump.start()
-        try:
-            wait_ready(origin, proc, log_path, args.server_timeout)
-            model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
-            print(f"[bench] model_id={model_id}", flush=True)
-            print(f"[bench] AIME25 #{args.problem} (answer {answer})", flush=True)
 
-            # Warm the expert cache to a steady-state decode working set.
-            stream_generate(origin, model_id, problem, sampling, args)
-            r = stream_generate(origin, model_id, problem, sampling, args)
-            stats = get_json(f"{origin}/v1/stats")
-        finally:
-            stop_server(proc)
-            pump.join(timeout=10)
-
-    stamps, usage = r["stamps"], r["usage"]
+def build_benchmark_row(
+    *, args: argparse.Namespace, backend: str, problem: str, sampling: dict,
+    sampling_src: str, result: dict, stats: dict, run_index: int,
+    server_mode: str, log_path: str, startup_s: float, warmup_count: int,
+) -> dict:
+    """Build one identity-bearing row without deciding promotion eligibility."""
+    stamps, usage = result["stamps"], result["usage"]
     if len(stamps) < 2:
-        sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
+        raise ValueError(f"need >=2 token events to measure decode, got {len(stamps)}")
     completion = usage["completion_tokens"]
     if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+        raise ValueError(f"completion_tokens={completion} != --decode {args.decode}")
     steps = completion - 1
     decode_time = stamps[-1] - stamps[0]
     gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
+    model_sha = model_sha256(args.model)
+    prompt_sha = sha256_text(problem)
+    route = stats.get("route") or stats.get("runtime_route") or "unreported"
+    fallbacks = stats.get("fallbacks")
     row = {
+        "schema": "freetoken-serving-benchmark-v1",
+        "status": "incomplete",
         "model": args.model,
         "backend": backend,
         "problem": args.problem,
@@ -357,26 +400,164 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
         "event_ms_p50": gaps[len(gaps) // 2],
         "event_ms_p99": gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))],
-        "ttft_ms": (stamps[0] - r["t0"]) * 1e3,
+        "ttft_ms": (stamps[0] - result["t0"]) * 1e3,
         "events": len(stamps),
         "completion_tokens": completion,
+        "startup_s": startup_s,
+        "warmup_requests": warmup_count,
         "vram_gib": stats.get("vram_bytes", 0) / 2**30,
         "sampling": sampling,
-        "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
+        "sampling_source": sampling_src,
+        "identity": {
+            "model_sha256": model_sha,
+            "prompt_sha256": prompt_sha,
+            "continuation_text_sha1": hashlib.sha1(result["text"].encode()).hexdigest(),
+            "token_count": completion,
+            "mtp": False,
+            "backend": backend,
+            "graph_mode": "eager" if args.no_graph else "replay",
+            "cache_policy": "reuse" if server_mode == "resident" else "reset",
+            "kv_mode": "server-default",
+            "route": route,
+            "fallbacks": fallbacks,
+            "server_mode": server_mode,
+            "run_index": run_index,
+            "instance_id": stats.get("instance_id"),
+            "runtime": runtime_identity(),
+        },
+        "output_sha1": hashlib.sha1(result["text"].encode()).hexdigest()[:12],
         "server_log": log_path,
     }
+    return row
+
+
+def model_sha256(model: str) -> str | None:
+    """Return cached content identity; missing startup inputs stay explicit."""
+    model_path = Path(model)
+    try:
+        stat = model_path.stat()
+    except OSError:
+        return None
+    cache_key = str(model_path)
+    fingerprint = (stat.st_size, stat.st_mtime_ns)
+    cached = _MODEL_SHA_CACHE.get(cache_key)
+    if cached is None or cached[0] != fingerprint:
+        digest = sha256_path(model)
+        _MODEL_SHA_CACHE[cache_key] = (fingerprint, digest)
+        return digest
+    return cached[1]
+
+
+def incomplete_row(args: argparse.Namespace, backend: str, reason: object, run_index: int) -> dict:
+    """Record startup/request failure without fabricating timing or median evidence."""
+    try:
+        runtime = runtime_identity()
+    except Exception as exc:  # runtime identity is best-effort for failure artifacts
+        runtime = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "schema": "freetoken-serving-benchmark-v1",
+        "status": "incomplete",
+        "backend": backend,
+        "model": args.model,
+        "failure": str(reason),
+        "identity": {
+            "model_sha256": model_sha256(args.model),
+            "token_count": args.decode,
+            "mtp": False,
+            "backend": backend,
+            "graph_mode": "eager" if args.no_graph else "replay",
+            "cache_policy": "reuse" if args.mode == "resident" else "reset",
+            "kv_mode": "server-default",
+            "server_mode": args.mode,
+            "run_index": run_index,
+            "runtime": runtime,
+        },
+        "timing": {"status": "incomplete"},
+    }
+
+
+def append_rows(path: str, rows: list[dict]) -> None:
+    with open(path, "a", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\n")
+
+
+def measure_one(
+    args: argparse.Namespace, *, origin: str, model_id: str, backend: str,
+    problem: str, sampling: dict, sampling_src: str, run_index: int,
+    server_mode: str, log_path: str, startup_s: float, warmup_count: int,
+) -> dict:
+    result = stream_generate(origin, model_id, problem, sampling, args)
+    stats = get_json(f"{origin}/v1/stats")
+    row = build_benchmark_row(
+        args=args, backend=backend, problem=problem, sampling=sampling,
+        sampling_src=sampling_src, result=result, stats=stats, run_index=run_index,
+        server_mode=server_mode, log_path=log_path, startup_s=startup_s,
+        warmup_count=warmup_count,
+    )
 
     print(f"\n==== decode bs=1 [{backend}] via /v1/chat/completions ====", flush=True)
     print(f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  ({row['ms_per_token']:.3f} ms/token)")
     print(f"  TTFT (warm)       : {row['ttft_ms']:8.1f} ms  (prompt {row['prompt_tokens']} tok)")
-    print(f"  decode measured   : {steps} steps in {decode_time:.3f} s  "
+    print(f"  decode measured   : {row['decode_steps']} steps in "
+          f"{row['decode_steps'] / row['decode_tok_s']:.3f} s  "
           f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
-          f"{len(stamps)} events)")
+          f"{row['events']} events)")
     print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
-    print(f"  output sample     : {r['text'][:240]!r}")
+    print(f"  evidence status   : {row['status']} (route/fallback counters require server metadata)")
+    print(f"  output sample     : {result['text'][:240]!r}")
     return row
+
+
+def run_one(args: argparse.Namespace, backend: str, *, run_index: int = 0) -> dict:
+    """Run one fresh-process measurement, preserving historical default behavior."""
+    problem, answer = load_problem(args.aime, args.problem)
+    sampling, sampling_src = resolve_sampling(args.model, args.greedy)
+    origin, proc, log_path, pump, startup_s = start_server(args, backend)
+    try:
+        model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
+        print(f"[bench] model_id={model_id}", flush=True)
+        print(f"[bench] AIME25 #{args.problem} (answer {answer})", flush=True)
+        print(f"[bench] sampling={sampling} <- {sampling_src}", flush=True)
+        for _ in range(args.warmup):
+            stream_generate(origin, model_id, problem, sampling, args)
+        return measure_one(
+            args, origin=origin, model_id=model_id, backend=backend, problem=problem,
+            sampling=sampling, sampling_src=sampling_src,
+            run_index=run_index, server_mode="fresh", log_path=log_path,
+            startup_s=startup_s, warmup_count=args.warmup,
+        )
+    finally:
+        stop_server(proc)
+        pump.join(timeout=10)
+
+
+def run_resident(args: argparse.Namespace, backend: str) -> list[dict]:
+    """Run warmup plus repeated measurements in one server process."""
+    problem, answer = load_problem(args.aime, args.problem)
+    sampling, sampling_src = resolve_sampling(args.model, args.greedy)
+    origin, proc, log_path, pump, startup_s = start_server(args, backend)
+    try:
+        model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
+        print(f"[bench] model_id={model_id}", flush=True)
+        print(f"[bench] AIME25 #{args.problem} (answer {answer})", flush=True)
+        print(f"[bench] sampling={sampling} <- {sampling_src}", flush=True)
+        for _ in range(args.warmup):
+            stream_generate(origin, model_id, problem, sampling, args)
+        return [
+            measure_one(
+                args, origin=origin, model_id=model_id, backend=backend, problem=problem,
+                sampling=sampling, sampling_src=sampling_src,
+                run_index=index, server_mode="resident", log_path=log_path,
+                startup_s=startup_s, warmup_count=args.warmup,
+            )
+            for index in range(args.repeats)
+        ]
+    finally:
+        stop_server(proc)
+        pump.join(timeout=10)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -388,19 +569,26 @@ def main(argv: list[str] | None = None) -> int:
 
     failed = []
     for backend in backends:
+        run_index = 0
         try:
-            row = run_one(args, backend)
+            if args.mode == "resident":
+                rows = run_resident(args, backend)
+            else:
+                rows = []
+                for run_index in range(args.repeats):
+                    rows.append(run_one(args, backend, run_index=run_index))
         # SystemExit inherits BaseException, not Exception, so name both: a mid-decode
         # connection drop (server crash) must not abort the remaining backends either.
         except (SystemExit, Exception) as e:
+            if args.json_out:
+                append_rows(args.json_out, [incomplete_row(args, backend, e, run_index)])
             if len(backends) == 1:
                 raise
             print(f"\n[bench] backend {backend} failed: {e!r}", flush=True)
             failed.append(backend)
             continue
         if args.json_out:
-            with open(args.json_out, "a") as f:
-                f.write(json.dumps(row) + "\n")
+            append_rows(args.json_out, rows)
     if failed:
         print(f"\n[bench] backends that failed: {failed}", flush=True)
         return 1

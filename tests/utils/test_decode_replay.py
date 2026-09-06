@@ -81,3 +81,19 @@ def test_replay_record_rejects_malformed_identity_and_missing_oracle(tmp_path):
 
     assert any("continuation identity" in problem for problem in problems)
     assert any("oracle ID" in problem for problem in problems)
+
+
+def test_replay_v1_record_remains_compatible():
+    record = {
+        "schema": "freetoken-replay-manifest-v1",
+        "timing": {"lane": "teacher_forced_replay"},
+        "replay": {
+            "forced": True,
+            "prompt_ids_sha256": "legacy-prompt",
+            "continuation_ids_sha256": "legacy-continuation",
+            "route_digest": "legacy-route",
+            "route_hash_status": "matched",
+        },
+    }
+
+    assert validate_replay_record(record) == []

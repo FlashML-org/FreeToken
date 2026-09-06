@@ -45,6 +45,10 @@ struct BatchMemcpy {
             .verify(sizes);
         const auto n = static_cast<std::size_t>(N.unwrap());
         if (n == 0) return;
+        const auto* signed_sizes = static_cast<const int64_t*>(sizes.data_ptr());
+        for (std::size_t i = 0; i < n; ++i) {
+            RuntimeCheck(signed_sizes[i] >= 0, "batch_memcpy sizes must be non-negative");
+        }
         RuntimeCheck(stream_handle != 0, "batch_memcpy rejects the legacy NULL stream");
         auto stream = reinterpret_cast<hipStream_t>(stream_handle);
         const void* const* srcs = reinterpret_cast<const void* const*>(src_ptrs.data_ptr());
@@ -53,6 +57,15 @@ struct BatchMemcpy {
         void* d_srcs = nullptr;
         void* d_dsts = nullptr;
         void* d_sizes = nullptr;
+        struct AsyncFree {
+            void*& ptr;
+            hipStream_t stream;
+            ~AsyncFree() {
+                if (ptr != nullptr) {
+                    (void)hipFreeAsync(ptr, stream);
+                }
+            }
+        } free_srcs{d_srcs, stream}, free_dsts{d_dsts, stream}, free_sizes{d_sizes, stream};
         HIP_CHECK(hipMallocAsync(&d_srcs, n * sizeof(void*), stream));
         HIP_CHECK(hipMallocAsync(&d_dsts, n * sizeof(void*), stream));
         HIP_CHECK(hipMallocAsync(&d_sizes, n * sizeof(std::size_t), stream));
@@ -62,9 +75,6 @@ struct BatchMemcpy {
         void* args[4] = {&d_srcs, &d_dsts, &d_sizes, const_cast<std::size_t*>(&n)};
         HIP_CHECK(hipLaunchKernel(reinterpret_cast<const void*>(batch_memcpy_kernel),
                                   dim3(n), dim3(256), args, 0, stream));
-        HIP_CHECK(hipFreeAsync(d_srcs, stream));
-        HIP_CHECK(hipFreeAsync(d_dsts, stream));
-        HIP_CHECK(hipFreeAsync(d_sizes, stream));
 #elif CUDART_VERSION >= 13000
         using namespace host;
         auto N = SymbolicSize{"batch length"};
@@ -78,6 +88,10 @@ struct BatchMemcpy {
         const auto n = static_cast<std::size_t>(N.unwrap());
         if (n == 0) {
             return;
+        }
+        const auto* signed_sizes = static_cast<const int64_t*>(sizes.data_ptr());
+        for (std::size_t i = 0; i < n; ++i) {
+            RuntimeCheck(signed_sizes[i] >= 0, "batch_memcpy sizes must be non-negative");
         }
         RuntimeCheck(stream_handle != 0, "cudaMemcpyBatchAsync rejects the legacy NULL stream");
         auto attr = ::cudaMemcpyAttributes{};
