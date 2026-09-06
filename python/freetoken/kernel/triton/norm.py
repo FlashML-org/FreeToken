@@ -30,7 +30,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_rocm, is_sm90_supported
 
 _HEUR = {"BLOCK": lambda a: triton.next_power_of_2(a["H"])}
 
@@ -145,7 +145,7 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # launch_pdl is a CUDA-Hopper-only Triton launch kwarg; the AMD backend's
     # arg-packer rejects it outright (KeyError) even when passed as False, so it
     # is only included on the one backend/arch combination that ever sets pdl=True.
-    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
+    pdl_kwargs = {"launch_pdl": pdl} if pdl and not is_rocm() else {}
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
         CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma, **pdl_kwargs,
@@ -174,7 +174,7 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     _, _, sra, srb = _leading(residual)
     contig = input.ndim == 2 and input.is_contiguous() and residual.is_contiguous()
     pdl = contig and is_sm90_supported()
-    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
+    pdl_kwargs = {"launch_pdl": pdl} if pdl and not is_rocm() else {}
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
         CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma, **pdl_kwargs,

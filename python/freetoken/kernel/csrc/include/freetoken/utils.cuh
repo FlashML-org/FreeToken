@@ -137,7 +137,11 @@ public:
     CUDA_CHECK(::cudaGetLastError());
   }
 
-  auto with_attr(bool /*use_pdl*/) -> LaunchKernel & { return *this; }
+  auto with_attr(bool use_pdl) -> LaunchKernel & {
+    RuntimeCheck(!use_pdl,
+                 "Programmatic dependent launch is unavailable on ROCm");
+    return *this;
+  }
 
 private:
   dim3 m_grid_dim;
