@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: FAQ (read first)
+    url: https://github.com/FlashML-org/FreeToken/issues/84
+    about: Most install and runtime problems are already answered here.
+  - name: Roadmap (read first)
+    url: https://github.com/FlashML-org/FreeToken/issues/79
+    about: What we are working on next. Please do not open a new issue for something already on the Roadmap.
+  - name: Usage questions (Discord)
+    url: https://discord.gg/MsA277cJzZ
+    about: Ask on the Community Discord instead of opening an issue.
+  - name: Usage questions (WeChat, CN)
+    url: https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png
+    about: Scan the QR code to join the Community WeChat group.
+  - name: Development discussion
+    url: https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA
+    about: Join the Developer Slack to discuss Roadmap items before starting work.

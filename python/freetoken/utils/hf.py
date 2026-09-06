@@ -14,6 +14,12 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
+from freetoken.utils.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
@@ -204,13 +210,27 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     return type(config)(**config.to_dict())
 
 
+def _weight_allow_patterns(repo_id: str) -> list[str]:
+    try:
+        index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
+        with open(index, encoding="utf-8") as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    except Exception as e:
+        logger.warning(
+            "no usable %s for %s (%s); falling back to *.safetensors",
+            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
+        )
+        return ["*.safetensors"]
+    return shards or ["*.safetensors"]
+
+
 def download_hf_weight(model_path: str) -> str:
     if os.path.isdir(model_path):
         return model_path
     try:
         return snapshot_download(
             model_path,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=_weight_allow_patterns(model_path),
             tqdm_class=DisabledTqdm,
         )
     except Exception as e:

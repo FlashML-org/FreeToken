@@ -280,6 +280,20 @@ use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability()[0] >= 8
 is_gather_supported = hasattr(triton.language, "gather")
 
+# Shared chunk length of the fla chunked kernels (KDA vendor reads it from here).
+FLA_CHUNK_SIZE = 64
+
+# TMA descriptors (solve_tril fast path): Hopper+, opt-in via FLA_USE_TMA=1, and only
+# when this triton exposes a make_tensor_descriptor (see kernel/fla/op.py).
+is_tma_supported = (
+    is_nvidia_hopper
+    and os.getenv("FLA_USE_TMA", "0") == "1"
+    and (
+        hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        or hasattr(triton.language, "make_tensor_descriptor")
+    )
+)
+
 
 def get_all_max_shared_mem():
     try:

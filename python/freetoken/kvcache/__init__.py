@@ -40,7 +40,8 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .mha_pool import MHAKVCache
 
         return MHAKVCache
-    types = {spec.attn_type for spec in specs_fn()}
+    specs = list(specs_fn())
+    types = {spec.attn_type for spec in specs}
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -50,6 +51,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
 
         return HybridSWAKVCache
     if AttnType.DSA in types:
+        # kpool-compressed indexer (glm5_next): shadow slab + tail rings.
+        if any(s.attn_type == AttnType.DSA and s.index_ratio > 1 for s in specs):
+            from .dsa_pool import KpoolDSAKVCache
+
+            return KpoolDSAKVCache
         from .dsa_pool import DSAKVCache
 
         return DSAKVCache
@@ -138,36 +144,31 @@ def create_kvcache_pool(
 
     from .mha_pool import MHAKVCache
 
-    # Hybrid linear-attention models (e.g. Qwen3.5 GatedDeltaNet) only store paged KV
-    # for their full-attention layers; the linear layers keep a separate recurrent
-    # state. Back just those layers and remap their global ids to dense storage slots
-    # so we don't over-allocate slabs for the (majority) linear layers.
+    # Hybrid linear-attention models only store paged KV for their non-linear
+    # layers; the linear layers keep a separate recurrent state (LinearStatePool).
+    # The linear group emits no paged spec, so the remaining paged spec(s) drive
+    # the dispatch below; the paged pool backs JUST those layers via a global-id
+    # -> dense-slot remap (layer_ids) so the (majority) linear layers cost no
+    # slabs.
     layer_ids: tuple[int, ...] | None = None
-    num_kv_heads = model_config.num_kv_heads
-    head_dim = model_config.head_dim
+    kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
     if model_config.has_linear_attention:
-        specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
-        assert len(specs) == 1, f"expected one paged-KV group, got {[s.name for s in specs]}"
-        spec = specs[0]
-        layer_ids = spec.layer_ids
-        num_kv_heads = spec.num_kv_heads
-        head_dim = spec.head_dim
+        assert len(kv_specs) == 1, (
+            f"hybrid-linear models support one paged-KV group, got "
+            f"{[s.name for s in kv_specs]}"
+        )
+        layer_ids = kv_specs[0].layer_ids
 
-    # Latent-KV MLA models declare it on their single full-attention group: they get
-    # the latent pool (one slab, V aliases K), plus the DSA index-key slab when the
-    # spec carries indexer dims. The same spec fields drive the KV cost model, so the
-    # factory and the budget can never disagree.
-    kv_specs = model_config.kv_cache_group_specs()
-
-    # GQA block-sparse (MiniMax-M3): one full-attention group carrying the index dims
-    # with mla=False -> the MHA pool plus the index-key slab. The same spec fields
-    # drive the KV cost model, so the factory and the budget can never disagree.
+    # Latent-KV MLA / GQA block-sparse models declare their geometry on the single
+    # paged spec; the same spec fields drive the KV cost model, so the factory and
+    # the budget can never disagree.
     from freetoken.attention import AttnType as _AttnType
 
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache
 
         spec = kv_specs[0]
+        assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -206,35 +207,51 @@ def create_kvcache_pool(
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
-        from .dsa_pool import DSAKVCache, MLAKVCache
+        from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
 
         spec = kv_specs[0]
+        # With a layer remap the pool allocates len(layer_ids) slabs; without one
+        # it backs every model layer (all-MLA models, GLM-5.2).
+        num_layers = model_config.num_layers if layer_ids is None else len(layer_ids)
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
-            return DSAKVCache(
+            common = dict(
                 latent_dim=spec.head_dim,
-                num_layers=model_config.num_layers,
+                num_layers=num_layers,
                 num_pages=num_pages,
                 page_size=page_size,
                 dtype=dtype,
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=layer_ids,
             )
+            if spec.index_ratio > 1:
+                # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
+                if num_req_slots is None:
+                    raise ValueError("kpool pools need num_req_slots (max_running_req + 1)")
+                return KpoolDSAKVCache(
+                    **common,
+                    index_ratio=spec.index_ratio,
+                    num_req_slots=num_req_slots,
+                )
+            return DSAKVCache(**common)
         return MLAKVCache(
             latent_dim=spec.head_dim,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=layer_ids,
         )
 
+    spec = kv_specs[0] if len(kv_specs) == 1 else None
     return MHAKVCache(
-        num_kv_heads=num_kv_heads,
+        num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
         num_layers=model_config.num_layers,
-        head_dim=head_dim,
+        head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,

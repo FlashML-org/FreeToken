@@ -31,7 +31,7 @@ split does not fit the generic ``forward(q, k, v)`` contract).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple, NamedTuple
 
 import torch
 from freetoken.core import Batch, get_global_ctx
@@ -50,6 +50,32 @@ _PREFILL_SCORE_BYTES = 128 << 20
 _PREFILL_SCORE_CHUNK = 512
 
 
+class KpoolPlan(NamedTuple):
+    """glm5_next kpool: one forward's slab/ring routing (layer-invariant; the
+    first DSA layer plans, the rest reuse -- Glm5NextDSABackend._plan_kpool_writes)."""
+
+    cmp_rows: torch.Tensor      # [T] shadow row (closing) or scratch row
+    ring_rows: torch.Tensor     # [T] tail-ring row, -1 = masked off
+    ring_slots: torch.Tensor    # [n_req] Req.table_idx
+    token_to_req: torch.Tensor  # [T]
+    cu_seqlens: torch.Tensor    # [n_req + 1]
+
+
+@dataclass(frozen=True)
+class DSAIndexerInputs:
+    """Per-forward indexer tensors, built by the MODEL's indexer module and passed
+    per call (QSAIndexerInputs precedent): the backend holds no model parameters.
+    ``gate``/``ape`` are the glm5_next kpool extras (None for GLM-5.2): the raw
+    per-channel compression gate scores and the [kpool, Di] APE weight."""
+    # fmt: off
+    q:    torch.Tensor              # [T, Hi, Di]
+    k:    torch.Tensor              # [T, Di]
+    w:    torch.Tensor              # [T, Hi] fp32
+    gate: torch.Tensor | None = None
+    ape:  torch.Tensor | None = None
+    # fmt: on
+
+
 @dataclass
 class DSAMetadata(BaseAttnMetadata):
     # fmt: off
@@ -63,6 +89,11 @@ class DSAMetadata(BaseAttnMetadata):
     kvlen:          torch.Tensor | None = None
     # group leader layer -> (sel_rows, counts); only the LIVE leader is retained
     sel:            dict = field(default_factory=dict)
+    # glm5_next kpool decode: per-request tail-ring slots (Req.table_idx). Under CUDA
+    # graphs this is a view of the backend's STATIC buffer (restaged per replay by
+    # _stage_decode, QSA ring_slots precedent); eager decode reads active_table_idx.
+    ring_slots:     torch.Tensor | None = None
+    kpool_plan:     "KpoolPlan | None" = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -73,8 +104,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
 
-        args = config.glm_dsa_args
-        assert args is not None, "dsa backend needs ModelConfig.glm_dsa_args (MLA dims)"
+        args = self._model_args(config)
         self.config = config
         self.num_heads = config.num_qo_heads
         self.kv_lora_rank = args.kv_lora_rank
@@ -99,21 +129,39 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._leader: Dict[int, int] = {}
         self._idx_slot: Dict[int, int] = {}
         if self.dsa_enabled:
-            lead = None
-            # Capped to the SERVED layer count (dev num_layers overrides must not
-            # index slots past the pool the factory sized from the same cap).
-            for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
-                if kind == "full":
-                    lead = lid
-                    self._idx_slot[lid] = len(self._idx_slot)
-                assert lead is not None, "indexer_types must start with a 'full' layer"
-                self._leader[lid] = lead
+            self._build_index_slots(args, config)
         # decode staging (static buffers under CUDA graphs; eager decode builds
         # per-forward tensors in prepare_metadata instead)
         self._rows_buf: torch.Tensor | None = None
         self._kvlen_buf: torch.Tensor | None = None
         self.max_seq_len = 0
         self.capture_bs: List[int] = []
+
+    # ----- model-family hooks (overridden by the glm5_next kpool backend) ---------------
+    def _model_args(self, config: ModelConfig):
+        """The MLA/indexer dims payload. GLM-5.2 reads glm_dsa_args; glm5_next's
+        subclass reads glm5_args (same duck-typed fields)."""
+        args = config.glm_dsa_args
+        assert args is not None, "dsa backend needs ModelConfig.glm_dsa_args (MLA dims)"
+        return args
+
+    def _build_index_slots(self, args, config: ModelConfig) -> None:
+        """IndexShare (GLM-5.2): "full" layers own an indexer slot; followers reuse
+        the most recent leader's selection."""
+        lead = None
+        # Capped to the SERVED layer count (dev num_layers overrides must not
+        # index slots past the pool the factory sized from the same cap).
+        for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+            if kind == "full":
+                lead = lid
+                self._idx_slot[lid] = len(self._idx_slot)
+            assert lead is not None, "indexer_types must start with a 'full' layer"
+            self._leader[lid] = lead
+
+    def _store_index(self, inputs: "DSAIndexerInputs", batch: Batch, layer_id: int) -> None:
+        """Scatter this forward's index keys (kpool subclass adds gate scores and
+        pool-completion compression)."""
+        self.kvcache.store_index_k(inputs.k, batch.out_loc, self._idx_slot[layer_id])
 
     def forward(self, q, k, v, layer_id, batch, attn_spec: AttentionSpec | None = None):
         raise NotImplementedError("MLA models use mla_forward(), not forward().")
@@ -156,14 +204,14 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         )
 
     def mla_forward(
-        self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_qkw=None
+        self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_inputs=None
     ) -> torch.Tensor:
         """Store this forward's latent rows and attend over the paged latent history.
 
         ``q_nope`` [T, H, kv_lora_rank] (kv_b-absorbed), ``q_pe`` [T, H, rope_dim],
         ``c_kv`` [T, kv_lora_rank] / ``k_rope`` [T, rope_dim] (the pool scatters the
-        two latent halves). ``indexer_qkw`` = (q [T, Hi, Di], k [T, Di], w [T, Hi])
-        on full-indexer layers, None on shared layers. Returns [T, H, kv_lora_rank].
+        two latent halves). ``indexer_inputs`` is a :class:`DSAIndexerInputs` on
+        full-indexer layers, None on shared layers. Returns [T, H, kv_lora_rank].
         """
         md = batch.attn_metadata
         assert isinstance(md, DSAMetadata)
@@ -174,17 +222,17 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             md.rows = self._decode_rows(batch).to(torch.int32)
             md.kvlen = md.kv_len_cpu.to(self.device, non_blocking=True)
         self.kvcache.store_kv(c_kv, k_rope, batch.out_loc, layer_id)
-        if self.dsa_enabled and indexer_qkw is not None:
+        if self.dsa_enabled and indexer_inputs is not None:
             # Scatter index keys unconditionally: short prefills serve through the
             # identity path TODAY, but their keys must exist once decode passes topk.
-            self.kvcache.store_index_k(indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id])
+            self._store_index(indexer_inputs, batch, layer_id)
 
         if md.is_decode:
-            return self._decode(md, layer_id, q_nope, q_pe, indexer_qkw)
-        return self._prefill(md, layer_id, q_nope, q_pe, batch, indexer_qkw)
+            return self._decode(md, layer_id, q_nope, q_pe, indexer_inputs)
+        return self._prefill(md, layer_id, q_nope, q_pe, batch, indexer_inputs)
 
     # ----- decode (CUDA-graph capturable, single code path) -----------------------------
-    def _decode(self, md, layer_id, q_nope, q_pe, indexer_qkw) -> torch.Tensor:
+    def _decode(self, md, layer_id, q_nope, q_pe, inputs) -> torch.Tensor:
         bs = q_nope.shape[0]
         rows, kvlen = md.rows, md.kvlen
         if not self.dsa_enabled:
@@ -192,8 +240,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             # whole row list, bounded by the device-side live length.
             sel, cnt = rows.view(bs, 1, -1), kvlen.view(bs, 1)
         else:
-            if indexer_qkw is not None:
-                q_idx, _, w = indexer_qkw
+            if inputs is not None:
+                q_idx, w = inputs.q, inputs.w
                 s = self.dsa_decode_scores(q_idx, w, self._idx_slot[layer_id], rows, kvlen)
                 k_sel = min(self.index_topk, s.shape[-1])
                 picks = self.indexer_select_decode(
@@ -212,15 +260,16 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
         self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
-        rows: torch.Tensor, positions: torch.Tensor,
+        rows: torch.Tensor, positions: torch.Tensor, start_pos: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-request causal top-k: ([1, m, K] physical rows, [1, m] counts)."""
+        """Per-request causal top-k: ([1, m, K] physical rows, [1, m] counts).
+        ``start_pos`` is the request's first query position -- a host int
+        (cached_len), so no device->host sync on the prefill path."""
         kv_len = rows.numel()
         k_all = self.kvcache.index_k_cache(slot).index_select(0, rows.long())
         k_sel = min(self.index_topk, kv_len)
         m = q_idx.shape[0]
         sel = torch.empty(m, k_sel, dtype=torch.int32, device=self.device)
-        start_pos = int(positions[0])
         # Bound the fp32 [chunk, kv_len] logits transient (worst case is capped by the
         # model's max_position: floor 16 x 1M x 4 B = 64 MB, see _PREFILL_SCORE_BYTES).
         chunk = max(16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(kv_len * 4, 1)))
@@ -236,15 +285,16 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         cnt = torch.clamp(positions + 1, max=k_sel).to(torch.int32)
         return sel.view(1, m, k_sel), cnt.view(1, m)
 
-    def _prefill(self, md, layer_id, q_nope, q_pe, batch, indexer_qkw) -> torch.Tensor:
+    def _prefill(self, md, layer_id, q_nope, q_pe, batch, inputs) -> torch.Tensor:
         t = q_nope.shape[0]
         q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, 576]
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         page_table = get_global_ctx().page_table
         qo = md.qo_indptr_cpu.tolist()
-        sparse = self.dsa_enabled and int(md.kv_len_cpu.max()) > self.index_topk
-        if sparse and indexer_qkw is not None:
-            q_idx, _, w = indexer_qkw
+        kv_lens = md.kv_len_cpu.tolist()  # one D2H for both the gate and start_pos
+        sparse = self.dsa_enabled and max(kv_lens) > self.index_topk
+        if sparse and inputs is not None:
+            q_idx, w = inputs.q, inputs.w
             md.sel.clear()  # one live group leader at a time
             md.sel[layer_id] = [
                 self._select_prefill(
@@ -252,6 +302,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                     q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
                     page_table[r.table_idx, : r.device_len],
                     batch.positions[qo[i] : qo[i + 1]],
+                    kv_lens[i] - (qo[i + 1] - qo[i]),  # cached_len == first position
                 )
                 for i, r in enumerate(reqs)
             ]

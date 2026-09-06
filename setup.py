@@ -4,6 +4,8 @@ import importlib.util
 import os
 from pathlib import Path
 
+import sys
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension, ROCM_HOME
 
@@ -130,6 +132,16 @@ setup(
             extra_compile_args=extra_compile + ([] if os.name == "nt" else ["-pthread"]),
             extra_link_args=runtime_link_args,
         ),
+        # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        *([
+            CppExtension(
+                name="freetoken.kernel._ple_store",
+                sources=[
+                    "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                ],
+                extra_compile_args=["-O3", "-std=c++17"],
+            )
+        ] if sys.platform == "linux" else []),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

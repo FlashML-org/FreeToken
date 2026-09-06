@@ -18,6 +18,10 @@ Env knobs:
   FREETOKEN_AIME_SAMPLES        pass@N sample count when sampling (default 3)
   FREETOKEN_AIME_MIN_FREE_GIB   free-GPU-memory gate (default 70; raise for a big resident model)
   FREETOKEN_TEST_MOE_CACHE_SIZE >0 switches to the offload MoE backend (fp8/GLM/MiniMax)
+  FREETOKEN_TEST_MOE_BACKEND    offload-family backend override (default offload; e.g. hybrid)
+  FREETOKEN_TEST_MOE_CPU_THREADS  CPU MoE worker threads (0 = physical cores)
+  FREETOKEN_TEST_MOE_CACHE_AUTO 1 sizes the MoE cache from free VRAM instead of MOE_CACHE_SIZE
+  FREETOKEN_TEST_KV_RESERVE     KV token floor reserved before auto-cache fills experts
   FREETOKEN_TEST_MEM_RATIO      offload memory ratio (default 0.9)
 
 fp8 / offload recipe: point FREETOKEN_TEST_MODEL at the fp8 checkpoint dir and set
@@ -164,10 +168,14 @@ def build_llm(model_path: Path) -> LLM:
         max_extend_tokens=8192,
     )
     cache_size = int(os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "0"))
-    if cache_size > 0:
+    cache_auto = os.environ.get("FREETOKEN_TEST_MOE_CACHE_AUTO") == "1"
+    if cache_size > 0 or cache_auto:
         kwargs.update(
-            moe_backend="offload",
+            moe_backend=os.environ.get("FREETOKEN_TEST_MOE_BACKEND", "offload"),
+            moe_cpu_threads=int(os.environ.get("FREETOKEN_TEST_MOE_CPU_THREADS", "0")),
+            moe_cache_auto=cache_auto,
             moe_cache_size=cache_size,
+            kv_reserve_tokens=int(os.environ.get("FREETOKEN_TEST_KV_RESERVE", "8192")),
             moe_cache_policy="lru",
             memory_ratio=float(os.environ.get("FREETOKEN_TEST_MEM_RATIO", "0.9")),
             max_seq_len_override=max_tokens() + 2048,

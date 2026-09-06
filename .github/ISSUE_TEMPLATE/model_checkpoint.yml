@@ -1,0 +1,66 @@
+name: Support Model Checkpoint
+description: A checkpoint FreeToken cannot load, whether a new model architecture or an unsupported checkpoint or quantization of a supported one.
+labels: ["new-model"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening an issue, please check the [supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md), the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84). A checkpoint listed there that fails to load is a bug: use a Bug report instead. Other checkpoints of a supported architecture usually work without changes; try them first. If the architecture is supported but a specific unlisted checkpoint or quantization fails to load, this is the right template.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you start
+      options:
+        - label: I have checked the [supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md) and this checkpoint is not listed there. A listed checkpoint that fails is a bug; use a Bug report instead.
+          required: true
+        - label: I have read the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and this model is not already planned there.
+          required: true
+        - label: I have read the [FAQ](https://github.com/FlashML-org/FreeToken/issues/84).
+          required: true
+        - label: I have searched [existing issues](https://github.com/FlashML-org/FreeToken/issues?q=is%3Aissue) and found no duplicate.
+          required: true
+        - label: This is not a GGUF checkpoint. GGUF support is on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79); please do not open an issue for it.
+          required: true
+  - type: input
+    id: link
+    attributes:
+      label: Hugging Face link
+      description: The exact checkpoint you want to run, not just the model family.
+      placeholder: https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Is the model architecture already supported
+      description: Check the architecture, not the checkpoint, against the [supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md) table.
+      options:
+        - Yes, but this checkpoint or quantization does not load
+        - No, this is a new model architecture
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: quant
+    attributes:
+      label: Is the quantization already supported
+      description: FP8, NVFP4 and MXFP4 are supported today.
+      options:
+        - Not quantized
+        - Yes, but this checkpoint's weight format does not load
+        - No, a new quantization
+        - GGUF (on the Roadmap, please do not open an issue)
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: What happens when you load it
+      description: The error or log from trying to load the checkpoint, as text. Leave empty if you have not tried.
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Links to other engines that support it, or anything that may matter.

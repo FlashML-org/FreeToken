@@ -1,0 +1,14 @@
+windows:
+  - '### OS\s+Windows 1[01]'
+WSL:
+  - '### OS\s+WSL2'
+linux:
+  - '### OS\s+(Ubuntu|Debian|Fedora|Arch Linux|Other Linux)'
+amd:
+  - '### GPU and driver\s+[^\n]*(AMD|Radeon|ROCm)'
+Desktop:
+  - '### Applies to\s+(Desktop app|Both)'
+gguf:
+  - '### Is the quantization already supported\s+GGUF'
+quant:
+  - '### Is the quantization already supported\s+No,'

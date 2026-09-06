@@ -22,6 +22,22 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
+    # Maps checkpoint tensor-kind names onto the canonical (modelopt) kinds, e.g.
+    # compressed-tensors' weight_packed -> weight, weight_global_scale -> weight_scale_2.
+    kind_map: dict[str, str] | None = None
+    # The checkpoint stores the QUANT-side global scale (local fp8 scales were
+    # multiplied by it before the cast); the banks keep its reciprocal.
+    global_reciprocal: bool = False
+
+
+def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
+    return spec.kind_map.get(kind, kind) if spec.kind_map else kind
+
+
+def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
+    if spec.global_reciprocal:
+        tensor = 1.0 / tensor.float()
+    return tensor.to(torch.float16)
 
 
 def _num_moe_layers(config) -> int:
@@ -112,7 +128,7 @@ def load_nvfp4_expert_source_banks(
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
-        kind = match.group("kind")
+        kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
             global_shards[shard].append((name, match, bank_layer))
         elif kind in {"weight", "weight_scale"}:
@@ -130,7 +146,7 @@ def load_nvfp4_expert_source_banks(
                     int(match.group("expert")),
                     match.group("proj"),
                 )
-                globals_map[key] = f.get_tensor(name).to(torch.float16)
+                globals_map[key] = _ingest_global(spec, f.get_tensor(name))
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -154,7 +170,7 @@ def load_nvfp4_expert_source_banks(
                     expert = int(match.group("expert"))
                     proj = match.group("proj")
                     role = spec.proj_to_role[proj]
-                    kind = match.group("kind")
+                    kind = _canon_kind(spec, match.group("kind"))
                     tensor = f.get_tensor(name)
                     if kind == "weight":
                         if role == "gate":
@@ -236,7 +252,7 @@ def load_nvfp4_expert_source_banks_parallel(
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
-        kind = match.group("kind")
+        kind = _canon_kind(spec, match.group("kind"))
         if kind == "weight_scale_2":
             global_names_by_shard[shard].append(name)
         elif kind in {"weight", "weight_scale"}:
@@ -253,7 +269,7 @@ def load_nvfp4_expert_source_banks_parallel(
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
                 globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (
-                    f.get_tensor(name).to(torch.float16)
+                    _ingest_global(spec, f.get_tensor(name))
                 )
         drop_page_cache(path)
 
@@ -279,7 +295,7 @@ def load_nvfp4_expert_source_banks_parallel(
             expert = int(match.group("expert"))
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
-            kind = match.group("kind")
+            kind = _canon_kind(spec, match.group("kind"))
             if kind == "weight":
                 if role == "gate":
                     gate_up_packed[bank_layer_id][expert, :I] = tensor

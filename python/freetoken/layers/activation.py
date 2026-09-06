@@ -56,4 +56,19 @@ def swigluoai_and_mul(
     return swigluoai_and_mul(x, out=out, alpha=alpha, limit=limit)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]
+def swiglu_clamp_and_mul(
+    x, out=None, *, alpha: float = 1.0, limit: float = 10.0
+):
+    """GLM-5.3 clamped SwiGLU over UNINTERLEAVED halves: ``clamp(gate, max=limit) * sigmoid(alpha * gate) * clamp(up, +-limit)``."""
+    from freetoken.kernel.triton.activation import swiglu_clamp_and_mul
+
+    return swiglu_clamp_and_mul(x, out=out, alpha=alpha, limit=limit)
+
+
+__all__ = [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swigluoai_and_mul",
+    "swiglu_clamp_and_mul",
+]

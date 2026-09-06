@@ -60,13 +60,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
-          head_stamp="+g${GITHUB_SHA:0:9}"
+          head_stamp="${GITHUB_SHA:0:9}"
           # The release also carries win_amd64 wheels with their own stamp; this
-          # workflow only builds linux, so compare the linux runtime wheel only.
-          published_stamp="$(gh api "repos/$WEB_REPO/releases/tags/$WEB_TAG" \
+          # workflow only builds linux, so read the linux manifest that
+          # scripts/publish-wheels.sh writes. Before the first manifest exists, fall
+          # back to the stamp in the linux runtime wheel's name.
+          published_stamp="$(curl -fsSL \
+            "https://github.com/$WEB_REPO/releases/download/$WEB_TAG/engine-linux_x86_64.json" \
+            2>/dev/null | jq -r '.commit // empty' || true)"
+          [ -n "$published_stamp" ] || published_stamp="$(gh api "repos/$WEB_REPO/releases/tags/$WEB_TAG" \
             --jq '.assets[].name' 2>/dev/null \
             | grep -E '^freetoken-.*linux_x86_64\.whl$' \
-            | grep -oE '\+g[0-9a-f]{7,}' | head -1 || true)"
+            | grep -oE '\+g[0-9a-f]{7,}' | head -1 | sed 's/^+g//' || true)"
           echo "HEAD: $head_stamp  published: ${published_stamp:-<none>}"
           if [ "$FORCE" = "true" ] || [ "$head_stamp" != "$published_stamp" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
