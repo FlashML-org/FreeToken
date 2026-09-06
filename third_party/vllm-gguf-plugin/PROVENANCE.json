@@ -1,0 +1,2264 @@
+{
+  "schema_version": 1,
+  "component": "vendored Triton GGUF GEMM and dequantize",
+  "qualification_date": "2026-09-06",
+  "qualification_scope": "Source identity, license and attribution for the enumerated 52 files; not a repository-wide license or runtime audit.",
+  "historical_import_revision": null,
+  "historical_import_revision_status": "UNKNOWN; reconstructed public content baseline only",
+  "upstream_repository": "https://github.com/vllm-project/vllm-gguf-plugin",
+  "verified_upstream_revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+  "additional_identical_upstream_revision": "fb973ad784f38b98b054e136bec3414b7cd8494d",
+  "donor_repository": "https://github.com/Maxritz/FreeToken-ROCm",
+  "donor_revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+  "production_import_revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+  "production_baseline_revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+  "row_aware_revision": "845e541d70040e610dde7231c34e0e89358c64b8",
+  "hash_semantics": {
+    "source_sha256": "SHA-256 of Git blob bytes, UTF-8 LF; normalize CRLF checkout bytes to LF before comparison.",
+    "upstream_git_blob_oid": "SHA-1 of Git blob header plus exact upstream bytes.",
+    "license_sha256": "SHA-256 of exact upstream LICENSE bytes.",
+    "qualified_source_revision": "The preceding annotation commit containing all 52 qualified source blobs; the manifest commit is recorded by the external qualification report."
+  },
+  "license": {
+    "spdx_expression": "Apache-2.0",
+    "upstream_path": "LICENSE",
+    "upstream_url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/LICENSE",
+    "bundled_path": "third_party/vllm-gguf-plugin/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "byte_identical_to_upstream": true
+  },
+  "notice": {
+    "decision": "NO_UPSTREAM_NOTICE_IN_CHECKED_SNAPSHOTS",
+    "checked_revisions": [
+      "a494069684fcbfb8c23aff8266d9bceea7569b57",
+      "fb973ad784f38b98b054e136bec3414b7cd8494d"
+    ],
+    "notice_paths": [],
+    "nested_license_paths": [],
+    "restored_spdx_paths": [
+      "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+      "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+      "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+      "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py"
+    ],
+    "attribution_path": "third_party/vllm-gguf-plugin/ATTRIBUTION.md",
+    "attribution_sha256": "173323d27cb164abb5a6fba2f7ff869479d0e3fc701528da48034a2e995c2e56"
+  },
+  "upstream_archive_evidence": [
+    {
+      "url": "https://codeload.github.com/vllm-project/vllm-gguf-plugin/tar.gz/a494069684fcbfb8c23aff8266d9bceea7569b57",
+      "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+      "archive_sha256": "b34750525c8928b0bc69cd77ea70ac5bd4b8ba2bf9796bdc3d0efd974c26e0bb",
+      "bytes": 108148,
+      "file_count": 130,
+      "archive_commit_verified": true,
+      "license_notice_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "url": "https://codeload.github.com/vllm-project/vllm-gguf-plugin/tar.gz/fb973ad784f38b98b054e136bec3414b7cd8494d",
+      "revision": "fb973ad784f38b98b054e136bec3414b7cd8494d",
+      "archive_sha256": "390af563346d310311157b7767c80f4a5f9bffac2d2a802a5d5c04fcaa950128",
+      "bytes": 131754,
+      "file_count": 148,
+      "archive_commit_verified": true,
+      "license_notice_paths": [
+        "LICENSE"
+      ]
+    }
+  ],
+  "path_mapping": {
+    "python/freetoken/kernel/triton/gguf_dequant/": "vllm_gguf_plugin/triton/dequantize/",
+    "python/freetoken/kernel/triton/gguf_gemm/": "vllm_gguf_plugin/triton/gemm/"
+  },
+  "upstream_to_donor_verification": {
+    "verified_files": 52,
+    "classification_counts": {
+      "RELOCATED_IMPORTS_AND_EOF": 22,
+      "REMOVED_EXPORT_LIST": 3,
+      "REMOVED_SPDX_ONLY": 4,
+      "EXACT_BYTES": 23
+    },
+    "unexplained_differences": 0,
+    "method": "Exact byte comparisons; reconstruct relocated import strings, removed AST-located __all__ assignments, removed SPDX-only content, and explicit EOF changes. No downloaded module is executed."
+  },
+  "not_vendored": [
+    "vllm_gguf_plugin/triton/dequantize/__init__.py",
+    "vllm_gguf_plugin/triton/fused_moe/",
+    "vllm_gguf_plugin/csrc/"
+  ],
+  "files": [
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/interface.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/interface.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/interface.py",
+        "sha256": "fa7f5cd35eae43068f798ba154c787e0719ca0401ace3af72754c3be0e7e4705",
+        "git_blob_oid": "fd5d731805ca685306a13a73f9511cc5dc7e74a7"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/interface.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/interface.py",
+        "sha256": "70223f0d1d938c3744a693b75b1daa5ffee5912dfd679f36d27f74ae4b8af629",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/interface.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "0bb6cf0c10cdf418cbe6b174f5a8b381a91463c1aefec9b30b0e2f1e96b151e6",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/interface.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "0bb6cf0c10cdf418cbe6b174f5a8b381a91463c1aefec9b30b0e2f1e96b151e6",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/interface.py",
+        "sha256": "957d58c577e11092dc2b417f8a24c60268872f9d9dc49a337c04a316ab516f73",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/__init__.py",
+        "sha256": "484c1f66ed156f26dc558dee8111ec6aef969d0af6bed784193ceb148e1d01fd",
+        "git_blob_oid": "ec4017fe101efbb8b56b3a7e46bed7af1743458f"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+        "sha256": "7e2f2c522b3c5ff3f84dcfdbddda1d2416d85c5b44a61c64e8372cd79c79f10d",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_EXPORT_LIST",
+        "modifications": [
+          "Removed the __all__ declaration; retained the import statements."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "7e2f2c522b3c5ff3f84dcfdbddda1d2416d85c5b44a61c64e8372cd79c79f10d",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "7e2f2c522b3c5ff3f84dcfdbddda1d2416d85c5b44a61c64e8372cd79c79f10d",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/__init__.py",
+        "sha256": "337fb57b25214474c0af908ee83cf1c1ce651653c64e465f1fc20cf3b36f1bbf",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq1_m.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq1_m.py",
+        "sha256": "735412106ed9d36db56cf7394516ca2f56aae2f94d7ad9ee033f5552e65fc473",
+        "git_blob_oid": "d8dd57c760a53dec0557b90ce0051908dbcc5919"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+        "sha256": "5f44eff98dd157978b2c8e59b257b25d42ee8a3280d4f74c5d755b3fd0f92b4b",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "409b9a4bd92f284cc4960f2ec80e291b41f03aeae9a25ca5731a126d256c10d3",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "409b9a4bd92f284cc4960f2ec80e291b41f03aeae9a25ca5731a126d256c10d3",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_m.py",
+        "sha256": "478089cd375ee6eb4ae01a1758dee6bb1541e564eaf349347ec51f300635bc6d",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq1_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq1_s.py",
+        "sha256": "e4619535a6776d8fbbf4ac1c451a7773b866d07f3c40a1231112bcc2c436a4c7",
+        "git_blob_oid": "a5a5f1c507248c4b29336350fd044c22a3a306b3"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+        "sha256": "e467de99b3d5084411fcc7b2f934ca13e06459f723f9e124952d6d762c92e275",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "6e22defd9520434c5d04b956823157f2013a0f4e938eadfb50e1ac83631241ba",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "6e22defd9520434c5d04b956823157f2013a0f4e938eadfb50e1ac83631241ba",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq1_s.py",
+        "sha256": "28e2abbca145858a19ab5b5c659ac9fca1f962a843f212d5baabeb185d48c583",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_s.py",
+        "sha256": "2102e3f5293c3aefd0a0352e68ddccae9adc5e0d339e3d901629a6a3e3ed7b65",
+        "git_blob_oid": "dfad0887a513e37f08b6864f89951a3e989ae027"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+        "sha256": "87aea0587f999e49c33cef071ea96d31ddb09e55f65f1b7c1023dd812e23851f",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "a48783ec3d3bd3b2835fe92788c9fb54f3bfa5e458e0260df5022809a6922673",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "a48783ec3d3bd3b2835fe92788c9fb54f3bfa5e458e0260df5022809a6922673",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_s.py",
+        "sha256": "4197565b582507516e4aa508ff42ef751ac36ca8753a0c22b4c2dcb6423f8f5f",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_xs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_xs.py",
+        "sha256": "30cf8761d25401603849a71ca6f98467d418c4832e15fa485bde037ca96aea4e",
+        "git_blob_oid": "dba6658340f175b3f6dd261a76757670498d7cac"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+        "sha256": "dc023e5c88e2e12bee789b92d68cc7bc82fe88deae08fac07177d72387fddb37",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "2c37fa1c355e2918f06c7223f46384589be5d61ee82cf21caab265f2169cad02",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "2c37fa1c355e2918f06c7223f46384589be5d61ee82cf21caab265f2169cad02",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xs.py",
+        "sha256": "47749d8c5b14422f16b73d932c31719235f6aea74df4a5503f1c0e801a0a0047",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_xxs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq2_xxs.py",
+        "sha256": "2cc8610c83de7087e8bf542dce2d47c2a89d9d88c7fbd9092a4b4753e57409c6",
+        "git_blob_oid": "b82d70d0fdf6929419cbeda5f32bbb703e8f0449"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+        "sha256": "d3dd48aeccf1561b397fbe0077fcac463b18e209af3d2f9000815ecd40df117a",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "f3fcc7c8c2da845b5b61cf2acce1eac1a1b32fc88299cd3f4fe7176d18cd80d4",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "f3fcc7c8c2da845b5b61cf2acce1eac1a1b32fc88299cd3f4fe7176d18cd80d4",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq2_xxs.py",
+        "sha256": "37597afaac0fc218e3511f5221d3a45fb9c40ef666fbad8934628940fceed102",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq3_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq3_s.py",
+        "sha256": "841ab0215c7c61be31068f634b3c2d26903bbd9639438eaa9d0e4c6871e8a374",
+        "git_blob_oid": "52fcca9fac29119df213ed9f23536a8ad8f6a956"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+        "sha256": "04841b226f227ddfd1681d9d74fdd9b049564a0c00657ac0c599ac68e62a7255",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "eacbe026e1553b0610334631e0ea934d6fa494c5711bd3a7b08a0db1265e758f",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "eacbe026e1553b0610334631e0ea934d6fa494c5711bd3a7b08a0db1265e758f",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_s.py",
+        "sha256": "948374ef9ff759b2dabd9473171361f802bb9f01a235ed60cc2bc2688191b247",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq3_xxs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq3_xxs.py",
+        "sha256": "414627369715ab31aec9ac5103b3ef18ecb8bfb45670af2e877418821ea62210",
+        "git_blob_oid": "499a44e0781536e77e12469057ee3bdd59ca9e2c"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+        "sha256": "29a933c104badbfeaedeeeec4b9fb83d1b9b9052487aa72c458405a8343e38aa",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "5e74bc9510b2681854bce3a4f34f88b8c0191bbc72f9c3540e93f7f8ed8b4ecf",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "5e74bc9510b2681854bce3a4f34f88b8c0191bbc72f9c3540e93f7f8ed8b4ecf",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq3_xxs.py",
+        "sha256": "9e0c3994101a0cbb2331d61d041cbe3830dc3dfcc9883c65cfc08cd2b269ef0a",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq4_nl.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq4_nl.py",
+        "sha256": "b8e640287eb0929f83dcdc3bf01d7bf8ac0ac2b63cadc5b7d17f83bb77daa4db",
+        "git_blob_oid": "ec05a3fa8223f4b897351caeec30d0ee5f515ed4"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+        "sha256": "8072ca10188c2542c332b9cf82b1ae9cacf21f83bc107ba73c19c481bfbbcad5",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "71de539e1eb5046b2f71bb424cdf36d7a7a36de5e07a31dc15e43287957f8507",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "71de539e1eb5046b2f71bb424cdf36d7a7a36de5e07a31dc15e43287957f8507",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_nl.py",
+        "sha256": "2c20033f90b84953e62842da8f2040780e6d711fa87ccd6d53bdc254e2028eea",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/iq_quant/iq4_xs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/iq_quant/iq4_xs.py",
+        "sha256": "91529ddc95d9e7da4824364b4308d0aa8c5d9712ea3d7c4a644f5a396c7ff4f0",
+        "git_blob_oid": "adda55f415a5d1a824a9ef01c4c1b2965d635b57"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+        "sha256": "8a8b39d54411de3b044a9ff04a1fdf697afe226932a87b02ded4e1de9512389e",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "7c784e15a074fe4559d74b4223eafb8c635a6ffe3805d57e5700d4d1c4ecca74",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "7c784e15a074fe4559d74b4223eafb8c635a6ffe3805d57e5700d4d1c4ecca74",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/iq_quant/iq4_xs.py",
+        "sha256": "fd81ec65d8fcb9c86e485d7da27e3600a2ca181b6e3eaabf95c08293488a9e15",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/__init__.py",
+        "sha256": "3c42c6eb160150dc781258ddf2103d7b0de03b674297646f42929f707694bb20",
+        "git_blob_oid": "61a447ea6b1f5c9c112de88716de4e093b404a2b"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+        "sha256": "2fa902002ac17f7ef49923c22310fdc8021c90502bb571d65a458b669d690247",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_EXPORT_LIST",
+        "modifications": [
+          "Removed the __all__ declaration; retained the import statements."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "2fa902002ac17f7ef49923c22310fdc8021c90502bb571d65a458b669d690247",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "2fa902002ac17f7ef49923c22310fdc8021c90502bb571d65a458b669d690247",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/__init__.py",
+        "sha256": "36cb6f7a1c86e1496b42dd8f83ab42312fe3292d16184c833d0458e8598f7fb8",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/q2_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/q2_k.py",
+        "sha256": "4dff47db3970b03709b22ed67cb29fddfb99faec5fe26980f0683b3bd7759ef1",
+        "git_blob_oid": "d1c5071e88522ed10de9a4423bc6724e415865e9"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+        "sha256": "cee34209213c44f7ee61304482e14a63cd17515c246083062a0c17e16377e667",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "f08f72068a9c2ef7de8d7cb5ef603e88600b88e75f02d0c89caae34249ea8825",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "f08f72068a9c2ef7de8d7cb5ef603e88600b88e75f02d0c89caae34249ea8825",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q2_k.py",
+        "sha256": "afa6e43cd1dac1f8369e84ab423f654b516bfb93cfe079f5912c3b40a0e2db18",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/q3_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/q3_k.py",
+        "sha256": "e97247b9ead180afa31d896bcb72e2df8ef1ea5f326e9988d3d3c36a9caa58a1",
+        "git_blob_oid": "ed47e4757abc7442baf0068a6dafd1932247635c"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+        "sha256": "f0d65d84a8fe4fc378a70c9a064f9840c7eea902497f92f48fea01ae7cd0532f",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "fa0747f7548242df0d5aa7b10fa1c9e63f99c20d25e6c8271dd957c6e7a0a10a",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "fa0747f7548242df0d5aa7b10fa1c9e63f99c20d25e6c8271dd957c6e7a0a10a",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q3_k.py",
+        "sha256": "4477f68a3a64f15459f480475f6c67145d24c121e6c1b3b350e80ccca3a14ee4",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/q4_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/q4_k.py",
+        "sha256": "4a1d1323fab0a463fc33fa9abc32a8d2a43b30be9f3d24de95b4f008c3253811",
+        "git_blob_oid": "8d69afdba2383d10febfe07691e752a052fd818d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+        "sha256": "c74ed6b34fcc82c55ffd0c4c2590db7bb32bd1074c28298bb5d0e73f9c830f71",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "ec448b2b519f55de635244137eb09e01c467a25cd3ef945407d766f54f30fee7",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "ec448b2b519f55de635244137eb09e01c467a25cd3ef945407d766f54f30fee7",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q4_k.py",
+        "sha256": "e18891799a0eff0cd7d4861b76e565b569147ae279aadcf6cf104002adecf22d",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/q5_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/q5_k.py",
+        "sha256": "c74345d0972a37777f33c013758e868b2b835f5805b721a88c1ad40fd92e0238",
+        "git_blob_oid": "be6c05d8c6b05f51c88e060a44e6dfb043e5dd1b"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+        "sha256": "0ccadf8b9f5bfdab8bf2822498f02d0f6b81b80168bd449b79fba29ecaf4774e",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "e5e2e3b8899123474476f00870f72a7c9c906269a3714b90a2c9de8bd862dcc4",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "e5e2e3b8899123474476f00870f72a7c9c906269a3714b90a2c9de8bd862dcc4",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q5_k.py",
+        "sha256": "fe520ce8e39992ad86a5dcf99d3c2f62efa67f8dd8a8c97be2d8eb8579270254",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/k_quant/q6_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/k_quant/q6_k.py",
+        "sha256": "1c705c7052286cd179d4793d9fa08d57a20145bb24f7da49511503e5fe0eab04",
+        "git_blob_oid": "1bf1451ed023c1b3a5f6ffd86bf93c360c28b603"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+        "sha256": "6a529a85f7e78e335c107790a3dc1f90b8fbbc3e53710e14f846742fe99b2f9f",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "8703ef9f31cb1757af5ca67b93c4c61eab4ef5bc2834a7c5a6102c9ad33871bb",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "8703ef9f31cb1757af5ca67b93c4c61eab4ef5bc2834a7c5a6102c9ad33871bb",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/k_quant/q6_k.py",
+        "sha256": "c8f34b102c6336d412191d20458808d2991ce8c7a082bd8b5afe15fad8bc1b0a",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/__init__.py",
+        "sha256": "9727990b5e8d5f051f572cd8999c28f22b2be99c2babeb1dee17c081b1853ac9",
+        "git_blob_oid": "72ab8b799987931fa40989bfced6247f29fb8347"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+        "sha256": "3e2ce21bd8c5ca04fdcf657968c27a3776ef4787357976d8fa7b405286215b97",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_EXPORT_LIST",
+        "modifications": [
+          "Removed the __all__ declaration; retained the import statements."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "3e2ce21bd8c5ca04fdcf657968c27a3776ef4787357976d8fa7b405286215b97",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "3e2ce21bd8c5ca04fdcf657968c27a3776ef4787357976d8fa7b405286215b97",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/__init__.py",
+        "sha256": "1d1bd39fac9bd86f8840f9fccf2349173ac0d1384473d155720d8d12db5e1c22",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q4_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q4_0.py",
+        "sha256": "4aab047fbf9abf6234ef6fd64f2a3aee4023cb91c850579997e9827d5b997643",
+        "git_blob_oid": "19cb29b481ab6a202d49eebf26f9feffaea26d8d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+        "sha256": "e4bc0061e3758959de9e22de25f52480dd431b11389d7c702989c4f7f095447d",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "76236bdadb67c853cced44e00660fde69fd9f601f6db4c2535379726b30394b8",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "76236bdadb67c853cced44e00660fde69fd9f601f6db4c2535379726b30394b8",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_0.py",
+        "sha256": "ec4d6e6f1962a32f7a8b2e7af7a170d97605146f5ef4503afe26446da4ae2d7c",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q4_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q4_1.py",
+        "sha256": "5d0d85223f69082951a5301b87235e74c1c212e1c34f987871bbdf0a523e93c3",
+        "git_blob_oid": "5faf93fed212aa5e6dd48bc76d828ef09b1876de"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+        "sha256": "5a48c3aff3692f3f53c64c5d04e4dce53cb070d45ca9122b12ee34fd6a9bb9eb",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "04695f0343eba37cbb9325ae2b388352be7941079a2c9befc1c8fc1bb6df83e5",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "04695f0343eba37cbb9325ae2b388352be7941079a2c9befc1c8fc1bb6df83e5",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q4_1.py",
+        "sha256": "f83e633d4676f67978d61f3e8869911baeb6e695a442da25ef0ca77ef72d04ae",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q5_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q5_0.py",
+        "sha256": "ae4e2c494b227a6d6534631b6ee2bdbc313c46ecd2a7e8af8a582575338c796e",
+        "git_blob_oid": "0214bdd861ae70512649c5863b77fc9d55d3028f"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+        "sha256": "12e638c750d654e77bc95bded8be6e01f5e34bab3e5436b0b64911576aaabffc",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "9a4d7d826da82d4abdfc4e039186d3073a47090e827c5546d9dca10540b14ccc",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "9a4d7d826da82d4abdfc4e039186d3073a47090e827c5546d9dca10540b14ccc",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_0.py",
+        "sha256": "966dbb19cdd27831f1f32beacf78964a68505f4c1d210fe0d5aacda5a27c8f93",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q5_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q5_1.py",
+        "sha256": "d6d526993a0f26cb0da9030d24456cd6a163d13a66205c2f47f4557b9443daec",
+        "git_blob_oid": "cb892666b289dfd16484ed2ea3cd5d0a32972142"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+        "sha256": "34da598f8faa14c7594cf2798caa27eb2e1bfa8d6664c5d934fd4b75941232fe",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "2af771c204b2648864ec54209f5121583caa0993be159e7d94b19756971e2cb4",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "2af771c204b2648864ec54209f5121583caa0993be159e7d94b19756971e2cb4",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q5_1.py",
+        "sha256": "b45c303c7e86c869e1e9a9efc9532d3e63793c3a1d694be87f95dd18cb1ee450",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q8_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q8_0.py",
+        "sha256": "274008decd5ddf15fa6741d1422201d6831c59d439df0a7b44fe7939eaafbc8d",
+        "git_blob_oid": "946407eda665a60ceb34b208ee475390c32c00c9"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+        "sha256": "94701622ad786747bafb0d637fca546335588bf11c6b56c6d325adeb04556b12",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "3f7cfb4a496be7cfcd85f20277c2b360c5b06cbf5cfe2a44fead809505870cba",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "3f7cfb4a496be7cfcd85f20277c2b360c5b06cbf5cfe2a44fead809505870cba",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_0.py",
+        "sha256": "3cce6a565d7d7ccf8bdc4dc99cd22c7abfbd0df99f9166286b8e072ef4c70db5",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/standard_quant/q8_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/standard_quant/q8_1.py",
+        "sha256": "d2b56f6ba4b0018240b81bc354d805917a83f0f26838cd45021821e50b7b39fc",
+        "git_blob_oid": "7b158902b56892f85b67bc0182c7a7575cf53f7d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+        "sha256": "7616d3954d4e736b72eb57846fd5f6bd8cf35f84d5196749c32a78cd077d4aaf",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "9b5a7b5348e9a0634bb2cf3f6a6c7ef7de8c9588b02ab76cd256aca031269996",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "9b5a7b5348e9a0634bb2cf3f6a6c7ef7de8c9588b02ab76cd256aca031269996",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/standard_quant/q8_1.py",
+        "sha256": "08e08bbb213522f336662ff9acea80188cf0f341265cd5dd8d9262863c7da473",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_dequant/utils.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/dequantize/utils.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/dequantize/utils.py",
+        "sha256": "3b46512556ee6ef55d5c7acd32ce289f41640c022252ab0f65ec961e9a854750",
+        "git_blob_oid": "c6460bb5884317af212fdbe7b771f2358067450e"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/utils.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_dequant/utils.py",
+        "sha256": "4fb1da3e4b68537679dfb7d7ec274e68faf42563646eb434c5cfd9a0eff1ac70",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "RELOCATED_IMPORTS_AND_EOF",
+        "modifications": [
+          "Changed relative imports from gemm to gguf_gemm.",
+          "Added one empty EOF line in the donor; normalized in the production import."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/utils.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "d660f5d57131d7942245318103fc67787e24e7ce43c0472f5cbe65f4213ce185",
+        "eof_normalized": true
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/utils.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "d660f5d57131d7942245318103fc67787e24e7ce43c0472f5cbe65f4213ce185",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_dequant/utils.py",
+        "sha256": "98d41916da744d7fb8f2a8a3e3e241036990338673aa26c8d3ee549a7946482c",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "git_blob_oid": "9881313609aae2c16a19dae665af4268bd54431d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_SPDX_ONLY",
+        "modifications": [
+          "Removed the SPDX line from an otherwise empty package initializer."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "annotation_changes": [
+          "Restored the upstream SPDX-License-Identifier."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/interface.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/interface.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/interface.py",
+        "sha256": "4797dd1ead0968eed05a7a4d700288e9e9500a194719b9457e03287d4021b4b5",
+        "git_blob_oid": "a083f80af7073890fdb1c084d00a2d87bc645ea2"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/interface.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/interface.py",
+        "sha256": "4797dd1ead0968eed05a7a4d700288e9e9500a194719b9457e03287d4021b4b5",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/interface.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "4797dd1ead0968eed05a7a4d700288e9e9500a194719b9457e03287d4021b4b5",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/interface.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "4797dd1ead0968eed05a7a4d700288e9e9500a194719b9457e03287d4021b4b5",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/interface.py",
+        "sha256": "4797dd1ead0968eed05a7a4d700288e9e9500a194719b9457e03287d4021b4b5",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "git_blob_oid": "9881313609aae2c16a19dae665af4268bd54431d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_SPDX_ONLY",
+        "modifications": [
+          "Removed the SPDX line from an otherwise empty package initializer."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "annotation_changes": [
+          "Restored the upstream SPDX-License-Identifier."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq1_m.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq1_m.py",
+        "sha256": "a085d73390d934bb9a080d52e6240e00d78c9157853a852166fded297bb32610",
+        "git_blob_oid": "7f1c6957a4b0450bc6dbcb2e82c3f8195934d7fa"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+        "sha256": "a085d73390d934bb9a080d52e6240e00d78c9157853a852166fded297bb32610",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "a085d73390d934bb9a080d52e6240e00d78c9157853a852166fded297bb32610",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "a085d73390d934bb9a080d52e6240e00d78c9157853a852166fded297bb32610",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_m.py",
+        "sha256": "a085d73390d934bb9a080d52e6240e00d78c9157853a852166fded297bb32610",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq1_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq1_s.py",
+        "sha256": "1fa2ac641d986803fc8f5dd8e3e81334580ddf287b106cb01bcb6fb10989936e",
+        "git_blob_oid": "2d947032ecc28968080e24eeeee70d33170977aa"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+        "sha256": "1fa2ac641d986803fc8f5dd8e3e81334580ddf287b106cb01bcb6fb10989936e",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "1fa2ac641d986803fc8f5dd8e3e81334580ddf287b106cb01bcb6fb10989936e",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "1fa2ac641d986803fc8f5dd8e3e81334580ddf287b106cb01bcb6fb10989936e",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq1_s.py",
+        "sha256": "1fa2ac641d986803fc8f5dd8e3e81334580ddf287b106cb01bcb6fb10989936e",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq2_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq2_s.py",
+        "sha256": "3c0ffa66e08bf1e38f950be2e53f39303c8bb0e11087caf6ae639eea83e52838",
+        "git_blob_oid": "2157c5b0919b12a41bcf9b6d612bdeee0f775d34"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+        "sha256": "3c0ffa66e08bf1e38f950be2e53f39303c8bb0e11087caf6ae639eea83e52838",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "3c0ffa66e08bf1e38f950be2e53f39303c8bb0e11087caf6ae639eea83e52838",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "3c0ffa66e08bf1e38f950be2e53f39303c8bb0e11087caf6ae639eea83e52838",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_s.py",
+        "sha256": "3c0ffa66e08bf1e38f950be2e53f39303c8bb0e11087caf6ae639eea83e52838",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq2_xs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq2_xs.py",
+        "sha256": "a9259737326c7e4ed6559285355c822f972921d454e0cce3dd91a2d718dd218a",
+        "git_blob_oid": "48c8b6c0ffedf36419fac48485c7bf1a93e448f7"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+        "sha256": "a9259737326c7e4ed6559285355c822f972921d454e0cce3dd91a2d718dd218a",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "a9259737326c7e4ed6559285355c822f972921d454e0cce3dd91a2d718dd218a",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "a9259737326c7e4ed6559285355c822f972921d454e0cce3dd91a2d718dd218a",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xs.py",
+        "sha256": "a9259737326c7e4ed6559285355c822f972921d454e0cce3dd91a2d718dd218a",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq2_xxs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq2_xxs.py",
+        "sha256": "f7b240c3d764b82805d68b6108d618dfa49594cddba4d0af11873e5fbeb4c061",
+        "git_blob_oid": "eefea38651c8fcf71ff750a3edbfd9a966907913"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+        "sha256": "f7b240c3d764b82805d68b6108d618dfa49594cddba4d0af11873e5fbeb4c061",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "f7b240c3d764b82805d68b6108d618dfa49594cddba4d0af11873e5fbeb4c061",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "f7b240c3d764b82805d68b6108d618dfa49594cddba4d0af11873e5fbeb4c061",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq2_xxs.py",
+        "sha256": "f7b240c3d764b82805d68b6108d618dfa49594cddba4d0af11873e5fbeb4c061",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq3_s.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq3_s.py",
+        "sha256": "85b029e372f7c025320965cc98283f7556982bd0195b429173c094d4eb261d68",
+        "git_blob_oid": "0cc1d1b0a0f1411570e475cb9e9a14bf9e8a0edb"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+        "sha256": "85b029e372f7c025320965cc98283f7556982bd0195b429173c094d4eb261d68",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "85b029e372f7c025320965cc98283f7556982bd0195b429173c094d4eb261d68",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "85b029e372f7c025320965cc98283f7556982bd0195b429173c094d4eb261d68",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_s.py",
+        "sha256": "85b029e372f7c025320965cc98283f7556982bd0195b429173c094d4eb261d68",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq3_xxs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq3_xxs.py",
+        "sha256": "cce28674e735a9ccec6a503604790e915e723783551c90fd80dcebce5535d4c0",
+        "git_blob_oid": "1f14529c2527e62ad43c93c7bc9a935740c905fb"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+        "sha256": "cce28674e735a9ccec6a503604790e915e723783551c90fd80dcebce5535d4c0",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "cce28674e735a9ccec6a503604790e915e723783551c90fd80dcebce5535d4c0",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "cce28674e735a9ccec6a503604790e915e723783551c90fd80dcebce5535d4c0",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq3_xxs.py",
+        "sha256": "cce28674e735a9ccec6a503604790e915e723783551c90fd80dcebce5535d4c0",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq4_nl.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq4_nl.py",
+        "sha256": "8da067cc8a21a58bab73a7c5af4a7eaf293d7287033069e303d99511b0153fbf",
+        "git_blob_oid": "0448d3634d6499024f26b449bfacbd985563e0bb"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+        "sha256": "8da067cc8a21a58bab73a7c5af4a7eaf293d7287033069e303d99511b0153fbf",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "8da067cc8a21a58bab73a7c5af4a7eaf293d7287033069e303d99511b0153fbf",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "8da067cc8a21a58bab73a7c5af4a7eaf293d7287033069e303d99511b0153fbf",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_nl.py",
+        "sha256": "8da067cc8a21a58bab73a7c5af4a7eaf293d7287033069e303d99511b0153fbf",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq4_xs.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq4_xs.py",
+        "sha256": "b420a17e6ea301a3c0ef7e732c71b720cda92481aadc08d229505495a7566afe",
+        "git_blob_oid": "d3160b5a386bcaa349ef2f58a56408be14d6bbcc"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+        "sha256": "b420a17e6ea301a3c0ef7e732c71b720cda92481aadc08d229505495a7566afe",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "b420a17e6ea301a3c0ef7e732c71b720cda92481aadc08d229505495a7566afe",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "b420a17e6ea301a3c0ef7e732c71b720cda92481aadc08d229505495a7566afe",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq4_xs.py",
+        "sha256": "b420a17e6ea301a3c0ef7e732c71b720cda92481aadc08d229505495a7566afe",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/iq_quant/iq_tables.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/iq_quant/iq_tables.py",
+        "sha256": "237e8f35e00611aa5f1ae3c176a440fec6cd672aeb54b8ced4fc2aaad019e693",
+        "git_blob_oid": "80fe7ff6b345db23fae29d95c72828c22ecc5814"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+        "sha256": "237e8f35e00611aa5f1ae3c176a440fec6cd672aeb54b8ced4fc2aaad019e693",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "237e8f35e00611aa5f1ae3c176a440fec6cd672aeb54b8ced4fc2aaad019e693",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "237e8f35e00611aa5f1ae3c176a440fec6cd672aeb54b8ced4fc2aaad019e693",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/iq_quant/iq_tables.py",
+        "sha256": "237e8f35e00611aa5f1ae3c176a440fec6cd672aeb54b8ced4fc2aaad019e693",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "git_blob_oid": "9881313609aae2c16a19dae665af4268bd54431d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_SPDX_ONLY",
+        "modifications": [
+          "Removed the SPDX line from an otherwise empty package initializer."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "annotation_changes": [
+          "Restored the upstream SPDX-License-Identifier."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/q2_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/q2_k.py",
+        "sha256": "0e3c07ca796f20ef2af8bb0c7f9675c9a56256a180731e92df9802fa157ea95b",
+        "git_blob_oid": "bbca7a57846adc7b1589f4a165a1af97d0119441"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+        "sha256": "0e3c07ca796f20ef2af8bb0c7f9675c9a56256a180731e92df9802fa157ea95b",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "0e3c07ca796f20ef2af8bb0c7f9675c9a56256a180731e92df9802fa157ea95b",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "0e3c07ca796f20ef2af8bb0c7f9675c9a56256a180731e92df9802fa157ea95b",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q2_k.py",
+        "sha256": "0e3c07ca796f20ef2af8bb0c7f9675c9a56256a180731e92df9802fa157ea95b",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/q3_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/q3_k.py",
+        "sha256": "9b08b1190036c3f6f9f76c5df47d651139de1cc275b4e0506924d58e45303fe9",
+        "git_blob_oid": "594986e7dc0a77b7f1a956d81f02a7adbdcbdcf7"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+        "sha256": "9b08b1190036c3f6f9f76c5df47d651139de1cc275b4e0506924d58e45303fe9",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "9b08b1190036c3f6f9f76c5df47d651139de1cc275b4e0506924d58e45303fe9",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "9b08b1190036c3f6f9f76c5df47d651139de1cc275b4e0506924d58e45303fe9",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q3_k.py",
+        "sha256": "9b08b1190036c3f6f9f76c5df47d651139de1cc275b4e0506924d58e45303fe9",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/q4_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/q4_k.py",
+        "sha256": "8a3f708e6efb9351125ac4388c9b1cccc545a4e0b10929ec6d19e1178c99e96d",
+        "git_blob_oid": "2b26ca4baba7d96d42b0f26aa8ac98f590f52962"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+        "sha256": "8a3f708e6efb9351125ac4388c9b1cccc545a4e0b10929ec6d19e1178c99e96d",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "8a3f708e6efb9351125ac4388c9b1cccc545a4e0b10929ec6d19e1178c99e96d",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "8a3f708e6efb9351125ac4388c9b1cccc545a4e0b10929ec6d19e1178c99e96d",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q4_k.py",
+        "sha256": "8a3f708e6efb9351125ac4388c9b1cccc545a4e0b10929ec6d19e1178c99e96d",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/q5_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/q5_k.py",
+        "sha256": "eb981367e11f71068ba16e6b42a39c49f272b01291b51dd1a2867f887b64a879",
+        "git_blob_oid": "e355ced68d9312e2060863ce24c84c70f3cc5e8e"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+        "sha256": "eb981367e11f71068ba16e6b42a39c49f272b01291b51dd1a2867f887b64a879",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "eb981367e11f71068ba16e6b42a39c49f272b01291b51dd1a2867f887b64a879",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "eb981367e11f71068ba16e6b42a39c49f272b01291b51dd1a2867f887b64a879",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q5_k.py",
+        "sha256": "eb981367e11f71068ba16e6b42a39c49f272b01291b51dd1a2867f887b64a879",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/k_quant/q6_k.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/k_quant/q6_k.py",
+        "sha256": "1f5eb00e017b24b8651cfe814856747a1b86e6b0e2b140d318c66fd48fd0a80c",
+        "git_blob_oid": "ad86ab40e8a269f1ba7049b6b7804b6d9ba7b060"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+        "sha256": "1f5eb00e017b24b8651cfe814856747a1b86e6b0e2b140d318c66fd48fd0a80c",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "1f5eb00e017b24b8651cfe814856747a1b86e6b0e2b140d318c66fd48fd0a80c",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "1f5eb00e017b24b8651cfe814856747a1b86e6b0e2b140d318c66fd48fd0a80c",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/k_quant/q6_k.py",
+        "sha256": "1f5eb00e017b24b8651cfe814856747a1b86e6b0e2b140d318c66fd48fd0a80c",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/__init__.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "git_blob_oid": "9881313609aae2c16a19dae665af4268bd54431d"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "REMOVED_SPDX_ONLY",
+        "modifications": [
+          "Removed the SPDX line from an otherwise empty package initializer."
+        ]
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/__init__.py",
+        "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1",
+        "annotation_changes": [
+          "Restored the upstream SPDX-License-Identifier."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py",
+        "sha256": "e3a80371bfbfd13946ff4ac0f5a0dcb10c780de40d76a3309246632c70c6c8c1",
+        "git_blob_oid": "a299281c09ad5f4b6b1b4f9d75eb72912632d7ac"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+        "sha256": "e3a80371bfbfd13946ff4ac0f5a0dcb10c780de40d76a3309246632c70c6c8c1",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "e3a80371bfbfd13946ff4ac0f5a0dcb10c780de40d76a3309246632c70c6c8c1",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "e3a539da45dfa8391c57c920d33fbcdf43b396e02db162a69965a45581a285bf",
+        "local_modification_commit": "845e541d70040e610dde7231c34e0e89358c64b8",
+        "local_modification": "Row-aware decode tiling."
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_0.py",
+        "sha256": "b28deb7292283fc80423b3ee3ee86c1fe9a0b5120591a70047ce2fe9e0cda735",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q4_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q4_1.py",
+        "sha256": "7dc5dbb13ba58810129faf71f5dd4dd24ee2a0cd2bf633dc9d1dddf27fa355ba",
+        "git_blob_oid": "6406d500f8c2bd3d1e57d37a43a52fd4582278d7"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+        "sha256": "7dc5dbb13ba58810129faf71f5dd4dd24ee2a0cd2bf633dc9d1dddf27fa355ba",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "7dc5dbb13ba58810129faf71f5dd4dd24ee2a0cd2bf633dc9d1dddf27fa355ba",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "7dc5dbb13ba58810129faf71f5dd4dd24ee2a0cd2bf633dc9d1dddf27fa355ba",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q4_1.py",
+        "sha256": "7dc5dbb13ba58810129faf71f5dd4dd24ee2a0cd2bf633dc9d1dddf27fa355ba",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q5_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q5_0.py",
+        "sha256": "7966b6d565b7285e0268aa0c2fdef6cfb464234ca32d34481e80672cf906c26e",
+        "git_blob_oid": "0701806c8de74ffb60f44fb38a0b6e86e4443f6a"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+        "sha256": "7966b6d565b7285e0268aa0c2fdef6cfb464234ca32d34481e80672cf906c26e",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "7966b6d565b7285e0268aa0c2fdef6cfb464234ca32d34481e80672cf906c26e",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "7966b6d565b7285e0268aa0c2fdef6cfb464234ca32d34481e80672cf906c26e",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_0.py",
+        "sha256": "7966b6d565b7285e0268aa0c2fdef6cfb464234ca32d34481e80672cf906c26e",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q5_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q5_1.py",
+        "sha256": "c625c7bd20992b45c5c3f42d4be1f83b7d3d6843299aeaaa74417f858bc13ece",
+        "git_blob_oid": "3a0b1809ba0a4e6f3dfb6b1548624bc837acf8d4"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+        "sha256": "c625c7bd20992b45c5c3f42d4be1f83b7d3d6843299aeaaa74417f858bc13ece",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "c625c7bd20992b45c5c3f42d4be1f83b7d3d6843299aeaaa74417f858bc13ece",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "c625c7bd20992b45c5c3f42d4be1f83b7d3d6843299aeaaa74417f858bc13ece",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q5_1.py",
+        "sha256": "c625c7bd20992b45c5c3f42d4be1f83b7d3d6843299aeaaa74417f858bc13ece",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q8_0.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q8_0.py",
+        "sha256": "75de808a1017fd6e4787086b9ffa42acfbc685e5ce1c8255a9d3e890ae61fa4e",
+        "git_blob_oid": "a541c6a02810c53d8926e9512da818498f98173f"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+        "sha256": "75de808a1017fd6e4787086b9ffa42acfbc685e5ce1c8255a9d3e890ae61fa4e",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "75de808a1017fd6e4787086b9ffa42acfbc685e5ce1c8255a9d3e890ae61fa4e",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "75de808a1017fd6e4787086b9ffa42acfbc685e5ce1c8255a9d3e890ae61fa4e",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_0.py",
+        "sha256": "75de808a1017fd6e4787086b9ffa42acfbc685e5ce1c8255a9d3e890ae61fa4e",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/standard_quant/q8_1.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/standard_quant/q8_1.py",
+        "sha256": "84dcf565d25c1190b6d8984810118a66049ac57d54aaf04920f0e1025b946885",
+        "git_blob_oid": "a0fca4c595539e8837be9c4921ba737f608479f9"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+        "sha256": "84dcf565d25c1190b6d8984810118a66049ac57d54aaf04920f0e1025b946885",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "84dcf565d25c1190b6d8984810118a66049ac57d54aaf04920f0e1025b946885",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "84dcf565d25c1190b6d8984810118a66049ac57d54aaf04920f0e1025b946885",
+        "local_modification_commit": null,
+        "local_modification": null
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/standard_quant/q8_1.py",
+        "sha256": "84dcf565d25c1190b6d8984810118a66049ac57d54aaf04920f0e1025b946885",
+        "annotation_changes": [],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    },
+    {
+      "path": "python/freetoken/kernel/triton/gguf_gemm/utils.py",
+      "upstream": {
+        "path": "vllm_gguf_plugin/triton/gemm/utils.py",
+        "revision": "a494069684fcbfb8c23aff8266d9bceea7569b57",
+        "url": "https://github.com/vllm-project/vllm-gguf-plugin/blob/a494069684fcbfb8c23aff8266d9bceea7569b57/vllm_gguf_plugin/triton/gemm/utils.py",
+        "sha256": "6ee2b74c572dafc1511d006e5a08cebae06138f6a2b51aa59939edd88ebf051f",
+        "git_blob_oid": "6cd3243d28b35306cb5e2c90af31b8ea9c16de4e"
+      },
+      "donor": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/utils.py",
+        "revision": "45675e47348a167a9b36ca224ad310c1ee1e34b4",
+        "raw_url": "https://raw.githubusercontent.com/Maxritz/FreeToken-ROCm/45675e47348a167a9b36ca224ad310c1ee1e34b4/python/freetoken/kernel/triton/gguf_gemm/utils.py",
+        "sha256": "6ee2b74c572dafc1511d006e5a08cebae06138f6a2b51aa59939edd88ebf051f",
+        "public_bytes_match_local_git_blob": true,
+        "classification": "EXACT_BYTES",
+        "modifications": []
+      },
+      "production_import": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/utils.py",
+        "revision": "f3cec5ab9a87ddfab9d2961287e1952fbebd4664",
+        "sha256": "6ee2b74c572dafc1511d006e5a08cebae06138f6a2b51aa59939edd88ebf051f",
+        "eof_normalized": false
+      },
+      "production_baseline": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/utils.py",
+        "revision": "10dd74e62fa0cf27898cd4878264e73ef9043259",
+        "sha256": "4cede92c8d04d876412d5f7f156758324117ea75e1841db1b26d65caa8fd537d",
+        "local_modification_commit": "845e541d70040e610dde7231c34e0e89358c64b8",
+        "local_modification": "Row-aware decode tiling."
+      },
+      "qualified_source": {
+        "path": "python/freetoken/kernel/triton/gguf_gemm/utils.py",
+        "sha256": "ccfa2e3e88846aeaadc249007a231b531bb246446960dfb87670487e22e9a6a1",
+        "annotation_changes": [
+          "Added license, source attribution and modification comments; executable AST unchanged."
+        ],
+        "ast_matches_production_baseline": true,
+        "revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+      }
+    }
+  ],
+  "qualified_source_revision": "289fea2d951d7d5080faa2061a41259d9c7310d0"
+}

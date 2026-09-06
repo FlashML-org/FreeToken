@@ -14,7 +14,12 @@ description = "Local MoE-offload LLM inference runtime with OpenAI- and Anthropi
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "third_party/vllm-gguf-plugin/LICENSE",
+    "third_party/vllm-gguf-plugin/ATTRIBUTION.md",
+    "third_party/vllm-gguf-plugin/PROVENANCE.json",
+]
 authors = [{ name = "FlashML Team" }]
 # No License:: classifier: setuptools>=77 rejects mixing one with the SPDX string above.
 classifiers = [
