@@ -2,6 +2,7 @@ import importlib
 import inspect
 import os
 import pathlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,43 @@ def test_rocm_compile_flags_emit_one_offload_flag_per_arch(monkeypatch):
     assert "--offload-arch=gfx1200" in flags
     assert "--offload-arch=gfx1201" in flags
     assert not any(";" in flag for flag in flags)
+
+
+def test_ensure_rocm_env_discovers_modular_sdk_and_visible_arch(monkeypatch, tmp_path):
+    from freetoken.kernel import _toolchain
+
+    sdk = tmp_path / "_rocm_sdk_core"
+    clang = sdk / "lib" / "llvm" / "bin" / "clang.exe"
+    clang.parent.mkdir(parents=True)
+    clang.write_bytes(b"")
+    module = SimpleNamespace(__file__=str(sdk / "__init__.py"))
+
+    monkeypatch.setitem(sys.modules, "_rocm_sdk_core", module)
+    fake_os = SimpleNamespace(environ={}, path=os.path)
+    monkeypatch.setattr(_toolchain, "os", fake_os)
+    monkeypatch.setattr(torch.version, "hip", "test-rocm")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(gcnArchName="gfx1201:sramecc-:xnack-"),
+    )
+    _toolchain.ensure_rocm_env.cache_clear()
+
+    try:
+        assert _toolchain.ensure_rocm_env() == str(sdk)
+        assert fake_os.environ["HIP_PATH"] == str(sdk)
+        assert fake_os.environ["ROCM_HOME"] == str(sdk)
+        assert "ROCM_PATH" not in fake_os.environ
+        for variable in (
+            "TVM_FFI_ROCM_ARCH_LIST",
+            "PYTORCH_ROCM_ARCH",
+            "TRITON_OVERRIDE_ARCH",
+            "ROCM_SDK_TARGET_FAMILY",
+        ):
+            assert fake_os.environ[variable] == "gfx1201"
+    finally:
+        _toolchain.ensure_rocm_env.cache_clear()
 
 
 @pytest.mark.parametrize(

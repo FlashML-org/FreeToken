@@ -357,8 +357,9 @@ def load_aot(
         return prebuilt
 
     if cuda_files:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import check_nvcc_matches_torch, ensure_rocm_env
 
+        ensure_rocm_env()
         check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load
@@ -411,8 +412,9 @@ def load_jit(
         return prebuilt
 
     if cuda_files or cuda_wrappers:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import check_nvcc_matches_torch, ensure_rocm_env
 
+        ensure_rocm_env()
         check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load_inline

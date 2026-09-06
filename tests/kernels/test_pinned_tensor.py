@@ -1,4 +1,5 @@
 import importlib
+from unittest import mock
 
 import pytest
 import torch
@@ -31,6 +32,28 @@ def test_pinned_extension_uses_packaged_module_not_runtime_jit(monkeypatch):
         assert pinned._load_pinned_extension() is fake_extension
     finally:
         pinned._load_pinned_extension.cache_clear()
+
+
+def test_rocm_source_run_registers_and_translates_through_hip_runtime(monkeypatch):
+    import freetoken.kernel.pinned as pinned
+
+    hip = mock.Mock()
+
+    def translate(device_ref, _host_ptr, _flags):
+        device_ref._obj.value = 0x205C80000
+        return 0
+
+    hip.hipHostRegister.return_value = 0
+    hip.hipHostGetDevicePointer.side_effect = translate
+    monkeypatch.setattr(pinned, "_load_pinned_extension", lambda: None)
+    monkeypatch.setattr(pinned, "_hip_runtime", lambda: hip)
+    monkeypatch.setattr(pinned, "_host_ptr_identity", lambda: False)
+
+    pinned.host_register(0x10000, 4096)
+    tensor = torch.empty(4, dtype=torch.uint8)
+    assert pinned.device_ptr(tensor) == 0x205C80000
+    hip.hipHostRegister.assert_called_once()
+    hip.hipHostGetDevicePointer.assert_called_once()
 
 
 def test_copy_to_pinned_tensor_preserves_strided_cpu_tensor_values():
@@ -137,7 +160,7 @@ def test_host_bank_pin_registers_and_translates():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension
+    from freetoken.kernel.pinned import _host_ptr_identity, device_ptr
     from freetoken.moe.host_banks import HostBank
 
     bank = HostBank((4, 32), torch.bfloat16)
@@ -145,7 +168,7 @@ def test_host_bank_pin_registers_and_translates():
     bank.pin()
     bank.pin()  # idempotent
     # registered+mapped memory must have a device alias
-    dev = _load_pinned_extension().host_device_ptr(bank.addr)
+    dev = device_ptr(bank.tensor)
     if _host_ptr_identity():
         assert dev == bank.addr
     else:

@@ -18,7 +18,74 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 def _is_rocm() -> bool:
     import torch
+
     return getattr(torch.version, "hip", None) is not None
+
+
+@functools.cache
+def ensure_rocm_env() -> str | None:
+    """Expose a wheel-provided ROCm SDK to JIT builders when the shell did not.
+
+    Native Windows ROCm installs commonly live in ``_rocm_sdk_core`` rather than a
+    system-wide ``C:\\Program Files\\AMD\\ROCm`` tree.  TVM-FFI keys its Windows HIP
+    toolchain selection off ``HIP_PATH``; without it an otherwise healthy source run can
+    fall back to MSVC/CUDA assumptions and fail only when the first uncached kernel builds.
+
+    Existing user configuration wins.  ``ROCM_PATH`` is intentionally not synthesized:
+    some builders interpret it as a traditional SDK layout and then look for device
+    bitcode in a directory the modular wheel does not use.
+    """
+    if not _is_rocm():
+        return None
+
+    existing = os.environ.get("HIP_PATH")
+    if existing:
+        os.environ.setdefault("ROCM_HOME", existing)
+        _ensure_rocm_arch()
+        return existing
+
+    try:
+        import _rocm_sdk_core
+    except ImportError:
+        return None
+
+    root = os.path.dirname(_rocm_sdk_core.__file__)
+    clang_names = (
+        os.path.join(root, "lib", "llvm", "bin", "clang.exe"),
+        os.path.join(root, "lib", "llvm", "bin", "clang"),
+    )
+    if not any(os.path.isfile(path) for path in clang_names):
+        return None
+
+    os.environ["HIP_PATH"] = root
+    os.environ.setdefault("ROCM_HOME", root)
+    _ensure_rocm_arch()
+    return root
+
+
+def _ensure_rocm_arch() -> None:
+    """Populate the arch variables used by the modular ROCm JIT toolchains."""
+    names = (
+        "TVM_FFI_ROCM_ARCH_LIST",
+        "PYTORCH_ROCM_ARCH",
+        "TRITON_OVERRIDE_ARCH",
+        "ROCM_SDK_TARGET_FAMILY",
+    )
+    if all(os.environ.get(name) for name in names):
+        return
+
+    import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].strip()
+    except Exception:
+        return
+    if not arch:
+        return
+    for name in names:
+        os.environ.setdefault(name, arch)
 
 
 def _nvcc_path() -> str | None:
