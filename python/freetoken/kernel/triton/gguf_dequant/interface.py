@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from vllm-project/vllm-gguf-plugin; see
+# third_party/vllm-gguf-plugin/ATTRIBUTION.md and PROVENANCE.json.
+# Modified by Maxritz: relocated relative GEMM imports for FreeToken.
+
 import torch
 
 from ..gguf_gemm.utils import (

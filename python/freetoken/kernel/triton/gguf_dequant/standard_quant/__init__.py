@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from vllm-project/vllm-gguf-plugin; see
+# third_party/vllm-gguf-plugin/ATTRIBUTION.md and PROVENANCE.json.
+# Modified by Maxritz: removed the upstream __all__ export list.
+
 from .q4_0 import ggml_dequantize_q4_0_triton
 from .q4_1 import ggml_dequantize_q4_1_triton
 from .q5_0 import ggml_dequantize_q5_0_triton

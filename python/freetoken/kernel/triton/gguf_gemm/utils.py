@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from vllm-project/vllm-gguf-plugin; see
+# third_party/vllm-gguf-plugin/ATTRIBUTION.md and PROVENANCE.json.
+# Modified by Iskandar: added row-aware decode tiling (2026-09-05).
+
 import torch
 import triton
 import triton.language as tl
