@@ -1,18 +1,28 @@
 """Python wrapper around the ``_cpu_moe`` C++ executor (--moe-backend cpu).
 
 Owns the persistent CPU worker pool, the per-batch-size pinned IO buffers, and
-the per-(layer, batch-size) host-func task descriptors. ``decode`` issues the
-whole CUDA-graph-capturable sequence on the current stream:
+the per-(layer, batch-size) task descriptors. ``decode`` issues this sequence on
+the current stream:
 
     D2H (hidden, topk_ids, topk_weights -> pinned)
-      -> submit host node (cudaLaunchHostFunc: enqueue MoE task to the pool)
-      -> sync host node   (cudaLaunchHostFunc: spin until the pool drains)
+      -> submit flag memop (or eager cudaLaunchHostFunc fallback)
+      -> sync flag memop   (or eager cudaLaunchHostFunc fallback)
       -> H2D (pinned expert output -> GPU)
 
-Buffers and tasks are allocated lazily per batch size. GraphRunner runs an eager
-``model.forward()`` at each batch size immediately before capturing it, so the
-first (eager) call materializes the stable pinned buffers + task pointers that
-the subsequent capture embeds in its host/memcpy nodes.
+CUDA and ROCm expose the same ordering and results; only the GPU/CPU handshake
+implementation differs. CUDA keeps mapped-pinned ready/done arrays and the
+established module-level ``cuStreamWriteValue64``/``cuStreamWaitValue64`` path.
+ROCm 7.14 uses executor-owned ``hipMallocSignalMemory`` signals and explicitly
+adds batch-memory-op nodes during graph capture. The executor also owns the HIP
+node-parameter arrays because captured graphs retain their addresses through
+replay.
+
+Only a ROCm handshake that passes a real capture/instantiate/replay probe is
+graph-safe; the Engine disables graph capture and continues eagerly when the
+probe fails. Buffers and tasks are allocated lazily per batch size. GraphRunner
+runs an eager ``model.forward()`` at each batch size immediately before
+capturing it, so the first (eager) call materializes the stable pinned buffers +
+task pointers that the subsequent capture embeds in its host/memcpy nodes.
 """
 
 from __future__ import annotations
@@ -32,26 +42,27 @@ logger = init_logger(__name__)
 # Flag-based GPU<->CPU handshake for hybrid/cpu decode. The default host-func path
 # (cudaLaunchHostFunc submit+sync per layer) pays ~30-50us of callback dispatch latency
 # per call with the GPU stream idle -- 2 calls per MoE layer per decode step (~6 ms/step
-# on a 75-layer model). Instead the GPU raises a mapped-pinned "ready" flag at submit; a
-# persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets a "done"
-# flag the GPU waits on at sync -- no host-func round-trip. Both GPU-side operations are
-# STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64, resolved from the
-# driver at runtime): they execute on the GPU front end with no SM-resident kernel, so
-# GPU utilization stays truthful during the CPU compute window. (The first cut used a
-# spin-wait kernel; that pinned reported utilization at 99% and laptop CPU/GPU dynamic
-# power schedulers responded by clamping the CPU frequency -- a net decode regression on
-# power-coupled edge devices.) Each (layer, decode batch size) pair gets its own flag
-# slot, so every captured decode graph rides the handshake. Where memops are unavailable
-# (Windows WDDM, vGPU, old drivers -- functionally probed at startup) or the slot
-# capacity is exceeded, decode keeps the host-func path (functional, slower). A Python
-# watchdog thread turns a wedged coordinator into a loud RuntimeError (via err[] +
+# on a 75-layer model). Instead the GPU raises a backend-specific "ready" signal at
+# submit; a persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets
+# the "done" signal the GPU waits on at sync -- no host-func round-trip. CUDA uses
+# mapped-pinned per-slot arrays with cuStreamWriteValue64/cuStreamWaitValue64; ROCm uses
+# executor-owned HIP signal memory and explicit graph batch-memory-op nodes. Both execute
+# on the GPU front end with no SM-resident kernel, so GPU utilization stays truthful
+# during the CPU compute window. (The first cut used a spin-wait kernel; that pinned
+# reported utilization at 99% and laptop CPU/GPU dynamic power schedulers responded by
+# clamping the CPU frequency -- a net decode regression on power-coupled edge devices.)
+# Each (layer, decode batch size) pair gets a logical slot, so every captured decode graph
+# rides the handshake. Where memops are unavailable (Windows WDDM, vGPU, old drivers --
+# functionally probed at startup), CUDA keeps the host-func path (functional, slower);
+# ROCm fails closed during capture and the Engine normally selects the eager path. A
+# Python watchdog thread turns a wedged coordinator into a loud RuntimeError (via err[] +
 # raise_if_unhealthy) instead of an indefinite stream stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
 _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
-# Flag slots per MoE layer: covers this many distinct decode batch sizes (captured graph
-# sizes plus any eager padded sizes); more than that is unheard of, and the overflow
-# just keeps the host-func path for the extra combos.
+_IS_ROCM = getattr(torch.version, "hip", None) is not None
+# Minimum flag slots per MoE layer, retaining eager headroom for small graph sets. The
+# Engine raises this to the number of distinct configured graph batch sizes when needed.
 _FLAG_SLOTS_PER_LAYER = 16
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
@@ -155,6 +166,7 @@ class CpuMoeExecutor:
         num_threads: int,
         max_tokens: int,
         device: torch.device,
+        flag_slots_per_layer: int = _FLAG_SLOTS_PER_LAYER,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
     ) -> None:
@@ -189,6 +201,9 @@ class CpuMoeExecutor:
         self.quant_format = fmt
         self.device = device
         self.max_tokens = int(max_tokens)
+        self._flag_slots_per_layer = int(flag_slots_per_layer)
+        if self._flag_slots_per_layer < 1:
+            raise ValueError("flag_slots_per_layer must be positive")
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
@@ -196,7 +211,9 @@ class CpuMoeExecutor:
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
-        # probe): its coordinator needs a core of its own, which the auto thread sizing
+        # probe). On ROCm the extension's probe performs a real graph capture + replay,
+        # not merely an eager enqueue: its coordinator needs a core of its own, which
+        # the auto thread sizing
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
         self._flag_sync = _FLAG_SYNC and device.type == "cuda"
@@ -207,11 +224,18 @@ class CpuMoeExecutor:
             if not _cpu_moe.memops_probe(
                 torch.cuda.current_stream().cuda_stream, probe_scratch.data_ptr()
             ):
-                logger.info_rank0(
-                    "cpu-moe flag handshake unavailable: CUDA stream memory operations "
-                    "are not supported here (Windows WDDM / vGPU / old driver); using "
-                    "the cudaLaunchHostFunc sync"
-                )
+                if _IS_ROCM:
+                    logger.info_rank0(
+                        "cpu-moe flag handshake unavailable: stream memory operations "
+                        "did not pass the capture/replay probe; using "
+                        "cudaLaunchHostFunc only for eager execution"
+                    )
+                else:
+                    logger.info_rank0(
+                        "cpu-moe flag handshake unavailable: CUDA stream memory "
+                        "operations are not supported here (Windows WDDM / vGPU / old "
+                        "driver); using the cudaLaunchHostFunc sync"
+                    )
                 self._flag_sync = False
 
         nthreads, core_ids = resolve_threads_and_affinity(num_threads)
@@ -267,19 +291,31 @@ class CpuMoeExecutor:
         # self so the coordinator's pinned pointers stay valid for the executor's
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
+        self._shared_flag_signal = bool(
+            self._flag_sync
+            and getattr(_cpu_moe, "memops_use_shared_signal", lambda: False)()
+        )
         self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
-        self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
+        self._flag_capacity = self.num_layers * self._flag_slots_per_layer
         if self._flag_sync:
-            self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
             self._err = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._ready.zero_()
-            self._done.zero_()
             self._err.zero_()
-            self._ext.start_flag_coordinator(
-                self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
-                self._coord_core,
-            )
+            if self._shared_flag_signal:
+                # HIP wait addresses must come from hipMallocSignalMemory. The C++
+                # executor owns the two exact 64-bit allocations so it can stop/join
+                # the coordinator before freeing them.
+                self._ext.start_shared_signal_coordinator(
+                    self._flag_capacity, self._coord_core
+                )
+            else:
+                self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
+                self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
+                self._ready.zero_()
+                self._done.zero_()
+                self._ext.start_flag_coordinator(
+                    self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
+                    self._coord_core,
+                )
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -317,6 +353,11 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
+
+    @property
+    def graph_capture_safe(self) -> bool:
+        """Whether this executor passed the native stream-memop graph replay probe."""
+        return self._flag_sync
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
@@ -551,8 +592,33 @@ class CpuMoeExecutor:
         computes only the routes assigned to it. Returns an opaque handle to pass to
         :meth:`decode_sync`. The output tensor is allocated here so it stays live (and
         distinct from the interleaved GPU work) across the overlap window."""
+        # hipLaunchHostFunc is not replay-safe for this CPU handshake on ROCm. The
+        # Engine normally disables graphs when the native capture/replay probe failed;
+        # this is the non-bypassable last line of defence for direct executor use or a
+        # future configuration path that misses that downgrade.
+        if (
+            _IS_ROCM
+            and not self._flag_sync
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "CPU/Hybrid MoE is not CUDA-graph safe on ROCm when "
+                "stream-memory synchronization is unavailable"
+            )
+
         bs = hidden_states.shape[0]
         io = self._io_for(bs)
+        task = self._task_for(layer_id, bs)
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        if (
+            _IS_ROCM
+            and torch.cuda.is_current_stream_capturing()
+            and slot is None
+        ):
+            raise RuntimeError(
+                "CPU/Hybrid MoE exhausted its graph-safe ROCm flag slots during "
+                "CUDA-graph capture"
+            )
 
         if self._gpu_prequant:
             # DSV4: apply the reference FP8 round-trip on the GPU (the same kernel the
@@ -567,16 +633,24 @@ class CpuMoeExecutor:
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        task = self._task_for(layer_id, bs)
         out = torch.empty_like(hidden_states)
-        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
-            self._cpu_moe.memop_submit(
-                torch.cuda.current_stream().cuda_stream,
-                self._done.data_ptr(), self._ready.data_ptr(), slot,
-            )
+            stream = torch.cuda.current_stream().cuda_stream
+            if self._shared_flag_signal:
+                self._ext.submit_flag_memop(
+                    stream,
+                    self._ext.flag_done_address(),
+                    self._ext.flag_ready_address(),
+                    slot,
+                )
+            else:
+                # Keep CUDA on the established module-level driver-API path.  Only
+                # ROCm needs executor-owned graph parameter storage.
+                self._cpu_moe.memop_submit(
+                    stream, self._done.data_ptr(), self._ready.data_ptr(), slot
+                )
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
@@ -590,9 +664,13 @@ class CpuMoeExecutor:
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
-            self._cpu_moe.memop_sync(
-                torch.cuda.current_stream().cuda_stream, self._done.data_ptr(), slot,
-            )
+            stream = torch.cuda.current_stream().cuda_stream
+            if self._shared_flag_signal:
+                self._ext.sync_flag_memop(
+                    stream, self._ext.flag_done_address(), slot
+                )
+            else:
+                self._cpu_moe.memop_sync(stream, self._done.data_ptr(), slot)
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
@@ -611,12 +689,11 @@ class CpuMoeExecutor:
         windows under heavy external load, but a coordinator that made progress in
         between is alive by definition. ``suspects`` maps slot -> (first_seen,
         served_at_first_sight) and persists across ticks."""
-        stuck = (self._ready == 1) & (self._done == 0)
-        if not bool(stuck.any()):
+        pending = set(self._ext.pending_flag_slots())
+        if not pending:
             suspects.clear()
             return
         now = time.monotonic()
-        pending = set(stuck.nonzero().flatten().tolist())
         for slot in list(suspects):
             if slot not in pending:
                 del suspects[slot]
@@ -638,7 +715,7 @@ class CpuMoeExecutor:
         for i in dead:
             self._err[i] = 1
         for i in dead:
-            self._done[i] = 1  # after err: unblock the stream into a checked failure
+            self._ext.poison_flag(i)  # after err: unblock into a checked failure
             suspects.pop(i, None)
 
     def raise_if_unhealthy(self) -> None:
@@ -663,7 +740,7 @@ def _watchdog_main(executor_ref) -> None:
     while True:
         time.sleep(2.0)
         executor = executor_ref()
-        if executor is None or executor._watchdog_stop or executor._ready is None:
+        if executor is None or executor._watchdog_stop or not executor._flag_sync:
             return
         try:
             executor._watchdog_tick(suspects)

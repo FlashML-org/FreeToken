@@ -12,6 +12,50 @@ from freetoken.moe.offload_cache import _BANK_SCHEMAS, OffloadMoeCache
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
+
+def test_hip_capture_uses_safe_direct_copy_route(monkeypatch):
+    from freetoken.moe import offload_cache
+
+    monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert offload_cache._hip_graph_capture_active()
+
+    calls = []
+    from freetoken.kernel import fast_index_copy as fast_copy
+
+    monkeypatch.setattr(
+        fast_copy,
+        "fast_index_copy_multi_jit",
+        lambda *args: calls.append("fused"),
+    )
+    monkeypatch.setattr(
+        "freetoken.kernel.fast_index_copy_jit",
+        lambda *args: calls.append("per_bank"),
+    )
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.banks = [
+        ([torch.zeros(2, 8, dtype=torch.uint8)], torch.zeros(2, 8, dtype=torch.uint8)),
+        ([torch.zeros(2, 16, dtype=torch.uint8)], torch.zeros(2, 16, dtype=torch.uint8)),
+    ]
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache._unpinned_layers = set()
+    cache._copy_fused_ok = True
+    cache._copy_dst_ptrs = None
+    cache._copy_src_ptrs = [None]
+    cache._copy_feat_bytes = None
+    cache.num_indices = torch.tensor([0], dtype=torch.int64)
+    cache.evict_slots = torch.zeros(1, dtype=torch.int32)
+    cache.src_indices = torch.zeros(1, dtype=torch.int32)
+    cache.device = torch.device("cuda")
+    cache.copy_missing()
+    assert calls == ["per_bank", "per_bank"]
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    cache.copy_missing()
+    assert calls[-1] == "fused"
+
 # mxfp4_triton 6-bank schema with mixed 16B-aligned per-row sizes (bytes), >=256 so the
 # legacy per-bank kernel's vectorized template is valid. Sizes not covered by a model in
 # kernel/aot_models.py must be listed in its TEST_FEATURE_SIZES so the per-bank kernels

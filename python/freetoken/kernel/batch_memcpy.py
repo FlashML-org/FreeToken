@@ -40,12 +40,17 @@ def _probe(fn) -> None:
 
 
 def load_batch_memcpy():
-    """Build (once), probe, and return the batch-memcpy entry point, or raise.
+    """Build (once), probe, and return batch-memcpy entry point, or raise.
 
-    The 8-argument cudaMemcpyBatchAsync signature this binding uses is CUDA 13.0's
+    ROCm uses its generic HIP copy kernel; CUDA uses 8-argument cudaMemcpyBatchAsync.
+    The CUDA signature is CUDA 13.0's
     (12.8/12.9 had an extra failIdx parameter); gate on the torch runtime version
     before paying for the JIT build, then verify with a real copy.
     """
+    if torch.version.hip is not None:
+        fn = _jit_batch_memcpy_module().batch_memcpy
+        _probe(fn)
+        return fn
     cuda = torch.version.cuda
     if cuda is None or tuple(int(x) for x in cuda.split(".")[:2]) < (13, 0):
         raise RuntimeError(f"cudaMemcpyBatchAsync binding requires CUDA >= 13.0 (torch built with {cuda})")

@@ -29,3 +29,22 @@ python benchmarks/bench_offload_cache_copy.py
 
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
+
+## ROCm evidence
+
+`bench_rocm_matrix.py` creates content-hashed workload/runtime manifests. Keep
+sampled, greedy, and teacher-forced replay lanes separate. Validate candidate
+versus incumbent evidence with `check_decode_gate.py`; speed promotion accepts only
+`teacher_forced_replay` rows carrying replay schema v2, prompt/continuation hashes,
+an independent oracle ID, matching route digest, zero fallbacks, finite logits, and
+exact completion count. Sampled/greedy rows remain correctness evidence only.
+
+Use unique `TORCH_EXTENSIONS_DIR` per run. Fresh cache proves JIT hygiene, not
+correctness or speed. Promotion requires same-model A/B served results and at
+least three fresh-process repeats; direct-kernel timings remain diagnostics.
+
+`profile_decode_rocm.py` wraps `rocprofv3` only for an explicit command after `--`,
+or summarizes `--trace` JSON. Pass observed `--route`, `--graph-mode`, and `--lane`
+when artifact does not contain them. It returns exit code 2 and writes `incomplete`
+when clock, route, token, or lane evidence is missing; missing profiler data never
+becomes zero overhead.

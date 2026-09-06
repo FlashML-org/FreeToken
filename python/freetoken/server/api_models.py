@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+
+def _validate_penalty(value: float, name: str) -> float:
+    if not math.isfinite(value) or not -2.0 <= value <= 2.0:
+        raise ValueError(f"{name} must be finite and between -2 and 2")
+    return value
 
 
 class MessageContent(BaseModel):
@@ -91,6 +98,11 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
 
+    @field_validator("presence_penalty", "frequency_penalty")
+    @classmethod
+    def _validate_penalties(cls, value: float, info: ValidationInfo) -> float:
+        return _validate_penalty(value, info.field_name)
+
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
         if self.max_completion_tokens is not None:
@@ -120,6 +132,11 @@ class CompletionRequest(BaseModel):
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+
+    @field_validator("presence_penalty", "frequency_penalty")
+    @classmethod
+    def _validate_penalties(cls, value: float, info: ValidationInfo) -> float:
+        return _validate_penalty(value, info.field_name)
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "CompletionRequest":

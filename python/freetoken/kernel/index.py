@@ -47,6 +47,8 @@ def indexing(
 ) -> torch.Tensor:
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
+    if indices.numel() == 0:
+        return output
 
     element_size = weights.shape[1] * weights.element_size()
     module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))

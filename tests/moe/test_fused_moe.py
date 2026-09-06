@@ -58,6 +58,33 @@ def test_fused_topk_accepts_triton_kernel_tuple_output():
     torch.testing.assert_close(weights, ref_weights, rtol=2e-4, atol=2e-4)
 
 
+@pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="ROCm GPU is required")
+@pytest.mark.parametrize("num_tokens,num_experts,topk", [(1, 512, 8), (7, 512, 8), (33, 512, 8)])
+def test_fused_topk_rocm_uses_inrepo_triton_router(num_tokens, num_experts, topk, monkeypatch):
+    """ROCm must use portable in-repo Triton routing, not a CUDA-only package fallback."""
+    from freetoken.kernel.triton import moe_router as router_mod
+    from freetoken.moe.fused import _torch_fused_topk, fused_topk
+
+    routed = []
+    real = router_mod.fused_topk_softmax
+
+    def spy(*args, **kwargs):
+        routed.append(True)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(router_mod, "fused_topk_softmax", spy)
+    generator = torch.Generator(device="cuda").manual_seed(97)
+    gating = torch.randn(num_tokens, num_experts, generator=generator, device="cuda")
+
+    weights, ids = fused_topk(gating, gating, topk, renormalize=True)
+
+    assert routed, "fused_topk did not use in-repo Triton router on ROCm"
+    reference_weights, reference_ids = _torch_fused_topk(gating, topk, True, None)
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert torch.equal(ids, reference_ids)
+    torch.testing.assert_close(weights, reference_weights, rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

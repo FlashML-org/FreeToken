@@ -1,0 +1,50 @@
+name: NVIDIA unit and extension gate
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/unit-nvidia.yml"
+      - "setup.py"
+      - "pyproject.toml"
+      - "python/freetoken/kernel/**"
+      - "python/freetoken/utils/arch.py"
+      - "tests/kernels/**"
+      - "tests/utils/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Compile and run focused CUDA-safe tests (no GPU)
+        run: |
+          cuda_image="nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:435220c0fef35cbf712e11999f8670a83835ef3cdd18564e5e8122f83078c88c"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace/FreeToken" \
+            -w /workspace/FreeToken \
+            "$cuda_image" bash -lc '
+              apt-get update -qq &&
+              apt-get install -y -qq python3-pip python3-venv &&
+              python3 -m venv /tmp/freetoken-cuda-venv &&
+              /tmp/freetoken-cuda-venv/bin/pip install --quiet uv==0.12.10 &&
+              /tmp/freetoken-cuda-venv/bin/uv pip install \
+                --python /tmp/freetoken-cuda-venv/bin/python \
+                --index-url https://download.pytorch.org/whl/cu130 \
+                torch==2.11.0 &&
+              /tmp/freetoken-cuda-venv/bin/uv pip install \
+                --python /tmp/freetoken-cuda-venv/bin/python --quiet -e ".[dev]" &&
+              /tmp/freetoken-cuda-venv/bin/python setup.py build_ext --inplace &&
+              /tmp/freetoken-cuda-venv/bin/python -m pytest \
+                tests/kernels/test_e4m3_compat.py \
+                tests/kernels/test_pinned_tensor.py \
+                tests/kernels/test_rocm_launch_kwargs.py \
+                tests/kernels/test_norm.py \
+                tests/utils/test_rocm_arch.py
+            '

@@ -342,6 +342,43 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_gguf_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    layer_sink=None,
+) -> dict:
+    """Load packed GGUF expert banks with padded native gate/up rows and Q8_0 down.
+    ``layer_sink`` (converter) streams each completed layer's banks."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
+def load_gguf_moe_expert_sources_native(
+    model_path: str,
+    model_config,
+    *,
+    layer_sink=None,
+) -> dict:
+    """Load packed Qwen GGUF expert banks retaining per-layer native row types."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources_native")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
+def load_gguf_moe_expert_sources_cpu(
+    model_path: str,
+    model_config,
+    *,
+    layer_sink=None,
+) -> dict:
+    """Load GGUF MoE experts converted to the CPU executor's native Q4_0 banks."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources_cpu")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:
@@ -407,6 +444,7 @@ __all__ = [
     "load_weight",
     "load_moe_expert_sources",
     "load_nvfp4_moe_expert_sources",
+    "load_gguf_moe_expert_sources_cpu",
     "dummy_moe_expert_sources",
     "dummy_nvfp4_expert_sources",
     "iter_expert_tensors_parallel",

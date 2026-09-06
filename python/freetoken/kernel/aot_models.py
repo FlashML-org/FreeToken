@@ -149,6 +149,9 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
         architecture="Qwen3_5MoeForConditionalGeneration",
+        # GGUF uses the same model geometry; its mixed native expert rows use the
+        # GGUF JIT path rather than this safetensors bank-format entry.
+        arch_aliases=("Qwen35moeGGUFForCausalLM",),
         hidden_size=2048,
         kv_groups=((2, 256),),  # full-attention group; GDN layers hold no paged KV
         top_k=8,

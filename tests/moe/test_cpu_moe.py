@@ -20,6 +20,16 @@ import torch.nn.functional as Fn
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def _skip_if_unsafe_rocm_graph() -> None:
+    """Direct executor graph tests require native HIP capture/replay support."""
+    if getattr(torch.version, "hip", None) is None:
+        return
+    from freetoken.kernel import _cpu_moe
+
+    if not _cpu_moe.memops_use_shared_signal():
+        pytest.skip("native ROCm graph handshake unavailable")
+
+
 def _make_cache(L, E, H, I, scale=0.1):
     from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -442,6 +452,8 @@ def _reference(cache, layer, hidden, ids, w, act="silu", apply_in=False):
 def test_cpu_moe_decode_cuda_graph_replay():
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+    _skip_if_unsafe_rocm_graph()
+
     torch.manual_seed(0)
     L, E, H, I, top_k = 3, 8, 512, 256, 2
     layer = 1
@@ -502,7 +514,8 @@ def test_cpu_moe_decode_cuda_graph_replay():
         assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
         slot = ex._flag_slots[(layer, bs)]
         assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
+        assert ex._ext.flag_done_value(slot) == 1, "completion flag at rest"
+        assert ex._ext.flag_ready_value(slot) == 0, "doorbell must be consumed"
         assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
@@ -514,6 +527,8 @@ def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts
+
+    _skip_if_unsafe_rocm_graph()
 
     torch.manual_seed(7)
     L, E, H, I, top_k = 2, 8, 256, 256, 2
@@ -572,6 +587,8 @@ def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
     from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+    _skip_if_unsafe_rocm_graph()
 
     torch.manual_seed(11)
     L, E, H, I, top_k = 2, 8, 256, 256, 4

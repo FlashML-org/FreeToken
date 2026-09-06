@@ -38,7 +38,30 @@ _MMA_TOL = dict(rtol=5e-2, atol=0.5)
 
 
 def _native_cc() -> bool:
-    return torch.cuda.get_device_capability() >= (8, 9)
+    return torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 9)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm")
+def test_rocm_host_and_compile_time_native_gates_match():
+    """The host wrapper and Triton constexpr must choose the same buffer ABI."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.e4m3_compat import e4m3_native, e4m3_native_cx
+
+    @triton.jit
+    def gate_kernel(output):
+        if e4m3_native_cx():
+            value = 1
+        else:
+            value = 0
+        tl.store(output, value)
+
+    output = torch.empty(1, dtype=torch.int32, device="cuda")
+    gate_kernel[(1,)](output)
+
+    assert e4m3_native() is False
+    assert output.item() == int(e4m3_native())
 
 
 # ======================================================================================

@@ -1,7 +1,9 @@
 # Supported models
 
-FreeToken loads HF safetensors checkpoints directly (plus native GGUF for
-Gemma-4). The checkpoints below are known-good — the prebuilt kernels are tuned
+FreeToken loads HF safetensors checkpoints directly plus native GGUF adapters
+for Gemma-4 and Qwen3.5. Qwen3.5 GGUF ROCm serving is validated on gfx1100;
+other target-matrix cells remain gated by hardware evidence.
+The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
@@ -25,8 +27,11 @@ for them; other checkpoints of the same architectures work too.
 
 - **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
-  misses stream over PCIe.
+  misses stream over PCIe. ROCm uses FreeToken's in-tree Triton LRU when the
+  CUDA-only `flashlib` slot-cache wheel is unavailable.
 - **cpu** — misses are computed on the CPU instead of fetched.
+  Qwen3.5 mixed GGUF expert rows are converted to packed Q4_0 one tensor at a
+  time for the CPU executor.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to

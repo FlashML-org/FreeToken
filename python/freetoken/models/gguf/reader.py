@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import struct
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -19,12 +20,48 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 
+from .dequant import BLOCK_SHAPE, GGML_NAME
+
 
 def is_gguf_path(model_path: str) -> bool:
     """A single ``.gguf`` file (the only GGUF layout FreeToken loads directly)."""
     return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
         ".gguf"
     )
+
+
+_SPLIT_NAME = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$")
+
+
+def gguf_shard_paths(model_path: str) -> tuple[str, ...]:
+    """Resolve one GGUF path to its ordered split files.
+
+    GGUF split metadata is authoritative. A split filename must use llama.cpp's
+    ``-00001-of-00003.gguf`` convention; missing pieces fail before tensor loading.
+    Unsplit files return a one-item tuple.
+    """
+    if not is_gguf_path(model_path):
+        raise FileNotFoundError(f"GGUF file not found: {model_path}")
+    reader = _reader(model_path)
+    field = reader.fields.get("split.count")
+    count = int(field.contents()) if field is not None else 1
+    if count < 1:
+        raise ValueError(f"{model_path}: invalid GGUF split.count={count}")
+    if count == 1:
+        return (model_path,)
+
+    match = _SPLIT_NAME.match(model_path)
+    if match is None or int(match.group("count")) != count:
+        raise ValueError(
+            f"{model_path}: split.count={count} requires filename '*-00001-of-"
+            f"{count:05d}.gguf'"
+        )
+    prefix = match.group("prefix")
+    paths = tuple(f"{prefix}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count + 1))
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(f"{model_path}: missing GGUF shard(s): {', '.join(missing)}")
+    return paths
 
 
 # Canonical name of the metadata-only GGUF that ``convert_checkpoint`` drops into an FTW
@@ -133,6 +170,26 @@ def load_gguf_metadata(model_path: str) -> dict[str, Any]:
     return {name: field.contents() for name, field in reader.fields.items()}
 
 
+def _iter_shard_readers(model_path: str):
+    for path in gguf_shard_paths(model_path):
+        yield path, _reader(path)
+
+
+def _checked_type_info(ggml_type: int, tensor_name: str) -> tuple[int, int]:
+    try:
+        return BLOCK_SHAPE[ggml_type]
+    except KeyError:
+        raise ValueError(
+            f"{tensor_name}: unknown GGML type {ggml_type}"
+        ) from None
+
+
+def _validate_tensor_name(name: str, seen: set[str], path: str) -> None:
+    if name in seen:
+        raise ValueError(f"duplicate GGUF tensor {name!r} across shards (including {path})")
+    seen.add(name)
+
+
 def gguf_architecture(model_path: str) -> str:
     arch = _field_value(_reader(model_path), "general.architecture")
     if arch is None:
@@ -144,39 +201,60 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
     """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
     import gguf
 
-    reader = _reader(model_path)
-    for t in reader.tensors:
-        ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
-        torch_shape = tuple(reversed(ne))
-        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
-        n_fast = ne[0]
-        if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
+    seen: set[str] = set()
+    for path, reader in _iter_shard_readers(model_path):
+        for t in reader.tensors:
+            _validate_tensor_name(t.name, seen, path)
+            ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
+            if not ne or any(size <= 0 for size in ne):
+                raise ValueError(f"{t.name}: GGUF tensor shape must be positive, got {ne}")
+            torch_shape = tuple(reversed(ne))
+            ggml_type = int(t.tensor_type)
+            block, type_size = _checked_type_info(ggml_type, t.name)
+            package_shape = gguf.GGML_QUANT_SIZES.get(t.tensor_type)
+            if package_shape is None or tuple(package_shape) != (block, type_size):
+                raise RuntimeError(
+                    f"{t.name}: gguf-py type table disagrees for {GGML_NAME[ggml_type]}"
+                )
+            n_fast = ne[0]
+            if n_fast % block != 0:
+                raise ValueError(
+                    f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
+                    f"for {GGML_NAME[ggml_type]}"
+                )
+            row_bytes = n_fast // block * type_size
+            rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+            # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
+            # normalize everything to a flat byte view before shaping into [rows, row_bytes].
+            flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+            expected = rows * row_bytes
+            if flat.nbytes != expected:
+                raise ValueError(
+                    f"{t.name}: tensor data has {flat.nbytes} bytes; expected {expected} "
+                    f"for shape {ne} and {GGML_NAME[ggml_type]}"
+                )
+            raw = flat.reshape(rows, row_bytes)
+            yield GgufTensor(
+                name=t.name,
+                shape=torch_shape,
+                ggml_type=ggml_type,
+                rows=rows,
+                row_bytes=row_bytes,
+                _raw=raw,
             )
-        row_bytes = n_fast // block * type_size
-        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
-        # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
-        # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-        flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-        raw = flat.reshape(rows, row_bytes)
-        yield GgufTensor(
-            name=t.name,
-            shape=torch_shape,
-            ggml_type=int(t.tensor_type),
-            rows=rows,
-            row_bytes=row_bytes,
-            _raw=raw,
-        )
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in _reader(model_path).tensors}
+    names: set[str] = set()
+    for path, reader in _iter_shard_readers(model_path):
+        for tensor in reader.tensors:
+            _validate_tensor_name(tensor.name, names, path)
+    return names
 
 
 __all__ = [
     "is_gguf_path",
+    "gguf_shard_paths",
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
     "gguf_config_source",

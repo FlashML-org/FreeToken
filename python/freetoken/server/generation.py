@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -163,6 +164,8 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -177,6 +180,13 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    penalties = {
+        "presence_penalty": 0.0 if presence_penalty is None else presence_penalty,
+        "frequency_penalty": 0.0 if frequency_penalty is None else frequency_penalty,
+    }
+    for name, value in penalties.items():
+        if not math.isfinite(value) or not -2.0 <= value <= 2.0:
+            raise ValueError(f"{name} must be finite and between -2 and 2")
     return SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
@@ -184,6 +194,7 @@ def resolve_sampling(
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        **penalties,
     )
 
 

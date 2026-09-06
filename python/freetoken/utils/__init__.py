@@ -1,9 +1,12 @@
 from .arch import (
+    device_kind,
+    is_cuda,
     is_arch_supported,
     is_sm90_family,
     is_sm90_supported,
     is_sm100_family,
     is_sm100_supported,
+    is_rocm,
 )
 from .hf import (
     cached_load_hf_config,
@@ -35,6 +38,9 @@ __all__ = [
     "load_toolcall_anchor_id",
     "init_logger",
     "is_arch_supported",
+    "device_kind",
+    "is_cuda",
+    "is_rocm",
     "is_sm90_family",
     "is_sm90_supported",
     "is_sm100_family",

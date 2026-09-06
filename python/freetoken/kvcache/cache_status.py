@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 
@@ -191,6 +192,7 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     Best-effort/total -- each piece independently degrades to 0/{} and this never raises
     (it runs on readiness)."""
     meta: Dict[str, Any] = dict(compute_cache_unit_bytes(engine))
+    meta["runtime"] = _runtime_route_status(engine)
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
@@ -213,3 +215,57 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
     return meta
+
+
+def _runtime_route_status(engine: "Engine") -> Dict[str, Any]:
+    """Return serializable backend/route identity for readiness diagnostics."""
+    try:
+        from freetoken.utils.arch import device_kind
+
+        kind = device_kind()
+    except Exception:
+        kind = "unknown"
+    config = getattr(engine, "config", None)
+    graph_runner = getattr(engine, "graph_runner", None)
+    graph_requested = bool(
+        config is not None
+        and not (
+            getattr(config, "cuda_graph_bs", None) == []
+            or getattr(config, "cuda_graph_max_bs", None) == 0
+        )
+    )
+    graph_selected = bool(getattr(graph_runner, "graph_map", {}))
+    fallback_reasons = []
+    if graph_requested and not graph_selected:
+        fallback_reasons.append("graph_capture_unavailable_or_disabled")
+    blas_policy = getattr(engine, "blas_policy", None)
+    if isinstance(blas_policy, dict) and blas_policy.get("verification") == "mismatch":
+        fallback_reasons.append("rocm_blas_mismatch")
+    try:
+        tp_size = int(getattr(getattr(config, "tp_info", None), "size", 1))
+    except (TypeError, ValueError):
+        tp_size = 1
+    try:
+        import torch.distributed
+
+        communication = torch.distributed.get_backend() if tp_size > 1 else "none"
+    except Exception:
+        communication = "unknown" if tp_size > 1 else "none"
+    kv_cache = getattr(engine, "kv_cache", None)
+    placement = str(getattr(kv_cache, "device", getattr(engine, "device", "unknown")))
+    return {
+        "device_kind": kind,
+        "graph_requested": graph_requested,
+        "graph_selected": graph_selected,
+        "communication_backend": communication,
+        "kv_placement": placement,
+        "moe_route": getattr(config, "moe_backend", None),
+        "attention_route": getattr(config, "attention_backend", None),
+        "nvfp4_route": getattr(config, "nvfp4_backend", None),
+        "gguf_moe_impl": getattr(
+            config, "gguf_moe_impl", os.environ.get("FREETOKEN_GGUF_MOE_IMPL", "legacy")
+        ),
+        "blas_policy": blas_policy,
+        "fallback_reasons": fallback_reasons,
+        "runtime_abi": "freetoken-runtime-v1",
+    }

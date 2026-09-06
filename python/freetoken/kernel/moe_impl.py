@@ -197,6 +197,44 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
     )
 
 
+def moe_weighted_sum_reduce_triton(
+    input: torch.Tensor, weights: torch.Tensor, output: torch.Tensor
+) -> None:
+    """Apply route weights and reduce ``[tokens, topk, hidden]`` in one Triton launch."""
+    import triton
+
+    from .triton.fused_moe import moe_weighted_sum_reduce_kernel
+
+    assert input.is_contiguous()
+    assert weights.is_contiguous()
+    assert output.is_contiguous()
+    token_num, topk_num, hidden_dim = input.shape
+    assert weights.shape == (token_num, topk_num)
+    assert output.shape == (token_num, hidden_dim)
+
+    block_m = 1 if token_num <= 16 else 2
+    block_dim = min(triton.next_power_of_2(hidden_dim), 1024)
+    grid = (triton.cdiv(token_num, block_m), triton.cdiv(hidden_dim, block_dim))
+    moe_weighted_sum_reduce_kernel[grid](
+        input,
+        input.stride(0),
+        input.stride(1),
+        input.stride(2),
+        weights,
+        weights.stride(0),
+        weights.stride(1),
+        output,
+        output.stride(0),
+        output.stride(1),
+        token_num,
+        topk_num,
+        hidden_dim,
+        BLOCK_M=block_m,
+        BLOCK_DIM=block_dim,
+        NUM_STAGE=4,
+    )
+
+
 def mxfp4_fused_moe_kernel_t_triton(
     A: torch.Tensor,
     B_blocks_t: torch.Tensor,   # transposed layout [E, K//2, N] (uint8, N innermost)

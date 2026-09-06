@@ -8,7 +8,18 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
+// Same overridable knob as ggml-common_hip.h (kept byte-identical): rows per warp
+// for the MMVQ / MoE-vec launches; tune via -DGGML_CUDA_MMV_Y (FREETOKEN_GGUF_MMV_Y).
+#ifndef GGML_CUDA_MMV_Y
 #define GGML_CUDA_MMV_Y 1
+#endif
+
+#if defined(USE_ROCM)
+// ROCm shim: the vendored GGUF launchers (moe.cuh/mmvq.cuh/...) take a CUDA-style
+// stream parameter. Map the CUDA stream type to HIP so those signatures compile
+// unmodified under USE_ROCM. The including .cu pulls in hip/hip_runtime.h first.
+using cudaStream_t = hipStream_t;
+#endif
 
 // Data Structures
 // QK = number of values after dequantization

@@ -427,6 +427,63 @@ def test_nvfp4_backend_selection():
         select_nvfp4_backend(cpu, None, "bogus")
 
 
+def test_rocm_nvfp4_selection_is_triton_only(monkeypatch):
+    import freetoken.moe.nvfp4_backends as nvfp4
+
+    monkeypatch.setattr(nvfp4, "is_rocm", lambda: True)
+    device = torch.device("cuda")
+
+    assert nvfp4.select_nvfp4_backend(device, 4096, "auto") == "triton"
+    assert nvfp4.select_nvfp4_backend(device, 4096, "triton") == "triton"
+    for requested in ("marlin", "flashinfer"):
+        with pytest.raises(RuntimeError, match="CUDA-only on ROCm"):
+            nvfp4.select_nvfp4_backend(device, 4096, requested)
+
+
+def test_rocm_suppresses_cuda_optional_probes(monkeypatch):
+    from freetoken.kernel import backend
+
+    monkeypatch.setattr(backend, "is_rocm", lambda: True)
+    backend.is_flashinfer_installed.cache_clear()
+    backend.is_sgl_kernel_installed.cache_clear()
+    backend.is_triton_kernels_installed.cache_clear()
+    backend.driver_cuda_version.cache_clear()
+
+    def fail_probe(_name):
+        raise AssertionError("CUDA optional package probe ran on ROCm")
+
+    monkeypatch.setattr(backend, "_importable", fail_probe)
+    assert backend.is_flashinfer_installed() is False
+    assert backend.is_sgl_kernel_installed() is False
+    assert backend.is_triton_kernels_installed() is False
+    assert backend.driver_cuda_version() is None
+
+    backend.is_flashinfer_installed.cache_clear()
+    backend.is_sgl_kernel_installed.cache_clear()
+    backend.is_triton_kernels_installed.cache_clear()
+    backend.driver_cuda_version.cache_clear()
+
+
+def test_cuda_optional_probes_remain_enabled(monkeypatch):
+    from freetoken.kernel import backend
+
+    monkeypatch.setattr(backend, "is_rocm", lambda: False)
+    backend.is_flashinfer_installed.cache_clear()
+    backend.is_sgl_kernel_installed.cache_clear()
+    backend.is_triton_kernels_installed.cache_clear()
+    seen = []
+    monkeypatch.setattr(backend, "_importable", lambda name: seen.append(name) or True)
+
+    assert backend.is_flashinfer_installed() is True
+    assert backend.is_sgl_kernel_installed() is True
+    assert backend.is_triton_kernels_installed() is True
+    assert seen == ["flashinfer", "sgl_kernel", "triton_kernels"]
+
+    backend.is_flashinfer_installed.cache_clear()
+    backend.is_sgl_kernel_installed.cache_clear()
+    backend.is_triton_kernels_installed.cache_clear()
+
+
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache

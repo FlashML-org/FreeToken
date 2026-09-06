@@ -21,6 +21,16 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def _skip_if_unsafe_rocm_graph() -> None:
+    """Direct executor graph test requires native HIP capture/replay support."""
+    if getattr(torch.version, "hip", None) is None:
+        return
+    from freetoken.kernel import _cpu_moe
+
+    if not _cpu_moe.memops_use_shared_signal():
+        pytest.skip("native ROCm graph handshake unavailable")
+
+
 def _pack_q4_0(nibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Pack [S, OUT, K] uint8 nibble codes (0..15) + [S, OUT, K//32] fp16 scales into
     the native Q4_0 row layout [S, OUT, K//32*18]: each 32-elem block is a 2-byte fp16
@@ -152,6 +162,8 @@ def test_cpu_moe_decode_q4_0_cuda_graph_replay():
     the freshly written pinned routing on each replay (dep flows through pinned buffers)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused import fused_experts_decode_impl
+
+    _skip_if_unsafe_rocm_graph()
 
     torch.manual_seed(9)
     L, E, H, I, top_k = 2, 8, 2816, 704, 8

@@ -1,0 +1,86 @@
+name: Unit tests (ROCm, self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Exact ROCm target from the FreeToken matrix
+        required: true
+        type: choice
+        default: gfx1100
+        options:
+          - gfx1100
+          - gfx1101
+          - gfx1102
+          - gfx1103
+          - gfx1150
+          - gfx1151
+          - gfx1200
+          - gfx1201
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-rocm
+  cancel-in-progress: false
+
+jobs:
+  rocm-unit:
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: FreeToken
+          persist-credentials: false
+      - name: Prepare ROCm environment
+        working-directory: FreeToken
+        env:
+          FREETOKEN_ROCM_ARCH: ${{ inputs.target }}
+          PYTORCH_ROCM_ARCH: ${{ inputs.target }}
+        run: |
+          venv="${FREETOKEN_ROCM_VENV:-$RUNNER_TEMP/freetoken-rocm-venv}"
+          if [ ! -x "$venv/bin/python" ]; then
+            python3 -m venv --system-site-packages "$venv"
+          fi
+          echo "FREETOKEN_ROCM_VENV=$venv" >> "$GITHUB_ENV"
+          "$venv/bin/python" -m pip install \
+            --disable-pip-version-check --quiet --no-deps "setuptools>=77" wheel
+          "$venv/bin/python" -m pip install \
+            --disable-pip-version-check --quiet --no-deps \
+            --no-build-isolation -e .
+          "$venv/bin/python" -m pip install \
+            --disable-pip-version-check --quiet pytest
+          FREETOKEN_ROCM_ARCH="$FREETOKEN_ROCM_ARCH" \
+          PYTORCH_ROCM_ARCH="$PYTORCH_ROCM_ARCH" \
+            "$venv/bin/python" setup.py build_ext --inplace
+      - name: Validate target
+        working-directory: FreeToken
+        env:
+          FREETOKEN_ROCM_ARCH: ${{ inputs.target }}
+        run: |
+          PYTHONPATH=python "$FREETOKEN_ROCM_VENV/bin/python" - <<'PY'
+          import os
+
+          from freetoken.utils.arch import (
+              parse_rocm_arches,
+              rocm_arch_capability,
+          )
+
+          target = os.environ["FREETOKEN_ROCM_ARCH"]
+          arches = parse_rocm_arches(target)
+          assert len(arches) == 1 and arches[0] == target
+          print(rocm_arch_capability(target))
+          PY
+      - name: Focused ROCm matrix gate
+        working-directory: FreeToken
+        env:
+          FREETOKEN_ROCM_ARCH: ${{ inputs.target }}
+          PYTORCH_ROCM_ARCH: ${{ inputs.target }}
+        run: |
+          PYTHONPATH=python "$FREETOKEN_ROCM_VENV/bin/python" -m pytest -q \
+            tests/utils/test_rocm_arch.py \
+            tests/kernels/test_rocm_launch_kwargs.py \
+            tests/kernels/test_gguf_rocm.py \
+            tests/engine/test_cpu_moe_graph_safety.py

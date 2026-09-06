@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
 
+from .backend import is_rocm
 from .utils import load_aot
 
 if TYPE_CHECKING:
@@ -27,6 +28,10 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
+    if is_rocm():
+        raise RuntimeError(
+            "PyNCCL is CUDA-only on ROCm; use PyTorch's nccl process group backed by RCCL"
+        )
     return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
 
 
@@ -50,6 +55,11 @@ def init_pynccl(
     max_size_bytes: int = 0,
 ) -> PyNCCLCommunicator:
     import torch
+
+    if is_rocm():
+        raise RuntimeError(
+            "PyNCCL is CUDA-only on ROCm; use PyTorch's nccl process group backed by RCCL"
+        )
 
     max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
 

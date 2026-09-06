@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import hashlib
+import json
 import os
 import pathlib
 import re
-from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias, Union
+import shutil
+import subprocess
+import sys
+import time
+from functools import cache
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple, TypeAlias, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -19,7 +27,24 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
+DEFAULT_ROCM_ARCHES = (
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+)
+STALE_JIT_LOCK_AGE_S = 3 * 3600
+
+
+def _is_rocm() -> bool:
+    import torch
+    return getattr(torch.version, "hip", None) is not None
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -40,6 +65,84 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
         cc = max(arch_list, key=_rank).rstrip("a").replace(".", "")
         flags = flags + [f"-gencode=arch=compute_{cc},code=compute_{cc}"]
     return flags
+
+
+def _hip_cflags(extra: List[str]) -> List[str]:
+    """HIP flags for a kernel build on ROCm."""
+    # TODO(ROCm): Triton autotune configs need RDNA-specific tuning (wave count, LDS size).
+    flags = DEFAULT_HIP_CFLAGS + extra
+    from freetoken.utils.arch import parse_rocm_arches
+
+    raw_arches = (
+        os.getenv("FREETOKEN_ROCM_ARCH")
+        or os.getenv("PYTORCH_ROCM_ARCH")
+        or os.getenv("FREETOKEN_KERNEL_CACHE_GFX", "")
+    )
+    arches = list(parse_rocm_arches(raw_arches)) if raw_arches else []
+    if not arches:
+        from freetoken.utils.arch import get_rocm_gfx_arch
+
+        detected = get_rocm_gfx_arch()
+        arches = [detected] if detected else list(DEFAULT_ROCM_ARCHES)
+    return flags + [f"--offload-arch={arch}" for arch in arches]
+
+
+@cache
+def _rocm_link_flags() -> List[str]:
+    """Make ROCm's runtime library discoverable to JIT link commands.
+
+    Traditional ROCm installs provide ``libamdhip64.so`` under ``$ROCM_HOME/lib``.
+    ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
+    still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
+    an explicit linker search path without modifying the Python environment.
+    """
+    candidates: list[pathlib.Path] = []
+    if os.getenv("ROCM_HOME"):
+        candidates.append(pathlib.Path(os.environ["ROCM_HOME"]))
+    try:
+        from torch.utils.cpp_extension import ROCM_HOME
+
+        if ROCM_HOME:
+            candidates.append(pathlib.Path(ROCM_HOME))
+    except ImportError:
+        pass
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec and spec.submodule_search_locations:
+        candidates.append(pathlib.Path(next(iter(spec.submodule_search_locations))))
+    candidates.append(pathlib.Path("/opt/rocm"))
+
+    for rocm_home in dict.fromkeys(candidates):
+        library_dir = rocm_home / "lib"
+        unversioned = library_dir / "libamdhip64.so"
+        link_dir = library_dir
+        if not unversioned.exists():
+            versioned: list[tuple[tuple[int, ...], pathlib.Path]] = []
+            prefix = "libamdhip64.so."
+            for path in library_dir.glob(f"{prefix}*"):
+                suffix = path.name.removeprefix(prefix)
+                try:
+                    version = tuple(int(part) for part in suffix.split("."))
+                except ValueError:
+                    continue
+                versioned.append((version, path))
+            if not versioned:
+                continue
+            _, runtime = max(versioned, key=lambda item: item[0])
+            link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib"
+            link_dir.mkdir(parents=True, exist_ok=True)
+            compat_link = link_dir / "libamdhip64.so"
+            if not compat_link.exists() and not compat_link.is_symlink():
+                try:
+                    compat_link.symlink_to(runtime)
+                except FileExistsError:
+                    # Multiple tensor-parallel ranks may prepare the same cache.
+                    pass
+
+        return [f"-L{link_dir}", f"-Wl,-rpath,{library_dir}"]
+
+    raise RuntimeError("Unable to locate libamdhip64 for ROCm JIT linking")
+
+
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
 
@@ -86,6 +189,10 @@ def _build_stamps(segments: List[str]) -> set[str]:
     return {s for s in segments if re.fullmatch(r"g[0-9a-f]{7,40}", s)}
 
 
+def _backend_tags(segments: List[str]) -> set[str]:
+    return {segment for segment in segments if segment.startswith("cu") or segment == "rocm"}
+
+
 def _kernel_cache_version_ok(cache_version: str, runtime_version: str) -> bool:
     """Same release -- and, when both sides carry a `g<sha>` stamp, the same build.
 
@@ -100,7 +207,167 @@ def _kernel_cache_version_ok(cache_version: str, runtime_version: str) -> bool:
         return False
     cache_stamps = _build_stamps(cache_local)
     runtime_stamps = _build_stamps(runtime_local)
-    return not (cache_stamps and runtime_stamps and cache_stamps != runtime_stamps)
+    if cache_stamps and runtime_stamps and cache_stamps != runtime_stamps:
+        return False
+    cache_backend = _backend_tags(cache_local)
+    runtime_backend = _backend_tags(runtime_local)
+    return not (cache_backend and runtime_backend and cache_backend != runtime_backend)
+
+
+def _runtime_backend_tag() -> str:
+    return "rocm" if _is_rocm() else "cuda"
+
+
+def _compiler_identity() -> str:
+    compiler = os.environ.get("HIPCC" if _is_rocm() else "NVCC")
+    if not compiler:
+        compiler = "hipcc" if _is_rocm() else "nvcc"
+    resolved = shutil.which(compiler) or compiler
+    try:
+        result = subprocess.run(
+            [resolved, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return resolved
+    first_line = (result.stdout or result.stderr).splitlines()
+    return f"{resolved}:{first_line[0] if first_line else 'unknown'}"
+
+
+def _triton_version() -> str:
+    try:
+        return importlib.metadata.version("triton")
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
+
+
+def _source_digest(paths: List[str], texts: List[str]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        source = pathlib.Path(path)
+        digest.update(b"path:")
+        digest.update(str(source).encode())
+        digest.update(b"\0")
+        try:
+            digest.update(source.read_bytes())
+        except OSError as exc:
+            raise RuntimeError(f"cannot read JIT source {source}: {exc}") from exc
+    for text in texts:
+        digest.update(b"text:")
+        digest.update(text.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def jit_cache_identity(
+    *,
+    source_paths: List[str] | None = None,
+    source_texts: List[str] | None = None,
+    cflags: List[str] | None = None,
+    cuda_cflags: List[str] | None = None,
+    ldflags: List[str] | None = None,
+    include_paths: List[str] | None = None,
+) -> dict[str, Any]:
+    """Return deterministic identity for one runtime JIT build.
+
+    Source bytes, wrapper text, backend/toolchain, target, and compiler flags all
+    participate. This is metadata only; callers decide cache lifetime and cleanup.
+    """
+    import torch
+
+    target = None
+    if _is_rocm():
+        from freetoken.utils.arch import get_rocm_gfx_arch, parse_rocm_arches
+
+        raw_arch = os.environ.get("FREETOKEN_ROCM_ARCH") or os.environ.get("PYTORCH_ROCM_ARCH")
+        target = list(parse_rocm_arches(raw_arch)) if raw_arch else []
+        if not target:
+            detected = get_rocm_gfx_arch()
+            target = [detected] if detected else []
+    else:
+        target = list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else []
+    identity = {
+        "backend": _runtime_backend_tag(),
+        "target": target,
+        "torch": str(torch.__version__),
+        "rocm": str(torch.version.hip or "none"),
+        "cuda": str(torch.version.cuda or "none"),
+        "triton": _triton_version(),
+        "compiler": _compiler_identity(),
+        "source_sha256": _source_digest(source_paths or [], source_texts or []),
+        "cflags": list(cflags or []),
+        "cuda_cflags": list(cuda_cflags or []),
+        "ldflags": list(ldflags or []),
+        "include_paths": list(include_paths or []),
+    }
+    identity["key"] = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return identity
+
+
+def jit_cache_key(**kwargs: Any) -> str:
+    return str(jit_cache_identity(**kwargs)["key"])
+
+
+def jit_cache_diagnostics(name: str, build_directory: str | None = None) -> dict[str, Any]:
+    """Report exact JIT directory/lock state without changing filesystem state."""
+    if build_directory is None:
+        try:
+            import torch
+            from torch.utils.cpp_extension import get_default_build_root
+
+            root = os.environ.get("TORCH_EXTENSIONS_DIR")
+            if root is None:
+                backend = (
+                    "rocm"
+                    if _is_rocm()
+                    else (
+                        "cpu"
+                        if torch.version.cuda is None
+                        else f"cu{torch.version.cuda.replace('.', '')}"
+                    )
+                )
+                root = str(
+                    pathlib.Path(get_default_build_root())
+                    / f"py{sys.version_info.major}{sys.version_info.minor}_{backend}"
+                )
+            build_path = pathlib.Path(root) / name
+        except (ImportError, OSError, RuntimeError):
+            build_path = pathlib.Path(name)
+    else:
+        build_path = pathlib.Path(build_directory).expanduser()
+    lock = build_path / "lock"
+    age = None
+    if lock.exists():
+        try:
+            age = max(0.0, time.time() - lock.stat().st_mtime)
+        except OSError:
+            age = None
+    return {
+        "name": name,
+        "build_directory": str(build_path),
+        "lock_path": str(lock),
+        "lock_exists": lock.exists(),
+        "lock_age_s": age,
+        "stale": age is not None and age >= STALE_JIT_LOCK_AGE_S,
+    }
+
+
+def clear_stale_jit_lock(name: str, build_directory: str | None = None) -> bool:
+    """Remove only an old lock at one resolved JIT build directory."""
+    diagnostics = jit_cache_diagnostics(name, build_directory)
+    if not diagnostics["stale"]:
+        return False
+    lock = pathlib.Path(diagnostics["lock_path"])
+    try:
+        lock.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _kernel_cache_dir() -> pathlib.Path | None:
@@ -127,6 +394,15 @@ def _kernel_cache_dir() -> pathlib.Path | None:
                 f"{package_version!r} does not match freetoken version {runtime_version!r}"
             )
         cache_cuda = re.search(r"\+cu(\d{2,})", package_version)
+        cache_rocm = re.search(r"\+rocm(?:\.|$)", package_version)
+        if cache_rocm is not None and not _is_rocm():
+            raise RuntimeError(
+                f"freetoken-kernel-cache {package_version!r} is ROCm-only but torch is not ROCm"
+            )
+        if cache_cuda is not None and _is_rocm():
+            raise RuntimeError(
+                f"freetoken-kernel-cache {package_version!r} is CUDA-only but torch is ROCm"
+            )
         if cache_cuda is not None:
             from freetoken.kernel._toolchain import torch_cuda_major
 
@@ -217,13 +493,32 @@ def load_aot(
     cpp_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cpp_files]
     cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
 
+    if _is_rocm():
+        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        runtime_ldflags = _rocm_link_flags()
+    else:
+        cuda_cflags = _cuda_cflags(extra_cuda_cflags)
+        runtime_ldflags = []
+
+    compile_cflags = DEFAULT_CFLAGS + extra_cflags
+    compile_ldflags = DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags
+    identity = jit_cache_identity(
+        source_paths=cpp_files + cuda_files,
+        cflags=compile_cflags,
+        cuda_cflags=cuda_cflags,
+        ldflags=compile_ldflags,
+        include_paths=DEFAULT_INCLUDE + extra_include_paths,
+    )
+    compile_cflags += [f"-DFREETOKEN_JIT_CACHE_KEY={identity['key'][:16]}"]
+    clear_stale_jit_lock(name, build_directory)
+
     return load(
         name,
         cpp_files=cpp_files,
         cuda_files=cuda_files,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+        extra_cflags=compile_cflags,
+        extra_cuda_cflags=cuda_cflags,
+        extra_ldflags=compile_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
@@ -272,13 +567,33 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
+    if _is_rocm():
+        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        runtime_ldflags = _rocm_link_flags()
+    else:
+        cuda_cflags = _cuda_cflags(extra_cuda_cflags)
+        runtime_ldflags = []
+
+    compile_cflags = DEFAULT_CFLAGS + extra_cflags
+    compile_ldflags = DEFAULT_LDFLAGS + runtime_ldflags + extra_ldflags
+    identity = jit_cache_identity(
+        source_paths=[str(path) for path in cpp_paths + cuda_paths],
+        source_texts=cpp_sources + cuda_sources,
+        cflags=compile_cflags,
+        cuda_cflags=cuda_cflags,
+        ldflags=compile_ldflags,
+        include_paths=DEFAULT_INCLUDE + extra_include_paths,
+    )
+    compile_cflags += [f"-DFREETOKEN_JIT_CACHE_KEY={identity['key'][:16]}"]
+    clear_stale_jit_lock(name, build_directory)
+
     return load_inline(
         name,
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+        extra_cflags=compile_cflags,
+        extra_cuda_cflags=cuda_cflags,
+        extra_ldflags=compile_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )

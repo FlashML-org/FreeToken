@@ -319,6 +319,14 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # GGUF routed-expert down projection type per decoder layer.
+    gguf_down_quant_types: Tuple[int, ...] = ()
+    # GGUF routed-expert gate/up type per decoder layer (usually Q4_K; some exports
+    # use Q8_0 for terminal full-attention blocks).
+    gguf_gate_up_quant_types: Tuple[int, ...] = ()
+    # GGUF native quant type per source tensor. Tuple keeps frozen ModelConfig immutable
+    # while allowing mixed output slices to retain their original packed layouts.
+    gguf_tensor_types: Tuple[Tuple[str, int], ...] = ()
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

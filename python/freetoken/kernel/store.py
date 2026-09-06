@@ -34,6 +34,8 @@ def store_cache(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> None:
+    if indices.numel() == 0:
+        return
     num_tokens = k_cache.shape[0]
     k_cache = k_cache.view(num_tokens, -1)
     v_cache = v_cache.view(num_tokens, -1)

@@ -5,7 +5,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flashlib.kernels.slot_cache import lru_ensure
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
@@ -19,12 +18,33 @@ _HYBRID_FETCH_BY_RECENCY = (
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
-    Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
+    Uses flashlib's slot cache on CUDA and the in-tree Triton LRU on ROCm or when the
+    CUDA-only flashlib wheel is absent. ``id_base`` maps this layer's expert ids into the
     flat ``layer * num_experts + expert`` space the cache indexes by, and maps
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    # flashlib's slot-cache wheel is CUDA-only. On ROCm, use the equivalent
+    # in-tree Triton kernel even if an unrelated import shim is present.
+    if torch.version.hip is not None:
+        cache._gpu_lru_fallback = True
+        _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, cache.num_experts, 0)
+        return
+    try:
+        from flashlib.kernels.slot_cache import lru_ensure
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"flashlib", "flashlib.kernels", "flashlib.kernels.slot_cache"}:
+            raise
+        # The in-tree Triton hybrid kernel implements the same timestamp-LRU
+        # bookkeeping. With a full fetch cap it is also a safe non-hybrid
+        # fallback, keeping ROCm usable without CUDA-only flashlib.
+        cache._gpu_lru_fallback = True
+        _ensure_experts_hybrid_gpu(
+            cache, layer_id, expert_ids, cache.num_experts, 0
+        )
+        return
+
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
