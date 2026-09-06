@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import inspect
 import os
 import subprocess
@@ -35,11 +34,20 @@ async def _zmq_asyncio_roundtrip() -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows asyncio/ZMQ regression")
 def test_raw_windows_proactor_reproduces_pyzmq_failure_without_tornado() -> None:
-    assert importlib.util.find_spec("tornado") is None
     code = textwrap.dedent(
         """
         import asyncio
+        import importlib.abc
+        import sys
         import uuid
+
+        class BlockTornado(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "tornado" or fullname.startswith("tornado."):
+                    raise ModuleNotFoundError("No module named 'tornado'", name=fullname)
+                return None
+
+        sys.meta_path.insert(0, BlockTornado())
 
         import zmq
         import zmq.asyncio
