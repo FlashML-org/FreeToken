@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
@@ -43,11 +44,11 @@ def _pool(num_slots=16):
                            device=torch.device("cpu"), tp_size=1)
 
 
-def _setup():
+def _setup(num_tokens=64):
     """Hybrid managers + a stub Scheduler `self` for the real unbound methods."""
     pool = _pool()
-    pt = torch.zeros(4, 64, dtype=torch.int32)
-    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    pt = torch.zeros(4, num_tokens, dtype=torch.int32)
+    cm = CacheManager(num_tokens, 1, pt, "hybrid_radix", linear_state_pool=pool)
     tm = TableManager(max_running_reqs=4, page_table=pt)
     dm = DecodeManager(page_size=1)
     pm = PrefillManager(cm, tm, dm)
@@ -75,13 +76,13 @@ def _setup():
     return pool, cm, tm, dm, pm, sent, stub
 
 
-def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
+def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None, output_len=4):
     """A launched (forward in flight) hybrid req: handle locked, pages allocated,
     GDN slots held, cached_len advanced -- the state _process_last_data will drain."""
     mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt),
                                       mm_embeds=None))
-    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=4,
-              uid=UID, sampling_params=SamplingParams(max_tokens=4),
+    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=output_len,
+              uid=UID, sampling_params=SamplingParams(max_tokens=output_len),
               cache_handle=mr.cuda_handle)
     req.linear_slot_idx = pool.alloc(1)[0]
     req.mamba_ping_pong = tuple(pool.alloc(2))
@@ -221,4 +222,69 @@ def test_post_terminal_overlap_step_is_dropped():
     Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
+    cm.check_integrity()
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 32, 256])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("stop_mode", ["length", "eos_at_limit", "stop_at_limit", "early_eos"])
+def test_output_budget_drains_final_token(limit, overlap, stop_mode):
+    """Budget completion follows delivered tokens, with one terminal reply/free."""
+    pool, cm, tm, dm, _pm, sent, stub = _setup(num_tokens=512)
+    prompt = torch.arange(1000, 1012, dtype=torch.int32)
+    req = _launch_req(pool, cm, tm, prompt, output_len=limit)
+    dm.filter_reqs([req])
+    expected_count = min(2, limit) if stop_mode == "early_eos" else limit
+    if stop_mode in ("eos_at_limit", "early_eos"):
+        stub.eos_token_ids = {expected_count}
+    elif stop_mode == "stop_at_limit":
+        req.sampling_params.stop_strs = ["END"]
+        stub._match_stop_str = lambda r: "END" if int(r.input_ids[-1]) == limit else None
+    else:
+        req.sampling_params.ignore_eos = True
+    freed_at = []
+    free_req = stub._free_req_resources
+
+    def record_free(r):
+        freed_at.append(r.input_ids.numel() - len(prompt))
+        free_req(r)
+
+    stub._free_req_resources = record_free
+
+    def data(batch, token):
+        return (SimpleNamespace(batch=batch),
+                (None, torch.tensor([token], dtype=torch.int32),
+                 SimpleNamespace(synchronize=lambda: None)))
+
+    launched = 1  # _launch_req has already forwarded the prefill.
+    last = data(Batch(reqs=[req], phase="prefill"), launched)
+
+    def launch_next():
+        nonlocal launched
+        batch = dm.schedule_next_batch()
+        if batch is None:
+            return None
+        cm.allocate_paged(batch.reqs)
+        req.complete_one()
+        dm.filter_reqs(batch.reqs)
+        launched += 1
+        return data(batch, launched)
+
+    while last is not None:
+        # Mirror the real loops: overlap launches N+1 before draining N.
+        if overlap:
+            ongoing = launch_next()
+            Scheduler._process_last_data(stub, last)
+            last = ongoing
+        else:
+            Scheduler._process_last_data(stub, last)
+            last = launch_next()
+
+    assert [m.next_token for m in sent] == list(range(1, expected_count + 1))
+    assert [m.finished for m in sent] == [False] * (expected_count - 1) + [True]
+    assert sent[-1].finish_reason == ("length" if stop_mode == "length" else "stop")
+    assert sent[-1].matched_stop == ("END" if stop_mode == "stop_at_limit" else None)
+    assert freed_at == [expected_count]
+    assert req.input_ids[len(prompt):].tolist() == list(range(1, expected_count + 1))
+    assert not dm.runnable
     cm.check_integrity()
