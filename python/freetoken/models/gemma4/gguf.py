@@ -406,7 +406,7 @@ def load_q4_0_expert_sources(
     and the sink may release banks it has written out, so the returned tensors are only
     valid until then (the caller owns that tradeoff).
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.gguf.reader import PageReleaser, iter_gguf_tensors
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
     _require_tp1("expert banks")
@@ -419,6 +419,7 @@ def load_q4_0_expert_sources(
 
     def _load(sink) -> None:
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
+        releaser = PageReleaser(model_path)
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
                 continue
@@ -431,6 +432,7 @@ def load_q4_0_expert_sources(
                 seen_dn.add(layer)
             else:
                 continue
+            releaser.note(t.rows * t.row_bytes)
             if tracker is not None:
                 tracker.note(layer)
 

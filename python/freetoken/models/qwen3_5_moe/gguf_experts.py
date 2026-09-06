@@ -147,7 +147,7 @@ def load_gguf_expert_sources(
       tracker into it instead -- nothing is pinned, and the sink may release banks,
       so returned tensors are only valid until the sink releases them.
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.gguf.reader import PageReleaser, iter_gguf_tensors
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
     types = gguf_expert_types(model_path, config.num_layers)
@@ -172,6 +172,7 @@ def load_gguf_expert_sources(
     def _load(sink) -> None:
         # Track completion: 2 banks per layer (gate_up and down).
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
+        releaser = PageReleaser(model_path)
 
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
@@ -204,6 +205,8 @@ def load_gguf_expert_sources(
 
             else:
                 continue
+
+            releaser.note(t.rows * t.row_bytes)
 
             # Emit gate_up bank once both gate and up are present.
             if layer in gate_buf and layer in up_buf:

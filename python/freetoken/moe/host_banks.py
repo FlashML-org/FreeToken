@@ -23,6 +23,7 @@ import math
 import mmap
 import os
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -52,6 +53,65 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+
+_PINNED_BYTES = 0
+_PINNED_COUNT = 0
+_PINNED_LOCK = threading.Lock()
+
+
+def _note_pinned(nbytes: int) -> None:
+    global _PINNED_BYTES, _PINNED_COUNT
+    with _PINNED_LOCK:
+        _PINNED_BYTES += nbytes
+        _PINNED_COUNT += 1
+
+
+def host_mem_summary() -> str:
+    """Return a compact physical/commit-memory snapshot for load diagnostics."""
+    gib = float(2**30)
+    if sys.platform == "win32":
+        from ctypes import wintypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+        kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return "host mem: unavailable"
+        return (
+            f"host mem: availPhys={status.ullAvailPhys / gib:.2f} GiB of "
+            f"{status.ullTotalPhys / gib:.2f}, "
+            f"availCommit={status.ullAvailPageFile / gib:.2f} GiB of "
+            f"{status.ullTotalPageFile / gib:.2f}, load={status.dwMemoryLoad}%"
+        )
+
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo") as file:
+            for line in file:
+                key, _, value = line.partition(":")
+                info[key] = int(value.split()[0]) * 1024
+        return (
+            f"host mem: MemAvailable={info.get('MemAvailable', 0) / gib:.2f} GiB of "
+            f"{info.get('MemTotal', 0) / gib:.2f}, "
+            f"Committed_AS={info.get('Committed_AS', 0) / gib:.2f} GiB"
+        )
+    except (OSError, ValueError, IndexError):
+        return "host mem: unavailable"
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -137,9 +197,19 @@ class HostBank:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB after "
+                f"{_PINNED_COUNT} bank(s), {_PINNED_BYTES / 2**30:.1f} GiB already "
+                f"pinned in this process; {host_mem_summary()}"
             ) from exc
         self._pinned = True
+        _note_pinned(len(self._buf))
+        if _PINNED_COUNT % 16 == 0:
+            logger.info(
+                "Pinned %d host banks, %.2f GiB; %s",
+                _PINNED_COUNT,
+                _PINNED_BYTES / 2**30,
+                host_mem_summary(),
+            )
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -479,6 +549,7 @@ __all__ = [
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "host_mem_summary",
     "pin_banks",
     "read_file_into",
     "read_range_into",

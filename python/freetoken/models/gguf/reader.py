@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import os
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -171,6 +172,69 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
         )
 
 
+def _release_pages(addr: int, nbytes: int) -> bool:
+    """Best-effort removal of a mapped range from this process's working set."""
+    if nbytes <= 0:
+        return False
+    try:
+        import ctypes
+
+        if sys.platform == "win32":
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.VirtualUnlock.argtypes = [wintypes.LPVOID, ctypes.c_size_t]
+            kernel32.VirtualUnlock.restype = wintypes.BOOL
+            # For an unlocked range Windows returns ERROR_NOT_LOCKED, but explicitly
+            # removes those pages from the process working set.
+            kernel32.VirtualUnlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes))
+            return True
+
+        page = os.sysconf("SC_PAGE_SIZE")
+        start = addr // page * page
+        end = (addr + nbytes + page - 1) // page * page
+        libc = ctypes.CDLL(None, use_errno=True)
+        return (
+            libc.madvise(
+                ctypes.c_void_p(start), ctypes.c_size_t(end - start), 4  # MADV_DONTNEED
+            )
+            == 0
+        )
+    except Exception:  # best-effort memory hint must never fail a model load
+        return False
+
+
+def release_mapped_pages(model_path: str) -> bool:
+    """Trim already-read GGUF pages while keeping the zero-copy mapping valid."""
+    data = getattr(_reader(model_path), "data", None)
+    if data is None or not getattr(data, "nbytes", 0):
+        return False
+    return _release_pages(int(data.ctypes.data), int(data.nbytes))
+
+
+class PageReleaser:
+    """Periodically trim mapped GGUF pages after consumers copy them into banks."""
+
+    __slots__ = ("_path", "_budget", "_pending")
+
+    def __init__(self, model_path: str, budget: int | None = None):
+        self._path = model_path
+        self._budget = (
+            int(os.environ.get("FT_GGUF_TRIM_BYTES", 2 << 30))
+            if budget is None
+            else budget
+        )
+        self._pending = 0
+
+    def note(self, nbytes: int) -> None:
+        if self._budget <= 0:
+            return
+        self._pending += nbytes
+        if self._pending >= self._budget:
+            self._pending = 0
+            release_mapped_pages(self._path)
+
+
 def gguf_tensor_names(model_path: str) -> set[str]:
     return {t.name for t in _reader(model_path).tensors}
 
@@ -186,4 +250,6 @@ __all__ = [
     "gguf_architecture",
     "iter_gguf_tensors",
     "gguf_tensor_names",
+    "release_mapped_pages",
+    "PageReleaser",
 ]

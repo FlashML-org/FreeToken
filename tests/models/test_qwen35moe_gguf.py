@@ -292,6 +292,7 @@ class TestQwenNameMapping:
         assert gguf_name_to_freetoken("blk.0.ssm_out.weight", num_layers) == "model.layers.0.linear_attn.out_proj.weight"
         assert gguf_name_to_freetoken("blk.0.ssm_a", num_layers) == "model.layers.0.linear_attn.A_log"
         assert gguf_name_to_freetoken("blk.0.ssm_dt.bias", num_layers) == "model.layers.0.linear_attn.dt_bias"
+        assert gguf_name_to_freetoken("blk.0.ssm_dt", num_layers) == "model.layers.0.linear_attn.dt_bias"
 
         # MoE tensors: shared expert and router
         assert gguf_name_to_freetoken("blk.5.ffn_gate_inp.weight", num_layers) == "model.layers.5.mlp.gate.weight"
@@ -310,6 +311,44 @@ class TestQwenNameMapping:
         assert gguf_name_to_freetoken("blk.0.ffn_gate_exps.weight", num_layers) is None
         assert gguf_name_to_freetoken("blk.15.ffn_up_exps.weight", num_layers) is None
         assert gguf_name_to_freetoken("blk.39.ffn_down_exps.weight", num_layers) is None
+
+
+class TestQwenMetadataVariants:
+    def test_head_count_accepts_hybrid_per_layer_arrays(self):
+        from freetoken.models.qwen3_5_moe.gguf import _head_count
+
+        assert _head_count(24, "attention.head_count") == 24
+        assert _head_count([0, 0, 24, 0, 24], "attention.head_count") == 24
+
+    def test_head_count_rejects_disagreeing_full_attention_layers(self):
+        from freetoken.models.qwen3_5_moe.gguf import _head_count
+
+        with pytest.raises(ValueError, match="one non-zero"):
+            _head_count([0, 16, 0, 24], "attention.head_count")
+
+    def test_layer_types_prefer_tensor_table_and_fall_back_to_interval(self, monkeypatch):
+        from freetoken.models.gguf import reader
+        from freetoken.models.qwen3_5_moe.gguf import _layer_types
+
+        monkeypatch.setattr(
+            reader,
+            "gguf_tensor_names",
+            lambda _path: {"blk.1.ssm_a", "blk.3.ssm_dt"},
+        )
+        assert _layer_types("model.gguf", 4, 2) == [
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+        ]
+
+        monkeypatch.setattr(reader, "gguf_tensor_names", lambda _path: set())
+        assert _layer_types("metadata.gguf", 4, 2) == [
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ]
 
 __all__ = [
     "test_merged_linear_concatenates_outputs",

@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
+from freetoken.utils import init_logger
+
 # Verify that LinearGatedDeltaGroupConfig is available for isinstance checks
 # (imported above in the config module import)
 
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
 
 _ARCH = "qwen35moe"
+logger = init_logger(__name__)
 
 
 def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
@@ -74,6 +77,53 @@ def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
             f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}"
         )
     return val
+
+
+def _head_count(value: Any, what: str) -> int:
+    """Collapse hybrid-model per-layer head counts to one full-attention value."""
+    if not isinstance(value, (list, tuple)):
+        return int(value)
+    counts = {int(item) for item in value if int(item)}
+    if len(counts) != 1:
+        raise ValueError(
+            f"qwen35 GGUF: {what} must contain one non-zero full-attention head "
+            f"count, got {sorted(counts)} from {list(value)}"
+        )
+    return counts.pop()
+
+
+def _layer_types(model_path: str, num_layers: int, interval: int) -> list[str]:
+    """Infer GDN/full-attention layers from tensor names, with metadata fallback."""
+    by_interval = [
+        "full_attention" if (layer + 1) % interval == 0 else "linear_attention"
+        for layer in range(num_layers)
+    ]
+
+    from freetoken.models.gguf.reader import gguf_tensor_names
+
+    ssm_layers = {
+        int(name.split(".")[1])
+        for name in gguf_tensor_names(model_path)
+        if name.startswith("blk.") and ".ssm_" in name
+    }
+    if not ssm_layers:
+        return by_interval
+
+    from_names = [
+        "linear_attention" if layer in ssm_layers else "full_attention"
+        for layer in range(num_layers)
+    ]
+    if from_names != by_interval:
+        logger.info(
+            "qwen35 GGUF tensor names override full_attention_interval=%d on layers %s",
+            interval,
+            [
+                layer
+                for layer in range(num_layers)
+                if from_names[layer] != by_interval[layer]
+            ],
+        )
+    return from_names
 
 
 def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] | None:
@@ -107,8 +157,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     num_layers = block_count - nextn
 
     hidden_size = int(_kv(shim, "embedding_length"))
-    num_qo_heads = int(_kv(shim, "attention.head_count"))
-    num_kv_heads = int(_kv(shim, "attention.head_count_kv"))
+    num_qo_heads = _head_count(_kv(shim, "attention.head_count"), "attention.head_count")
+    num_kv_heads = _head_count(
+        _kv(shim, "attention.head_count_kv"), "attention.head_count_kv"
+    )
     head_dim = int(_kv(shim, "attention.key_length"))
     rms_eps = float(_kv(shim, "attention.layer_norm_rms_epsilon"))
     rope_base = float(_kv(shim, "rope.freq_base"))
@@ -140,11 +192,12 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             "layout assumed by this adapter does not hold for this checkpoint"
         )
 
-    # llama.cpp writes the stride, not a per-layer list: layer i is full attention when
-    # (i + 1) % interval == 0. For Ornith (interval=4, 40 layers) that is 3,7,...,39.
+    # Prefer the tensor table: a GDN layer carries blk.i.ssm_* tensors. Metadata-only
+    # converted checkpoints have no tensor table and retain the interval fallback.
     interval = int(_kv(shim, "full_attention_interval"))
-    full_ids = tuple(i for i in range(num_layers) if (i + 1) % interval == 0)
-    linear_ids = tuple(i for i in range(num_layers) if i not in set(full_ids))
+    layer_types = _layer_types(shim.model_path, num_layers, interval)
+    full_ids = tuple(i for i, kind in enumerate(layer_types) if kind == "full_attention")
+    linear_ids = tuple(i for i, kind in enumerate(layer_types) if kind == "linear_attention")
 
     full_rotary = RotaryConfig(
         head_dim=head_dim,
@@ -239,6 +292,7 @@ _LAYER_MAP: dict[str, str] = {
     "ssm_out.weight": "linear_attn.out_proj.weight",
     "ssm_a": "linear_attn.A_log",
     "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_dt": "linear_attn.dt_bias",
     # MoE router + shared expert. ffn_gate_shexp / ffn_up_shexp are absent for the same
     # reason as attn_q/k/v: _SharedExpert has a single merged gate_up_proj, so they are
     # fused rather than renamed.
@@ -537,6 +591,7 @@ def iter_gguf_weights(
     in_proj_buf: dict[int, dict[str, torch.Tensor]] = {}  # GDN in_proj (qkv+gate+beta+alpha)
     gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}  # shared_expert gate_up (MoE)
     dense_mlp_buf: dict[int, dict[str, torch.Tensor]] = {}  # mlp gate_up (dense qwen35)
+    unhandled: list[str] = []
 
     def layer_of(name: str) -> int:
         return int(name.split(".")[1])
@@ -616,7 +671,7 @@ def iter_gguf_weights(
                 )
             yield f"{base}.linear_attn.A_log", torch.log(-a)
             continue
-        if suffix == "ssm_dt.bias":
+        if suffix in ("ssm_dt.bias", "ssm_dt"):
             dt = _to_f32(t)
             if _untile:
                 dt = _ungroup_v(dt, 0, _vK, _vR, 1)
@@ -709,7 +764,8 @@ def iter_gguf_weights(
             elif suffix == "attn_output.weight":
                 yield f"{base}.self_attn.o_proj.qweight", t.packed()
             else:
-                continue  # unmapped for full-attn layers
+                unhandled.append(name)
+                continue
 
             # Emit fused qkv once all three parts are present.
             slots = qkv_buf.get(layer)
@@ -768,7 +824,8 @@ def iter_gguf_weights(
                     w = _ungroup_v(w, 1, _vK, _vR, _vD)
                 yield f"{base}.linear_attn.out_proj.qweight", _requant_q8_0(w)
             else:
-                continue  # unmapped for GDN layers
+                unhandled.append(name)
+                continue
 
             # Emit fused in_proj once all four parts are present.
             slots = in_proj_buf.get(layer)
@@ -810,6 +867,11 @@ def iter_gguf_weights(
     assert not in_proj_buf, f"incomplete GDN in_proj groups: {sorted(in_proj_buf)}"
     assert not gate_up_buf, f"incomplete shared_expert gate_up groups: {sorted(gate_up_buf)}"
     assert not dense_mlp_buf, f"incomplete dense mlp gate_up groups: {sorted(dense_mlp_buf)}"
+    if unhandled:
+        raise ValueError(
+            f"qwen35 GGUF has {len(unhandled)} unmapped tensor(s) inside the decoder "
+            f"stack; refusing a partially initialized model: {unhandled[:8]}"
+        )
 
 
 def is_gguf_model(config: ModelConfig) -> bool:
