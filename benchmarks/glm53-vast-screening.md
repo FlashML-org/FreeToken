@@ -62,7 +62,7 @@ Longer output runs, repeated c1/c2/c4/c8/c16 measurements, generated-answer
 checks, actual serverless routing, idle shutdown, and cached restart remain
 required. Do not describe an endpoint configuration or direct-worker result
 as a verified serverless lifecycle. The
-[raw screening report](https://github.com/tekizai/tekizai-vast-setup/blob/a7398b3548ab6b8d392a02bffff4d142beae87c2/docs/model-test-results/glm53-full-c8-c16-screen-20260907.json)
+[raw screening report](https://github.com/earlvanze/FreeToken/blob/0182c7e1a4509c79906b40b0ca29ccdc44b084a1/benchmarks/results/glm53-full-c8-c16-screen-20260907.json)
 retains every request result. The
-[qualification record](https://github.com/tekizai/tekizai-vast-setup/blob/a7398b3548ab6b8d392a02bffff4d142beae87c2/docs/model-test-results/glm53-full-vast-50116782-qualification-20260907.json)
+[qualification record](https://github.com/earlvanze/FreeToken/blob/0182c7e1a4509c79906b40b0ca29ccdc44b084a1/benchmarks/results/glm53-full-vast-50116782-qualification-20260907.json)
 records hardware, checkpoint validation, and outstanding lifecycle gates.
