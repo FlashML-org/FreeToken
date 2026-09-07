@@ -1,7 +1,44 @@
-# Full GLM-5.3: preliminary Vast screening
+# Full GLM-5.3: H200 Serverless qualification and preliminary screening
 
 Measured 2026-09-07. This is full GLM-5.3, not GLM-5.3-Flash.
-These short runs do not qualify this host for production or serverless use.
+The H200 NVL run verifies model readiness, authenticated Vast Serverless
+routing, correct semantic output, and concurrency throughput. Idle shutdown
+and cached restart were not tested before the instance was deleted.
+
+## H200 NVL Serverless qualification
+
+Vast Serverless provisioned one H200 NVL worker in Japan with 143,771 MiB
+reported VRAM, 32 effective CPU cores, and a 520 GiB disk. FreeToken 0.1.2
+loaded `LibertAIDAI/GLM-5.3-NVFP4`, allocated 8,384 KV tokens, and captured
+CUDA graphs for batch sizes 1, 2, 4, and 8. Both worker creation and routing
+through the authenticated Serverless endpoint were observed.
+
+The semantic smoke prompt, `What is 17 + 25? Reply with only the number.`,
+returned exactly `42` with finish reason `stop` in 10.402 seconds.
+
+The concurrency workload requested a concise Python function for merging two
+sorted iterables. It used non-streaming end-to-end timing, including routing,
+queueing, and prefill, with `reasoning_effort="low"` and a 128-token output
+cap.
+
+| Offered concurrency | Running slots | Successful requests | Output tokens | Wall seconds | Aggregate output tok/s | Mean request seconds | p95 request seconds |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | 8 | 8/8 | 1,016 | 57.136 | 17.782 | 57.133 | 57.135 |
+| 16 | 8 | 16/16 | 2,032 | 112.747 | 18.023 | 85.600 | 112.738 |
+
+All 24 requests succeeded and produced assistant output. Each reached the
+fixed 128-token cap, so these runs measure throughput rather than completed
+answer quality. At c16, eight requests ran while the other eight queued behind
+the worker's eight active-request slots. The nearly unchanged aggregate rate
+and nearly doubled wall time place practical saturation at c8 for this worker
+configuration.
+
+The [qualification record](results/glm53-full-h200-serverless-qualification-20260907.json),
+[raw c8/c16 results](results/glm53-full-h200-serverless-c8-c16-20260907.json),
+and [semantic smoke response](results/glm53-full-h200-serverless-smoke-20260907.json)
+preserve the machine-readable evidence.
+
+## Preliminary RTX PRO 6000 screening
 
 ## Configuration
 
@@ -31,7 +68,7 @@ The running process was inspected with this exact command line:
   --disable-moe-prefill-overlap
 ```
 
-## Initial results
+### Initial results
 
 The prompt requested a concise Python function merging two sorted iterables,
 with a request index appended. Each request used a 32-token output cap and
@@ -56,13 +93,14 @@ checkpoint template always opens a thinking block; disabling parsing does
 not disable reasoning computation. A separately prepared parser regression fix
 has local test coverage but was not deployed for these measurements.
 
-## Outstanding qualification
+## Remaining lifecycle checks
 
-Longer output runs, repeated c1/c2/c4/c8/c16 measurements, generated-answer
-checks, actual serverless routing, idle shutdown, and cached restart remain
-required. Do not describe an endpoint configuration or direct-worker result
-as a verified serverless lifecycle. The
+The H200 run verifies worker creation, model readiness, authenticated
+Serverless routing, and a correct semantic response. Repeated concurrency
+runs, idle shutdown, and cached restart remain outstanding. Do not describe
+the result as a complete Serverless lifecycle qualification. The earlier
 [raw screening report](https://github.com/earlvanze/FreeToken/blob/0182c7e1a4509c79906b40b0ca29ccdc44b084a1/benchmarks/results/glm53-full-c8-c16-screen-20260907.json)
 retains every request result. The
 [qualification record](https://github.com/earlvanze/FreeToken/blob/0182c7e1a4509c79906b40b0ca29ccdc44b084a1/benchmarks/results/glm53-full-vast-50116782-qualification-20260907.json)
-records hardware, checkpoint validation, and outstanding lifecycle gates.
+records the RTX PRO 6000 hardware, checkpoint validation, and original
+screening limitations.
