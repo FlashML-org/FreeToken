@@ -33,6 +33,7 @@ from .anthropic_models import (
     AnthropicUsage,
 )
 from .generation import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     KEEPALIVE,
     ContentDelta,
     GenDone,
@@ -116,6 +117,9 @@ async def handle_anthropic_messages(
         spec = convert_anthropic_to_genspec(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            default_max_tokens=(
+                getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+            ),
         )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
@@ -303,6 +307,7 @@ def convert_anthropic_to_genspec(
     req: AnthropicMessagesRequest,
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> GenSpec:
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
         req, reasoning_parser=reasoning_parser
@@ -317,6 +322,7 @@ def convert_anthropic_to_genspec(
             ignore_eos=False,
             model_sampling=model_sampling,
             stop=req.stop_sequences,
+            default_max_tokens=default_max_tokens,
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,

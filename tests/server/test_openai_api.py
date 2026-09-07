@@ -391,30 +391,40 @@ def test_completion_forwards_length_finish_reason():
     assert response["choices"][0]["finish_reason"] == "length"
 
 
-def test_omitted_max_tokens_defaults_to_hardcoded_32k():
+def test_omitted_max_tokens_honors_server_default():
     from freetoken.server.generation import DEFAULT_MAX_OUTPUT_TOKENS
 
     chat_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    chat_state.config.max_output_tokens = 4096
     run(handle_chat_completion(
         ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
         request=None, state=chat_state, model_sampling={},
     ))
-    assert chat_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert chat_state.sent.sampling_params.max_tokens == 4096
 
     cmpl_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    cmpl_state.config.max_output_tokens = 4096
     run(handle_completion(
         CompletionRequest(model="m", prompt="hi"),
         request=None, state=cmpl_state, model_sampling={},
     ))
-    assert cmpl_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert cmpl_state.sent.sampling_params.max_tokens == 4096
 
     # explicit value wins
     exp_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    exp_state.config.max_output_tokens = 4096
     run(handle_completion(
         CompletionRequest(model="m", prompt="hi", max_tokens=50),
         request=None, state=exp_state, model_sampling={},
     ))
     assert exp_state.sent.sampling_params.max_tokens == 50
+
+    fallback_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    run(handle_chat_completion(
+        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
+        request=None, state=fallback_state, model_sampling={},
+    ))
+    assert fallback_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def test_models_route_returns_served_model_name():
