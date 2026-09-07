@@ -266,13 +266,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
     AotModel(
         # MLA latent-KV: the dsa backend writes the latent via torch scatter,
         # not store_cache (same as DSV4 below), so no paged-KV store groups.
-        name="zai-org/GLM-5.2-NVFP4",
+        # GLM-5.3 keeps GLM-5.2's architecture, tensor names, and geometry. The
+        # LibertAI NVFP4 conversion follows NVIDIA's 5.2 recipe tensor-for-tensor,
+        # so both checkpoints share the same offload-bank and AOT shapes.
+        name="LibertAIDAI/GLM-5.3-NVFP4",
         architecture="GlmMoeDsaForCausalLM",
         hidden_size=6144,
         kv_groups=(),
         top_k=8,
         moe_intermediate_size=2048,
         expert_formats=_NVFP4_FORMATS,
+        aliases=("nvidia/GLM-5.2-NVFP4", "zai-org/GLM-5.2-NVFP4"),
     ),
     AotModel(
         # GLM-5.3-Flash: hybrid KDA + NoPE-MLA/DSA (kpool indexer). Latent writes
