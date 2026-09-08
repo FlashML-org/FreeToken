@@ -311,9 +311,30 @@ _PT_BF16_FUSE: dict[str, tuple[str, ...]] = {
 }
 
 
-def _per_row_scale(scalar: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-tensor scalar -> per-output-row fp32 vector ``[rows]`` (exact broadcast)."""
-    return scalar.reshape(1).to(torch.float32).expand(rows)
+def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """FP8 weight scale -> per-output-row fp32 vector ``[rows]``, which is what
+    ``Fp8PerTensorLinear.weight_scale`` wants whichever on-disk shape arrives:
+
+    * **per-tensor** (``strategy: "tensor"``) -- one scalar for the whole weight, broadcast
+      across the rows. Exact.
+    * **per-channel** (``strategy: "channel"``) -- ``[rows, 1]``, already one scalar per row,
+      so the reshape alone is enough. This case is why the per-tensor ``reshape(1)`` cannot be
+      unconditional: on a per-channel checkpoint it raises ``RuntimeError: shape '[1]' is
+      invalid for input of size <rows>``.
+
+    Any other element count is raised on rather than broadcast: a silently mis-shaped scale
+    would be applied to the wrong output rows and produce plausible garbage.
+    """
+    flat = scale.reshape(-1).to(torch.float32)
+    if flat.numel() == 1:
+        return flat.expand(rows)
+    if flat.numel() != rows:
+        raise ValueError(
+            f"fp8 weight_scale has {flat.numel()} elements for a weight with {rows} output "
+            f"rows (shape {tuple(scale.shape)}); expected either 1 (per-tensor) or {rows} "
+            "(per-channel)"
+        )
+    return flat
 
 
 def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
