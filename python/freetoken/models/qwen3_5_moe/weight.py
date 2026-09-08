@@ -47,6 +47,40 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
+# llm-compressor export (compressed-tensors): weight_packed | weight_scale |
+# weight_global_scale (quant-side global -> reciprocal at ingest). ``input_global_scale``
+# (the calibrated W4A4 activation scale) deliberately does not match: our routed-expert
+# paths are W4A16 and never quantize activations.
+_NVFP4_CT_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+)
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_CT_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
+# Some llm-compressor exports stack the experts per layer instead of per expert:
+# ``...experts.gate_up_proj.weight_packed`` U8 [E*rows, cols] with ONE layer-global
+# ``weight_global_scale`` scalar (e.g. doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED).
+# The stacked rows are already expert-major, so each bank tensor just reshapes to [E, ...].
+_NVFP4_CT_STACKED_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<proj>gate_up_proj|down_proj)\.(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+)
+_NVFP4_CT_STACKED_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_CT_STACKED_EXPERT_KEY_RE,
+    proj_to_role={"gate_up_proj": "gate_up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 NVFP4 experts (compressed-tensors, stacked)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+    stacked=True,
+)
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -82,9 +116,14 @@ _FUSIONS: dict[str, tuple[str, ...]] = {
 
 
 def _dequant_fp8_weight(weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
-    """Weight-only FP8 -> bf16 (per-tensor static scale). Activations stay bf16 (W8A16),
-    which is at least as precise as the checkpoint's intended W8A8."""
-    return weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+    """Weight-only FP8 -> bf16 (W8A16). ``weight_scale`` is either a scalar (per-tensor
+    FP8) or a per-output-row vector (modelopt / llm-compressor per-tensor fp8); broadcast
+    to the weight's rows in both cases. Activations stay bf16 (W8A16), which is at least
+    as precise as the checkpoint's intended W8A8."""
+    if weight_scale.numel() == 1:
+        return weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+    scale = weight_scale.reshape(-1, 1).to(torch.bfloat16)
+    return (weight.to(torch.bfloat16) * scale).contiguous()
 
 
 def _dequant_nvfp4_weight(
@@ -186,6 +225,7 @@ def iter_weights(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
+            lmhead_nvfp4=config.lm_head_quant == "nvfp4",
         )
         return
     if config.expert_quant == "fp8_block":
@@ -544,6 +584,9 @@ def _iter_weights_attn_fp8(
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj": (
@@ -564,20 +607,25 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, lmhead_nvfp4: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
+    """Dense pass for a compressed-tensors NVFP4 checkpoint.
 
-    Keeps the NVFP4 attention (q/k/v/o, GDN out_proj) and dense MLP (gate/up/down) native
-    (W4A16) -- ``.weight`` (uint8) + ``.weight_scale`` (fp8 block) + ``.weight_global`` (fp16
-    per-row) -- when ``nvfp4``; otherwise dequantizes each to bf16. q/k/v -> ``qkv_proj``, dense gate/up -> ``gate_up_proj`` (output-dim concat).
-    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; ``conv1d``/``A_log``/``dt_bias``/
-    gated ``norm`` pass through (fp32 for A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and
-    embeddings are bf16. The model is dense (no routed experts), so there is no experts pass."""
+    Keeps the NVFP4 attention (q/k/v/o), dense MLP (gate/up/down, shared_expert) and the
+    lm_head native (W4A16) -- ``.weight`` (uint8) + ``.weight_scale`` (fp8 block) +
+    ``.weight_global`` (fp16 per-row) -- when the corresponding quant flag is on;
+    otherwise dequantizes each to bf16. q/k/v -> ``qkv_proj``, dense gate/up ->
+    ``gate_up_proj`` (output-dim concat). GDN ``in_proj_{qkv,z,b,a}`` and ``out_proj``
+    compute in bf16: NVFP4- or per-tensor-fp8-stored ones are dequantized (the export's
+    ``ignore``/``recipe`` may keep the whole GDN bf16). ``embed_tokens`` is always
+    dequantized (there is no NVFP4 embedding kernel). Routed experts never appear here --
+    they ride the offload banks via ``load_nvfp4_expert_sources``. ``conv1d``/``A_log``/
+    ``dt_bias``/gated ``norm`` pass through (fp32 for A_log/dt_bias). Gemma (1+w) norms
+    get +1."""
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
     if not include_non_moe:
-        return  # dense checkpoint: no routed experts to load
+        return  # checkpoint's routed experts are not yielded by this pass
 
     tp_info = get_tp_info()
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
@@ -604,52 +652,69 @@ def _iter_weights_compressed_tensors(
             desc="Loading compressed-tensors weights",
             disable=not tp_info.is_primary(),
         ):
-            for raw_name in reader.names_in(file):
-                if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
-                    continue
-                if raw_name.endswith(_CT_SCALE_SUFFIXES):
-                    continue  # consumed with weight_packed (or unused W4A4 activation scales)
-
-                name = _rename(raw_name)
-                if name is None:
-                    continue
-
-                if raw_name.endswith(".weight_packed"):  # NVFP4 projection
-                    base = name[: -len(".weight_packed")]
-                    raw_base = raw_name[: -len(".weight_packed")]
-                    w, s, g = _nvfp4_parts_ct(reader, raw_base)
-                    # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
-                    # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
-                    # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
-                    if any(base.endswith(p) for ps in _CT_BF16_FUSE.values() for p in ps):
-                        bf16 = _dequant_nvfp4_weight(w, s, g[:1])
-                        yield from _emit_bf16_weight(base + ".weight", bf16)
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                keyset = set(f.keys())
+                for raw_name in reader.names_in(file):
+                    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
                         continue
-                    if nvfp4:  # keep native (W4A16)
-                        emit = _ct_nvfp4_fuse(base, (w, s, g), nvfp4_buf)
+                    # Routed experts go to the offload cache (load_nvfp4_expert_sources),
+                    # not the dense pass: ``.mlp.experts.<int>.`` (per-expert) and
+                    # ``.mlp.experts.gate_up_proj`` (stacked per-layer) keying.
+                    if _NVFP4_EXPERT_RE.search(raw_name) or ".mlp.experts." in raw_name:
+                        continue
+                    if raw_name.endswith(_CT_SCALE_SUFFIXES):
+                        continue  # consumed with weight_packed (or unused W4A4 activation scales)
+
+                    name = _rename(raw_name)
+                    if name is None:
+                        continue
+
+                    if raw_name.endswith(".weight_packed"):  # NVFP4 projection
+                        base = name[: -len(".weight_packed")]
+                        raw_base = raw_name[: -len(".weight_packed")]
+                        w, s, g = _nvfp4_parts_ct(reader, raw_base)
+                        # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
+                        # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
+                        # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
+                        if any(base.endswith(p) for ps in _CT_BF16_FUSE.values() for p in ps):
+                            bf16 = _dequant_nvfp4_weight(w, s, g[:1])
+                            yield from _emit_bf16_weight(base + ".weight", bf16)
+                            continue
+                        if base == "model.embed_tokens":
+                            # No NVFP4 embedding kernel: always dequant to bf16.
+                            bf16 = _dequant_nvfp4_weight(w, s, g[:1])
+                            yield from _emit_bf16_weight(base + ".weight", bf16)
+                            continue
+                        if nvfp4 and (base != "lm_head" or lmhead_nvfp4):
+                            # keep native (W4A16); lm_head only when the model wants it
+                            emit = _ct_nvfp4_fuse(base, (w, s, g), nvfp4_buf)
+                            if emit is not None:
+                                yield from emit
+                            else:  # standalone: o_proj, linear_attn.out_proj, mlp.down_proj
+                                yield base + ".weight", w
+                                yield base + ".weight_scale", s
+                                yield base + ".weight_global", g
+                            continue
+                        # bf16 A-B: dequant FP4 -> bf16, then merge q/k/v + gate/up as bf16. ``g`` is
+                        # already the dequant global (1/weight_global_scale) per row; pass one element.
+                        bf16 = _dequant_nvfp4_weight(w, s, g[:1])
+                        emit = _ct_bf16_fuse(base, bf16, bf16_buf, _CT_NVFP4_FUSE)
                         if emit is not None:
                             yield from emit
-                        else:  # standalone: o_proj, linear_attn.out_proj, mlp.down_proj
-                            yield base + ".weight", w
-                            yield base + ".weight_scale", s
-                            yield base + ".weight_global", g
+                        else:
+                            yield base + ".weight", bf16
                         continue
-                    # bf16 A-B: dequant FP4 -> bf16, then merge q/k/v + gate/up as bf16. ``g`` is
-                    # already the dequant global (1/weight_global_scale) per row; pass one element.
-                    bf16 = _dequant_nvfp4_weight(w, s, g[:1])
-                    emit = _ct_bf16_fuse(base, bf16, bf16_buf, _CT_NVFP4_FUSE)
-                    if emit is not None:
-                        yield from emit
-                    else:
-                        yield base + ".weight", bf16
-                    continue
 
-                if name.endswith(".weight"):
-                    yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
-                    continue
+                    if name.endswith(".weight"):
+                        # bf16 weight, or a per-tensor fp8 projection (fp8-e4m3 weight +
+                        # per-row ``weight_scale``, e.g. a ``gdn:fp8`` recipe) that the
+                        # model computes in bf16 -- dequant, then feed the bf16 fusion.
+                        tensor = _load_maybe_quantized(f, raw_name, keyset)
+                        yield from _emit_bf16_weight(name, tensor)
+                        continue
 
-                # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).
-                yield name, reader.get_tensor(raw_name)
+                    # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).
+                    yield name, reader.get_tensor(raw_name)
     finally:
         reader.close()
 
@@ -1060,15 +1125,44 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
 
 
+def _stacked_expert_keying(model_path: str) -> bool:
+    """Do the routed experts use per-layer stacked tensors (``...experts.gate_up_proj``)
+    instead of per-expert ones (``...experts.E.{gate,up,down}_proj``)?"""
+    from freetoken.models.nvfp4_banks import _weight_map
+
+    folder = download_hf_weight(model_path)
+    for name in _weight_map(folder):
+        if ".mlp.experts." in name and name.endswith(".weight_packed"):
+            return re.search(r"\.mlp\.experts\.\d+\.", name) is None
+    return False
+
+
+def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
+    """Pick the NVFP4 expert bank spec from the checkpoint's ``quant_method``: modelopt
+    stores ``weight | weight_scale | weight_scale_2`` (dequant-side global); llm-compressor
+    (compressed-tensors) stores ``weight_packed | weight_scale | weight_global_scale``
+    (quant-side global -> reciprocal at ingest), per-expert or stacked per-layer."""
+    quant = getattr(cached_load_hf_config(model_path), "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    method = str(get("quant_method") or "").lower()
+    if method == "compressed-tensors":
+        return _NVFP4_CT_STACKED_SOURCE_SPEC if _stacked_expert_keying(model_path) else _NVFP4_CT_SOURCE_SPEC
+    return _NVFP4_SOURCE_SPEC
+
+
 def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, torch.Tensor]:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
     output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
-    return load_nvfp4_expert_source_banks(
+    from freetoken.models.nvfp4_banks import load_nvfp4_stacked_expert_sources
+
+    spec = _select_expert_source_spec(model_path)
+    loader = load_nvfp4_stacked_expert_sources if spec.stacked else load_nvfp4_expert_source_banks
+    return loader(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        spec,
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -1081,10 +1175,17 @@ def load_nvfp4_expert_sources_parallel(
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
 
+    spec = _select_expert_source_spec(model_path)
+    if spec.stacked:
+        # stacked experts are a handful of large tensors per layer -- the serial read
+        # already saturates the disk, so the parallel reader has nothing to add.
+        raise NotImplementedError(
+            "parallel reader not implemented for stacked compressed-tensors experts"
+        )
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        spec,
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,

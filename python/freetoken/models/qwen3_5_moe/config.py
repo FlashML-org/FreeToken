@@ -39,16 +39,110 @@ def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
     return "none", None
 
 
+def _ct_expert_groups_nvfp4(hf_config: Any) -> bool:
+    """compressed-tensors MoE checkpoint: are the *routed experts* NVFP4? Mirrors the
+    mixed-precision scan in ``models.config.detect_expert_quant``: groups whose
+    ``targets`` name the experts decide (a generic ``["Linear"]`` group falls back to
+    covering everything). Exports without ``config_groups`` (format-only, e.g.
+    doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED) ride the top-level format."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    groups = get("config_groups") or {}
+    if not groups:
+        return str(get("format") or "").lower() == "nvfp4-pack-quantized"
+    groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
+    expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
+    for g in expert_groups or groups:
+        w = (g or {}).get("weights") or {}
+        if int(w.get("num_bits", 0) or 0) != 4 or str(w.get("type", "")).lower() != "float":
+            continue
+        if int(w.get("group_size", 0) or 0) == 16 and str(w.get("strategy", "")).lower() == "tensor_group":
+            return True
+    return False
+
+
+def _ct_recipe(hf_config: Any) -> dict[str, str]:
+    """Parse llm-compressor's ``recipe`` string (``all,gdn:fp8,-router``) into a map of
+    module-key -> value. Tokens: ``name:quant`` (per-module override), ``-name`` (skip),
+    bare ``name`` (quantize). Unknown keys are ignored; absence means the default."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return {}
+    out: dict[str, str] = {}
+    for tok in str(get("recipe") or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.startswith("-"):
+            out.setdefault(tok[1:], "skip")
+        elif ":" in tok:
+            key, _, val = tok.partition(":")
+            out.setdefault(key, val.lower())
+        else:
+            out.setdefault(tok, "quant")
+    return out
+
+
+def _ct_ignored(hf_config: Any, probe: str) -> bool:
+    """Is the canonical module path ``probe`` excluded from quantization by the export's
+    ``ignore`` list (exact or ``re:`` entries) or a ``recipe`` skip token (``-lm_head``)?"""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    import re
+
+    for entry in get("ignore") or []:
+        e = str(entry)
+        if e.startswith("re:"):
+            try:
+                if re.search(e[3:], probe):
+                    return True
+            except re.error:
+                continue
+        elif e == probe:
+            return True
+    return _ct_recipe(hf_config).get(probe.split(".")[-1]) == "skip"
+
+
+def _ct_gdn_nvfp4(hf_config: Any) -> bool:
+    """Is the GDN ``out_proj`` stored NVFP4 (as opposed to per-tensor fp8 / bf16)?
+
+    The full-attention projections can be NVFP4 while the whole GDN is left bf16 (the
+    AEON Qwen3.6-35B-A3B ``ignore`` list) or per-tensor fp8 (a ``gdn:fp8`` recipe, e.g.
+    Kwaipilot-KAT-Coder-V2.5). Returns False in both cases; True when the GDN rides the
+    default NVFP4 format."""
+    if _ct_ignored(hf_config, "model.language_model.layers.0.linear_attn.out_proj"):
+        return False
+    return _ct_recipe(hf_config).get("gdn", "nvfp4") in ("nvfp4", "fp4", "quant", "all")
+
+
+def _ct_linear_attn_ignored(hf_config: Any) -> bool:
+    """Backward-compatible wrapper: the GDN out_proj is "ignored" exactly when it is not
+    NVFP4 (the ignore-list or ``recipe`` override left it fp8/bf16)."""
+    return not _ct_gdn_nvfp4(hf_config)
+
+
 def _expert_quant(hf_config: Any) -> str:
     """Quantization format of the *routed* experts (the only weights served from the
     offload cache). The nvidia/modelopt checkpoints are either plain NVFP4 (``quant_algo``
     ``NVFP4``) or ``MIXED_PRECISION`` (per-layer ``quantized_layers`` map); in the mixed
-    case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. Dense quantized
-    weights (attention/shared-expert/lm_head) are handled separately by dequant-at-load."""
+    case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. llm-compressor
+    (compressed-tensors) MoE checkpoints keep the routed experts NVFP4 in the offload
+    cache. Dense quantized weights (attention/shared-expert/lm_head) are handled
+    separately by dequant-at-load."""
     get = _quant_accessor(hf_config)
     if get is None:
         return "none"
     algo = str(get("quant_algo") or get("quant_method") or "").lower()
+    if algo == "compressed-tensors":
+        # Dense exports (e.g. Qwen3.6-27B, no routed experts) stay "none" -- their
+        # weights ride the dense compressed-tensors reader. An MoE export (e.g. the
+        # Qwen3.6-35B-A3B NVFP4 builds) keeps its experts NVFP4 in the offload cache.
+        text = getattr(hf_config, "text_config", hf_config)
+        if int(getattr(text, "num_experts", 0) or 0) > 0 and _ct_expert_groups_nvfp4(hf_config):
+            return "nvfp4"
+        return "none"
     if "fp4" in algo:
         return "nvfp4"
     if "mixed" in algo:
@@ -179,13 +273,18 @@ def parse_config(hf_config: Any) -> ModelConfig:
     dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
     lm_head_quant = _lm_head_quant(hf_config)
 
-    # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
-    # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
-    # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # compressed-tensors NVFP4: the attention (q/k/v/o) and dense MLP are W4A16 NVFP4.
+    # The GDN out_proj follows only when the export actually quantized it (its
+    # ``ignore``/``recipe`` may leave the GDN bf16 or fp8). lm_head is NVFP4 unless the
+    # export skipped it (dense Qwen3.6-27B and the AEON MoE builds put it in ``ignore``).
     if _compressed_tensors_nvfp4(hf_config):
         attn_quant = "nvfp4"
         dense_quant = "nvfp4"
-        lm_head_quant = "none"
+        lm_head_quant = "none" if _ct_ignored(hf_config, "lm_head") else "nvfp4"
+    # The GDN's out_proj follows attn_quant EXCEPT when the export left it non-NVFP4
+    # (the AEON ``ignore`` list keeps the GDN bf16; a ``gdn:fp8`` recipe keeps it
+    # per-tensor fp8); the full-attention q/k/v/o are quantized either way.
+    gdn_quant = "none" if (attn_quant == "nvfp4" and not _ct_gdn_nvfp4(hf_config)) else attn_quant
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -255,6 +354,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
         attn_quant=attn_quant,
+        gdn_quant=gdn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
     )
