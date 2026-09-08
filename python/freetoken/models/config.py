@@ -69,6 +69,11 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     if str(get("quant_method") or "").lower() != "compressed-tensors":
         return False
     groups = get("config_groups") or {}
+    if not groups:
+        # No config_groups: some llm-compressor exports (e.g. the AEON / Kwaipilot Qwen3.6
+        # MoE NVFP4 builds) carry only ``format: nvfp4-pack-quantized`` (+ a ``recipe``
+        # string). Gate on the exact format string, like the config_groups branch below.
+        return str(get("format") or "").lower() == "nvfp4-pack-quantized"
     # Verdicts are collected across ALL groups before returning: an early return on
     # the first NVFP4 group would accept a mixed {nvfp4, mxfp4} checkpoint (and the
     # error would depend on the groups' key order).
@@ -277,6 +282,12 @@ class ModelConfig:
     # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
     # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
     attn_quant: str = "none"
+    # Quantization of the GatedDeltaNet's ``out_proj`` only (qwen3_5_moe). Independent of
+    # ``attn_quant`` because llm-compressor checkpoints can quantize the full-attention
+    # projections while leaving the whole GDN bf16 (their ``ignore`` list names the
+    # ``linear_attn.*`` modules). "nvfp4" keeps ``out_proj`` packed (W4A16); "fp8_pertensor"
+    # keeps it per-tensor fp8 (modelopt MIXED_PRECISION); "none" -> bf16.
+    gdn_quant: str = "none"
     # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
     # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
     # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their

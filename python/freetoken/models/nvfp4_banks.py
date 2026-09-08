@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import collections
+import glob
 import json
 import os
 import re
+import struct
 from dataclasses import dataclass
 from typing import Callable
 
@@ -28,6 +30,10 @@ class Nvfp4ExpertSourceSpec:
     # The checkpoint stores the QUANT-side global scale (local fp8 scales were
     # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
+    # True when the experts are stacked per layer (``experts.gate_up_proj`` U8
+    # [E*rows, cols] + a per-layer scalar global) instead of per expert; the stacked
+    # loader reshapes each bank tensor to [E, ...] and broadcasts the scalar global.
+    stacked: bool = False
 
 
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
@@ -78,6 +84,24 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     }, num_layers)
 
 
+def _weight_map(folder: str) -> dict[str, str]:
+    """name -> shard (basename) from the index, or from each safetensors header when the
+    checkpoint ships a single shard without an index (llm-compressor single-file exports)."""
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as f:
+            return json.load(f)["weight_map"]
+    weight_map: dict[str, str] = {}
+    for shard in sorted(os.path.basename(p) for p in glob.glob(os.path.join(folder, "*.safetensors"))):
+        with open(os.path.join(folder, shard), "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+        for name in hdr:
+            if name != "__metadata__":
+                weight_map[name] = shard
+    return weight_map
+
+
 def load_nvfp4_expert_source_banks(
     model_path: str,
     config,
@@ -103,9 +127,7 @@ def load_nvfp4_expert_source_banks(
     until then (the caller owns that tradeoff).
     """
     folder = download_hf_weight(model_path)
-    index_path = os.path.join(folder, "model.safetensors.index.json")
-    with open(index_path, encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
@@ -235,8 +257,7 @@ def load_nvfp4_expert_source_banks_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
 
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
@@ -336,8 +357,119 @@ def load_nvfp4_expert_source_banks_parallel(
     }
 
 
+def load_nvfp4_stacked_expert_sources(
+    model_path: str,
+    config,
+    spec: Nvfp4ExpertSourceSpec,
+    *,
+    drop_page_cache: DropPageCache,
+    primary: bool,
+    layer_sink=None,
+) -> dict[str, list[torch.Tensor]]:
+    """Build the 6 native NVFP4 source banks for a STACKED (per-layer) expert layout.
+
+    llm-compressor can store the routed experts as one packed tensor per layer instead of
+    per expert: ``...experts.gate_up_proj.weight_packed`` U8 [E*rows, cols] (rows are
+    expert-major, so the bank tensor just reshapes to [E, rows, cols]) plus ONE
+    layer-global ``weight_global_scale`` scalar (reciprocated at ingest). Placement and
+    the resulting 6-bank dict are identical to :func:`load_nvfp4_expert_source_banks`
+    (which is why the marlin/b12x repack and the offload cache never notice the
+    difference). ``layer_sink``: see :func:`load_nvfp4_expert_source_banks`."""
+    folder = download_hf_weight(model_path)
+    weight_map = _weight_map(folder)
+
+    E = config.num_experts
+    H = config.hidden_size
+    I = config.moe_intermediate_size
+    num_layers = _num_moe_layers(config)
+
+    weight_shards: dict[str, list[tuple[str, re.Match[str], int]]] = collections.defaultdict(list)
+    global_shards: dict[str, list[tuple[str, int, str]]] = collections.defaultdict(list)
+    for name, shard in weight_map.items():
+        match = spec.key_pattern.match(name)
+        if match is None:
+            continue
+        bank_layer = _bank_layer(spec, int(match.group("layer")), config)
+        if bank_layer is None:
+            continue
+        kind = _canon_kind(spec, match.group("kind"))
+        if kind == "weight_scale_2":
+            global_shards[shard].append((name, bank_layer, match.group("proj")))
+        elif kind in {"weight", "weight_scale"}:
+            weight_shards[shard].append((name, match, bank_layer))
+        else:
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+
+    # Pass 1: the per-layer scalar globals (reciprocal at ingest). gate_up and down carry
+    # their own global, so key by (bank_layer, proj).
+    globals_map: dict[tuple[int, str], torch.Tensor] = {}
+    for shard in sorted(global_shards):
+        path = os.path.join(folder, shard)
+        drop_page_cache(path)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name, bank_layer, proj in global_shards[shard]:
+                globals_map[(bank_layer, proj)] = _ingest_global(spec, f.get_tensor(name))
+        drop_page_cache(path)
+
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
+    gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
+    gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
+    down_packed = [b.tensor for b in _hb["down_packed"]]
+    down_scale = [b.tensor for b in _hb["down_scale"]]
+    down_global = [b.tensor for b in _hb["down_global"]]
+
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
+
+    def _load(sink) -> int:
+        tracker = LayerCompletionTracker(4, _hb, sink)  # 2 gate_up + 2 down per layer
+        placed = 0
+        for shard in tqdm(sorted(weight_shards), desc=f"Loading {spec.desc}", disable=not primary):
+            path = os.path.join(folder, shard)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                for name, match, bank_layer in weight_shards[shard]:
+                    proj = match.group("proj")
+                    kind = _canon_kind(spec, match.group("kind"))
+                    tensor = f.get_tensor(name)
+                    if kind == "weight":
+                        if proj == "gate_up_proj":
+                            gate_up_packed[bank_layer].copy_(tensor.view(E, 2 * I, H // 2))
+                        else:
+                            down_packed[bank_layer].copy_(tensor.view(E, H, I // 2))
+                    else:
+                        g = globals_map[(bank_layer, proj)]
+                        if proj == "gate_up_proj":
+                            gate_up_scale[bank_layer].copy_(tensor.view(E, 2 * I, H // 16))
+                            gate_up_global[bank_layer].fill_(g.item())
+                        else:
+                            down_scale[bank_layer].copy_(tensor.view(E, H, I // 16))
+                            down_global[bank_layer].fill_(g.item())
+                    tracker.note(bank_layer)
+                    placed += 1
+            drop_page_cache(path)
+        return placed
+
+    if layer_sink is not None:
+        placed = _load(layer_sink)
+    else:
+        with PinPipeline() as pins:
+            placed = _load(pins)
+
+    expected = num_layers * 4
+    assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
+    return {
+        "gate_up_packed": gate_up_packed,
+        "gate_up_scale": gate_up_scale,
+        "gate_up_global": gate_up_global,
+        "down_packed": down_packed,
+        "down_scale": down_scale,
+        "down_global": down_global,
+    }
+
+
 __all__ = [
     "Nvfp4ExpertSourceSpec",
     "load_nvfp4_expert_source_banks",
     "load_nvfp4_expert_source_banks_parallel",
+    "load_nvfp4_stacked_expert_sources",
 ]
