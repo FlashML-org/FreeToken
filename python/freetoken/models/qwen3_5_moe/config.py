@@ -71,7 +71,9 @@ _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 def _lm_head_quant(hf_config: Any) -> str:
     """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
     the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
-    per-layer map and leave lm_head bf16. Returns ``"nvfp4"`` or ``"none"``."""
+    per-layer map and leave lm_head bf16. llm-compressor mixed-precision instead puts
+    ``lm_head`` in an fp8 ``config_groups`` entry. Returns ``"nvfp4"``, ``"fp8"``
+    or ``"none"``."""
     get = _quant_accessor(hf_config)
     if get is None:
         return "none"
@@ -82,6 +84,23 @@ def _lm_head_quant(hf_config: Any) -> str:
         if name == "lm_head" or name.endswith(".lm_head"):
             if "fp4" in str((spec or {}).get("quant_algo", "")).lower():
                 return "nvfp4"
+    # compressed-tensors ``ignore`` wins over a group's ``targets``. A head listed there is
+    # bf16 on disk however broadly the group matches, so claiming it as fp8 would build an
+    # Fp8LMHead for a bf16 weight and fail the load on the dtype check.
+    if any("lm_head" in str(x) for x in (get("ignore") or [])):
+        return "none"
+    # llm-compressor mixed-precision puts lm_head in the fp8 group (unsloth NVFP4-Fast), with
+    # no per-layer `quantized_layers` map at all. Keeping it fp8 rather than dequantizing is
+    # worth 0.473 GiB on a [248320, 2048] head -- decode traffic, and the headroom an 8k
+    # prefill needs. Gated on the same weights geometry _attn_quant uses.
+    for g in (get("config_groups") or {}).values():
+        if not g or not any("lm_head" in t for t in (g.get("targets") or [])):
+            continue
+        w = g.get("weights") or {}
+        if str(w.get("type", "")).lower() != "float" or int(w.get("num_bits", 0) or 0) != 8:
+            continue
+        if w.get("group_size") is None and w.get("strategy") in ("tensor", "channel"):
+            return "fp8"
     return "none"
 
 

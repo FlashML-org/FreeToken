@@ -207,6 +207,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             dense_nvfp4=config.dense_quant == "nvfp4",
             lmhead_nvfp4=config.lm_head_quant == "nvfp4",
+            lmhead_fp8=config.lm_head_quant == "fp8",
         )
         return
     tp_info = get_tp_info()
@@ -447,7 +448,7 @@ def _dense_nvfp4_emit(
 
 def _iter_weights_attn_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False,
+    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False, lmhead_fp8: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the modelopt MIXED_PRECISION Qwen3.5 checkpoint.
 
@@ -495,7 +496,14 @@ def _iter_weights_attn_fp8(
                     raw_base = raw_name[: -len(".weight")]
                     has_s2 = raw_base + ".weight_scale_2" in keyset
                     has_s = raw_base + ".weight_scale" in keyset
-                    if has_s and not has_s2:  # per-tensor FP8 dense projection
+                    # An fp8 lm_head is only safe to keep native if the model built an
+                    # Fp8LMHead for it (lm_head_quant == "fp8"). The bf16 ParallelLMHead has
+                    # no weight_scale buffer, so emitting fp8 into it fails the load with
+                    # "Unexpected keys in state_dict: ['lm_head.weight_scale']". Keep it
+                    # native only when the model asked for an fp8 head; otherwise fall
+                    # through and dequantize.
+                    is_lmhead = base == "lm_head" or base.endswith(".lm_head")
+                    if has_s and not has_s2 and (lmhead_fp8 or not is_lmhead):
                         w = f.get_tensor(raw_name)  # fp8-e4m3, kept verbatim
                         sc = f.get_tensor(raw_base + ".weight_scale")
                         # modelopt's calibrated activation scale: kept (not dropped with the

@@ -100,6 +100,15 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
+        elif getattr(config, "lm_head_quant", "none") == "fp8":
+            # checkpoint stores the (untied) lm_head as fp8 (llm-compressor mixed-precision):
+            # keep it native (W8A16). Halves this matrix versus dequantizing to bf16.
+            from freetoken.kernel.triton.fp8_pertensor_linear import Fp8LMHead
+
+            assert not config.tie_word_embeddings, "fp8 lm_head assumes untied embeddings"
+            self.lm_head = Fp8LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,

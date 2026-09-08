@@ -423,8 +423,45 @@ class Fp8PerTensorColMerged(Fp8PerTensorLinear):
         super().__init__(in_features, sum(output_sizes), has_bias)
 
 
+class Fp8LMHead(Fp8PerTensorLinear):
+    """FP8 (W8A16) LM head: ``Fp8PerTensorLinear`` with ``ParallelLMHead``'s prefill
+    behaviour at TP=1 -- slice to the last token per sequence, then the W8A16 GEMV/GEMM
+    instead of a bf16 ``F.linear`` over the dequantized weight. Weight buffers, the
+    ``input_scale`` dance and the uniform-scale/segment precompute are all inherited; the
+    prefill slice is the only new code.
+
+    Exists because a checkpoint can store ``lm_head`` as fp8 natively and no head class could
+    consume that: ``Nvfp4LMHead`` is FP4, and glm_moe_dsa/glm5_next's fp8 heads subclass the
+    bf16 ``ParallelLMHead`` and quantize at load. So a natively-fp8 head had to be
+    dequantized at load. For unsloth/Qwen3.6-35B-A3B-NVFP4-Fast that matrix is
+    ``[248320, 2048]``: 0.474 GiB kept native versus 0.947 GiB as bf16. On a 16 GiB card the
+    difference is not only decode traffic, it is the headroom an 8k prefill needs -- the
+    dequantized head left 118 MiB free and the GDN chunked-prefill workspace then OOM'd.
+
+    ``weight_scale`` is per output row ``[vocab]``, which covers both compressed-tensors
+    strategies: "channel" ships one scalar per row, "tensor" ships one for the whole matrix
+    and the loader broadcasts it. TP=1 and untied embeddings, same as ``Nvfp4LMHead``."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        super().__init__(in_features=embedding_dim, out_features=num_embeddings)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            # Only the last position of each sequence produces logits, so slicing here keeps
+            # the [vocab, hidden] GEMM at M=batch rather than M=prompt_tokens.
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return super().forward(x)
+
+
 __all__ = [
     "FP8",
+    "Fp8LMHead",
     "Fp8PerTensorLinear",
     "Fp8PerTensorColMerged",
     "fp8_pertensor_linear",
