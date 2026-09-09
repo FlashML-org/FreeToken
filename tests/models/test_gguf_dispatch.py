@@ -187,6 +187,37 @@ class TestUnquantized:
         # Result should match torch matmul
         expected = x @ qweight.T
         assert result.shape == expected.shape
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("qweight_type,dtype", [
+        (GGML_F32, torch.float32),
+        (GGML_F16, torch.float16),
+        (GGML_BF16, torch.bfloat16),
+    ])
+    def test_packed_float_bytes_match_dense_weights(
+        self, mock_kernel_module, qweight_type, dtype
+    ):
+        weights = (torch.arange(48).reshape(3, 16) - 23).to(dtype) / 32
+        x = (torch.arange(32).reshape(2, 16) - 15).to(torch.bfloat16) / 16
+        packed = weights.contiguous().view(torch.uint8)
+
+        result = fused_mul_mat_gguf(x, packed, qweight_type)
+
+        expected = x @ weights.to(x.dtype).T
+        assert result.dtype == x.dtype
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        assert all(call is None for call in mock_kernel_module.values())
+
+    def test_packed_float_path_does_not_import_native_extension(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "freetoken.kernel.gguf", None)
+        weights = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float32)
+        x = torch.tensor([[2.0, -1.0]], dtype=torch.bfloat16)
+
+        result = fused_mul_mat_gguf(x, weights.view(torch.uint8), GGML_F32)
+
+        torch.testing.assert_close(
+            result, torch.tensor([[4.0, -2.0]], dtype=x.dtype), rtol=0, atol=0
+        )
 
 
 class TestSmallBatchMMVQ:

@@ -48,6 +48,7 @@ from freetoken.models.gguf.dequant import (
     GGML_UNQUANTIZED,
     MMQ_TYPES,
     MMVQ_TYPES,
+    dequantize,
     row_bytes,
 )
 
@@ -110,8 +111,8 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 
     Dispatch order:
     1. Empty batch: return before selecting or importing a backend
-    2. Quantized with Triton selected: vendored Triton GGUF GEMM
-    3. Unquantized (F32/F16/BF16): plain torch matmul
+    2. Unquantized (F32/F16/BF16): decode packed bytes, then torch matmul
+    3. Quantized with Triton selected: vendored Triton GGUF GEMM
     4. Small-batch quantized (batch <= 6, in MMVQ_TYPES): HIP GEMV kernel
     5. Large-batch standard quants (in MMQ_TYPES): HIP MMQ kernel
     6. Large-batch I-quants: HIP dequant + torch matmul
@@ -119,7 +120,12 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     out_features = qweight.shape[0]
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
-    if qweight_type not in GGML_UNQUANTIZED and _use_triton(x):
+    if qweight_type in GGML_UNQUANTIZED:
+        # GGUF loaders retain byte rows even for floating-point weights.
+        if qweight.dtype == torch.uint8:
+            qweight = dequantize(qweight, qweight_type, x.dtype)
+        return x @ qweight.T
+    if _use_triton(x):
         return _gemm_triton(x, qweight, qweight_type)
     from freetoken.kernel.gguf import (
         ggml_dequantize,
@@ -127,8 +133,6 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         ggml_mul_mat_vec_a8,
     )
 
-    if qweight_type in GGML_UNQUANTIZED:
-        return x @ qweight.T
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in MMQ_TYPES:

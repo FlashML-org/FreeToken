@@ -19,12 +19,17 @@ import torch
 
 from freetoken.layers.gguf import GGUFLinear, GGUFMergedLinear, gguf_merged_or_plain
 from freetoken.models.gguf.dequant import (
+    GGML_BF16,
+    GGML_F16,
+    GGML_F32,
     GGML_IQ3_S,
+    GGML_Q4_1,
     GGML_Q4_K,
     BLOCK_SHAPE,
     row_bytes,
 )
 from freetoken.models.qwen3_5_moe.gguf import gguf_name_to_freetoken
+from freetoken.models.gguf.reader import GgufTensor
 
 
 @pytest.fixture
@@ -251,6 +256,79 @@ class TestGDNGeometry:
 
         # Verify all parts are as specified
         assert in_proj_split == [8192, 4096, 32, 32]
+
+    @pytest.mark.parametrize("qweight_type,dtype", [
+        (GGML_F32, torch.float32),
+        (GGML_F16, torch.float16),
+        (GGML_BF16, torch.bfloat16),
+    ])
+    def test_packed_float_gdn_projection_matches_dense_reference(
+        self, mock_kernel_module, qweight_type, dtype
+    ):
+        # The failing startup projection is BF16 [80, 2048] times F32 [32, 2048].
+        weights = ((torch.arange(32 * 2048).reshape(32, 2048) % 29) - 14).to(dtype) / 32
+        x = ((torch.arange(80 * 2048).reshape(80, 2048) % 17) - 8).to(torch.bfloat16) / 16
+        record = GgufTensor(
+            name="blk.0.ssm_beta.weight",
+            shape=(32, 2048),
+            ggml_type=qweight_type,
+            rows=32,
+            row_bytes=2048 * weights.element_size(),
+            _raw=weights.contiguous().view(torch.uint8).numpy(),
+        )
+        layer = GGUFLinear(2048, 32, qweight_type)
+        layer.load_state_dict({"qweight": record.packed()})
+
+        result = layer.forward(x)
+
+        assert layer.qweight.dtype == torch.uint8
+        assert layer.qweight.shape == (32, 2048 * weights.element_size())
+        assert result.shape == (80, 32)
+        assert result.dtype == x.dtype
+        torch.testing.assert_close(result, x @ weights.to(x.dtype).T, rtol=0, atol=0)
+        assert all(not calls for calls in mock_kernel_module.values())
+
+    def test_mixed_quant_and_float_projection_preserves_values_and_order(self, monkeypatch):
+        in_features = 2048
+        output_sizes = [8, 32, 5, 7]
+        quant_types = [GGML_Q4_1, GGML_F32, GGML_F16, GGML_BF16]
+        layer = GGUFMergedLinear(in_features, output_sizes, quant_types)
+        x = ((torch.arange(80 * in_features).reshape(80, in_features) % 17) - 8).to(torch.bfloat16) / 16
+        float_weights = [
+            ((torch.arange(size * in_features).reshape(size, in_features) % 29) - 14).to(dtype) / 32
+            for size, dtype in zip(output_sizes[1:], [torch.float32, torch.float16, torch.bfloat16])
+        ]
+        layer.qweight_0.zero_()
+        for name, weights in zip(layer.part_names[1:], float_weights):
+            getattr(layer, name).copy_(weights.contiguous().view(torch.uint8))
+        quant_calls = []
+
+        def quant_mmq(qweight, inputs, quant_type, out_features):
+            quant_calls.append(quant_type)
+            assert qweight is layer.qweight_0
+            assert inputs is x
+            assert quant_type == GGML_Q4_1
+            assert out_features == output_sizes[0]
+            return inputs[:, :out_features].clone()
+
+        def unexpected_kernel(*args, **kwargs):
+            pytest.fail("Only the quantized part may call the MMQ kernel")
+
+        native = ModuleType("freetoken.kernel.gguf")
+        native.ggml_mul_mat_a8 = quant_mmq
+        native.ggml_mul_mat_vec_a8 = unexpected_kernel
+        native.ggml_dequantize = unexpected_kernel
+        monkeypatch.setitem(sys.modules, "freetoken.kernel.gguf", native)
+
+        result = layer.forward(x)
+
+        expected = torch.cat(
+            [x[:, :output_sizes[0]]] + [x @ weights.to(x.dtype).T for weights in float_weights],
+            dim=-1,
+        )
+        assert result.dtype == x.dtype
+        assert quant_calls == [GGML_Q4_1]
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 class TestQwenNameMapping:
