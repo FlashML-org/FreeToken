@@ -36,6 +36,8 @@ for them; other checkpoints of the same architectures work too.
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+- FTW files converted by builds before the quantization refactor may fail to load;
+  see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
