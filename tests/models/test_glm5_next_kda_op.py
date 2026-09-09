@@ -53,7 +53,7 @@ def _make_args():
 def _make_op(seed=0):
     from freetoken.models.glm5_next.kda import Glm5NextKDA
 
-    cfg = SimpleNamespace(glm5_args=_make_args(), attn_quant="none")
+    cfg = SimpleNamespace(glm5_args=_make_args(), attn_quant="none", quant=None)
     op = Glm5NextKDA(cfg, layer_id=0)
     torch.manual_seed(seed)
     dev, dt = "cuda", torch.bfloat16

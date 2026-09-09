@@ -1,11 +1,6 @@
 """SwiGLU MLP for GLM-5.2's leading dense layers and per-layer shared experts.
 
-The checkpoint ships these bf16 (NVIDIA's NVFP4 recipe leaves them unquantized; only
-the routed experts are FP4). Serving default is W8A16 fp8 with per-row scales,
-quantized at load (``ModelConfig.dense_quant == "fp8_pertensor"``, from
-FREETOKEN_GLM_MLP_FP8): decode reads every shared expert each token, so this halves
-~5.6 GiB/token of weight traffic and frees the same VRAM for expert-cache slots.
-``FREETOKEN_GLM_MLP_FP8=0`` restores the checkpoint-faithful bf16 weights.
+Every projection is built from the QuantConfig, so it serves whatever precision the checkpoint stores (bf16 under NVIDIA's NVFP4 recipe, which only quantizes the routed experts).
 """
 
 from __future__ import annotations
@@ -16,17 +11,17 @@ import torch.nn.functional as F
 from freetoken.layers import BaseOP
 from freetoken.utils import nvtx_annotate
 
-from .attention import _make_proj
+from freetoken.layers import LinearReplicated
 
 if TYPE_CHECKING:
     import torch
 
 
 class GlmDsaGatedMLP(BaseOP):
-    def __init__(self, hidden_size: int, intermediate_size: int, quant: str = "none"):
-        self.gate_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.up_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.down_proj = _make_proj(quant, intermediate_size, hidden_size)
+    def __init__(self, hidden_size: int, intermediate_size: int, *, quant_config=None, prefix: str = ""):
+        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
+        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.up_proj")
+        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

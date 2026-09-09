@@ -5,12 +5,11 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.attention import AttentionSpec
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaRMSNorm
+from freetoken.layers import BaseOP, GemmaRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.models.config import SWAAttentionGroupConfig
 from freetoken.utils import nvtx_annotate
 
-from freetoken.models.quant_linear import make_col_merged, make_replicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -31,7 +30,7 @@ class MuseGlimmerAttention(BaseOP):
     the same normed layer input as q/k/v, so it rides the fused projection.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.layer_id = layer_id
         group = config.attention_group_for_layer(layer_id)
         self.is_swa = isinstance(group, SWAAttentionGroupConfig)
@@ -43,10 +42,14 @@ class MuseGlimmerAttention(BaseOP):
         self.kv_attn_dim = self.num_kv * head_dim
 
         self._qkvg_split = [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim, self.qo_attn_dim]
-        self.qkvg_proj = make_col_merged(
-            config, config.hidden_size, self._qkvg_split, has_bias=False
+        self.qkvg_proj = LinearColParallelMerged(
+            config.hidden_size, self._qkvg_split, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.qkvg_proj",
         )
-        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearReplicated(
+            self.qo_attn_dim, config.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
         # Weightless: the checkpoint carries no q/k norm weights; the runtime ones vector
         # is intentionally not part of state_dict.
         self.qk_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps, with_scale=False)

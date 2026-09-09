@@ -367,7 +367,7 @@ def test_qsa_layer_matches_hf_dense():
 class _StubLinearMixer(BaseOP):
     """Stands in for the GDN layer; same [T, hidden] -> [T, hidden] shape."""
 
-    def __init__(self, config, layer_id):
+    def __init__(self, config, layer_id, prefix=""):
         self.out_proj = LinearReplicated(config.hidden_size, config.hidden_size, has_bias=False)
 
     def forward(self, x):
@@ -379,7 +379,6 @@ def test_shared_expert_gate_fusion_matches_eager():
     """Qwen4ExpMoE only swaps qwen3_5's gemv+sigmoid+mul+add gate chain for two triton kernels."""
     from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
     from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
-    from freetoken.moe.fused import FusedMoe
     from freetoken.utils.torch_utils import torch_dtype
 
     config = _config()
@@ -387,7 +386,7 @@ def test_shared_expert_gate_fusion_matches_eager():
     with torch.device(device), torch_dtype(dtype):
         moe = Qwen4ExpMoE(config, 0)
     _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
-    _fresh_ctx(moe_backend=FusedMoe())
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=True))
 
     x = torch.randn(6, config.hidden_size, device=device, dtype=dtype) * 0.5
     fused = moe.forward(x.clone())
@@ -433,7 +432,6 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     from freetoken.models.qwen4_exp import model as model_module
     from freetoken.models.qwen4_exp.attention import TorchDenseQSAReference
     from freetoken.models.qwen4_exp.ple import GpuResidentTable
-    from freetoken.moe.fused import FusedMoe
     from freetoken.utils.torch_utils import torch_dtype
 
     torch.manual_seed(8)
@@ -462,7 +460,6 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     prompts = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12], [9, 10, 11, 12, 13]]
     ctx = _fresh_ctx(
         attn_backend=TorchDenseQSAReference(config, num_slots, max_len, device, dtype),
-        moe_backend=FusedMoe(),
         linear_state_pool=pool,
     )
     reqs = [

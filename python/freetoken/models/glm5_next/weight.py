@@ -1,13 +1,14 @@
 """Weight loading for GLM-5.3-Flash (``glm5_next``).
 
-Supported checkpoints: NVFP4 exports of GLM-5.3-Flash in the multimodal-wrapper
-layout (``model.language_model.*``) -- ModelOpt tensor kinds (LibertAIDAI) or
-compressed-tensors kinds (RedHatAI), selected by ``quantization_config``. Not
-supported: bf16-expert originals (zai-org), text-only key layouts, TP > 1.
+Supported checkpoints, all in the multimodal-wrapper layout (``model.language_model.*``):
+NVFP4 exports (ModelOpt tensor kinds from LibertAIDAI, compressed-tensors kinds from
+RedHatAI, selected by ``quantization_config``) and the zai-org block-fp8 release. Not
+supported: text-only key layouts, TP > 1, resident routed experts.
 
-Routed experts go to the offload cache via ``load_nvfp4_expert_sources``;
-everything else loads bf16 with keys renamed ``model.language_model.X`` ->
-``model.X``. ``model.visual.*`` and the trailing MTP layer are never read.
+Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
+other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
+renamed ``model.language_model.X`` -> ``model.X``. ``model.visual.*`` and the trailing
+MTP layer are never read.
 
 Load-time fusions (must mirror the module split orders):
 
@@ -15,9 +16,7 @@ Load-time fusions (must mirror the module split orders):
 * KDA ``conv1d``   = q|k|v depthwise conv weights concatenated on the channel axis
 
 fp32-kept tensors: ``A_log`` / ``dt_bias``, the mHC ``hc_*`` tensors, the indexer
-APE, and the router ``e_score_correction_bias``. Optional W8A16 fp8-at-load
-follows ``ModelConfig.attn_quant`` / ``dense_quant`` / ``lm_head_quant``
-(defaults and env opt-ins: see config.py).
+APE, and the router ``e_score_correction_bias``.
 """
 
 from __future__ import annotations
@@ -29,11 +28,11 @@ from typing import Iterator
 
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.glm_moe_dsa.weight import _ShardReader, _quant_fp8_per_row
+from freetoken.layers.quantization import QuantKind
+from freetoken.models.glm_moe_dsa.weight import _ShardReader
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
@@ -94,73 +93,54 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
 # KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
 _KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
 
-
-def load_nvfp4_expert_sources(model_path: str, config, layer_sink=None):
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _select_expert_source_spec(model_path),
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
+# zai-org fp8 release: fp8 codes + fp32 128x128 block scales per expert projection
+_FP8_EXPERT_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
+)
 
 
-def _maybe_fp8(key: str, w: torch.Tensor, fp8: bool):
-    if fp8:
-        q, scale = _quant_fp8_per_row(w)
-        yield f"{key}.weight", q
-        yield f"{key}.weight_scale", scale
+def _proj(reader, src: str, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
+    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales."""
+    w = reader.get(f"{src}.weight")
+    if w.dtype == torch.float8_e4m3fn:
+        yield f"{dst}.weight", w
+        yield f"{dst}.weight_scale_inv", reader.get(f"{src}.weight_scale_inv")
     else:
-        yield f"{key}.weight", w.to(torch.bfloat16)
+        yield f"{dst}.weight", w.to(torch.bfloat16)
 
 
-def _iter_kda_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, torch.Tensor]]:
+def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
+    return _select_expert_source_spec(model_path)
+
+
+def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
-    if attn_fp8:
-        # fp8 resident: q|k|v (the 201 MB/layer read) as one W8A16 GEMM with
-        # per-row scales; the small gate projections b|f_a|g_a stay bf16.
-        qkv = torch.cat(
-            [reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p in ("q_proj", "k_proj", "v_proj")],
-            dim=0,
-        )
-        q, scale = _quant_fp8_per_row(qkv)
-        yield f"{dst}.in_proj_qkv.weight", q
-        yield f"{dst}.in_proj_qkv.weight_scale", scale
-        bfg = torch.cat(
-            [reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p in ("b_proj", "f_a_proj", "g_a_proj")],
-            dim=0,
-        )
-        yield f"{dst}.in_proj_bfg.weight", bfg
-    else:
-        # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
-        fused = torch.cat(
-            [reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p in _KDA_IN_PROJ], dim=0
-        )
-        yield f"{dst}.in_proj.weight", fused
+    # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
+    parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
+    if any(p.dtype == torch.float8_e4m3fn for p in parts):
+        raise NotImplementedError("fp8 KDA input projections are not fused by this reader")
+    yield f"{dst}.in_proj.weight", torch.cat([p.to(torch.bfloat16) for p in parts], dim=0)
     # One merged depthwise conv over the q|k|v stream (channel-axis concat).
     conv = torch.cat(
         [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
         dim=0,
     )
     yield f"{dst}.conv1d.weight", conv
-    for p in ("f_b_proj", "g_b_proj"):
-        yield f"{dst}.{p}.weight", reader.get(f"{src}.{p}.weight").to(torch.bfloat16)
-    yield from _maybe_fp8(f"{dst}.o_proj", reader.get(f"{src}.o_proj.weight"), attn_fp8)
+    for p in ("f_b_proj", "g_b_proj", "o_proj"):
+        yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}")
     # Gate params stay fp32 (the recurrent kernels read them as fp32).
     yield f"{dst}.A_log", reader.get(f"{src}.A_log").to(torch.float32)
     yield f"{dst}.dt_bias", reader.get(f"{src}.dt_bias").to(torch.float32)
     yield f"{dst}.o_norm.weight", reader.get(f"{src}.o_norm.weight").to(torch.bfloat16)
 
 
-def _iter_dsa_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
-    fp8_projs = ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj") if attn_fp8 else ()
     for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-        w = reader.get(f"{src}.{proj}.weight")
-        yield from _maybe_fp8(f"{dst}.{proj}", w, proj in fp8_projs)
+        yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}")
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
         yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
     # kpool indexer (every DSA layer owns one). Kept bf16; the APE is fp32.
@@ -185,8 +165,7 @@ def iter_weights(
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
-        "GLM-5.3 stores routed experts as NVFP4 and only supports the offload backend; "
-        "experts are loaded into the offload cache via load_nvfp4_expert_sources()."
+        "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
     if get_tp_info().size > 1:
@@ -201,17 +180,6 @@ def iter_weights(
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
     primary = get_tp_info().is_primary()
-    attn_fp8 = config.attn_quant == "fp8_pertensor"
-    mlp_fp8 = config.dense_quant == "fp8_pertensor"
-    head_fp8 = config.lm_head_quant == "fp8_pertensor"
-    if primary:
-        from freetoken.utils import init_logger
-
-        init_logger(__name__).info(
-            f"GLM-5.3 resident quant: attn={config.attn_quant} dense={config.dense_quant} "
-            f"lm_head={config.lm_head_quant} (FREETOKEN_GLM5_ATTN_FP8/FREETOKEN_GLM5_MLP_FP8; "
-            "an FTW conversion records these choices implicitly -- serve with the same flags)"
-        )
     try:
         for layer in tqdm(
             range(config.num_layers),
@@ -221,9 +189,9 @@ def iter_weights(
             src = f"{_CKPT}.layers.{layer}"
             dst = f"{_MODEL}.layers.{layer}"
             if args.is_kda_layer(layer):
-                yield from _iter_kda_layer(reader, layer, attn_fp8)
+                yield from _iter_kda_layer(reader, layer)
             else:
-                yield from _iter_dsa_layer(reader, layer, attn_fp8)
+                yield from _iter_dsa_layer(reader, layer)
 
             # mHC mixing tensors, fp32 on every layer.
             for hc in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale",
@@ -237,9 +205,7 @@ def iter_weights(
 
             if layer < config.first_k_dense_replace:
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield from _maybe_fp8(
-                        f"{dst}.mlp.{proj}", reader.get(f"{src}.mlp.{proj}.weight"), mlp_fp8
-                    )
+                    yield from _proj(reader, f"{src}.mlp.{proj}", f"{dst}.mlp.{proj}")
             else:
                 yield f"{dst}.mlp.gate.weight", reader.get(f"{src}.mlp.gate.weight").to(
                     torch.bfloat16
@@ -251,25 +217,63 @@ def iter_weights(
                     reader.get(f"{src}.mlp.gate.e_score_correction_bias").to(torch.float32),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield from _maybe_fp8(
-                        f"{dst}.mlp.shared_experts.{proj}",
-                        reader.get(f"{src}.mlp.shared_experts.{proj}.weight"),
-                        mlp_fp8,
-                    )
+                    yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
 
         yield f"{_MODEL}.embed_tokens.weight", reader.get(
             f"{_CKPT}.embed_tokens.weight"
         ).to(torch.bfloat16)
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        head = reader.get("lm_head.weight")
-        if head_fp8 and not config.tie_word_embeddings:
-            q, scale = _quant_fp8_per_row(head)
-            yield "lm_head.weight", q
-            yield "lm_head.weight_scale", scale
-        else:
-            yield "lm_head.weight", head.to(torch.bfloat16)
+        yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
     finally:
         reader.close()
 
 
-__all__ = ["iter_weights", "load_nvfp4_expert_sources"]
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+    """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
+    if kind is not QuantKind.FP8_BLOCK:
+        return None
+    if get_tp_info().size > 1:
+        raise NotImplementedError("glm5_next fp8 expert banks support TP=1 only")
+    from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    suffix = {"weight": "", "weight_scale_inv": "_scale"}
+
+    def locate(raw_name: str):
+        m = _FP8_EXPERT_RE.match(raw_name)
+        if m is None:
+            return None
+        bank = _layer_to_bank(int(m["layer"]), config)
+        if bank is None:
+            return None
+        return bank, int(m["expert"]), m["proj"] + suffix[m["kind"]]
+
+    if parallel is None:
+        parallel = experts_scattered(model_path)
+    if parallel:
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
+        )
+        return per_expert_pieces(tensors, locate, tensors_per_expert=6)
+
+    def _serial():
+        folder = download_hf_weight(model_path)
+        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        reader = _ShardReader(folder, weight_map, torch.device("cpu"))
+        try:
+            layers = range(config.first_k_dense_replace, config.num_layers)
+            for layer in tqdm(layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+                for e in range(config.num_experts):
+                    base = f"{_CKPT}.layers.{layer}.mlp.experts.{e}"
+                    for proj in ("gate", "up", "down"):
+                        for kind_name in suffix:
+                            name = f"{base}.{proj}_proj.{kind_name}"
+                            yield name, reader.get(name)
+        finally:
+            reader.close()
+
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+
+
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]

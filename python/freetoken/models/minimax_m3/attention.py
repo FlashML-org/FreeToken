@@ -22,11 +22,9 @@ from typing import TYPE_CHECKING
 
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
-
-from .mlp import make_proj
 
 if TYPE_CHECKING:
     import torch
@@ -35,7 +33,7 @@ if TYPE_CHECKING:
 
 
 class MiniMaxM3Attention(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.m3_args
         assert get_tp_info().size == 1, "MiniMax-M3 currently supports TP=1 only"
         self.layer_id = layer_id
@@ -45,11 +43,14 @@ class MiniMaxM3Attention(BaseOP):
         self.qo_attn_dim = self.num_qo_heads * self.head_dim
         self.kv_attn_dim = self.num_kv_heads * self.head_dim
 
-        quant = config.attn_quant
-        self.qkv_proj = make_proj(
-            quant, args.hidden_size, self.qo_attn_dim + 2 * self.kv_attn_dim
+        self.qkv_proj = LinearReplicated(
+            args.hidden_size, self.qo_attn_dim + 2 * self.kv_attn_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = make_proj(quant, self.qo_attn_dim, args.hidden_size)
+        self.o_proj = LinearReplicated(
+            self.qo_attn_dim, args.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
 
         # Per-head Gemma (1+w) q/k norms (qk_norm_type == "per_head").
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=args.norm_eps)
@@ -70,8 +71,9 @@ class MiniMaxM3Attention(BaseOP):
             self.index_dim = args.index_dim
             self.index_q_dim = self.num_index_heads * self.index_dim
             # Merged [index_q | index_k] projection (one shared index KEY head).
-            self.index_qk_proj = make_proj(
-                quant, args.hidden_size, self.index_q_dim + self.index_dim
+            self.index_qk_proj = LinearReplicated(
+                args.hidden_size, self.index_q_dim + self.index_dim, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
             )
             self.index_q_norm = GemmaPlusOneRMSNorm(self.index_dim, eps=args.norm_eps)
             self.index_k_norm = GemmaPlusOneRMSNorm(self.index_dim, eps=args.norm_eps)

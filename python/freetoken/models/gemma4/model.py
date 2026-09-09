@@ -28,11 +28,13 @@ class Gemma4DecoderLayer(BaseOP):
     per-layer ``layer_scalar``. The feed-forward is the dual (shared MLP || routed MoE)
     branch for MoE checkpoints, or a single dense MLP branch for dense checkpoints."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self._layer_id = layer_id
-        self.self_attn = Gemma4Attention(config, layer_id)
+        self.self_attn = Gemma4Attention(config, layer_id, prefix=f"{prefix}.self_attn")
         self.feed_forward = (
-            Gemma4MLP(config, layer_id) if config.is_moe else Gemma4DenseMLP(config)
+            Gemma4MLP(config, layer_id, prefix=f"{prefix}.feed_forward")
+            if config.is_moe
+            else Gemma4DenseMLP(config, prefix=f"{prefix}.feed_forward")
         )
 
         eps = config.rms_norm_eps
@@ -53,14 +55,17 @@ class Gemma4DecoderLayer(BaseOP):
 
 
 class Gemma4Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             embed_scale=config.embedding_scale,
         )
         self.layers = OPList(
-            [Gemma4DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                Gemma4DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._image_token_id = config.image_token_id
@@ -101,6 +106,8 @@ class Gemma4ForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         self._final_logit_softcapping = config.final_logit_softcapping
         if config.is_multimodal:

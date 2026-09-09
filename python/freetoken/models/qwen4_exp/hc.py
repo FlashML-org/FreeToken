@@ -85,7 +85,7 @@ class GatedResidual(BaseOP):
     Launch budget on CUDA: ``mix`` is 3 kernels around 2 GEMMs, ``combine`` is 1.
     """
 
-    def __init__(self, config: ModelConfig, use_combine: bool = True) -> None:
+    def __init__(self, config: ModelConfig, use_combine: bool = True, *, prefix: str = "") -> None:
         args = config.qwen4_args
         self.hc_count = args.hc_count
         self.hidden_size = args.hidden_size
@@ -97,12 +97,19 @@ class GatedResidual(BaseOP):
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
             self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_down_block_inject",
             )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(self.lowrank, width, has_bias=False)
+            self.input_mix_weight_down = LinearReplicated(
+                width, self.lowrank, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_down",
+            )
+        self.input_mix_weight_up = LinearReplicated(
+            self.lowrank, width, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_up",
+        )
 
     def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""

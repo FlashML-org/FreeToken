@@ -31,10 +31,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.layers.quantization import QuantKind
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 # Shared with GLM-5.2 (weight.py imports privately from the same package).
-from freetoken.models.glm_moe_dsa.attention import _IdxLayerNorm, _make_proj
+from freetoken.models.glm_moe_dsa.attention import _IdxLayerNorm
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -46,17 +47,17 @@ class Glm5NextIndexer(BaseOP):
     checkpoint's NoPE geometry leaves ``qk_rope_head_dim == 0`` so position enters
     only via the compression APE).
 
-    Kept bf16 in every quant mode: small (~17 MB/layer) and the top-k boundary is
-    precision-sensitive (same reasoning as glm_moe_dsa's indexer).
+    ``wq_b`` follows the checkpoint's quant config; ``wk`` and ``weights_proj`` stay bf16 (same reasoning as glm_moe_dsa's indexer).
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.kpool = args.index_kpool
         self.wq_b = LinearReplicated(
-            args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False
+            args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.wq_b",
         )
         self.wk = LinearReplicated(args.hidden_size, self.head_dim, has_bias=False)
         self.k_norm = _IdxLayerNorm(self.head_dim, eps=1e-6)
@@ -91,10 +92,10 @@ class Glm5NextIndexer(BaseOP):
 
 
 class Glm5NextAttention(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.layer_id = layer_id
-        self.indexer = Glm5NextIndexer(config, layer_id)
+        self.indexer = Glm5NextIndexer(config, layer_id, prefix=f"{prefix}.indexer")
         self.num_heads = args.num_heads
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim  # 0 (NoPE)
@@ -106,25 +107,32 @@ class Glm5NextAttention(BaseOP):
             "would need the glm_moe_dsa rope plumbing back"
         )
 
-        quant = config.attn_quant
-        self.q_a_proj = _make_proj(quant, args.hidden_size, args.q_lora_rank)
+        self.q_a_proj = LinearReplicated(
+            args.hidden_size, args.q_lora_rank, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.q_a_proj",
+        )
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
-        self.q_b_proj = _make_proj(
-            quant, args.q_lora_rank, self.num_heads * self.qk_head_dim
+        self.q_b_proj = LinearReplicated(
+            args.q_lora_rank, self.num_heads * self.qk_head_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.q_b_proj",
         )
         # NoPE: kv_a projects to bare ckv (no +qk_rope_head_dim rows).
-        self.kv_a_proj_with_mqa = _make_proj(
-            quant, args.hidden_size, self.kv_lora_rank
+        self.kv_a_proj_with_mqa = LinearReplicated(
+            args.hidden_size, self.kv_lora_rank, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
-        # kv_b stays bf16 in every mode (bmm absorption operand, not a Linear).
+        # the MLA absorption reads kv_b_proj.weight as bmm operands, so only an unquantized scheme is served
         self.kv_b_proj = LinearReplicated(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
         )
-        self.o_proj = _make_proj(
-            quant, self.num_heads * self.v_head_dim, args.hidden_size
+        assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
+        self.o_proj = LinearReplicated(
+            self.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self._w_uk: torch.Tensor | None = None
         self._w_uv: torch.Tensor | None = None

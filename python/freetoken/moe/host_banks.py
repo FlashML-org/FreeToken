@@ -36,6 +36,10 @@ logger = init_logger(__name__)
 _BLK = 4096  # O_DIRECT alignment (page size)
 
 
+class PinFailed(RuntimeError):
+    """cudaHostRegister refused a bank: the host is out of pinnable RAM or over its pin quota."""
+
+
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
@@ -136,9 +140,7 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
-            raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
-            ) from exc
+            raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
 
     def release(self) -> None:

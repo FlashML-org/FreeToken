@@ -44,7 +44,7 @@ def _expert_quant(hf_config: Any) -> str:
     offload cache). The nvidia/modelopt checkpoints are either plain NVFP4 (``quant_algo``
     ``NVFP4``) or ``MIXED_PRECISION`` (per-layer ``quantized_layers`` map); in the mixed
     case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. Dense quantized
-    weights (attention/shared-expert/lm_head) are handled separately by dequant-at-load."""
+    weights (attention / shared expert / lm_head) are served through their own schemes."""
     get = _quant_accessor(hf_config)
     if get is None:
         return "none"
@@ -109,7 +109,7 @@ def _attn_quant(hf_config: Any) -> str:
     ``MIXED_PRECISION`` checkpoints tag ``self_attn.{q,k,v,o}_proj`` and
     ``linear_attn.{in_proj_qkv,in_proj_z,out_proj}`` with ``quant_algo`` ``FP8`` (fp8-e4m3
     weight + a scalar ``weight_scale``; W8A16). Returns ``"fp8_pertensor"`` when present,
-    else ``"none"`` (NVFP4 dense weights -- shared_expert/lm_head -- stay dequant-at-load)."""
+    else ``"none"`` (NVFP4 dense weights are covered by ``dense_quant`` / ``lm_head_quant``)."""
     get = _quant_accessor(hf_config)
     if get is None:
         return "none"

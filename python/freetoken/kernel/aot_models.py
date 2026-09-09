@@ -79,10 +79,10 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     """
     H, I = hidden_size, moe_intermediate_size
     if fmt == "bf16":
-        # models/loader.py stream_moe_expert_sources: gate_up [E, 2I, H], down [E, H, I], bf16
+        # bf16 expert banks: gate_up [E, 2I, H], down [E, H, I]
         return {"gate_up": 2 * I * H * 2, "down": H * I * 2}
     if fmt == "fp8_block":
-        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block
+        # block-fp8 expert banks: fp8 weights + bf16 128x128 block
         # scales, trailing scale dim 16B-padded (same helper as the loader)
         B = 128
         return {
@@ -97,7 +97,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
-        # folded into GPU-resident alphas (moe/nvfp4_backends.py), so no global banks.
+        # folded into GPU-resident alphas (layers/quantization/moe/nvfp4.py), so no global banks.
         banks = {
             "gate_up_packed": 2 * I * (H // 2),
             "gate_up_scale": 2 * I * (H // 16),
@@ -109,7 +109,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             banks["down_global"] = H * 2
         return banks
     if fmt == "mxfp4_triton":
-        # gpt_oss/weight.py _empty_mxfp4_triton_banks: transposed split-K blocks/scales + bf16 bias
+        # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias
         return {
             "gate_up_blocks": (H // 2) * (2 * I),
             "gate_up_scales": (H // 32) * (2 * I),
@@ -285,7 +285,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=(),
         top_k=8,
         moe_intermediate_size=2048,
-        expert_formats=_NVFP4_FORMATS,
+        expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
         aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
     ),
     AotModel(

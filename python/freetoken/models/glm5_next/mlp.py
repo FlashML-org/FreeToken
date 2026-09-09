@@ -1,7 +1,6 @@
 """Clamped-SwiGLU MLP for GLM-5.3-Flash's leading dense layers and shared experts.
 
-Same shape as glm_moe_dsa's GlmDsaGatedMLP (bf16 in the NVFP4 checkpoint;
-optional W8A16 fp8-at-load via ``ModelConfig.dense_quant``), but the activation
+Same shape as glm_moe_dsa's GlmDsaGatedMLP (every projection built from the QuantConfig), but the activation
 is the GLM-5.3 clamped SwiGLU (``swiglu_limit``):
 ``clamp(gate, max=L) * sigmoid(gate_clamped) * clamp(up, +-L)``.
 """
@@ -13,7 +12,7 @@ import torch
 from freetoken.layers import BaseOP, swiglu_clamp_and_mul
 from freetoken.utils import nvtx_annotate
 
-from .attention import _make_proj
+from freetoken.layers import LinearReplicated
 
 
 class Glm5NextGatedMLP(BaseOP):
@@ -21,12 +20,14 @@ class Glm5NextGatedMLP(BaseOP):
         self,
         hidden_size: int,
         intermediate_size: int,
-        quant: str = "none",
         swiglu_limit: float | None = None,
+        *,
+        quant_config=None,
+        prefix: str = "",
     ):
-        self.gate_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.up_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.down_proj = _make_proj(quant, intermediate_size, hidden_size)
+        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
+        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.up_proj")
+        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")

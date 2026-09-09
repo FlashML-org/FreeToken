@@ -17,29 +17,16 @@ any other bf16 projection.
 
 from __future__ import annotations
 
-import os
 
 import torch
 import triton
 import triton.language as tl
-from freetoken.layers.base import BaseOP
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
 
 FP8 = torch.float8_e4m3fn
 MXFP8_BLOCK = 32
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
-
-# Escape hatch: FREETOKEN_DEBUG_MXFP8_REF=1 swaps the kernels for a pure-torch
-# dequant matmul (numeric reference / A-B debugging). Evaluated once, logged once.
-_USE_REF = os.environ.get("FREETOKEN_DEBUG_MXFP8_REF") == "1"
-if _USE_REF:
-    from freetoken.utils import init_logger
-
-    init_logger(__name__).info(
-        "FREETOKEN_DEBUG_MXFP8_REF=1: MXFP8 linears serve the pure-torch fp32 "
-        "dequant reference (slow; debugging only)."
-    )
 
 
 def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
@@ -250,10 +237,7 @@ def mxfp8_linear(
     N = weight.shape[0]
     M = x.numel() // K
     assert K % MXFP8_BLOCK == 0 and scale_codes.shape == (N, K // MXFP8_BLOCK)
-    if _USE_REF:  # numeric-reference fallback (debug / A-B)
-        w = mxfp8_dequant(weight, scale_codes, dtype=torch.float32)
-        out = (x.reshape(-1, K).float() @ w.t()).to(x.dtype).reshape(*lead, N)
-    elif M <= _GEMV_MAX_M:
+    if M <= _GEMV_MAX_M:
         w8 = e4m3_kernel_view(weight)
         out = _gemv(x.reshape(M, K), w8, scale_codes, x.dtype).reshape(*lead, N)
     else:
@@ -265,28 +249,4 @@ def mxfp8_linear(
     return out
 
 
-# ======================================================================================
-# BaseOP linear layers (TP=1, replicated). Buffers: fp8 ``weight`` + uint8
-# ``weight_scale_inv`` (the checkpoint's e8m0 exponent codes, loaded verbatim).
-# ======================================================================================
-class Mxfp8Linear(BaseOP):
-    """Replicated MXFP8 linear: fp8-e4m3 ``weight`` ``[out, in]`` + uint8 e8m0
-    ``weight_scale_inv`` ``[out, in // 32]``. Fused projections concatenate several
-    checkpoint projections along the output dim; the scales are per-output-row so the
-    concatenation is exact."""
-
-    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
-        assert in_features % MXFP8_BLOCK == 0
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.empty(out_features, in_features, dtype=FP8)
-        self.weight_scale_inv = torch.empty(
-            out_features, in_features // MXFP8_BLOCK, dtype=torch.uint8
-        )
-        self.bias = torch.empty(out_features) if has_bias else None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return mxfp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
-
-
-__all__ = ["FP8", "MXFP8_BLOCK", "Mxfp8Linear", "mxfp8_linear", "mxfp8_dequant"]
+__all__ = ["FP8", "MXFP8_BLOCK", "mxfp8_linear", "mxfp8_dequant"]

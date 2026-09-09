@@ -59,6 +59,7 @@ def _hf_config(num_layers: int = 52, quantized: bool = False) -> _Cfg:
         data["quantization_config"] = {
             "quant_method": "compressed-tensors",
             "format": "nvfp4-pack-quantized",
+            "ignore": ["lm_head"],
             "config_groups": {
                 "group_0": {
                     "format": "nvfp4-pack-quantized",
@@ -447,16 +448,22 @@ def test_model_state_dict_matches_loader_keys():
     assert layers[3].self_attn.attn_spec.sliding_window is None
     assert layers[0].self_attn.attn_spec.sm_scale == pytest.approx(3.87 * 128**-0.5)
 
-    # NVFP4 build swaps every text Linear for the W4A16 kernels.
-    from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
+    # NVFP4 build: every text Linear the config targets gets the W4A16 method.
+    from freetoken.layers.quantization import NameMap, QuantConfig
+    from freetoken.layers.quantization.linear import Nvfp4LinearMethod
+    from freetoken.layers.quantization.linear import UnquantizedLinearMethod
+    from freetoken.models.register import get_model_spec
 
-    qcfg = parse_config(_hf_config(num_layers=4, quantized=True))
+    hf_q = _hf_config(num_layers=4, quantized=True)
+    qcfg = parse_config(hf_q)
+    spec = get_model_spec("MuseGlimmerForConditionalGeneration")
+    object.__setattr__(qcfg, "quant", QuantConfig.from_hf(
+        hf_q, name_map=NameMap(roots=spec.checkpoint_roots, packed=spec.packed_modules_mapping)
+    ))
     qmodel = MuseGlimmerForCausalLM(qcfg)
     attn = qmodel.model.layers.op_list[0].self_attn
     mlp = qmodel.model.layers.op_list[0].mlp
-    assert isinstance(attn.qkvg_proj, Nvfp4DenseColMerged)
-    assert isinstance(attn.o_proj, Nvfp4DenseLinear)
-    assert isinstance(mlp.gate_up_proj, Nvfp4DenseColMerged)
-    assert isinstance(mlp.down_proj, Nvfp4DenseLinear)
-    assert type(qmodel.lm_head).__name__ == "ParallelLMHead"  # lm_head stays bf16
+    for proj in (attn.qkvg_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj):
+        assert type(proj.quant_method) is Nvfp4LinearMethod
+    assert type(qmodel.lm_head.quant_method) is UnquantizedLinearMethod  # lm_head stays bf16
     del model, qmodel, torch

@@ -10,6 +10,27 @@ from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
+logger = init_logger(__name__)
+
+
+class _DeprecatedAlias(argparse.Action):
+    """An old flag: warns at parse time, converts the value if asked, stores it."""
+
+    def __init__(self, *args, new_flag: str, convert=None, **kwargs):
+        self.new_flag, self.convert = new_flag, convert
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        logger.warning("%s is deprecated; use %s", option_string, self.new_flag)
+        setattr(namespace, self.dest, self.convert(values) if self.convert else values)
+
+
+def _nvfp4_entry(value: str) -> str:
+    """The --quant-backend entry an old --nvfp4-backend value stands for; auto stands for none."""
+    if value == "auto":
+        return ""
+    return "moe.nvfp4=" + {"flashinfer": "b12x"}.get(value, value)
+
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
@@ -93,7 +114,16 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
-    from freetoken.moe import SUPPORTED_MOE_BACKENDS
+    from freetoken.moe import MOE_STRATEGIES
+
+    def _parse_quant_backend(value: str) -> str:
+        from freetoken.layers.quantization import QuantBackend
+
+        try:
+            QuantBackend.parse(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+        return value
 
     def _parse_moe_cache_rate(value: str) -> float:
         try:
@@ -467,13 +497,34 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--moe-backend",
-        default=ServerArgs.moe_backend,
-        choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
+        "--moe-strategy",
+        default=ServerArgs.moe_strategy,
+        choices=["auto", *MOE_STRATEGIES],
         help=(
-            "The MoE backend to use. 'auto' resolves a MoE model to the offload family "
+            "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
             "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
             "'fused' experts must be requested explicitly."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-backend",
+        dest="moe_strategy",
+        action=_DeprecatedAlias,
+        new_flag="--moe-strategy",
+        default=argparse.SUPPRESS,
+        choices=["auto", *MOE_STRATEGIES],
+        help="[Deprecated] Use --moe-strategy.",
+    )
+
+    parser.add_argument(
+        "--quant-backend",
+        default=None,
+        type=_parse_quant_backend,
+        help=(
+            "Kernel per quantized layer type: comma-separated layer[.kind]=name entries, e.g. "
+            "'linear=marlin,moe=b12x' or 'moe.nvfp4=triton'. A layer-level entry applies to every "
+            "kind whose kernel table lists the name; unlisted tables stay automatic."
         ),
     )
 
@@ -489,13 +540,12 @@ def parse_args(
 
     parser.add_argument(
         "--nvfp4-backend",
-        default=ServerArgs.nvfp4_backend,
+        action=_DeprecatedAlias,
+        new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
+        convert=_nvfp4_entry,
+        default=argparse.SUPPRESS,
         choices=["auto", "marlin", "flashinfer", "triton"],
-        help=(
-            "NVFP4 routed-expert GEMM backend (default: triton, the portable inline-dequant "
-            "kernel). auto picks by GPU (marlin on sm80-99 + vLLM; flashinfer b12x on sm120+ "
-            "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot run."
-        ),
+        help="[Deprecated] Use --quant-backend moe.nvfp4=<marlin|b12x|triton> ('flashinfer' is b12x).",
     )
 
     parser.add_argument(
@@ -552,7 +602,7 @@ def parse_args(
         type=int,
         default=ServerArgs.moe_cpu_threads,
         help=(
-            "Number of CPU worker threads for --moe-backend cpu decode experts. "
+            "Number of CPU worker threads for --moe-strategy cpu decode experts. "
             "0 = auto (physical cores)."
         ),
     )
@@ -562,13 +612,15 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_cpu_layers,
         help=(
-            "With --moe-backend offload/hybrid: which MoE layers compute on the "
+            "With --moe-strategy offload/hybrid: which MoE layers compute on the "
             "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
             "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
-            "layers evenly strided), or a fraction ('0.5'). Unset = automatic where "
-            "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
-            "layers when the banks exceed the pin budget, none otherwise); '0' "
-            "forces all layers on GPU."
+            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for Windows/WSL "
+            "only, where CUDA pinned memory is capped: it locks just enough head+tail layers "
+            "for the banks over the pin budget. Any value, 'auto' included, commits to CPU "
+            "decode before the model is built, so the expert format must have a CPU executor "
+            "path (bf16, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
+            "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
         ),
     )
 
@@ -577,7 +629,7 @@ def parse_args(
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,
         help=(
-            "For --moe-backend hybrid: max experts fetched over PCIe per (layer, decode "
+            "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
             "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
@@ -661,6 +713,14 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
+    # the old flag stands in for one --quant-backend entry; next to the real flag it is a usage error
+    entry = kwargs.pop("nvfp4_backend", None)
+    if entry is not None:
+        if kwargs["quant_backend"] is not None:
+            parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
+        if entry:
+            kwargs["quant_backend"] = entry
+
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
@@ -681,14 +741,14 @@ def parse_args(
     # sizing flag at all, default to --moe-cache-auto so a bare `ft serve <FTW MoE>` works
     # out of the box (the scheduler resolves the size from free VRAM). Explicit
     # size/rate/auto is preserved.
-    from freetoken.moe import is_offload_moe_backend
+    from freetoken.moe import is_offload_moe_strategy
 
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
         and not kwargs["moe_cache_auto"]
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )
-    if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
+    if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
 
     if kwargs["model_source"] == "modelscope":
@@ -726,6 +786,5 @@ def parse_args(
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
-    logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

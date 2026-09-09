@@ -15,7 +15,6 @@ from freetoken.models.loader import (
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
@@ -49,7 +48,7 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """yield dense BF16 weights only; NVFP4 experts go to the offload cache via load_nvfp4_expert_sources."""
+    """yield dense BF16 weights only; NVFP4 experts go to the offload cache from their pieces."""
     assert not include_moe_experts, (
         "MiniMax-M2 stores experts as NVFP4 and only supports the offload MoE backend; "
         "experts are loaded into the offload cache, not the dense model."
@@ -88,39 +87,8 @@ def iter_weights(
     yield from iter_merged_tensors(raw(), _MERGE_RULES, model_name="minimax_m2")
 
 
-def load_nvfp4_expert_sources(
-    model_path: str,
-    config,
-    *,
-    layer_sink=None,
-) -> dict[str, torch.Tensor]:
-    """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
-
-
-__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
+__all__ = ["iter_weights", "nvfp4_expert_spec"]

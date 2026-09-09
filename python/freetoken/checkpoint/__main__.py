@@ -1,7 +1,7 @@
 """CLI: convert an HF safetensors checkpoint to a FreeToken Weight (FTW) checkpoint.
 
     ft checkpoint --model <hf_dir> --out <ftw_dir> \
-        [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--gpu <uuid-or-index>]
+        [--dtype bfloat16] [--moe-backend offload] [--quant-backend moe.nvfp4=b12x] [--shard-gib 8] [--gpu <uuid-or-index>]
 
 The output dir is self-contained: point the server's ``--model`` at it to load via the FTW
 fast path (auto-detected).
@@ -21,6 +21,16 @@ from .convert import convert_checkpoint
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
+def _parse_quant_backend(value: str) -> str:
+    from freetoken.layers.quantization import QuantBackend
+
+    try:
+        QuantBackend.parse(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
 def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__)
     p.add_argument("--model", required=True, help="source HF safetensors checkpoint dir")
@@ -28,6 +38,9 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--dtype", choices=sorted(_DTYPES), default="bfloat16")
     p.add_argument("--moe-backend", default="offload",
                    help="offload (experts -> banks) or e.g. triton (experts stay dense)")
+    p.add_argument("--quant-backend", type=_parse_quant_backend, default=None,
+                   help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
+                        "chosen MoE kernel and the server picks that kernel back up from the FTW")
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
@@ -46,7 +59,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     t = time.perf_counter()
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
-        moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
+        moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

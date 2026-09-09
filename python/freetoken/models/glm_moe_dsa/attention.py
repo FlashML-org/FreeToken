@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.layers.quantization import QuantKind
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.rotary import get_rope
@@ -34,16 +35,6 @@ from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
-
-
-def _make_proj(quant: str, in_features: int, out_features: int) -> BaseOP:
-    """A resident projection in the model's resolved quant mode: ``"fp8_pertensor"``
-    (W8A16, per-row scale, quantized at load -- see weight.py) or bf16."""
-    if quant == "fp8_pertensor":
-        from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorLinear
-
-        return Fp8PerTensorLinear(in_features, out_features, has_bias=False)
-    return LinearReplicated(in_features, out_features, has_bias=False)
 
 
 class _IdxLayerNorm(BaseOP):
@@ -63,17 +54,18 @@ class _IdxLayerNorm(BaseOP):
 class GlmDsaIndexer(BaseOP):
     """DSA lightning indexer ("full" layers only; "shared" layers carry no weights).
 
-    Kept bf16 in every quant mode: the projections are small (~17 MB/layer) and the
-    top-k boundary is precision-sensitive. The HF reference itself is the bf16
-    equivalent of DeepSeek's fp8 scoring kernel, so bf16 scoring is faithful.
+    ``wq_b`` follows the checkpoint's quant config; ``wk`` and ``weights_proj`` stay bf16 as in vLLM (the top-k boundary is precision-sensitive, and they are ~17 MB/layer).
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm_dsa_args
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.softmax_scale = args.index_head_dim**-0.5
-        self.wq_b = LinearReplicated(args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False)
+        self.wq_b = LinearReplicated(
+            args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.wq_b",
+        )
         self.wk = LinearReplicated(args.hidden_size, self.head_dim, has_bias=False)
         self.k_norm = _IdxLayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = LinearReplicated(args.hidden_size, self.n_heads, has_bias=False)
@@ -106,14 +98,14 @@ class GlmDsaIndexer(BaseOP):
 
 
 class GlmMoeDsaAttention(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm_dsa_args
         self.layer_id = layer_id
         # IndexShare: "full" layers own an indexer; "shared" layers reuse the most
         # recent full layer's top-k selection (resolved in the backend).
         idx_types = args.indexer_types
         self.indexer = (
-            GlmDsaIndexer(config, layer_id)
+            GlmDsaIndexer(config, layer_id, prefix=f"{prefix}.indexer")
             if idx_types and idx_types[layer_id] == "full"
             else None
         )
@@ -137,22 +129,32 @@ class GlmMoeDsaAttention(BaseOP):
             is_neox=not args.rope_interleave,  # GLM-5.2: interleaved (config-driven)
         )
 
-        quant = config.attn_quant
-        self.q_a_proj = _make_proj(quant, args.hidden_size, args.q_lora_rank)
+        self.q_a_proj = LinearReplicated(
+            args.hidden_size, args.q_lora_rank, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.q_a_proj",
+        )
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
-        self.q_b_proj = _make_proj(quant, args.q_lora_rank, self.num_heads * self.qk_head_dim)
-        self.kv_a_proj_with_mqa = _make_proj(
-            quant, args.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim
+        self.q_b_proj = LinearReplicated(
+            args.q_lora_rank, self.num_heads * self.qk_head_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.q_b_proj",
+        )
+        self.kv_a_proj_with_mqa = LinearReplicated(
+            args.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
-        # kv_b stays bf16 in every mode: it is consumed as bmm operands by the MLA
-        # absorption (below), not through a Linear forward.
+        # the MLA absorption reads kv_b_proj.weight as bmm operands, so only an unquantized scheme is served
         self.kv_b_proj = LinearReplicated(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
         )
-        self.o_proj = _make_proj(quant, self.num_heads * self.v_head_dim, args.hidden_size)
+        assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
+        self.o_proj = LinearReplicated(
+            self.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
         # Contiguous per-head kv_b split, cached on first forward (see _kv_b). Absorbing
         # kv_b into Q/O runs as a per-head bf16 bmm on these instead of re-slicing +
         # re-upcasting the bf16 weight per token (bf16 einsum with tensor-core fp32

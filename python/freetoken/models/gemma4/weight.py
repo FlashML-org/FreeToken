@@ -14,7 +14,6 @@ from freetoken.models.loader import (
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
@@ -178,7 +177,7 @@ def iter_weights(
                 if name is None:
                     continue
 
-                # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
+                # Per-expert NVFP4 tensors go to the offload cache (expert pieces),
                 # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
                 if _NVFP4_EXPERT_RE.search(raw_name):
                     continue
@@ -255,7 +254,7 @@ def iter_weights_parallel(
     (``feed_forward.experts.{gate_up_proj,down_proj}``), so no merge needed; same key
     rename as iter_weights, read via the common chunked O_DIRECT reader."""
     assert include_moe_experts and not include_non_moe, (
-        "gemma4 parallel reader is experts-only (used by load_moe_expert_sources)"
+        "gemma4 parallel reader is experts-only (used by the expert piece reader)"
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
@@ -275,41 +274,12 @@ def iter_weights_parallel(
         yield _expert_name(raw_name), tensor
 
 
-def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
 __all__ = [
+    "nvfp4_expert_spec",
     "iter_weights",
     "iter_weights_parallel",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
 ]

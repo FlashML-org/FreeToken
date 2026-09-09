@@ -9,7 +9,7 @@ import torch
 
 from freetoken.moe.fused import moe_align_block_size, try_get_optimal_moe_config
 
-# Token-count threshold used by GptOssMxfp4TritonMoELayer.forward to dispatch: batches at
+# Token-count threshold used by the resident gpt-oss mxfp4 kernel to dispatch: batches at
 # or below this bound take the gather decode path (no sort), larger batches take the
 # grouped/sorted prefill kernel. GPT-OSS decode targets small batches (max running
 # requests), matching the gather path.

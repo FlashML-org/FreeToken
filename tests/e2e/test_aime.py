@@ -154,6 +154,16 @@ def recommended_sampling(model_dir: Path) -> tuple[SamplingParams, int]:
     return sp, n_samples
 
 
+def format_chat(tokenizer, messages: list[dict]) -> str:
+    """The thinking-mode prompt: the checkpoint's chat template, or DeepSeek-V4's encoder module."""
+    from freetoken.tokenizer.tokenize import _apply_dsv4_chat_encoder, _load_dsv4_encoder_if_needed
+
+    encoder = _load_dsv4_encoder_if_needed(tokenizer)
+    if encoder is not None:
+        return _apply_dsv4_chat_encoder(encoder, messages, None, {"enable_thinking": True})
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+
+
 def build_llm(model_path: Path) -> LLM:
     """Resident by default; set FREETOKEN_TEST_MOE_CACHE_SIZE>0 to run an offload model
     (fp8 Qwen3.5-MoE, GLM-4.7, MiniMax, ... -- routed experts that do not fit in HBM)."""
@@ -167,12 +177,15 @@ def build_llm(model_path: Path) -> LLM:
         max_running_req=1,
         max_extend_tokens=8192,
     )
+    if quant_backend := os.environ.get("FREETOKEN_TEST_QUANT_BACKEND"):
+        kwargs["quant_backend"] = quant_backend  # --quant-backend syntax, e.g. moe.nvfp4=b12x
     cache_size = int(os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "0"))
     cache_auto = os.environ.get("FREETOKEN_TEST_MOE_CACHE_AUTO") == "1"
     if cache_size > 0 or cache_auto:
         kwargs.update(
-            moe_backend=os.environ.get("FREETOKEN_TEST_MOE_BACKEND", "offload"),
+            moe_strategy=os.environ.get("FREETOKEN_TEST_MOE_STRATEGY", "offload"),
             moe_cpu_threads=int(os.environ.get("FREETOKEN_TEST_MOE_CPU_THREADS", "0")),
+            moe_cpu_layers=os.environ.get("FREETOKEN_TEST_MOE_CPU_LAYERS"),
             moe_cache_auto=cache_auto,
             moe_cache_size=cache_size,
             kv_reserve_tokens=int(os.environ.get("FREETOKEN_TEST_KV_RESERVE", "8192")),
@@ -251,13 +264,7 @@ def test_aime():
     for idx in selected:
         row = rows[idx]
         prompt, expected = row["prompt"], str(row["answer"])
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        formatted_prompt = format_chat(tokenizer, [{"role": "user", "content": prompt}])
         # Decode at the model's recommended params and check pass@N: the expected answer must
         # appear in at least one of N samples (single greedy/sampled runs are brittle -- see
         # recommended_sampling docstring).

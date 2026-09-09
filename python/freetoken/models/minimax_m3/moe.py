@@ -4,8 +4,8 @@ Routing follows the DeepSeek/GLM family (``GlmMoeDsaSparseBlock``): fp32 sigmoid
 scores + a selection-only ``e_score_correction_bias``, gather the unbiased scores,
 renormalize, scale by ``routed_scaling_factor`` (2.0). No group-limited top-k
 (n_group == 1). The routed experts (NVFP4, swigluoai) go through ``make_moe_layer``
-(the offload family; the swigluoai alpha/limit ride the layer via ``extra_attrs``,
-gpt-oss precedent) and the always-on shared expert (MXFP8, swigluoai) is added.
+(the offload family; the swigluoai alpha/limit are the layer's ``alpha`` /
+``limit``) and the always-on shared expert (MXFP8, swigluoai) is added.
 
 The checkpoint keeps ``e_score_correction_bias`` fp32 and the reference applies it
 fp32; the bias sits on the top-k boundary, so it is stored fp32 here too (unlike
@@ -29,7 +29,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 
 
 class MiniMaxM3SparseMoeBlock(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.m3_args
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
@@ -55,17 +55,18 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
             layer_id=layer_id - config.first_k_dense_replace,
             renormalize=config.norm_topk_prob,
             activation="swigluoai",
-            extra_attrs={
-                "hidden_act_alpha": args.swiglu_alpha,
-                "swiglu_limit": args.swiglu_limit,
-            },
+            alpha=args.swiglu_alpha,
+            limit=args.swiglu_limit,
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
         self.shared_experts = MiniMaxM3MLP(
             config.hidden_size,
             config.shared_expert_intermediate_size * max(1, config.n_shared_experts),
-            quant=config.dense_quant,
             alpha=args.swiglu_alpha,
             limit=args.swiglu_limit,
+            quant_config=config.quant,
+            prefix=f"{prefix}.shared_experts",
         )
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:

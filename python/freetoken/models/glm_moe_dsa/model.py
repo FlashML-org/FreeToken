@@ -16,38 +16,15 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
-class GlmFp8LMHead(ParallelLMHead):
-    """W8A16 lm_head (fp8-e4m3 weight + per-row scale, quantized at load).
-
-    The full-vocab logits GEMV reads the whole ~1.9 GiB bf16 head every decode step;
-    fp8 halves that. Selected by ``ModelConfig.lm_head_quant == "fp8_pertensor"``
-    (weight.py quantizes at load off the same field). GLM-5.2 does not tie embeddings,
-    so the fp8 weight is head-only.
-    """
-
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
-        self.weight = torch.empty(num_embeddings, embedding_dim, dtype=torch.float8_e4m3fn)
-        self.weight_scale = torch.empty(num_embeddings, dtype=torch.float32)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return fp8_pertensor_linear(x, self.weight, self.weight_scale)
-
-
 class GlmMoeDsaDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = GlmMoeDsaAttention(config, layer_id)
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.self_attn = GlmMoeDsaAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         if layer_id >= config.first_k_dense_replace:
-            self.mlp: BaseOP = GlmMoeDsaSparseBlock(config, layer_id)
+            self.mlp: BaseOP = GlmMoeDsaSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
             self.mlp = GlmDsaGatedMLP(
-                config.hidden_size, config.intermediate_size, quant=config.dense_quant
+                config.hidden_size, config.intermediate_size,
+                quant_config=config.quant, prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
@@ -67,13 +44,16 @@ class GlmMoeDsaDecoderLayer(BaseOP):
 
 
 class GlmMoeDsaModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [GlmMoeDsaDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                GlmMoeDsaDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
@@ -88,18 +68,14 @@ class GlmMoeDsaModel(BaseOP):
 class GlmMoeDsaForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = GlmMoeDsaModel(config)
-        if config.lm_head_quant == "fp8_pertensor" and not config.tie_word_embeddings:
-            self.lm_head: BaseOP = GlmFp8LMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-            )
-        else:
-            self.lm_head = ParallelLMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                tie_word_embeddings=config.tie_word_embeddings,
-                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            )
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
+        )
         super().__init__()
 
     def prepare_for_runtime(self) -> None:
