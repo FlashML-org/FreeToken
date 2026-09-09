@@ -144,7 +144,7 @@ def test_fused_layer_forward_on_a_side_stream_completes():
         scale = torch.cat([torch.full((p,), 0.01 * (i + 1), device="cuda")
                            for i, p in enumerate(parts)])
         input_scale = torch.tensor(0.02, device="cuda")
-        # same load-time decisions the cublaslt fp8_tensor kernel makes in finalize
+        # same load-time decisions the torch fp8_tensor kernel makes in finalize
         segments = weight_scale_segments(scale)
         rowwise_scaled_mm_ok()
         x = torch.randn(2010, K, device="cuda", dtype=torch.bfloat16)  # #182 shape

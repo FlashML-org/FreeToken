@@ -15,10 +15,10 @@ from .base import LinearConfig, LinearKernel, LinearMethod
 FP8 = torch.float8_e4m3fn
 
 
-class CublasltFp8TensorLinearKernel(LinearKernel):
+class TorchFp8TensorLinearKernel(LinearKernel):
     """Static W8A8 through torch._scaled_mm; needs the checkpoint's input_scale and fp8 tensor cores."""
 
-    name = "cublaslt"
+    name = "torch"
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
         if cfg.scheme is None or not cfg.scheme.has("input_scale"):
@@ -75,7 +75,7 @@ class EmulationFp8TensorLinearKernel(LinearKernel):
 
 @register_method(QuantKind.FP8_TENSOR, LayerKind.LINEAR)
 class Fp8TensorLinearMethod(LinearMethod):
-    candidates = (CublasltFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
+    candidates = (TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
