@@ -1,0 +1,99 @@
+# Promote the nightly wheel pair to FreeToken-Web's curated `beta` release.
+#
+# Nothing is built here: the pair is copied byte-for-byte from this repo's rolling
+# `nightly` release (or from one nightly-wheels run's `wheels` artifact, kept 7 days),
+# so beta only ever carries wheels that nightly already published. Linux only -- the
+# win_amd64 assets on beta are published by hand from FreeToken-Windows and are never
+# touched; scripts/publish-wheels.sh prunes per platform.
+#
+# Trigger policy: workflow_dispatch only. GitHub requires write permission to dispatch,
+# and this is the only lane that holds the cross-repo FreeToken-Web token (an
+# ENVIRONMENT secret on `release`). Nothing here runs on the self-hosted node.
+#
+# The `release` environment carries the PAT with no protection rules, so write access
+# to dispatch is the gate. Add required reviewers there if that is ever too little.
+#
+# To promote a commit nightly has not built yet, run nightly-wheels.yml with
+# force=true first, then this workflow.
+
+name: Promote nightly to beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      expect_commit:
+        description: "Commit (7-40 hex) the pair must be built from; empty = whatever nightly holds"
+        type: string
+        default: ""
+      run_id:
+        description: "Take the pair from this nightly-wheels run's artifact instead of the nightly release"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  WEB_REPO: FlashML-org/FreeToken-Web
+  WEB_TAG: beta
+
+jobs:
+  # Reads the nightly release, so it shares a group with nightly-wheels.yml's publish
+  # job and never sees the window between prune and upload. Kept apart from the PAT
+  # job: a promotion waiting on the environment gate must not hold that group.
+  fetch:
+    # Guard against runs from forks of this repo; update on an org transfer.
+    if: github.repository == 'FlashML-org/FreeToken'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: nightly-release-assets
+    permissions:
+      contents: read
+      # gh run download of another run's artifact
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch the nightly pair
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_REPO: ${{ github.repository }}
+          NIGHTLY_TAG: nightly
+          EXPECT_COMMIT: ${{ inputs.expect_commit }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: scripts/ci/fetch-nightly-pair.sh dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: promote-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: fetch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: promote-wheels
+          path: dist
+      - name: Publish to the beta release
+        env:
+          GH_TOKEN: ${{ secrets.FREETOKEN_WEB_TOKEN }}
+          FREETOKEN_RELEASE_REPO: ${{ env.WEB_REPO }}
+          FREETOKEN_RELEASE_TAG: ${{ env.WEB_TAG }}
+        run: scripts/publish-wheels.sh dist
+      - name: Summary
+        run: |
+          {
+            echo "Promoted to https://github.com/$WEB_REPO/releases/tag/$WEB_TAG:"
+            echo
+            for w in dist/*.whl; do echo "- \`$(basename "$w")\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,8 @@
-# Nightly engine wheels: build on the self-hosted EC2 node and publish to the
-# FreeToken-Web rolling `beta` release.
+# Nightly engine wheels: build on the self-hosted EC2 node and publish to this repo's
+# rolling `nightly` prerelease. scripts/publish-wheels.sh moves the `nightly` tag to the
+# built commit after every publish. Promotion to the curated FreeToken-Web `beta`
+# channel is a separate, hand-triggered lane (promote-beta.yml) that copies the pair
+# without rebuilding.
 #
 # The node currently runs ALWAYS-ON, so this workflow does no power management.
 # Reintroduce the elastic variant (OIDC start-node/stop-node jobs around the build,
@@ -16,8 +19,7 @@
 # nightly is fully identified by the commit it was built from. Nights where HEAD is
 # already published are skipped before the EC2 node is ever started.
 #
-# Formal (tagged) releases are out of scope here for now -- this workflow is the
-# nightly channel only.
+# Formal (tagged) releases are out of scope here -- see release.yml.
 
 name: Nightly wheels
 
@@ -40,38 +42,41 @@ concurrency:
   group: nightly-wheels
 
 env:
-  WEB_REPO: FlashML-org/FreeToken-Web
-  WEB_TAG: beta
+  RELEASE_TAG: nightly
 
 jobs:
   # Decide whether HEAD needs building at all. Runs on a hosted runner so a no-op
   # night costs nothing and never touches AWS.
   check:
-    # Guard against runs from forks of this repo; update on an org transfer.
-    if: github.repository == 'FlashML-org/FreeToken'
+    # Guard against runs from forks of this repo; update on an org transfer. Only main
+    # feeds the nightly channel: a dispatch on any other branch is a no-op.
+    if: github.repository == 'FlashML-org/FreeToken' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       build: ${{ steps.decide.outputs.build }}
     steps:
-      - name: Compare HEAD against the published beta stamp
+      - name: Compare HEAD against the published nightly stamp
         id: decide
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
           head_stamp="${GITHUB_SHA:0:9}"
-          # The release also carries win_amd64 wheels with their own stamp; this
-          # workflow only builds linux, so read the linux manifest that
-          # scripts/publish-wheels.sh writes. Before the first manifest exists, fall
-          # back to the stamp in the linux runtime wheel's name.
+          # Read the manifest scripts/publish-wheels.sh writes. Before the first manifest
+          # exists, fall back to the stamp in the runtime wheel's name.
           published_stamp="$(curl -fsSL \
-            "https://github.com/$WEB_REPO/releases/download/$WEB_TAG/engine-linux_x86_64.json" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/engine-linux_x86_64.json" \
             2>/dev/null | jq -r '.commit // empty' || true)"
-          [ -n "$published_stamp" ] || published_stamp="$(gh api "repos/$WEB_REPO/releases/tags/$WEB_TAG" \
+          [ -n "$published_stamp" ] || published_stamp="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
             --jq '.assets[].name' 2>/dev/null \
             | grep -E '^freetoken-.*linux_x86_64\.whl$' \
             | grep -oE '\+g[0-9a-f]{7,}' | head -1 | sed 's/^+g//' || true)"
+          # The tag is moved last; if it lags the manifest, a publish died half-way and
+          # must run again.
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" \
+            --jq '.object.sha' 2>/dev/null || true)"
+          [ "${tag_sha:0:9}" = "$published_stamp" ] || published_stamp=""
           echo "HEAD: $head_stamp  published: ${published_stamp:-<none>}"
           if [ "$FORCE" = "true" ] || [ "$head_stamp" != "$published_stamp" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
@@ -102,23 +107,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Publish from a hosted runner: the cross-repo token is never present on the
-  # self-hosted node, so a compromised build node cannot reach the release channel.
+  # Publish from a hosted runner with the job-scoped GITHUB_TOKEN. The self-hosted
+  # node never holds a token that can write releases, so a compromised build node
+  # cannot reach the nightly channel. The job-level group is shared with
+  # promote-beta.yml's fetch job, so a promotion never reads the release between
+  # the prune and the upload.
   publish:
     needs: [check, build]
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: release
+    concurrency:
+      group: nightly-release-assets
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: wheels
           path: dist
-      - name: Publish to the beta release
+      - name: Publish to the nightly release
         env:
-          GH_TOKEN: ${{ secrets.FREETOKEN_WEB_TOKEN }}
-          FREETOKEN_WEB_REPO: ${{ env.WEB_REPO }}
-          FREETOKEN_WEB_TAG: ${{ env.WEB_TAG }}
+          GH_TOKEN: ${{ github.token }}
+          FREETOKEN_RELEASE_REPO: ${{ github.repository }}
+          FREETOKEN_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          FREETOKEN_RELEASE_ROLLING: "1"
+          FREETOKEN_RELEASE_COMMIT: ${{ github.sha }}
         run: scripts/publish-wheels.sh dist

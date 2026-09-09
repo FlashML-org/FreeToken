@@ -152,7 +152,8 @@ stamp_version() {
     local version tag
     version="$(sed -nE 's/^__version__ = "([^"+]+)".*$/\1/p' "$VERSION_FILE")"
     [[ -n "$version" ]] || die "cannot read a version from $VERSION_FILE"
-    tag="$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null)" \
+    # --match: the rolling `nightly` tag can sit on the same commit as the release tag.
+    tag="$(git -C "$ROOT" describe --exact-match --tags --match 'v*' HEAD 2>/dev/null)" \
       || die "FREETOKEN_BUILD_RELEASE: HEAD is not at a tag (expected tag v$version)."
     [[ "$tag" == "v$version" ]] \
       || die "FREETOKEN_BUILD_RELEASE: HEAD tag is '$tag' but version.py says '$version' (expected tag v$version)."

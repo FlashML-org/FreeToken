@@ -23,6 +23,26 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+## Method 3: Nightly wheels
+
+Every night `main` is built into a wheel pair on the rolling
+[`nightly` release](https://github.com/FlashML-org/FreeToken/releases/tag/nightly):
+the `freetoken` runtime (CPython 3.12, Linux x86_64) and the matching
+`freetoken-kernel-cache` with FreeToken's own CUDA kernels prebuilt.
+Install both from the URLs on that release page:
+
+```bash
+uv pip install \
+  "freetoken[accel] @ https://github.com/FlashML-org/FreeToken/releases/download/nightly/<runtime wheel>" \
+  "https://github.com/FlashML-org/FreeToken/releases/download/nightly/<kernel-cache wheel>"
+```
+
+Filenames carry a `+g<sha>` build stamp and change every night, and the `nightly`
+tag moves with them. Pin a wheel URL, never the tag. A local copy of the tag goes
+stale: `git fetch` leaves it alone and `git fetch --tags` refuses to overwrite it;
+refresh it with `git fetch --force origin tag nightly`. `engine-linux_x86_64.json`
+next to the wheels names the current pair for scripts.
+
 ## Verify
 
 ```bash

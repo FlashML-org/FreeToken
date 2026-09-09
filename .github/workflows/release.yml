@@ -8,9 +8,10 @@
 # this in FREETOKEN_BUILD_RELEASE mode and refuses otherwise.
 #
 # This lane is separate from nightly-wheels.yml on purpose:
-#   - nightly ships +g<sha>-stamped, linux_x86_64-tagged cp312 wheels to the
-#     FreeToken-Web rolling `beta` release, which shipped Desktops resolve by
-#     asset name -- that channel's naming must not change.
+#   - nightly ships +g<sha>-stamped, linux_x86_64-tagged cp312 wheels to this repo's
+#     rolling `nightly` prerelease, and promote-beta.yml copies that pair to the
+#     FreeToken-Web `beta` release, which shipped Desktops resolve by asset name --
+#     that naming must not change.
 #   - release ships bare-versioned, manylinux-retagged cp310-cp313 wheels, which
 #     is what PyPI accepts.
 #
@@ -168,7 +169,7 @@ jobs:
 
   # Upload-only draft release on THIS repo carrying every wheel, most importantly
   # the kernel-cache one PyPI cannot host. Deliberately not scripts/publish-wheels.sh:
-  # its prune-then-upload semantics and stamp-pairing gate are for the rolling beta
+  # its prune-then-upload semantics and stamp-pairing gate are for the rolling nightly
   # channel, and would be wrong against an immutable version tag.
   github-release:
     needs: build
