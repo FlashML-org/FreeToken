@@ -149,7 +149,7 @@ def _dsv4(model, idx):
         assert proj.weight_scale_inv.shape == (proj.out_features // 128, proj.in_features // 128) and proj.bias is None
     assert set(block.attn.compressor.wkv.state_dict()) == {"weight"}
     experts = block.ffn.experts
-    assert experts.limit == 10.0 and experts.quant_method.cpu_format == "ds_fp4" and not experts.quant_method.scheme.has("bias")
+    assert experts.limit == 10.0 and experts.quant_method.cpu_format == "ds_fp4" and not experts.has_bias
     H, I = 4096, 2048
     assert {r: (s.shape, s.dtype) for r, s in experts.quant_method.layout().items()} == {
         "gate_up": ((2 * I, H // 2), torch.uint8), "gate_up_scale": ((2 * I, H // 32), torch.float8_e8m0fnu),

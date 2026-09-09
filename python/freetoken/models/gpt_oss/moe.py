@@ -53,6 +53,7 @@ class GptOssMLP(BaseOP):
             alpha=config.hidden_act_alpha,
             limit=config.swiglu_limit,
             interleaved=True,
+            has_bias=True,
             resident_cls=GptOssMoELayer,
             offload_cls=GptOssOffloadMoELayer,
             quant_config=config.quant,

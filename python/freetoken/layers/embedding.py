@@ -87,8 +87,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         if tied_embedding is None:
             self.quant_method = quant_method_for(quant_config, self, prefix)
             self.quant_method.create_weights(self)
-        else:
-            self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+        self.bias = torch.empty(self.num_embeddings_tp) if bias else None
 
     def finalize(self) -> None:
         if self.quant_method is not None:

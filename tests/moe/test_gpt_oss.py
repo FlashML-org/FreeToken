@@ -70,7 +70,7 @@ def _offload_layer(config, layer_id, cache):
     layer = GptOssOffloadMoELayer(
         layer_id, config.num_experts, config.num_experts_per_tok, config.hidden_size,
         config.moe_intermediate_size, renormalize=True, activation="gpt_oss_swiglu",
-        alpha=config.hidden_act_alpha, limit=config.swiglu_limit, interleaved=True,
+        alpha=config.hidden_act_alpha, limit=config.swiglu_limit, interleaved=True, has_bias=True,
         quant_config=quant, prefix=f"model.layers.{layer_id}.mlp.experts",
     )
     layer.offload_cache = cache

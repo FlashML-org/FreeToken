@@ -18,8 +18,6 @@ class TritonMxfp4MoEKernel(MoEKernel):
     cpu_format = "ds_fp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        if cfg.scheme is not None and cfg.scheme.has("bias"):
-            return "standard MXFP4 kernel has no bias epilogue"
         if cfg.interleaved:
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
@@ -62,7 +60,7 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
     cpu_format = "mxfp4_triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        if cfg.scheme is None or not cfg.scheme.has("bias"):
+        if not cfg.has_bias:
             return "gpt-oss kernel needs the expert biases"
         return None
 
@@ -110,7 +108,7 @@ class Mxfp4MoEMethod(MoEMethod):
     candidates = (TritonMxfp4MoEKernel, TritonGptossMxfp4MoEKernel)
 
     def create_weights(self, layer) -> None:
-        if not self.scheme.has("bias"):
+        if not self.cfg.has_bias:
             raise NotImplementedError("standard MXFP4 experts are served from the offload cache, not resident")
         g = self.cfg
         e, i, h = g.num_experts, g.local_intermediate, g.hidden

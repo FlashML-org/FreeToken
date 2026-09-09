@@ -46,4 +46,3 @@ class Mxfp8LinearMethod(LinearMethod):
             raise ValueError(f"mxfp8 needs in_features divisible by {BLOCK}, got {g.in_features}")
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         layer.weight_scale_inv = torch.empty(g.out_features, g.in_features // BLOCK, dtype=torch.uint8)
-        layer.bias = torch.empty(g.out_features) if layer.has_bias else None

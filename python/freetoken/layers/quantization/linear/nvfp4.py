@@ -121,4 +121,3 @@ class Nvfp4LinearMethod(LinearMethod):
         layer.weight_scale = torch.empty(g.out_features, g.in_features // GROUP, dtype=FP8)
         layer.weight_global = torch.empty(g.out_features, dtype=torch.float16)
         # input_scale stays undeclared: the W4A16 kernels never read it and today's readers drop it
-        layer.bias = torch.empty(g.out_features) if layer.has_bias else None

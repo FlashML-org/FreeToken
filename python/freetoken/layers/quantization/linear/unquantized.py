@@ -31,4 +31,3 @@ class UnquantizedLinearMethod(LinearMethod):
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
         layer.weight = torch.empty(g.out_features, g.in_features)
-        layer.bias = torch.empty(g.out_features) if layer.has_bias else None

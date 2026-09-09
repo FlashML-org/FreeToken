@@ -19,8 +19,8 @@ class Fp8BlockConfig(QuantConfig):
         "BLOCK": fp8_block_scheme("float"),
         "BLOCK_E8M0": fp8_block_scheme("e8m0"),
         # HF ``modules_to_convert``: a table (Qwen3.8-Flash-Next PLE) stored e4m3 with one scalar scale
-        "TABLE": fp8_tensor_scheme("float", bias=False),
-        "EXPERT_MXFP4": mxfp4_scheme(bias=False),
+        "TABLE": fp8_tensor_scheme("float"),
+        "EXPERT_MXFP4": mxfp4_scheme(),
     }
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):

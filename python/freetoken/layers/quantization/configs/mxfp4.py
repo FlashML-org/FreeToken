@@ -15,7 +15,7 @@ class Mxfp4Config(QuantConfig):
 
     dialect = "mxfp4"
 
-    SCHEME: ClassVar[QuantScheme] = mxfp4_scheme(bias=True)
+    SCHEME: ClassVar[QuantScheme] = mxfp4_scheme()
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)

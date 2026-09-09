@@ -51,6 +51,7 @@ class MoELayer(BaseOP):
         beta: float = 0.0,
         limit: float | None = None,
         interleaved: bool = False,
+        has_bias: bool = False,
         layer_id: int | None = None,
         strategy: str = "resident",
         decode_target: str = "gpu",
@@ -75,6 +76,7 @@ class MoELayer(BaseOP):
         self.beta = beta
         self.limit = limit
         self.interleaved = interleaved
+        self.has_bias = has_bias
         self.layer_id = layer_id
         self.strategy = strategy
         self.decode_target = decode_target
@@ -156,6 +158,7 @@ class OffloadMoELayer(MoELayer):
         beta: float = 0.0,
         limit: float | None = None,
         interleaved: bool = False,
+        has_bias: bool = False,
         strategy: str = "offload",
         decode_target: str = "gpu",
         quant_config: QuantConfig | None = None,
@@ -174,6 +177,7 @@ class OffloadMoELayer(MoELayer):
             beta=beta,
             limit=limit,
             interleaved=interleaved,
+            has_bias=has_bias,
             layer_id=layer_id,
             strategy=strategy,
             decode_target=decode_target,
@@ -442,6 +446,7 @@ def make_moe_layer(
     beta: float = 0.0,
     limit: float | None = None,
     interleaved: bool = False,
+    has_bias: bool = False,
     quant_config: QuantConfig | None = None,
     prefix: str = "",
 ) -> MoELayer:
@@ -469,6 +474,7 @@ def make_moe_layer(
         beta=beta,
         limit=limit,
         interleaved=interleaved,
+        has_bias=has_bias,
         quant_config=quant_config,
         prefix=prefix,
     )

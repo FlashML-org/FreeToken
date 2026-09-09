@@ -28,6 +28,7 @@ class MoEConfig:
     beta: float = 0.0
     limit: float | None = None
     interleaved: bool = False
+    has_bias: bool = False
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"
     decode_target: str = "gpu"
@@ -47,6 +48,7 @@ class MoEConfig:
             beta=float(layer.beta),
             limit=layer.limit,
             interleaved=bool(layer.interleaved),
+            has_bias=bool(layer.has_bias),
             apply_router_weight_on_input=bool(layer.apply_router_weight_on_input),
             strategy=layer.strategy,
             decode_target=layer.decode_target,
@@ -152,6 +154,8 @@ class MoEKernel(ABC):
             return "TP > 1 is not supported for this expert format"
         if not cpu_ok and cfg.decode_target != "gpu":
             return "has no CPU executor format; decode must run on the GPU"
+        if cfg.has_bias:
+            return "kernel has no bias epilogue"
         if plain_silu_only and not cfg.plain_silu:
             return f"kernel is plain-silu only, experts use ({cfg.activation}, alpha={cfg.alpha}, beta={cfg.beta}, limit={cfg.limit})"
         return None

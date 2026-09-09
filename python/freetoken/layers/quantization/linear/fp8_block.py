@@ -58,4 +58,3 @@ class Fp8BlockLinearMethod(LinearMethod):
         # e8m0 codes stay codes for the dsv4 kernel; float scales are bf16 as the readers push them today
         scale_dtype = E8M0 if _e8m0(g) else torch.bfloat16
         layer.weight_scale_inv = torch.empty(g.out_features // BLOCK, g.in_features // BLOCK, dtype=scale_dtype)
-        layer.bias = torch.empty(g.out_features) if layer.has_bias else None

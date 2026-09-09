@@ -42,6 +42,7 @@ class _LinearTPImpl(BaseOP):
         self.output_sizes = tuple(output_sizes or (local_osize,))
         self.quant_method = quant_method_for(quant_config, self, prefix)
         self.quant_method.create_weights(self)
+        self.bias = torch.empty(local_osize) if has_bias else None
 
     def finalize(self) -> None:
         self.quant_method.finalize(self)

@@ -82,4 +82,3 @@ class Fp8TensorLinearMethod(LinearMethod):
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         layer.weight_scale = torch.empty(g.out_features, dtype=torch.float32)
         layer.input_scale = torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None
-        layer.bias = torch.empty(g.out_features) if layer.has_bias else None
