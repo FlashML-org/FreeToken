@@ -26,7 +26,7 @@ class MiniMaxM2Attention(BaseOP):
       of each head are rotated.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         head_dim = config.head_dim
         self.layer_id = layer_id
         tp_size = get_tp_info().size
@@ -41,6 +41,8 @@ class MiniMaxM2Attention(BaseOP):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         if config.use_qk_norm:
             self.q_norm = RMSNorm(self.qo_attn_dim, eps=config.rms_norm_eps)
@@ -63,6 +65,8 @@ class MiniMaxM2Attention(BaseOP):
             head_dim * config.num_qo_heads,
             config.hidden_size,
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
 
     @nvtx_annotate("MHA")

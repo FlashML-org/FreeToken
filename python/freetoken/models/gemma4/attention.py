@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class Gemma4Attention(BaseOP):
     """Gemma 4 attention for one full-context or SWA layer."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.layer_id = layer_id
         group = config.attention_group_for_layer(layer_id)
         self.is_swa = isinstance(group, SWAAttentionGroupConfig)
@@ -37,8 +37,13 @@ class Gemma4Attention(BaseOP):
             self.num_qo_heads,
             self.num_kv_heads,
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(self.q_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearReplicated(
+            self.q_dim, config.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)

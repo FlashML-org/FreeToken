@@ -168,3 +168,25 @@ class RMSNormFused(BaseOP):
             return self.rmsnorm(x, self.weight, self.eps), x
         self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
+
+
+_GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
+
+
+class GatedRMSNorm(BaseOP):
+    """``rmsnorm(x) * activation(z)`` in one fla kernel: the GDN / KDA output norm."""
+
+    def __init__(self, size: int, eps: float, activation: str = "silu") -> None:
+        # rms_norm_gated drops the gate entirely (no error) for a name it does not know
+        assert activation in _GATE_ACTIVATIONS, f"unsupported gate activation {activation!r}"
+        self.weight = torch.empty(size)
+        self.eps = eps
+        self.activation = activation
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.fla import rms_norm_gated
+
+        return rms_norm_gated(
+            x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
+            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
+        )

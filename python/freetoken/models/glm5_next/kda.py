@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -43,29 +43,13 @@ class _DepthwiseConv1d(BaseOP):
         self.weight = torch.empty(conv_dim, 1, kernel)
 
 
-class _GatedRMSNormSigmoid(BaseOP):
-    """RMSNorm(x) * sigmoid(z), fused (KDA's o_norm; GDN's variant gates with silu)."""
-
-    def __init__(self, dim: int, eps: float):
-        self.weight = torch.empty(dim)
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.fla import rms_norm_gated
-
-        return rms_norm_gated(
-            x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation="sigmoid",
-        )
-
-
 class Glm5NextKDA(BaseOP):
     """KDA op; state is held in ``ctx.linear_state_pool`` keyed by the request's
     linear slot (``FLAMetadata.cache_indices``). Parameter names follow the
     checkpoint modulo two load-time fusions (see weight.py): ``in_proj`` is
     q|k|v|b|f_a|g_a concatenated, ``conv1d`` is q|k|v conv concatenated."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.layer_id = layer_id
         self.num_heads = args.linear_num_heads
@@ -77,41 +61,22 @@ class Glm5NextKDA(BaseOP):
         self.scale = self.head_dim**-0.5
 
         p, h, d = self.proj_size, self.num_heads, self.head_dim
-        # q|k|v dominate the resident read (3 * 8192 x 4096 = 201 MB/layer bf16 --
-        # the single biggest dense-weight stream in the model); under the fp8
-        # resident mode they split into their own W8A16 GEMM while the small,
-        # precision-sensitive gate projections (b|f_a|g_a) stay bf16 (the GDN
-        # qkvz/ba split precedent). BF16 mode keeps the single fused GEMM.
-        self._fp8 = config.attn_quant == "fp8_pertensor"
-        self._bfg_split = [h, d, d]
-        if self._fp8:
-            from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
-
-            self.in_proj_qkv = Fp8PerTensorColMerged(
-                args.hidden_size, [p, p, p], has_bias=False
-            )
-            self.in_proj_bfg = LinearColParallelMerged(
-                args.hidden_size, self._bfg_split, has_bias=False
-            )
-        else:
-            self._in_proj_split = [p, p, p, h, d, d]
-            self.in_proj = LinearColParallelMerged(
-                args.hidden_size, self._in_proj_split, has_bias=False
-            )
+        # one fused input GEMM over q|k|v|b|f_a|g_a
+        self._in_proj_split = [p, p, p, h, d, d]
+        self.in_proj = LinearColParallelMerged(
+            args.hidden_size, self._in_proj_split, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.in_proj",
+        )
         # Low-rank gate up-projections (128 -> 8192): forget gate and output gate.
-        self.f_b_proj = LinearReplicated(d, p, has_bias=False)
-        self.g_b_proj = LinearReplicated(d, p, has_bias=False)
+        self.f_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.f_b_proj")
+        self.g_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.g_b_proj")
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
         # Gate params stay fp32 (exp/sigmoid precision; the kernels read fp32).
         # models/weight.py exempts *.A_log / *.dt_bias from the model-dtype downcast.
         self.A_log = torch.empty(h, dtype=torch.float32)
         self.dt_bias = torch.empty(p, dtype=torch.float32)
-        self.o_norm = _GatedRMSNormSigmoid(d, eps=args.norm_eps)
-        # o_proj follows the resident quant mode (rationale: the split comment
-        # at _fp8 above); f_b/g_b stay bf16 alongside the gate slice.
-        from .attention import _make_proj
-
-        self.o_proj = _make_proj(config.attn_quant, p, args.hidden_size)
+        self.o_norm = GatedRMSNorm(d, eps=args.norm_eps, activation="sigmoid")
+        self.o_proj = LinearReplicated(p, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj")
 
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
@@ -143,16 +108,10 @@ class Glm5NextKDA(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
-            conv_in = self.in_proj_qkv.forward(hidden_states)
-            b, f_a, g_a = torch.split(
-                self.in_proj_bfg.forward(hidden_states), self._bfg_split, dim=-1
-            )
-        else:
-            proj = self.in_proj.forward(hidden_states)
-            conv_in, b, f_a, g_a = torch.split(
-                proj, [self.conv_dim, h, d, d], dim=-1
-            )
+        proj = self.in_proj.forward(hidden_states)
+        conv_in, b, f_a, g_a = torch.split(
+            proj, [self.conv_dim, h, d, d], dim=-1
+        )
         g1 = self.f_b_proj.forward(f_a)  # raw forget-gate logits [T, H*D]
         g2 = self.g_b_proj.forward(g_a)  # output-gate logits [T, H*D]
         li = pool.local_index(self.layer_id)

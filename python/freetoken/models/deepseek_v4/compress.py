@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.compress import gated_pool
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
 from freetoken.kernel.triton.dsv4.hadamard import hadamard_transform
+from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 
 from .args import DeepseekV4Args
-from .layers import Linear, RMSNorm
 from .ops import apply_rotary_emb, apply_rotary_emb_decode
 
 
-class Compressor(nn.Module):
+class Compressor(BaseOP):
     """Learned gated pooling of KV over ``compress_ratio`` tokens (CSA overlap when
     ratio==4). Stateful across decode steps. KV / state buffers are bound from the pool."""
 
-    def __init__(self, args: DeepseekV4Args, compress_ratio: int, head_dim: int, rotate: bool = False):
-        super().__init__()
+    def __init__(self, args: DeepseekV4Args, compress_ratio: int, head_dim: int, rotate: bool = False, *, quant_config=None, prefix: str = ""):
         self.dim = args.dim
         self.head_dim = head_dim
         self.rope_head_dim = args.rope_head_dim
@@ -31,10 +29,10 @@ class Compressor(nn.Module):
         self.max_batch_size = args.max_batch_size
         coff = 1 + self.overlap
 
-        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32), requires_grad=False)
+        self.ape = torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         # checkpoint stores these bf16; matmul upcasts on-chip (halves footprint + read).
-        self.wkv = Linear(self.dim, coff * self.head_dim, kind="bf16")
-        self.wgate = Linear(self.dim, coff * self.head_dim, kind="bf16")
+        self.wkv = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
+        self.wgate = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wgate")
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         # Paged-KV binding (set on first forward). All addressing -- the compressed-KV pool view,
         # the per-window-page compress-state ring, the decode snapshot -- is reached through the
@@ -46,7 +44,7 @@ class Compressor(nn.Module):
         self.coff = coff
         self.item_size = coff * self.head_dim   # the ring row's kv|score split point
         self.P: int = 128  # window-page size (set in bind)
-        self.freqs_cis: torch.Tensor | None = None
+        self._freqs_cis: torch.Tensor | None = None
         # Rolling state register held in fp32 (the carry); seeded by prefill, advanced by
         # decode. At bs=1 it mirrors the page's ring block; persisted to the ring on write.
         self._kv_state: torch.Tensor | None = None
@@ -70,7 +68,7 @@ class Compressor(nn.Module):
         self.layer_id = layer_id
         self.tier = tier
         self.P = pool.P
-        self.freqs_cis = freqs_cis
+        self._freqs_cis = freqs_cis
         self._device = device
         coff = self.coff
         self._kv_state = torch.zeros(
@@ -140,8 +138,8 @@ class Compressor(nn.Module):
             return self.extend(x, start_pos, window_slots, int(tail_window_slot), ti)
         dtype = x.dtype
         x = x.float()
-        kv = self.wkv(x)
-        score = self.wgate(x)
+        kv = self.wkv.forward(x)
+        score = self.wgate.forward(x)
         kv_full, score_full = kv, score  # pre-split (for the page-boundary carry write-through)
         ks, ss = self._kv_state, self._score_state
         should_compress = seqlen >= ratio
@@ -171,8 +169,8 @@ class Compressor(nn.Module):
                 self._write_through_carry(int(window_slots[-1].item()))
         if not should_compress:
             return None
-        kv = self.norm(kv.to(dtype))
-        freqs_cis = self.freqs_cis[:cutoff:ratio]
+        kv = self.norm.forward(kv.to(dtype))
+        freqs_cis = self._freqs_cis[:cutoff:ratio]
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         if self.rotate:
             kv = hadamard_transform(kv)
@@ -210,8 +208,8 @@ class Compressor(nn.Module):
         self._seed_carry_from_ring(tail_window_slot)
 
         x = x.float()
-        kv = self.wkv(x)
-        score = self.wgate(x)
+        kv = self.wkv.forward(x)
+        score = self.wgate.forward(x)
         kv_full, score_full = kv, score
         ks, ss = self._kv_state, self._score_state
         should_compress = (start_pos + seqlen) // ratio > start_pos // ratio
@@ -268,13 +266,13 @@ class Compressor(nn.Module):
             self._write_through_carry(int(window_slots[-1].item()))
         if not should_compress:
             return None
-        reduced = self.norm(reduced.to(dtype))
+        reduced = self.norm.forward(reduced.to(dtype))
         # freqs per compressed block: position b*ratio for absolute block b. start_pos is ratio-
         # aligned, so the new FULL blocks span [start_pos, start_pos+cutoff) at stride ratio. Use
         # the block-aligned `cutoff` end (NOT start_pos+seqlen): a stepped slice over an unaligned
         # span ceils to one extra element when seqlen % ratio != 0 (mirrors the from-scratch
         # prefill's freqs_cis[:cutoff:ratio]).
-        freqs_cis = self.freqs_cis[start_pos:start_pos + cutoff:ratio]
+        freqs_cis = self._freqs_cis[start_pos:start_pos + cutoff:ratio]
         assert freqs_cis.size(0) == reduced.size(1), f"{freqs_cis.shape=} {reduced.shape=}"
         apply_rotary_emb(reduced[..., -rd:], freqs_cis)
         if self.rotate:
@@ -342,8 +340,8 @@ class Compressor(nn.Module):
             self.layer_id, self.tier, window_slots, self.ring_size, torch.cat([ks, ss], dim=-1)
         )
 
-        compressed = self.norm(compressed)
-        freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
+        compressed = self.norm.forward(compressed)
+        freqs_t = self._freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
         apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
         if self.rotate:
             compressed = hadamard_transform(compressed)
@@ -363,27 +361,26 @@ class Compressor(nn.Module):
         self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(B, -1))
 
 
-class Indexer(nn.Module):
+class Indexer(BaseOP):
     """Lightning Indexer: scores compressed KV and returns top-k positions to attend."""
 
-    def __init__(self, args: DeepseekV4Args, compress_ratio: int):
-        super().__init__()
+    def __init__(self, args: DeepseekV4Args, compress_ratio: int, *, quant_config=None, prefix: str = ""):
         self.dim = args.dim
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
-        self.weights_proj = Linear(self.dim, self.n_heads, kind="bf16")
+        self.wq_b = LinearReplicated(self.q_lora_rank, self.n_heads * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.weights_proj = LinearReplicated(self.dim, self.n_heads, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.weights_proj")
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
-        self.compressor = Compressor(args, compress_ratio, self.head_dim, rotate=True)
+        self.compressor = Compressor(args, compress_ratio, self.head_dim, rotate=True, quant_config=quant_config, prefix=f"{prefix}.compressor")
         # The indexer's own compressor writes its compressed keys into the idx tier; scoring
         # gathers them by block index. Both go through the LIVE backend (self.attn ->
         # ctx.attn_backend) per access, so a runtime rebuild needs no model unbind.
         self.layer_id: int | None = None
-        self.freqs_cis: torch.Tensor | None = None
+        self._freqs_cis: torch.Tensor | None = None
 
     @property
     def attn(self):
@@ -398,7 +395,7 @@ class Indexer(nn.Module):
         # arithmetic rows (full_loc // ratio); its OWN compress-state ring is pool.indexer_state_ring[L]
         # (distinct from the attention compressor's, so the two never collide on per-page state slots).
         self.layer_id = layer_id
-        self.freqs_cis = freqs_cis
+        self._freqs_cis = freqs_cis
         self._device = device
         self.compressor.bind_paged(pool, layer_id, freqs_cis, device, tier="idx")
 
@@ -407,17 +404,17 @@ class Indexer(nn.Module):
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int, window_slots: torch.Tensor, ti: int = 0):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        freqs_cis = self._freqs_cis[start_pos:start_pos + seqlen]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
-        q = self.wq_b(qr)
+        q = self.wq_b.forward(qr)
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
-        self.compressor(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        self.compressor.forward(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end_pos // ratio, ratio, self.layer_id, bsz)
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
         return self.attn.indexer_select_prefill(
@@ -431,14 +428,14 @@ class Indexer(nn.Module):
         blocks [0, end//ratio) with a causal mask, returns top-k block indices offset by ``offset``."""
         bsz, seqlen, _ = x.size()
         end = start_pos + seqlen
-        freqs_cis = self.freqs_cis[start_pos:end]
+        freqs_cis = self._freqs_cis[start_pos:end]
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
-        self.compressor(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        self.compressor.forward(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
         return self.attn.indexer_select_prefill(
@@ -460,13 +457,13 @@ class Indexer(nn.Module):
         fixed staging width (== max valid count in eager, a static capture width under graph)."""
         B = x.size(0)
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
-        apply_rotary_emb_decode(q[..., -rd:], self.freqs_cis.index_select(0, pos))  # per-row freqs
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb_decode(q[..., -rd:], self._freqs_cis.index_select(0, pos))  # per-row freqs
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
         # Advance the indexer's own compressor (writes this token's idx key to idx_pool per row).
         self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
         valid = (pos + 1) // ratio  # [B] per-row valid block count
         # Head-reduced scores in one pass: the kernel gathers each block's key off the full-loc
         # SNAPSHOT (not the live map -> overlap-safe replay) and reads its column bound from

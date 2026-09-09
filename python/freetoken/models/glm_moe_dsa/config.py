@@ -9,11 +9,7 @@ kernel, identity selection for the dense regimes).
 MoE routing knobs mirror the glm4_moe path (sigmoid ``noaux_tc`` router, shared
 expert, routed scaling). The DSA indexer geometry rides in ``glm_dsa_args``.
 
-Resident-weight quantization is resolved HERE (from the FREETOKEN_GLM_*_FP8 env
-switches, default on) into the standard ``ModelConfig`` fields -- ``attn_quant`` /
-``dense_quant`` / ``lm_head_quant`` = ``"fp8_pertensor"`` or ``"none"`` -- and every
-consumer (the module constructors and the weight loader) reads those fields, so the
-resolved config is the single record of what the served weights actually are.
+Every resident projection is built from the QuantConfig, so the served precision is whatever the checkpoint's quantization_config declares.
 """
 
 from __future__ import annotations
@@ -30,13 +26,6 @@ from freetoken.models.config import (
 
 from .args import load_args
 
-# W8A16 fp8 (per-row scale, quantized at load) for the resident weights; decode is
-# weight-bandwidth bound and the freed VRAM densifies the expert cache. =0 restores
-# checkpoint-faithful bf16. NB: these resolve into ModelConfig at parse time and change
-# what iter_weights yields -- an FTW checkpoint converted under one setting must be
-# served under the same one (see weight.py).
-_ATTN_FP8 = os.getenv("FREETOKEN_GLM_ATTN_FP8", "1") != "0"
-_MLP_FP8 = os.getenv("FREETOKEN_GLM_MLP_FP8", "1") != "0"
 
 
 def _dsa_on(args, num_layers: int) -> bool:
@@ -124,12 +113,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         topk_group=int(getattr(hf_config, "topk_group", 1)),
         attn_sm_scale=args.qk_head_dim**-0.5,
         has_attn_bias=bool(getattr(hf_config, "attention_bias", False)),
-        # Resident-weight quant modes (see the module docstring): recorded here so the
-        # resolved config describes the served weights; the constructors and
-        # iter_weights read these fields, never the env directly.
-        attn_quant="fp8_pertensor" if _ATTN_FP8 else "none",
-        dense_quant="fp8_pertensor" if _MLP_FP8 else "none",
-        lm_head_quant="fp8_pertensor" if _MLP_FP8 else "none",
         glm_dsa_args=args,
     )
 

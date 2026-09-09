@@ -89,7 +89,7 @@ def iter_weights_parallel(
     """experts-only iter_weights: raw experts read via the common chunked multi-threaded
     O_DIRECT reader, then same merge+stack pipeline."""
     assert include_moe_experts and not include_non_moe, (
-        "qwen3_moe parallel reader is experts-only (used by load_moe_expert_sources)"
+        "qwen3_moe parallel reader is experts-only (used by the expert piece reader)"
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 

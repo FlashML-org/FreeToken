@@ -542,7 +542,7 @@ class PLELayer(BaseOP):
     """
 
     def __init__(
-        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None
+        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None, *, prefix: str = ""
     ) -> None:
         args = config.qwen4_args
         self.args = args
@@ -554,8 +554,12 @@ class PLELayer(BaseOP):
         self.state_len = args.ple_conv_state_len
         width = args.ple_state_width
         self.ple_embedding = NGramEmbedding(args, table)
-        self.key_proj = LinearReplicated(args.ple_embed_dim, width, has_bias=False)
-        self.value_proj = LinearReplicated(args.ple_embed_dim, args.hidden_size, has_bias=False)
+        self.key_proj = LinearReplicated(
+            args.ple_embed_dim, width, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.key_proj"
+        )
+        self.value_proj = LinearReplicated(
+            args.ple_embed_dim, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.value_proj"
+        )
         self.norm_key = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_query = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_conv = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)

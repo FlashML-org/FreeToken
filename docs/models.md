@@ -1,7 +1,6 @@
 # Supported models
 
-FreeToken loads HF safetensors checkpoints directly (plus native GGUF for
-Gemma-4). The checkpoints below are known-good — the prebuilt kernels are tuned
+FreeToken loads HF safetensors checkpoints directly. The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
@@ -19,9 +18,9 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 
-## MoE backends
+## MoE strategies
 
-`ft serve --moe-backend {auto,fused,offload,cpu,hybrid}`:
+`ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
 - **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;

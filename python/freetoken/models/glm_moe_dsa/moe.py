@@ -25,7 +25,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 
 
 class GlmMoeDsaSparseBlock(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
@@ -44,11 +44,14 @@ class GlmMoeDsaSparseBlock(BaseOP):
             config,
             layer_id=layer_id - config.first_k_dense_replace,
             renormalize=config.norm_topk_prob,
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
         self.shared_experts = GlmDsaGatedMLP(
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
-            quant=config.dense_quant,
+            quant_config=config.quant,
+            prefix=f"{prefix}.shared_experts",
         )
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:

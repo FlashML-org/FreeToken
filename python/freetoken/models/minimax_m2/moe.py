@@ -16,7 +16,7 @@ class MiniMaxM2SparseMoeBlock(BaseOP):
     NVFP4 expert banks in the unified offload cache (the expert GEMM backend follows
     ``cache.quant_format``; see :meth:`OffloadMoELayer.routed_forward`)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
@@ -27,6 +27,8 @@ class MiniMaxM2SparseMoeBlock(BaseOP):
             config,
             layer_id=layer_id,
             renormalize=config.norm_topk_prob,
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
 
     def _route(self, router_logits: torch.Tensor) -> TopK:

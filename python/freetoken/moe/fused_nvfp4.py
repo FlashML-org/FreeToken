@@ -21,37 +21,8 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _e2m1_lut,
     _prefill_nvfp4_moe_kernel,
 )
-from freetoken.layers import (
-    gelu_and_mul,
-    gelu_tanh_and_mul,
-    silu_and_mul,
-    swiglu_clamp_and_mul,
-    swigluoai_and_mul,
-)
+from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
-
-_ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-
-
-def _run_act(
-    activation: str,
-    gate_up: torch.Tensor,
-    out: torch.Tensor,
-    act_alpha: float,
-    act_limit: float,
-) -> None:
-    """gemm1 -> gemm2 activation dispatch. ``swigluoai`` (MiniMax-M3, clamped
-    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) and
-    ``swiglu_clamp`` (GLM-5.3, same clamp without the +1 up bias) carry the
-    per-model ``act_alpha``/``act_limit`` scalars; the plain *_and_mul kinds
-    ignore them."""
-    if activation == "swigluoai":
-        swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
-        return
-    if activation == "swiglu_clamp":
-        swiglu_clamp_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
-        return
-    _ACT[activation](gate_up, out)
 
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
@@ -196,7 +167,7 @@ def _fused_experts_decode_nvfp4(
         ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
@@ -346,7 +317,7 @@ def fused_experts_nvfp4(
         apply_router_weight_on_input, cfg,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,

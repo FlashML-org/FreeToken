@@ -5,19 +5,19 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
-from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
+from .layers import get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 
 
-class Attention(nn.Module):
+class Attention(BaseOP):
     """Multi-head Latent Attention with sliding window + optional KV compression.
 
     KV lives in the paged DSV4 pools (window / compressed / indexer), resolved per token via
@@ -26,8 +26,7 @@ class Attention(nn.Module):
     ``window_pool[L]`` / ``cmp_pool[L]`` inside the kernel -- no per-forward staging slab. Both
     prefill and decode use the same paged kernel."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
-        super().__init__()
+    def __init__(self, layer_id: int, args: DeepseekV4Args, *, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -40,22 +39,23 @@ class Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False)
-        self.wq_a = Linear(self.dim, self.q_lora_rank, kind="fp8")
+        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
+        # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
+        self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
-        self.wkv = Linear(self.dim, self.head_dim, kind="fp8")
+        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
+        # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
         wo_a_rows = self.n_groups * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
-        self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
-        self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
+        self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
+        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
-            self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
-            self.indexer = Indexer(args, self.compress_ratio) if self.compress_ratio == 4 else None
+            self.compressor = Compressor(args, self.compress_ratio, self.head_dim, quant_config=quant_config, prefix=f"{prefix}.compressor")
+            self.indexer = Indexer(args, self.compress_ratio, quant_config=quant_config, prefix=f"{prefix}.indexer") if self.compress_ratio == 4 else None
         else:
             self.compressor = None
             self.indexer = None
@@ -69,7 +69,7 @@ class Attention(nn.Module):
             rope_theta, args.rope_factor, args.beta_fast, args.beta_slow,
         )
         # Bound on first forward (freqs/arange only; pool buffers are read off the LIVE pool).
-        self.freqs_cis: torch.Tensor | None = None
+        self._freqs_cis: torch.Tensor | None = None
 
     # KV addressing lives in the attention backend (ctx.attn_backend), pool buffers on the live
     # pool (ctx.kv_cache) -- both read per access, so the model holds NO state a runtime rebuild
@@ -85,11 +85,11 @@ class Attention(nn.Module):
         L = self.layer_id
         win = self.window_size
         self.P = pool.P
-        self.freqs_cis = get_freqs_cis(*self._freqs_params, device)
+        self._freqs_cis = get_freqs_cis(*self._freqs_params, device)
         if self.compress_ratio:
-            self.compressor.bind_paged(pool, L, self.freqs_cis, device, tier="attn")
+            self.compressor.bind_paged(pool, L, self._freqs_cis, device, tier="attn")
             if self.indexer is not None:
-                self.indexer.bind_paged(pool, L, self.freqs_cis, device)
+                self.indexer.bind_paged(pool, L, self._freqs_cis, device)
 
     def reset(self) -> None:
         if self.compressor is not None:
@@ -102,7 +102,7 @@ class Attention(nn.Module):
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b(o)
+        return self.wo_b.forward(o)
 
     def _prefill_segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
@@ -144,17 +144,17 @@ class Attention(nn.Module):
         if start_pos == 0:
             self.reset()  # re-seed the compressor/indexer carry from scratch
             blocks = (
-                self.indexer(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
+                self.indexer.forward(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
-            self.compressor(x_seg, 0, slots, ti=ti)
+            self.compressor.forward(x_seg, 0, slots, ti=ti)
         else:
             blocks = (
                 self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
                 if self.indexer is not None
                 else self._compress_topk_extend(n, start_pos, end, 0, device, 1)
             )
-            self.compressor(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
+            self.compressor.forward(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
         return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
 
     def forward_ragged(self, x, segments, flat_positions):
@@ -178,17 +178,17 @@ class Attention(nn.Module):
         _, T, _ = x.size()
         if len(segments) == 1:
             # single contiguous segment: a free slice view instead of a per-layer gather
-            freqs = self.freqs_cis[segments[0][3]:segments[0][3] + T]
+            freqs = self._freqs_cis[segments[0][3]:segments[0][3] + T]
         else:
-            freqs = self.freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
+            freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
-        qr = q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        qr = q = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
 
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        kv = self.wkv.forward(x)
+        kv = self.kv_norm.forward(kv)
         apply_rotary_emb(kv[..., -rd:], freqs)
         act_quant_fp8_inplace(kv[..., :-rd], 64)
 
@@ -273,15 +273,15 @@ class Attention(nn.Module):
         if wctx is None:
             wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
         window_slots, prev_window_slots, window_slots_topk = wctx
-        freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
+        freqs_t = self._freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
-        qr = q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        qr = q = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
 
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        kv = self.wkv.forward(x)
+        kv = self.kv_norm.forward(kv)
         apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
         act_quant_fp8_inplace(kv[..., :-rd], 64)
         # Persistent window write: each row's new token to its own window slot (swa_ratio=1).

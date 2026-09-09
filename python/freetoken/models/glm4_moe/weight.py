@@ -11,7 +11,6 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
@@ -79,8 +78,8 @@ def _iter_nvfp4_resident(
     """Yield native NVFP4 buffers for an always-resident Linear.
 
     ``weight`` (packed fp4) + ``weight_scale`` (fp8 block scale) verbatim; per-tensor
-    ``weight_scale_2`` broadcast to per-row fp16 ``weight_global`` as LinearNVFP4 /
-    dequant_nvfp4 expect. lossless vs checkpoint; same dequant math as routed experts.
+    ``weight_scale_2`` broadcast to per-row fp16 ``weight_global`` as the NVFP4 linear
+    method / dequant_nvfp4 expect. lossless vs checkpoint; same dequant math as routed experts.
     """
     packed = reader.get(f"{src_prefix}.weight")  # [OUT, IN//2] uint8
     scale = reader.get(f"{src_prefix}.weight_scale")  # [OUT, IN//16] fp8-e4m3
@@ -122,7 +121,7 @@ def iter_weights(
     """
     assert not include_moe_experts, (
         "GLM-4 MoE stores experts as NVFP4 and only supports the offload backend; experts "
-        "are loaded into the offload cache via load_nvfp4_expert_sources()."
+        "are loaded into the offload cache from their NVFP4 pieces."
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
@@ -191,39 +190,8 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 # --------------------------------------------------------------------------------------
 # Routed expert host banks (NVFP4) for the offload cache.
 # --------------------------------------------------------------------------------------
-def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict[str, torch.Tensor]:
-    """Build the pinned CPU NVFP4 banks for GLM-4's routed experts.
-
-    experts exist only for layers [first_k_dense_replace, num_layers) and pack by MoE layer
-    index (layer - first_k_dense_replace) so banks have no holes for leading dense layers.
-    MTP layer excluded.
-    """
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
-
-
-__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
+__all__ = ["iter_weights", "nvfp4_expert_spec"]

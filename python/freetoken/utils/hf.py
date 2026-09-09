@@ -6,6 +6,7 @@ from typing import Any
 from typing import FrozenSet
 
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.utils import EntryNotFoundError
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoConfig,
@@ -168,6 +169,17 @@ class RawConfigShim:
 
     def to_dict(self) -> dict:
         return json.loads(json.dumps(self._data))  # deep copy, callers may mutate
+
+
+def optional_hf_file(model_path: str, filename: str) -> str | None:
+    """Local path of ``filename`` in a checkpoint dir or Hub repo; None when the checkpoint has no such file."""
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, filename)
+        return path if os.path.isfile(path) else None
+    try:
+        return hf_hub_download(repo_id=model_path, filename=filename)
+    except EntryNotFoundError:
+        return None
 
 
 def _raw_config_json(model_path: str) -> dict:

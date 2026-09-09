@@ -1,4 +1,4 @@
-"""Python wrapper around the ``_cpu_moe`` C++ executor (--moe-backend cpu).
+"""Python wrapper around the ``_cpu_moe`` C++ executor (--moe-strategy cpu).
 
 Owns the persistent CPU worker pool, the per-batch-size pinned IO buffers, and
 the per-(layer, batch-size) host-func task descriptors. ``decode`` issues the
@@ -157,15 +157,17 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
+        fmt: str | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
+        from freetoken.moe.legacy_format import canonical_role
 
-        fmt = cache.quant_format
+        fmt = fmt or cache.quant_format
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
-                f"--moe-backend cpu/hybrid computes experts on the CPU and supports "
+                f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
                 f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
-                f"{fmt!r}; use --moe-backend offload (GPU-side dequant) instead."
+                f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
@@ -193,7 +195,9 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        ptrs, (self.H, self.I) = self._resolve_banks(
+            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
+        )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -375,8 +379,8 @@ class CpuMoeExecutor:
             return self._resolve_dsfp4_banks(banks)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
-        gup, gus, gug = banks["gate_up_packed"], banks["gate_up_scale"], banks["gate_up_global"]
-        dnp, dns, dng = banks["down_packed"], banks["down_scale"], banks["down_global"]
+        gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
+        dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
         assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
         assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
@@ -432,8 +436,8 @@ class CpuMoeExecutor:
         (N innermost) + per-output-row biases. The C++ kernel streams K and
         accumulates a contiguous N-block, so the GPU-tiled layout is read in place
         (no repack, no extra host memory). Block scales are e8m0 (1 byte / 32 K)."""
-        gub, gus, gob = banks["gate_up_blocks"], banks["gate_up_scales"], banks["gate_up_bias"]
-        dnb, dns, dob = banks["down_blocks"], banks["down_scales"], banks["down_bias"]
+        gub, gus, gob = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_bias"]
+        dnb, dns, dob = banks["down"], banks["down_scale"], banks["down_bias"]
         assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (gub[0].dtype, dnb[0].dtype)
         assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (gus[0].dtype, dns[0].dtype)
         assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (gob[0].dtype, dob[0].dtype)
@@ -463,8 +467,8 @@ class CpuMoeExecutor:
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
         activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
-        gup, gus = banks["gate_up_packed"], banks["gate_up_scale"]
-        dnp, dns = banks["down_packed"], banks["down_scale"]
+        gup, gus = banks["gate_up"], banks["gate_up_scale"]
+        dnp, dns = banks["down"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
         assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
         I = int(gup[0].shape[1] // 2)

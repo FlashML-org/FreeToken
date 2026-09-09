@@ -4,7 +4,7 @@ Routing is identical to glm_moe_dsa (sigmoid scores + selection-only
 ``e_score_correction_bias``, optional group-limited top-k, gather unbiased
 scores, renormalize, scale by ``routed_scaling_factor``); the deltas are the
 expert count (288, top-8) and the clamped-SwiGLU activation (``swiglu_limit`` =
-10), which rides ``make_moe_layer``'s ``extra_attrs`` into the offload kernels
+10), carried as the experts layer's ``limit`` into the offload kernels
 (triton NVFP4 in-GPU, generic-epilogue CPU GEMV). The marlin/b12x borrowed
 kernels hard-code silu; the backend selector already falls back to triton for
 non-silu experts.
@@ -27,7 +27,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 
 
 class Glm5NextSparseBlock(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
@@ -44,16 +44,16 @@ class Glm5NextSparseBlock(BaseOP):
             layer_id=layer_id - config.first_k_dense_replace,
             activation="swiglu_clamp" if config.swiglu_limit is not None else "silu",
             renormalize=config.norm_topk_prob,
-            extra_attrs={
-                "swiglu_limit": config.swiglu_limit,
-                "hidden_act_alpha": 1.0,  # plain sigmoid inside the clamped swiglu
-            },
+            limit=config.swiglu_limit,
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
         self.shared_experts = Glm5NextGatedMLP(
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
-            quant=config.dense_quant,
             swiglu_limit=config.swiglu_limit,
+            quant_config=config.quant,
+            prefix=f"{prefix}.shared_experts",
         )
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:

@@ -4,20 +4,20 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.moe import is_offload_moe_backend
-from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
+from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
-from freetoken.utils import div_even
+
 
 from .base import BaseOP
+from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
-# is computed outside the MoE layer. Such models call ``routed_forward`` (offload) or
-# ``_run_experts`` (dense) with a precomputed routing instead of going through the
-# generic softmax+top-k path.
+# is computed outside the MoE layer. Such models call ``routed_forward`` with a
+# precomputed routing instead of going through the generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
@@ -27,6 +27,15 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
 
 class MoELayer(BaseOP):
+    """Resident routed experts.
+
+    The expert format comes from ``quant_method`` (declared by ``create_weights``, run by
+    ``apply``); without a ``quant_config`` the experts are plain bf16. The gated activation is
+    ``act(clamp(g, limit) * alpha) * (clamp(u) + beta)`` with ``interleaved`` gate|up rows
+    for gpt-oss."""
+
+    quant_layer_kind = LayerKind.MOE
+
     def __init__(
         self,
         num_experts: int,
@@ -37,7 +46,17 @@ class MoELayer(BaseOP):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         allocate_experts: bool = True,
-        weight_format: str = "bf16",
+        *,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        limit: float | None = None,
+        interleaved: bool = False,
+        has_bias: bool = False,
+        layer_id: int | None = None,
+        strategy: str = "resident",
+        decode_target: str = "gpu",
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -48,70 +67,35 @@ class MoELayer(BaseOP):
         self._comm = DistributedCommunicator()
 
         tp_info = get_tp_info()
+        self.tp_rank = tp_info.rank
         self.tp_size = tp_size = tp_info.size
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.weight_format = weight_format
-        intermediate_size_per_partition = div_even(intermediate_size, tp_size)
-        if allocate_experts:
-            self._alloc_resident_experts(intermediate_size_per_partition)
+        self.alpha = alpha
+        self.beta = beta
+        self.limit = limit
+        self.interleaved = interleaved
+        self.has_bias = has_bias
+        self.layer_id = layer_id
+        self.strategy = strategy
+        self.decode_target = decode_target
+        self.prefix = prefix
+        # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
+        self.quant_method = None
+        if quant_config is not None or allocate_experts:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            if allocate_experts:
+                self.quant_method.create_weights(self)
 
-    def _alloc_resident_experts(self, intermediate_size_per_partition: int) -> None:
-        """Allocate the resident (in-GPU) expert weights for ``self.weight_format``.
-
-        The resident sibling of the offload bank schemas: each format owns its
-        tensor layout here and its kernel branch in ``_resident_gemm``.
-        """
-        if self.weight_format == "fp8_block":
-            # Stacked block-fp8 experts + bf16 per-128x128-block inverse scales.
-            # Full (unpartitioned) intermediate size: this layout is TP=1-only.
-            from freetoken.kernel.triton.fp8_block_linear import FP8
-
-            blk = 128
-            n, i, h = self.num_experts, self.intermediate_size, self.hidden_size
-            self.gate_up_proj = torch.empty(n, 2 * i, h, dtype=FP8)
-            self.gate_up_scale_inv = torch.empty(
-                n, 2 * i // blk, h // blk, dtype=torch.bfloat16
-            )
-            self.down_proj = torch.empty(n, h, i, dtype=FP8)
-            self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
-            return
-        assert self.weight_format == "bf16", (
-            f"no resident expert allocation for weight_format {self.weight_format!r}"
-        )
-        self.gate_up_proj = torch.empty(
-            self.num_experts,
-            2 * intermediate_size_per_partition,
-            self.hidden_size,
-        )
-        self.down_proj = torch.empty(
-            self.num_experts,
-            self.hidden_size,
-            intermediate_size_per_partition,
-        )
+    def finalize(self) -> None:
+        if self.quant_method is not None:
+            self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
             return self._comm.all_reduce(hidden_states)
         return hidden_states
-
-    def _run_experts(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense (in-GPU) expert compute for a precomputed routing decision."""
-        return fused_experts_impl(
-            hidden_states,
-            self.gate_up_proj,
-            self.down_proj,
-            topk_weights,
-            topk_ids,
-            self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-        )
 
     def _resident_gemm(
         self,
@@ -119,30 +103,11 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Kernel dispatch on ``self.weight_format`` -- the resident mirror of
-        ``OffloadMoELayer._expert_gemm``'s ``cache.quant_format`` dispatch."""
-        if self.weight_format == "fp8_block":
-            # Prefill dequantizes the layer's experts to bf16 and runs the bf16
-            # grouped GEMM; decode dequantizes only the routed rows.
-            from freetoken.moe.fused_fp8_block import (
-                fused_experts_decode_fp8_block,
-                fused_experts_fp8_block,
-            )
-
-            if get_global_ctx().batch.is_prefill:
-                return fused_experts_fp8_block(
-                    hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
-                    self.down_proj, self.down_scale_inv,
-                    topk_weights, topk_ids, self.num_experts,
-                )
-            return fused_experts_decode_fp8_block(
-                hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
-                self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
-            )
-        assert self.weight_format == "bf16", (
-            f"no resident expert kernel for weight_format {self.weight_format!r}"
+        assert self.quant_method is not None
+        return self.quant_method.apply(
+            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
+            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
         )
-        return self._run_experts(hidden_states, topk_weights, topk_ids)
 
     def routed_forward(
         self,
@@ -168,30 +133,13 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        if self.weight_format != "bf16":
-            # Quantized resident experts: generic softmax router + format kernel.
-            # The bf16 path below stays on ctx.moe_backend byte-for-byte.
-            topk_weights, topk_ids = fused_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=self.top_k,
-                renormalize=self.renormalize,
-            )
-            return self._maybe_all_reduce(
-                self._resident_gemm(hidden_states, topk_weights, topk_ids)
-            )
-        ctx = get_global_ctx()
-        final_hidden_states = ctx.moe_backend.forward(
+        topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
-            w1=self.gate_up_proj,
-            w2=self.down_proj,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
-        return self._maybe_all_reduce(final_hidden_states)
+        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
 class OffloadMoELayer(MoELayer):
@@ -205,6 +153,16 @@ class OffloadMoELayer(MoELayer):
         renormalize: bool = True,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        *,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        limit: float | None = None,
+        interleaved: bool = False,
+        has_bias: bool = False,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__(
             num_experts=num_experts,
@@ -215,8 +173,17 @@ class OffloadMoELayer(MoELayer):
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             allocate_experts=False,
+            alpha=alpha,
+            beta=beta,
+            limit=limit,
+            interleaved=interleaved,
+            has_bias=has_bias,
+            layer_id=layer_id,
+            strategy=strategy,
+            decode_target=decode_target,
+            quant_config=quant_config,
+            prefix=prefix,
         )
-        self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
     def forward(
@@ -423,9 +390,8 @@ class OffloadMoELayer(MoELayer):
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------
-    # Kernel dispatch -- pure routing on the cache's quant format. ``views``
-    # are the bank tensors the movement step produced (in bank registration
-    # order) and ``topk_ids`` already index their rows.
+    # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
+    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -440,88 +406,17 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
+        if self.quant_method is not None:
+            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+
+            view = ExpertView(
+                {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
+                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            )
+            return self.quant_method.apply(
+                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
+            )
         fmt = cache.quant_format
-        if fmt in ("nvfp4_marlin", "nvfp4_b12x"):
-            # Borrowed W4A16 fused MoE -- Marlin (vLLM, sm_80-99) or b12x
-            # (flashinfer, sm_120) over their pre-tiled banks; one kernel serves
-            # prefill and decode, with the movement-matched per-row global scales.
-            from freetoken.moe.nvfp4_backends import b12x_fused_experts, marlin_fused_experts
-
-            assert alphas is not None
-            gate_up_packed, gate_up_scale, down_packed, down_scale = views
-            fused = marlin_fused_experts if fmt == "nvfp4_marlin" else b12x_fused_experts
-            return fused(
-                hidden_states,
-                gate_up_packed,
-                gate_up_scale,
-                alphas[0],
-                down_packed,
-                down_scale,
-                alphas[1],
-                topk_weights,
-                topk_ids,
-                self.activation,
-                self.apply_router_weight_on_input,
-            )
-        if fmt == "nvfp4":
-            # FreeToken's Triton inline-dequant kernels over the native ModelOpt
-            # rows: the FP4 banks are read directly in the GEMM, no BF16 copy of
-            # the experts is ever materialized. The swigluoai scalars (MiniMax-M3)
-            # live on the layer via make_moe_layer's extra_attrs (gpt-oss precedent)
-            # and are ignored by the plain *_and_mul activations.
-            act_alpha = getattr(self, "hidden_act_alpha", 1.702)
-            act_limit = getattr(self, "swiglu_limit", None)
-            # None == "no clamp" everywhere else in the repo (mxfp4 maps it to +inf).
-            act_limit = float("inf") if act_limit is None else act_limit
-            if is_prefill:
-                from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
-
-                return fused_experts_nvfp4(
-                    hidden_states,
-                    *views,
-                    topk_weights,
-                    topk_ids,
-                    n,
-                    self.activation,
-                    self.apply_router_weight_on_input,
-                    act_alpha,
-                    act_limit,
-                )
-            # Marlin-style int32 wide-load GEMV (arithmetic dequant, no HW cvt).
-            # Bit-identical to the byte-at-a-time path; lifts gate/up BW ~43%->51%
-            # (I=512), ~41%->53% (I=768), 65%->72% (I=1536). CUDA-graph safe (fixed
-            # shapes, no host sync).
-            from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
-
-            return fused_experts_decode_nvfp4_marlin(
-                hidden_states,
-                *views,
-                topk_weights,
-                topk_ids,
-                self.activation,
-                self.apply_router_weight_on_input,
-                act_alpha,
-                act_limit,
-            )
-        if fmt == "fp8_block":
-            # Block-fp8 experts: fused inline-dequant grouped GEMM reads the routed fp8 rows
-            # directly (fp8 banks halve host/cache bytes; no bf16 materialization).
-            from freetoken.moe.fused_fp8_block import (
-                fused_experts_decode_fp8_block,
-                fused_experts_fp8_block,
-            )
-
-            gate_up, gate_up_scale, down, down_scale = views
-            if is_prefill:
-                return fused_experts_fp8_block(
-                    hidden_states, gate_up, gate_up_scale, down, down_scale,
-                    topk_weights, topk_ids, n, self.activation,
-                    self.apply_router_weight_on_input,
-                )
-            return fused_experts_decode_fp8_block(
-                hidden_states, gate_up, gate_up_scale, down, down_scale,
-                topk_weights, topk_ids, self.activation, self.apply_router_weight_on_input,
-            )
         if fmt == "q4_0":
             # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.
@@ -531,57 +426,7 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        if fmt == "mxfp4_triton":
-            # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
-            # decode + grouped `_t` prefill. The swiglu scalars live on the layer
-            # (set at construction), not in the base signature.
-            from freetoken.moe.fused_mxfp4 import (
-                run_mxfp4_prefill_experts_t,
-                run_mxfp4_splitk_decode_experts,
-            )
-
-            gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
-            run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
-            return run(
-                hidden_states, topk_weights, topk_ids,
-                gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias,
-                top_k=self.top_k,
-                hidden_act_alpha=self.hidden_act_alpha,
-                swiglu_limit=self.swiglu_limit,
-            )
-        if fmt == "ds_fp4":
-            # DeepSeek-V4 FP4 experts: grouped inline-dequant GEMM for streaming
-            # prefill chunks (n = bank rows to sort over); per-route dequant GEMV
-            # for decode and the sparse small-chunk slot path (n is None there,
-            # and sorting over the full slot cache would drown in padding).
-            gate_up_packed, gate_up_scale, down_packed, down_scale = views
-            if is_prefill and n is not None:
-                from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
-
-                return routed_experts_fp4_prefill(
-                    hidden_states, topk_ids, topk_weights,
-                    gate_up_packed, gate_up_scale, down_packed, down_scale,
-                    self.swiglu_limit, n,
-                )
-            from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
-
-            return routed_experts_fp4(
-                hidden_states, topk_ids, topk_weights,
-                gate_up_packed, gate_up_scale, down_packed, down_scale,
-                self.swiglu_limit,
-            )
-        assert fmt == "bf16", f"unknown quant_format {fmt!r}"
-        gate_up, down = views
-        impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
-        return impl(
-            hidden_states,
-            gate_up,
-            down,
-            topk_weights,
-            topk_ids,
-            self.activation,
-            self.apply_router_weight_on_input,
-        )
+        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
 
 
 def make_moe_layer(
@@ -589,7 +434,6 @@ def make_moe_layer(
     *,
     layer_id: int | None = None,
     activation: str = "silu",
-    weight_format: str = "bf16",
     renormalize: bool | None = None,
     apply_router_weight_on_input: bool = False,
     num_experts: int | None = None,
@@ -598,21 +442,23 @@ def make_moe_layer(
     intermediate_size: int | None = None,
     resident_cls: type[MoELayer] | None = None,
     offload_cls: "type[OffloadMoELayer] | None" = None,
-    extra_attrs: dict | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    limit: float | None = None,
+    interleaved: bool = False,
+    has_bias: bool = False,
+    quant_config: QuantConfig | None = None,
+    prefix: str = "",
 ) -> MoELayer:
-    """Build the experts layer for ``config.moe_backend`` -- the one construction
+    """Build the experts layer for ``config.moe_strategy`` -- the one construction
     seam between a model and the MoE strategy.
 
-    Picks ``OffloadMoELayer`` for the offload family (offload/cpu/hybrid, which
-    ignore ``weight_format``: the quant format comes from the offload cache) and
+    Picks ``OffloadMoELayer`` for the offload family (offload/cpu/hybrid) and
     ``MoELayer`` otherwise. Geometry defaults come from ``config``; pass overrides
-    for models whose fields deviate. ``extra_attrs`` become instance attributes --
-    the seam for per-format scalars the base signature does not carry (e.g.
-    ``hidden_act_alpha``/``swiglu_limit``, read back via ``getattr`` by the engine
-    and format kernels). ``resident_cls``/``offload_cls`` keep model-specific
+    for models whose fields deviate. ``resident_cls``/``offload_cls`` keep model-specific
     subclasses constructible through the same seam.
     """
-    offload = is_offload_moe_backend(config.moe_backend)
+    offload = is_offload_moe_strategy(config.moe_strategy)
     layer_cls = (offload_cls or OffloadMoELayer) if offload else (resident_cls or MoELayer)
     kwargs = dict(
         num_experts=num_experts if num_experts is not None else config.num_experts,
@@ -624,13 +470,17 @@ def make_moe_layer(
         renormalize=renormalize if renormalize is not None else config.norm_topk_prob,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
+        alpha=alpha,
+        beta=beta,
+        limit=limit,
+        interleaved=interleaved,
+        has_bias=has_bias,
+        quant_config=quant_config,
+        prefix=prefix,
     )
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
         kwargs["layer_id"] = layer_id
-    else:
-        kwargs["weight_format"] = weight_format
-    layer = layer_cls(**kwargs)
-    for name, value in (extra_attrs or {}).items():
-        setattr(layer, name, value)
-    return layer
+        kwargs["strategy"] = config.moe_strategy
+        kwargs["decode_target"] = config.decode_target
+    return layer_cls(**kwargs)

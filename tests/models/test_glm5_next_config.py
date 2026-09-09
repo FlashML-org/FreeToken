@@ -202,8 +202,7 @@ def test_moe_and_scalars():
     assert cfg.attn_sm_scale == pytest.approx(256**-0.5)
     assert cfg.num_moe_layers == _NUM_LAYERS - 3
     assert cfg.is_moe
-    # Checkpoint-faithful default; the FREETOKEN_GLM5_*_FP8 env flags opt into
-    # the W8A16 fp8 load.
+    # checkpoint-faithful: the resident projections follow the quantization_config, never a switch
     assert (cfg.attn_quant, cfg.dense_quant, cfg.lm_head_quant) == ("none",) * 3
     # Text-only serving: the vision tower is never built.
     assert cfg.vision_config is None

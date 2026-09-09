@@ -16,14 +16,12 @@ ablation: plain MHAKVCache, every layer attends its whole history through a gene
 FULL backend). ``page_size`` is pinned to the 128-token sparse block by the backend's
 ``page_sizes`` declaration, so one KV page == one sparse block.
 
-Resident-weight quantization is resolved HERE (from the FREETOKEN_M3_*_MXFP8 env
-switches, default on) into the standard ``ModelConfig`` fields -- ``attn_quant`` /
-``dense_quant`` = ``"mxfp8"`` or ``"none"`` -- and every consumer (the module
-constructors and the weight loader) reads those fields, so the resolved config is the
-single record of what the served weights actually are. The routed experts are NVFP4
+The resident projections are served in the precision the checkpoint stores (MXFP8 for the
+official export); ``attn_quant`` / ``dense_quant`` record what was detected for the weight
+loader. The routed experts are NVFP4
 (same ModelOpt layout as MiniMax-M2 / GLM) and always live in the offload cache;
 their swigluoai activation restricts the NVFP4 GEMM backend to the Triton kernels
-(``select_nvfp4_backend``). lm_head / embeddings are BF16 in the checkpoint.
+(the NVFP4 MoE kernel objects). lm_head / embeddings are BF16 in the checkpoint.
 """
 
 from __future__ import annotations
@@ -85,22 +83,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         )
     args = load_args(text, num_layers, sparse_enabled=sparse_enabled)
 
-    # W8A16 MXFP8 (the checkpoint's native dense quantization) for the resident
-    # weights; decode is weight-bandwidth bound and the freed VRAM densifies the
-    # expert cache. =0 dequantizes to bf16 at load (bring-up / ablation). Read at
-    # PARSE time so the resolved config is the single record of the served weights
-    # -- an FTW checkpoint converted under one setting must be served under the
-    # same one (see weight.py) -- and logged HERE so the FTW serve path (which
-    # never runs iter_weights) still leaves a serve-time record of the modes.
-    attn_mxfp8 = os.getenv("FREETOKEN_M3_ATTN_MXFP8", "1") != "0"
-    mlp_mxfp8 = os.getenv("FREETOKEN_M3_MLP_MXFP8", "1") != "0"
-    _log_mode_once(
-        f"quant={attn_mxfp8}/{mlp_mxfp8}",
-        f"MiniMax-M3 resident quant: attn={'mxfp8' if attn_mxfp8 else 'none'} "
-        f"dense={'mxfp8' if mlp_mxfp8 else 'none'} lm_head=none "
-        "(FREETOKEN_M3_ATTN_MXFP8/FREETOKEN_M3_MLP_MXFP8; an FTW checkpoint "
-        "converted under one setting must be served under the same one).",
-    )
+    # the quantized release stores the dense projections MXFP8; the reader keeps them native and the layers take their scheme from the QuantConfig
+    dense_mxfp8 = getattr(hf_config, "quantization_config", None) is not None
 
     # Leading dense-FFN layers: M3's moe_layer_freq is a contiguous 0-prefix; the
     # offload cache and the generic num_moe_layers arithmetic rely on that shape.
@@ -191,8 +175,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # resolved config describes the served weights; the constructors and
         # iter_weights read these fields, never the env directly. lm_head stays bf16
         # (the checkpoint excludes it from quantization).
-        attn_quant="mxfp8" if attn_mxfp8 else "none",
-        dense_quant="mxfp8" if mlp_mxfp8 else "none",
+        attn_quant="mxfp8" if dense_mxfp8 else "none",
+        dense_quant="mxfp8" if dense_mxfp8 else "none",
         lm_head_quant="none",
         m3_args=args,
     )

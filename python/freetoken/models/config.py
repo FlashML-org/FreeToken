@@ -260,7 +260,11 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    moe_backend: str = "fused"
+    moe_strategy: str = "fused"
+    # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
+    decode_target: str = "gpu"
+    # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
+    quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
     moe_enabled: bool = False
     # Weight quantization of the MoE experts only. "none" keeps the default BF16
@@ -268,26 +272,13 @@ class ModelConfig:
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
-    nvfp4_backend: str = "triton"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
-    # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate
-    # from the routed experts above). "fp8_pertensor" keeps them fp8-e4m3 + a per-output-row
-    # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
-    # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
+    # the checkpoint's quant kind for the dense attention / GatedDeltaNet projections, detected by the family's parse_config for its reader
     attn_quant: str = "none"
-    # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
-    # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
-    # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their
-    # decode weight traffic); "none" dequantizes them to bf16 at load. Set independently of the
-    # routed experts and lm_head: e.g. pure-NVFP4 Qwen3.5 has bf16 attn + bf16 lm_head but FP4
-    # shared experts, so this is "nvfp4" while attn_quant / lm_head_quant are "none".
+    # the checkpoint's quant kind for the dense MLP projections (shared expert, dense layers), detected the same way
     dense_quant: str = "none"
-    # Weight quantization of the lm_head. "nvfp4" keeps the (untied) FP4 head native (W4A16) --
-    # the bf16 dequant of this ~1 GB matrix was the single largest decode kernel; "none" leaves
-    # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
-    # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
+    # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False

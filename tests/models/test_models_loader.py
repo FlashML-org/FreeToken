@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -181,8 +182,8 @@ def test_stack_expert_tensors_after_all_experts_arrive():
     assert packed[0][1][1].tolist() == [[11.0, 11.0]]
 
 
-def test_stream_moe_expert_sources_writes_layers_into_final_banks():
-    from freetoken.models.loader import stream_moe_expert_sources
+def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
+    from freetoken.moe.expert_pieces import stacked_expert_pieces
 
     config = SimpleNamespace(num_layers=2, num_experts=2)
     tensors = [
@@ -192,16 +193,11 @@ def test_stream_moe_expert_sources_writes_layers_into_final_banks():
         ("model.layers.0.mlp.experts.down_proj", torch.full((2, 4, 3), 10.0)),
     ]
 
-    gate_up_source, down_source = stream_moe_expert_sources(
-        tensors,
-        config,
-        dtype=torch.bfloat16,
-    )
+    pieces = list(stacked_expert_pieces(tensors, config))
 
-    assert len(gate_up_source) == 2 and all(t.shape == (2, 3, 4) for t in gate_up_source)
-    assert len(down_source) == 2 and all(t.shape == (2, 4, 3) for t in down_source)
-    assert all(t.dtype == torch.bfloat16 for t in gate_up_source + down_source)
-    torch.testing.assert_close(gate_up_source[0], torch.full_like(gate_up_source[0], 2.0))
-    torch.testing.assert_close(gate_up_source[1], torch.full_like(gate_up_source[1], 3.0))
-    torch.testing.assert_close(down_source[0], torch.full_like(down_source[0], 10.0))
-    torch.testing.assert_close(down_source[1], torch.full_like(down_source[1], 11.0))
+    assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(1, 0, 2), (0, 0, 2)]
+    assert torch.equal(pieces[0][3]["gate_up"], torch.full((2, 3, 4), 3.0))
+    assert torch.equal(pieces[0][3]["down"], torch.full((2, 4, 3), 11.0))
+    assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
+    with pytest.raises(ValueError, match="Missing MoE expert source layers"):
+        list(stacked_expert_pieces(tensors[:3], config))

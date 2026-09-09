@@ -108,16 +108,18 @@ def resolve_moe_cache_auto(
     prefill_overlap: bool,
     kv_reserve_tokens: int,
     page_size: int,
-    quant_format: str,
+    max_slots: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
+
+    ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
     CUDA-graph/activation headroom (not subtracted here).
     """
     budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
-    max_slots = 992 if quant_format == "nvfp4_marlin" else total_experts
+    max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(
         budget_bytes=budget_bytes,

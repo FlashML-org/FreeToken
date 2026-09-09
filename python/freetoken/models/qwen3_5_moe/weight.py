@@ -7,6 +7,7 @@ from typing import Iterator
 
 import safetensors
 import torch
+from freetoken.layers.quantization import QuantKind
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.models.loader import (
@@ -18,10 +19,7 @@ from freetoken.models.loader import (
     iter_weight_files,
     nvfp4_parts_ct,
 )
-from freetoken.models.nvfp4_banks import (
-    Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
-)
+from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
@@ -191,7 +189,7 @@ def iter_weights(
     if config.expert_quant == "fp8_block":
         # Dense (attn/GDN/shared-expert) weights are always block-fp8; routed experts are
         # yielded here only for the resident path (include_moe_experts=True). Under offload
-        # they are excluded and loaded by setup_offload_expert_banks instead.
+        # they are excluded and loaded from expert pieces instead.
         yield from _iter_weights_fp8(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
@@ -230,7 +228,7 @@ def iter_weights(
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             keyset = set(f.keys())
             for raw_name in f.keys():
-                # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
+                # Per-expert NVFP4 tensors go to the offload cache (expert pieces),
                 # not the dense pass. bf16-base stacked experts (experts.gate_up_proj) have no
                 # ``.mlp.experts.<int>.`` so they are unaffected and still hit _PACKED_EXPERT.
                 if _NVFP4_EXPERT_RE.search(raw_name):
@@ -670,7 +668,7 @@ def iter_weights_parallel(
     Qwen3.5 stores experts pre-fused/pre-stacked per layer (already ``[E, ...]``), so no
     merge/stack -- just rename and yield; bank builder places by name as the serial path."""
     assert include_moe_experts and not include_non_moe, (
-        "qwen3_5_moe parallel reader is experts-only (used by load_moe_expert_sources)"
+        "qwen3_5_moe parallel reader is experts-only (used by the expert piece reader)"
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
@@ -760,7 +758,7 @@ def _iter_weights_fp8(
     q/k/v -> qkv_proj, GDN in_proj_qkv|z -> in_proj_qkvz (fp8) and in_proj_b|a -> in_proj_ba
     (bf16), shared_expert gate|up -> gate_up_proj; Gemma (1+w) norms get +1.
 
-    Routed experts: skipped under offload (loaded by setup_offload_expert_banks). Under the
+    Routed experts: skipped under offload (loaded from expert pieces). Under the
     resident (non-offload) path ``include_moe_experts`` is True -> per-layer stacked fp8
     experts for the Fp8ResidentMoE buffers are yielded too."""
     if get_tp_info().size > 1:
@@ -787,20 +785,40 @@ def _iter_weights_fp8(
         assert not fuse_buf, f"Incomplete fp8 fusions: {sorted(k for k, _ in fuse_buf)}"
 
     if include_moe_experts:
-        # Resident (non-offload) experts: build the stacked fp8 banks once via the shared
-        # parallel reader (pageable host -- the engine copies the per-layer slices to GPU),
-        # then yield per-layer views into the Fp8ResidentMoE buffers.
+        # resident experts: stack the per-expert pieces into the per-layer tensors the resident MoE method declares (pageable host; the engine copies to GPU)
         config = parse_config(cached_load_hf_config(model_path))
         if not config.is_moe:
             return  # dense checkpoint: no routed experts to build as resident banks
-        L, E, H, I, dense = _moe_dims(config)
-        banks = _build_fp8_expert_banks(model_path, config, dummy=False, pin=False)
-        for li in range(L):
+        yield from _resident_fp8_experts(model_path, config)
+
+
+def _resident_fp8_experts(model_path, config):
+    from freetoken.kernel.triton.fp8_block_linear import FP8
+
+    B = 128
+    L, E, H, I, dense = _moe_dims(config)
+    shapes = {
+        "gate_up_proj": ((E, 2 * I, H), FP8),
+        "gate_up_scale_inv": ((E, 2 * I // B, H // B), torch.bfloat16),
+        "down_proj": ((E, H, I), FP8),
+        "down_scale_inv": ((E, H // B, I // B), torch.bfloat16),
+    }
+    layers: dict[int, dict[str, torch.Tensor]] = {}
+    placed = [0] * L
+    for li, e0, e1, piece in iter_expert_pieces(model_path, config, "fp8_block", parallel=None):
+        stack = layers.setdefault(li, {n: torch.empty(shape, dtype=dt) for n, (shape, dt) in shapes.items()})
+        stack["gate_up_proj"][e0:e1, :I] = piece["gate"]
+        stack["gate_up_proj"][e0:e1, I:] = piece["up"]
+        stack["gate_up_scale_inv"][e0:e1, : I // B] = piece["gate_scale"]
+        stack["gate_up_scale_inv"][e0:e1, I // B :] = piece["up_scale"]
+        stack["down_proj"][e0:e1] = piece["down"]
+        stack["down_scale_inv"][e0:e1] = piece["down_scale"]
+        placed[li] += e1 - e0
+        if placed[li] == E:
             pre = f"model.layers.{dense + li}.mlp.experts"
-            yield f"{pre}.gate_up_proj", banks["gate_up"][li]
-            yield f"{pre}.gate_up_scale_inv", banks["gate_up_scale"][li]
-            yield f"{pre}.down_proj", banks["down"][li]
-            yield f"{pre}.down_scale_inv", banks["down_scale"][li]
+            for name, tensor in layers.pop(li).items():
+                yield f"{pre}.{name}", tensor
+    assert not layers, f"incomplete resident fp8 experts for layers {sorted(layers)}"
 
 
 class _ShardReader:
@@ -831,49 +849,6 @@ class _ShardReader:
         self._handles.clear()
 
 
-def setup_offload_expert_banks(
-    model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
-    dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
-    decode_target: str = "gpu", layer_sink=None,
-):
-    """Build the routed-expert offload banks. The qwen3_5_moe module always exports this hook,
-    so it intercepts *every* qwen3_5_moe offload load -- defer non-block-fp8 checkpoints (plain
-    BF16, or modelopt NVFP4) to the generic provider for that ``expert_quant``.
-
-    block-fp8 default ("fp8"): keep experts block-fp8 -- ``gate_up``/``down`` fp8 banks + their
-    bf16 ``weight_scale_inv`` banks (half the host/cache bytes; routed rows are dequantized on
-    demand in ``_expert_gemm``). ``FREETOKEN_FP8_EXPERTS=bf16`` instead dequantizes every expert
-    to bf16 at load (reuses the bf16 offload path; ~2x the memory). Both modes build per-layer
-    :class:`HostBank` banks (pin-after-fill), so the converter's ``layer_sink`` streams each
-    completed layer straight through; ``layer_sink`` also reaches the deferred (nvfp4/none)
-    providers for non-block-fp8 checkpoints.
-
-    ``decode_target`` is forwarded so the cpu backend gets CPU-readable (native, non-
-    GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x."""
-    eq = getattr(model_config, "expert_quant", "none")
-    if eq != "fp8_block":
-        from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
-
-        return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
-                              parallel=parallel, workers=workers, chunk=chunk,
-                              decode_target=decode_target, layer_sink=layer_sink)
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
-    from freetoken.moe.expert_banks import ExpertBanks
-
-    mode = os.environ.get("FREETOKEN_FP8_EXPERTS", "fp8").strip().lower()
-    if mode not in ("fp8", "bf16"):
-        raise ValueError(f"FREETOKEN_FP8_EXPERTS must be 'fp8' or 'bf16', got {mode!r}")
-    sink = None if dummy else layer_sink
-    if mode == "bf16":
-        return _setup_bf16_dequant_banks(model_path, model_config, device, dummy, layer_sink=sink)
-    banks = _build_fp8_expert_banks(
-        model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        pin=True, layer_sink=sink,
-    )
-    return ExpertBanks("fp8_block", banks, streamed=sink is not None)
-
-
 def _moe_dims(model_config):
     L = model_config.num_moe_layers
     return (
@@ -889,214 +864,59 @@ def _expert_reader(model_path, device):
     return _ShardReader(folder, weight_map, device)
 
 
-def _build_fp8_expert_banks(
-    model_path, config, *, dummy: bool, parallel: bool | None = None,
-    workers: int = 8, chunk: int = 8 << 20, pin: bool = True, layer_sink=None,
-) -> dict[str, list[torch.Tensor]]:
-    """The single block-fp8 routed-expert reader, shared by offload (``pin=True`` -> per-layer
-    :class:`HostBank` banks, pin-after-fill / streamable) and resident (``pin=False`` -> plain
-    pageable tensors, never pinned or streamed). Reads via the common chunked multi-threaded
-    O_DIRECT reader (drops page cache, no per-tensor serial overhead) when the experts are
-    scattered per-tensor; else a serial shard fallback. Stacks gate|up -> gate_up into one
-    ``[E, ...]`` tensor per layer per bank.
-
-    Each expert contributes 6 ``place()`` writes per layer ({gate,up,down} x {weight,
-    weight_scale_inv}), so a layer completes after ``E * 6`` writes. ``layer_sink=None``
-    (serving) pins each layer's 4 banks as it completes via an internally-owned
-    :class:`PinPipeline`; ``layer_sink`` given (converter) fires the completion tracker into it
-    instead (nothing pinned; released banks -- caller owns that tradeoff). ``pin=False`` and the
-    CUDA-less host stay on the plain materialize path (no pin, no stream)."""
-    from freetoken.kernel.triton.fp8_block_linear import FP8
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+    """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
+    ``_scale`` (bf16 block ``weight_scale_inv``) companions. Other expert kinds use the generic readers."""
+    if kind is not QuantKind.FP8_BLOCK:
+        return None
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+    from freetoken.moe.expert_pieces import per_expert_pieces
 
-    B = 128
     L, E, H, I, dense = _moe_dims(config)
+    suffix = {"weight": "", "weight_scale_inv": "_scale"}
 
-    # 16B-align the per-expert scale rows (Qwen3.8: down_scale is 20x5 bf16 = 200 B) so the
-    # fused multi-bank copy engages; the GEMMs read scales through explicit strides, so the
-    # padding is inert. Unconditional: one layout per format, shared with the byte formulas.
-    from freetoken.moe.offload_cache import fp8_block_scale_pad as _pad_cols
-
-    specs = {
-        "gate_up": ((E, 2 * I, H), FP8),
-        "gate_up_scale": ((E, 2 * I // B, _pad_cols(2 * I // B, H // B)), torch.bfloat16),
-        "down": ((E, H, I), FP8),
-        "down_scale": ((E, H // B, _pad_cols(H // B, I // B)), torch.bfloat16),
-    }
-    hb = None
-    if pin:
-        from freetoken.moe.host_banks import alloc_layer_banks
-
-        hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (unpinned)
-        banks = {name: [b.tensor for b in hb[name]] for name in specs}
-    else:  # resident dequant source: plain pageable tensors (never pinned / streamed)
-        banks = {name: [torch.empty(shape, dtype=dt) for _ in range(L)] for name, (shape, dt) in specs.items()}
-    gate_up, gate_up_scale, down, down_scale = (
-        banks["gate_up"], banks["gate_up_scale"], banks["down"], banks["down_scale"]
-    )
-    if dummy:
-        for li in range(L):
-            gate_up[li].view(torch.uint8).random_(0, 16)  # small fp8 codes (avoid NaN/inf)
-            down[li].view(torch.uint8).random_(0, 16)
-            gate_up_scale[li].fill_(1.0)
-            down_scale[li].fill_(1.0)
-        if hb is not None and torch.cuda.is_available():
-            from freetoken.moe.host_banks import pin_banks
-
-            pin_banks(hb)  # pin-after-fill (match the other dummies)
-        return banks
-
-    def place(raw_name: str, t: torch.Tensor) -> int | None:
+    def locate(raw_name: str):
         m = _FP8_EXPERT_RE.match(raw_name)
         if m is None:
             return None
-        li, e = int(m["layer"]) - dense, int(m["expert"])
-        proj, kind = m["proj"], m["kind"]
-        if kind == "weight":
-            (gate_up[li][e, :I] if proj == "gate" else
-             gate_up[li][e, I:] if proj == "up" else down[li][e]).copy_(t)
-        else:  # weight_scale_inv
-            (gate_up_scale[li][e, : I // B, : H // B] if proj == "gate" else
-             gate_up_scale[li][e, I // B :, : H // B] if proj == "up" else
-             down_scale[li][e, :, : I // B]).copy_(t)
-        return li
+        li = int(m["layer"]) - dense
+        if not 0 <= li < L:
+            raise ValueError(f"unexpected routed-expert layer in {raw_name}")
+        return li, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
     if parallel is None:
         parallel = experts_scattered(model_path)
+    if parallel:
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: _FP8_EXPERT_RE.match(n) is not None, workers=workers, chunk=chunk
+        )
+        return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
-
-    def _load(sink) -> None:
-        # {gate,up,down} x {weight, weight_scale_inv} per expert -> E*6 writes/layer.
-        tracker = LayerCompletionTracker(E * 6, hb, sink) if sink is not None else None
-        if parallel:
-            for raw_name, t in iter_expert_tensors_parallel(
-                model_path, lambda n: _FP8_EXPERT_RE.match(n) is not None, workers=workers, chunk=chunk
-            ):
-                li = place(raw_name, t)
-                if tracker is not None and li is not None:
-                    tracker.note(li)
-        else:
-            reader = _expert_reader(model_path, torch.device("cpu"))
-            primary = get_tp_info().is_primary()
-            try:
-                for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not primary):
-                    layer = dense + li
-                    for e in range(E):
-                        p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
-                        for proj in ("gate", "up", "down"):
-                            for kind in ("weight", "weight_scale_inv"):
-                                key = f"{p}.{proj}_proj.{kind}"
-                                place(key, reader.get(key))
-                                if tracker is not None:
-                                    tracker.note(li)
-            finally:
-                reader.close()
-
-    if not pin:
-        assert layer_sink is None, "pin=False (resident source) cannot stream to a layer_sink"
-        _load(None)
-    elif layer_sink is not None:
-        _load(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _load(pins)
-    else:
-        _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
-    return banks
-
-
-def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, layer_sink=None):
-    from freetoken.models.weight import dummy_moe_expert_sources
-    from freetoken.moe.expert_banks import ExpertBanks
-
-    if dummy:
-        gate_up, down = dummy_moe_expert_sources(model_config, dtype=torch.bfloat16)
-        return ExpertBanks("bf16", {"gate_up": gate_up, "down": down})
-
-    from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
-
-    L, E, H, I, dense = _moe_dims(model_config)
-    specs = {"gate_up": ((E, 2 * I, H), torch.bfloat16), "down": ((E, H, I), torch.bfloat16)}
-    hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (unpinned)
-    banks = {name: [b.tensor for b in hb[name]] for name in specs}
-    gate_up, down = banks["gate_up"], banks["down"]
-    reader = _expert_reader(model_path, device)
-    primary = get_tp_info().is_primary()
-
-    def _deq(prefix: str) -> torch.Tensor:
-        return dequant_block_fp8(reader.get(f"{prefix}.weight"), reader.get(f"{prefix}.weight_scale_inv"))
-
-    def _load(sink) -> None:
-        # Whole-layer gate_up + down copies -> 2 writes/layer.
-        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
+    def _serial():
+        reader = _expert_reader(model_path, torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading fp8 experts (dequant->bf16)", disable=not primary):
-                layer = dense + li
-                gu_rows = torch.empty(E, 2 * I, H, dtype=torch.bfloat16, device=device)
-                dn_rows = torch.empty(E, H, I, dtype=torch.bfloat16, device=device)
+            for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
-                    p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
-                    gu_rows[e, :I] = _deq(f"{p}.gate_proj")
-                    gu_rows[e, I:] = _deq(f"{p}.up_proj")
-                    dn_rows[e] = _deq(f"{p}.down_proj")
-                gate_up[li].copy_(gu_rows)
-                if tracker is not None:
-                    tracker.note(li)
-                down[li].copy_(dn_rows)
-                if tracker is not None:
-                    tracker.note(li)
+                    base = f"model.language_model.layers.{dense + li}.mlp.experts.{e}"
+                    for proj in ("gate", "up", "down"):
+                        for kind, suf in suffix.items():
+                            name = f"{base}.{proj}_proj.{kind}"
+                            yield name, reader.get(name)
         finally:
             reader.close()
 
-    if layer_sink is not None:
-        _load(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _load(pins)
-    else:
-        _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
-    return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
-) -> dict[str, torch.Tensor]:
-    """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
-    output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
 __all__ = [
     "iter_weights",
     "iter_weights_parallel",
-    "setup_offload_expert_banks",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
+    "iter_expert_pieces",
+    "nvfp4_expert_spec",
 ]

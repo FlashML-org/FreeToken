@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from freetoken.layers.quantization import MoEConfig
 
 from freetoken.attention.base import AttnType
 from freetoken.models.minimax_m3.config import parse_config
@@ -148,7 +149,7 @@ def test_parse_config_full_model(monkeypatch):
     assert cfg.hidden_act_alpha == pytest.approx(1.702)
     assert cfg.swiglu_limit == pytest.approx(7.0)
     assert cfg.expert_quant == "nvfp4"
-    # Default env: MXFP8 dense native, bf16 lm_head.
+    # quantized release: MXFP8 dense native, bf16 lm_head.
     assert cfg.attn_quant == "mxfp8" and cfg.dense_quant == "mxfp8"
     assert cfg.lm_head_quant == "none"
 
@@ -212,13 +213,6 @@ def test_sparse_ablation_env(monkeypatch):
     assert resolve_pool_class(cfg) is MHAKVCache
 
 
-def test_mxfp8_ablation_env(monkeypatch):
-    monkeypatch.setenv("FREETOKEN_M3_ATTN_MXFP8", "0")
-    monkeypatch.setenv("FREETOKEN_M3_MLP_MXFP8", "0")
-    cfg = parse_config(_hf_config())
-    assert cfg.attn_quant == "none" and cfg.dense_quant == "none"
-
-
 def test_registry_resolves_both_architectures():
     from freetoken.models.register import get_model_spec
 
@@ -238,13 +232,19 @@ def test_auto_backend_resolution():
     assert attention_backend_info("m3_sparse").page_sizes == (128,)
 
 
-def test_nvfp4_backend_restricted_to_triton_for_swigluoai():
-    from freetoken.moe.nvfp4_backends import select_nvfp4_backend
+def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):
+    """The borrowed marlin / b12x kernels hard-code silu; swigluoai experts land on the Triton kernels."""
+    from freetoken.kernel import backend
+    from freetoken.layers.quantization import KernelSelectionError, ModelOptConfig, select_kernel
+    from freetoken.layers.quantization.moe import Nvfp4MoEMethod
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    assert select_nvfp4_backend(dev, 3072, "auto", activation="swigluoai") == "triton"
-    with pytest.raises(RuntimeError):
-        select_nvfp4_backend(dev, 3072, "marlin", activation="swigluoai")
+    monkeypatch.setattr(backend, "device_capability", lambda: (12, 0))
+    monkeypatch.setattr(backend, "is_vllm_installed", lambda: True)
+    monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: True)
+    cfg = MoEConfig(num_experts=256, hidden=6144, intermediate=3072, top_k=4, scheme=ModelOptConfig.SCHEMES["NVFP4"], strategy="offload", activation="swigluoai", alpha=1.702, limit=7.0)
+    assert select_kernel(Nvfp4MoEMethod.candidates, "auto", cfg).name == "triton"
+    with pytest.raises(KernelSelectionError):
+        select_kernel(Nvfp4MoEMethod.candidates, "marlin", cfg)
 
 
 def test_expert_source_spec_layer_to_bank():

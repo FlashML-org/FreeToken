@@ -22,10 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator, Tuple
 
 import torch
-from freetoken.distributed import get_tp_info
-from freetoken.kernel.pinned import alloc_pinned_tensor, copy_to_pinned_tensor
-from freetoken.models.loader import stream_moe_expert_sources
-from freetoken.utils import cached_load_hf_config, div_even
+from freetoken.utils import cached_load_hf_config
 
 from .register import _load_attr, get_model_spec
 
@@ -256,74 +253,6 @@ def load_weight(
     )
 
 
-def load_moe_expert_sources(
-    model_path: str,
-    *,
-    dtype: torch.dtype,
-    dummy: bool = False,
-    parallel: bool = False,
-    workers: int = 8,
-    chunk: int = 8 << 20,
-    layer_sink=None,
-) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
-    config, spec = _spec_for_model_path(model_path)
-    if not config.is_moe:
-        raise ValueError(
-            f"{config.architectures[0]} does not provide MoE expert source loading"
-        )
-    if dummy:
-        builder = _model_override(spec, "dummy_moe_expert_sources") or dummy_moe_expert_sources
-        return builder(config, dtype=dtype)
-    if parallel:  # parallel: experts read via the common chunked multi-threaded O_DIRECT reader
-        iter_weights = _model_override(spec, "iter_weights_parallel")
-        if iter_weights is None:  # model has no parallel reader -> let the caller fall back to serial
-            raise NotImplementedError(
-                f"{spec.module} provides no iter_weights_parallel")
-        src = iter_weights(model_path, torch.device("cpu"), include_moe_experts=True,
-                           include_non_moe=False, workers=workers, chunk=chunk)
-    else:
-        iter_weights = _load_attr(spec.module, spec.iter_weights)
-        src = iter_weights(model_path, torch.device("cpu"), include_moe_experts=True,
-                           include_non_moe=False)
-    return stream_moe_expert_sources(
-        src,
-        config,
-        dtype=dtype,
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_moe_expert_sources(
-    model_path: str,
-    model_config,
-    *,
-    dummy: bool = False,
-    parallel: bool = False,
-    workers: int = 8,
-    chunk: int = 8 << 20,
-    layer_sink=None,
-) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed NVFP4 expert source banks.
-    ``parallel=True`` uses the model's ``load_nvfp4_expert_sources_parallel`` (common
-    chunked multi-threaded O_DIRECT reader). ``layer_sink``: see
-    ``models.nvfp4_banks.load_nvfp4_expert_source_banks``; forwarded to the per-model
-    loader, which forwards it on."""
-    _config, spec = _spec_for_model_path(model_path)
-    if dummy:
-        builder = (
-            _model_override(spec, "dummy_nvfp4_expert_sources") or dummy_nvfp4_expert_sources
-        )
-        return builder(model_config)
-    if parallel:
-        loader = _model_override(spec, "load_nvfp4_expert_sources_parallel")
-        if loader is None:  # no parallel reader -> let the caller fall back to serial
-            raise NotImplementedError(
-                f"{spec.module} provides no load_nvfp4_expert_sources_parallel")
-        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink)
-    loader = _load_attr(spec.module, "load_nvfp4_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
-
-
 def load_q4_0_moe_expert_sources(
     model_path: str,
     model_config,
@@ -342,72 +271,8 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
-def _num_moe_layers(config) -> int:
-    value = getattr(config, "num_moe_layers", None)
-    if value is not None:
-        return int(value)
-    return int(config.num_layers) - int(getattr(config, "first_k_dense_replace", 0))
-
-
-def dummy_moe_expert_sources(
-    config, *, dtype: torch.dtype
-) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Random BF16 expert banks shaped like ``stream_moe_expert_sources`` output:
-    one independently allocated ``[num_experts, ...]`` tensor per layer."""
-    num_layers = _num_moe_layers(config)
-    intermediate_size = div_even(config.moe_intermediate_size, get_tp_info().size)
-    gate_up = [
-        torch.randn(config.num_experts, 2 * intermediate_size, config.hidden_size, dtype=dtype)
-        for _ in range(num_layers)
-    ]
-    down = [
-        torch.randn(config.num_experts, config.hidden_size, intermediate_size, dtype=dtype)
-        for _ in range(num_layers)
-    ]
-    if torch.cuda.is_available():
-        gate_up = [copy_to_pinned_tensor(t) for t in gate_up]
-        down = [copy_to_pinned_tensor(t) for t in down]
-    return gate_up, down
-
-
-def dummy_nvfp4_expert_sources(config) -> dict[str, list[torch.Tensor]]:
-    """Random NVFP4 (ModelOpt-layout) expert banks shaped like the real loader's.
-
-    Same pinned allocation and per-layer bank shapes as ``load_nvfp4_expert_sources``,
-    so the repack/offload path downstream is exercised unchanged. Packed codes are
-    random nibbles; block scales are 1.0 and globals small because random e4m3 bytes
-    reach 448 (and include NaN encodings), which would blow up the dummy activations.
-    """
-    num_layers = _num_moe_layers(config)
-    E = config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    fp8 = torch.float8_e4m3fn
-
-    def bank(*shape: int, dtype: torch.dtype) -> list[torch.Tensor]:
-        return [alloc_pinned_tensor(*shape, dtype=dtype) for _ in range(num_layers)]
-
-    sources = {
-        "gate_up_packed": bank(E, 2 * I, H // 2, dtype=torch.uint8),
-        "gate_up_scale": bank(E, 2 * I, H // 16, dtype=fp8),
-        "gate_up_global": bank(E, 2 * I, dtype=torch.float16),
-        "down_packed": bank(E, H, I // 2, dtype=torch.uint8),
-        "down_scale": bank(E, H, I // 16, dtype=fp8),
-        "down_global": bank(E, H, dtype=torch.float16),
-    }
-    for t in sources["gate_up_packed"] + sources["down_packed"]:
-        t.random_(0, 256)
-    for t in sources["gate_up_scale"] + sources["down_scale"]:
-        t.fill_(1.0)
-    for t in sources["gate_up_global"] + sources["down_global"]:
-        t.fill_(0.01)
-    return sources
-
-
 __all__ = [
     "load_weight",
-    "load_moe_expert_sources",
-    "load_nvfp4_moe_expert_sources",
-    "dummy_moe_expert_sources",
-    "dummy_nvfp4_expert_sources",
+    "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

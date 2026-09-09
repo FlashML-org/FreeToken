@@ -20,14 +20,11 @@ accurate than the previous ``weight.to(bf16) * scale`` materialization, which it
 from __future__ import annotations
 
 import functools
-import os
 import re
 
 import torch
 import triton
 import triton.language as tl
-from freetoken.layers import BaseOP
-from freetoken.layers.base import _concat_prefix
 
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
@@ -38,10 +35,6 @@ from freetoken.kernel.triton.e4m3_compat import (
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
-
-# Escape hatch: FREETOKEN_DEBUG_FP8_REF=1 swaps the triton kernels for a pure-torch dequant matmul
-# (numeric reference / A-B debugging). Evaluated once; the kernels are the default.
-_USE_REF = os.environ.get("FREETOKEN_DEBUG_FP8_REF") == "1"
 
 
 # Row-wise _scaled_mm on sm_89 with torch < 2.12 launches its CUTLASS stream-K kernel off the
@@ -55,11 +48,7 @@ def _torch_version() -> tuple[int, int]:
 @functools.cache
 def rowwise_scaled_mm_ok() -> bool:
     """Whether row-wise ``torch._scaled_mm`` may be issued from a side stream on this GPU.
-    Decided once per process, at load (never under graph capture). ``FREETOKEN_FP8_ROWWISE_MM=0/1``
-    forces the answer."""
-    forced = os.environ.get("FREETOKEN_FP8_ROWWISE_MM")
-    if forced in ("0", "1"):
-        return forced == "1"
+    Decided once per process, at load (never under graph capture)."""
     if not torch.cuda.is_available():
         return True
     from freetoken.gpu_select import assigned_visible_gpu
@@ -347,10 +336,7 @@ def fp8_pertensor_linear(
         segments = scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)
         if not _segments_w8a8_ok(segments):
             w8a8 = False  # W8A16 below is exact for any per-row scale and never calls _scaled_mm
-    if _USE_REF:  # numeric-reference fallback (debug / A-B)
-        w = weight.to(x.dtype) * weight_scale.to(x.dtype)[:, None]
-        out = (x.reshape(-1, K) @ w.t()).reshape(*lead, N)
-    elif w8a8:
+    if w8a8:
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
             scale_segments=segments,
@@ -367,67 +353,4 @@ def fp8_pertensor_linear(
 
 
 # ======================================================================================
-# BaseOP linear layers (TP=1, replicated). Buffers: fp8 ``weight`` + fp32 ``weight_scale``.
 # ======================================================================================
-class Fp8PerTensorLinear(BaseOP):
-    """Replicated per-tensor-FP8 linear: fp8-e4m3 ``weight`` ``[out, in]`` + per-row fp32
-    ``weight_scale`` ``[out]`` (a genuine per-tensor weight stores the same scalar in every
-    row; a fused projection stores each part's scalar across its own rows).
-
-    ``input_scale`` (modelopt's calibrated per-tensor activation scale) is optional: when the
-    checkpoint ships it, batched decode runs W8A8 through cuBLASLt; when it does not (models
-    that quantize to fp8 at load, e.g. glm_moe_dsa), every batch size stays W8A16."""
-
-    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.empty(out_features, in_features, dtype=FP8)
-        self.weight_scale = torch.empty(out_features, dtype=torch.float32)
-        self.bias = torch.empty(out_features) if has_bias else None
-        # Set from the state dict when present. Left as None (not a tensor) so BaseOP's
-        # reflective state_dict/load_state_dict skip it entirely on checkpoints without one.
-        self.input_scale: torch.Tensor | None = None
-        self._uniform_scale = False
-        self._scale_segments: list[tuple[int, int]] | None = None
-
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        # Taken out before BaseOP's reflective pass (so it is not an "unexpected key") and
-        # put back after (so that pass does not try to pop it a second time on a reload).
-        input_scale = state_dict.pop(_concat_prefix(prefix, "input_scale"), None)
-        self.input_scale = None
-        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
-        self.input_scale = input_scale
-        # Tensor-wise scaling needs one scalar for the whole weight; a fused projection is
-        # only piecewise-constant, so decide once here rather than syncing on every forward.
-        scale = self.weight_scale
-        self._uniform_scale = bool((scale == scale[0]).all().item())
-        # Segments for the per-part path; decide row-wise safety now, not under graph capture.
-        self._scale_segments = None if self._uniform_scale else weight_scale_segments(scale)
-        if self.input_scale is not None and not self._uniform_scale:
-            rowwise_scaled_mm_ok()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return fp8_pertensor_linear(
-            x, self.weight, self.weight_scale, self.bias,
-            self.input_scale, self._uniform_scale, scale_segments=self._scale_segments,
-        )
-
-
-class Fp8PerTensorColMerged(Fp8PerTensorLinear):
-    """Column-merged per-tensor-FP8 linear (drop-in for ``LinearColParallelMerged`` at TP=1):
-    one fp8 weight concatenating several projections along the output dim; the caller splits
-    the bf16 output by ``output_sizes`` as before."""
-
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
-        self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
-
-
-__all__ = [
-    "FP8",
-    "Fp8PerTensorLinear",
-    "Fp8PerTensorColMerged",
-    "fp8_pertensor_linear",
-    "rowwise_scaled_mm_ok",
-    "weight_scale_segments",
-]
