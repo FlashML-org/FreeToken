@@ -53,6 +53,7 @@ _PLE_SHARD_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+_PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
 # Zero-centered Qwen4ExpTextRMSNorm weights, loaded RAW: GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm
 # and the vendored grouped_gemma_rmsnorm all apply (1+w) at runtime in fp32, so folding the +1 into
@@ -220,6 +221,39 @@ def _ple_table_files(folder: str) -> list[str]:
         weight_map = json.load(fh)["weight_map"]
     files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
     return sorted(os.path.join(folder, shard) for shard in files)
+
+
+def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
+    """Write the PLE n-gram table tensors, and only those, into ``ple-table-*.safetensors`` next to an FTW checkpoint.
+
+    The table is served from safetensors files in the checkpoint dir (see load_ple_table), not from FTW entries."""
+    from safetensors.torch import save_file
+
+    folder = download_hf_weight(model_path)
+    written: list[str] = []
+    batch: dict[str, torch.Tensor] = {}
+    size = 0
+
+    def flush():
+        nonlocal batch, size
+        if batch:
+            name = f"ple-table-{len(written):05d}.safetensors"
+            save_file(batch, os.path.join(out_dir, name))
+            written.append(name)
+            batch, size = {}, 0
+
+    for path in _ple_table_files(folder):
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if _PLE_TABLE_INFIX not in key:
+                    continue
+                t = f.get_tensor(key)
+                batch[key] = t
+                size += t.numel() * t.element_size()
+                if size >= _PLE_FILE_BYTES:
+                    flush()
+    flush()
+    return written
 
 
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,

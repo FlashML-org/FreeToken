@@ -226,6 +226,15 @@ def convert_checkpoint(
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
+    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
+    except (AttributeError, KeyError, ValueError):
+        side_hook = None
+    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
+
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
     num_layers = None
@@ -308,6 +317,7 @@ def convert_checkpoint(
         "expert_bank_num_layers": num_layers,
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
+        "side_files": side_files,
     })
     return index
 

@@ -12,6 +12,7 @@ Contracts shared across modules (do not rename):
 from .config import parse_config
 from .model import Qwen4ExpForCausalLM
 from .weight import (
+    ftw_side_files,
     nvfp4_expert_spec,
     iter_weights,
     load_ple_table,
@@ -22,6 +23,7 @@ from .weight import (
 from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces
 
 __all__ = [
+    "ftw_side_files",
     "nvfp4_expert_spec",
     "Qwen4ExpForCausalLM",
     "iter_weights",
