@@ -600,6 +600,25 @@ def recommend(cpu_bw_gbs: float, pcie_bw_gbs: float, threshold: float = 2.0) -> 
     return "hybrid" if cpu_bw_gbs > threshold * pcie_bw_gbs else "offload"
 
 
+def verdict(cpu_runs: list[float], pcie_runs: list[float],
+            threshold: float = 2.0) -> tuple[str, bool, tuple[float, float]]:
+    """``(backend, confident, (ratio_lo, ratio_hi))`` from repeated measurements.
+
+    A single ratio hides how repeatable it is. Some formats are stable to a percent or
+    two; a compute-bound kernel on a busy box can swing wide enough to land on both sides
+    of ``threshold`` from one run to the next, so its "recommendation" is a coin flip
+    presented as a fact. Bound the ratio by the worst and best pairing actually observed:
+    when that interval clears ``threshold`` the call is real, and when it straddles it we
+    say so and fall back to ``offload`` -- the backend that always works, and the way the
+    profile reader already resolves ambiguity.
+    """
+    lo = min(cpu_runs) / max(pcie_runs)
+    hi = max(cpu_runs) / min(pcie_runs)
+    confident = bool(lo > threshold or hi <= threshold)
+    median = recommend(statistics.median(cpu_runs), statistics.median(pcie_runs), threshold)
+    return (median if confident else "offload"), confident, (lo, hi)
+
+
 # ================================ orchestration ================================
 
 
@@ -608,6 +627,7 @@ def _note(entry: dict, msg: str) -> None:
 
 
 def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float,
+                  reps: int,
                   cpu_threads: int, cpu_iters: int, pcie_iters: int,
                   isas: list[str] | None = None) -> dict:
     """Per (workload, format): real PCIe gather + real CPU MoE GEMV + hybrid/offload verdict.
@@ -623,8 +643,11 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         "note": None,
     }
     try:
-        g = measure_pcie_gather_bw(fmt, wl, device, pcie_iters)
-        entry["pcie_gather_gbs"] = round(g["bw_gbs"], 2)
+        runs = [measure_pcie_gather_bw(fmt, wl, device, pcie_iters) for _ in range(reps)]
+        bws = [r["bw_gbs"] for r in runs]
+        g = runs[-1]
+        entry["pcie_gather_gbs"] = round(statistics.median(bws), 2)
+        entry["pcie_gather_gbs_runs"] = [round(b, 2) for b in bws]
         entry["expert_bytes"] = g["expert_bytes"]
         entry["synth_experts"] = g["synth_experts"]
     except (ImportError, RuntimeError) as e:
@@ -637,8 +660,13 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         _note(entry, f"CPU MoE has no {fmt} weight path; hybrid unavailable")
     else:
         try:
-            c = measure_cpu_moe_bw(fmt, wl, cpu_iters, cpu_threads, isas=isas)
-            entry["cpu_moe_gbs"] = c["bw_gbs"]  # auto/best tier (what production runs)
+            cruns = [measure_cpu_moe_bw(fmt, wl, cpu_iters, cpu_threads, isas=isas)
+                     for _ in range(reps)]
+            cbws = [r["bw_gbs"] for r in cruns]
+            c = cruns[-1]
+            # auto/best tier (what production runs), median over reps
+            entry["cpu_moe_gbs"] = round(statistics.median(cbws), 2)
+            entry["cpu_moe_gbs_runs"] = [round(b, 2) for b in cbws]
             entry["cpu_moe_isa"] = c["isa"]
             if isas:  # a sweep was requested -> keep the per-tier breakdown
                 entry["isa_sweep"] = c["isa_sweep"]
@@ -659,7 +687,22 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
     cpu_g, pcie_g = entry["cpu_moe_gbs"], entry["pcie_gather_gbs"]
     if cpu_g is not None and pcie_g:  # pcie_g truthy also rules out a div-by-zero
         entry["ratio"] = round(cpu_g / pcie_g, 3)
-        entry["recommended"] = recommend(cpu_g, pcie_g, threshold)
+        # Worst/best case ratio actually observed. A format whose spread straddles the
+        # threshold gets a different verdict run to run (mxfp4 was measured anywhere from
+        # 19 to 71 GB/s on one machine, flipping hybrid<->offload), and a single number
+        # hides that entirely. Report the interval and only commit when it clears.
+        cbs = entry.get("cpu_moe_gbs_runs") or [cpu_g]
+        pbs = entry.get("pcie_gather_gbs_runs") or [pcie_g]
+        pick, confident, (lo, hi) = verdict(cbs, pbs, threshold)
+        entry["ratio_range"] = [round(lo, 3), round(hi, 3)]
+        entry["reps"] = reps
+        entry["confident"] = confident
+        entry["recommended"] = pick
+        if not confident:
+            _note(entry, f"ratio spans the {threshold}x threshold across {reps} runs "
+                         f"({lo:.2f}-{hi:.2f}x): too noisy to call, resolving to offload. "
+                         f"Confirm with an end-to-end tokens/s comparison before "
+                         f"forcing --moe-backend hybrid.")
         # Both sides work standalone -> also measure them contended (concurrently). This
         # pair sets the hybrid backend's fetch split (load_hybrid_fetch_fraction); the
         # hybrid-vs-offload verdict above stays on the standalone numbers.
@@ -702,6 +745,7 @@ def run_benchbw(
     pcie_iters: int = 30,
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
+    reps: int = 3,
 ) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -753,7 +797,8 @@ def run_benchbw(
             _prog(f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}")
             logger.info(f"benchbw: dtype {_FORMAT_DISPLAY.get(fmt, fmt)} real kernels ...")
             dtypes_out[fmt] = _bench_format(
-                fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas
+                fmt, wl, device, threshold, reps, cpu_threads, kernel_cpu_iters,
+                kernel_pcie_iters, isas
             )
             done += 1
         # optional per-model detail (--model): specific geometries, unchanged.
@@ -765,7 +810,8 @@ def run_benchbw(
                 _prog(f"{mname}:{_FORMAT_DISPLAY.get(fmt, fmt)}")
                 logger.info(f"benchbw: {mname}/{fmt} real kernels ...")
                 kernels[fmt] = _bench_format(
-                    fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas
+                    fmt, wl, device, threshold, reps, cpu_threads, kernel_cpu_iters,
+                kernel_pcie_iters, isas
                 )
                 done += 1
             workloads_out[mname] = {
@@ -820,8 +866,15 @@ def _print_kernels(kernels: dict, iw: int) -> None:
         disp = _FORMAT_DISPLAY.get(fmt, fmt)
         eb = f"{e['expert_bytes'] / 2**20:.2f} MB" if e["expert_bytes"] else "n/a"
         ratio = f"{e['ratio']:.2f}x" if e["ratio"] is not None else "—"
+        verdict = e["recommended"]
+        if e.get("confident") is False:
+            verdict = f"{verdict} (unstable)"
         print(f"    {disp:<8} {eb:>9} {_gbs(e['cpu_moe_gbs'])} {_gbs(e['pcie_gather_gbs'])} "
-              f"{ratio:>9}  {e['recommended']}")
+              f"{ratio:>9}  {verdict}")
+        rr = e.get("ratio_range")
+        if rr and e.get("reps", 1) > 1 and rr[0] != rr[1]:
+            print(f"       {e['reps']} runs: CPU-MoE {min(e['cpu_moe_gbs_runs']):.1f}-"
+                  f"{max(e['cpu_moe_gbs_runs']):.1f}, ratio {rr[0]:.2f}-{rr[1]:.2f}x")
         c_ov, p_ov = e.get("cpu_moe_overlap_gbs"), e.get("pcie_gather_overlap_gbs")
         if c_ov and p_ov:
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
@@ -958,6 +1011,10 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
     p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
     p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
+    p.add_argument("--reps", type=_positive_int, default=3,
+                   help="repeat each kernel measurement this many times; the verdict uses "
+                        "the median and is withheld when the spread straddles --threshold "
+                        "(default 3)")
     p.add_argument("--kernel-cpu-iters", type=_positive_int, default=64,
                    help="CPU MoE decode steps to time")
     p.add_argument("--kernel-pcie-iters", type=_positive_int, default=20,
@@ -984,6 +1041,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
+            reps=ns.reps,
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")
