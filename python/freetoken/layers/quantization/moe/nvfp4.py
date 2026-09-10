@@ -41,14 +41,20 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        # tp_ok: the source stream is sliced along the intermediate axis per rank
+        # (nvfp4_banks._tp_shard) and this kernel sizes its banks from
+        # cfg.local_intermediate, so a rank holds and reads only its own half. The routed
+        # output is then a partial sum, which the MoE layer reduces (_maybe_all_reduce, or
+        # one combined all-reduce in qwen4_exp's block). marlin and b12x stay off: their
+        # pack() repacks the rows and neither has been checked against a sharded bank.
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -61,7 +67,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, cfg.local_intermediate))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
@@ -241,7 +247,7 @@ class MarlinNvfp4MoEKernel(MoEKernel):
         return (8, 0) <= backend.device_capability() < (10, 0)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((h // GROUP, 4 * i), torch.int32),
             "gate_up_scale": BankSpec((h // GROUP, 2 * i), FP8),
@@ -252,7 +258,7 @@ class MarlinNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         device = torch.device("cuda")
         gu, gus, gug = fused_piece(pieces, "gate_up"), fused_piece(pieces, "gate_up_scale"), fused_global(pieces, i)
         dn, dns, dng = pieces["down"], pieces["down_scale"], global_rows(pieces["down_global"], h)
@@ -503,7 +509,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     def worth_it(self, cfg: MoEConfig) -> bool:
         # NOTE: never auto-selected. flashinfer's cute launcher indexes each bank with int32 element offsets, so the GPU slot cache is capped at (2^31 - 1) / elements-per-slot (about 1000 slots for GLM-5.3-Flash's 12960 experts); until flashinfer lifts that, b12x stays behind triton in the table; the selection does not weigh the cap, cache-auto clamps to slot_limit() and OffloadMoeCache refuses a larger cache.
-        return cfg.intermediate >= B12X_MIN_INTERMEDIATE
+        return cfg.local_intermediate >= B12X_MIN_INTERMEDIATE
 
     def slot_limit(self, cfg: MoEConfig) -> int | None:
         # the cute launcher indexes each bank with int32 element offsets
@@ -512,7 +518,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         # flashinfer's prepared tiles: the Marlin shapes, byte-identical to the native rows
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((h // GROUP, 4 * i), torch.int32),
             "gate_up_scale": BankSpec((h // GROUP, 2 * i), FP8),
@@ -525,7 +531,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import prepare_w4a16_packed_weights
 
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         device = torch.device("cuda")
         gu = fused_piece(pieces, "gate_up").to(device)
         gug = fused_global(pieces, i).to(device).float()
