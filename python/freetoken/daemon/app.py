@@ -13,24 +13,53 @@ import collections
 import functools
 import json
 import os
+import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .accounting import AccountingOutboxError, AccountingPrepareError
 from .serve_manager import Conflict
 from .version import DAEMON_VERSION
 
 
+
+
+
 class StartBody(BaseModel):
     model: str
-    port: int | None = None
-    args: list[str] = []
+    port: int | None = Field(default=None, ge=1, le=65535)
+    args: list[str] = Field(default_factory=list)
 
+
+class StopBody(BaseModel):
+    force: bool = False
+
+
+class SwitchBody(StartBody):
+    force: bool = False
+
+
+class AccountingAckBody(BaseModel):
+    receiptId: str
+
+
+class CheckpointBody(BaseModel):
+    id: str
+    args: list[str] = Field(default_factory=list)
+
+
+class CancelBody(BaseModel):
+    id: str
+
+
+class BenchBody(BaseModel):
+    # Raw `ft bench bw` args (e.g. ["--dtype", "nvfp4", "--threshold", "2.5"]); empty = all dtypes.
+    args: list[str] = Field(default_factory=list)
 
 class StopBody(BaseModel):
     force: bool = False
@@ -111,6 +140,25 @@ def _parse_ftbench(line: str) -> dict | None:
         return {"done": int(parts[1]), "total": int(parts[2]), "label": parts[3]}
     except ValueError:
         return None
+
+
+async def _terminate_and_reap_bench_child(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace_s)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    await proc.wait()
 
 
 def build_app(
@@ -350,7 +398,13 @@ def build_app(
             argv = [sys.executable, "-m", "freetoken.cli", "bench", "bw", *body.args]
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                    # Own process group: lets us tear down the whole bench tree (it may
+                    # spawn its own children) when the client disconnects mid-stream.
+                    start_new_session=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 yield _bench_sse("error", {"message": f"failed to spawn bench: {exc}"})
@@ -358,16 +412,24 @@ def build_app(
             tail: collections.deque = collections.deque(maxlen=8)  # last non-progress lines (errors)
             out_path: str | None = None
             assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip()
-                prog = _parse_ftbench(line)
-                if prog is not None:
-                    yield _bench_sse("progress", prog)
-                elif line.startswith("FTBENCH_OUT "):
-                    out_path = line[len("FTBENCH_OUT "):]
-                elif line:
-                    tail.append(line)
-            rc = await proc.wait()
+            rc: int | None = None
+            try:
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    prog = _parse_ftbench(line)
+                    if prog is not None:
+                        yield _bench_sse("progress", prog)
+                    elif line.startswith("FTBENCH_OUT "):
+                        out_path = line[len("FTBENCH_OUT "):]
+                    elif line:
+                        tail.append(line)
+                rc = await proc.wait()
+            finally:
+                # Client disconnect / task cancellation unwinds here; never orphan the
+                # bench child: terminate, 5s grace, kill escalation, always reap.
+                await asyncio.shield(_terminate_and_reap_bench_child(proc))
+            if rc is None:
+                return
             if rc != 0:
                 yield _bench_sse("error", {"message": "\n".join(tail) or f"bench exited {rc}"})
                 return
