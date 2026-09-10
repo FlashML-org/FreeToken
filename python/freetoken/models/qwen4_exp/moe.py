@@ -25,8 +25,10 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     is reduced once (one all-reduce per MoE layer instead of two).
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int | None = None) -> None:
-        super().__init__(config, layer_id=layer_id)
+    def __init__(
+        self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""
+    ) -> None:
+        super().__init__(config, layer_id=layer_id, prefix=prefix)
         self._comm = DistributedCommunicator()
         self._tp_size = get_tp_info().size
 
