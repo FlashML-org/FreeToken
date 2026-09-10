@@ -16,7 +16,7 @@ import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 
 import safetensors
 import torch
@@ -45,7 +45,10 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
+# ``.weight_scale_inv`` is NOT here: it is the 128x128 block-FP8 scale, and whether it is
+# dropped or emitted depends on how the module it belongs to is served (see ``_rename``).
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+_SCALE_INV = ".weight_scale_inv"
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -98,15 +101,25 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
-def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+def _rename(raw_name: str, is_block_fp8: Callable[[str], bool] | None = None) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``is_block_fp8`` answers, for one checkpoint module name, whether the model serves it as
+    block-FP8. A ``weight_scale_inv`` is kept only for those modules -- their linears declare
+    the matching buffer -- and dropped for every other module, whose weight this reader
+    dequantizes to bf16 instead (see :func:`_load_maybe_block_fp8`). Emitting it either way
+    would trip ``load_state_dict``'s strict unexpected-key check.
+    """
     if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
         return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
-    if raw_name.endswith(_SCALE_SUFFIXES):
+    if raw_name.endswith(_SCALE_INV):
+        if is_block_fp8 is None or not is_block_fp8(raw_name[: -len(_SCALE_INV)]):
+            return None
+    elif raw_name.endswith(_SCALE_SUFFIXES):
         return None
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
@@ -116,10 +129,11 @@ def _rename(raw_name: str) -> str | None:
 
 
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
+    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]],
+    table: dict[str, tuple[tuple[str, ...], int]] | None = None,
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """Buffer a fusion part; return the merged ``(name, tensor)`` once all parts arrive, ``()`` while incomplete, ``None`` if ``name`` is not a fusion part."""
-    for fused_suffix, (parts, pad_to) in _FUSIONS.items():
+    for fused_suffix, (parts, pad_to) in (table or _FUSIONS).items():
         for idx, part in enumerate(parts):
             if not name.endswith(part):
                 continue
@@ -137,6 +151,128 @@ def _try_fuse(
     return None
 
 
+def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
+    """Load ``raw_name``, dequantizing 128x128 block-FP8 to bf16 when a sibling
+    ``weight_scale_inv`` sits in the same shard; pass everything else through unchanged.
+
+    The official releases keep the dense attn/GDN/HC/PLE projections bf16 (they sit on the
+    quant ``ignore`` list), but a community requant can store them as block-FP8 without saying
+    so per module -- and an undeclared module gets no scheme, so the model builds a plain bf16
+    linear for it. Dequantizing here is what keeps the two agreeing. Without it those weights
+    reach ``_try_fuse`` as fp8 and die on the fp8-with-bf16 ``torch.cat``.
+    """
+    tensor = f.get_tensor(raw_name)
+    if raw_name.endswith(".weight") and raw_name[: -len(".weight")] + _SCALE_INV in keyset:
+        from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+        scale = f.get_tensor(raw_name[: -len(".weight")] + _SCALE_INV)
+        return dequant_block_fp8(tensor, scale).to(torch.bfloat16)
+    return tensor
+
+
+# Serving the dense side natively as block-FP8 changes which buffers the model expects. The
+# four-way in_proj fusion cannot survive it: b|a are num_v_heads rows wide, and
+# Fp8BlockLinearMethod requires every output size to be a whole number of 128-row blocks, so
+# gdn.py splits the projection into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM -- the split
+# sglang and vLLM use. Each fp8 group fuses its ``weight_scale_inv`` on the same axis as its
+# ``weight``; every fp8 part is a whole number of 128-row blocks (10240|6144 for qkv|z,
+# 12288|512|512 for q|k|v), so the per-block scales concatenate exactly alongside the rows
+# they describe.
+_SPLIT_FP8: dict[str, tuple[str, tuple[str, ...]]] = {
+    "in_proj": (
+        ".linear_attn.in_proj_qkvz",
+        (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z"),
+    ),
+    "qkv_proj": (
+        ".self_attn.qkv_proj",
+        (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
+    ),
+}
+_SPLIT_BF16: dict[str, tuple[str, tuple[str, ...]]] = {
+    "in_proj": (
+        ".linear_attn.in_proj_ba",
+        (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+    ),
+}
+# The bf16 fusion each group replaces when it is served natively.
+_SPLIT_REPLACES = {
+    "in_proj": ".linear_attn.in_proj.weight",
+    "qkv_proj": ".self_attn.qkv_proj.weight",
+}
+# (layer type carrying the group, the attribute path the model builds for it). The probe asks
+# the QuantConfig the same question gdn.py and attention.py ask when they build the linear.
+_SPLIT_PROBE = {
+    "in_proj": ("linear_attention", "linear_attn.in_proj_qkvz"),
+    "qkv_proj": ("full_attention", "self_attn.qkv_proj"),
+}
+
+
+def _fusions_for(groups: frozenset[str]) -> dict[str, tuple[tuple[str, ...], int]]:
+    """``_FUSIONS`` with each block-FP8 group replaced by its split, weights and scales."""
+    table = {k: v for k, v in _FUSIONS.items() if k not in {_SPLIT_REPLACES[g] for g in groups}}
+    for group in groups:
+        fused, parts = _SPLIT_FP8[group]
+        for kind in (".weight", _SCALE_INV):
+            table[fused + kind] = (tuple(part + kind for part in parts), 0)
+        if group in _SPLIT_BF16:
+            fused_bf16, parts_bf16 = _SPLIT_BF16[group]
+            table[fused_bf16 + ".weight"] = (tuple(part + ".weight" for part in parts_bf16), 0)
+    return table
+
+
+def _declares_quant(model_path: str) -> bool:
+    """Whether a local checkpoint directory carries any quantization declaration at all."""
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True  # ModelOpt < 0.41 keeps it only in the sidecar
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    text = config.get("text_config") or {}
+    return bool(config.get("quantization_config") or text.get("quantization_config"))
+
+
+def _block_fp8_dense(model_path: str) -> tuple[frozenset[str], Callable[[str], bool]]:
+    """Which fused attention groups the checkpoint declares as block-FP8, plus a predicate
+    over checkpoint module names for the un-fused ones (o_proj, out_proj, shared expert).
+
+    Both read the family's own :class:`QuantConfig`, built from the same ModelSpec name map
+    the engine hands the model, so the buffers this reader emits cannot disagree with the
+    modules the model built. That is not just tidiness: the block-FP8 linears have no
+    tensor-parallel variant, so a rank that downgrades must downgrade on both sides at once.
+    """
+    from freetoken.engine.config import checkpoint_quant_config
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.qwen4_exp.config import _layer_types
+    from freetoken.models.register import get_model_spec
+    from freetoken.utils import cached_load_hf_config
+
+    # A local checkpoint that declares no quantization has nothing to serve natively, and
+    # answering that from the file avoids the full AutoConfig resolution behind
+    # cached_load_hf_config -- which the reader's own fixtures cannot satisfy, since they
+    # write safetensors shards and no config.json. Non-local paths take the full route.
+    if os.path.isdir(model_path) and not _declares_quant(model_path):
+        return frozenset(), lambda _name: False
+
+    hf_config = cached_load_hf_config(model_path)
+    spec = get_model_spec(hf_config.architectures[0])
+    quant = checkpoint_quant_config(model_path, hf_config, spec)
+    if quant is None:
+        return frozenset(), lambda _name: False
+
+    def is_block(scheme) -> bool:
+        return scheme is not None and scheme.kind is QuantKind.FP8_BLOCK
+
+    layer_types = _layer_types(getattr(hf_config, "text_config", hf_config))
+    groups = set()
+    for group, (layer_type, leaf) in _SPLIT_PROBE.items():
+        layer_id = next((i for i, t in enumerate(layer_types) if t == layer_type), None)
+        if layer_id is not None and is_block(quant.scheme_for(f"model.layers.{layer_id}.{leaf}")):
+            groups.add(group)
+    return frozenset(groups), lambda name: is_block(quant.scheme_for_name(name))
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -147,10 +283,13 @@ def iter_weights(
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the
-    model's state dict minus the routed experts. Nothing here is quantized: every release's skip
-    list (modelopt ``ignore``, fp8 ``modules_to_not_convert``) covers everything except those experts,
-    so attention, GDN, HC, PLE, the shared expert and lm_head are all plain bf16 (the n-gram hash
-    constants stay int64). Fusions:
+    model's state dict minus the routed experts. Most releases quantize only the routed experts --
+    every skip list (modelopt ``ignore``, fp8 ``modules_to_not_convert``) covers the rest -- so
+    attention, GDN, HC, PLE, the shared expert and lm_head arrive as plain bf16 (the n-gram hash
+    constants stay int64). A modelopt ``MIXED_PRECISION`` build can instead declare the dense
+    attention and GDN projections ``FP8_PB_WO``; the model then builds block-FP8 linears for them,
+    so their weights and ``weight_scale_inv`` pass through un-dequantized and the in_proj fusion
+    splits to match (see :func:`_block_fp8_dense`). Fusions:
     attention q|k|v -> ``qkv_proj``, GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, shared-expert
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
@@ -163,6 +302,9 @@ def iter_weights(
     if not include_non_moe:
         return
 
+    # A declared block-FP8 dense side is served natively; anything else keeps the dequant path.
+    groups, is_block_fp8 = _block_fp8_dense(model_path)
+    fusions = _fusions_for(groups) if groups else _FUSIONS
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
@@ -170,12 +312,17 @@ def iter_weights(
         disable=not get_tp_info().is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, is_block_fp8)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
-                fused = _try_fuse(name, tensor, fuse_buf)
+                tensor = (
+                    f.get_tensor(raw_name)
+                    if is_block_fp8(raw_name.rpartition(".")[0])
+                    else _load_maybe_block_fp8(f, raw_name, keyset)
+                )
+                fused = _try_fuse(name, tensor, fuse_buf, fusions)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
