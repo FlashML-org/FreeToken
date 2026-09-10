@@ -315,11 +315,16 @@ def test_decode_triton_attention_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
-@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), [(24, 4), (20, 4), (28, 4)])
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads"),
+    [(24, 4), (20, 4), (28, 4), (48, 2), (40, 2), (80, 4)],
+)
 def test_decode_triton_attention_non_pow2_group(num_q_heads: int, num_kv_heads: int):
-    """GQA groups that are not a power of two (e.g. Qwen3.6-27B's 24/4 == 6). The grouped
-    decode tiles the head axis to a power of two (tl.arange constraint) and masks the extra
-    lanes; the result must still match the reference."""
+    """Non-power-of-two GQA groups, including groups that span multiple 16-head tiles.
+
+    The grouped decode must mask a group's partial tail tile without assigning its lanes to
+    the next KV head.
+    """
     from freetoken.kernel.triton.attention import decode_paged_attention
 
     torch.manual_seed(3)
