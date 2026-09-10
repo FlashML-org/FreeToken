@@ -110,6 +110,23 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+def use_fp8_lmhead(config: ModelConfig) -> bool:
+    """Whether to build/load the lm_head as load-time per-tensor FP8.
+
+    The MODEL BUILDER and the WEIGHT READER must agree exactly: if one says yes and the
+    other no, the state dict gains or loses ``lm_head.weight_scale`` and load fails. They
+    used to test this separately and drifted. Conditions: the operator asked
+    (FREETOKEN_FP8_LMHEAD=1), the head is untied (a tied head shares the bf16 embedding
+    table), and the checkpoint declares no scheme OF ITS OWN for lm_head -- a quantized head
+    goes through QuantConfig instead. Note it is the lm_head scheme that matters, not whether
+    the checkpoint has a QuantConfig at all: this model ships NVFP4 experts with lm_head in
+    the modelopt ignore list."""
+    if not fp8_lmhead_enabled() or config.tie_word_embeddings:
+        return False
+    quant = getattr(config, "quant", None)
+    return quant is None or quant.scheme_for("lm_head") is None
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 

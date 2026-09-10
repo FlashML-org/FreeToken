@@ -266,17 +266,18 @@ def iter_weights(
 
     from freetoken.models.config import fp8_dense_enabled, fp8_lmhead_enabled
 
-    from .config import parse_config
+    from .config import parse_config, use_fp8_lmhead
 
     tp = get_tp_info()
     # The sharding geometry (and the fp8 split) need the HF config; TP=1 bf16 never does, so
     # keep that path free of a config load (synthetic test checkpoints carry no model_type).
-    lmhead = fp8_lmhead_enabled()
     config = (
         parse_config(cached_load_hf_config(model_path))
-        if tp.size > 1 or fp8_dense_enabled() or lmhead
+        if tp.size > 1 or fp8_dense_enabled() or fp8_lmhead_enabled()
         else None
     )
+    # the SAME predicate the model builder uses, so the emitted keys always match its slots
+    lmhead = config is not None and use_fp8_lmhead(config)
     fp8 = config is not None and config.attn_quant == "fp8_dynamic"
     if fp8:
         logger.info(

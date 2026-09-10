@@ -21,7 +21,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.models.config import fp8_lmhead_enabled
+from .config import use_fp8_lmhead
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -130,7 +130,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        if fp8_lmhead_enabled() and not config.tie_word_embeddings and config.quant is None:
+        if use_fp8_lmhead(config):
             # Load-time per-tensor FP8 head, for a checkpoint that ships lm_head unquantized.
             # A checkpoint that declares its own scheme goes through QuantConfig instead.
             from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
