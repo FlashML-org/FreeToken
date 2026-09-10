@@ -263,6 +263,21 @@ def _ple_table_files(folder: str) -> list[str]:
     """Shards holding a piece of the n-gram table, from the index when there is one."""
     index = os.path.join(folder, "model.safetensors.index.json")
     if not os.path.exists(index):
+        # FTW checkpoints carry no safetensors index -- and the converter never
+        # writes the PLE table (iter_weights skips ngram_embedding.*). Stream it
+        # from the conversion source recorded in the FTW index instead.
+        from freetoken.checkpoint.ftw import INDEX_NAME, is_ftw_checkpoint
+
+        if is_ftw_checkpoint(folder):
+            with open(os.path.join(folder, INDEX_NAME), encoding="utf-8") as fh:
+                src = json.load(fh).get("source_model_path")
+            if src and os.path.isdir(src):
+                return _ple_table_files(src)
+            raise ValueError(
+                f"FTW checkpoint {folder} holds no PLE n-gram table and its "
+                f"conversion source {src!r} is missing; re-convert with the "
+                "source present or serve the safetensors checkpoint directly"
+            )
         return sorted(iter_weight_files(folder))
     with open(index, encoding="utf-8") as fh:
         weight_map = json.load(fh)["weight_map"]
