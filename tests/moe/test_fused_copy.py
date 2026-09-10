@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import freetoken.moe.offload_cache as offload_cache
 from freetoken.moe.offload_cache import _BANK_SCHEMAS, OffloadMoeCache
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -40,7 +41,10 @@ def _build_cache(num_layers, num_experts, cache_size):
 @CUDA
 @pytest.mark.slow
 @pytest.mark.parametrize("num_indices", [0, 1, 4, 8])
-def test_fused_copy_matches_per_bank(num_indices):
+def test_fused_copy_matches_per_bank(num_indices, monkeypatch):
+    # Exercise the fused kernel explicitly even on Windows/ROCm, where serving now
+    # defaults to the stable per-bank path.
+    monkeypatch.setattr(offload_cache, "_FUSED_COPY", True)
     num_layers, num_experts, cache_size = 8, 8, 32
     layer_id = 3  # exercise a non-zero per-layer source selection, not just layer 0
     cache = _build_cache(num_layers, num_experts, cache_size)
@@ -74,3 +78,37 @@ def test_fused_copy_matches_per_bank(num_indices):
 
     for b, (r, (_, c)) in enumerate(zip(ref, cache.banks)):
         assert torch.equal(r, c), f"bank {b} (feat={FEATS[b]}) fused != per-bank at num_indices={num_indices}"
+
+
+def test_fused_copy_defaults_off_on_windows_rocm(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_FUSED_COPY", raising=False)
+    monkeypatch.setattr(offload_cache.os, "name", "nt")
+    monkeypatch.setattr(offload_cache.torch.version, "hip", "test-rocm")
+
+    assert not offload_cache._fused_copy_enabled()
+
+
+def test_fused_copy_default_stays_on_for_other_platforms(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_FUSED_COPY", raising=False)
+    monkeypatch.setattr(offload_cache.os, "name", "posix")
+    monkeypatch.setattr(offload_cache.torch.version, "hip", "test-rocm")
+
+    assert offload_cache._fused_copy_enabled()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+def test_fused_copy_explicit_override_enables_windows_rocm(monkeypatch, value):
+    monkeypatch.setenv("FREETOKEN_FUSED_COPY", value)
+    monkeypatch.setattr(offload_cache.os, "name", "nt")
+    monkeypatch.setattr(offload_cache.torch.version, "hip", "test-rocm")
+
+    assert offload_cache._fused_copy_enabled()
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+def test_fused_copy_explicit_override_disables_other_platforms(monkeypatch, value):
+    monkeypatch.setenv("FREETOKEN_FUSED_COPY", value)
+    monkeypatch.setattr(offload_cache.os, "name", "posix")
+    monkeypatch.setattr(offload_cache.torch.version, "hip", "test-rocm")
+
+    assert not offload_cache._fused_copy_enabled()

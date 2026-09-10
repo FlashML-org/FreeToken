@@ -769,8 +769,11 @@ def test_locked_layer_prefill_materialize_copies_whole_layer_pageable():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_copy_plan_skips_locked_layers_and_keeps_fused_path():
+def test_copy_plan_skips_locked_layers_and_keeps_fused_path(monkeypatch):
     # _build_copy_plan must not resolve a device alias for a LOCKED layer; its descriptor row stays a 0 placeholder while the pinned layers keep the fused path
+    import freetoken.moe.offload_cache as offload_cache
+
+    monkeypatch.setattr(offload_cache, "_FUSED_COPY", True)
     cache, _ = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
 
     assert cache._copy_fused_ok

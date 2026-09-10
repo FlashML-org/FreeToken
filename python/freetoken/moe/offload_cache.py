@@ -9,10 +9,19 @@ import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
-# instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
-# (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
-# base address are not 16-byte aligned.
-_FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+# instead of one per bank). Windows/ROCm defaults to the legacy per-bank path: sustained
+# concurrent decode on that runtime has exposed rare out-of-bounds writes from the fused
+# launch, while the same workload is stable with the per-bank HIP kernel. An explicit
+# FREETOKEN_FUSED_COPY value remains available for controlled A/B profiling. Other
+# platforms retain the fused default. Bank alignment can still force the per-bank path.
+def _fused_copy_enabled() -> bool:
+    configured = os.getenv("FREETOKEN_FUSED_COPY")
+    if configured is not None:
+        return configured.strip().lower() not in {"0", "false", "no", "off"}
+    return not (os.name == "nt" and getattr(torch.version, "hip", None) is not None)
+
+
+_FUSED_COPY = _fused_copy_enabled()
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
