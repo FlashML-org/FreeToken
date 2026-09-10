@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
-from freetoken.engine.config import EngineConfig, checkpoint_quant_config
+from freetoken.engine.config import EngineConfig
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import (
     CompressedTensorsConfig,
@@ -42,7 +42,7 @@ from freetoken.layers.quantization.linear import (
 from freetoken.layers.quantization.moe import Fp8BlockMoEMethod, Mxfp4MoEMethod, Nvfp4MoEMethod, UnquantizedMoEMethod
 from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
-from freetoken.models.register import get_model_spec
+from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
