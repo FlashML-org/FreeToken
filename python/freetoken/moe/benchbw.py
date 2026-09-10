@@ -39,6 +39,7 @@ import contextlib
 import json
 import logging
 import os
+import shlex
 import socket
 import statistics
 import threading
@@ -688,6 +689,11 @@ def _atomic_write_json(path: str, obj: dict) -> None:
     os.replace(tmp, path)
 
 
+def custom_profile_hint(path: str) -> str:
+    """Shell command required for a non-default bench profile to affect serving."""
+    return f"export FREETOKEN_BENCHBW_PATH={shlex.quote(path)}"
+
+
 def run_benchbw(
     out_path: str | None = None,
     threshold: float = 2.0,
@@ -703,6 +709,7 @@ def run_benchbw(
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
 ) -> dict:
+    custom_out_path = out_path is not None
     if not torch.cuda.is_available():
         raise RuntimeError(
             "benchbw needs a CUDA device to measure PCIe bandwidth (both offload and "
@@ -801,6 +808,7 @@ def run_benchbw(
     out_path = os.path.expanduser(out_path or default_out_path(gpu["uuid"]))
     _atomic_write_json(out_path, result)
     result["out_path"] = out_path
+    result["custom_out_path"] = custom_out_path
     if prog_on:
         print(f"FTBENCH_OUT {out_path}", flush=True)
     return result
@@ -856,7 +864,10 @@ def _print_report(r: dict) -> None:
         m = w["model"]
         print(f"\n  {name}  H={m['hidden']} I={m['inter']} E={m['experts']} top_k={m['top_k']}")
         _print_kernels(w["kernels"], iw)
-    print(f"\n  saved: {r['out_path']}\n")
+    print(f"\n  saved: {r['out_path']}")
+    if r.get("custom_out_path"):
+        print(f"  custom profile; before `ft serve`, run: {custom_profile_hint(r['out_path'])}")
+    print()
 
 
 # ================================ CLI plumbing ================================
@@ -947,7 +958,8 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                    help=f"CPU MoE ISA: 'auto' (default, best), 'all', or a subset of "
                         f"{list(_ISA_TIERS)} to sweep (kernel caps down to hw support)")
     p.add_argument("-o", "--out", default=None,
-                   help=f"JSON output path (default {default_out_path('<gpu-uuid>')})")
+                   help=(f"JSON output path (default {default_out_path('<gpu-uuid>')}); "
+                         "custom paths require the printed FREETOKEN_BENCHBW_PATH export when serving"))
     p.add_argument("--threshold", type=_positive_float, default=2.0,
                    help="recommend hybrid when CPU BW > threshold x PCIe BW (default 2.0)")
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
