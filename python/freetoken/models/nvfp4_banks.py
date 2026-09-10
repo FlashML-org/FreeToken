@@ -115,7 +115,7 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    experts = config.num_experts - (skip_experts_from or 0)
+    experts = min(skip_experts_from, config.num_experts) if skip_experts_from is not None else config.num_experts
     expected = _num_moe_layers(config) * experts * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
