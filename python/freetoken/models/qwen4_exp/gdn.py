@@ -3,9 +3,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.quantization import QuantConfig
+from freetoken.utils import div_even
+from freetoken.layers.fp8_dynamic import Fp8DynamicColMerged, Fp8DynamicRowParallel
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 
 
@@ -33,6 +37,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
         *, quant_config: QuantConfig | None = None, prefix: str = "",
+        attn_quant: str = "none",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -50,13 +55,42 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
+        # TP-local head counts: k heads and their v-head groups split evenly across ranks
+        # (the fla kernels take the GQA ratio from the shapes); the state pool is sharded the
+        # same way (kvcache.linear_state_pool._linear_local_dims).
+        tp = get_tp_info()
+        self._local_num_k_heads = div_even(num_k_heads, tp.size, allow_replicate=True)
+        self._local_num_v_heads = div_even(num_v_heads, tp.size, allow_replicate=True)
+        self._local_key_dim = self._local_num_k_heads * head_k_dim
+        self._local_value_dim = self._local_num_v_heads * head_v_dim
+        self._local_conv_dim = 2 * self._local_key_dim + self._local_value_dim
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
+        # Load-time per-tensor FP8 splits the fusion the same way, but it is synthetic: it
+        # applies only where the checkpoint declares no scheme of its own.
+        self._dynamic_fp8 = attn_quant == "fp8_dynamic" and not self._split_in_proj
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._split_in_proj:
+        self._in_proj_split = [
+            self._local_conv_dim, self._local_value_dim,
+            self._local_num_v_heads, self._local_num_v_heads,
+        ]
+        # A checkpoint-declared scheme has no TP-aware variant here: those two linears are
+        # built from the checkpoint's own scheme and are not sharded. Load-time fp8 is.
+        assert not (tp.size > 1 and self._split_in_proj), (
+            "qwen4_exp TP shards bf16 or load-time fp8 GDN projections only"
+        )
+        if self._dynamic_fp8:
+            self.in_proj_qkvz = Fp8DynamicColMerged(
+                hidden_size, [self.conv_dim, self.value_dim],
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
+            )
+            self.in_proj_ba = LinearColParallelMerged(
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
+            )
+        elif self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
@@ -68,21 +102,29 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
+                hidden_size, [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
+                has_bias=False, local_output_sizes=self._in_proj_split,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
-        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
+        self.conv1d = _DepthwiseConv1d(self._local_conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self._local_num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
-        self.out_proj = LinearReplicated(
-            self.value_dim, hidden_size, has_bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.out_proj",
-        )
+        # Row-parallel over the local v heads, all-reduce inside. At TP=1 LinearOProj is
+        # exactly LinearReplicated (div_even(x, 1) == x and the reduction is skipped), so one
+        # class covers both -- and under TP>1 a replicated o_proj would silently take the
+        # wrong input width and skip the reduction.
+        if self._dynamic_fp8:
+            self.out_proj = Fp8DynamicRowParallel(self.value_dim, hidden_size)
+        else:
+            self.out_proj = LinearOProj(
+                self.value_dim, hidden_size, has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.out_proj",
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -140,15 +182,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._split_in_proj:
+        if self._split_in_proj or self._dynamic_fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
-            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b, a = torch.split(ba, [nv, nv], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
-        z = z.reshape(total, self.num_v_heads, self.head_v_dim)
+        kd, vd = self._local_key_dim, self._local_value_dim
+        z = z.reshape(total, nv, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
         if batch.is_decode:
@@ -157,10 +200,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
             mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
             B = mixed.shape[0]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, B, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, B, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, B, nv, self.head_v_dim).to(dtype)
             core_out = gdn_decode_fla(
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
@@ -170,13 +213,13 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
             g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
+            g = g.reshape(1, total, nv)
+            beta = beta.float().reshape(1, total, nv)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:

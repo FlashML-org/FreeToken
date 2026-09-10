@@ -7,6 +7,8 @@ import torch
 
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
+    fp8_dense_enabled,
+    fp8_lmhead_enabled,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
@@ -109,6 +111,23 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+def use_fp8_lmhead(config: ModelConfig) -> bool:
+    """Whether to build/load the lm_head as load-time per-tensor FP8.
+
+    The MODEL BUILDER and the WEIGHT READER must agree exactly: if one says yes and the
+    other no, the state dict gains or loses ``lm_head.weight_scale`` and load fails. They
+    used to test this separately and drifted. Conditions: the operator asked
+    (FREETOKEN_FP8_LMHEAD=1), the head is untied (a tied head shares the bf16 embedding
+    table), and the checkpoint declares no scheme OF ITS OWN for lm_head -- a quantized head
+    goes through QuantConfig instead. Note it is the lm_head scheme that matters, not whether
+    the checkpoint has a QuantConfig at all: this model ships NVFP4 experts with lm_head in
+    the modelopt ignore list."""
+    if not fp8_lmhead_enabled() or config.tie_word_embeddings:
+        return False
+    quant = getattr(config, "quant", None)
+    return quant is None or quant.scheme_for("lm_head") is None
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -138,6 +157,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # FREETOKEN_FP8_DENSE=1: the bf16 attention / GDN projections are quantized at LOAD to
+    # per-tensor e4m3 and served W8A8 through cuBLASLt (layers/fp8_dynamic.py). This is a
+    # synthetic scheme for a checkpoint that ships those modules unquantized -- distinct from
+    # the QuantConfig path, which serves what the checkpoint declares. The module builders
+    # apply it only where the checkpoint has no scheme of its own, so the two never collide.
+    attn_quant = "fp8_dynamic" if fp8_dense_enabled() else "none"
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
@@ -245,6 +270,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        attn_quant=attn_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )

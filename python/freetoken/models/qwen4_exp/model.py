@@ -21,6 +21,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from .config import use_fp8_lmhead
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -50,6 +51,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         output_gate=g.output_gate,
         quant_config=config.quant,
         prefix=prefix,
+        attn_quant=config.attn_quant,
     )
 
 
@@ -128,14 +130,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
-        )
+        if use_fp8_lmhead(config):
+            # Load-time per-tensor FP8 head, for a checkpoint that ships lm_head unquantized.
+            # A checkpoint that declares its own scheme goes through QuantConfig instead.
+            from freetoken.layers.fp8_dynamic import Fp8ParallelLMHead
+
+            self.lm_head = Fp8ParallelLMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        else:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:

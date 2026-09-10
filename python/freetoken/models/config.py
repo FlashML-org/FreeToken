@@ -18,6 +18,21 @@ def vision_load_enabled() -> bool:
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 
+def fp8_dense_enabled() -> bool:
+    """Load-time FP8 for a model's bf16 attention / GDN projections (opt-in, default OFF):
+    per-tensor e4m3 weights, per-tensor dynamic activation scale, cuBLASLt W8A8 GEMMs
+    (``torch._scaled_mm``, sm_89+). ``FREETOKEN_FP8_DENSE=1``."""
+    return os.getenv("FREETOKEN_FP8_DENSE", "0").strip().lower() in _VISION_TRUE
+
+
+def fp8_lmhead_enabled() -> bool:
+    """Load-time FP8 for the lm_head as well (opt-in, default OFF, needs FREETOKEN_FP8_DENSE=1
+    for the rest). Separate from :func:`fp8_dense_enabled` because this one moves the logits:
+    a per-tensor e4m3 vocab matrix changes every sampled token's score, so it carries its own
+    quality gate. ``FREETOKEN_FP8_LMHEAD=1``."""
+    return os.getenv("FREETOKEN_FP8_LMHEAD", "0").strip().lower() in _VISION_TRUE
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export

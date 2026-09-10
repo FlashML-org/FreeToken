@@ -83,13 +83,17 @@ class LinearColParallelMerged(_LinearTPImpl):
         input_size: int,
         output_sizes: List[int],
         has_bias: bool,
+        local_output_sizes: List[int] | None = None,
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
-        # check that all output sizes are divisible by tp_size
+        # check that all output sizes are divisible by tp_size (a caller that replicates
+        # GQA kv heads across ranks passes the per-rank sizes explicitly)
         tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        if local_output_sizes is None:
+            local_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        tp_output_sizes = local_output_sizes
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(
