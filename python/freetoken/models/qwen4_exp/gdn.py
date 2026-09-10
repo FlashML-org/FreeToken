@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.quantization import QuantConfig
 from freetoken.utils import div_even
@@ -182,6 +181,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
+        nk, nv = self._local_num_k_heads, self._local_num_v_heads
         if self._split_in_proj or self._dynamic_fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, self._in_proj_split[:2], dim=-1)
