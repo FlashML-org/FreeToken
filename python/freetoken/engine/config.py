@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.layers.quantization import set_quant_config
+from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
-from freetoken.utils.hf import optional_hf_file
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -104,9 +104,10 @@ class EngineConfig:
     @cached_property
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
+        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        model_config = parse_config(self.hf_config)
-        return replace(model_config, quant=checkpoint_quant_config(self.model_path, self.hf_config, spec))
+        return replace(parse_config(self.hf_config), quant=quant)
 
     @property
     def max_seq_len(self) -> int:
@@ -121,25 +122,3 @@ class EngineConfig:
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
-
-
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: Any):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
-    from freetoken.layers.quantization import NameMap, QuantConfig
-
-    if spec.parse_config == "parse_gguf_config":
-        return None
-    # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
-    hf_quant_config = None
-    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
-    if sidecar is not None:
-        import json
-
-        with open(sidecar) as f:
-            hf_quant_config = json.load(f)
-    return QuantConfig.from_hf(
-        hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
-        unquantized=spec.unquantized_modules,
-        hf_quant_config=hf_quant_config,
-    )
