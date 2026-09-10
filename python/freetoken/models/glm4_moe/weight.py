@@ -87,6 +87,8 @@ def _iter_nvfp4_resident(
     yield f"{dst_prefix}.weight", packed
     yield f"{dst_prefix}.weight_scale", scale
     yield f"{dst_prefix}.weight_global", g.expand(packed.shape[0]).contiguous()
+    if reader.has(f"{src_prefix}.input_scale"):
+        yield f"{dst_prefix}.input_scale", reader.get(f"{src_prefix}.input_scale").reshape(()).to(torch.float32)
 
 
 def _iter_attn_df11(

@@ -59,16 +59,13 @@ _FEED_FORWARD_PREFIXES = (
 
 # modelopt-NVFP4 dense MLP (nvidia/Gemma-4-31B-IT-NVFP4): mlp.{gate,up,down}_proj are W4A16
 # FP4 -- uint8 weight + fp8-e4m3 block weight_scale + per-tensor weight_scale_2 + input_scale.
-# The scales are consumed with their .weight; input_scale is unused (W4A16). Mirrors the
-# qwen3_5_moe native-NVFP4 dense loader.
+# The scales are consumed with their .weight.
 _NVFP4_DENSE_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
-def _nvfp4_dense_parts(f, raw_base: str):
-    """Load an NVFP4 dense weight as the W4A16 kernel's buffers: (weight uint8 [O, IN//2],
-    weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] from the per-tensor
-    weight_scale_2 broadcast per output row)."""
+def _nvfp4_dense_parts(f, raw_base: str, keyset: set[str]):
+    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
     w = f.get_tensor(raw_base + ".weight")
     s = f.get_tensor(raw_base + ".weight_scale")
     g = f.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
@@ -78,31 +75,37 @@ def _nvfp4_dense_parts(f, raw_base: str):
         and s.dtype is torch.float8_e4m3fn
         and g.dtype is torch.float16
     ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
-    return w, s, g
+    a = f.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32) if raw_base + ".input_scale" in keyset else None
+    return w, s, g, a
 
 
-def _emit_nvfp4_dense_mlp(f, base: str, raw_base: str, buf: dict):
-    """(key, tensor) triples for an NVFP4 dense MLP projection: down_proj standalone;
+def _emit_nvfp4_dense_mlp(f, base: str, raw_base: str, buf: dict, keyset: set[str]):
+    """(key, tensor) pairs for an NVFP4 dense MLP projection: down_proj standalone;
     gate_proj/up_proj merged output-wise into gate_up_proj (each keeps its own scales, so the
     fused weight is exact). Returns [] while a gate/up merge is still buffered."""
-    w, s, g = _nvfp4_dense_parts(f, raw_base)
+    w, s, g, a = _nvfp4_dense_parts(f, raw_base, keyset)
     if base.endswith(".down_proj"):
-        return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+        out = [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+        return out + ([(base + ".input_scale", a)] if a is not None else [])
     is_gate = base.endswith(".gate_proj")
     prefix = base[: -len(".gate_proj")] if is_gate else base[: -len(".up_proj")]
     slots = buf.setdefault(prefix, {})
-    slots["gate" if is_gate else "up"] = (w, s, g)
+    slots["gate" if is_gate else "up"] = (w, s, g, a)
     if "gate" not in slots or "up" not in slots:
         return []
-    gw, gs, gg = slots["gate"]
-    uw, us, ug = slots["up"]
+    gw, gs, gg, ga = slots["gate"]
+    uw, us, ug, ua = slots["up"]
     del buf[prefix]
     pre = prefix + ".gate_up_proj"
-    return [
+    out = [
         (pre + ".weight", torch.cat([gw, uw], dim=0)),
         (pre + ".weight_scale", torch.cat([gs, us], dim=0)),
         (pre + ".weight_global", torch.cat([gg, ug], dim=0)),
     ]
+    if ga is not None and ua is not None:
+        # both parts read the same activation; the larger range covers both
+        out.append((pre + ".input_scale", torch.maximum(ga, ua)))
+    return out
 
 
 def _rename_language_key(raw_name: str) -> str:
@@ -207,7 +210,7 @@ def iter_weights(
                     and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset
                 ):
                     yield from _emit_nvfp4_dense_mlp(
-                        f, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf
+                        f, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf, keyset
                     )
                     continue
 

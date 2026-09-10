@@ -4,9 +4,9 @@ from typing import Any, ClassVar
 
 from ..names import name_set
 from ..registry import register_dialect
-from ..scheme import QuantScheme
+from ..scheme import QuantKind, QuantScheme
 from ..scheme import mxfp4_scheme
-from .base import QuantConfig
+from .base import QuantConfig, Stored
 
 
 @register_dialect
@@ -16,6 +16,8 @@ class Mxfp4Config(QuantConfig):
     dialect = "mxfp4"
 
     SCHEME: ClassVar[QuantScheme] = mxfp4_scheme()
+    # the experts are stacked per layer (``gate_up_proj_blocks`` / ``_scales``), not per-Linear tensors; gpt_oss reads them itself
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {}
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)

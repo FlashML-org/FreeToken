@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import collections
-import json
 import os
 import re
 from dataclasses import dataclass
@@ -83,12 +82,12 @@ def iter_nvfp4_expert_pieces(
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
     """
     from freetoken.models.loader import drop_page_cache as _drop
+    from freetoken.models.loader import safetensors_weight_map
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     drop = drop_page_cache or _drop
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = safetensors_weight_map(folder)
 
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:

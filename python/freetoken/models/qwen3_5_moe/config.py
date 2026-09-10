@@ -2,125 +2,24 @@ from __future__ import annotations
 
 from typing import Any
 
+from freetoken.layers.quantization import QuantConfig, QuantKind
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
-    detect_compressed_tensors_nvfp4,
 )
 
 
-def _quant_accessor(hf_config: Any):
-    """A ``get(key, default=None)`` accessor over the HF ``quantization_config`` (dict or
-    object), or ``None`` when the model has no quant config."""
-    quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
-        return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
-
-
-def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
-    """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
-
-    Returns ``("fp8_block", (block_n, block_k))`` for a block-fp8 checkpoint (weights
-    fp8-e4m3 + per-block ``weight_scale_inv``, dynamic activation), else ``("none", None)``.
-    The quantization_config sits on the top-level hf_config (not ``text_config``).
-    """
-    get = _quant_accessor(hf_config)
-    if get is None:
+def _expert_quant(hf_config: Any, text: Any) -> tuple[str, tuple[int, int] | None]:
+    """The routed experts' quant kind as the engine's format tag, with the scale block of block-fp8."""
+    if not (getattr(text, "num_experts", 0) or 0):
         return "none", None
-    method = str(get("quant_method") or get("quant_algo") or "").lower()
-    block = get("weight_block_size")
-    if method == "fp8" and block:
-        bs = tuple(int(x) for x in block)
-        assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
-        return "fp8_block", bs
-    return "none", None
-
-
-def _expert_quant(hf_config: Any) -> str:
-    """Quantization format of the *routed* experts (the only weights served from the
-    offload cache). The nvidia/modelopt checkpoints are either plain NVFP4 (``quant_algo``
-    ``NVFP4``) or ``MIXED_PRECISION`` (per-layer ``quantized_layers`` map); in the mixed
-    case the routed experts carry their own ``W4A16_NVFP4``/``FP8`` algo. Dense quantized
-    weights (attention / shared expert / lm_head) are served through their own schemes."""
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return "none"
-    algo = str(get("quant_algo") or get("quant_method") or "").lower()
-    if "fp4" in algo:
-        return "nvfp4"
-    if "mixed" in algo:
-        layers = get("quantized_layers") or {}
-        for name, spec in (layers.items() if isinstance(layers, dict) else []):
-            if name.endswith(".mlp.experts") or ".mlp.experts." in name:
-                expert_algo = str((spec or {}).get("quant_algo", "")).lower()
-                if "fp4" in expert_algo:
-                    return "nvfp4"
-                if "fp8" in expert_algo:
-                    return "fp8"
-    return "none"
-
-
-# Detection now lives in models/config.py (shared with muse_glimmer); weight.py imports
-# it under this name.
-_compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
-
-
-def _lm_head_quant(hf_config: Any) -> str:
-    """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
-    the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
-    per-layer map and leave lm_head bf16. Returns ``"nvfp4"`` or ``"none"``."""
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return "none"
-    layers = get("quantized_layers") or {}
-    if not isinstance(layers, dict):
-        return "none"
-    for name, spec in layers.items():
-        if name == "lm_head" or name.endswith(".lm_head"):
-            if "fp4" in str((spec or {}).get("quant_algo", "")).lower():
-                return "nvfp4"
-    return "none"
-
-
-def _dense_mlp_quant(hf_config: Any) -> str:
-    """NVFP4 on the *dense* (non-MoE) decoder MLP. modelopt MIXED_PRECISION dense checkpoints
-    (e.g. Qwen3.6-27B-NVFP4) list ``.mlp.{gate,up,down}_proj`` as ``W4A16_NVFP4`` in
-    ``quantized_layers``; MoE checkpoints have ``.mlp.experts.*`` / ``.mlp.shared_expert.*``
-    instead (covered by ``expert_quant``). ``endswith(".mlp.gate_proj")`` matches only the bare
-    dense MLP -- not ``.mlp.shared_expert.gate_proj`` nor ``.mlp.experts.N.gate_proj``."""
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return "none"
-    layers = get("quantized_layers") or {}
-    if not isinstance(layers, dict):
-        return "none"
-    for name, spec in layers.items():
-        if name.endswith((".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")):
-            if "fp4" in str((spec or {}).get("quant_algo", "")).lower():
-                return "nvfp4"
-    return "none"
-
-
-def _attn_quant(hf_config: Any) -> str:
-    """Per-tensor FP8 on the *dense* attention/GDN projections. The modelopt
-    ``MIXED_PRECISION`` checkpoints tag ``self_attn.{q,k,v,o}_proj`` and
-    ``linear_attn.{in_proj_qkv,in_proj_z,out_proj}`` with ``quant_algo`` ``FP8`` (fp8-e4m3
-    weight + a scalar ``weight_scale``; W8A16). Returns ``"fp8_pertensor"`` when present,
-    else ``"none"`` (NVFP4 dense weights are covered by ``dense_quant`` / ``lm_head_quant``)."""
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return "none"
-    layers = get("quantized_layers") or {}
-    if not isinstance(layers, dict):
-        return "none"
-    for name, spec in layers.items():
-        algo = str((spec or {}).get("quant_algo", "")).lower()
-        if algo == "fp8" and (".self_attn." in name or ".linear_attn." in name):
-            return "fp8_pertensor"
-    return "none"
+    # the engine reads this tag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    if scheme is None:
+        return "none", None
+    return str(scheme.kind), scheme.weight.group if scheme.kind is QuantKind.FP8_BLOCK else None
 
 
 def _layer_types(text: Any) -> list[str]:
@@ -164,28 +63,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    expert_quant, weight_block_size = _fp8_block_quant(hf_config)
-    if expert_quant == "none":
-        expert_quant = _expert_quant(hf_config)  # nvfp4 / mixed-precision modelopt
-    # Dense attention/GDN quant is independent of the routed experts (block-fp8 already
-    # quantizes both, so only probe for per-tensor FP8 when experts aren't block-fp8).
-    attn_quant = "none" if expert_quant == "fp8_block" else _attn_quant(hf_config)
-    # NVFP4 checkpoints store the dense MLP projections (shared_expert; dense non-MoE MLP) as
-    # packed FP4 exactly like the routed experts -- independent of whether attention is FP8
-    # (mixed) or bf16 (pure NVFP4). Keep them native FP4 (W4A16) whenever the experts are
-    # NVFP4. The lm_head is detected separately (only the mixed checkpoint quantizes it).
-    # MoE-NVFP4 keeps the shared_expert dense MLP native FP4 (expert_quant=="nvfp4"); a dense
-    # (non-MoE) modelopt checkpoint instead tags the bare .mlp.{gate,up,down}_proj as NVFP4.
-    dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
-    lm_head_quant = _lm_head_quant(hf_config)
-
-    # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
-    # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
-    # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
-    if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
-        dense_quant = "nvfp4"
-        lm_head_quant = "none"
+    expert_quant, weight_block_size = _expert_quant(hf_config, text)
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -254,9 +132,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
     )
 
 
