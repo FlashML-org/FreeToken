@@ -16,7 +16,7 @@ Commands:
   daemon      Run the FreeToken supervisor (persistent engine service)
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
-  bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  bench       Run a benchmark ("bench bw" = bandwidth, "bench decode" = tokens/s)
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -66,7 +66,8 @@ def _print_bench_help(file: TextIO) -> None:
         """usage: ft bench <subcommand> [args]
 
 Subcommands:
-  bw   Benchmark CPU vs PCIe bandwidth and pick the MoE backend (hybrid/offload)
+  bw      Benchmark CPU vs PCIe bandwidth and pick the MoE backend (hybrid/offload)
+  decode  Measure end-to-end decode tokens/s, optionally A/B across engine flags
 
 Use "ft bench <subcommand> --help" for subcommand-specific options.""",
         file=file,
@@ -85,6 +86,10 @@ def _run_bench(argv: list[str]) -> int:
         from freetoken.moe.benchbw import main
 
         return main(argv[1:], prog="ft bench bw")
+    if sub == "decode":
+        from freetoken.moe.bench_decode import main
+
+        return main(argv[1:], prog="ft bench decode")
     print(f"unknown ft bench subcommand: {sub}", file=sys.stderr)
     _print_bench_help(sys.stderr)
     return 2
