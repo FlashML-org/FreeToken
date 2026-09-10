@@ -67,7 +67,12 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, co
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
-        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+        // int64: ``off`` walks up to ``ky``, which on the MoE down-projection is
+        // ``tokens * top_k``. ``off * kx`` wraps int32 past off = 524288 at
+        // kx = 4096, which would turn a launch that now succeeds into a silently
+        // wrong read. (``kx_padded`` is already int64, so the ``vy`` term is not
+        // affected.)
+        &x[(int64_t)off * (int64_t)kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
   }
 }
 
