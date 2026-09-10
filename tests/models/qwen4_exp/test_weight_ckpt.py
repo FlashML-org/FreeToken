@@ -31,6 +31,8 @@ from freetoken.moe.expert_banks import build_expert_banks
 from freetoken.moe.host_banks import HostResidency
 from freetoken.utils import cached_load_hf_config
 
+from .common import install_quant_config, meta_state_dict
+
 MODEL_PATH = os.environ.get("FREETOKEN_QWEN4EXP_MODEL")
 pytestmark = [
     pytest.mark.needs_weights,
@@ -166,6 +168,7 @@ def dense_pass() -> tuple[list[str], dict[str, torch.Tensor]]:
     wanted = {name for name, _raw, _mode in SAMPLES}
     names: list[str] = []
     sampled: dict[str, torch.Tensor] = {}
+    install_quant_config(MODEL_PATH)
     for name, tensor in iter_weights(
         MODEL_PATH, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
     ):
@@ -190,27 +193,12 @@ def test_emitted_names_are_unique_and_complete(dense_pass):
 @pytest.fixture(scope="module")
 def model_state_dict_keys() -> set[str]:
     """Keys ``Qwen4ExpForCausalLM`` declares -- the authoritative target the loader must fill."""
-    from freetoken.layers import rotary
-    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
-
-    config = parse_config(cached_load_hf_config(MODEL_PATH))
-    saved = rotary._ROPE_DEVICE
-    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
-    rotary.get_rope.cache_clear()
-    try:
-        with torch.device("meta"):
-            return set(Qwen4ExpForCausalLM(config).state_dict())
-    finally:
-        rotary.set_rope_device(saved)
-        rotary.get_rope.cache_clear()
+    return set(meta_state_dict(MODEL_PATH))
 
 
 def test_emitted_names_are_the_model_state_dict(dense_pass, model_state_dict_keys):
     names, _sampled = dense_pass
-    # The routed NVFP4 experts come from the offload source banks, never from the dense pass.
-    expected = {k for k in model_state_dict_keys
-                if not k.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))}
-    assert set(names) == expected
+    assert set(names) == model_state_dict_keys
 
 
 def test_every_zero_centered_norm_is_present_and_raw(dense_pass, reader):

@@ -1,11 +1,12 @@
-"""qwen4_exp weight loading against a synthetic checkpoint shaped like the RadixArk NVFP4 one.
+"""qwen4_exp weight loading against synthetic checkpoints shaped like the released ones.
 
 The tensors are tiny but the key names, dtypes and the fusion geometry that matters
-(hc_lowrank=320 + hc_count=4 -> a 12-row zero pad) are the real ones.
+(hc_lowrank=320 + hc_count=4 -> a 12-row zero pad; 128-row block scales) are the real ones.
 """
 
 from __future__ import annotations
 
+import json
 import random
 from types import SimpleNamespace
 
@@ -17,18 +18,23 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
+    _DenseFuser,
     iter_weights,
     load_ple_table,
 )
+from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-H = 32  # hidden_size
+from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+
+H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
 LR = 320  # hc_lowrank; kept real so the merged HC pad is the real (-(320+4)) % 16 = 12
 HCH = HC * H  # hyper-connection stream width
-KH, VH, HD = 2, 6, 8  # GDN key / value heads, head dim
-QH, KVH, AHD = 4, 2, 16  # QSA q / kv heads, head dim
-IHD = 8  # indexer head dim
+KH, VH, HD = 2, 4, 32  # GDN key / value heads, head dim: qkv rows 256, z rows 128
+QH, KVH, AHD = 4, 2, 64  # QSA q / kv heads, head dim: q rows 512, k / v rows 128
+IHD = 64  # indexer head dim
+BLOCK = 128
 E, I = 3, 6  # routed experts, moe_intermediate_size
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
 
@@ -54,8 +60,15 @@ def _hc_weights(prefix: str, inject: bool) -> dict[str, torch.Tensor]:
     return w
 
 
-def _raw_checkpoint() -> dict[str, torch.Tensor]:
-    """Layer 0 = GDN + PLE, layer 1 = QSA; plus the mtp / visual / routed-expert noise."""
+def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
+    return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
+
+
+def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
+    """Layer 0 = GDN + PLE, layer 1 = QSA; plus the mtp / visual / routed-expert noise.
+
+    ``dense_fp8`` stores the attention and GDN qkv|z / out projections as 128x128 block-fp8 (e4m3 ``.weight`` + fp32 ``.weight_scale_inv``) like the community NVFP4-FP8 requants.
+    """
     lm = "model.language_model"
     raw: dict[str, torch.Tensor] = {
         f"{lm}.embed_tokens.weight": _bf16(11, H),
@@ -127,7 +140,29 @@ def _raw_checkpoint() -> dict[str, torch.Tensor]:
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
         "model.visual.merger.norm.weight": _bf16(H),
     })
+    if dense_fp8:
+        for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.out_proj",
+                       *(f"{attn}.{p}_proj" for p in "qkvo")):
+            weight = raw[f"{module}.weight"]
+            raw[f"{module}.weight"] = weight.to(torch.float8_e4m3fn)
+            raw[f"{module}.weight_scale_inv"] = _fp8_scale(weight)
     return raw
+
+
+FP8_DENSE_QUANT = mixed_precision_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
+
+
+def _config_json(quantization_config) -> dict:
+    cfg = hf_config(
+        num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=2,
+        budget=16, hidden=H, max_position=4096, rope_theta=10000.0,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=KH, linear_num_value_heads=VH,
+        linear_key_head_dim=HD, linear_value_head_dim=HD,
+        hc_lowrank=LR, ple_layer_ids=[1],
+        num_experts=E, moe_intermediate_size=I, shared_expert_intermediate_size=I,
+    )
+    return {**vars(cfg), "text_config": vars(cfg.text_config), "quantization_config": quantization_config}
 
 
 def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -144,11 +179,7 @@ def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     return shards, scale
 
 
-@pytest.fixture(scope="module")
-def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
-    torch.manual_seed(0)
-    folder = tmp_path_factory.mktemp("qwen4_exp_ckpt")
-    raw = _raw_checkpoint()
+def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config) -> tuple[str, dict[str, torch.Tensor]]:
     table, _scale = _ngram_table()
     # Spread the dense tensors over two shards so the fusion buffer has to survive a file
     # boundary, and put the n-gram table in its own shards like the real checkpoint does.
@@ -158,18 +189,42 @@ def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
     shard_names = sorted(table)
     save_file({n: table[n] for n in shard_names[:2]}, str(folder / "model-plefp8-00000.safetensors"))
     save_file({n: table[n] for n in shard_names[2:]}, str(folder / "model-plefp8-00001.safetensors"))
+    (folder / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     return str(folder), {**raw, **table}
 
 
-@pytest.fixture(scope="module")
-def loaded(checkpoint) -> dict[str, torch.Tensor]:
-    folder, _raw = checkpoint
+def _load(folder: str) -> dict[str, torch.Tensor]:
+    install_quant_config(folder)
     return {
         name: tensor.clone()
         for name, tensor in iter_weights(
             folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
         )
     }
+
+
+@pytest.fixture(scope="module")
+def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    torch.manual_seed(0)
+    return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_ckpt"), _raw_checkpoint(), None)
+
+
+@pytest.fixture(scope="module")
+def loaded(checkpoint) -> dict[str, torch.Tensor]:
+    return _load(checkpoint[0])
+
+
+@pytest.fixture(scope="module")
+def checkpoint_fp8(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    torch.manual_seed(1)
+    return _write_checkpoint(
+        tmp_path_factory.mktemp("qwen4_exp_fp8_ckpt"), _raw_checkpoint(dense_fp8=True), FP8_DENSE_QUANT
+    )
+
+
+@pytest.fixture(scope="module")
+def loaded_fp8(checkpoint_fp8) -> dict[str, torch.Tensor]:
+    return _load(checkpoint_fp8[0])
 
 
 def _expected_names() -> set[str]:
@@ -206,7 +261,7 @@ def test_mtp_visual_experts_and_table_never_loaded(loaded):
         assert not name.startswith(("mtp.", "model.visual."))
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
-        assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
+        assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_scale_inv"))
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
@@ -399,12 +454,92 @@ def test_every_registry_architecture_is_claimed_by_an_aot_entry():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
 def test_fusion_pad_rides_the_tensor_device():
     """safetensors loads straight to cuda; a cpu-allocated pad row would break torch.cat."""
-    from freetoken.models.qwen4_exp.weight import _try_fuse
-
-    buf = {}
+    fuser = _DenseFuser(None, get_model_spec("Qwen4ExpForConditionalGeneration").packed_modules_mapping)
     down = torch.randn(320, 64, device="cuda", dtype=torch.bfloat16)
     inject = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
-    assert _try_fuse("model.layers.0.attn_hyper_connection.input_mix_weight_down.weight", down, buf) == ()
-    key, fused = _try_fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject, buf)
+    assert fuser.fuse("model.layers.0.attn_hyper_connection.input_mix_weight_down.weight", down) == []
+    [(key, fused)] = fuser.fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject)
+    assert key == "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
     assert fused.device.type == "cuda" and fused.shape[0] == 336
     assert torch.equal(fused[324:], torch.zeros(12, 64, device="cuda", dtype=torch.bfloat16))
+
+
+# ======================================================================================
+# the reader against the model the engine builds, for each released quant layout
+# ======================================================================================
+
+
+@pytest.fixture(scope="module")
+def checkpoint_nvfp4(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """bf16 dense tensors under a real ModelOptConfig whose ignore list covers them (RadixArk)."""
+    torch.manual_seed(2)
+    return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_nvfp4_ckpt"), _raw_checkpoint(), RADIXARK_NVFP4)
+
+
+FP8_MODULES = (
+    "model.layers.1.self_attn.qkv_proj", "model.layers.1.self_attn.o_proj",
+    "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",
+)
+
+
+@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8"])
+def test_emitted_keys_are_the_model_state_dict(fixture, request):
+    """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
+    folder, _raw = request.getfixturevalue(fixture)
+    loaded, state = _load(folder), meta_state_dict(folder)
+    assert set(loaded) == set(state)
+    if fixture != "checkpoint_fp8":
+        assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16
+        return
+    for module in FP8_MODULES:
+        for kind in (".weight", ".weight_scale_inv"):
+            assert loaded[module + kind].shape == state[module + kind].shape, module + kind
+        assert loaded[module + ".weight"].dtype is state[module + ".weight"].dtype is torch.float8_e4m3fn
+        assert loaded[module + ".weight_scale_inv"].dtype is torch.float32  # the engine casts it to the bf16 buffer at load
+
+
+def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str]) -> None:
+    for kind in (".weight", ".weight_scale_inv"):
+        sources = [raw[f"{p}{kind}"].view(torch.uint8) for p in parts]
+        merged = loaded[fused + kind]
+        assert merged.dtype is raw[f"{parts[0]}{kind}"].dtype
+        for source, back in zip(sources, torch.split(merged.view(torch.uint8), [s.shape[0] for s in sources], dim=0)):
+            assert torch.equal(source, back)
+
+
+def test_fp8_projections_fuse_per_kind(loaded_fp8, checkpoint_fp8):
+    _folder, raw = checkpoint_fp8
+    attn, gdn = f"{LM}.layers.1.self_attn", f"{LM}.layers.0.linear_attn"
+    _assert_fused_per_kind(loaded_fp8, raw, "model.layers.1.self_attn.qkv_proj", [f"{attn}.{p}_proj" for p in "qkv"])
+    _assert_fused_per_kind(loaded_fp8, raw, "model.layers.0.linear_attn.in_proj_qkvz", [f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z"])
+    assert torch.equal(loaded_fp8["model.layers.0.linear_attn.out_proj.weight_scale_inv"], raw[f"{gdn}.out_proj.weight_scale_inv"])
+    assert torch.equal(
+        loaded_fp8["model.layers.0.linear_attn.in_proj_ba.weight"],
+        torch.cat([raw[f"{gdn}.in_proj_b.weight"], raw[f"{gdn}.in_proj_a.weight"]], dim=0),
+    )
+    for name in ("model.layers.0.linear_attn.in_proj_ba.weight", "model.layers.1.mlp.shared_expert.gate_up_proj.weight",
+                 "model.layers.1.self_attn.indexer.index_qk_proj.weight", "lm_head.weight",
+                 "model.hyper_connection_mixer.input_mix_weight_down.weight",
+                 "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"):
+        assert loaded_fp8[name].dtype is torch.bfloat16
+
+
+ATTN = f"{LM}.layers.1.self_attn"
+REJECTED = [
+    pytest.param(None, lambda w: {f"{ATTN}.q_proj.weight": w, f"{ATTN}.q_proj.weight_scale_inv": _fp8_scale(w)},
+                 r"q_proj\.weight_scale_inv", id="scale the config does not declare"),
+    pytest.param(None, lambda w: {f"{ATTN}.o_proj.weight": w.to(torch.float8_e4m3fn)},
+                 r"o_proj\.weight is torch\.float8", id="fp8 weight the config declares bf16"),
+    pytest.param(FP8_DENSE_QUANT, lambda w: {f"{ATTN}.{p}_proj.weight": w.clone() for p in "qkv"},
+                 r"[qkv]_proj\.weight is torch\.bfloat16", id="bf16 weight the config declares fp8"),
+    pytest.param(FP8_DENSE_QUANT, lambda w: {f"{ATTN}.q_proj.weight": w[:-64].to(torch.float8_e4m3fn), f"{ATTN}.q_proj.weight_scale_inv": _fp8_scale(w)},
+                 "128x128", id="part that is not a 128-row multiple"),
+]
+
+
+@pytest.mark.parametrize("quantization_config, tensors, match", REJECTED)
+def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quantization_config, tensors, match):
+    save_file(tensors(_bf16(2 * QH * AHD, H)), str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
+    with pytest.raises(ValueError, match=match):
+        _load(str(tmp_path))
