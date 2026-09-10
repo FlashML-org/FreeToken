@@ -1,7 +1,7 @@
 """Patch an FTW checkpoint written by an older FreeToken so the current build loads it.
 
     python scripts/ftw_hotfix.py --ftw <ftw_dir> [--out <new_dir>] \
-        [--repo <hf_repo_id> | --source <local_hf_dir>] [--dry-run]
+        [--repo <hf_repo_id> [--revision <rev>] | --source <local_hf_dir>] [--dry-run]
 
 The tool builds the current model on the meta device from the FTW's own config.json, diffs the
 FTW index against the tensors that model declares, and repairs the differences:
@@ -11,22 +11,27 @@ FTW index against the tensors that model declares, and repairs the differences:
 - tensors the model declares but the FTW lacks (``input_scale``) are fetched from the HF repo by byte range
 - a Qwen3.8-Flash-Next FTW without the PLE n-gram table gets it written as ``ple-table-*.safetensors``
 
-In place, an FTW that only gains tensors gets one shard appended; when entries are replaced or
-dropped the live entries are rewritten into fresh shards so no dead bytes remain. ``--out`` always
-writes a fresh, compact FTW dir. While the old shards are kept, the previous index stays as
-``freetoken_weight.json.bak`` so the patch can be undone.
+Before anything is written the FTW is checked against the model: shapes, dtypes, byte counts and
+shard files must agree, or the layout is reported as unsupported.
+
+In place, new tensors go into an appended shard and the index is swapped atomically; shards left
+with unreferenced bytes are then compacted one at a time, each step ending in another atomic index
+swap. An interrupted run therefore always leaves a loadable FTW, and a rerun finishes the job.
+``--out`` writes a fresh, compact FTW dir instead and never touches the original.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import glob
 import json
+import math
 import os
+import re
 import shutil
 import struct
 import sys
-from typing import Any
 
 import torch
 
@@ -45,9 +50,16 @@ _ST_DTYPES = {
     "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2, "U8": torch.uint8, "I8": torch.int8, "I32": torch.int32, "I64": torch.int64,
 }
+_FLOAT_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 _CHUNK = 64 << 20
+_SHARD_RE = re.compile(r"^freetoken-(\d{5})\.ftw$")
 _PLE_INFIX = ".ple.ple_embedding.ngram_embedding."
+_PLE_SHARD_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$")
+_PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+_PLE_FILE_RE = re.compile(r"^ple-table-\d{5}\.safetensors$")
 _PLE_FILE_BYTES = 4 << 30
+# tensors an old FTW may carry that the text model does not declare; they are kept and never count as errors
+_IGNORED_PREFIXES = ("vision_tower.", "embed_vision.")
 _VERBOSE = False
 
 
@@ -71,13 +83,17 @@ def done(b) -> None:
         b.close()
 
 
+def tensor_bytes(shape, dtype: torch.dtype) -> int:
+    return math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+
+
 # ------------------------------------------------------------------ safetensors slicing
 class TensorSource:
     """Single tensors out of an HF repo (byte-range GET) or a local safetensors dir."""
 
-    def __init__(self, repo: str | None, local: str | None):
+    def __init__(self, repo: str | None, local: str | None, revision: str | None = None):
         assert repo or local, "need --repo or --source to fetch tensors"
-        self.repo, self.local = repo, local
+        self.repo, self.local, self.revision = repo, local, revision
         self._headers: dict[str, tuple[dict, int]] = {}
         if local:
             files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(local, "*.safetensors")))
@@ -85,9 +101,10 @@ class TensorSource:
         else:
             from huggingface_hub import HfApi, hf_hub_download
 
-            repo_files = HfApi().list_repo_files(repo)
+            repo_files = HfApi().list_repo_files(repo, revision=revision)
             files = sorted(f for f in repo_files if f.endswith(".safetensors") and "/" not in f)
-            index = hf_hub_download(repo, "model.safetensors.index.json") if "model.safetensors.index.json" in repo_files else None
+            index = (hf_hub_download(repo, "model.safetensors.index.json", revision=revision)
+                     if "model.safetensors.index.json" in repo_files else None)
         if index and os.path.exists(index):
             with open(index) as f:
                 self.weight_map = json.load(f)["weight_map"]
@@ -109,7 +126,8 @@ class TensorSource:
         token = get_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        r = requests.get(hf_hub_url(self.repo, shard), headers=headers, allow_redirects=True, timeout=300)
+        url = hf_hub_url(self.repo, shard, revision=self.revision)
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=300)
         if r.status_code != 206:
             raise RuntimeError(f"range read of {shard} failed: HTTP {r.status_code}")
         return r.content
@@ -119,6 +137,13 @@ class TensorSource:
             n = struct.unpack("<Q", self._range(shard, 0, 7))[0]
             self._headers[shard] = (json.loads(self._range(shard, 8, 8 + n - 1)), 8 + n)
         return self._headers[shard]
+
+    def meta(self, name: str) -> dict:
+        return self._header(self.weight_map[name])[0][name]
+
+    def nbytes(self, name: str) -> int:
+        a, b = self.meta(name)["data_offsets"]
+        return b - a
 
     def get(self, name: str) -> torch.Tensor:
         shard = self.weight_map[name]
@@ -176,32 +201,100 @@ def plan(arch: str, entries: list[dict], expected: dict, name_map: NameMap):
     for n, e in names.items():
         exp = expected.get(n)
         scale = names.get(n[: -len(".weight")] + ".weight_scale") if n.endswith(".weight") else None
-        if exp and exp[1] == torch.bfloat16 and e["dtype"] == "float8_e4m3fn" and scale is not None and scale["name"] not in expected:
+        if (exp and exp[1] == torch.bfloat16 and e["dtype"] == "float8_e4m3fn" and tuple(e["shape"]) == exp[0]
+                and scale is not None and scale["name"] not in expected and list(scale["shape"]) == [e["shape"][0]]):
             dequants.append((n, e, scale))
             drops.add(scale["name"])
 
+    # (name, checkpoint parts): a fused module maps to several checkpoint tensors
     fetches: list[tuple[str, list[str]]] = []
     for n in (n for n in expected if n not in names):
         module, _, leaf = n.rpartition(".")
-        cands = [f"{m}.{leaf}" for m in name_map.to_checkpoint(module)] if module else [n]
-        if n not in cands:
-            cands.append(n)
-        fetches.append((n, cands))
+        parts = [f"{m}.{leaf}" for m in name_map.to_checkpoint(module)] if module else [n]
+        fetches.append((n, parts))
 
     leftovers = [n for n in names if n not in expected and n not in drops]
     return renames, dequants, fetches, drops, leftovers
+
+
+def resolve_fetches(fetches, source: TensorSource) -> tuple[dict[str, list[str]], list[str]]:
+    """Map each missing tensor to the source tensors it is built from; a fused scale needs every part."""
+    resolved: dict[str, list[str]] = {}
+    errors: list[str] = []
+    for n, parts in fetches:
+        if source.has(n):
+            resolved[n] = [n]
+        elif all(source.has(p) for p in parts):
+            if len(parts) > 1 and not n.endswith(".input_scale"):
+                errors.append(f"{n} maps to {len(parts)} source tensors; fusing is not supported here")
+            else:
+                resolved[n] = parts
+        else:
+            errors.append(f"no source tensor for {n}: missing {[p for p in parts if not source.has(p)]}")
+    return resolved, errors
 
 
 def dequantize_rows(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (weight.float() * scale.float()[:, None]).to(torch.bfloat16)
 
 
+def validate_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, str], dequant_names: set[str]) -> list[str]:
+    """Structural checks of the index and shard files, plus shape/dtype agreement with the model."""
+    problems: list[str] = []
+    pos = 0
+    for sh in sorted(index["shards"], key=lambda s: s["global_off"]):
+        if sh["global_off"] != pos:
+            problems.append(f"shard {sh['file']} starts at {sh['global_off']}, expected {pos}")
+        path = os.path.join(ftw_dir, sh["file"])
+        if not os.path.exists(path):
+            problems.append(f"shard file {sh['file']} is missing")
+        elif os.path.getsize(path) != sh["nbytes"]:
+            problems.append(f"shard {sh['file']} is {os.path.getsize(path)} B, index says {sh['nbytes']}")
+        pos = sh["global_off"] + sh["nbytes"]
+    if pos != index["total_bytes"]:
+        problems.append(f"shards end at {pos}, index total_bytes is {index['total_bytes']}")
+    seen: set[str] = set()
+    for e in index["tensors"]:
+        if e["name"] in seen:
+            problems.append(f"duplicate entry {e['name']}")
+        seen.add(e["name"])
+        try:
+            dt = _dtype_of(e["dtype"])
+        except Exception:
+            problems.append(f"{e['name']}: unknown dtype {e['dtype']!r}")
+            continue
+        if tensor_bytes(e["shape"], dt) != e["nbytes"]:
+            problems.append(f"{e['name']}: {e['shape']} {e['dtype']} is {tensor_bytes(e['shape'], dt)} B, index says {e['nbytes']}")
+        if e["global_off"] < 0 or e["global_off"] % ALIGN:
+            problems.append(f"{e['name']}: offset {e['global_off']} is not {ALIGN}-aligned")
+        if e["global_off"] + e["nbytes"] > pos:
+            problems.append(f"{e['name']}: extends past the last shard")
+        if e["kind"] != "weight":
+            continue
+        name = renames.get(e["name"], e["name"])
+        exp = expected.get(name)
+        if exp is None:
+            continue
+        if name in dequant_names:  # shape already checked by plan(); the dtype is what the repair changes
+            continue
+        if tuple(e["shape"]) != exp[0]:
+            problems.append(f"{name}: FTW shape {e['shape']} != model shape {list(exp[0])}")
+        # the loader casts between float types; anything else has to match exactly
+        if dt != exp[1] and not (dt in _FLOAT_DTYPES and exp[1] in _FLOAT_DTYPES):
+            problems.append(f"{name}: FTW dtype {e['dtype']} is not loadable as {exp[1]}")
+    blocks = sorted((e["global_off"], e["global_off"] + _align_up(e["nbytes"]), e["name"]) for e in index["tensors"])
+    for (_, a1, an), (b0, _, bn) in zip(blocks, blocks[1:]):
+        if b0 < a1:
+            problems.append(f"{bn} overlaps {an}")
+    return problems
+
+
 # ------------------------------------------------------------------ FTW I/O
 class ShardWriter:
-    """Streams entries into ``freetoken-NNNNN.ftw`` shards, from offset 0 (rewrite) or from the old end (append)."""
+    """Streams entries into ``freetoken-NNNNN.ftw`` shards, from offset 0 (new dir) or from the old end (append)."""
 
-    def __init__(self, out_dir: str, shard_limit: int, *, first_shard: int = 0, global_off: int = 0, suffix: str = ""):
-        self.out_dir, self.shard_limit, self.suffix = out_dir, shard_limit, suffix
+    def __init__(self, out_dir: str, shard_limit: int, *, first_shard: int = 0, global_off: int = 0):
+        self.out_dir, self.shard_limit = out_dir, shard_limit
         self.global_off = global_off
         self.first_shard = first_shard
         self.shard_idx = first_shard - 1
@@ -211,12 +304,18 @@ class ShardWriter:
         self.entries: list[dict] = []
 
     def _path(self, idx: int) -> str:
-        return os.path.join(self.out_dir, _SHARD_FMT.format(idx) + self.suffix)
+        return os.path.join(self.out_dir, _SHARD_FMT.format(idx))
+
+    def _finish_shard(self) -> None:
+        self.shards.append({"file": _SHARD_FMT.format(self.shard_idx), "global_off": self._start, "nbytes": self._cur})
+        self._f.flush()
+        os.fsync(self._f.fileno())
+        self._f.close()
+        self._f = None
 
     def _roll(self) -> None:
         if self._f is not None:
-            self.shards.append({"file": _SHARD_FMT.format(self.shard_idx), "global_off": self._start, "nbytes": self._cur})
-            self._f.close()
+            self._finish_shard()
         self.shard_idx += 1
         self._start, self._cur = self.global_off, 0
         self._f = open(self._path(self.shard_idx), "wb")
@@ -255,9 +354,7 @@ class ShardWriter:
 
     def close(self) -> list[dict]:
         if self._f is not None:
-            self.shards.append({"file": _SHARD_FMT.format(self.shard_idx), "global_off": self._start, "nbytes": self._cur})
-            self._f.close()
-            self._f = None
+            self._finish_shard()
         return self.shards
 
     def abort(self) -> None:
@@ -297,13 +394,224 @@ def read_entry(ftw_dir: str, index: dict, e: dict) -> torch.Tensor:
     return torch.frombuffer(buf, dtype=_dtype_of(e["dtype"])).reshape(e["shape"])
 
 
-def ple_tensors_present(ftw_dir: str) -> int:
-    have = 0
-    for path in glob.glob(os.path.join(ftw_dir, "*.safetensors")):
-        with open(path, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            have += sum(_PLE_INFIX in k for k in json.loads(f.read(n)))
-    return have
+def fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError:
+        if not os.path.isdir(path):  # some filesystems reject fsync on a directory; that only weakens the rename
+            raise
+    finally:
+        os.close(fd)
+
+
+def write_index(ftw_dir: str, index: dict) -> None:
+    # data of every file the new index points at is synced by its writer; sync the index, then the rename
+    tmp = os.path.join(ftw_dir, INDEX_NAME + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(index, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(ftw_dir, INDEX_NAME))
+    fsync_path(ftw_dir)
+
+
+def shard_numbers(ftw_dir: str, index: dict) -> tuple[int, list[str]]:
+    """The next free shard number, and shard files on disk that the index does not reference."""
+    used = {sh["file"] for sh in index["shards"]}
+    on_disk = [f for f in os.listdir(ftw_dir) if _SHARD_RE.match(f)]
+    nums = [int(_SHARD_RE.match(f).group(1)) for f in set(on_disk) | used if _SHARD_RE.match(f)]
+    return (max(nums) + 1 if nums else 0), sorted(f for f in on_disk if f not in used)
+
+
+# ------------------------------------------------------------------ compaction
+def live_ranges(tensors: list[dict], s0: int, s1: int) -> list[tuple[int, int]]:
+    """Referenced byte ranges of shard [s0, s1), merged and sorted; every entry owns its ALIGN-padded block."""
+    rs = []
+    for e in tensors:
+        a, b = e["global_off"], e["global_off"] + _align_up(e["nbytes"])
+        a, b = max(a, s0), min(b, s1)
+        if a < b:
+            rs.append((a, b))
+    rs.sort()
+    merged: list[tuple[int, int]] = []
+    for a, b in rs:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def dirty_shards(index: dict) -> list[tuple[dict, list[tuple[int, int]], int]]:
+    """Shards holding bytes no entry references, with their live ranges and live byte count."""
+    out = []
+    for sh in sorted(index["shards"], key=lambda s: s["global_off"]):
+        s0, s1 = sh["global_off"], sh["global_off"] + sh["nbytes"]
+        live = live_ranges(index["tensors"], s0, s1)
+        live_bytes = sum(b - a for a, b in live)
+        if live_bytes < sh["nbytes"]:
+            out.append((sh, live, live_bytes))
+    return out
+
+
+def compact_in_place(work: str, index: dict, next_num: int) -> tuple[dict, int]:
+    """Rewrite each dirty shard without its dead bytes; one atomic index swap per shard."""
+    dirty = dirty_shards(index)
+    b = bar(sum(lb for _, _, lb in dirty), "Compacting shards") if dirty else None
+    n = 0
+    while dirty:
+        sh, live, live_bytes = dirty[0]
+        s0, s1 = sh["global_off"], sh["global_off"] + sh["nbytes"]
+        delta = sh["nbytes"] - live_bytes
+        old_path = os.path.join(work, sh["file"])
+        new_file = None
+        if live_bytes:
+            new_file = _SHARD_FMT.format(next_num)
+            next_num += 1
+            log(f"  compact {sh['file']} -> {new_file}: keep {live_bytes} B, drop {delta} B")
+            with open(old_path, "rb") as src, open(os.path.join(work, new_file), "wb") as dst:
+                for a, b1 in live:
+                    src.seek(a - s0)
+                    left = b1 - a
+                    while left > 0:
+                        buf = src.read(min(left, _CHUNK))
+                        if not buf:
+                            raise ValueError(f"short read in {sh['file']}")
+                        dst.write(buf)
+                        left -= len(buf)
+                        tick(b, len(buf))
+                dst.flush()
+                os.fsync(dst.fileno())
+        else:
+            log(f"  drop empty shard {sh['file']}")
+        starts = [a for a, _ in live]
+        prefix = [0]
+        for a, b1 in live:
+            prefix.append(prefix[-1] + (b1 - a))
+
+        def remap(go: int) -> int:
+            i = bisect.bisect_right(starts, go) - 1
+            if i < 0 or go >= live[i][1]:
+                # only a zero-byte entry can sit in a dead gap: park it at the next live block
+                return s0 + prefix[i + 1]
+            return s0 + prefix[i] + (go - starts[i])
+
+        tensors = []
+        for e in index["tensors"]:
+            go = e["global_off"]
+            if go >= s1:
+                e = {**e, "global_off": go - delta}
+            elif go >= s0:
+                e = {**e, "global_off": remap(go)}
+            tensors.append(e)
+        shards = []
+        for x in sorted(index["shards"], key=lambda s: s["global_off"]):
+            if x["file"] == sh["file"]:
+                if new_file:
+                    shards.append({"file": new_file, "global_off": s0, "nbytes": live_bytes})
+            elif x["global_off"] > s0:
+                shards.append({**x, "global_off": x["global_off"] - delta})
+            else:
+                shards.append(x)
+        index = {**index, "tensors": tensors, "shards": shards, "total_bytes": index["total_bytes"] - delta}
+        write_index(work, index)
+        os.remove(old_path)
+        n += 1
+        dirty = dirty_shards(index)
+    done(b)
+    return index, n
+
+
+# ------------------------------------------------------------------ PLE table
+def ple_expected_shards(ftw_dir: str) -> int:
+    with open(os.path.join(ftw_dir, "config.json")) as f:
+        cfg = json.load(f)
+    return int((cfg.get("text_config") or cfg)["split_ngram_parts"])
+
+
+def classify_ple(shards: dict[int, tuple], scale: bool, bad: list[str], n_shards: int) -> tuple[str, str]:
+    """('complete' | 'missing' | 'partial', detail) by the loader's rules: shards 0..N-1, one shape, a scale."""
+    if not shards and not scale and not bad:
+        return "missing", ""
+    if bad or not scale or sorted(shards) != list(range(n_shards)) or len(set(shards.values())) > 1:
+        return "partial", "; ".join(bad[:3]) if bad else f"{len(shards)}/{n_shards} shards" + ("" if scale else ", no weight_scale")
+    return "complete", ""
+
+
+def ple_source_status(source: TensorSource, n_shards: int) -> tuple[str, str]:
+    shards: dict[int, tuple] = {}
+    scale = False
+    bad: list[str] = []
+    for k in source.weight_map:
+        if _PLE_INFIX not in k:
+            continue
+        if k.endswith(_PLE_SCALE_SUFFIX):
+            scale = True
+            continue
+        mt = _PLE_SHARD_RE.search(k)
+        if mt is None:
+            continue
+        idx, m = int(mt.group(1)), source.meta(k)
+        if m["dtype"] != "F8_E4M3":
+            bad.append(f"shard {idx} has dtype {m['dtype']}")
+        if idx in shards:
+            bad.append(f"duplicate shard {idx}")
+        shards[idx] = tuple(m["shape"])
+    return classify_ple(shards, scale, bad, n_shards)
+
+
+def ple_table_status(ftw_dir: str, n_shards: int) -> tuple[str, str, list[str]]:
+    """The dir's PLE table: (status, detail, files holding PLE tensors)."""
+    shards: dict[int, tuple] = {}
+    scale = False
+    bad: list[str] = []
+    files: list[str] = []
+    for path in sorted(glob.glob(os.path.join(ftw_dir, "*.safetensors"))):
+        try:
+            with open(path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                header, base = json.loads(f.read(n)), 8 + n
+        except (struct.error, ValueError):
+            bad.append(f"{os.path.basename(path)} has an unreadable header")
+            files.append(os.path.basename(path))
+            continue
+        size = os.path.getsize(path)
+        holds = False
+        for k, m in header.items():
+            if k == "__metadata__" or _PLE_INFIX not in k:
+                continue
+            holds = True
+            if base + m["data_offsets"][1] > size:
+                bad.append(f"{os.path.basename(path)} is truncated")
+            if k.endswith(_PLE_SCALE_SUFFIX):
+                scale = True
+                continue
+            mt = _PLE_SHARD_RE.search(k)
+            if mt is None:
+                continue
+            idx = int(mt.group(1))
+            if m["dtype"] != "F8_E4M3":
+                bad.append(f"shard {idx} has dtype {m['dtype']}")
+            if idx in shards:
+                bad.append(f"duplicate shard {idx}")
+            shards[idx] = tuple(m["shape"])
+        if holds:
+            files.append(os.path.basename(path))
+    status, detail = classify_ple(shards, scale, bad, n_shards)
+    return status, detail, files
+
+
+def check_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, str], dequant_names: set[str], n_ple: int) -> dict:
+    """Everything the tool verifies, on the input before planning and on the result after writing."""
+    have = {renames.get(e["name"], e["name"]) for e in index["tensors"] if e["kind"] == "weight"}
+    return {
+        "problems": validate_ftw(ftw_dir, index, expected, renames, dequant_names),
+        "missing": [n for n in expected if n not in have],
+        "extra": [n for n in have if n not in expected and not n.startswith(_IGNORED_PREFIXES)],
+        "dead": dirty_shards(index),
+        "ple": ple_table_status(ftw_dir, n_ple) if n_ple else ("n/a", "", []),
+    }
 
 
 def ple_shards(out_dir: str, source: TensorSource) -> list[str]:
@@ -313,39 +621,53 @@ def ple_shards(out_dir: str, source: TensorSource) -> list[str]:
     todo = sorted(n for n in source.weight_map if _PLE_INFIX in n)
     if not todo:
         raise SystemExit("ERROR: the source checkpoint has no PLE table tensors")
-    written: list[str] = []
+    for stale in glob.glob(os.path.join(out_dir, "ple-table-*.safetensors.tmp")):
+        os.remove(stale)
+    names: list[str] = []
     batch: dict[str, torch.Tensor] = {}
     size = 0
-    b = bar(sum(b1 - a1 for n in todo for a1, b1 in [source._header(source.weight_map[n])[0][n]["data_offsets"]]), "Writing PLE table")
+    b = bar(sum(source.nbytes(n) for n in todo), "Writing PLE table")
 
     def flush():
         nonlocal batch, size
         if not batch:
             return
-        path = os.path.join(out_dir, f"ple-table-{len(written):05d}.safetensors")
-        log(f"  write {os.path.basename(path)}: {len(batch)} tensors, {size / 2**30:.2f} GiB")
-        save_file(batch, path)
-        written.append(os.path.basename(path))
+        name = f"ple-table-{len(names):05d}.safetensors"
+        log(f"  write {name}: {len(batch)} tensors, {size / 2**30:.2f} GiB")
+        save_file(batch, os.path.join(out_dir, name + ".tmp"))
+        names.append(name)
         batch, size = {}, 0
 
-    for n in todo:
-        t = source.get(n)
-        batch[n] = t
-        size += t.numel() * t.element_size()
-        tick(b, t.numel() * t.element_size())
-        if size >= _PLE_FILE_BYTES:
-            flush()
-    flush()
+    try:
+        for n in todo:
+            t = source.get(n)
+            batch[n] = t
+            size += t.numel() * t.element_size()
+            tick(b, t.numel() * t.element_size())
+            if size >= _PLE_FILE_BYTES:
+                flush()
+        flush()
+    except BaseException:
+        for name in names:
+            os.remove(os.path.join(out_dir, name + ".tmp"))
+        raise
     done(b)
-    return written
+    # every file is complete and synced before any gets its final name, so a scan never sees a half table
+    for name in names:
+        fsync_path(os.path.join(out_dir, name + ".tmp"))
+        os.replace(os.path.join(out_dir, name + ".tmp"), os.path.join(out_dir, name))
+    fsync_path(out_dir)
+    return names
 
 
-def copy_side_files(src: str, dst: str) -> None:
+def side_files(src: str, skip) -> list[str]:
     """Everything in the FTW dir except the shards and the index: configs, tokenizer, PLE tables, nested dirs."""
+    return [f for f in os.listdir(src) if not (f.endswith((".ftw", ".bak", ".tmp")) or f == INDEX_NAME or skip(f))]
+
+
+def copy_side_files(src: str, dst: str, skip) -> None:
     os.makedirs(dst, exist_ok=True)
-    for f in os.listdir(src):
-        if f.endswith((".ftw", ".bak", ".tmp")) or f == INDEX_NAME:
-            continue
+    for f in side_files(src, skip):
         s = os.path.join(src, f)
         if os.path.isdir(s):
             shutil.copytree(s, os.path.join(dst, f), dirs_exist_ok=True)
@@ -353,12 +675,21 @@ def copy_side_files(src: str, dst: str) -> None:
             shutil.copy2(s, os.path.join(dst, f))
 
 
+def side_files_bytes(src: str, skip) -> int:
+    total = 0
+    for f in side_files(src, skip):
+        p = os.path.join(src, f)
+        total += sum(os.path.getsize(os.path.join(r, x)) for r, _, fs in os.walk(p) for x in fs) if os.path.isdir(p) else os.path.getsize(p)
+    return total
+
+
 # ------------------------------------------------------------------ main
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ftw", required=True, help="FTW checkpoint dir to repair")
-    p.add_argument("--out", help="write a fresh, compact FTW dir here instead of patching in place")
+    p.add_argument("--out", help="write a fresh, compact FTW dir here (new or empty) instead of patching in place")
     p.add_argument("--repo", help="HF repo id of the source checkpoint (tensors are read by byte range)")
+    p.add_argument("--revision", help="HF revision (branch, tag or commit) of --repo")
     p.add_argument("--source", help="local HF safetensors dir of the source checkpoint (instead of --repo)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true", help="print every step")
@@ -366,26 +697,48 @@ def main(argv: list[str] | None = None) -> int:
     global _VERBOSE
     _VERBOSE = ns.verbose
 
+    if not os.path.isfile(os.path.join(ns.ftw, INDEX_NAME)):
+        print(f"ERROR: {ns.ftw} has no {INDEX_NAME}; not an FTW checkpoint dir", file=sys.stderr)
+        return 2
     with open(os.path.join(ns.ftw, INDEX_NAME)) as f:
         index = json.load(f)
-    assert index.get("format") == FORMAT_TAG, f"{ns.ftw} is not an FTW checkpoint"
-    if ns.out and os.path.abspath(ns.out) == os.path.abspath(ns.ftw):
-        print("ERROR: --out must differ from --ftw (omit --out to patch in place)", file=sys.stderr)
+    if index.get("format") != FORMAT_TAG:
+        print(f"ERROR: {ns.ftw} is not an FTW checkpoint (format {index.get('format')!r})", file=sys.stderr)
         return 2
+    if ns.out:
+        out, ftw = os.path.abspath(ns.out), os.path.abspath(ns.ftw)
+        if out == ftw or os.path.commonpath([out, ftw]) == ftw:
+            print("ERROR: --out must be outside --ftw (omit --out to patch in place)", file=sys.stderr)
+            return 2
+        if os.path.exists(out) and not os.path.isdir(out):
+            print(f"ERROR: --out {ns.out} exists and is not a directory", file=sys.stderr)
+            return 2
+        if os.path.isdir(out) and os.listdir(out):
+            print(f"ERROR: --out {ns.out} exists and is not empty", file=sys.stderr)
+            return 2
+    if ns.revision and not ns.repo:
+        print("  note: --revision only applies to --repo; ignored", file=sys.stderr)
     resident_experts = any(e["kind"] == "weight" and ".experts." in e["name"] for e in index["tensors"])
     log(f"reading {os.path.join(ns.ftw, INDEX_NAME)}: {len(index['tensors'])} entries, {len(index['shards'])} shards, {index['total_bytes'] / 2**30:.2f} GiB")
     log("building the current model on the meta device from the FTW's config.json" + (" (resident experts)" if resident_experts else ""))
     arch, expected, name_map = expected_tensors(ns.ftw, resident_experts)
     log(f"{arch}: model declares {len(expected)} dense tensors")
-    source = TensorSource(ns.repo, ns.source) if (ns.repo or ns.source) else None
+    source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
     renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map)
-    need_ple = arch.startswith("Qwen4Exp") and ple_tensors_present(ns.ftw) == 0
+    dequant_names = {n for n, _, _ in dequants}
+    n_ple = ple_expected_shards(ns.ftw) if arch.startswith("Qwen4Exp") else 0
+    chk = check_ftw(ns.ftw, index, expected, renames, dequant_names, n_ple)
+    problems, dirty = chk["problems"], chk["dead"]
+    ple_status, ple_detail, ple_files = chk["ple"]
+    need_ple = ple_status in ("missing", "partial")
+    next_num, orphans = shard_numbers(ns.ftw, index)
 
     print(f"{arch}: {len(expected)} expected dense tensors, FTW has {sum(e['kind'] == 'weight' for e in index['tensors'])}")
     print(f"  renames {len(renames)}  dequantize {len(dequants)}  fetch {len(fetches)}  drop {len(drops)}  leftover {len(leftovers)}"
-          + ("  PLE table: missing" if need_ple else ""))
-    for n, cands in fetches[:8]:
-        print(f"    fetch {n} <- {cands}")
+          + (f"  PLE table: {ple_status}" + (f" ({ple_detail})" if ple_detail else "") if need_ple else "")
+          + (f"  dead bytes in {len(dirty)} shard(s)" if dirty else ""))
+    for n, parts in fetches[:8]:
+        print(f"    fetch {n} <- {parts}")
     if len(fetches) > 8:
         print(f"    ... {len(fetches) - 8} more")
     for old, new in list(renames.items())[:5]:
@@ -396,119 +749,180 @@ def main(argv: list[str] | None = None) -> int:
         log(f"    dequantize {n} (drop {scale_e['name']})")
     for n in leftovers[:8]:
         print(f"    leftover (not declared by the model): {n}")
+    if orphans:
+        print(f"  note: {len(orphans)} shard file(s) not referenced by the index, left by an interrupted run, will be removed: {orphans[:3]}")
+
+    bad = False
+    for msg in problems[:10]:
+        print(f"ERROR: {msg}", file=sys.stderr)
+        bad = True
+    if len(problems) > 10:
+        print(f"ERROR: ... {len(problems) - 10} more", file=sys.stderr)
     if (fetches or need_ple) and source is None:
         print("ERROR: tensors must be fetched but neither --repo nor --source was given", file=sys.stderr)
         return 2
-    bad = False
-    for n, c in fetches:
-        srcs = [x for x in c if source.has(x)]
-        if not srcs:
-            print(f"ERROR: no source tensor for {n} (tried {c})", file=sys.stderr)
+    fetch_srcs: dict[str, list[str]] = {}
+    if fetches:
+        fetch_srcs, errors = resolve_fetches(fetches, source)
+        for msg in errors:
+            print(f"ERROR: {msg}", file=sys.stderr)
             bad = True
-        elif len(srcs) > 1 and not n.endswith(".input_scale"):
-            print(f"ERROR: {n} maps to {len(srcs)} source tensors; fusing is not supported here", file=sys.stderr)
-            bad = True
-    real_leftovers = [n for n in leftovers if not n.startswith(("vision_tower.", "embed_vision."))]
+    # the converter transforms most tensors on the way in (norm offsets, fusion, packing); only the
+    # activation scale scalars are stored as the checkpoint has them, so only they can be fetched raw
+    unfetchable = [n for n, _ in fetches if not n.endswith(".input_scale")]
+    if unfetchable:
+        print(f"ERROR: {len(unfetchable)} missing tensor(s) cannot be fetched raw (first: {unfetchable[0]}); reconvert the checkpoint", file=sys.stderr)
+        bad = True
+    real_leftovers = [n for n in leftovers if not n.startswith(_IGNORED_PREFIXES)]
     if real_leftovers:
         print(f"ERROR: the FTW holds {len(real_leftovers)} tensors the current model does not declare (first: {real_leftovers[0]}); this layout is not supported", file=sys.stderr)
         bad = True
+    foreign_ple = [f for f in ple_files if not _PLE_FILE_RE.match(f)]
+    if ple_status == "partial" and foreign_ple:
+        print(f"ERROR: the PLE table in {ns.ftw} is incomplete ({ple_detail}) and lives in files this tool did not write: {foreign_ple[:3]}; remove them first", file=sys.stderr)
+        bad = True
+    if need_ple and source is not None:
+        src_status, src_detail = ple_source_status(source, n_ple)
+        if src_status != "complete":
+            print(f"ERROR: the PLE table in the source is {src_status}" + (f" ({src_detail})" if src_detail else ""), file=sys.stderr)
+            bad = True
     if bad:
         return 2
-    if ns.dry_run:
-        return 0
-    if not (renames or dequants or fetches or drops or need_ple):
-        print("nothing to do; the FTW loads as is")
-        return 0
 
-    replaced = {n for n, _, _ in dequants} | {n for n, _ in fetches}
+    replaced = dequant_names | set(fetch_srcs)
     keep: list[tuple[dict, str]] = []
     for e in index["tensors"]:
         name = renames.get(e["name"], e["name"]) if e["kind"] == "weight" else e["name"]
         if e["kind"] == "weight" and (name in drops or name in replaced):
             continue
         keep.append((e, name))
-    rewrite = bool(ns.out) or len(keep) < len(index["tensors"])
+    kept_names = {e["name"] for e, _ in keep}
+    skip_ple = (lambda f: bool(_PLE_FILE_RE.match(f))) if need_ple else (lambda f: False)
+
+    # disk: the new entries and the PLE table, plus either one compacted shard next to its original
+    # (in place) or the whole compact copy (--out)
+    new_bytes = sum(_align_up(tensor_bytes(*expected[n])) for n in replaced)
+    table_bytes = sum(source.nbytes(n) for n in source.weight_map if _PLE_INFIX in n) if need_ple else 0
     work = ns.out or ns.ftw
-    log(("--out: writing a fresh FTW" if ns.out else "in place: rewriting shards, no dead bytes" if rewrite else "in place: appending one shard") + f" -> {work}")
     if ns.out:
-        copy_side_files(ns.ftw, ns.out)
-    if rewrite:
-        live = sum(_align_up(e["nbytes"]) for e, _ in keep)
-        if shutil.disk_usage(work).free < live + (1 << 30):
-            print(f"ERROR: {work} needs about {live / 2**30:.1f} GiB free to rewrite the shards", file=sys.stderr)
-            return 2
-        w = ShardWriter(work, index["shard_limit"], suffix="" if ns.out else ".tmp")
+        need = sum(_align_up(e["nbytes"]) for e, _ in keep) + new_bytes + table_bytes + side_files_bytes(ns.ftw, skip_ple)
     else:
-        w = ShardWriter(work, index["shard_limit"], first_shard=len(index["shards"]), global_off=index["total_bytes"])
-    try:
-        if rewrite:
-            log(f"rewriting {len(keep)} live entries into new shards under {work}")
-            b = bar(sum(e["nbytes"] for e, _ in keep), "Rewriting shards")
-            for e, name in keep:
-                log(f"  copy {e['name']}" + (f" -> {name}" if name != e["name"] else "") + f"  {e['nbytes']} B")
-                w.add({**e, "name": name}, entry_chunks(ns.ftw, index, e))
-                tick(b, e["nbytes"])
-            done(b)
+        after = {**index, "tensors": [e for e in index["tensors"] if e["name"] in kept_names]}
+        need = new_bytes + table_bytes + max([lb for _, _, lb in dirty_shards(after)] + [0])
+    probe = os.path.abspath(work)
+    while not os.path.isdir(probe):
+        probe = os.path.dirname(probe)
+    free = shutil.disk_usage(probe).free
+    print(f"  disk: about {need / 2**30:.1f} GiB needed under {work} ({free / 2**30:.1f} GiB free)")
+    if ns.dry_run:
+        return 0
+    for f in orphans:
+        os.remove(os.path.join(ns.ftw, f))
+    if not (renames or dequants or fetch_srcs or drops or need_ple or dirty or ns.out):
+        print("nothing to do; the FTW loads as is")
+        return 0
+    if free < need + (1 << 30):
+        print(f"ERROR: not enough free space under {work}", file=sys.stderr)
+        return 2
+
+    def write_new(w: ShardWriter) -> None:
         b = bar(sum(e["nbytes"] for _, e, _ in dequants), "Dequantizing") if dequants else None
         for n, e, scale_e in dequants:
             log(f"  dequantize {n}: fp8 x {scale_e['name']} -> bf16 {e['shape']}")
             w.add_tensor(n, dequantize_rows(read_entry(ns.ftw, index, e), read_entry(ns.ftw, index, scale_e)))
             tick(b, e["nbytes"])
         done(b)
-        for n, cands in (fetches if _VERBOSE or not fetches else count_bar(fetches, "Fetching tensors")):
-            srcs = [c for c in cands if source.has(c)]
+        items = list(fetch_srcs.items())
+        for n, srcs in (items if _VERBOSE or not items else count_bar(items, "Fetching tensors")):
             log(f"  fetch {n} <- {', '.join(srcs)}")
             vals = [source.get(c) for c in srcs]
-            shape, dtype = expected[n]
-            if n.endswith(".input_scale"):
-                # a fused projection shares one activation scale; the reader takes the max over its parts
-                w.add_tensor(n, torch.stack([v.reshape(()).float() for v in vals]).max().reshape(()))
-                continue
-            v = vals[0]
-            if tuple(v.shape) != shape:
-                raise SystemExit(f"ERROR: {n}: source shape {tuple(v.shape)} != expected {shape}")
-            w.add_tensor(n, v.to(dtype))
-    except BaseException:
-        w.abort()
-        raise
-    new_shards = w.close()
+            # a fused projection shares one activation scale; the reader takes the max over its parts
+            w.add_tensor(n, torch.stack([v.reshape(()).float() for v in vals]).max().reshape(()))
 
-    tensors = w.entries if rewrite else [{**e, "name": name} for e, name in keep] + w.entries
-    shards = new_shards if rewrite else index["shards"] + new_shards
-    new_index = {**index, "tensors": tensors, "total_bytes": w.global_off, "shards": shards,
-                 "counts": {**index.get("counts", {}), "weight": sum(e["kind"] == "weight" for e in tensors)},
-                 "hotfix": {"from": os.path.abspath(ns.ftw), "renamed": len(renames), "dequantized": len(dequants),
-                            "fetched": len(fetches), "dropped": len(drops), "rewritten": rewrite, "source": ns.repo or ns.source}}
-    if need_ple:
-        log("writing the PLE table into ple-table-*.safetensors")
-        got = ple_shards(work, source)
-        print(f"  PLE table written: {len(got)} files")
-    if rewrite and not ns.out:
-        log(f"replacing {len(index['shards'])} old shards with {len(new_shards)} new ones")
-        for sh in index["shards"]:
-            os.remove(os.path.join(work, sh["file"]))
-        for sh in new_shards:
-            os.replace(os.path.join(work, sh["file"] + ".tmp"), os.path.join(work, sh["file"]))
-    # the old index only allows a rollback while the old shards still exist
-    bak = os.path.join(work, INDEX_NAME + ".bak")
-    if not ns.out and not rewrite and not os.path.exists(bak):
-        shutil.copy2(os.path.join(work, INDEX_NAME), bak)
-    tmp = os.path.join(work, INDEX_NAME + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(new_index, f)
-    os.replace(tmp, os.path.join(work, INDEX_NAME))
-    log(f"index written: {os.path.join(work, INDEX_NAME)}")
+    hotfix = {"from": os.path.abspath(ns.ftw), "renamed": len(renames), "dequantized": len(dequants),
+              "fetched": len(fetch_srcs), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}
+    compacted = 0
+    if ns.out:
+        log(f"--out: writing a fresh FTW -> {work}")
+        try:
+            copy_side_files(ns.ftw, work, skip_ple)
+            w = ShardWriter(work, index["shard_limit"])
+            b = bar(sum(e["nbytes"] for e, _ in keep), "Rewriting shards")
+            for e, name in keep:
+                log(f"  copy {e['name']}" + (f" -> {name}" if name != e["name"] else "") + f"  {e['nbytes']} B")
+                w.add({**e, "name": name}, entry_chunks(ns.ftw, index, e))
+                tick(b, e["nbytes"])
+            done(b)
+            write_new(w)
+            shards = w.close()
+            side = [f for f in index.get("side_files", []) if not skip_ple(f)]
+            if need_ple:
+                got = ple_shards(work, source)
+                side += got
+                print(f"  PLE table written: {len(got)} files")
+            new_index = {**index, "tensors": w.entries, "shards": shards, "total_bytes": w.global_off,
+                         "counts": {**index.get("counts", {}), "weight": sum(e["kind"] == "weight" for e in w.entries)},
+                         "side_files": sorted(side), "hotfix": hotfix}
+            write_index(work, new_index)
+        except BaseException:
+            # the dir was new or empty, so nothing of the user's is in it
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+        added = len(w.entries) - len(keep)
+    else:
+        new_entries: list[dict] = []
+        new_shards: list[dict] = []
+        if dequants or fetch_srcs:
+            log(f"in place: appending shard {_SHARD_FMT.format(next_num)} -> {work}")
+            w = ShardWriter(work, index["shard_limit"], first_shard=next_num, global_off=index["total_bytes"])
+            try:
+                write_new(w)
+            except BaseException:
+                w.abort()
+                raise
+            new_shards = w.close()
+            new_entries = w.entries
+            next_num = w.shard_idx + 1
+        tensors = [{**e, "name": name} for e, name in keep] + new_entries
+        new_index = {**index, "tensors": tensors, "shards": index["shards"] + new_shards,
+                     "total_bytes": index["total_bytes"] + sum(sh["nbytes"] for sh in new_shards),
+                     "counts": {**index.get("counts", {}), "weight": sum(e["kind"] == "weight" for e in tensors)},
+                     "hotfix": hotfix}
+        if renames or new_entries or drops:
+            # rollback stays possible only while no shard gets replaced: keep the old index then
+            bak = os.path.join(work, INDEX_NAME + ".bak")
+            if not drops and not dirty and not os.path.exists(bak):
+                shutil.copy2(os.path.join(work, INDEX_NAME), bak)
+            write_index(work, new_index)
+            log(f"index written: {os.path.join(work, INDEX_NAME)}")
+        if need_ple:
+            for f in ple_files:
+                os.remove(os.path.join(work, f))
+            got = ple_shards(work, source)
+            side = {f for f in new_index.get("side_files", []) if not _PLE_FILE_RE.match(f)} | set(got)
+            new_index = {**new_index, "side_files": sorted(side)}
+            write_index(work, new_index)
+            print(f"  PLE table written: {len(got)} files")
+        new_index, compacted = compact_in_place(work, new_index, next_num)
+        if compacted:
+            new_index = {**new_index, "hotfix": {**hotfix, "compacted": compacted}}
+            write_index(work, new_index)
+            # the old shards are gone, so an old index can no longer roll anything back
+            bak = os.path.join(work, INDEX_NAME + ".bak")
+            if os.path.exists(bak):
+                os.remove(bak)
+        added = len(new_entries)
 
-    final = {e["name"] for e in tensors if e["kind"] == "weight"}
-    still_missing = [n for n in expected if n not in final]
-    extra = [n for n in final if n not in expected]
-    added = len(w.entries) - (len(keep) if rewrite else 0)
-    print(f"wrote {work}: {len(tensors)} entries, +{added} new, {'rewritten' if rewrite else 'appended'}, "
-          f"{len(shards)} shard(s), total {w.global_off / 2**30:.2f} GiB")
-    print(f"  check: missing {len(still_missing)}  extra {len(extra)}")
-    for n in (still_missing + extra)[:10]:
+    chk = check_ftw(work, new_index, expected, {}, set(), n_ple)
+    ple_status, ple_detail, _ = chk["ple"]
+    print(f"wrote {work}: {len(new_index['tensors'])} entries, +{added} new, {len(new_index['shards'])} shard(s)"
+          + (f", {compacted} compacted" if compacted else "") + f", total {new_index['total_bytes'] / 2**30:.2f} GiB")
+    print(f"  check: missing {len(chk['missing'])}  extra {len(chk['extra'])}  problems {len(chk['problems'])}  "
+          f"dead bytes in {len(chk['dead'])} shard(s)  PLE table: {ple_status}" + (f" ({ple_detail})" if ple_detail else ""))
+    for n in (chk["missing"] + chk["extra"] + chk["problems"])[:10]:
         print(f"    {n}")
-    return 1 if still_missing else 0
+    ok = not (chk["missing"] or chk["extra"] or chk["problems"] or chk["dead"]) and ple_status in ("complete", "n/a")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

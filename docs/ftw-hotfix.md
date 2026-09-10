@@ -19,7 +19,7 @@ python scripts/ftw_hotfix.py --ftw ~/models/GLM-5.2-NVFP4-FTW --dry-run
 ```
 
 The script needs the installed `freetoken` package. It downloads only the tensors it needs, by
-byte range, never the whole checkpoint.
+byte range, never the whole checkpoint; `--revision` pins the Hub revision to read from.
 
 ## What breaks and how it is repaired
 
@@ -32,17 +32,22 @@ byte range, never the whole checkpoint.
 
 The script decides by itself: it builds the current model from the FTW's `config.json`, compares
 the FTW index with the tensors the model declares, and applies only the repairs that are needed.
-An FTW that loads as is is left untouched.
+Before writing anything it checks that the FTW matches the model (shapes, dtypes, byte counts,
+shard files) and refuses one that does not. An FTW that loads as is is left untouched.
 
 ## What it writes
 
-- In place by default. When tensors are only added, one shard is appended and the existing shards
-  are not touched. When tensors are replaced or dropped (GLM-5.2), the live entries are rewritten
-  into fresh shards so the FTW holds no dead bytes; this needs free disk space equal to the FTW.
-  As long as the old shards are kept, the previous index stays as `freetoken_weight.json.bak`, so
-  restoring it (and deleting the appended shard) undoes the patch.
-- `--out <dir>` writes a fresh, compact FTW dir and leaves the original untouched.
-- The last line of the output reports how many declared tensors are still missing; it must be 0.
+- In place by default. New tensors go into one appended shard, then the index is replaced
+  atomically. Shards left with replaced or dropped entries (GLM-5.2) are compacted one at a time
+  into new shard files, each step ending in another atomic index swap, so the FTW is loadable at
+  every moment and an interrupted run is finished by running the same command again. While no
+  shard has been replaced, the previous index stays as `freetoken_weight.json.bak`.
+- `--out <dir>` writes a fresh, compact FTW dir (the dir must be new or empty) and leaves the
+  original untouched.
+- The plan prints the disk space the run needs. The last line re-checks the result: declared
+  tensors still missing, structural problems and shards with dead bytes must all be 0, and the PLE
+  table (Flash-Next) must be `complete`. Every shard and index write is synced to disk before the
+  index is replaced, so a power loss leaves either the old or the new state.
   Long phases show a progress bar; `-v` prints every step instead.
 
 Not covered: FTWs converted from GGUF, and checkpoints outside [models.md](models.md).
