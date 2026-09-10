@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -128,7 +128,11 @@ class Qwen4ExpAttention(BaseOP):
             config.hidden_size, self._qkv_split, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
+        # Row-parallel, as every other family builds o_proj: qkv_proj is column-parallel, so a
+        # rank's attention output is its local head slice and the partial sums need an
+        # all-reduce. At TP=1 this is LinearReplicated exactly -- div_even(x, 1) == x and the
+        # all-reduce is skipped -- so it is a no-op today and correct when #385 lands.
+        self.o_proj = LinearOProj(
             self.qo_attn_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
