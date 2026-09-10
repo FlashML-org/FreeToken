@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
 
+from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -93,17 +93,6 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
-def _quant_get(hf_config: Any):
-    quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
-        return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
-
-
-def _ignored(patterns, module_name: str) -> bool:
-    return any(fnmatch(module_name, pat) for pat in patterns)
-
-
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -149,39 +138,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    get = _quant_get(hf_config)
-    if get is None:
-        expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
-    else:
-        algo = str(get("quant_algo") or get("quant_method") or "").lower()
-        block = get("weight_block_size")
-        if algo == "fp8" and block:
-            # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
-            # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
-            # GDN, the shared expert, HC, PLE and lm_head stay bf16.
-            bs = tuple(int(x) for x in block)
-            assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
-            expert_quant = "fp8_block"
-            attn_quant = dense_quant = lm_head_quant = "none"
-        else:
-            is_fp4 = "fp4" in algo
-            ignore = list(get("ignore") or [])
-
-            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
-            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
-            # and stay bf16. Derive every flag from that list instead of assuming the split.
-            def _quant(probe: str) -> str:
-                return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
-
-            prefix = "model.language_model.layers.0"
-            expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
-            dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
-            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
-            lm_head_quant = _quant("lm_head")
-
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
@@ -282,9 +245,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )
