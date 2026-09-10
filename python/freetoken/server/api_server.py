@@ -38,7 +38,7 @@ from pydantic import BaseModel
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
-from .control_api import register_control_routes
+from .control_api import build_runtime_identity_snapshot, register_control_routes
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
@@ -57,6 +57,42 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
+_TRUSTED_PROXY_HOSTS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def _maintenance_lock_for(state: Any) -> Any:
+    lock = getattr(state, "_maintenance_lock", None)
+    if lock is None:
+        # Production FrontendManager always has this field. The lazy fallback keeps the focused
+        # fake-state tests and compatible external state adapters on the same transition API.
+        lock = threading.Lock()
+        state._maintenance_lock = lock
+    return lock
+
+
+def _transition_maintenance(state: Any, expected: set[str], target: str) -> bool:
+    """Atomic cross-thread lifecycle transition; terminal states cannot be overwritten."""
+    with _maintenance_lock_for(state):
+        if state.maintenance_state not in expected:
+            return False
+        state.maintenance_state = target
+        return True
+
+
+def _refresh_shell_runtime_identity(state: Any) -> None:
+    """Refresh worker process groups after shell workers complete their early detach.
+
+    Shell-mode children call ``setpgrp()`` asynchronously immediately after spawn. The loading
+    snapshot can therefore observe their inherited foreground group; the ready callback is the
+    first point where every acknowledged worker is guaranteed to have completed that detach.
+    The ready path calls this while holding the lifecycle lock, making snapshot publication and
+    the loading-to-serving transition atomic to endpoint readers.
+    """
+    config = getattr(state, "config", None)
+    if getattr(config, "shell_mode", False):
+        state.runtime_identity = build_runtime_identity_snapshot(
+            state, list(getattr(state, "backend_processes", None) or [])
+        )
 
 
 def get_global_state() -> FrontendManager:
@@ -140,6 +176,10 @@ class FrontendManager:
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Process/correlation facts bound immediately after backend spawn. Shell mode rebinds once,
+    # atomically at ready, after workers detach their process groups; the snapshot is immutable
+    # thereafter. Lifecycle is overlaid when /v1/runtime/identity is read.
+    runtime_identity: Dict[str, Any] | None = None
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
@@ -147,6 +187,7 @@ class FrontendManager:
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
+    _maintenance_lock: Any = field(default_factory=threading.Lock, repr=False)
     last_rebuild: Dict[str, Any] | None = None
     load_progress: Any = None
     # Monotonic timestamp the server became ready; drives /health + /v1/stats uptime without
@@ -282,11 +323,14 @@ class FrontendManager:
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
-        if self.fatal_error is not None:
-            # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
-            self.maintenance_state = "failed"
-            return
-        self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+        with _maintenance_lock_for(self):
+            if self.fatal_error is not None:
+                # A dead backend stays failed regardless of a stale/buffered reply.
+                self.maintenance_state = "failed"
+            elif self.maintenance_state == "rebuilding":
+                # A stop/failure transition outranks a late rebuild reply. The result is still
+                # recorded and its waiter is still woken above, but admission stays sealed.
+                self.maintenance_state = "failed" if msg.status == "failed" else "serving"
 
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
@@ -377,7 +421,32 @@ class FrontendManager:
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
 
+    def mark_stopping(self) -> None:
+        # Failure is terminal and more informative than an orderly-stop label. Every other
+        # state seals as stopping; _on_ready only reopens an exact "loading" state.
+        _transition_maintenance(
+            self,
+            {"loading", "serving", "rebuilding", "stopping"},
+            "stopping",
+        )
+
+    def mark_ready(self) -> bool:
+        """Open admission exactly once, and never after a stop/failure transition."""
+        with _maintenance_lock_for(self):
+            if self.maintenance_state != "loading":
+                return False
+            _refresh_shell_runtime_identity(self)
+            self.maintenance_state = "serving"
+            self.ready_at = time.monotonic()
+            return True
+
+    def mark_failed(self, message: str) -> None:
+        with _maintenance_lock_for(self):
+            self.fatal_error = message
+            self.maintenance_state = "failed"
+
     def shutdown(self):
+        self.mark_stopping()
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
         # Tear the workers down ourselves (best-effort). _SHUTTING_DOWN is already set by the
@@ -515,7 +584,12 @@ async def dispatch_rebuild(
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
-    state.maintenance_state = "rebuilding"
+    if not _transition_maintenance(state, {"serving"}, "rebuilding"):
+        state.rebuild_futures.pop(request_id, None)
+        return {
+            "status": "rejected",
+            "error": f"engine is {state.maintenance_state}; rebuild not started",
+        }
     try:
         await state.send_one(
             CacheRebuildMsg(
@@ -532,7 +606,7 @@ async def dispatch_rebuild(
         # untouched. Roll the gate back to serving (else a transient ZMQ error would latch
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
-        state.maintenance_state = "serving"
+        _transition_maintenance(state, {"rebuilding"}, "serving")
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -861,6 +935,7 @@ def _install_shell_stop_handlers() -> None:
 
     def _flag_shutdown(signum, frame) -> None:
         _SHUTTING_DOWN.set()
+        _GLOBAL_STATE.mark_stopping()
         _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
         prev = previous.get(signum)
         if callable(prev):
@@ -871,6 +946,32 @@ def _install_shell_stop_handlers() -> None:
 
     for sig in previous:
         signal.signal(sig, _flag_shutdown)
+
+
+def _uvicorn_config(host: str, port: int, *, access_log: bool = True) -> uvicorn.Config:
+    # Loopback control endpoints authorize from Request.client. Pin proxy trust to loopback peers
+    # so FORWARDED_ALLOW_IPS=* cannot make a remote direct client spoof that address, while a
+    # local reverse proxy can still preserve the real remote client for the authorization check.
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        access_log=access_log,
+        proxy_headers=True,
+        forwarded_allow_ips=list(_TRUSTED_PROXY_HOSTS),
+    )
+
+
+def _run_uvicorn(host: str, port: int) -> None:
+    # Keep uvicorn.run's KeyboardInterrupt wrapper for normal `ft serve` Ctrl-C behavior while
+    # applying the same explicit loopback-only proxy trust as shell mode's Config.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=list(_TRUSTED_PROXY_HOSTS),
+    )
 
 
 def _serve_and_run_shell(host: str, port: int) -> None:
@@ -897,7 +998,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(_uvicorn_config(host, port, access_log=False))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -913,6 +1014,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # Belt and braces: if uvicorn's lifespan shutdown did not run (thread wedged), flag the
         # stop and tear the workers down here so nothing outlives the shell.
         _SHUTTING_DOWN.set()
+        _GLOBAL_STATE.mark_stopping()
         _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
@@ -979,19 +1081,19 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
+    _GLOBAL_STATE.runtime_identity = build_runtime_identity_snapshot(
+        _GLOBAL_STATE, _GLOBAL_STATE.backend_processes
+    )
 
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend
         # may finish its ready handshake before SIGTERM arrives; never reopen that gate after the
         # daemon has received a final accounting snapshot.
-        if _GLOBAL_STATE.maintenance_state == "loading":
-            _GLOBAL_STATE.maintenance_state = "serving"
-            _GLOBAL_STATE.ready_at = time.monotonic()
+        if _GLOBAL_STATE.mark_ready():
             logger.info(f"API server is ready to serve on {host}:{port}")
 
     def _on_failure(message: str) -> None:
-        _GLOBAL_STATE.fatal_error = message
-        _GLOBAL_STATE.maintenance_state = "failed"
+        _GLOBAL_STATE.mark_failed(message)
         logger.error("Backend supervisor: %s", message)
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
@@ -1037,4 +1139,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    _run_uvicorn(host, port)

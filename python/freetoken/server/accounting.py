@@ -69,9 +69,15 @@ async def prepare_stop_accounting(
         if maintenance not in {"loading", "serving", "stopping", "failed"}:
             raise AccountingDrainError(f"engine cannot prepare stop from state {maintenance!r}")
 
-        # This assignment and FrontendManager.new_user's check run on the same event loop, making
-        # the generation gate atomic with respect to every protocol adapter.
-        state.maintenance_state = "stopping"
+        # This transition and FrontendManager.new_user's check run on the same event loop, making
+        # the generation gate atomic with respect to every protocol adapter. Production state
+        # also serializes it with the backend supervisor so a concurrent failure stays terminal;
+        # the direct assignment preserves compatibility with focused/external state adapters.
+        mark_stopping = getattr(state, "mark_stopping", None)
+        if callable(mark_stopping):
+            mark_stopping()
+        else:
+            state.maintenance_state = "stopping"
 
         stats = state.stats
         drained = await _wait_for_idle(stats, drain_timeout_s)
