@@ -74,6 +74,22 @@ def _anthropic_stop(finish_reason: str | None, matched_stop: str | None) -> tupl
     return STOP_REASON_MAP.get(finish_reason or "stop"), None
 
 
+def _maintenance_gate(state: Any) -> JSONResponse | None:
+    """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
+    runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
+    None when serving."""
+    mstate = getattr(state, "maintenance_state", "serving")
+    if mstate == "serving":
+        return None
+    if mstate == "loading":
+        msg = "model is still loading"
+    elif mstate == "failed":
+        msg = "server unavailable: maintenance failed (restart required)"
+    else:
+        msg = "server unavailable: cache rebuild in progress"
+    return JSONResponse({"error": msg}, status_code=503)
+
+
 def register_anthropic_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -83,10 +99,8 @@ def register_anthropic_routes(
     async def v1_messages(req: AnthropicMessagesRequest, request: Request):
         log_request("/v1/messages", req, request)
         state = get_state()
-        mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
-            return _anthropic_error_response(503, "overloaded_error", detail)
+        if (gate := _maintenance_gate(state)) is not None:
+            return gate
         return await handle_anthropic_messages(req, request, state, get_model_sampling())
 
     @app.post("/v1/messages/count_tokens")
