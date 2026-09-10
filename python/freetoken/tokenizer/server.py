@@ -80,12 +80,26 @@ def _send_generation_replies(
     _put_user_replies(send_frontend, terminal_errors)
 
 
+def _backend_msg(msg, t) -> UserMsg:
+    mm_inputs = getattr(t, "mm_inputs", None)
+    cache_ids = mm_inputs.pop("cache_ids", None) if mm_inputs else None
+    return UserMsg(
+        uid=msg.uid,
+        input_ids=t,
+        sampling_params=msg.sampling_params,
+        mm_inputs=mm_inputs,
+        cache_ids=cache_ids,
+    )
+
+
 def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
 ) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
-    """Tokenize independently, returning backend work plus terminal frontend errors.
+    """Tokenize independently, returning backend work plus terminal frontend errors. The
+    returned tensors carry the request's vision-processor outputs as ``.mm_inputs`` (None for
+    text-only requests).
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
@@ -95,7 +109,8 @@ def _tokenize_requests(
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokens, mm_inputs = tokenize_manager.tokenize_one(msg)
+            tokens.mm_inputs = mm_inputs
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -147,7 +162,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, model_path=tokenizer_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -254,8 +269,7 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        _backend_msg(msg, t) for msg, t in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

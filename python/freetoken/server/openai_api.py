@@ -66,8 +66,9 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    images: list[bytes] = []
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages], images),
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -80,6 +81,7 @@ def chat_request_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        images=images,
     )
 
 

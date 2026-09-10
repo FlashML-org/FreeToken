@@ -520,6 +520,12 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.mm_inputs is not None:
+                error = self._prepare_multimodal(msg)
+                if error is not None:
+                    logger.warning_rank0(f"Rejecting request {msg.uid}: {error}")
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -759,6 +765,23 @@ class Scheduler(SchedulerIOMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
+    def _prepare_multimodal(self, msg: UserMsg) -> str | None:
+        """Encode the request's images on this rank (every TP rank sees the same UserMsg) into
+        ``mm_embeds`` + mRoPE positions; returns the client-facing error instead of raising."""
+        model = self.engine.model
+        if not getattr(model, "has_vision", False):
+            return "image inputs need the vision tower: start the server with FREETOKEN_LOAD_VISION=1"
+        try:
+            with self.engine_stream_ctx:  # ordered before the prefill that reads mm_embeds
+                msg.mm_embeds, msg.mrope_positions, msg.mrope_delta = model.prepare_mm_inputs(
+                    msg.input_ids, msg.mm_inputs
+                )
+        except Exception as exc:  # noqa: BLE001 -- a bad image must not take the scheduler down
+            logger.warning_rank0(f"image encoding failed for request {msg.uid}: {exc!r}")
+            return f"could not encode images: {exc}"
+        msg.mm_inputs = None
+        return None
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
@@ -781,6 +804,9 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        batch.rope_positions, batch.mrope_cos_sin = _make_rope_positions(
+            batch, self.device, self.engine.model
+        )
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -820,11 +846,18 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        batch so the model can scatter them at image-token positions. A chunked prompt
+        contributes only the placeholders inside its current chunk; ``req.mm_embeds`` is
+        kept (not cleared) so later chunks can slice theirs. Image prompts take part in the
+        prefix cache through ``req.cache_ids`` (per-image content hash, see
+        ``tokenizer.tokenize._image_cache_ids``): a hit skips the cached placeholders too."""
+        image_token_id = getattr(self.engine.model, "image_token_id", None)
+        parts = [
+            _mm_embeds_window(req, image_token_id)
+            for req in batch.reqs
+            if req.mm_embeds is not None
+        ]
+        parts = [p for p in parts if p.shape[0]]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
 
@@ -888,6 +921,35 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _mm_embeds_window(req, image_token_id: int) -> torch.Tensor:
+    """The rows of ``req.mm_embeds`` for this prefill window: the image placeholders in
+    ``input_ids[cached_len:]``, skipping those an earlier chunk already scattered."""
+    is_image = req.input_ids == image_token_id
+    before = int(is_image[: req.cached_len].sum())
+    within = int(is_image[req.cached_len :].sum())
+    return req.mm_embeds[before : before + within]
+
+
+def _make_rope_positions(
+    batch: Batch, device: torch.device, model
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``(rope_positions, mrope_cos_sin)`` for the batch (see ``Batch``). Text-only batches
+    alias ``positions`` (no extra work); requests decoding after an image add their
+    ``mrope_delta``; a prefill batch holding image tokens gets a per-token cos|sin table from
+    the model (``mrope_table``) and each token's table row as its rope position."""
+    reqs = batch.padded_reqs
+    if batch.is_prefill and any(r.mrope_positions is not None for r in reqs):
+        return model.mrope_table(reqs, device)
+    if all(r.mrope_delta == 0 for r in reqs):
+        return batch.positions, None
+    delta_host = torch.empty(len(batch.positions), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in reqs:
+        delta_host[offset : offset + req.extend_len].fill_(req.mrope_delta)
+        offset += req.extend_len
+    return batch.positions + delta_host.to(device, non_blocking=True), None
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
