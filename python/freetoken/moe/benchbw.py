@@ -43,7 +43,7 @@ import socket
 import statistics
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -413,6 +413,49 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     return cache, total_bytes
 
 
+def measure_pcie_gather_by_misses(fmt: str, wl: Workload, device: torch.device,
+                                  iters: int = 20) -> list[dict]:
+    """Gather bandwidth as a function of how many experts actually miss per step.
+
+    ``measure_pcie_gather_bw`` refills a *whole layer* -- every expert missing. That is
+    the best case for PCIe: one large scatter, fixed costs amortized to nothing. Real
+    decode misses a handful of experts per layer, and a small gather is latency-bound,
+    not bandwidth-bound, so it moves bytes far slower than the headline figure.
+
+    That matters because the hybrid-vs-offload ratio is built from the headline figure.
+    A verdict derived at 100% miss does not describe a well-cached deployment, and the
+    two regimes genuinely disagree: measured end to end on one box, hybrid beat offload
+    by 16% at 10% expert residency and lost by 33% at 25%. This sweep at least makes the
+    regime visible rather than leaving it implicit.
+    """
+    eb = _expert_bytes(fmt, wl.hidden, wl.inter)
+    cache, _ = _build_gather_rig(fmt, wl, device)
+    E = cache.num_experts
+    points = [k for k in (1, 2, 4, 8, 16, 32, 64, 128, 256) if k < E] + [E]
+    out = []
+    for k in points:
+        cache.num_indices.fill_(k)
+        for _ in range(3):
+            cache.copy_missing()
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        if hasattr(torch.cuda, "_sleep"):
+            torch.cuda._sleep(10**7)
+        start.record()
+        for _ in range(iters):
+            cache.copy_missing()
+        end.record()
+        end.synchronize()
+        ms = start.elapsed_time(end) / iters
+        out.append({
+            "misses": k,
+            "ms": round(ms, 4),
+            "bw_gbs": round((k * eb) / (ms / 1e3) / 1e9, 2),
+        })
+    return out
+
+
 def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: int = 20) -> dict:
     """Real PCIe gather bandwidth (GB/s): pinned host banks -> GPU slot cache.
 
@@ -501,6 +544,50 @@ def _time_cpu_moe(ex, wl: Workload, eb: int, E: int, iters: int) -> float:
         samples.append(time.perf_counter() - t0)
     ms = statistics.median(samples) * 1e3
     return (wl.top_k * eb) / (ms / 1e3) / 1e9
+
+
+def measure_cpu_moe_step_cost(fmt: str, wl: Workload, iters: int = 64,
+                              num_threads: int = 0) -> dict | None:
+    """Split one CPU MoE decode step into a fixed cost and a per-expert cost.
+
+    The hybrid backend does not just add CPU bandwidth to PCIe bandwidth. Every layer of
+    every step it also pays a fixed toll -- activations D2H, the GPU<->CPU handshake,
+    waking the worker pool and draining its barrier, results H2D -- whether it computes
+    one expert or twenty, and the GPU stalls on it. When most experts miss, that toll is
+    amortized and hybrid wins. When the GPU cache is holding well and only a couple miss,
+    the toll is most of what hybrid contributes, and plain offload is faster.
+
+    Two points give the split, since ``top_k`` is fixed per executor: build one at
+    ``top_k = 1`` and one at the workload's own ``top_k`` over the same banks, and solve
+    ``t(k) = fixed + k * per_expert``. Returns None if the geometry has no second point.
+    """
+    if wl.top_k < 2:
+        return None
+    H, I = wl.hidden, wl.inter
+    eb = _expert_bytes(fmt, H, I)
+    E = _synth_experts(wl.experts, eb)
+    banks = _cpu_moe_bank_sources(fmt, H, I, E)
+
+    def step_ms(top_k: int) -> float:
+        w = replace(wl, top_k=top_k)
+        ex = _build_cpu_moe_executor(fmt, w, banks, num_threads, E)
+        try:
+            # _time_cpu_moe reports GB/s over top_k experts; invert back to milliseconds.
+            gbs = _time_cpu_moe(ex, w, eb, E, iters)
+            return (top_k * eb) / (gbs * 1e9) * 1e3
+        finally:
+            del ex
+
+    t1, tk = step_ms(1), step_ms(wl.top_k)
+    per_expert = (tk - t1) / (wl.top_k - 1)
+    fixed = t1 - per_expert
+    return {
+        "fixed_ms": round(fixed, 4),
+        "per_expert_ms": round(per_expert, 4),
+        "top_k": wl.top_k,
+        "step_ms_at_1": round(t1, 4),
+        "step_ms_at_top_k": round(tk, 4),
+    }
 
 
 def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int = 0,
@@ -619,10 +706,16 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         "expert_bytes": None, "synth_experts": None, "cpu_moe_gbs": None, "cpu_moe_isa": None,
         "isa_sweep": None, "pcie_gather_gbs": None,
         "cpu_moe_overlap_gbs": None, "pcie_gather_overlap_gbs": None,
-        "ratio": None, "recommended": None,
+        "ratio": None, "recommended": None, "pcie_gather_by_misses": None,
+        "cpu_moe_step_cost": None,
         "note": None,
     }
     try:
+        try:
+            entry["pcie_gather_by_misses"] = measure_pcie_gather_by_misses(
+                fmt, wl, device, pcie_iters)
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"benchbw: gather miss sweep failed for {wl.name}/{fmt}: {e}")
         g = measure_pcie_gather_bw(fmt, wl, device, pcie_iters)
         entry["pcie_gather_gbs"] = round(g["bw_gbs"], 2)
         entry["expert_bytes"] = g["expert_bytes"]
@@ -660,6 +753,15 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
     if cpu_g is not None and pcie_g:  # pcie_g truthy also rules out a div-by-zero
         entry["ratio"] = round(cpu_g / pcie_g, 3)
         entry["recommended"] = recommend(cpu_g, pcie_g, threshold)
+        # The ratio says hybrid moves expert bytes faster. It does not say whether that
+        # beats offload at *this* deployment's miss rate, because hybrid also pays a
+        # fixed per-layer toll the ratio cannot see. Measure the toll and report the
+        # miss count where the two break even.
+        try:
+            sc = measure_cpu_moe_step_cost(fmt, wl, cpu_iters, cpu_threads)
+            entry["cpu_moe_step_cost"] = sc
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"benchbw: step-cost bench failed for {wl.name}/{fmt}: {e}")
         # Both sides work standalone -> also measure them contended (concurrently). This
         # pair sets the hybrid backend's fetch split (load_hybrid_fetch_fraction); the
         # hybrid-vs-offload verdict above stays on the standalone numbers.
@@ -826,6 +928,16 @@ def _print_kernels(kernels: dict, iw: int) -> None:
         if c_ov and p_ov:
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
                   f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
+        sc = e.get("cpu_moe_step_cost")
+        if sc:
+            print(f"       cpu step: {sc['fixed_ms']:.2f} ms fixed + "
+                  f"{sc['per_expert_ms']:.2f} ms/expert -- the fixed part is paid per layer "
+                  f"per step whether 1 expert misses or 20")
+        gm = e.get("pcie_gather_by_misses")
+        if gm and len(gm) > 1:
+            lo, hi = gm[0], gm[-1]
+            print(f"       gather scales linearly: {lo['bw_gbs']:.1f} GB/s at "
+                  f"{lo['misses']} miss -> {hi['bw_gbs']:.1f} GB/s at {hi['misses']}")
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):
