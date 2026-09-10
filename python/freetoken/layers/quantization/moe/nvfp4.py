@@ -41,7 +41,13 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        # tp_ok: the source stream is sliced along the intermediate axis per rank
+        # (nvfp4_banks._tp_shard) and this kernel sizes its banks from
+        # cfg.local_intermediate, so a rank holds and reads only its own half. The routed
+        # output is then a partial sum, which the MoE layer reduces (_maybe_all_reduce, or
+        # one combined all-reduce in qwen4_exp's block). marlin and b12x stay off: their
+        # pack() repacks the rows and neither has been checked against a sharded bank.
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
