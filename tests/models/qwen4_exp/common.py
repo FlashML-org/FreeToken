@@ -255,3 +255,118 @@ def selection_spy(monkeypatch, backend) -> dict:
 
     monkeypatch.setattr(QSASparseAttnBackend, "_select", spy)
     return seen
+
+
+LM = "model.language_model"
+
+# quantization_config of each released checkpoint, trimmed to the entries parse_config and the reader look at
+
+# RadixArk/Qwen3.8-Flash-Next-NVFP4: modelopt NVFP4 everywhere except the ignore list
+RADIXARK_NVFP4 = {
+    "quant_algo": "NVFP4",
+    "quant_method": "modelopt",
+    "ignore": [
+        "model.embed_tokens",
+        "mtp.*",
+        "model.mtp.*",
+        "*.self_attn.*",
+        "*.linear_attn.*",
+        "*.mlp.gate*",
+        "*.mlp.shared_expert.*",
+        "*.mlp.shared_expert_gate*",
+        "*hyper_connection*",
+        "*.ple.*",
+        "model.visual.*",
+        "model.language_model.embed_tokens",
+        "lm_head",
+    ],
+}
+
+# nvidia/Qwen3.8-Flash-Next-NVFP4: modelopt MIXED_PRECISION, the per-module algo sits in quantized_layers
+NVIDIA_NVFP4 = {
+    "quant_algo": "MIXED_PRECISION",
+    "quant_method": "modelopt",
+    "quantized_layers": {
+        **{f"model.language_model.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for i in range(48)},
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {"quant_algo": "FP8"},
+        "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO", "group_size": 128},
+    },
+    "ignore": ["lm_head", "model.language_model.embed_tokens", "model.language_model.layers.0.mlp.shared_expert*", "model.visual*"],
+}
+
+# Qwen/Qwen3.8-Flash-Next-FP8: 128x128 block-fp8 experts, everything else listed in modules_to_not_convert
+QWEN_FP8 = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_per_tensor": False,
+    "act_per_tensor": False,
+    "weight_block_size": [128, 128],
+    "modules_to_not_convert": [
+        "lm_head",
+        "model.language_model.embed_tokens",
+        "model.language_model.hyper_connection_mixer.input_mix_weight_up",
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.3.self_attn.q_proj",
+        "model.language_model.layers.3.mlp.gate",
+        "model.language_model.layers.3.mlp.shared_expert.gate_proj",
+    ],
+    "modules_to_convert": ["ple.ple_embedding.ngram_embedding"],
+}
+
+
+def mixed_precision_quant(gdn_layers, attn_layers, moe_layers) -> dict:
+    """modelopt MIXED_PRECISION with NVFP4 routed experts and FP8_PB_WO attention / GDN projections, ignore list as in lovedheart/Qwen3.8-Flash-Next-NVFP4-FP8."""
+    return {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            **{f"{LM}.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for i in moe_layers},
+            **{f"{LM}.layers.{i}.linear_attn.{p}": {"quant_algo": "FP8_PB_WO", "group_size": 128}
+               for i in gdn_layers for p in ("in_proj_qkv", "in_proj_z", "out_proj")},
+            **{f"{LM}.layers.{i}.self_attn.{p}_proj": {"quant_algo": "FP8_PB_WO", "group_size": 128}
+               for i in attn_layers for p in "qkvo"},
+        },
+        "ignore": [
+            "model.embed_tokens", "mtp.*", "model.mtp.*", "*.mlp.gate*", "*.mlp.shared_expert.*",
+            "*.mlp.shared_expert_gate*", "*hyper_connection*", "*.ple.*", "model.visual.*",
+            "model.language_model.embed_tokens", "lm_head", "*.self_attn.indexer*",
+        ],
+    }
+
+
+# lovedheart/Qwen3.8-Flash-Next-NVFP4-FP8, trimmed to layers 0 (GDN) and 3 (attention)
+LOVEDHEART_NVFP4_FP8 = mixed_precision_quant(gdn_layers=(0,), attn_layers=(3,), moe_layers=(0, 3))
+
+
+def install_quant_config(model_path: str) -> None:
+    """Install ``model_path``'s QuantConfig process-wide, as EngineConfig does before the reader runs."""
+    from freetoken.layers.quantization import set_quant_config
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+    from freetoken.utils import cached_load_hf_config
+
+    hf = cached_load_hf_config(model_path)
+    set_quant_config(checkpoint_quant_config(model_path, hf, get_model_spec(hf.architectures[0])))
+
+
+def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+    """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device."""
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _decode_target
+    from freetoken.layers import rotary
+    from freetoken.models import create_model
+    from freetoken.utils.torch_utils import torch_dtype
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload")
+    object.__setattr__(config.model_config, "moe_strategy", "offload")
+    object.__setattr__(config.model_config, "decode_target", _decode_target(config))
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
+    rotary.get_rope.cache_clear()
+    try:
+        with torch.device("meta"), torch_dtype(torch.bfloat16):
+            return create_model(config.model_config).state_dict()
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()  # the cpu rope must not leak into the GPU tests' cache
