@@ -43,7 +43,11 @@ shard files) and refuses one that does not. An FTW that loads as is is left unto
   every moment and an interrupted run is finished by running the same command again. While no
   shard has been replaced, the previous index stays as `freetoken_weight.json.bak`.
 - `--out <dir>` writes a fresh, compact FTW dir (the dir must be new or empty) and leaves the
-  original untouched.
+  original untouched. Shard files that an interrupted run left behind are removed by the next
+  in-place repair and left alone otherwise.
+- The PLE table is judged as the engine loads it. A leftover `model.safetensors.index.json` in the
+  FTW dir would make the engine look for the table through that file, so the script asks you to
+  remove it before it writes the table.
 - The plan prints the disk space the run needs. The last line re-checks the result: declared
   tensors still missing, structural problems and shards with dead bytes must all be 0, and the PLE
   table (Flash-Next) must be `complete`. Every shard and index write is synced to disk before the

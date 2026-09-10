@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import errno
 import glob
 import json
 import math
@@ -398,8 +399,9 @@ def fsync_path(path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        if not os.path.isdir(path):  # some filesystems reject fsync on a directory; that only weakens the rename
+    except OSError as e:
+        # a filesystem may not support fsync on a directory; any other error is a real persistence failure
+        if not (os.path.isdir(path) and e.errno in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP)):
             raise
     finally:
         os.close(fd)
@@ -524,57 +526,91 @@ def compact_in_place(work: str, index: dict, next_num: int) -> tuple[dict, int]:
 
 
 # ------------------------------------------------------------------ PLE table
-def ple_expected_shards(ftw_dir: str) -> int:
-    with open(os.path.join(ftw_dir, "config.json")) as f:
-        cfg = json.load(f)
-    return int((cfg.get("text_config") or cfg)["split_ngram_parts"])
+class PleSpec:
+    """What the loader demands of the table: split_ngram_parts fp8 shards of [rows, ngram_head_dim] and one scalar scale."""
+
+    def __init__(self, ftw_dir: str):
+        with open(os.path.join(ftw_dir, "config.json")) as f:
+            cfg = json.load(f)
+        t = cfg.get("text_config") or cfg
+        self.n_shards = int(t["split_ngram_parts"])
+        self.head_dim = int(t["ple_embed_dim"]) // ((int(t["ngram_size"]) - 1) * int(t["heads_per_ngram"]))
 
 
-def classify_ple(shards: dict[int, tuple], scale: bool, bad: list[str], n_shards: int) -> tuple[str, str]:
-    """('complete' | 'missing' | 'partial', detail) by the loader's rules: shards 0..N-1, one shape, a scale."""
-    if not shards and not scale and not bad:
+def _ple_collect(items, bad: list[str]) -> tuple[dict[int, tuple[tuple, int]], int | None]:
+    """Group (name, dtype, shape, nbytes) rows into shard index -> (shape, nbytes) and the scale's element count."""
+    shards: dict[int, tuple[tuple, int]] = {}
+    scale_numel = None
+    for name, dtype, shape, nbytes in items:
+        if name.endswith(_PLE_SCALE_SUFFIX):
+            scale_numel = math.prod(shape)
+            continue
+        mt = _PLE_SHARD_RE.search(name)
+        if mt is None:
+            continue
+        idx = int(mt.group(1))
+        if dtype != "F8_E4M3":
+            bad.append(f"shard {idx} has dtype {dtype}")
+        if idx in shards:
+            bad.append(f"duplicate shard {idx}")
+        shards[idx] = (tuple(shape), nbytes)
+    return shards, scale_numel
+
+
+def classify_ple(spec: PleSpec, shards: dict[int, tuple[tuple, int]], scale_numel: int | None, bad: list[str]) -> tuple[str, str]:
+    """('complete' | 'missing' | 'partial', detail) by the loader's rules."""
+    if not shards and scale_numel is None and not bad:
         return "missing", ""
-    if bad or not scale or sorted(shards) != list(range(n_shards)) or len(set(shards.values())) > 1:
-        return "partial", "; ".join(bad[:3]) if bad else f"{len(shards)}/{n_shards} shards" + ("" if scale else ", no weight_scale")
+    for idx, (shape, nbytes) in sorted(shards.items()):
+        if len(shape) != 2 or shape[1] != spec.head_dim:
+            bad.append(f"shard {idx} is {list(shape)}, expected [rows, {spec.head_dim}]")
+        elif nbytes != shape[0] * shape[1]:
+            bad.append(f"shard {idx} holds {nbytes} B for shape {list(shape)}")
+    if len({shape for shape, _ in shards.values()}) > 1:
+        bad.append("shards differ in shape")
+    if scale_numel is not None and scale_numel != 1:
+        bad.append(f"weight_scale has {scale_numel} elements")
+    if bad:
+        return "partial", "; ".join(bad[:3])
+    if scale_numel is None or sorted(shards) != list(range(spec.n_shards)):
+        return "partial", f"{len(shards)}/{spec.n_shards} shards" + ("" if scale_numel is not None else ", no weight_scale")
     return "complete", ""
 
 
-def ple_source_status(source: TensorSource, n_shards: int) -> tuple[str, str]:
-    shards: dict[int, tuple] = {}
-    scale = False
+def ple_source_status(source: TensorSource, spec: PleSpec) -> tuple[str, str]:
     bad: list[str] = []
-    for k in source.weight_map:
-        if _PLE_INFIX not in k:
-            continue
-        if k.endswith(_PLE_SCALE_SUFFIX):
-            scale = True
-            continue
-        mt = _PLE_SHARD_RE.search(k)
-        if mt is None:
-            continue
-        idx, m = int(mt.group(1)), source.meta(k)
-        if m["dtype"] != "F8_E4M3":
-            bad.append(f"shard {idx} has dtype {m['dtype']}")
-        if idx in shards:
-            bad.append(f"duplicate shard {idx}")
-        shards[idx] = tuple(m["shape"])
-    return classify_ple(shards, scale, bad, n_shards)
+    names = [k for k in source.weight_map if _PLE_INFIX in k]
+    shards, scale = _ple_collect(((k, source.meta(k)["dtype"], source.meta(k)["shape"], source.nbytes(k)) for k in names), bad)
+    return classify_ple(spec, shards, scale, bad)
 
 
-def ple_table_status(ftw_dir: str, n_shards: int) -> tuple[str, str, list[str]]:
-    """The dir's PLE table: (status, detail, files holding PLE tensors)."""
-    shards: dict[int, tuple] = {}
-    scale = False
+def ple_table_files(ftw_dir: str) -> list[str]:
+    """The files the loader reads the table from: the safetensors index's mapping when there is one, else every *.safetensors."""
+    index = os.path.join(ftw_dir, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        return sorted(glob.glob(os.path.join(ftw_dir, "*.safetensors")))
+    with open(index) as f:
+        weight_map = json.load(f)["weight_map"]
+    return sorted({os.path.join(ftw_dir, sh) for n, sh in weight_map.items() if _PLE_INFIX in n})
+
+
+def ple_table_status(ftw_dir: str, spec: PleSpec) -> tuple[str, str, list[str]]:
+    """The dir's PLE table as the loader would see it: (status, detail, files holding PLE tensors)."""
     bad: list[str] = []
+    items: list[tuple] = []
     files: list[str] = []
-    for path in sorted(glob.glob(os.path.join(ftw_dir, "*.safetensors"))):
+    for path in ple_table_files(ftw_dir):
+        name = os.path.basename(path)
+        if not os.path.exists(path):
+            bad.append(f"model.safetensors.index.json maps PLE tensors to missing {name}")
+            continue
         try:
             with open(path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
                 header, base = json.loads(f.read(n)), 8 + n
         except (struct.error, ValueError):
-            bad.append(f"{os.path.basename(path)} has an unreadable header")
-            files.append(os.path.basename(path))
+            bad.append(f"{name} has an unreadable header")
+            files.append(name)
             continue
         size = os.path.getsize(path)
         holds = False
@@ -582,27 +618,18 @@ def ple_table_status(ftw_dir: str, n_shards: int) -> tuple[str, str, list[str]]:
             if k == "__metadata__" or _PLE_INFIX not in k:
                 continue
             holds = True
-            if base + m["data_offsets"][1] > size:
-                bad.append(f"{os.path.basename(path)} is truncated")
-            if k.endswith(_PLE_SCALE_SUFFIX):
-                scale = True
-                continue
-            mt = _PLE_SHARD_RE.search(k)
-            if mt is None:
-                continue
-            idx = int(mt.group(1))
-            if m["dtype"] != "F8_E4M3":
-                bad.append(f"shard {idx} has dtype {m['dtype']}")
-            if idx in shards:
-                bad.append(f"duplicate shard {idx}")
-            shards[idx] = tuple(m["shape"])
+            a, b = m["data_offsets"]
+            if base + b > size:
+                bad.append(f"{name} is truncated")
+            items.append((k, m["dtype"], m["shape"], b - a))
         if holds:
-            files.append(os.path.basename(path))
-    status, detail = classify_ple(shards, scale, bad, n_shards)
+            files.append(name)
+    shards, scale = _ple_collect(items, bad)
+    status, detail = classify_ple(spec, shards, scale, bad)
     return status, detail, files
 
 
-def check_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, str], dequant_names: set[str], n_ple: int) -> dict:
+def check_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, str], dequant_names: set[str], ple: PleSpec | None) -> dict:
     """Everything the tool verifies, on the input before planning and on the result after writing."""
     have = {renames.get(e["name"], e["name"]) for e in index["tensors"] if e["kind"] == "weight"}
     return {
@@ -610,7 +637,7 @@ def check_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, str]
         "missing": [n for n in expected if n not in have],
         "extra": [n for n in have if n not in expected and not n.startswith(_IGNORED_PREFIXES)],
         "dead": dirty_shards(index),
-        "ple": ple_table_status(ftw_dir, n_ple) if n_ple else ("n/a", "", []),
+        "ple": ple_table_status(ftw_dir, ple) if ple else ("n/a", "", []),
     }
 
 
@@ -726,8 +753,8 @@ def main(argv: list[str] | None = None) -> int:
     source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
     renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map)
     dequant_names = {n for n, _, _ in dequants}
-    n_ple = ple_expected_shards(ns.ftw) if arch.startswith("Qwen4Exp") else 0
-    chk = check_ftw(ns.ftw, index, expected, renames, dequant_names, n_ple)
+    ple = PleSpec(ns.ftw) if arch.startswith("Qwen4Exp") else None
+    chk = check_ftw(ns.ftw, index, expected, renames, dequant_names, ple)
     problems, dirty = chk["problems"], chk["dead"]
     ple_status, ple_detail, ple_files = chk["ple"]
     need_ple = ple_status in ("missing", "partial")
@@ -750,7 +777,9 @@ def main(argv: list[str] | None = None) -> int:
     for n in leftovers[:8]:
         print(f"    leftover (not declared by the model): {n}")
     if orphans:
-        print(f"  note: {len(orphans)} shard file(s) not referenced by the index, left by an interrupted run, will be removed: {orphans[:3]}")
+        removing = not ns.out and bool(renames or dequants or fetches or drops or need_ple or dirty)
+        print(f"  note: {len(orphans)} shard file(s) not referenced by the index, left by an interrupted run"
+              + (", will be removed: " if removing else ", left as is: ") + str(orphans[:3]))
 
     bad = False
     for msg in problems[:10]:
@@ -781,8 +810,11 @@ def main(argv: list[str] | None = None) -> int:
     if ple_status == "partial" and foreign_ple:
         print(f"ERROR: the PLE table in {ns.ftw} is incomplete ({ple_detail}) and lives in files this tool did not write: {foreign_ple[:3]}; remove them first", file=sys.stderr)
         bad = True
+    if need_ple and os.path.exists(os.path.join(ns.ftw, "model.safetensors.index.json")):
+        print(f"ERROR: {ns.ftw}/model.safetensors.index.json makes the loader read the PLE table through its mapping, which cannot list the files this tool writes; remove it (an FTW dir does not need it) and rerun", file=sys.stderr)
+        bad = True
     if need_ple and source is not None:
-        src_status, src_detail = ple_source_status(source, n_ple)
+        src_status, src_detail = ple_source_status(source, ple)
         if src_status != "complete":
             print(f"ERROR: the PLE table in the source is {src_status}" + (f" ({src_detail})" if src_detail else ""), file=sys.stderr)
             bad = True
@@ -816,8 +848,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  disk: about {need / 2**30:.1f} GiB needed under {work} ({free / 2**30:.1f} GiB free)")
     if ns.dry_run:
         return 0
-    for f in orphans:
-        os.remove(os.path.join(ns.ftw, f))
     if not (renames or dequants or fetch_srcs or drops or need_ple or dirty or ns.out):
         print("nothing to do; the FTW loads as is")
         return 0
@@ -870,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
             raise
         added = len(w.entries) - len(keep)
     else:
+        for f in orphans:
+            os.remove(os.path.join(work, f))
         new_entries: list[dict] = []
         new_shards: list[dict] = []
         if dequants or fetch_srcs:
@@ -913,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
                 os.remove(bak)
         added = len(new_entries)
 
-    chk = check_ftw(work, new_index, expected, {}, set(), n_ple)
+    chk = check_ftw(work, new_index, expected, {}, set(), ple)
     ple_status, ple_detail, _ = chk["ple"]
     print(f"wrote {work}: {len(new_index['tensors'])} entries, +{added} new, {len(new_index['shards'])} shard(s)"
           + (f", {compacted} compacted" if compacted else "") + f", total {new_index['total_bytes'] / 2**30:.2f} GiB")
