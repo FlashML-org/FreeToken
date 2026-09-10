@@ -155,7 +155,8 @@ Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. `--moe-backend
 offload` (default) packs experts into offload banks; `--moe-backend triton`
 keeps them dense for resident serving. See the FTW caveats in
-[models.md](models.md#notes).
+[models.md](models.md#notes); FTW files from older builds can be repaired with
+[scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
 
 ## ft bench bw
 
