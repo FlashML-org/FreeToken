@@ -347,15 +347,84 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
+    def _resolve_local_ref(self, schema: Dict, root_schema: Dict) -> Dict:
+        """Resolve local refs such as #/$defs/Foo."""
+        if not isinstance(schema, dict):
+            return schema
+        ref = schema.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/"):
+            return schema
+        node = root_schema
+        try:
+            for part in ref[2:].split("/"):
+                part = part.replace("~1", "/").replace("~0", "~")
+                node = node[part]
+        except (KeyError, TypeError):
+            return schema
+        if not isinstance(node, dict):
+            return schema
+        merged = dict(node)
+        merged.update({k: v for k, v in schema.items() if k != "$ref"})
+        if "$ref" in merged:
+            return self._resolve_local_ref(merged, root_schema)
+        return merged
+
+    def _normalize_param_schema(self, schema: Dict, root_schema: Dict) -> Dict:
+        """Resolve the schema parts needed for tool argument typing."""
+        if not isinstance(schema, dict):
+            return {"type": "string"}
+        schema = self._resolve_local_ref(schema, root_schema)
+        param_type = schema.get("type")
+        if isinstance(param_type, list):
+            non_null = [t for t in param_type if t != "null"]
+            result = dict(schema)
+            result["type"] = non_null[0] if len(non_null) == 1 else "loose"
+            return result
+        if isinstance(param_type, str):
+            return schema
+        for keyword in ("oneOf", "anyOf"):
+            branches = schema.get(keyword)
+            if not isinstance(branches, list):
+                continue
+            types = []
+            for branch in branches:
+                if not isinstance(branch, dict):
+                    continue
+                branch = self._resolve_local_ref(branch, root_schema)
+                branch_type = branch.get("type")
+                if isinstance(branch_type, str) and branch_type != "null":
+                    types.append(branch_type)
+            types = list(dict.fromkeys(types))
+            result = dict(schema)
+            result["type"] = types[0] if len(types) == 1 else "loose"
+            return result
+        if isinstance(schema.get("properties"), dict):
+            result = dict(schema)
+            result["type"] = "object"
+            return result
+        if isinstance(schema.get("items"), (dict, list)):
+            result = dict(schema)
+            result["type"] = "array"
+            return result
+        result = dict(schema)
+        result["type"] = "loose"
+        return result
+
     def _get_param_config(self, func_name: str, tools: List[Tool]) -> Dict:
-        """Extract the parameter properties (JSON schema) for one tool."""
+        """Extract and normalize parameter properties for one tool."""
         for tool in tools:
-            if tool.function.name == func_name and tool.function.parameters:
-                params = tool.function.parameters
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
-                    return params
+            if tool.function.name != func_name or not tool.function.parameters:
+                continue
+            params = tool.function.parameters
+            if not isinstance(params, dict):
+                return {}
+            properties = params.get("properties")
+            if not isinstance(properties, dict):
+                return params
+            return {
+                name: self._normalize_param_schema(prop, params)
+                for name, prop in properties.items()
+            }
         return {}
 
     def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
@@ -392,6 +461,8 @@ class BaseFormatDetector(ABC):
                     return ast.literal_eval(value)
                 except (ValueError, SyntaxError, TypeError):
                     return value
+        elif param_type == "loose":
+            return _parse_loose_json_value(value)
         return value
 
     def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
