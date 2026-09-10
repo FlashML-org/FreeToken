@@ -8,6 +8,7 @@ import torch
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
     fp8_dense_enabled,
+    fp8_lmhead_enabled,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
