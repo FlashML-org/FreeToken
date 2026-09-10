@@ -1,76 +1,64 @@
-"""TP sharding of the NVFP4 expert source banks: the two ranks' banks concatenated along the
-intermediate axis must equal the unsharded placement."""
+"""TP sharding of the NVFP4 routed-expert stream.
 
+Every rank reads the same checkpoint tensors and keeps only its own slice of the expert
+intermediate axis, so the ranks' slices must partition the original exactly -- the MoE layer
+all-reduces the partial sums, which is only correct if nothing is dropped or double-counted.
+The expert kernel sizes its banks from ``MoEConfig.local_intermediate``, the same split.
+"""
+
+import pytest
 import torch
-from freetoken.distributed.info import DistributedInfo
-from freetoken.models import nvfp4_banks
-from freetoken.models.nvfp4_banks import _alloc_nvfp4_host_banks, _Placer
+from freetoken.layers.quantization.moe.base import MoEConfig
+from freetoken.models.nvfp4_banks import _tp_shard
 
-E, H, INTER = 2, 64, 32
+INTER, HIDDEN = 640, 2560
 
 
-def _place(monkeypatch, rank, world):
-    monkeypatch.setattr(
-        nvfp4_banks, "get_tp_info", lambda: DistributedInfo(rank, world)
-    )
-    hb = _alloc_nvfp4_host_banks(1, E, H, INTER // world)
-    banks = {name: [b.tensor for b in layers] for name, layers in hb.items()}
-    placer = _Placer(banks, INTER)
-    torch.manual_seed(0)
-    for e in range(E):
-        for role in ("gate", "up"):
-            placer.put(
-                0,
-                e,
-                role,
-                "weight",
-                torch.randint(0, 255, (INTER, H // 2), dtype=torch.uint8),
-            )
-            placer.put(
-                0,
-                e,
-                role,
-                "weight_scale",
-                torch.randn(INTER, H // 16).to(torch.float8_e4m3fn),
-                torch.tensor(0.5 + e, dtype=torch.float16),
-            )
-        placer.put(
-            0,
-            e,
-            "down",
-            "weight",
-            torch.randint(0, 255, (H, INTER // 2), dtype=torch.uint8),
+def _roles():
+    """One expert's checkpoint tensors, in the modelopt layout."""
+    return {
+        "gate": torch.arange(INTER * (HIDDEN // 2), dtype=torch.uint8).reshape(INTER, HIDDEN // 2),
+        "gate_scale": torch.arange(INTER * (HIDDEN // 16), dtype=torch.uint8).reshape(INTER, HIDDEN // 16),
+        "gate_global": torch.tensor([2.5]),
+        "up": torch.arange(INTER * (HIDDEN // 2), dtype=torch.uint8).reshape(INTER, HIDDEN // 2),
+        "up_scale": torch.arange(INTER * (HIDDEN // 16), dtype=torch.uint8).reshape(INTER, HIDDEN // 16),
+        "up_global": torch.tensor([2.5]),
+        "down": torch.arange(HIDDEN * (INTER // 2), dtype=torch.uint8).reshape(HIDDEN, INTER // 2),
+        "down_scale": torch.arange(HIDDEN * (INTER // 16), dtype=torch.uint8).reshape(HIDDEN, INTER // 16),
+        "down_global": torch.tensor([3.5]),
+    }
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_rank_slices_partition_the_original_tensor(tp_size):
+    full = _roles()
+    for role, tensor in full.items():
+        parts = [_tp_shard(role, tensor, INTER, tp_size, r) for r in range(tp_size)]
+        if role.endswith("_global"):
+            # per-tensor scalar: no I axis, every rank keeps it whole
+            assert all(torch.equal(p, tensor) for p in parts)
+            continue
+        axis = 1 if role.startswith("down") else 0
+        assert torch.equal(torch.cat(parts, dim=axis), tensor), role
+        assert all(p.shape[axis] == tensor.shape[axis] // tp_size for p in parts), role
+
+
+def test_tp1_is_the_identity():
+    for role, tensor in _roles().items():
+        assert _tp_shard(role, tensor, INTER, 1, 0) is tensor or torch.equal(
+            _tp_shard(role, tensor, INTER, 1, 0), tensor
         )
-        placer.put(
-            0,
-            e,
-            "down",
-            "weight_scale",
-            torch.randn(H, INTER // 16).to(torch.float8_e4m3fn),
-            torch.tensor(2.0 + e, dtype=torch.float16),
-        )
-    return {k: v[0] for k, v in banks.items()}
 
 
-def test_rank_banks_concatenate_to_the_full_placement(monkeypatch):
-    full = _place(monkeypatch, 0, 1)
-    r0, r1 = _place(monkeypatch, 0, 2), _place(monkeypatch, 1, 2)
-    n = INTER // 2
-    for name in (
-        "gate_up_packed",
-        "gate_up_scale",
-        "gate_up_global",
-    ):  # rows: [gate I | up I]
-        gate = torch.cat([r0[name][:, :n], r1[name][:, :n]], dim=1)
-        up = torch.cat([r0[name][:, n:], r1[name][:, n:]], dim=1)
-        assert torch.equal(
-            torch.cat([gate, up], dim=1).view(torch.uint8), full[name].view(torch.uint8)
-        ), name
-    for name in ("down_packed", "down_scale"):  # columns
-        assert torch.equal(
-            torch.cat([r0[name], r1[name]], dim=2).view(torch.uint8),
-            full[name].view(torch.uint8),
-        ), name
-    assert torch.equal(r0["down_global"], full["down_global"]) and torch.equal(
-        r1["down_global"], full["down_global"]
-    )
+def test_a_shard_that_splits_a_scale_block_is_rejected():
+    # scales cover 16 values; a rank slice that is not a whole number of blocks cannot be
+    # sliced consistently across the weight and its scale
+    with pytest.raises(AssertionError, match="16-wide scale blocks"):
+        _tp_shard("gate", torch.zeros(24, 8, dtype=torch.uint8), 24, 3, 0)
+
+
+def test_moe_config_local_intermediate_matches_the_shard():
+    for tp_size in (1, 2, 4):
+        cfg = MoEConfig(num_experts=8, hidden=HIDDEN, intermediate=INTER, top_k=2, tp_size=tp_size)
+        assert cfg.local_intermediate == INTER // tp_size
+        assert _tp_shard("gate", _roles()["gate"], INTER, tp_size, 0).shape[0] == cfg.local_intermediate
