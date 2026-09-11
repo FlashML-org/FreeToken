@@ -46,6 +46,19 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
+def _map_developer_role(
+    messages: list[dict[str, Any]], chat_template: str | None
+) -> list[dict[str, Any]]:
+    """OpenAI's ``developer`` role is the current spelling of ``system`` (clients such as pi
+    send the system prompt that way by default). Most chat templates do not know it and raise
+    ("Unexpected message role"), so map it to ``system`` unless the template handles it."""
+    if "developer" in (chat_template or "") or not any(
+        m.get("role") == "developer" for m in messages
+    ):
+        return messages
+    return [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+
+
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
@@ -108,6 +121,7 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
+        messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
