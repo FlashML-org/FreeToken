@@ -76,6 +76,12 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # Sampled-token logprobs (OpenAI chat semantics): top_logprobs (0..20) requires
+    # logprobs=true; entries cover generated tokens only (no prompt logprobs).
+    # Fail-closed (400) when a reasoning parser or tool parsing is active: entries
+    # must align 1:1 with visible content tokens (see _chat_logprobs_conflict).
+    logprobs: bool = False
+    top_logprobs: int | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a

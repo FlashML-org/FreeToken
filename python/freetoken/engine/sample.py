@@ -15,6 +15,8 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    logprob_rows: torch.Tensor | None = None
+    max_top_logprobs: int = 0
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -57,8 +59,21 @@ class Sampler:
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        want_logprobs = [p.logprobs for p in params]
+        logprob_rows = (
+            make_device_tensor(want_logprobs, torch.bool, self.device)
+            if any(want_logprobs)
+            else None
+        )
         if all(p.is_greedy for p in params):
-            return BatchSamplingArgs(temperatures=None)
+            max_top_logprobs = max((p.top_logprobs for p in params if p.logprobs), default=0)
+            if max_top_logprobs > self.vocab_size:
+                max_top_logprobs = self.vocab_size
+            return BatchSamplingArgs(
+                temperatures=None,
+                logprob_rows=logprob_rows,
+                max_top_logprobs=max_top_logprobs,
+            )
 
         MIN_P = MIN_T = 1e-6
         ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
@@ -70,7 +85,16 @@ class Sampler:
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p)
+        max_top_logprobs = max((p.top_logprobs for p in params if p.logprobs), default=0)
+        if max_top_logprobs > self.vocab_size:
+            max_top_logprobs = self.vocab_size
+        return BatchSamplingArgs(
+            temperatures,
+            top_k=top_k,
+            top_p=top_p,
+            logprob_rows=logprob_rows,
+            max_top_logprobs=max_top_logprobs,
+        )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
@@ -78,3 +102,59 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+
+    def compute_logprobs(
+        self,
+        logits: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        args: BatchSamplingArgs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if args.logprob_rows is None:
+            return None
+
+        requested_rows = torch.nonzero(args.logprob_rows, as_tuple=False).flatten()
+        if requested_rows.numel() == 0:
+            return None
+
+        request_logits = logits.index_select(0, requested_rows).float()
+        # Reported values are raw model logprobs (pre-temperature log_softmax over logits).
+        request_logprobs = torch.log_softmax(request_logits, dim=-1)
+
+        request_tokens = sampled_tokens.to(dtype=torch.long, device=logits.device).index_select(
+            0, requested_rows
+        )
+        request_row_idx = torch.arange(requested_rows.numel(), device=logits.device)
+        request_chosen_logprobs = request_logprobs[request_row_idx, request_tokens]
+
+        chosen_logprobs = torch.full(
+            (logits.shape[0],), float("nan"), dtype=torch.float32, device=logits.device
+        )
+        chosen_logprobs.index_copy_(0, requested_rows, request_chosen_logprobs)
+
+        if args.max_top_logprobs > 0:
+            request_top_logprobs, request_top_ids = torch.topk(
+                request_logprobs, k=args.max_top_logprobs, dim=-1
+            )
+            top_ids = torch.full(
+                (logits.shape[0], args.max_top_logprobs),
+                -1,
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            top_logprobs = torch.full(
+                (logits.shape[0], args.max_top_logprobs),
+                float("-inf"),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            top_ids[requested_rows] = request_top_ids.to(torch.int32)
+            top_logprobs[requested_rows] = request_top_logprobs
+        else:
+            top_ids = torch.empty((logits.shape[0], 0), dtype=torch.int32, device=logits.device)
+            top_logprobs = torch.empty((logits.shape[0], 0), dtype=torch.float32, device=logits.device)
+
+        return (
+            chosen_logprobs.to("cpu", non_blocking=True),
+            top_ids.to("cpu", non_blocking=True),
+            top_logprobs.to("cpu", non_blocking=True),
+        )
