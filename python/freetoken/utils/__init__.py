@@ -7,6 +7,7 @@ from .arch import (
 )
 from .hf import (
     cached_load_hf_config,
+    download_hf_checkpoint,
     download_hf_weight,
     load_eos_token_ids,
     load_generation_sampling,
@@ -28,6 +29,7 @@ from .torch_utils import nvtx_annotate, torch_dtype
 
 __all__ = [
     "cached_load_hf_config",
+    "download_hf_checkpoint",
     "download_hf_weight",
     "load_eos_token_ids",
     "load_generation_sampling",
