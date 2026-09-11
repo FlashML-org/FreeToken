@@ -42,6 +42,250 @@ from .reasoning_parser import (
 )
 
 
+# Qwen's decoder intentionally keeps protocol markers visible so reasoning and
+# tool-call parsers can consume their (non-special-token) tags.  At the semantic
+# API waist, after those parsers, only transport/internal multimodal markers are
+# suppressed.  Grounding markers (object_ref/box/quad), think tags, tool tags,
+# and FIM/repository markers are deliberately absent from this list.
+_QWEN_SEMANTIC_HIDDEN_TOKENS = (
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+    "<|audio_start|>",
+    "<|audio_end|>",
+    "<|audio_pad|>",
+    "<tts_pad>",
+    "<tts_text_bos>",
+    "<tts_text_eod>",
+    "<tts_text_bos_single>",
+)
+
+
+def _uses_qwen_semantic_protocol(state: Any) -> bool:
+    """Whether this server is configured for a Qwen semantic output dialect.
+
+    Parser selection is the stable frontend-visible family signal available in
+    ``ServerArgs``.  Either half is enough because users may explicitly disable
+    reasoning or omit tools for an individual request.
+    """
+    config = state.config
+    return (
+        getattr(config, "reasoning_parser", None) == "qwen3"
+        or getattr(config, "tool_call_parser", None) in {"qwen", "qwen25", "qwen3_coder"}
+    )
+
+
+class _SemanticSpecialTokenFilter:
+    """Request-local, chunk-safe suppression of semantic protocol markers.
+
+    A proper marker prefix is retained until the next detokenizer delta, so a
+    marker split at any byte boundary cannot leak. A marker inside a quoted/code
+    literal is retained only once the matching closer arrives; an unclosed quote
+    is sanitized at end-of-stream. Structured events can be held inside either
+    ambiguity so their ordering relative to surrounding content stays exact.
+    """
+
+    def __init__(self, tokens: tuple[str, ...]) -> None:
+        self._tokens = tokens
+        self._quote: str | None = None
+        self._escaped = False
+        self._last_char = ""
+        self._candidate_text = ""
+        self._candidate_items: list[Any] = []
+        self._candidate_quoted = False
+        self._literal_items: list[Any] | None = None
+
+    @staticmethod
+    def _append_item(items: list[Any], item: Any) -> None:
+        if item == "":
+            return
+        if isinstance(item, str) and items and isinstance(items[-1], str):
+            items[-1] += item
+        else:
+            items.append(item)
+
+    @classmethod
+    def _strip_items(cls, items: list[Any], tokens: tuple[str, ...]) -> list[Any]:
+        """Strip markers across text segments while preserving event positions."""
+        out: list[Any] = []
+        candidate_text = ""
+        candidate_items: list[Any] = []
+
+        def flush(*, keep_text: bool) -> None:
+            nonlocal candidate_text, candidate_items
+            for pending in candidate_items:
+                if keep_text or not isinstance(pending, str):
+                    cls._append_item(out, pending)
+            candidate_text = ""
+            candidate_items = []
+
+        for item in items:
+            if not isinstance(item, str):
+                if candidate_text:
+                    cls._append_item(candidate_items, item)
+                else:
+                    cls._append_item(out, item)
+                continue
+            index = 0
+            while index < len(item):
+                ch = item[index]
+                if not candidate_text:
+                    if any(token.startswith(ch) for token in tokens):
+                        candidate_text = ch
+                        cls._append_item(candidate_items, ch)
+                    else:
+                        cls._append_item(out, ch)
+                    index += 1
+                    continue
+                extended = candidate_text + ch
+                if extended in tokens:
+                    candidate_text = extended
+                    cls._append_item(candidate_items, ch)
+                    flush(keep_text=False)
+                    index += 1
+                elif any(token.startswith(extended) for token in tokens):
+                    candidate_text = extended
+                    cls._append_item(candidate_items, ch)
+                    index += 1
+                else:
+                    flush(keep_text=True)
+        flush(keep_text=True)
+        return out
+
+    def _start_candidate(self, ch: str, *, quoted: bool) -> None:
+        self._candidate_text = ch
+        self._candidate_items = [ch]
+        self._candidate_quoted = quoted
+
+    def _extend_candidate(self, ch: str) -> tuple[list[Any], bool]:
+        extended = self._candidate_text + ch
+        if extended in self._tokens:
+            self._candidate_text = extended
+            self._append_item(self._candidate_items, ch)
+            if self._candidate_quoted:
+                self._literal_items = self._candidate_items
+                out: list[Any] = []
+            else:
+                out = [item for item in self._candidate_items if not isinstance(item, str)]
+            self._candidate_text = ""
+            self._candidate_items = []
+            self._candidate_quoted = False
+            return out, True
+        if any(token.startswith(extended) for token in self._tokens):
+            self._candidate_text = extended
+            self._append_item(self._candidate_items, ch)
+            return [], True
+        out = self._candidate_items
+        self._last_char = self._candidate_text[-1]
+        self._candidate_text = ""
+        self._candidate_items = []
+        self._candidate_quoted = False
+        return out, False
+
+    def feed_items(self, text: str, *, final: bool = False) -> list[Any]:
+        if not self._tokens:
+            return [text] if text else []
+        out: list[Any] = []
+        index = 0
+        while index < len(text):
+            ch = text[index]
+            if self._literal_items is not None:
+                self._append_item(self._literal_items, ch)
+                if self._escaped:
+                    self._escaped = False
+                elif ch == "\\":
+                    self._escaped = True
+                elif ch == self._quote:
+                    out.extend(self._literal_items)
+                    self._literal_items = None
+                    self._quote = None
+                self._last_char = ch
+                index += 1
+                continue
+
+            if self._candidate_text:
+                emitted, consumed = self._extend_candidate(ch)
+                out.extend(emitted)
+                if consumed:
+                    index += 1
+                continue
+
+            if self._quote is not None:
+                if any(token.startswith(ch) for token in self._tokens):
+                    self._escaped = False
+                    self._start_candidate(ch, quoted=True)
+                    index += 1
+                    continue
+                if self._escaped:
+                    self._escaped = False
+                elif ch == "\\":
+                    self._escaped = True
+                elif ch == self._quote:
+                    self._quote = None
+                self._append_item(out, ch)
+                self._last_char = ch
+                index += 1
+                continue
+
+            opens_quote = ch in {'"', "`", "“", "‘"} or (
+                ch == "'" and not self._last_char.isalnum()
+            )
+            if opens_quote:
+                self._quote = {"“": "”", "‘": "’"}.get(ch, ch)
+                self._append_item(out, ch)
+            elif any(token.startswith(ch) for token in self._tokens):
+                self._start_candidate(ch, quoted=False)
+                index += 1
+                continue
+            else:
+                self._append_item(out, ch)
+            self._last_char = ch
+            index += 1
+
+        if final:
+            if self._literal_items is not None:
+                out.extend(self._strip_items(self._literal_items, self._tokens))
+                self._literal_items = None
+            elif self._candidate_text:
+                out.extend(self._candidate_items)
+            self._candidate_text = ""
+            self._candidate_items = []
+            self._candidate_quoted = False
+            self._quote = None
+            self._escaped = False
+        return out
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        items = self.feed_items(text, final=final)
+        assert all(isinstance(item, str) for item in items)
+        return "".join(items)
+
+    def boundary(self, item: Any) -> list[Any]:
+        if self._literal_items is not None:
+            self._append_item(self._literal_items, item)
+            return []
+        if self._candidate_text:
+            self._append_item(self._candidate_items, item)
+            return []
+        return [item]
+
+    def finish(self) -> str:
+        return self.feed("", final=True)
+
+    def finish_items(self) -> list[Any]:
+        return self.feed_items("", final=True)
+
+
+def _make_semantic_special_token_filter(state: Any) -> _SemanticSpecialTokenFilter:
+    tokens = _QWEN_SEMANTIC_HIDDEN_TOKENS if _uses_qwen_semantic_protocol(state) else ()
+    return _SemanticSpecialTokenFilter(tokens)
+
+
 class GenerationError(Exception):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
@@ -562,6 +806,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
+    reasoning_special_filter = _make_semantic_special_token_filter(state)
+    content_special_filter = _make_semantic_special_token_filter(state)
+
+    def _filter_reasoning(piece: str) -> str:
+        return reasoning_special_filter.feed(strip_special_tokens(piece, specials))
+
+    def _filter_content(piece: str) -> str:
+        return content_special_filter.feed(strip_special_tokens(piece, specials))
 
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
@@ -583,6 +835,28 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     # chunk is a legitimate word gap.
     suppress_ws = False
 
+    def _semantic_content_events(items: list[Any]) -> list[GenEvent]:
+        nonlocal suppress_ws
+        out: list[GenEvent] = []
+        for item in items:
+            if isinstance(item, str):
+                if item and not (item.strip() == "" and suppress_ws):
+                    out.append(ContentDelta(item))
+                    if item.strip():
+                        suppress_ws = False
+            else:
+                out.append(item)
+                if isinstance(item, ToolCallsDelta):
+                    suppress_ws = True
+        return out
+
+    def _filter_tool_text(piece: str) -> list[GenEvent]:
+        text = strip_special_tokens(piece, specials)
+        return _semantic_content_events(content_special_filter.feed_items(text))
+
+    def _filter_tool_boundary(event: GenEvent) -> list[GenEvent]:
+        return _semantic_content_events(content_special_filter.boundary(event))
+
     def _close_open_call() -> ToolCallsDelta | None:
         nonlocal open_call, calls_emitted
         if open_call is None:
@@ -598,8 +872,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         )
         open_call = None
         calls_emitted += 1
-        nonlocal suppress_ws
-        suppress_ws = True
         return ToolCallsDelta([call])
 
     def _route_tool_text(piece: str) -> list[GenEvent]:
@@ -613,12 +885,8 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 # close it first so wire order matches generation order.
                 done = _close_open_call()
                 if done is not None:
-                    out.append(done)
-                stripped = strip_special_tokens(payload, specials)
-                if stripped and not (stripped.strip() == "" and suppress_ws):
-                    out.append(ContentDelta(stripped))
-                    if stripped.strip():
-                        suppress_ws = False
+                    out.extend(_filter_tool_boundary(done))
+                out.extend(_filter_tool_text(payload))
                 continue
             for frag in payload:
                 starts_new = frag.name is not None and (
@@ -627,7 +895,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 if starts_new:
                     done = _close_open_call()
                     if done is not None:
-                        out.append(done)
+                        out.extend(_filter_tool_boundary(done))
                 if open_call is None or starts_new:
                     open_call = {
                         "detector_index": frag.tool_index,
@@ -635,14 +903,16 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                         "params": "",
                         "ordinal": calls_emitted,
                     }
-                    out.append(ToolCallStart(
-                        tool_index=calls_emitted, name=frag.name, args_prefix_stable=frag_stable,
-                    ))
+                    out.extend(_filter_tool_boundary(ToolCallStart(
+                        tool_index=calls_emitted,
+                        name=frag.name,
+                        args_prefix_stable=frag_stable,
+                    )))
                 if frag.parameters:
                     open_call["params"] += frag.parameters
-                    out.append(
+                    out.extend(_filter_tool_boundary(
                         ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
-                    )
+                    ))
         return out
 
     engine_finish_reason: str | None = None
@@ -657,7 +927,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
             if reasoning_delta:
-                stripped_reasoning = strip_special_tokens(reasoning_delta, specials)
+                stripped_reasoning = _filter_reasoning(reasoning_delta)
                 if stripped_reasoning:  # a bare special token must not open a thinking block
                     yield ReasoningDelta(stripped_reasoning)
         if content_delta:
@@ -667,7 +937,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += content_delta
             else:
-                yield ContentDelta(strip_special_tokens(content_delta, specials))
+                stripped_content = _filter_content(content_delta)
+                if stripped_content:
+                    yield ContentDelta(stripped_content)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -678,7 +950,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     if reasoning_parser is not None:
         flush_reasoning, flush_content = reasoning_parser.flush()
         if flush_reasoning:
-            stripped_reasoning = strip_special_tokens(flush_reasoning, specials)
+            stripped_reasoning = _filter_reasoning(flush_reasoning)
             if stripped_reasoning:
                 yield ReasoningDelta(stripped_reasoning)
         if flush_content:
@@ -688,7 +960,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += flush_content
             else:
-                yield ContentDelta(strip_special_tokens(flush_content, specials))
+                stripped_content = _filter_content(flush_content)
+                if stripped_content:
+                    yield ContentDelta(stripped_content)
 
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -702,35 +976,60 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         for frag in tool_parser.finalize_stream():
             if open_call is not None and frag.parameters:
                 open_call["params"] += frag.parameters
-                yield ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
+                for ev in _filter_tool_boundary(
+                    ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
+                ):
+                    yield ev
         done = _close_open_call()
         if done is not None:
-            yield done
+            for ev in _filter_tool_boundary(done):
+                yield ev
         for item in tool_parser.recover_truncated_call():
-            yield ToolCallStart(tool_index=calls_emitted, name=item.name)
-            yield ToolCallsDelta(
-                [ToolCallItem(tool_index=calls_emitted, name=item.name, parameters=item.parameters)]
-            )
+            recovered = [
+                ToolCallStart(tool_index=calls_emitted, name=item.name),
+                ToolCallsDelta([
+                    ToolCallItem(
+                        tool_index=calls_emitted,
+                        name=item.name,
+                        parameters=item.parameters,
+                    )
+                ]),
+            ]
+            for event in recovered:
+                for ev in _filter_tool_boundary(event):
+                    yield ev
             calls_emitted += 1
         residual = tool_parser.finish_stream()
         if residual:
-            stripped = strip_special_tokens(residual, specials)
-            if stripped and not (stripped.strip() == "" and suppress_ws):
-                yield ContentDelta(stripped)
+            for ev in _filter_tool_text(residual):
+                yield ev
         if calls_emitted and finish_reason != "length":
             finish_reason = "tool_calls"
     else:
         parsed = _parse_tool_response(pending, spec, state) if parse_tools else None
         if parsed is not None:
             normal_text, tool_calls = parsed
-            normal_text = strip_special_tokens(normal_text, specials)
+            normal_text = _filter_content(normal_text)
             if normal_text:
                 yield ContentDelta(normal_text)
             yield ToolCallsDelta(tool_calls)
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         elif parse_tools and pending:
-            yield ContentDelta(strip_special_tokens(pending, specials))
+            stripped_pending = _filter_content(pending)
+            if stripped_pending:
+                yield ContentDelta(stripped_pending)
+
+    trailing_reasoning = reasoning_special_filter.finish()
+    if trailing_reasoning:
+        yield ReasoningDelta(trailing_reasoning)
+    if tool_parser is not None:
+        for ev in _semantic_content_events(content_special_filter.finish_items()):
+            yield ev
+    else:
+        trailing_content = content_special_filter.finish()
+        if trailing_content:
+            yield ContentDelta(trailing_content)
 
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
@@ -770,9 +1069,15 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
+    reasoning_special_filter = _make_semantic_special_token_filter(state)
+    content_special_filter = _make_semantic_special_token_filter(state)
     return GenResult(
-        reasoning=strip_special_tokens(reasoning_text, specials).strip(),
-        content=strip_special_tokens(content_text, specials),
+        reasoning=reasoning_special_filter.feed(
+            strip_special_tokens(reasoning_text, specials), final=True
+        ).strip(),
+        content=content_special_filter.feed(
+            strip_special_tokens(content_text, specials), final=True
+        ),
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         prompt_tokens=prompt_tokens,
