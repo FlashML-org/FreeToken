@@ -102,6 +102,10 @@ class ShellClient:
     ) -> None:
         self.origin = origin.rstrip("/")
         self.timeout = timeout
+        # Sent on the control plane too (the OpenAI client already sends it on chat), so a
+        # server started with --api-key accepts both halves of the shell. The default is the
+        # placeholder an unauthenticated server ignores.
+        self.api_key = api_key
         self._openai = AsyncOpenAI(
             base_url=f"{self.origin}/v1",
             api_key=api_key,
@@ -118,7 +122,7 @@ class ShellClient:
         self, method: str, path: str, body: dict[str, Any] | None, timeout: float
     ) -> dict[str, Any]:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self.api_key}"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"

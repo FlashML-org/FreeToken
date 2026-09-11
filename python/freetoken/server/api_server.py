@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import os
 import signal
@@ -437,6 +438,23 @@ _TRACKED_REQUEST_PREFIXES = (
 _UNTRACKED_REQUEST_PREFIXES = ("/v1/messages/count_tokens",)
 
 
+# --api-key (ServerArgs.api_key), installed by run_api_server before serving. None means no
+# authentication -- every route answers as before. Module-level rather than closed over so the
+# middleware below can be registered at import time like the others and tests can set it.
+_API_KEY: str | None = None
+# Routes that stay open with a key set: liveness probes (load balancers, Docker healthchecks,
+# the desktop app's load-progress polling) cannot carry a header and reveal nothing but status.
+_API_KEY_OPEN_PATHS = ("/health",)
+
+
+def install_api_key(key: str | None) -> None:
+    """Arm the bearer check for every route but ``_API_KEY_OPEN_PATHS``; ``None``/"" disarms."""
+    global _API_KEY
+    _API_KEY = key or None
+    if _API_KEY is not None:
+        logger.info("API key required (Authorization: Bearer) on every route except /health")
+
+
 def _served_model_name() -> str | None:
     st = _GLOBAL_STATE
     cfg = getattr(st, "config", None) if st is not None else None
@@ -564,6 +582,36 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     swa_page_size = page_size if is_dsv4 else 1
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """Reject any request without ``Authorization: Bearer <api_key>`` when a key is set.
+
+    Registered after ``_record_request_middleware`` so it runs *before* it (Starlette wraps the
+    last-added middleware outermost): a 401 never lands in the request ring or a handler. CORS
+    preflights (OPTIONS) carry no credentials by design and pass through; the CORS middleware
+    installed at startup is outer still, so it answers them. Constant-time compare, and the
+    same body shape the OpenAI-compatible routes use for errors."""
+    key = _API_KEY
+    if key is None or request.method == "OPTIONS" or request.url.path in _API_KEY_OPEN_PATHS:
+        return await call_next(request)
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        token.strip().encode("utf-8"), key.encode("utf-8")
+    ):
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={
+                "error": {
+                    "message": "Invalid or missing API key (Authorization: Bearer <key>).",
+                    "type": "authentication_error",
+                    "code": 401,
+                }
+            },
+        )
+    return await call_next(request)
 
 
 @app.post("/v1/cache/rebuild")
@@ -873,7 +921,7 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int) -> None:
+def _serve_and_run_shell(host: str, port: int, api_key: str | None = None) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -906,7 +954,8 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # /health and echoes the same load progress the desktop app polls for. A ^C during that
         # wait is a stop, not a crash -- exit through the teardown below, not a traceback.
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(run_shell(origin, connect_grace=30.0))
+            # The attached shell is an ordinary client, so it carries the server's own key.
+            asyncio.run(run_shell(origin, connect_grace=30.0, api_key=api_key))
     finally:
         server.should_exit = True
         thread.join(timeout=15)
@@ -951,6 +1000,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
+    install_api_key(config.api_key)
     init_request_logging()
     # Hide the frequent health/stats/requests/cache-status polling of the desktop app (and of
     # the shell's status bar) from uvicorn's access log; non-polling access lines are
@@ -1034,7 +1084,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     ).start()
 
     if run_shell:
-        _serve_and_run_shell(host, port)
+        _serve_and_run_shell(host, port, config.api_key)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
     uvicorn.run(app, host=host, port=port)
