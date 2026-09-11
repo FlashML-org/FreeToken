@@ -676,3 +676,66 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", -0.5),
+        ("top_p", 0.0),
+        ("top_k", 0),
+    ],
+)
+def test_chat_completion_rejects_invalid_sampling(field, value):
+    app = FastAPI()
+    state = FakeState([])
+
+    @app.post("/v1/chat/completions")
+    async def chat_completion(req: ChatCompletionRequest):
+        return await handle_chat_completion(req, request=None, state=state, model_sampling={})
+
+    body = {
+        "model": "unit-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+        field: value,
+    }
+    response = TestClient(app).post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert field in error["message"]
+    assert state.sent is None
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+        {"temperature": 0.0, "top_p": 1.0, "top_k": 1},
+    ],
+)
+def test_chat_completion_accepts_sampling_boundaries(sampling):
+    app = FastAPI()
+    state = FakeState([])
+
+    @app.post("/v1/chat/completions")
+    async def chat_completion(req: ChatCompletionRequest):
+        return await handle_chat_completion(req, request=None, state=state, model_sampling={})
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "unit-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            **sampling,
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.sent is not None
