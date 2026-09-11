@@ -19,7 +19,13 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
+
+
+def _is_rocm() -> bool:
+    import torch
+    return getattr(torch.version, "hip", None) is not None
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -39,6 +45,15 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
 
         cc = max(arch_list, key=_rank).rstrip("a").replace(".", "")
         flags = flags + [f"-gencode=arch=compute_{cc},code=compute_{cc}"]
+    return flags
+
+
+def _hip_cflags(extra: List[str]) -> List[str]:
+    """HIP flags for a kernel build on ROCm."""
+    # TODO(ROCm): Triton autotune configs need RDNA3-specific tuning (wave count, LDS size).
+    flags = DEFAULT_HIP_CFLAGS + extra
+    rocm_arch = os.getenv("FREETOKEN_ROCM_ARCH", "gfx1100;gfx1101;gfx1102;gfx1103")
+    flags = flags + [f"--offload-arch={rocm_arch}"]
     return flags
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
@@ -217,12 +232,17 @@ def load_aot(
     cpp_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cpp_files]
     cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
 
+    if _is_rocm():
+        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+    else:
+        cuda_cflags = _cuda_cflags(extra_cuda_cflags)
+
     return load(
         name,
         cpp_files=cpp_files,
         cuda_files=cuda_files,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
+        extra_cuda_cflags=cuda_cflags,
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
@@ -272,12 +292,17 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
+    if _is_rocm():
+        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+    else:
+        cuda_cflags = _cuda_cflags(extra_cuda_cflags)
+
     return load_inline(
         name,
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
+        extra_cuda_cflags=cuda_cflags,
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
