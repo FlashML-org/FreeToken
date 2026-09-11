@@ -303,9 +303,9 @@ def iter_weights_parallel(
 
 # Routed-expert checkpoint key (per-expert, un-fused). ``mtp.layers...`` is excluded by the
 # ``model.language_model.`` anchor, so the parallel reader only sees the real experts.
-_FP8_EXPERT_RE = re.compile(
+_FP8_EXPERT_KEY_RE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
+    r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|{scale})$"
 )
 
 
@@ -348,7 +348,7 @@ def _moe_dims(model_config):
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
-    ``_scale`` (bf16 block ``weight_scale_inv``) companions. Other expert kinds use the generic readers."""
+    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
     if get_tp_info().size > 1:
@@ -357,10 +357,12 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     L, E, H, I, dense = _moe_dims(config)
-    suffix = {"weight": "", "weight_scale_inv": "_scale"}
+    scale = get_quant_config().stored_tensors(QuantKind.FP8_BLOCK)["weight_scale_inv"].name
+    key_re = re.compile(_FP8_EXPERT_KEY_RE.format(scale=re.escape(scale)))
+    suffix = {"weight": "", scale: "_scale"}
 
     def locate(raw_name: str):
-        m = _FP8_EXPERT_RE.match(raw_name)
+        m = key_re.match(raw_name)
         if m is None:
             return None
         li = int(m["layer"]) - dense
@@ -372,7 +374,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         parallel = experts_scattered(model_path)
     if parallel:
         tensors = iter_expert_tensors_parallel(
-            model_path, lambda n: _FP8_EXPERT_RE.match(n) is not None, workers=workers, chunk=chunk
+            model_path, lambda n: key_re.match(n) is not None, workers=workers, chunk=chunk
         )
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 

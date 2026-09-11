@@ -41,6 +41,7 @@ from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.config import EngineConfig
 from freetoken.engine.engine import _decode_target
 from freetoken.layers import set_rope_device
+from freetoken.layers.quantization.configs.base import Stored
 from freetoken.layers.quantization.names import NameMap
 from freetoken.models import create_model
 from freetoken.models.register import get_model_spec
@@ -171,9 +172,21 @@ def expected_tensors(ftw_dir: str, resident_experts: bool):
         model = create_model(cfg.model_config)
     state = {k: (tuple(v.shape), v.dtype) for k, v in model.state_dict().items()}
     arch = cfg.model_config.architectures[0]
-    spec = get_model_spec(arch)
-    name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
-    return arch, state, name_map
+    quant = cfg.model_config.quant
+    if quant is None:
+        spec = get_model_spec(arch)
+        name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
+    else:
+        name_map = quant.name_map
+    return arch, state, name_map, quant
+
+
+def stored_entry(quant, module: str, role: str) -> Stored:
+    """The checkpoint tensor behind ``module``'s ``role`` in the checkpoint's dialect; a plain same-named tensor when the dialect has no say."""
+    scheme = quant.scheme_for(module) if quant is not None else None
+    if scheme is None:
+        return Stored(role)
+    return quant.storage(scheme).get(role, Stored(role))
 
 
 # ------------------------------------------------------------------ repairs
@@ -185,7 +198,7 @@ def dsv4_rename(name: str) -> str:
     return "model." + name
 
 
-def plan(arch: str, entries: list[dict], expected: dict, name_map: NameMap):
+def plan(arch: str, entries: list[dict], expected: dict, name_map: NameMap, quant=None):
     """Return (renames, dequants, fetches, drops, leftovers) that turn the FTW dense set into ``expected``."""
     dense = {e["name"]: e for e in entries if e["kind"] == "weight"}
     renames: dict[str, str] = {}
@@ -207,29 +220,28 @@ def plan(arch: str, entries: list[dict], expected: dict, name_map: NameMap):
             dequants.append((n, e, scale))
             drops.add(scale["name"])
 
-    # (name, checkpoint parts): a fused module maps to several checkpoint tensors
-    fetches: list[tuple[str, list[str]]] = []
+    # (name, checkpoint parts, reciprocal): a fused module maps to several checkpoint tensors, named as the dialect stores the role
+    fetches: list[tuple[str, list[str], bool]] = []
     for n in (n for n in expected if n not in names):
         module, _, leaf = n.rpartition(".")
-        parts = [f"{m}.{leaf}" for m in name_map.to_checkpoint(module)] if module else [n]
-        fetches.append((n, parts))
+        entry = stored_entry(quant, module, leaf) if module else Stored(leaf)
+        parts = [f"{m}.{entry.name}" for m in name_map.to_checkpoint(module)] if module else [n]
+        fetches.append((n, parts, entry.reciprocal))
 
     leftovers = [n for n in names if n not in expected and n not in drops]
     return renames, dequants, fetches, drops, leftovers
 
 
-def resolve_fetches(fetches, source: TensorSource) -> tuple[dict[str, list[str]], list[str]]:
-    """Map each missing tensor to the source tensors it is built from; a fused scale needs every part."""
-    resolved: dict[str, list[str]] = {}
+def resolve_fetches(fetches, source: TensorSource) -> tuple[dict[str, tuple[list[str], bool]], list[str]]:
+    """Map each missing tensor to (the source tensors it is built from, reciprocal); a fused scale needs every part."""
+    resolved: dict[str, tuple[list[str], bool]] = {}
     errors: list[str] = []
-    for n, parts in fetches:
-        if source.has(n):
-            resolved[n] = [n]
-        elif all(source.has(p) for p in parts):
+    for n, parts, reciprocal in fetches:
+        if all(source.has(p) for p in parts):
             if len(parts) > 1 and not n.endswith(".input_scale"):
                 errors.append(f"{n} maps to {len(parts)} source tensors; fusing is not supported here")
             else:
-                resolved[n] = parts
+                resolved[n] = (parts, reciprocal)
         else:
             errors.append(f"no source tensor for {n}: missing {[p for p in parts if not source.has(p)]}")
     return resolved, errors
@@ -748,10 +760,10 @@ def main(argv: list[str] | None = None) -> int:
     resident_experts = any(e["kind"] == "weight" and ".experts." in e["name"] for e in index["tensors"])
     log(f"reading {os.path.join(ns.ftw, INDEX_NAME)}: {len(index['tensors'])} entries, {len(index['shards'])} shards, {index['total_bytes'] / 2**30:.2f} GiB")
     log("building the current model on the meta device from the FTW's config.json" + (" (resident experts)" if resident_experts else ""))
-    arch, expected, name_map = expected_tensors(ns.ftw, resident_experts)
+    arch, expected, name_map, quant = expected_tensors(ns.ftw, resident_experts)
     log(f"{arch}: model declares {len(expected)} dense tensors")
     source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
-    renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map)
+    renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map, quant)
     dequant_names = {n for n, _, _ in dequants}
     ple = PleSpec(ns.ftw) if arch.startswith("Qwen4Exp") else None
     chk = check_ftw(ns.ftw, index, expected, renames, dequant_names, ple)
@@ -764,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  renames {len(renames)}  dequantize {len(dequants)}  fetch {len(fetches)}  drop {len(drops)}  leftover {len(leftovers)}"
           + (f"  PLE table: {ple_status}" + (f" ({ple_detail})" if ple_detail else "") if need_ple else "")
           + (f"  dead bytes in {len(dirty)} shard(s)" if dirty else ""))
-    for n, parts in fetches[:8]:
+    for n, parts, _ in fetches[:8]:
         print(f"    fetch {n} <- {parts}")
     if len(fetches) > 8:
         print(f"    ... {len(fetches) - 8} more")
@@ -790,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     if (fetches or need_ple) and source is None:
         print("ERROR: tensors must be fetched but neither --repo nor --source was given", file=sys.stderr)
         return 2
-    fetch_srcs: dict[str, list[str]] = {}
+    fetch_srcs: dict[str, tuple[list[str], bool]] = {}
     if fetches:
         fetch_srcs, errors = resolve_fetches(fetches, source)
         for msg in errors:
@@ -798,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
             bad = True
     # the converter transforms most tensors on the way in (norm offsets, fusion, packing); only the
     # activation scale scalars are stored as the checkpoint has them, so only they can be fetched raw
-    unfetchable = [n for n, _ in fetches if not n.endswith(".input_scale")]
+    unfetchable = [n for n, *_ in fetches if not n.endswith(".input_scale")]
     if unfetchable:
         print(f"ERROR: {len(unfetchable)} missing tensor(s) cannot be fetched raw (first: {unfetchable[0]}); reconvert the checkpoint", file=sys.stderr)
         bad = True
@@ -863,11 +875,14 @@ def main(argv: list[str] | None = None) -> int:
             tick(b, e["nbytes"])
         done(b)
         items = list(fetch_srcs.items())
-        for n, srcs in (items if _VERBOSE or not items else count_bar(items, "Fetching tensors")):
-            log(f"  fetch {n} <- {', '.join(srcs)}")
-            vals = [source.get(c) for c in srcs]
+        for n, (srcs, reciprocal) in (items if _VERBOSE or not items else count_bar(items, "Fetching tensors")):
+            log(f"  fetch {n} <- {', '.join(srcs)}" + (" (reciprocal)" if reciprocal else ""))
+            vals = [source.get(c).reshape(()).float() for c in srcs]
+            # llm-compressor stores the quant-side global; the layer wants the dequant-side scale, as the reader loads it
+            if reciprocal:
+                vals = [1.0 / v for v in vals]
             # a fused projection shares one activation scale; the reader takes the max over its parts
-            w.add_tensor(n, torch.stack([v.reshape(()).float() for v in vals]).max().reshape(()))
+            w.add_tensor(n, torch.stack(vals).max().reshape(()))
 
     hotfix = {"from": os.path.abspath(ns.ftw), "renamed": len(renames), "dequantized": len(dequants),
               "fetched": len(fetch_srcs), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}

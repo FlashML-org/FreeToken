@@ -8,17 +8,16 @@ config; the dense pass has to fill exactly those buffers whatever the checkpoint
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
-from freetoken.layers.quantization import set_quant_config
+from freetoken.layers.quantization import QuantKind, set_quant_config
 from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen3_5_moe.config import parse_config
-from freetoken.models.qwen3_5_moe.weight import iter_weights, nvfp4_expert_spec
+from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces, iter_weights, nvfp4_expert_spec
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config
 
@@ -195,6 +194,8 @@ CT_BLOCK_MOE = _ct({
     "group_0": {**FP8_BLOCK_GROUP, "targets": [r"re:.*self_attn\.(q|k|v|o)_proj$", r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$", r"re:.*shared_expert\.(gate|up|down)_proj$"]},
     "group_1": {**NVFP4_GROUP, "targets": [r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$"]},
 }, ["lm_head", *GDN_BA, *ROUTERS], "mixed-precision")
+# block-fp8 everywhere, experts included, under llm-compressor's names (``weight_scale`` for the block scale)
+CT_BLOCK_EXPERTS = _ct({"group_0": {**FP8_BLOCK_GROUP, "targets": ["Linear"]}}, ["lm_head", f"{LM}.embed_tokens", *GDN_BA, *ROUTERS], "float-quantized")
 
 
 def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
@@ -234,10 +235,14 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
         _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, lambda w: _fp8_block(w, ct=True))
         _experts(raw, lambda w: _nvfp4(w, ct=True))
         return moe, CT_BLOCK_MOE, raw
+    if name == "ct_block_experts":
+        _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, lambda w: _fp8_block(w, ct=True))
+        _experts(raw, lambda w: _fp8_block(w, ct=True))
+        return moe, CT_BLOCK_EXPERTS, raw
     raise KeyError(name)
 
 
-LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe"]
+LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
 
 
 def _config_json(moe: bool, quantization_config) -> dict:
@@ -327,9 +332,9 @@ def test_emitted_keys_are_the_model_state_dict(checkpoint):
 def test_expert_quant_tag_follows_the_config(checkpoint):
     name, folder, _raw = checkpoint
     config = parse_config(cached_load_hf_config(folder))
-    expected = {"bf16": "none", "fp8_block": "fp8_block", "ct_nvfp4_dense": "none"}.get(name, "nvfp4")
+    expected = {"bf16": "none", "fp8_block": "fp8_block", "ct_block_experts": "fp8_block", "ct_nvfp4_dense": "none"}.get(name, "nvfp4")
     assert config.expert_quant == expected
-    assert config.weight_block_size == ((128, 128) if name == "fp8_block" else None)
+    assert config.weight_block_size == ((128, 128) if expected == "fp8_block" else None)
 
 
 def _slices(fused: torch.Tensor, parts: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -372,7 +377,7 @@ def test_bf16_stacked_experts_pass_through_only_when_asked(checkpoint):
 
 def test_block_fp8_fuses_weight_and_scale_per_kind(checkpoint):
     name, folder, raw = checkpoint
-    if name not in ("fp8_block", "ct_block_moe"):
+    if name not in ("fp8_block", "ct_block_moe", "ct_block_experts"):
         pytest.skip("block-fp8 layouts only")
     loaded = _load(folder)
     scale = "weight_scale_inv" if name == "fp8_block" else "weight_scale"
@@ -496,6 +501,23 @@ def test_nvfp4_expert_pieces_read_either_dialect_from_a_single_file(checkpoint):
         assert _same(piece["gate"][0], raw[f"{base}.weight_packed"])
         assert _same(piece["down_scale"][0], raw[f"{LM}.layers.1.mlp.experts.2.down_proj.weight_scale"])
         assert torch.equal(piece["gate_global"].reshape(-1), (1.0 / raw[f"{base}.weight_global_scale"]).to(torch.float16))
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_block_fp8_expert_pieces_read_either_dialect(checkpoint, parallel):
+    """The block-fp8 expert reader takes the scale's name from the dialect: ``weight_scale_inv`` (HF fp8) or ``weight_scale`` (llm-compressor)."""
+    name, folder, raw = checkpoint
+    if name not in ("fp8_block", "ct_block_experts"):
+        pytest.skip("block-fp8 expert layouts only")
+    _install(folder)
+    config = parse_config(cached_load_hf_config(folder))
+    pieces = list(iter_expert_pieces(folder, config, QuantKind.FP8_BLOCK, parallel=parallel))
+    assert len(pieces) == 2 * E
+    layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
+    base = f"{LM}.layers.1.mlp.experts.2"
+    scale = "weight_scale_inv" if name == "fp8_block" else "weight_scale"
+    assert _same(piece["gate"][0], raw[f"{base}.gate_proj.weight"])
+    assert torch.equal(piece["down_scale"][0].float(), raw[f"{base}.down_proj.{scale}"].float())
 
 
 # --------------------------------------------------------------------------- the family's unquantized modules
