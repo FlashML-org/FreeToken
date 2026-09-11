@@ -49,6 +49,13 @@ class EngineConfig:
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
+    # Disk tier (--moe-disk-tier, see moe/disk_tier.py): "off" = classic behavior.
+    # When "on", experts [0, expert_ram_experts) per layer stay pinned in RAM and the
+    # rest are fetched from the original checkpoint on slot-cache miss. Requires the
+    # native NVFP4 layout, gpu decode target, no prefill overlap, no cuda graphs.
+    moe_disk_tier: str = "off"
+    expert_ram_experts: int = 0
+    disk_fetch_workers: int = 8
     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
