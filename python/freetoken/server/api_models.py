@@ -90,11 +90,30 @@ class ChatCompletionRequest(BaseModel):
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # The last message is an assistant prefix the model continues (no generation prompt).
+    continue_final_message: bool = False
+    # ---- sampling extras shared with vLLM / SGLang / llama.cpp (all optional) ----
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    min_tokens: int = 0
+    stop_token_ids: list[int] | None = None
+    include_stop_str_in_output: bool = False
+    skip_special_tokens: bool | None = None
+    # Accepted for OpenAI compatibility, not honoured: the batched sampling kernel has no
+    # per-request generator (seed); user / metadata / store are opaque to the server.
+    seed: int | None = None
+    user: str | None = None
+    # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
+    request_id: str | None = None
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
         if self.max_completion_tokens is not None:
             self.max_tokens = self.max_completion_tokens
+        if self.continue_final_message and (
+            not self.messages or self.messages[-1].role != "assistant"
+        ):
+            raise ValueError("continue_final_message needs a final assistant message")
         return self
 
 
@@ -120,12 +139,51 @@ class CompletionRequest(BaseModel):
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # ---- sampling extras shared with vLLM / SGLang / llama.cpp (all optional) ----
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    min_tokens: int = 0
+    stop_token_ids: list[int] | None = None
+    include_stop_str_in_output: bool = False
+    skip_special_tokens: bool | None = None
+    # Accepted for OpenAI compatibility, not honoured: the batched sampling kernel has no
+    # per-request generator (seed); user / metadata / store are opaque to the server.
+    seed: int | None = None
+    user: str | None = None
+    # A client-chosen id echoed as the response id (vLLM request_id / SGLang rid).
+    request_id: str | None = None
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "CompletionRequest":
         if self.max_completion_tokens is not None:
             self.max_tokens = self.max_completion_tokens
         return self
+
+
+MAX_N = 16  # choices per request; each is a full generation, so keep the fan-out bounded
+
+
+class TokenizeRequest(BaseModel):
+    """``POST /tokenize`` (the vLLM / SGLang shape): a raw prompt, or chat messages that
+    are rendered through the model's chat template first."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    prompt: str | None = None
+    messages: list[Message] | None = None
+    add_special_tokens: bool = True
+    add_generation_prompt: bool = True
+    return_token_strs: bool = False
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+class DetokenizeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    tokens: list[int]
+    skip_special_tokens: bool = False
 
 
 class ModelCard(BaseModel):

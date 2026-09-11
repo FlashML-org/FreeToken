@@ -80,6 +80,19 @@ def _send_generation_replies(
     _put_user_replies(send_frontend, terminal_errors)
 
 
+def _reasoning_end_id(tokenizer) -> int | None:
+    """The id of the reasoning end tag when the vocabulary has one (``</think>`` for the
+    Qwen / DeepSeek / GLM families), else None. Only used to count reasoning tokens."""
+    for tag in ("</think>", "<|end_of_thinking|>"):
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tag)
+        except Exception:  # noqa: BLE001 -- a tokenizer without the tag answers unk or raises
+            continue
+        if isinstance(tid, int) and tid >= 0 and tid != getattr(tokenizer, "unk_token_id", -1):
+            return tid
+    return None
+
+
 def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
@@ -149,7 +162,9 @@ def tokenize_worker(
 
     tokenize_manager = TokenizeManager(tokenizer)
     detokenize_manager = DetokenizeManager(
-        tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
+        tokenizer,
+        load_eos_token_ids(tokenizer_path, tokenizer),
+        think_end_id=_reasoning_end_id(tokenizer),
     )
 
     if ack_queue is not None:
@@ -207,7 +222,7 @@ def tokenize_worker(
             )
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
-                replies = detokenize_manager.detokenize(detokenize_msg)
+                replies, reasoning_counts = detokenize_manager.detokenize_with_meta(detokenize_msg)
                 sampled_replies = [
                     UserReply(
                         uid=msg.uid,
@@ -215,6 +230,7 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
+                        reasoning_tokens=reasoning_tokens,
                         completion_tokens_delta=1,
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
@@ -224,7 +240,9 @@ def tokenize_worker(
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                     )
-                    for msg, reply in zip(detokenize_msg, replies, strict=True)
+                    for msg, reply, reasoning_tokens in zip(
+                        detokenize_msg, replies, reasoning_counts, strict=True
+                    )
                 ]
 
             # An error reply and a client abort are both terminal for their uid, and neither

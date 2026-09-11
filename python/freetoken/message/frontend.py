@@ -56,6 +56,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # On the finished reply: tokens generated up to and including the reasoning end tag
+    # (0 when the model emitted none) -> usage.completion_tokens_details.reasoning_tokens.
+    reasoning_tokens: int = 0
 
 
 @dataclass

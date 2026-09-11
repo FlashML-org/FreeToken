@@ -68,6 +68,24 @@ def register_control_routes(
 
     from .stats import build_stats
 
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus text exposition of /v1/stats (the llama.cpp / vLLM convention)."""
+        from fastapi.responses import PlainTextResponse
+
+        from .stats import prometheus_text
+
+        doc = build_stats(
+            get_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+        )
+        return PlainTextResponse(prometheus_text(doc), media_type="text/plain; version=0.0.4")
+
+    @app.get("/version")
+    async def version():
+        from freetoken import __version__
+
+        return {"version": __version__}
+
     @app.get("/v1/stats")
     async def stats():
         doc = build_stats(
