@@ -75,3 +75,25 @@ def test_stats_limits_falls_back_to_the_model_ceiling_mid_load():
     limits = build_stats(state, p95_ms=0, ttft_mean_ms=0)["limits"]
 
     assert limits["max_seq_len"] == 262144
+
+
+def test_stats_model_ctx_is_the_enforced_ceiling_not_the_checkpoint_ceiling():
+    """``launch._stats_context_length`` reads ``model.ctx`` as its client-window fallback.
+
+    Reporting the raw checkpoint ceiling there re-introduced exactly the bug ``limits``
+    exists to prevent: a client sizes its window from the model card and then sends
+    prompts the scheduler rejects. The raw ceiling stays in
+    ``limits.model_max_seq_len``.
+    """
+    state = _state(enforced=245760, model_max=262144)
+    doc = build_stats(state, p95_ms=0, ttft_mean_ms=0)
+
+    assert doc["model"]["ctx"] == 245760
+    assert doc["limits"]["max_seq_len"] == 245760
+    assert doc["limits"]["model_max_seq_len"] == 262144
+
+
+def test_stats_model_ctx_keeps_the_ceiling_while_the_meta_is_in_flight():
+    """No readiness meta yet: ctx falls back to the ceiling rather than 0."""
+    state = _state(enforced=None, model_max=262144)
+    assert build_stats(state, p95_ms=0, ttft_mean_ms=0)["model"]["ctx"] == 262144

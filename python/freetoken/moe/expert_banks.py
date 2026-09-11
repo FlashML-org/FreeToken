@@ -327,6 +327,15 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if ownership is not None:
+            # ``load_ftw_banks`` rebuilds ``[num_experts, ...]`` GLOBAL rows and has no
+            # ownership filter, so the banks could not bind to the owner-local geometry.
+            # The engine rejects this combination up front; guard the loader too so a
+            # converter/tool call cannot reach the same inconsistent state.
+            raise NotImplementedError(
+                "owner-local expert banks are not supported for FTW checkpoints: the FTW "
+                "bank loader rebuilds global expert rows and does not filter by ownership"
+            )
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,

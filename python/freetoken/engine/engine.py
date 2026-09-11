@@ -79,6 +79,20 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
             "owner EP needs an explicit --moe-cache-size, or --moe-cache-auto (which now "
             "solves against the owner-local expert geometry)"
         )
+    if config.moe_cpu_layers:
+        raise ValueError(
+            "owner EP does not implement the CPU/hybrid expert path: the owner cache wraps "
+            "the GPU slot cache and _decode_owner is selected before the is_cpu_layer "
+            "branch, so --moe-cpu-layers would be accepted and then silently ignored"
+        )
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    if is_ftw_checkpoint(config.model_path):
+        raise ValueError(
+            "owner EP is not supported for FTW checkpoints: load_ftw_banks rebuilds "
+            "[num_experts, ...] GLOBAL expert rows with no ownership filter, so the banks "
+            "cannot bind to the owner-local geometry"
+        )
     # CUDA graphs are allowed: decode admission goes through the fixed-shape, sync-free
     # OwnerOffloadMoeCache.ensure_route_graph when graphs are on (see _owner_graph_safe).
 
@@ -483,19 +497,11 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-        # Set after graph capture: the decode_freq histogram is scattered host-side
-        # before the kernel rewrites expert ids to slots, so a captured decode graph
-        # replays without it -- warn that the routing stats need graphs off.
-        if (
-            self.moe_offload_cache is not None
-            and self.moe_offload_cache.collect_decode_freq
-            and self.graph_runner.max_graph_bs > 0
-        ):
-            logger.warning_rank0(
-                "--moe-collect-decode-freq with CUDA graphs enabled: the per-expert routing "
-                "histogram only sees the capture-time warm-up, not replayed decode steps. "
-                "Set --cuda-graph-max-bs 0 for accurate decode_freq / routing stats."
-            )
+        # NOTE: ``--moe-collect-decode-freq`` is CUDA-graph safe. The histogram lives on the
+        # device (``OffloadMoeCache.decode_freq``) and is accumulated by a device-side
+        # ``scatter_add_`` at the raw-ids point, so a captured decode graph replays the
+        # accumulation with every step. No warning is needed and graphs must not be disabled
+        # for it.
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -794,6 +800,9 @@ class Engine:
                 top_k=config.model_config.num_experts_per_tok,
                 model=config.model_path,
                 decode_target=cache.decode_target,
+                # One file per rank: every rank records the same configured path, so sharing
+                # it would let the TP writers truncate each other's trace.
+                rank=config.tp_info.rank if config.tp_info.size > 1 else None,
             )
             logger.info_rank0(
                 f"--moe-trace-route: recording ordered decode route trace to "

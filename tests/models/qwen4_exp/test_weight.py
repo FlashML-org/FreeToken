@@ -421,7 +421,59 @@ def test_tp2_row_parallel_dense_weights_reassemble(checkpoint):
             )
             for rank in range(2)
         ]
-        assert torch.equal(torch.cat(shards, dim=0), value), key
+        # The vocabulary axis is PADDED per rank to div_ceil(V, tp), not truncated: the
+        # model allocates that many rows (VocabParallelEmbedding.num_embeddings_tp) and its
+        # gather trims the padding -- see test_skeleton's parallel lm-head test. Only the
+        # real rows must reassemble.
+        rows = -(-value.shape[0] // 2)
+        assert [s.shape[0] for s in shards] == [rows, rows], key
+        assert torch.equal(torch.cat(shards, dim=0)[: value.shape[0]], value), key
+
+
+def test_tp2_short_final_vocabulary_shard_is_zero_padded():
+    """The vocabulary axis is padded, not truncated.
+
+    ``VocabParallelEmbedding`` always allocates ``div_ceil(vocab, tp)`` rows -- its
+    ``finish_idx`` clamps the token-index range, not the allocation -- so when the
+    vocabulary is not divisible by TP the final rank must still hand over a
+    full-width shard or strict loading fails on shape.
+    """
+    config = SimpleNamespace(linear_attention_group=lambda: None)
+    vocab, width = 7, 4  # 7 is not divisible by 2
+    value = torch.arange(vocab * width, dtype=torch.float32).reshape(vocab, width)
+    rows = -(-vocab // 2)
+
+    shards = [
+        shard_qwen4_exp_dense_tensor(
+            "model.embed_tokens.weight", value, config=config, rank=rank, world_size=2
+        )
+        for rank in range(2)
+    ]
+
+    assert [tuple(s.shape) for s in shards] == [(rows, width), (rows, width)]
+    assert torch.equal(shards[0], value[:rows])
+    # rank 1 carries the real tail rows plus a zero row no token id can reach
+    assert torch.equal(shards[1][: vocab - rows], value[rows:])
+    assert torch.count_nonzero(shards[1][vocab - rows :]) == 0
+    # the real vocabulary still reassembles exactly
+    assert torch.equal(torch.cat(shards, dim=0)[:vocab], value)
+
+
+def test_tp2_lm_head_short_final_shard_is_zero_padded_too():
+    config = SimpleNamespace(linear_attention_group=lambda: None)
+    vocab, width = 5, 3  # 5 % 4 != 0, so three of four ranks pad
+    value = torch.arange(vocab * width, dtype=torch.float32).reshape(vocab, width)
+    rows = -(-vocab // 4)
+
+    shards = [
+        shard_qwen4_exp_dense_tensor(
+            "lm_head.weight", value, config=config, rank=rank, world_size=4
+        )
+        for rank in range(4)
+    ]
+
+    assert all(tuple(s.shape) == (rows, width) for s in shards)
+    assert torch.equal(torch.cat(shards, dim=0)[:vocab], value)
 
 
 def test_shared_expert_gate_up_merge(loaded, checkpoint):
@@ -613,6 +665,18 @@ def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkey
                     assert torch.equal(half, expected), (name, rank)
             continue
         dim = 1 if name.endswith(dim1) else 0
+        if name in ("model.embed_tokens.weight", "lm_head.weight"):
+            # PADDED, not truncated: each rank holds div_ceil(V, tp) rows and the model's
+            # vocab gather trims the tail (see test_skeleton's parallel lm-head test), so
+            # only the real rows have to reassemble and the padding must be zero.
+            rows = -(-full.shape[0] // 2)
+            for rank in range(2):
+                got = shards[rank][name]
+                assert got.shape[0] == rows, name
+                real = full[rank * rows : (rank + 1) * rows]
+                assert torch.equal(got[: real.shape[0]], real), name
+                assert torch.count_nonzero(got[real.shape[0] :]) == 0, name
+            continue
         merged = torch.cat([shards[0][name], shards[1][name]], dim=dim)
         assert torch.equal(merged, full), name
         assert shards[0][name].shape != full.shape or full.shape[dim] == 1, name

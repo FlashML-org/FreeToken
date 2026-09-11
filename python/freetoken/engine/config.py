@@ -51,9 +51,9 @@ class EngineConfig:
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # Per-(layer, expert) decode routing histogram (working-set / oracle-hit analysis).
-    # The histogram is accumulated host-side before the kernel rewrites expert ids to
-    # slots, so it is only accurate with CUDA graphs disabled (a captured graph would
-    # not re-run the scatter on replay) -- the engine warns when both are on.
+    # Accumulated on the DEVICE by a ``scatter_add_`` at the raw-ids point, so a captured
+    # decode graph replays it with every step -- this flag is CUDA-graph safe and does not
+    # require disabling graphs.
     moe_collect_decode_freq: bool = False
     # Ordered MoE route trace path (--moe-trace-route): when set, every
     # ``ensure_experts`` call appends its RAW global expert ids (pre slot-rewrite)

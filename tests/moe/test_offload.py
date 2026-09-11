@@ -667,6 +667,71 @@ def test_offload_cache_rebuild_keeps_overlap_at_boundary():
     assert cache.cache_size == 8
 
 
+def test_copy_missing_consumes_the_staged_layer_exactly_once():
+    # Regression: _pending_src_layer was never cleared, so a later copy_missing() with
+    # nothing freshly staged replayed the PREVIOUS layer's src_indices/evict_slots and
+    # overwrote slots that had since been reassigned to another layer. The owner adapter's
+    # "nothing staged" guard (inner pending is None) depends on one-shot consumption.
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,))
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+    cache.copy_missing()
+
+    assert cache._pending_src_layer is None
+    assert cache._pending_whole_layer is False
+    # a second call is an explicit "nothing staged", never a silent replay of layer 1
+    with pytest.raises(AssertionError, match="no staged misses"):
+        cache.copy_missing()
+
+
+def test_owner_cache_rebuild_keeps_the_geometry_in_step():
+    # Regression: __getattr__ forwarded rebuild() to the inner cache, whose implementation
+    # disables prefill_overlap when the new size cannot hold two complete local layers.
+    # The frozen geometry kept the old values, so materialize_layer() still took the
+    # overlap path and waited on buffers the inner cache no longer had.
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    _init_tp()
+    geometry = OwnerCacheGeometry(
+        global_num_experts=8, world_size=2, rank=0, num_layers=1,
+        cache_size=8, prefill_overlap=True,
+    )
+    owner = OwnerOffloadMoeCache(geometry, torch.device("cpu"))
+    owner.set_bank_sources(
+        {"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]}
+    )
+    assert owner.geometry.prefill_overlap is True
+
+    owner.rebuild(5)  # 5 < 2*local_num_experts (8) -> the inner cache drops overlap
+
+    assert owner._cache.prefill_overlap is False
+    assert owner.geometry.prefill_overlap is False, "geometry must follow the inner cache"
+    assert owner.geometry.cache_size == 5
+    assert owner._cache.cache_size == 5
+
+
+def test_owner_cache_rebuild_keeps_overlap_when_the_new_size_still_fits():
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    _init_tp()
+    geometry = OwnerCacheGeometry(
+        global_num_experts=8, world_size=2, rank=0, num_layers=1,
+        cache_size=8, prefill_overlap=True,
+    )
+    owner = OwnerOffloadMoeCache(geometry, torch.device("cpu"))
+    owner.set_bank_sources(
+        {"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]}
+    )
+
+    owner.rebuild(8)  # exactly 2*local_num_experts -> overlap survives
+
+    assert owner.geometry.prefill_overlap is True
+    assert owner.geometry.cache_size == 8
+
+
 def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     # The constructor caps nvfp4_marlin slots at 992; a runtime rebuild must enforce the
     # same upper cap (and the num_experts floor), else marlin decode kernels later break.

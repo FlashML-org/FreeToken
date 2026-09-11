@@ -228,8 +228,10 @@ def load_weight(
         # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
-        if tp_shard:
-            raise NotImplementedError("FTW checkpoints store post-shard weights; tp_shard is unsupported")
+        #
+        # ``tp_shard`` is a no-op on this path: the FTW dense shard is written POST-shard, so
+        # it is already rank-local. The engine asks for tp_shard on every TP>1 launch, so
+        # rejecting the combination here would break FTW checkpoints at TP>1.
         skip_vision = not vision_load_enabled()
         for name, tensor in iter_ftw_weights(model_path):
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
@@ -242,14 +244,16 @@ def load_weight(
     kwargs = dict(include_moe_experts=include_moe_experts, include_non_moe=True)
     parameters = inspect.signature(iter_weights).parameters
     if "tp_shard" in parameters:
+        # Readers that declare ``tp_shard`` slice the RAW checkpoint tensors themselves.
         kwargs["tp_shard"] = tp_shard
         if tp_config is not None and "config" in parameters:
             kwargs["config"] = tp_config
-    elif tp_shard:
-        raise NotImplementedError(
-            f"{spec.module}.iter_weights does not implement tp_shard; TP>1 loading is "
-            f"unsupported for this architecture"
-        )
+    # Readers that do NOT declare ``tp_shard`` already shard inside ``iter_weights`` (they call
+    # ``shard_tensor`` with ``tp_info.rank``/``tp_info.size``: llama, qwen2, qwen3, qwen3_moe,
+    # mistral, gpt_oss, minimax_m2), so TP>1 is handled and the flag must NOT be forwarded --
+    # forwarding it raised and turned a working TP>1 launch into a startup failure.
+    # Architectures that cannot shard at all still fail loudly in ``load_state_dict``'s shape
+    # check, exactly as they did before this flag existed.
     yield from iter_weights(model_path, device, **kwargs)
 
 

@@ -68,7 +68,14 @@ class RouteTraceRecorder:
         model: str = "",
         decode_target: str = "",
         max_records: int = 0,
+        rank: int | None = None,
     ) -> None:
+        # Every TP rank would otherwise open the SAME configured path, and ``wb`` truncates
+        # while the sidecar is rewritten too -- two writers racing on one body + one meta
+        # leaves a truncated trace holding a single rank's records. A rank suffix keeps them
+        # separate; ``None`` (single rank) leaves the configured path byte-for-byte.
+        if rank is not None:
+            path = f"{path}.rank{rank}"
         self.path = path
         self.meta_path = path + ".meta.json"
         self.max_records = max_records

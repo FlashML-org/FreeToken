@@ -144,7 +144,17 @@ def shard_qwen4_exp_dense_tensor(
     if key in {"model.embed_tokens.weight", "lm_head.weight"}:
         rows = div_ceil(tensor.shape[0], world_size)
         start = rank * rows
-        return tensor[start : min(start + rows, tensor.shape[0])].contiguous()
+        shard = tensor[start : min(start + rows, tensor.shape[0])]
+        if shard.shape[0] != rows:
+            # The vocabulary axis is padded, not truncated: VocabParallelEmbedding (and the
+            # row-parallel lm_head) always allocate ``div_ceil(vocab, tp)`` rows -- its
+            # ``finish_idx`` clamps the token-index range, not the allocation -- so when the
+            # vocabulary is not divisible by TP the final rank must still hand over a
+            # full-width shard or strict loading fails on shape. The padding rows are never
+            # reachable by a token id.
+            pad = shard.new_zeros((rows - shard.shape[0], *shard.shape[1:]))
+            shard = torch.cat((shard, pad), dim=0)
+        return shard.contiguous()
 
     if key.endswith(".self_attn.q_proj.weight"):
         return _shard_head_rows(

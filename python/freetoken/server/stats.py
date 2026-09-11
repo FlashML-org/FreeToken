@@ -194,9 +194,16 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    model_card = derive_model_card(config)
+    # ``model.ctx`` must be the limit the scheduler ENFORCES, not the checkpoint ceiling:
+    # ``launch._stats_context_length`` reads exactly this field as its fallback when sizing a
+    # client's context window, so leaving the raw ceiling here would still let a client send
+    # prompts the scheduler rejects whenever the KV pool is smaller than max_position. The
+    # raw ceiling stays available in ``limits.model_max_seq_len``.
+    model_card["ctx"] = effective_max_seq_len
     return {
         "instance_id": getattr(state, "instance_id", None),
-        "model": derive_model_card(config),
+        "model": model_card,
         "uptime_s": uptime_s,
         "kv": kv,
         "mamba": mamba,

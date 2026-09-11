@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator
 
 import torch
@@ -1104,8 +1104,18 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        whole_layer = self._pending_whole_layer
+        # Consume the staged state exactly ONCE. ``src_indices``/``evict_slots`` are shared
+        # buffers overwritten by the next layer's staging, so leaving ``_pending_src_layer``
+        # set makes it impossible for a caller to tell "nothing staged" from "staged two
+        # layers ago" -- and the owner wrapper's ``is None`` guard depends on that
+        # distinction. Clearing here (before the copies, which only need the captured locals
+        # plus the already-staged slot tensors) also means a mid-copy exception leaves the
+        # cache in a clean "nothing staged" state instead of a stale one.
+        self._pending_src_layer = None
+        self._pending_whole_layer = False
         if layer_id in self._unpinned_layers:
-            if not self._pending_whole_layer:
+            if not whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "
@@ -1181,6 +1191,10 @@ class OwnerOffloadMoeCache:
         if layout is None and quant_format not in _BANK_SCHEMAS:
             raise ValueError(f"unknown quant_format {quant_format!r}")
         self.geometry = geometry
+        # The owner adapter is GPU-only: it wraps the GPU slot cache and `_decode_owner` is
+        # selected before the `is_cpu_layer` branch, so a CPU/hybrid target could not be
+        # honoured. `_validate_owner_ep_config` rejects `--moe-cpu-layers` under owner EP
+        # rather than accepting a configuration this class would silently ignore.
         self._cache = OffloadMoeCache(
             num_layers=geometry.num_layers,
             num_experts=geometry.local_num_experts,
@@ -1507,6 +1521,23 @@ This variant never changes the shape.  Remote entries are remapped to a row that
                 return
         self._cache.copy_missing()
         self._pending_owned = False
+
+    def rebuild(self, cache_size: int) -> None:
+        """Resize the wrapped slot cache and keep the owner geometry in step.
+
+        ``__getattr__`` would otherwise forward ``rebuild`` to the inner cache, whose
+        implementation disables ``prefill_overlap`` when the new size cannot hold two complete
+        local layers. ``geometry`` is frozen and would keep the old ``cache_size`` /
+        ``prefill_overlap``, so ``materialize_layer`` would still take the overlap path and
+        later call ``wait_prefill_layer`` against an inner cache that has overlap disabled --
+        buffers that no longer exist. Re-derive the geometry from the inner cache instead.
+        """
+        self._cache.rebuild(cache_size)
+        self.geometry = replace(
+            self.geometry,
+            cache_size=self._cache.cache_size,
+            prefill_overlap=self._cache.prefill_overlap,
+        )
 
     def begin_prefill(self) -> None:
         """Start the borrowed-buffer lifecycle for an owner-local prefill."""
