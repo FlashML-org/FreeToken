@@ -347,13 +347,24 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
-    def _resolve_local_ref(self, schema: Dict, root_schema: Dict) -> Dict:
-        """Resolve local refs such as #/$defs/Foo."""
+    def _resolve_local_ref(self, schema: Dict, root_schema: Dict, _seen: Optional[set[str]] = None,) -> Dict:
+        """
+        Resolve local JSON Schema references.
+
+        Unresolvable or cyclic references are returned unresolved. Their values
+        therefore follow the parser's existing loose/untyped conversion behavior.
+        """
         if not isinstance(schema, dict):
             return schema
         ref = schema.get("$ref")
         if not isinstance(ref, str) or not ref.startswith("#/"):
             return schema
+        if _seen is None:
+            _seen = set()
+        if ref in _seen:
+            # Cyclic ref: stop resolution and preserve the unresolved schema.
+            return schema
+        _seen.add(ref)
         node = root_schema
         try:
             for part in ref[2:].split("/"):
@@ -366,7 +377,7 @@ class BaseFormatDetector(ABC):
         merged = dict(node)
         merged.update({k: v for k, v in schema.items() if k != "$ref"})
         if "$ref" in merged:
-            return self._resolve_local_ref(merged, root_schema)
+            return self._resolve_local_ref(merged, root_schema, _seen)
         return merged
 
     def _normalize_param_schema(self, schema: Dict, root_schema: Dict) -> Dict:
