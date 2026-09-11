@@ -421,22 +421,27 @@ class BaseFormatDetector(ABC):
         result["type"] = "loose"
         return result
 
-    def _get_param_config(self, func_name: str, tools: List[Tool]) -> Dict:
-        """Extract and normalize parameter properties for one tool."""
+    def _get_tool_schema(self, func_name: str, tools: List[Tool]) -> Dict:
+        """Return the root JSON schema for one tool."""
         for tool in tools:
             if tool.function.name != func_name or not tool.function.parameters:
                 continue
             params = tool.function.parameters
-            if not isinstance(params, dict):
-                return {}
-            properties = params.get("properties")
-            if not isinstance(properties, dict):
-                return params
-            return {
-                name: self._normalize_param_schema(prop, params)
-                for name, prop in properties.items()
-            }
+            return params if isinstance(params, dict) else {}
         return {}
+
+    def _get_param_config(self, func_name: str, tools: List[Tool]) -> Dict:
+        """Extract and normalize parameter properties for one tool."""
+        params = self._get_tool_schema(func_name, tools)
+        if not params:
+            return {}
+        properties = params.get("properties")
+        if not isinstance(properties, dict):
+            return params
+        return {
+            name: self._normalize_param_schema(prop, params)
+            for name, prop in properties.items()
+        }
 
     def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
@@ -2673,18 +2678,23 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     return v
         return raw
 
-    def _nested_value(self, raw: str, schema: Any = None) -> Any:
+    def _nested_value(self, raw: str, schema: Any = None, root_schema: Any = None) -> Any:
+        if isinstance(schema, dict) and isinstance(root_schema, dict):
+            schema = self._normalize_param_schema(schema, root_schema)
         items, stray = self._scan_elements(raw)
         if not items:
             return self._typed_leaf(raw, schema)
-        return self._structure(items, schema, stray=stray)
+        return self._structure(items, schema, root_schema=root_schema, stray=stray)
 
-    def _structure(self, items: List[tuple], schema: Any = None, stray: str = "") -> Any:
+    def _structure(self, items: List[tuple], schema: Any = None, root_schema: Any = None, stray: str = "") -> Any:
         """Composite value from scanned elements, threading the JSON schema down
         (``properties`` / ``items`` / ``additionalProperties``). Only ``<item>``
         children render as a bare array -- the template's array convention;
         repeated siblings under any other tag stay an object with an array-valued
         key. Mixed text+children keeps the text under ``"$text"``."""
+        if isinstance(schema, dict) and isinstance(root_schema, dict):
+            schema = self._normalize_param_schema(schema, root_schema)
+        
         props = schema.get("properties") if isinstance(schema, dict) else None
         item_schema = schema.get("items") if isinstance(schema, dict) else None
 
@@ -2694,11 +2704,13 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 ap = schema.get("additionalProperties")
                 if isinstance(ap, dict):
                     sub = ap
+            if isinstance(sub, dict) and isinstance(root_schema, dict):
+                sub = self._normalize_param_schema(sub, root_schema)
             return sub
 
         names = {k for k, _ in items}
         if names == {"item"}:
-            return [self._nested_value(raw, item_schema) for _, raw in items]
+            return [self._nested_value(raw, item_schema, root_schema=root_schema) for _, raw in items]
         counts: Dict[str, int] = {}
         for k, _ in items:
             counts[k] = counts.get(k, 0) + 1
@@ -2714,7 +2726,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 and str(sub.get("type", "")).lower() == "array"
             ):
                 sub = sub.get("items")
-            value = self._nested_value(raw, sub)
+            value = self._nested_value(raw, sub, root_schema=root_schema)
             if key in out:
                 prev = out[key]
                 out[key] = (prev if isinstance(prev, list) else [prev]) + [value]
@@ -2725,16 +2737,19 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return out
 
     def _args_from_items(
-        self, func_name: str, items: List[tuple], tools: List[Tool]
+        self, func_name: str, items: List[tuple], tools: List[Tool],
     ) -> Dict:
+        root_schema = self._get_tool_schema(func_name, tools)
         config = self._get_param_config(func_name, tools)
         args: Dict[str, Any] = {}
         for key, raw in items:
             prop = config.get(key) if isinstance(config, dict) and key in config else None
             nested, stray = self._scan_elements(raw)
             if nested:
-                value: Any = self._structure(nested, prop, stray=stray)
+                value: Any = self._structure(nested, prop, root_schema=root_schema, stray=stray)
             else:
+                if isinstance(prop, dict) and isinstance(root_schema, dict):
+                    prop = self._normalize_param_schema(prop, root_schema)
                 value = self._typed_leaf(raw, prop)
             if key in args:
                 prev = args[key]
