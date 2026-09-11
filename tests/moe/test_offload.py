@@ -412,12 +412,17 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
-def test_adjust_config_converts_moe_cache_rate_to_cache_size():
+def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     from types import SimpleNamespace
 
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
+
+    # This test exercises the discrete-GPU offload path regardless of the host
+    # running the suite (GB10 reports cudaDevAttrIntegrated=1).
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
 
     config = EngineConfig(
         model_path="/tmp/freetoken-test-model",
