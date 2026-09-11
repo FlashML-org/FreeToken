@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..linear import LinearConfig
@@ -36,8 +37,18 @@ def quantization_config_of(hf_config: Any) -> dict[str, Any] | None:
     return dict(vars(q))
 
 
+@dataclass(frozen=True)
+class Stored:
+    """One checkpoint tensor behind a role: its suffix, and whether it holds the quant-side scale whose reciprocal the layer wants."""
+
+    name: str
+    reciprocal: bool = False
+
+
 class QuantConfig(ABC):
     dialect: ClassVar[str]
+    # per kind the dialect exports, role -> the checkpoint tensor suffix (or Stored) that feeds it
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]]
 
     def __init__(self, name_map: NameMap | None = None, unquantized: tuple[str, ...] = ()):
         self.name_map = name_map or NameMap()
@@ -64,6 +75,14 @@ class QuantConfig(ABC):
         scheme = schemes.pop()
         self._schemes[prefix] = scheme
         return scheme
+
+    def stored_tensors(self, kind: QuantKind) -> dict[str, Stored]:
+        """role -> checkpoint tensor for every role the dialect stores for ``kind``."""
+        return {role: entry if isinstance(entry, Stored) else Stored(entry) for role, entry in self.STORAGE[kind].items()}
+
+    def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
+        """role -> checkpoint tensor for one scheme's tensors."""
+        return {role: entry for role, entry in self.stored_tensors(scheme.kind).items() if scheme.has(role)}
 
     def get_quant_method(self, layer: Any, prefix: str):
         scheme = self.scheme_for(prefix)
@@ -101,6 +120,7 @@ class NoQuantConfig(QuantConfig):
     """No ``quantization_config``: every module is bf16."""
 
     dialect = "none"
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {}
 
     @classmethod
     def claims(cls, q: dict[str, Any]) -> bool:

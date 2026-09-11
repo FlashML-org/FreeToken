@@ -377,7 +377,9 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     dp = "model.layers.0.mlp.down_proj"
     assert loaded[dp + ".weight"].shape == (H, I // 2)  # cross-shard scales resolved
     assert loaded[dp + ".weight_global"][0].item() == pytest.approx(0.25)
-    # activation scales are never emitted
+    # the quant-side activation global lands as the dequant-side input_scale the layer declares
+    assert loaded[dp + ".input_scale"].item() == pytest.approx(1.0)
+    assert loaded[qkvg + ".input_scale"].shape == ()
     assert not any(k.endswith(".input_global_scale") for k in loaded)
 
 

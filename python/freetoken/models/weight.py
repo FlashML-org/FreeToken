@@ -87,22 +87,11 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
+    from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)
-    index = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index) as f:
-            weight_map = json.load(f)["weight_map"]
-    else:  # single-file / no-index checkpoint: map name -> shard from each shard's header
-        weight_map = {}
-        for shard in sorted(os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))):
-            with open(os.path.join(model_path, shard), "rb") as fh:
-                n = struct.unpack("<Q", fh.read(8))[0]
-                hdr = json.loads(fh.read(n))
-            for nm in hdr:
-                if nm != "__metadata__":
-                    weight_map[nm] = shard
+    weight_map = safetensors_weight_map(model_path)
     shards: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         if is_expert(name):

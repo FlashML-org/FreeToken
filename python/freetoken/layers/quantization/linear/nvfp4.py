@@ -120,4 +120,5 @@ class Nvfp4LinearMethod(LinearMethod):
         layer.weight = torch.empty(g.out_features, g.in_features // 2, dtype=torch.uint8)
         layer.weight_scale = torch.empty(g.out_features, g.in_features // GROUP, dtype=FP8)
         layer.weight_global = torch.empty(g.out_features, dtype=torch.float16)
-        # input_scale stays undeclared: the W4A16 kernels never read it and today's readers drop it
+        # no W4A16 kernel reads it; declared so a W4A4 checkpoint loads complete and a W4A4 kernel finds it in place
+        layer.input_scale = torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None

@@ -204,6 +204,42 @@ CASES = [
         "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{full}.self_attn.o_proj": FP8T,
         "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": NVFP4,
     }, strategy="auto"),
+    # llm-compressor exports of the dense 27B: every Linear NVFP4, GDN in_proj included (sakamakismile); channel-fp8 attention / GDN / lm_head over NVFP4 MLPs (unsloth)
+    Case("sakamakismile/Qwen3.6-27B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": NVFP4, "model.layers.{lin}.linear_attn.in_proj_ba": NVFP4,
+        "model.layers.{lin}.linear_attn.out_proj": NVFP4, "model.layers.{full}.self_attn.qkv_proj": NVFP4,
+        "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": BF16,
+    }, strategy="auto", check=_qwen35_fp8),
+    Case("unsloth/Qwen3.8-27B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{lin}.linear_attn.out_proj": FP8T, "model.layers.{full}.self_attn.o_proj": FP8T,
+        "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": FP8T,
+    }, strategy="auto", check=_qwen35_fp8),
+    # llm-compressor exports of the 35B MoE: NVFP4 everywhere but the GDN and the routers (RedHatAI); channel-fp8 attention / GDN / lm_head with NVFP4 experts and shared expert (unsloth)
+    Case("RedHatAI/Qwen3.6-35B-A3B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj": BF16, "model.layers.{lin}.linear_attn.out_proj": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": NVFP4, "model.layers.{full}.self_attn.o_proj": NVFP4,
+        "model.layers.{lin}.mlp.shared_expert.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_no_split),
+    # static per-tensor fp8 attention / GDN / shared expert with NVFP4 experts; the ignore list names every ``experts.N`` container
+    Case("primitive-ai/Ornith-1.5-35B-A3B-mixed-NVFP4-FP8", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": FP8T, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": FP8T,
+        "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_qwen35_fp8),
+    # block-fp8 attention / GDN / shared expert with NVFP4 experts, shipped as one model.safetensors without an index
+    Case("kyaky/Qwen3.6-35B-A3B-Uncensored-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8B, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": FP8B, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": FP8B,
+        "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_qwen35_fp8),
+    Case("unsloth/Qwen3.6-35B-A3B-NVFP4-Fast", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{lin}.linear_attn.out_proj": FP8T, "model.layers.{full}.self_attn.qkv_proj": FP8T,
+        "model.layers.{lin}.mlp.shared_expert.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{lin}.mlp.gate": BF16, "lm_head": FP8T,
+    }, check=_qwen35_fp8),
     Case("Qwen3.6-27B", NoQuantConfig, {
         "model.layers.{lin}.linear_attn.in_proj": BF16, "model.layers.{lin}.mlp.gate_up_proj": BF16, "lm_head": BF16,
     }, strategy="auto", check=_no_split),
@@ -373,6 +409,37 @@ def test_hub_ids_fetch_the_modelopt_sidecar(tmp_path, monkeypatch):
     assert type(quant) is ModelOptConfig
     assert quant.scheme_for("model.layers.0.self_attn.q_proj").kind is QuantKind.FP8_TENSOR
     assert quant.scheme_for("lm_head") is None
+
+
+def test_compressed_tensors_ignore_names_the_module_alone():
+    """llm-compressor lists every skipped module, containers included: an ignored ``linear_attn`` must not shield the quantized projections under it (unsloth/Qwen3.6-35B-A3B-NVFP4-Fast)."""
+    q = {
+        "quant_method": "compressed-tensors", "format": "mixed-precision",
+        "config_groups": {"group_0": {
+            "targets": [r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}, "input_activations": {"dynamic": True},
+        }},
+        "ignore": ["model.language_model.layers.0.linear_attn", "model.language_model.layers.0.linear_attn.in_proj_b"],
+    }
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_qkv").kind is QuantKind.FP8_TENSOR
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_b") is None
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn") is None
+
+
+def test_every_dialect_names_the_tensors_behind_its_schemes():
+    from freetoken.layers.quantization.registry import dialects
+
+    for cls in dialects():
+        for scheme in getattr(cls, "SCHEMES", {}).values():
+            assert set(cls.STORAGE[scheme.kind]) >= scheme.roles, f"{cls.__name__} does not name every tensor of {scheme}"
+
+
+def test_compressed_tensors_target_classes_other_than_linear_fail_closed():
+    q = {"quant_method": "compressed-tensors", "config_groups": {"group_0": {
+        "targets": ["Embedding"], "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}, "input_activations": {"dynamic": True}}}}
+    with pytest.raises(NotImplementedError, match="Embedding"):
+        QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
 
 
 def test_unsupported_dialects_fail_closed(tmp_path):

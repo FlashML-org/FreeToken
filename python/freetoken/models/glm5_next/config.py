@@ -48,6 +48,34 @@ def _dsa_on(args, dsa_layer_ids) -> bool:
     )
 
 
+def _quant_accessor(hf_config: Any):
+    """A ``get(key, default=None)`` accessor over the HF ``quantization_config`` (dict or
+    object), or ``None`` when the model has no quant config."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return None
+    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+
+
+def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
+    """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
+
+    Returns ``("fp8_block", (block_n, block_k))`` for a block-fp8 checkpoint (weights
+    fp8-e4m3 + per-block ``weight_scale_inv``, dynamic activation), else ``("none", None)``.
+    The quantization_config sits on the top-level hf_config (not ``text_config``).
+    """
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return "none", None
+    method = str(get("quant_method") or get("quant_algo") or "").lower()
+    block = get("weight_block_size")
+    if method == "fp8" and block:
+        bs = tuple(int(x) for x in block)
+        assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
+        return "fp8_block", bs
+    return "none", None
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     args = load_args(hf_config)
     text = getattr(hf_config, "text_config", hf_config)
@@ -127,8 +155,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
     assert all(t == "dense" for t in mlp_types[:first_dense]) and all(
         t == "sparse" for t in mlp_types[first_dense:]
     ), f"mlp_layer_types is not a dense-prefix layout: {mlp_types}"
-
-    from freetoken.models.qwen3_5_moe.config import _fp8_block_quant  # shared until the legacy quant fields go
 
     expert_quant, weight_block_size = _fp8_block_quant(hf_config)
     if expert_quant == "none":
