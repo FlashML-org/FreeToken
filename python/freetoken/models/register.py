@@ -39,6 +39,8 @@ _QWEN3_5_PACKED = _DENSE_PACKED + (
     ("in_proj_ba", ("in_proj_b", "in_proj_a")),
     ("in_proj", ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")),
 ) + _EXPERTS_PACKED
+# routers the family builds without a quant config (qwen3_5_moe/moe.py), so a checkpoint that quantized them is dequantized at load
+_QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 # Qwen3.8's per-layer hyper-connections fuse the down projection with the block-inject rows.
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
@@ -114,6 +116,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoEForCausalLM",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. 36 GDN + 12 QSA
@@ -133,6 +136,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoEForCausalLM",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA

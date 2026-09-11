@@ -4,9 +4,9 @@ from typing import Any, ClassVar
 
 from ..names import Matcher, ct_set
 from ..registry import register_dialect
-from ..scheme import QuantScheme
+from ..scheme import QuantKind, QuantScheme
 from ..scheme import fp8_block_scheme, fp8_tensor_scheme, nvfp4_scheme
-from .base import QuantConfig
+from .base import QuantConfig, Stored
 
 
 @register_dialect
@@ -22,6 +22,15 @@ class CompressedTensorsConfig(QuantConfig):
         "FP8_TENSOR_DYNAMIC": fp8_tensor_scheme("bf16"),
         "FP8_CHANNEL": fp8_tensor_scheme("bf16", per_row=True),
         "FP8_BLOCK": fp8_block_scheme("float"),
+    }
+    # the NVFP4 globals are the quant-side scales (vLLM: alpha = 1 / (input_global_scale * weight_global_scale))
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
+        QuantKind.NVFP4: {
+            "weight": "weight_packed", "weight_scale": "weight_scale",
+            "weight_global": Stored("weight_global_scale", reciprocal=True), "input_scale": Stored("input_global_scale", reciprocal=True),
+        },
+        QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"},
+        QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale"},
     }
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):

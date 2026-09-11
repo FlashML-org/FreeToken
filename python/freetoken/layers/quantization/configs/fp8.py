@@ -4,9 +4,9 @@ from typing import Any, ClassVar
 
 from ..names import is_routed_expert, name_set, substr_set
 from ..registry import register_dialect
-from ..scheme import QuantScheme
+from ..scheme import QuantKind, QuantScheme
 from ..scheme import FP8_BLOCK, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
-from .base import QuantConfig, cfg_get
+from .base import QuantConfig, Stored, cfg_get
 
 
 @register_dialect
@@ -22,6 +22,12 @@ class Fp8BlockConfig(QuantConfig):
         "TABLE": fp8_tensor_scheme("float"),
         "EXPERT_MXFP4": mxfp4_scheme(),
     }
+    # transformers' fp8 names; DeepSeek-V4's e8m0 export calls every scale ``scale`` (see storage)
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
+        QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
+        QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale"},
+        QuantKind.MXFP4: {"weight": "weight", "weight_scale": "scale"},
+    }
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)
@@ -35,6 +41,12 @@ class Fp8BlockConfig(QuantConfig):
         self.convert_tables = name_set(tuple(q.get("modules_to_convert") or ()))
         self.e8m0 = str(q.get("scale_fmt") or "").lower() == "ue8m0"
         self.expert_fp4 = str(cfg_get(hf_config, "expert_dtype") or "").lower() == "fp4"
+
+    def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
+        names = super().storage(scheme)
+        if self.e8m0 and scheme.kind is QuantKind.FP8_BLOCK:
+            names["weight_scale_inv"] = Stored("scale")
+        return names
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         if self.convert_tables(name):

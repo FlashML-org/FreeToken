@@ -4,9 +4,9 @@ from typing import Any, ClassVar
 
 from ..names import ancestors, name_set
 from ..registry import register_dialect
-from ..scheme import QuantScheme
+from ..scheme import QuantKind, QuantScheme
 from ..scheme import fp8_block_scheme, fp8_tensor_scheme, mxfp8_scheme, nvfp4_scheme
-from .base import QuantConfig
+from .base import QuantConfig, Stored
 
 
 @register_dialect
@@ -23,6 +23,12 @@ class ModelOptConfig(QuantConfig):
         "FP8_PER_CHANNEL_PER_TOKEN": fp8_tensor_scheme("fp32", per_row=True),
         "FP8_PB_WO": fp8_block_scheme("fp32"),
         "MXFP8": mxfp8_scheme(),
+    }
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
+        QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"},
+        QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
+        QuantKind.MXFP8: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
+        QuantKind.NVFP4: {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2", "input_scale": "input_scale"},
     }
 
     @classmethod
