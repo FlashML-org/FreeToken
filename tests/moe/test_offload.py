@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -876,3 +877,652 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def _owner_nvfp4_banks(num_layers, local_experts, out, inner, base):
+    """Owner-local nvfp4 banks; row `e` of layer `l` carries fingerprint base+l*E+e."""
+
+    def bank(o, i, dtype):
+        layers = []
+        for l in range(num_layers):
+            t = torch.zeros(local_experts, o, i, dtype=dtype)
+            for e in range(local_experts):
+                t[e].view(torch.uint8).fill_(base + l * local_experts + e)
+            layers.append(t)
+        return layers
+
+    def pinned(layers):
+        return [t.pin_memory() for t in layers]
+
+    return {
+        "gate_up_packed": pinned(bank(out, inner // 2, torch.uint8)),
+        "gate_up_scale": pinned(bank(out, inner // 16, torch.float8_e4m3fn)),
+        "gate_up_global": pinned(
+            [t.squeeze(-1).contiguous() for t in bank(out, 1, torch.float16)]
+        ),
+        "down_packed": pinned(bank(out, inner // 2, torch.uint8)),
+        "down_scale": pinned(bank(out, inner // 16, torch.float8_e4m3fn)),
+        "down_global": pinned(
+            [t.squeeze(-1).contiguous() for t in bank(out, 1, torch.float16)]
+        ),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_offload_cache_cuda_route_copies_local_rows_through_real_kernels():
+    """P3 namespace smoke on real GPU kernels: global route -> owner-local bank row ->
+    legacy slot cache. Remote entries must never read a bank row, and a cache hit must
+    not re-copy. No model is loaded; the banks are synthetic."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 4
+    OUT, IN = 64, 512  # rows >= 128B so the fast_index_copy JIT has a kernel
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+    cache = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4")
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+
+    def fingerprint(slot):
+        packed = cache.bank_caches["gate_up_packed"]
+        return int(packed[slot].view(torch.uint8).flatten()[0].item())
+
+    # rank 1 owns global [4, 8) -> local rows [0, 4).
+    ids = torch.tensor([[0, 4, 7, 5, 4]], dtype=torch.int32, device=dev)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.15, 0.25]], device=dev)
+    update = cache.ensure_route(0, weights, ids)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+
+    assert update.owned_mask.tolist() == [[False, True, True, True, True]]
+    assert update.local_ids.tolist() == [[0, 0, 3, 1, 0]]
+    # remote (global 0) stays a safe placeholder: slot 0, zero weight, never read.
+    assert int(update.slot_ids[0, 0].item()) == 0
+    assert float(update.weights[0, 0].item()) == 0.0
+    # flashlib emits the miss set in ascending local-row order (the CPU reference
+    # adapter emits route order) -- only the SET is part of the contract.
+    assert sorted(update.missing_local_ids.tolist()) == [0, 1, 3]
+
+    # each owned position's slot holds ITS OWN local row's bytes (layer 0 -> base 100).
+    owned_local = update.local_ids[update.owned_mask].tolist()
+    owned_slots = update.slot_ids[update.owned_mask].tolist()
+    assert [fingerprint(s) for s in owned_slots] == [100 + e for e in owned_local]
+    cache.validate_invariants()
+
+    # A repeated route is a pure hit: no miss, no eviction, identical bytes.
+    again = cache.ensure_route(0, weights, ids)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    assert again.missing_local_ids.numel() == 0
+    assert again.evicted_flat_ids.numel() == 0
+    assert again.slot_ids.tolist() == update.slot_ids.tolist()
+    assert [fingerprint(s) for s in owned_slots] == [100 + e for e in owned_local]
+
+    # The pool is unified: layer 1 must evict layer-0 entries and serve layer-1 bytes
+    # (base 100 + 4) without ever mixing the two layers' rows.
+    ids1 = torch.tensor([[4, 6]], dtype=torch.int32, device=dev)
+    update1 = cache.ensure_route(1, torch.ones(1, 2, device=dev), ids1)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    slots1 = update1.slot_ids.reshape(-1).tolist()
+    assert [fingerprint(s) for s in slots1] == [104 + e for e in [0, 2]]
+    assert int(update1.evicted_flat_ids.numel()) > 0  # S=6 < 2 layers * 4 local rows
+    cache.validate_invariants()
+
+    # Remote-only route: no admission, no copy, all placeholders.
+    remote_only = cache.ensure_route(
+        1, torch.full((1, 2), 0.5, device=dev),
+        torch.tensor([[0, 1]], dtype=torch.int32, device=dev),
+    )
+    assert remote_only.missing_local_ids.numel() == 0
+    assert remote_only.slot_ids.tolist() == [[0, 0]]
+    assert remote_only.weights.tolist() == [[0.0, 0.0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_route_graph_admission_matches_eager_slots_and_zeroes_remote():
+    """The graph-safe admission must place every OWNED route entry on the same local row as
+    the eager compacting path, keep remote entries at zero weight, and keep the route shape
+    statically known (that is what makes it capturable).  Remote entries point at the
+    sentinel row instead of being dropped, so they must be resident and finite -- the zero
+    weighting must never rely on ``0 * NaN``."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 8
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+
+    def build(graph_safe):
+        c = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4", graph_safe=graph_safe)
+        c.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+        c.reset()
+        return c
+
+    def fingerprint(cache, slot):
+        packed = cache.bank_caches["gate_up_packed"]
+        return int(packed[slot].view(torch.uint8).flatten()[0].item())
+
+    # rank 1 owns global [4, 8) -> local rows [0, 4); global 0/1 are remote.
+    # Route chosen so the FIRST owned position is local row 3, not row 0: that makes the
+    # remote fallback distinguishable from a fixed row-zero sentinel.
+    ids = torch.tensor([[0, 7, 5, 6, 4]], dtype=torch.int32, device=dev)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.15, 0.25]], device=dev)
+
+    eager = build(graph_safe=False)
+    up_eager = eager.ensure_route(0, weights, ids)
+    eager.copy_missing()
+    torch.cuda.synchronize()
+
+    graph = build(graph_safe=True)
+    assert graph.graph_safe is True
+    up_graph = graph.ensure_route_graph(0, weights, ids)
+    graph.copy_missing()
+    torch.cuda.synchronize()
+
+    # Weights agree exactly: remote positions are zero in both paths.
+    assert up_graph.weights.tolist() == up_eager.weights.tolist()
+    assert up_graph.weights[0, 0].item() == 0.0
+    assert up_graph.owned_mask.tolist() == up_eager.owned_mask.tolist()
+
+    # Shape/dtype are static, and the diagnostics contract is "empty, never a host read".
+    assert up_graph.slot_ids.shape == ids.shape
+    assert up_graph.slot_ids.dtype == torch.int32
+    assert up_graph.missing_local_ids.numel() == 0
+    assert up_graph.evicted_flat_ids.numel() == 0
+
+    # The remote entry borrows the first owned row (row 3), NOT a fixed row-zero sentinel.
+    local_row = up_graph.local_ids[0].tolist()
+    assert local_row == [3, 3, 1, 2, 0]
+    owned = up_graph.owned_mask[0].tolist()
+    slots = up_graph.slot_ids[0].tolist()
+    # The two admission paths must place every owned entry in the same slot: sharing the row
+    # set is what keeps the graph path from changing cache behaviour (extra misses).
+    assert [s for s, o in zip(slots, owned) if o] == [
+        s for s, o in zip(up_eager.slot_ids[0].tolist(), owned) if o
+    ]
+    # Every owned position carries ITS OWN row's bytes; the remote position carries row 3's.
+    assert [fingerprint(graph, s) for s, o in zip(slots, owned) if o] == [
+        100 + r for r, o in zip(local_row, owned) if o
+    ]
+    assert fingerprint(graph, slots[0]) == 103
+    assert torch.isfinite(graph.bank_caches["gate_up_packed"][slots[0]].float()).all()
+    graph.validate_invariants()
+
+    # All-remote route (no owned row to borrow) falls back to row zero and contributes
+    # nothing -- the only case that admits an extra row.
+    only_remote = graph.ensure_route_graph(
+        1, torch.full((1, 2), 0.5, device=dev),
+        torch.tensor([[0, 1]], dtype=torch.int32, device=dev),
+    )
+    graph.copy_missing()
+    torch.cuda.synchronize()
+    assert only_remote.weights.tolist() == [[0.0, 0.0]]
+    assert set(only_remote.local_ids[0].tolist()) == {0}
+    assert fingerprint(graph, only_remote.slot_ids[0, 0].item()) == 104  # layer 1, row 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_route_graph_admission_is_capturable_and_replays():
+    """The point of the graph-safe path: capture admission + copy into a real CUDA graph and
+    replay it.  The eager path's ``nonzero``/``num_indices.item()`` make this fail, which is
+    why owner EP used to be restricted to ``--cuda-graph-max-bs 0``."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 8
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+    cache = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4", graph_safe=True)
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+
+    ids = torch.tensor([[0, 4, 7, 5, 4]], dtype=torch.int32, device=dev)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.15, 0.25]], device=dev)
+
+    def step(ids_buf, weights_buf):
+        update = cache.ensure_route_graph(0, weights_buf, ids_buf)
+        cache.copy_missing()
+        return update
+
+    # Warm the kernels on a side stream so capture starts from a steady state.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            step(ids.clone(), weights.clone())
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    ids_buf = ids.clone()
+    weights_buf = weights.clone()
+    with torch.cuda.graph(graph):
+        captured = step(ids_buf, weights_buf)
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    packed = cache.bank_caches["gate_up_packed"]
+    slots = captured.slot_ids[0].tolist()
+    rows = captured.local_ids[0].tolist()
+    owned = captured.owned_mask[0].tolist()
+    assert captured.weights[0, 0].item() == 0.0
+    assert [int(packed[s].view(torch.uint8).flatten()[0].item())
+            for s, o in zip(slots, owned) if o] == [
+        100 + r for r, o in zip(rows, owned) if o
+    ]
+    cache.validate_invariants()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_prefill_materialize_copies_local_rows_and_does_not_leak_layers():
+    """Owner prefill must move bytes, not just remap slots: materialize layer 0, check
+    every local row's fingerprint, then materialize layer 1 and prove no layer-0 bytes
+    remain in the materialized view."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 4
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+    cache = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4")
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+
+    def fingerprint(slot):
+        packed = cache.bank_caches["gate_up_packed"]
+        return int(packed[slot].view(torch.uint8).flatten()[0].item())
+
+    cache.materialize_layer(0)
+    torch.cuda.synchronize()
+    assert [fingerprint(s) for s in range(E_LOCAL)] == [100 + e for e in range(E_LOCAL)]
+
+    cache.materialize_layer(1)
+    torch.cuda.synchronize()
+    assert [fingerprint(s) for s in range(E_LOCAL)] == [104 + e for e in range(E_LOCAL)]
+    cache.validate_invariants()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_prefill_overlap_keeps_two_layers_resident_at_once():
+    """Owner prefill overlap must stream layer L+1 while layer L computes.  The tell is
+    that the two borrowed buffers hold DIFFERENT layers SIMULTANEOUSLY after
+    ``prefetch(0) -> prefetch(1)`` and before any release -- a choreography that only
+    prefetched the current layer would leave buffer 1 untouched here."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL = 2, 8, 4
+    S = 2 * E_LOCAL  # the overlap floor: two full local layers
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L,
+        cache_size=S, prefill_overlap=True,
+    )
+    cache = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4")
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+    assert cache.geometry.prefill_overlap is True
+    assert cache.prefill_overlap is True  # forwarded to the wrapped cache
+
+    def fingerprint(buf, row):
+        return int(buf[row].view(torch.uint8).flatten()[0].item())
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)  # -> buffer 0
+    cache.prefetch_prefill_layer(1)  # -> buffer 1, issued while layer 0 will compute
+    torch.cuda.synchronize()
+
+    buffers = cache.prefill_bank_buffers[0]  # bank 0, [2, E_LOCAL, ...]
+    assert [fingerprint(buffers[0], r) for r in range(E_LOCAL)] == [
+        100 + r for r in range(E_LOCAL)
+    ]
+    # Layer 1 is already staged in the OTHER buffer: that is the overlap.
+    assert [fingerprint(buffers[1], r) for r in range(E_LOCAL)] == [
+        104 + r for r in range(E_LOCAL)
+    ]
+
+    # The hand-off the layer performs: wait(cur) returns cur's buffer, release frees it.
+    views0 = cache.wait_prefill_layer(0)
+    assert [fingerprint(views0[0], r) for r in range(E_LOCAL)] == [
+        100 + r for r in range(E_LOCAL)
+    ]
+    cache.release_prefill_layer(0)
+    views1 = cache.wait_prefill_layer(1)
+    assert [fingerprint(views1[0], r) for r in range(E_LOCAL)] == [
+        104 + r for r in range(E_LOCAL)
+    ]
+    cache.release_prefill_layer(1)
+
+    # A second prefill over the same buffers must not leak the previous layer's bytes.
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(1)
+    torch.cuda.synchronize()
+    assert [fingerprint(cache.prefill_bank_buffers[0][1], r) for r in range(E_LOCAL)] == [
+        104 + r for r in range(E_LOCAL)
+    ]
+    cache.validate_invariants()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "route_ids",
+    [
+        [0, 1, 2, 3, 4, 5, 6, 7, 0, 7],  # 5-5 split across the two owners
+        [0] * 10,  # rank 0 owns every entry
+        [4] * 10,  # rank 1 owns every entry
+    ],
+)
+def test_owner_prefill_gemm_partials_sum_to_tp1(route_ids):
+    """Two owner-local prefill GEMMs must sum to the TP1 GEMM for the same route.
+
+    Each rank materializes its own local layer, remaps the global route to local rows
+    with remote entries zero-weighted, and runs the real Triton NVFP4 prefill kernel.
+    The TP1 reference runs the same kernel over the full 8-expert layer."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache, OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL = 1, 8, 4
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    hidden = torch.randn(1, OUT, dtype=torch.bfloat16, device=dev) / 4
+    weights = torch.arange(1, 11, dtype=torch.float32, device=dev).reshape(1, 10) / 55
+    ids = torch.tensor([route_ids], dtype=torch.int32, device=dev)
+
+    def random_sources(num_experts, seed):
+        g = torch.Generator().manual_seed(seed)
+        total = L * num_experts
+
+        def rand_u8(*shape):
+            return torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
+
+        def rand_scale(*shape):
+            return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+
+        flat = {
+            "gate_up_packed": rand_u8(total, 2 * IN, OUT // 2),
+            "gate_up_scale": rand_scale(total, 2 * IN, OUT // 16),
+            "gate_up_global": torch.full((total, 2 * IN), 1.0, dtype=torch.float16),
+            "down_packed": rand_u8(total, OUT, IN // 2),
+            "down_scale": rand_scale(total, OUT, IN // 16),
+            "down_global": torch.full((total, OUT), 0.75, dtype=torch.float16),
+        }
+        return {name: list(t.pin_memory().split(num_experts)) for name, t in flat.items()}
+
+    full_sources = random_sources(E_GLOBAL, seed=7)
+    tp1 = OffloadMoeCache(
+        num_layers=L, num_experts=E_GLOBAL, cache_size=E_GLOBAL, device=dev,
+        quant_format="nvfp4",
+    )
+    tp1.set_bank_sources(full_sources)
+    tp1.reset()
+    tp1.materialize_layer(0)
+    tp1.copy_missing()
+    want = fused_experts_nvfp4(
+        hidden, *tp1.bank_views(E_GLOBAL), weights, ids, E_GLOBAL, "silu", False,
+    )
+
+    partials = []
+    for rank in range(2):
+        geometry = OwnerCacheGeometry(
+            global_num_experts=E_GLOBAL, world_size=2, rank=rank, num_layers=L,
+            cache_size=E_LOCAL,
+        )
+        owner = OwnerOffloadMoeCache(geometry, dev, quant_format="nvfp4")
+        local_sources = {
+            name: [
+                full_sources[name][0][rank * E_LOCAL:(rank + 1) * E_LOCAL]
+                .clone()
+                .pin_memory()
+            ]
+            for name in full_sources
+        }
+        owner.set_bank_sources(local_sources)
+        owner.reset()
+        owner.materialize_layer(0)
+        torch.cuda.synchronize()
+        local_ids, owned = geometry.global_to_local(ids)
+        safe_ids = torch.where(owned, local_ids, torch.zeros_like(local_ids)).contiguous()
+        safe_weights = torch.where(
+            owned, weights, torch.zeros_like(weights)
+        ).contiguous()
+        partials.append(
+            fused_experts_nvfp4(
+                hidden, *owner.bank_views(E_LOCAL), safe_weights, safe_ids, E_LOCAL,
+                "silu", False,
+            )
+        )
+    got = (partials[0] + partials[1]).float()
+    ref = want.float()
+    tol = 0.03 * float(ref.abs().max())
+    torch.testing.assert_close(got, ref, rtol=3e-2, atol=max(tol, 3e-2))
+
+
+class _RecordingMoEMethod:
+    """Stand-in for the layer's MoE quant method: records what ``_expert_gemm`` hands the
+    kernel (bank views + routing ids) and returns the hidden states unchanged."""
+
+    def __init__(self):
+        self.calls = []
+
+    def apply(self, hidden_states, topk_weights, topk_ids, view, *, layer, is_prefill):
+        self.calls.append(
+            SimpleNamespace(
+                weights=topk_weights,
+                ids=topk_ids,
+                views=view.tensors,
+                n=view.n,
+                is_prefill=is_prefill,
+            )
+        )
+        return hidden_states
+
+
+def _make_owner_layer(quant_format="bf16", prefill_overlap=False):
+    """OffloadMoELayer wired to an OwnerOffloadMoeCache with tiny local banks."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    _init_tp()
+    layer = _bf16_offload_layer(0, 8, 2, 8, 16)
+    geometry = OwnerCacheGeometry(
+        global_num_experts=8, world_size=2, rank=1, num_layers=1,
+        cache_size=8, prefill_overlap=prefill_overlap,
+    )
+    owner = OwnerOffloadMoeCache(geometry, torch.device("cpu"), quant_format=quant_format)
+    if quant_format == "bf16":
+        owner.set_bank_sources({
+            "gate_up": [torch.randn(4, 32, 8)],
+            "down": [torch.randn(4, 8, 16)],
+        })
+    else:
+        owner.set_bank_sources(_owner_nvfp4_banks(1, 4, 64, 512, base=100))
+    layer.owner_cache = owner
+    layer.offload_cache = owner._cache
+    # the owner path is exercised through the layer's kernel seam, so record there
+    layer.quant_method = _RecordingMoEMethod()
+    return layer, owner
+
+
+def test_owner_layer_decode_uses_owner_route_and_never_the_global_ids(monkeypatch):
+    """P3 wiring: an attached owner cache must route decode through ``ensure_route`` and
+    feed the kernel the LOCAL slot ids + masked weights, never the raw global ids."""
+    layer, owner = _make_owner_layer()
+    # rank 1 owns global [4, 8) -> local rows [0, 4).
+    topk_weights = torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 4, 7]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+    # The global-ID entry point must NOT be reached on the owner path.
+    monkeypatch.setattr(
+        owner._cache, "ensure_experts",
+        lambda *a, **k: pytest.fail("owner path called the global-ID ensure_experts"),
+    )
+
+    def fake_update(layer_id, weights, expert_ids):
+        owned = expert_ids >= 4
+        slots = torch.where(owned, expert_ids - 4, torch.zeros_like(expert_ids))
+        return SimpleNamespace(
+            weights=torch.where(owned, weights, torch.zeros_like(weights)),
+            slot_ids=slots,
+        )
+
+    monkeypatch.setattr(owner, "ensure_route", fake_update)
+    monkeypatch.setattr(owner, "copy_missing", lambda: None)
+
+    original_route = owner.ensure_route
+
+    def fake_route(layer_id, weights, expert_ids):
+        calls["route_args"] = (layer_id, weights.clone(), expert_ids.clone())
+        return original_route(layer_id, weights, expert_ids)
+
+    monkeypatch.setattr(owner, "ensure_route", fake_route)
+
+    out = layer.decode_forward(hidden_states, torch.randn(1, 8))
+
+    call = layer.quant_method.calls[-1]
+    assert out is hidden_states
+    assert calls["route_args"][0] == 0
+    assert calls["route_args"][2].tolist() == [[0, 4, 7]]  # raw global ids reached the adapter
+    # remote (global 0) is zero-weighted; owned entries keep their global weights.
+    assert torch.allclose(call.weights, torch.tensor([[0.0, 0.2, 0.3]]))
+    # ids handed to the kernel are LOCAL slots, strictly inside the local pool.
+    assert call.ids.dtype == torch.int32
+    assert int(call.ids.min()) >= 0
+    assert int(call.ids.max()) < owner.cache_size
+    # the banks the kernel reads are the owner-local ones (4 rows), not the global 8.
+    assert call.views["gate_up"].shape[0] == owner.cache_size
+    assert call.views["down"].shape[0] == owner.cache_size
+
+
+def test_owner_layer_remote_only_route_zeroes_the_contribution(monkeypatch):
+    """A rank that owns none of the routed experts must emit an all-zero, in-range route."""
+    layer, owner = _make_owner_layer()
+    topk_weights = torch.full((1, 2), 0.5, dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 2]], dtype=torch.int32)  # both owned by rank 0
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+    monkeypatch.setattr(
+        owner,
+        "ensure_route",
+        lambda layer_id, weights, expert_ids: SimpleNamespace(
+            weights=torch.zeros_like(weights),
+            slot_ids=torch.zeros_like(expert_ids),
+        ),
+    )
+    monkeypatch.setattr(owner, "copy_missing", lambda: None)
+
+    layer.decode_forward(torch.randn(1, 8), torch.randn(1, 8))
+
+    call = layer.quant_method.calls[-1]
+    assert torch.equal(call.weights, torch.zeros_like(topk_weights))
+    assert call.ids.tolist() == [[0, 0]]
+    assert owner.resident == 0  # nothing was admitted
+
+
+def test_owner_layer_prefill_remaps_global_ids_to_local_rows(monkeypatch):
+    """P3 prefill: bank row ids must be LOCAL rows with remote entries zero-weighted."""
+    layer, owner = _make_owner_layer(prefill_overlap=False)
+    topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+    topk_ids = torch.tensor([[1, 6]], dtype=torch.int32)  # 1 = rank0, 6 = local row 2
+    calls = {}
+    monkeypatch.setattr(owner, "materialize_layer", lambda layer_id, buffer_id=0: None)
+    monkeypatch.setattr(owner, "bank_views", lambda n=None: (torch.empty(8, 32, 8), torch.empty(8, 8, 16)))
+
+    layer._prefill_routed(torch.randn(1, 8), topk_weights, topk_ids)
+
+    call = layer.quant_method.calls[-1]
+    assert torch.allclose(call.weights, torch.tensor([[0.0, 0.75]]))
+    assert call.ids.tolist() == [[0, 2]]  # global 6 -> local row 2
+    assert int(call.ids.max()) < owner.num_experts
+
+
+def test_owner_layer_prefill_overlap_waits_and_releases_borrowed_buffer(monkeypatch):
+    """The owner prefill path must use the same borrowed-buffer lifecycle as the global
+    cache, INCLUDING the one-layer lookahead: prefetch(cur) stages this layer, prefetch(next)
+    starts the following layer's H2D on the copy stream so it runs while this layer's GEMMs
+    run on the compute stream.  Without the lookahead the copy is issued and immediately
+    waited on, which serializes the two and defeats the overlap."""
+    layer, owner = _make_owner_layer(prefill_overlap=True)
+    topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+    topk_ids = torch.tensor([[1, 6]], dtype=torch.int32)
+    calls = {}
+    lifecycle = []
+    monkeypatch.setattr(owner, "begin_prefill", lambda: lifecycle.append("begin"))
+    monkeypatch.setattr(owner, "prefetch_prefill_layer", lambda layer_id: lifecycle.append(("prefetch", layer_id)))
+    monkeypatch.setattr(
+        owner,
+        "wait_prefill_layer",
+        lambda layer_id: (torch.empty(8, 32, 8), torch.empty(8, 8, 16)),
+    )
+    monkeypatch.setattr(owner, "release_prefill_layer", lambda layer_id: lifecycle.append("release"))
+
+    layer._prefill_routed(torch.randn(1, 8), topk_weights, topk_ids)
+
+    call = layer.quant_method.calls[-1]
+    assert torch.allclose(call.weights, torch.tensor([[0.0, 0.75]]))
+    assert call.ids.tolist() == [[0, 2]]
+    assert call.n == owner.num_experts
+    # layer 0 -> the lookahead asks for layer 1 (a no-op past the last layer).
+    assert lifecycle == ["begin", ("prefetch", 0), ("prefetch", 1), "release"]
+
+
+def test_owner_wrapper_forwards_engine_assigned_flags_to_the_inner_cache():
+    """Engine sets these by assignment; without the properties they would land on the
+    wrapper and silently disable stats / the route trace / CPU-layer routing."""
+    layer, owner = _make_owner_layer()
+    owner.collect_stats = True
+    owner.collect_decode_freq = True
+    owner.route_recorder = object()
+    owner.cpu_layer_ids = frozenset({1})
+    assert owner._cache.collect_stats is True
+    assert owner._cache.collect_decode_freq is True
+    assert owner._cache.route_recorder is not None
+    assert owner._cache.cpu_layer_ids == frozenset({1})
+    assert owner.collect_stats is True and owner.cpu_layer_ids == frozenset({1})
+
+
+def test_owner_cache_bank_slots_start_zero_and_finite():
+    """Slot-zero remote placeholders must not read torch.empty/NaN data."""
+    _layer, owner = _make_owner_layer()
+    for cache in owner._cache.bank_caches.values():
+        assert torch.count_nonzero(cache).item() == 0
+        assert torch.isfinite(cache).all().item()
+
+
+def test_attach_owner_moe_cache_wires_layers_and_keeps_global_banks():
+    from freetoken.layers import BaseOP
+    from freetoken.moe.offload_cache import attach_owner_moe_cache
+
+    layer, owner = _make_owner_layer()
+    model = BaseOP()
+    model.block = layer
+    layers = attach_owner_moe_cache(model, owner)
+
+    assert layers == [layer]
+    assert layer.owner_cache is owner
+    assert layer.offload_cache is owner

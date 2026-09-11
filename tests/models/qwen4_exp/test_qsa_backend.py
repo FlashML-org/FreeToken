@@ -248,3 +248,107 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+def _unfuse_qkv(fused: torch.Tensor, config) -> dict[str, torch.Tensor]:
+    """Split the model's fused ``qkv_proj`` buffer back into the checkpoint's raw q/k/v keys.
+
+    The fused order is ``[2*qo*head_dim | kv*head_dim | kv*head_dim]`` (q carries the gate),
+    so the split is exact for both TP1 and a rank-local buffer.
+    """
+    qo = config.num_qo_heads * config.head_dim
+    kv = config.num_kv_heads * config.head_dim
+    q, k, v = fused.split([2 * qo, kv, kv], dim=0)
+    return {
+        f"layers.{QSA_LAYER}.self_attn.q_proj.weight": q,
+        f"layers.{QSA_LAYER}.self_attn.k_proj.weight": k,
+        f"layers.{QSA_LAYER}.self_attn.v_proj.weight": v,
+    }
+
+
+@requires_cuda
+def test_tp2_rank_partials_sum_to_the_tp1_output(monkeypatch):
+    """P2 numeric gate for QSA: two TP2 ranks' local layer outputs sum to the TP1 output,
+    and both ranks must select the SAME blocks (the indexer and its compressed slab are
+    replicated, so a split selection would corrupt the all-reduced result).
+
+    Each rank runs the real backend over its own rank-local K/V slab; only the row-parallel
+    ``o_proj`` all-reduce is replaced by an identity so the unreduced partials can be summed
+    here, which is exactly the TP contract.
+    """
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedCommunicator
+    from freetoken.models.qwen4_exp.weight import shard_qwen4_exp_dense_tensor
+
+    lengths = [2051, 1000, 137]  # dense regime: every complete block is selected
+    req_meta = [(i, 0, n) for i, n in enumerate(lengths)]
+
+    # ---- TP1 reference -------------------------------------------------------------
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=1))
+    config1 = parsed_config()
+    fix1 = Fixture(config1, num_pages=128)
+    attn1 = fix1.layer(QSA_LAYER)
+    x = torch.cat(_inputs(fix1, lengths))
+    seen1 = selection_spy(monkeypatch, fix1.backend)
+    batch1 = fix1.batch([fix1.req(*meta) for meta in req_meta], "prefill")
+    want = attn1.forward(x, batch1).clone()
+    want_idx = seen1["indices"].clone()
+    full_state = {k: v.detach().clone() for k, v in attn1.state_dict().items()}
+    assert config1.num_qo_heads == 4 and config1.num_kv_heads == 2  # global stays global
+
+    # ---- TP2: two rank-local runs ---------------------------------------------------
+    monkeypatch.setattr(DistributedCommunicator, "all_reduce", lambda self, x: x)
+    partials, selections, slab_kv_heads = [], [], []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=rank, size=2))
+        config2 = parsed_config()  # geometry resolves rank-local via get_tp_info()
+        fix2 = Fixture(config2, num_pages=128)
+        attn2 = fix2.layer(QSA_LAYER)
+        assert attn2.num_q == 2 and attn2.num_kv == 1, "rank-local heads not applied"
+
+        # Rank-local weights, built the way the real loader does it: shard the RAW q/k/v
+        # separately (so head groups stay intact), then re-fuse them into `qkv_proj`.
+        q, k, v = _unfuse_qkv(full_state["qkv_proj.weight"], config1).values()
+        parts = [
+            shard_qwen4_exp_dense_tensor(
+                name, tensor, config=config1, rank=rank, world_size=2
+            )
+            for name, tensor in (
+                (f"layers.{QSA_LAYER}.self_attn.q_proj.weight", q),
+                (f"layers.{QSA_LAYER}.self_attn.k_proj.weight", k),
+                (f"layers.{QSA_LAYER}.self_attn.v_proj.weight", v),
+            )
+        ]
+        raw = {
+            "qkv_proj.weight": torch.cat(parts, dim=0),
+            "o_proj.weight": shard_qwen4_exp_dense_tensor(
+                f"layers.{QSA_LAYER}.self_attn.o_proj.weight", full_state["o_proj.weight"],
+                config=config1, rank=rank, world_size=2,
+            ),
+            "q_norm.weight": full_state["q_norm.weight"].clone(),
+            "k_norm.weight": full_state["k_norm.weight"].clone(),
+        }
+        # The indexer is replicated: copy it verbatim (no sharding) and prove it is identical.
+        for leaf in (
+            "indexer.index_qk_proj.weight", "indexer.q_layernorm.weight",
+            "indexer.k_layernorm.weight",
+        ):
+            raw[leaf] = full_state[leaf].clone()
+            assert torch.equal(raw[leaf], full_state[leaf])
+        attn2.load_state_dict(raw)
+
+        seen2 = selection_spy(monkeypatch, fix2.backend)
+        batch2 = fix2.batch([fix2.req(*meta) for meta in req_meta], "prefill")
+        partials.append(attn2.forward(x, batch2).clone())
+        selections.append(seen2["indices"].clone())
+        slab_kv_heads.append(fix2.pool.k_cache(QSA_LAYER).shape[2])
+
+    # (a) replicated indexer => both ranks select exactly the same tokens as TP1
+    assert torch.equal(selections[0], selections[1]), "TP2 ranks selected different blocks"
+    assert torch.equal(selections[0], want_idx), "TP2 selection diverged from TP1"
+    # (b) the K/V slab really is rank-local (TP1 has 2 kv heads, each rank has 1)
+    assert slab_kv_heads == [1, 1]
+    # (c) numeric gate: unreduced row-parallel partials sum to the TP1 output
+    merged = partials[0] + partials[1]
+    torch.testing.assert_close(merged.float(), want.float(), rtol=2e-2, atol=2e-2)
+

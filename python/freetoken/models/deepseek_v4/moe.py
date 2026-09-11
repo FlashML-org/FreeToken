@@ -100,6 +100,11 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # streaming buffers disown their borrowed slots on invalidation.
         cache = self.offload_cache
         assert cache is not None
+        if self.owner_cache is not None:
+            # The owner adapter must see the original global route. Its local-row remap,
+            # borrowed-buffer lifecycle, and remote zeroing are handled by the base owner
+            # implementation; the short-prefill optimization is global-cache-only.
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
         if (
             hidden_states.shape[0] * self.top_k >= self.num_experts

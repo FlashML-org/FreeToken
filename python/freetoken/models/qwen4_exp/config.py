@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
 
-from freetoken.layers.quantization import QuantConfig
+from freetoken.distributed import try_get_tp_info
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -13,6 +14,7 @@ from freetoken.models.config import (
     RotaryConfig,
     SlotStateSpec,
 )
+from freetoken.utils import div_even
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,85 @@ class Qwen4ExpArgs:
         return self.hc_count * self.hidden_size
 
 
+@dataclass(frozen=True)
+class Qwen4ExpTPGeometry:
+    """Rank-local dense geometry derived from the global Qwen4Exp config."""
+
+    tp_size: int
+    rank: int
+    num_q_heads: int
+    num_kv_heads: int
+    num_key_heads: int
+    num_value_heads: int
+    head_dim: int
+    key_head_dim: int
+    value_head_dim: int
+
+    @property
+    def q_attn_dim(self) -> int:
+        return self.num_q_heads * self.head_dim
+
+    @property
+    def kv_attn_dim(self) -> int:
+        return self.num_kv_heads * self.head_dim
+
+    @property
+    def key_dim(self) -> int:
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def value_dim(self) -> int:
+        return self.num_value_heads * self.value_head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        return 2 * self.key_dim + self.value_dim
+
+    @property
+    def local_conv_dim(self) -> int:
+        """Rank-local GDN convolution width used by the linear-state pool."""
+        return self.conv_dim
+
+    @property
+    def local_recurrent_state_shape(self) -> tuple[int, int, int]:
+        """Rank-local ``(value_heads, key_dim, value_dim)`` recurrent-state shape."""
+        return (self.num_value_heads, self.key_head_dim, self.value_head_dim)
+
+
+def qwen4_exp_tp_geometry(
+    config: ModelConfig, *, tp_size: int | None = None, rank: int | None = None
+) -> Qwen4ExpTPGeometry:
+    """Resolve local QSA/GDN dimensions without mutating global model config."""
+    tp = try_get_tp_info()
+    tp_size = (1 if tp is None else tp.size) if tp_size is None else tp_size
+    rank = (0 if tp is None else tp.rank) if rank is None else rank
+    if tp_size < 1:
+        raise ValueError(f"TP size must be positive, got {tp_size}")
+    if not 0 <= rank < tp_size:
+        raise ValueError(f"TP rank {rank} is outside [0, {tp_size})")
+
+    linear = config.linear_attention_group()
+    if linear is None:
+        num_key_heads = num_value_heads = key_head_dim = value_head_dim = 0
+    else:
+        num_key_heads = div_even(linear.num_key_heads, tp_size, allow_replicate=True)
+        num_value_heads = div_even(linear.num_value_heads, tp_size, allow_replicate=True)
+        key_head_dim = linear.key_head_dim
+        value_head_dim = linear.value_head_dim
+
+    return Qwen4ExpTPGeometry(
+        tp_size=tp_size,
+        rank=rank,
+        num_q_heads=div_even(config.num_qo_heads, tp_size),
+        num_kv_heads=div_even(config.num_kv_heads, tp_size, allow_replicate=True),
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        head_dim=config.head_dim,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+    )
+
+
 PLE_CONV_STATE = "ple_conv"
 PLE_NGRAM_STATE = "ple_ngram_ctx"
 
@@ -93,6 +174,17 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
+def _quant_get(hf_config: Any):
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return None
+    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+
+
+def _ignored(patterns, module_name: str) -> bool:
+    return any(fnmatch(module_name, pat) for pat in patterns)
+
+
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -107,6 +199,45 @@ def _layer_types(text: Any) -> list[str]:
         "full_attention" if (i + 1) % interval == 0 else "linear_attention"
         for i in range(n)
     ]
+
+
+# modelopt spellings for 128x128 per-block, weight-only FP8 on the dense modules.
+_FP8_BLOCK_ALGOS = frozenset({"FP8_PB_WO", "FP8_BLOCK"})
+
+
+def dense_quant_mode(algo: str, quantized_layers: Any) -> str:
+    """The quantization mode the dense (non-expert) projections will actually be SERVED in.
+
+    Single source of truth for the two sides that must agree: :func:`parse_config`, which
+    decides the modules the model BUILDS, and the weight loader, which decides the buffers
+    it EMITS. They previously derived this independently from the same declaration - safe
+    only while they cannot disagree, and they can: the block-FP8 linears have no
+    tensor-parallel variant, so a rank running under TP>1 has to fall back to bf16. If only
+    one side knew that, the loaded buffers would not match the built modules.
+
+    Returns ``"fp8_block"`` only when the checkpoint declares per-block weight-only FP8 on a
+    non-expert module AND this rank can serve it; ``"none"`` otherwise (bf16, via the
+    dequantize-at-load path). A checkpoint carrying ``weight_scale_inv`` without declaring
+    the algo is "none" here and keeps the pre-existing dequant behaviour.
+    """
+    if str(algo or "").lower() != "mixed_precision":
+        return "none"
+    declared = any(
+        ".mlp.experts" not in str(module)
+        and str((spec or {}).get("quant_algo", "")).upper() in _FP8_BLOCK_ALGOS
+        for module, spec in (quantized_layers or {}).items()
+    )
+    if not declared:
+        return "none"
+    # Resolved here, once, so both sides downgrade together. ``Engine.__init__`` sets TP
+    # info as its very first statement, before the model config or any weight is built, so
+    # a rank always knows its size by the time this matters. try_get_tp_info is used rather
+    # than get_tp_info because config parsing also happens with no engine at all (checkpoint
+    # conversion, tooling, tests), where get_tp_info raises; unset means a single rank.
+    tp = try_get_tp_info()
+    if tp is not None and tp.size > 1:
+        return "none"
+    return "fp8_block"
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -138,13 +269,64 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # NOTE: the per-module schemes the built layers actually serve are decided by the
+    # ``QuantConfig`` (engine/config.py injects it as ``ModelConfig.quant``); the flags
+    # derived here are the loader/engine-facing summary of the same declaration.
+    get = _quant_get(hf_config)
+    if get is None:
+        expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
+    else:
+        algo = str(get("quant_algo") or get("quant_method") or "").lower()
+        block = get("weight_block_size")
+        if algo == "fp8" and block:
+            # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
+            # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
+            # GDN, the shared expert, HC, PLE and lm_head stay bf16.
+            bs = tuple(int(x) for x in block)
+            assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
+            expert_quant = "fp8_block"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "mixed_precision":
+            # modelopt MIXED_PRECISION: the quant algo is declared per module in
+            # ``quantized_layers`` rather than once at the top level. The community
+            # NVFP4-FP8 build of Qwen3.8-Flash-Next quantizes the routed experts to NVFP4
+            # (read natively by the offload cache) and the dense attn/GDN projections to
+            # 128x128 block-FP8, declared per module as ``FP8_PB_WO``.
+            quantized = get("quantized_layers") or {}
+            experts_nvfp4 = any(
+                ".mlp.experts" in str(module)
+                and str((spec or {}).get("quant_algo", "")).upper() == "NVFP4"
+                for module, spec in quantized.items()
+            )
+            # The same map declares the dense attn/GDN projections as FP8_PB_WO
+            # (per-block, weight-only FP8 with a ``weight_scale_inv`` sibling). Serve
+            # them natively instead of dequantizing at load: the four-way in_proj fusion
+            # splits into an fp8 qkv|z GEMM plus a small bf16 b|a GEMM (see gdn.py), which
+            # halves the dense bytes read on every decode step. Resolved through
+            # dense_quant_mode so the loader reaches the same answer, TP downgrade
+            # included - see that function.
+            expert_quant = "nvfp4" if experts_nvfp4 else "none"
+            attn_quant = dense_quant_mode(algo, quantized)
+            dense_quant = lm_head_quant = "none"
+        else:
+            is_fp4 = "fp4" in algo
+            ignore = list(get("ignore") or [])
+
+            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
+            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
+            # and stay bf16. Derive every flag from that list instead of assuming the split.
+            def _quant(probe: str) -> str:
+                return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
+
+            prefix = "model.language_model.layers.0"
+            expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
+            dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
+            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
+            lm_head_quant = _quant("lm_head")
+
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
-
-    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
-    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
-    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
@@ -245,9 +427,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        attn_quant=attn_quant,
+        dense_quant=dense_quant,
+        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "Qwen4ExpTPGeometry",
+    "parse_config",
+    "ple_slot_states",
+    "qwen4_exp_tp_geometry",
+]

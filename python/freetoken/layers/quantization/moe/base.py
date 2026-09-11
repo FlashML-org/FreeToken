@@ -35,13 +35,15 @@ class MoEConfig:
 
     @classmethod
     def from_layer(cls, layer: Any, scheme: QuantScheme | None) -> "MoEConfig":
+        # owner-local EP (TP+EP): experts are partitioned, never tensor-sharded, so the
+        # expert GEMM sees an unsharded intermediate (the layer all-reduces its output).
         return cls(
             num_experts=layer.num_experts,
             hidden=layer.hidden_size,
             intermediate=layer.intermediate_size,
             top_k=layer.top_k,
             tp_rank=layer.tp_rank,
-            tp_size=layer.tp_size,
+            tp_size=getattr(layer, "expert_tp_size", layer.tp_size),
             scheme=scheme,
             activation=layer.activation,
             alpha=float(layer.alpha),

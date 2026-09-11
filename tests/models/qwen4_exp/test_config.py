@@ -6,7 +6,7 @@ import pytest
 
 from freetoken.attention import AttnType
 from freetoken.models.config import FullAttentionGroupConfig, LinearGatedDeltaGroupConfig
-from freetoken.models.qwen4_exp.config import parse_config
+from freetoken.models.qwen4_exp.config import parse_config, qwen4_exp_tp_geometry
 
 from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4
 
@@ -130,6 +130,27 @@ def test_qwen4_args_payload():
     assert args.ple_conv_state_len == 9
     assert args.ple_state_width == 10240
     assert args.ngram_boundary_token_id == 248044
+
+
+def test_tp2_geometry_is_local_but_model_config_stays_global():
+    cfg = parse_config(_hf_config())
+    local = qwen4_exp_tp_geometry(cfg, tp_size=2, rank=1)
+    assert (local.num_q_heads, local.num_kv_heads) == (12, 1)
+    assert (local.num_key_heads, local.num_value_heads) == (8, 24)
+    assert local.q_attn_dim == 12 * 256
+    assert local.kv_attn_dim == 256
+    assert local.conv_dim == 2 * 8 * 128 + 24 * 128
+    assert local.local_conv_dim == local.conv_dim
+    assert local.local_recurrent_state_shape == (24, 128, 128)
+    assert cfg.num_qo_heads == 24 and cfg.num_kv_heads == 2
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_tp_geometry_rejects_non_divisible_dense_heads(tp_size):
+    cfg = parse_config(_hf_config())
+    geometry = qwen4_exp_tp_geometry(cfg, tp_size=tp_size, rank=0)
+    assert geometry.tp_size == tp_size
+    assert geometry.num_q_heads * tp_size == cfg.num_qo_heads
 
 
 def test_ple_on_full_attention_layer_rejected():

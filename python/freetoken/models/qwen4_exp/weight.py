@@ -22,13 +22,14 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.qwen4_exp.config import dense_quant_mode
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -47,7 +48,8 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# ``.weight_scale_inv`` is the 128x128 block-FP8 reciprocal scale (see _load_maybe_block_fp8).
+_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -81,15 +83,176 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 
-def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+def _partition(size: int, rank: int, world_size: int, *, allow_replicate: bool = False):
+    local = div_even(size, world_size, allow_replicate=allow_replicate)
+    if world_size <= size:
+        start = rank * local
+    else:
+        # Replicate each global head across a consecutive group of ranks, matching the
+        # generic KV sharder used by Qwen3.  This matters when TP exceeds KV/GDN heads.
+        start = (rank // (world_size // size)) * local
+    return start, local
+
+
+def _shard_head_rows(
+    tensor: torch.Tensor,
+    *,
+    num_heads: int,
+    rows_per_head: int,
+    rank: int,
+    world_size: int,
+    allow_replicate: bool = False,
+) -> torch.Tensor:
+    expected = num_heads * rows_per_head
+    if tensor.shape[0] != expected:
+        raise ValueError(
+            f"expected {expected} rows for {num_heads} heads, got {tuple(tensor.shape)}"
+        )
+    start, local = _partition(
+        num_heads, rank, world_size, allow_replicate=allow_replicate
+    )
+    view = tensor.reshape(num_heads, rows_per_head, *tensor.shape[1:])
+    return view[start : start + local].reshape(local * rows_per_head, *tensor.shape[1:]).contiguous()
+
+
+def _shard_dim1(tensor: torch.Tensor, *, rank: int, world_size: int) -> torch.Tensor:
+    if tensor.ndim < 2:
+        raise ValueError(f"dim-1 sharding needs a matrix, got {tuple(tensor.shape)}")
+    start, local = _partition(tensor.shape[1], rank, world_size)
+    return tensor.narrow(1, start, local).contiguous()
+
+
+def shard_qwen4_exp_dense_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    config,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Shard one *raw, unfused* Qwen4Exp dense tensor for TP.
+
+    Fusion happens after this function.  QSA q/k/v and GDN q/k/v/z/b/a therefore keep
+    head boundaries, while row-parallel output projections are sliced on input columns.
+    Routed experts, PLE/HC/indexer tensors and router weights are intentionally replicated;
+    expert-ID ownership belongs to the later EP stage.
+    """
+    if world_size == 1:
+        return tensor
+
+    linear = config.linear_attention_group()
+    if key in {"model.embed_tokens.weight", "lm_head.weight"}:
+        rows = div_ceil(tensor.shape[0], world_size)
+        start = rank * rows
+        return tensor[start : min(start + rows, tensor.shape[0])].contiguous()
+
+    if key.endswith(".self_attn.q_proj.weight"):
+        return _shard_head_rows(
+            tensor, num_heads=config.num_qo_heads, rows_per_head=2 * config.head_dim,
+            rank=rank, world_size=world_size,
+        )
+    if key.endswith((".self_attn.k_proj.weight", ".self_attn.v_proj.weight")):
+        return _shard_head_rows(
+            tensor, num_heads=config.num_kv_heads, rows_per_head=config.head_dim,
+            rank=rank, world_size=world_size, allow_replicate=True,
+        )
+    if key.endswith(".self_attn.o_proj.weight"):
+        return _shard_dim1(tensor, rank=rank, world_size=world_size)
+
+    if linear is not None and key.endswith(".linear_attn.in_proj_qkv.weight"):
+        q, k, v = torch.split(
+            tensor,
+            [
+                linear.num_key_heads * linear.key_head_dim,
+                linear.num_key_heads * linear.key_head_dim,
+                linear.num_value_heads * linear.value_head_dim,
+            ],
+            dim=0,
+        )
+        return torch.cat(
+            [
+                _shard_head_rows(
+                    q, num_heads=linear.num_key_heads, rows_per_head=linear.key_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+                _shard_head_rows(
+                    k, num_heads=linear.num_key_heads, rows_per_head=linear.key_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+                _shard_head_rows(
+                    v, num_heads=linear.num_value_heads, rows_per_head=linear.value_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+            ],
+            dim=0,
+        ).contiguous()
+    if linear is not None and key.endswith(".linear_attn.in_proj_z.weight"):
+        return _shard_head_rows(
+            tensor, num_heads=linear.num_value_heads, rows_per_head=linear.value_head_dim,
+            rank=rank, world_size=world_size, allow_replicate=True,
+        )
+    if linear is not None and key.endswith((".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight")):
+        return _shard_head_rows(
+            tensor, num_heads=linear.num_value_heads, rows_per_head=1,
+            rank=rank, world_size=world_size, allow_replicate=True,
+        )
+    if linear is not None and key.endswith(".linear_attn.conv1d.weight"):
+        q, k, v = torch.split(
+            tensor,
+            [
+                linear.num_key_heads * linear.key_head_dim,
+                linear.num_key_heads * linear.key_head_dim,
+                linear.num_value_heads * linear.value_head_dim,
+            ],
+            dim=0,
+        )
+        return torch.cat(
+            [
+                _shard_head_rows(
+                    q, num_heads=linear.num_key_heads, rows_per_head=linear.key_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+                _shard_head_rows(
+                    k, num_heads=linear.num_key_heads, rows_per_head=linear.key_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+                _shard_head_rows(
+                    v, num_heads=linear.num_value_heads, rows_per_head=linear.value_head_dim,
+                    rank=rank, world_size=world_size, allow_replicate=True,
+                ),
+            ],
+            dim=0,
+        ).contiguous()
+    if linear is not None and key.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
+        return _shard_head_rows(
+            tensor, num_heads=linear.num_value_heads, rows_per_head=1,
+            rank=rank, world_size=world_size, allow_replicate=True,
+        )
+    if linear is not None and key.endswith(".linear_attn.out_proj.weight"):
+        return _shard_dim1(tensor, rank=rank, world_size=world_size)
+
+    if key.endswith((".mlp.shared_expert.gate_proj.weight", ".mlp.shared_expert.up_proj.weight")):
+        return tensor.chunk(world_size, dim=0)[rank].contiguous()
+    if key.endswith(".mlp.shared_expert.down_proj.weight"):
+        return _shard_dim1(tensor, rank=rank, world_size=world_size)
+    return tensor
+
+
+def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``keep_scale_inv`` retains the block-FP8 ``weight_scale_inv`` tensors, which the
+    fp8 linears need alongside their weight; they are dropped otherwise (a rank that
+    dequantized its dense weights has no use for the reciprocal scale)."""
     if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
         return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
-    if raw_name.endswith(_SCALE_SUFFIXES):
+    if raw_name.endswith(_SCALE_SUFFIXES) and not (
+        keep_scale_inv and raw_name.endswith(".weight_scale_inv")
+    ):
         return None
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
@@ -112,8 +275,11 @@ class _DenseFuser:
     The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and validates each part against the scheme the model built its buffer from.
     """
 
-    def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+    def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...], *, dequantized: bool = False) -> None:
         self.quant = quant
+        # The reader normalized every dense weight to bf16 (a TP>1 rank cannot serve the
+        # block-FP8 kernels), so there is nothing left for the scheme to agree with.
+        self.dequantized = dequantized
         self.groups = {fused: parts for fused, parts in packed if fused != "experts"}  # experts: bank reader
         self.by_part: dict[str, list[tuple[str, int]]] = {}
         for fused, parts in self.groups.items():
@@ -142,6 +308,8 @@ class _DenseFuser:
 
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
         """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
+        if self.dequantized:
+            return
         scheme = self.scheme(module)
         if name.endswith(".weight_scale_inv"):
             if scheme is None or not scheme.has("weight_scale_inv"):
@@ -189,12 +357,35 @@ class _DenseFuser:
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 
+def _load_maybe_block_fp8(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
+    """Load ``raw_name``, dequantizing 128x128 block-FP8 to bf16 when a sibling
+    ``.weight_scale_inv`` is present in the same shard; pass plain bf16 through unchanged.
+
+    Only the TP>1 rank-local path needs this: the block-FP8 dense kernels are
+    replicated-only, so a rank at TP>1 builds those projections in bf16 and the reader has
+    to dequantize to match (the same downgrade :func:`dense_quant_mode` makes for the
+    model). At TP=1 the dense side is served natively as block-FP8 instead, so the fp8
+    codes and their ``weight_scale_inv`` travel through ``_DenseFuser`` untouched."""
+    tensor = f.get_tensor(raw_name)
+    if raw_name.endswith(".weight"):
+        base = raw_name[: -len(".weight")]
+        if base + ".weight_scale_inv" in keyset:
+            from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+            return dequant_block_fp8(
+                tensor, f.get_tensor(base + ".weight_scale_inv")
+            ).to(torch.bfloat16)
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    tp_shard: bool = False,
+    config=None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
@@ -202,26 +393,64 @@ def iter_weights(
     A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
+
+    ``tp_shard`` enables the rank-local TP path: each RAW tensor is sliced with
+    :func:`shard_qwen4_exp_dense_tensor` **before** fusion, so fused buffers keep head
+    boundaries (QSA q/k/v, GDN qkv/z/b/a) and row-parallel output projections are cut on
+    their input columns. It defaults to False, and TP>1 without it still fails fast, so no
+    existing TP1 caller changes behaviour. The emitted keys/shapes are exactly what a TP
+    rank's model builds. ``config`` optionally supplies the already-parsed
+    :class:`~freetoken.models.config.ModelConfig` (the engine has it); otherwise the
+    checkpoint config is parsed here.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
 
+    tp_info = get_tp_info()
+    if tp_info.size > 1 and not tp_shard:
+        raise NotImplementedError(
+            "qwen4_exp runtime TP requires iter_weights(tp_shard=True); the default "
+            "path is TP1-only. Pass tp_shard=True to load a rank-local shard."
+        )
+    shard = tp_info.size > 1
+    if shard and config is None:
+        from freetoken.models.qwen4_exp.config import parse_config
+
+        config = parse_config(cached_load_hf_config(model_path))
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    # A TP>1 rank builds the dense projections in bf16 (the block-FP8 kernels are
+    # replicated-only), so the reader dequantizes instead of carrying the fp8 codes.
+    serve_block_fp8 = not shard
+    fuser = _DenseFuser(
+        get_quant_config(), spec.packed_modules_mapping, dequantized=not serve_block_fp8
+    )
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, keep_scale_inv=serve_block_fp8)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                tensor = (
+                    f.get_tensor(raw_name)
+                    if serve_block_fp8
+                    else _load_maybe_block_fp8(f, raw_name, keyset)
+                )
+                if shard:
+                    # Slice the RAW name: fusion happens afterwards, so head-bearing
+                    # groups are still separable and the fused order is preserved.
+                    tensor = shard_qwen4_exp_dense_tensor(
+                        name,
+                        tensor,
+                        config=config,
+                        rank=tp_info.rank,
+                        world_size=tp_info.size,
+                    )
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
@@ -378,5 +607,6 @@ __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",
+    "shard_qwen4_exp_dense_tensor",
     "load_ple_table",
 ]

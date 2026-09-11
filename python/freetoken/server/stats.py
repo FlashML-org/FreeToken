@@ -30,6 +30,14 @@ class StatsTracker:
         # "cost saved by running locally" accounting. Monotonic; resets when the process restarts.
         self.prompt_tokens_total = 0
         self.completion_tokens_total = 0
+        # Lifetime prefix-cache hits: tokens of admitted prompts served from the radix
+        # cache instead of recomputed. Arrives per request on the same reply as
+        # prompt_tokens_delta (UserReply.cached_tokens); hit_ratio = this /
+        # prompt_tokens_total (same tokens denominator as vLLM's hits/queries pair).
+        self.cached_tokens_total = 0
+        # Last MoE slot-cache snapshot stamped by the scheduler (miss/residency/routing
+        # concentration); None until the first sample or on non-offload models.
+        self.moe_stats: dict | None = None
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -63,6 +71,10 @@ class StatsTracker:
         if getattr(reply, "prompt_tokens_delta", 0) > 0:
             self._prefill.append((t, reply.prompt_tokens_delta))
             self.prompt_tokens_total += reply.prompt_tokens_delta
+        if getattr(reply, "cached_tokens", 0) > 0:
+            self.cached_tokens_total += reply.cached_tokens
+        if getattr(reply, "moe_stats", None) is not None:
+            self.moe_stats = reply.moe_stats
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
@@ -118,6 +130,24 @@ def derive_model_card(config: Any) -> dict:
     }
 
 
+def _resolved_page_size(state: Any, config: Any) -> int:
+    """The engine's REAL KV page size (tokens per page).
+
+    ``_adjust_config`` runs inside the scheduler process, so the frontend's ``config.page_size``
+    can still hold the CLI default while the engine actually pages at, say, 64 (qsa_sparse).
+    Reporting that default made ``total_pages`` look like a token count (4096 "tokens" for a
+    262144-token pool). Prefer the value the engine published in its readiness meta.
+    """
+    pools = getattr(state, "cache_pools", None) or {}
+    try:
+        value = int(pools.get("page_size") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        value = int(getattr(config, "page_size", 1) or 1)
+    return max(1, value)
+
+
 def _swa_page_size(config: Any) -> int:
     """The window pool's own page unit: P (window_size) for DSV4, 1 token for radix-SWA.
     Mirrors compute_cache_pools' swa_page_size."""
@@ -139,7 +169,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
     kv = (
         {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
-         "page_size": getattr(config, "page_size", 1)}
+         "page_size": _resolved_page_size(state, config)}
         if tr.kv_total_pages > 0 else None
     )
     mamba = (
@@ -147,6 +177,18 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         if tr.mamba_total_slots > 0 else None
     )
     sps = _swa_page_size(config)
+    try:
+        model_max_seq_len = int(getattr(config, "max_seq_len", 0) or 0)
+    except (TypeError, ValueError):
+        model_max_seq_len = 0
+    # Same expression the scheduler's admission check uses; fall back to the model ceiling
+    # while the readiness meta is still in flight.
+    try:
+        effective_max_seq_len = int(getattr(state, "max_seq_len", 0) or 0)
+    except (TypeError, ValueError):
+        effective_max_seq_len = 0
+    if effective_max_seq_len <= 0:
+        effective_max_seq_len = model_max_seq_len
     swa = (
         {"used_pages": tr.swa_used_tokens // sps, "total_pages": tr.swa_total_tokens // sps,
          "page_size": sps}
@@ -159,6 +201,14 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "kv": kv,
         "mamba": mamba,
         "swa": swa,
+        # What the scheduler actually ADMITS. prompt_tokens must stay under max_seq_len (the
+        # output budget is clamped to the remainder), and it is min(model max_position, KV
+        # pool tokens) -- so it can be smaller than the model's own ceiling when the KV pool
+        # was configured below it. model_max_seq_len is that ceiling, for reference.
+        "limits": {
+            "max_seq_len": effective_max_seq_len,
+            "model_max_seq_len": model_max_seq_len,
+        },
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
@@ -173,4 +223,14 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
         },
+        "prefix_cache": {
+            "cached_tokens_total": tr.cached_tokens_total,
+            "prompt_tokens_total": tr.prompt_tokens_total,
+            "hit_ratio": (
+                round(tr.cached_tokens_total / tr.prompt_tokens_total, 4)
+                if tr.prompt_tokens_total
+                else 0.0
+            ),
+        },
+        "moe": tr.moe_stats,
     }

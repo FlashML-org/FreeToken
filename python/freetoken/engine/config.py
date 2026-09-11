@@ -21,6 +21,10 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Opt-in routed-expert owner group size.  1 preserves the legacy global-ID cache;
+    # values >1 require an explicit TP+EP runtime implementation and fail fast unless the
+    # model/quantizer supports the owner-local bank path.
+    moe_ep_size: int = 1
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -46,6 +50,17 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Per-(layer, expert) decode routing histogram (working-set / oracle-hit analysis).
+    # The histogram is accumulated host-side before the kernel rewrites expert ids to
+    # slots, so it is only accurate with CUDA graphs disabled (a captured graph would
+    # not re-run the scatter on replay) -- the engine warns when both are on.
+    moe_collect_decode_freq: bool = False
+    # Ordered MoE route trace path (--moe-trace-route): when set, every
+    # ``ensure_experts`` call appends its RAW global expert ids (pre slot-rewrite)
+    # to this file for offline LRU/EP replay (moe/route_trace.py). Host-side, so it
+    # is NOT CUDA-graph safe -- the engine refuses it unless --cuda-graph-max-bs 0.
+    # None (default) = no recorder, zero overhead on the production path.
+    moe_trace_route: str | None = None
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

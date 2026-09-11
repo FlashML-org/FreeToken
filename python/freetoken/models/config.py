@@ -263,6 +263,10 @@ class ModelConfig:
     moe_strategy: str = "fused"
     # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
     decode_target: str = "gpu"
+    # Expert-parallel group size (owner-local EP). 1 keeps the global-ID cache; >1 partitions
+    # the experts across the group, so the routed-expert GEMM is unsharded and the layer
+    # all-reduces its output once. Set by the engine before the model is built.
+    moe_ep_size: int = 1
     # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
     quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----

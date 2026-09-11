@@ -12,6 +12,7 @@ module; otherwise the defaults below (built purely from the parsed config) apply
 from __future__ import annotations
 
 import glob
+import inspect
 import json
 import mmap
 import os
@@ -211,6 +212,8 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    tp_shard: bool = False,
+    tp_config=None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -225,6 +228,8 @@ def load_weight(
         # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
+        if tp_shard:
+            raise NotImplementedError("FTW checkpoints store post-shard weights; tp_shard is unsupported")
         skip_vision = not vision_load_enabled()
         for name, tensor in iter_ftw_weights(model_path):
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
@@ -234,12 +239,18 @@ def load_weight(
 
     _config, spec = _spec_for_model_path(model_path)
     iter_weights = _load_attr(spec.module, spec.iter_weights)
-    yield from iter_weights(
-        model_path,
-        device,
-        include_moe_experts=include_moe_experts,
-        include_non_moe=True,
-    )
+    kwargs = dict(include_moe_experts=include_moe_experts, include_non_moe=True)
+    parameters = inspect.signature(iter_weights).parameters
+    if "tp_shard" in parameters:
+        kwargs["tp_shard"] = tp_shard
+        if tp_config is not None and "config" in parameters:
+            kwargs["config"] = tp_config
+    elif tp_shard:
+        raise NotImplementedError(
+            f"{spec.module}.iter_weights does not implement tp_shard; TP>1 loading is "
+            f"unsupported for this architecture"
+        )
+    yield from iter_weights(model_path, device, **kwargs)
 
 
 def load_q4_0_moe_expert_sources(

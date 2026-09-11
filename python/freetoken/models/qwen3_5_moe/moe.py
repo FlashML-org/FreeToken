@@ -76,9 +76,22 @@ class Qwen3_5MoE(BaseOP):
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
         router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
+        owner_ep = getattr(self.experts, "owner_cache", None) is not None
+        if owner_ep and not isinstance(self.shared_expert.down_proj, LinearRowParallel):
+            raise NotImplementedError(
+                "owner EP shared+routed fusion requires a row-parallel shared down projection"
+            )
+        shared = self.shared_expert.down_proj.forward(
+            silu_and_mul(self.shared_expert.gate_up_proj.forward(hidden_states)),
+            reduce=not owner_ep,
+        ) if owner_ep else self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        routed = self.experts.forward(
+            hidden_states=hidden_states, router_logits=router_logits, reduce=not owner_ep
+        )
+        if owner_ep:
+            routed = self.experts._maybe_all_reduce(routed + shared)
+            return routed.view(num_tokens, hidden_dim)
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

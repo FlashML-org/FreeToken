@@ -230,6 +230,28 @@ def _format_stats(doc: dict[str, Any]) -> str:
         lines.append(f"mamba={mamba.get('used_slots', 0)}/{mamba.get('total_slots', 0)} slots")
     else:
         lines.append("mamba=none")
+    pcache = doc.get("prefix_cache")
+    if isinstance(pcache, dict):
+        lines.append(
+            f"prefix_cache cached_tokens={pcache.get('cached_tokens_total', 0)} "
+            f"hit_ratio={pcache.get('hit_ratio', 0) * 100:.1f}%"
+        )
+    moe = doc.get("moe")
+    if isinstance(moe, dict):
+        lines.append(
+            f"moe resident={moe.get('resident', 0)}/{moe.get('cache_size', 0)} slots "
+            f"(of {moe.get('total_experts', 0)} expert-layers) "
+            f"miss_rate={moe.get('miss_rate', 0) * 100:.1f}% "
+            f"miss/layer/step={moe.get('missing_per_layer', 0):.1f} "
+            f"fetched={moe.get('fetched_per_layer', 0):.1f}"
+        )
+        routing = moe.get("routing")
+        if isinstance(routing, dict):
+            lines.append(
+                f"moe routing working_set={routing.get('working_set_mean', 0):.1f} "
+                f"experts_for_90pct={routing.get('experts_for_90pct', 0):.1f} "
+                f"oracle_hit={routing.get('oracle_hit_global', 0) * 100:.1f}%"
+            )
     return "\n".join(lines)
 
 

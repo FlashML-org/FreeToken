@@ -147,9 +147,9 @@ class LinearOProj(_LinearTPImpl):
             quant_config=quant_config, prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and reduce:
             y = self._comm.all_reduce(y)
         return y
 
@@ -174,8 +174,8 @@ class LinearRowParallel(_LinearTPImpl):
             quant_config=quant_config, prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and reduce:
             y = self._comm.all_reduce(y)
         return y
