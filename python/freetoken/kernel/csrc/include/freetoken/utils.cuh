@@ -1,5 +1,6 @@
 #pragma once
 
+#include <freetoken/hip_compat.h>
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -44,13 +45,21 @@ namespace PDL {
 
 template <bool kUsePDL> __always_inline __device__ void wait() {
   if constexpr (kUsePDL) {
+#if FREETOKEN_USE_ROCM
+    // Programmatic dependent launch is NVIDIA-specific.
+#else
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   }
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
   if constexpr (kUsePDL) {
+#if FREETOKEN_USE_ROCM
+    // Programmatic dependent launch is NVIDIA-specific.
+#else
     asm volatile("griddepcontrol.launch_dependents;" :::);
+#endif
   }
 }
 
@@ -115,6 +124,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if FREETOKEN_USE_ROCM
+    RuntimeCheck(!use_pdl, "Programmatic dependent launch is unavailable on ROCm");
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +136,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
@@ -138,7 +152,9 @@ private:
     return config;
   }
   cudaLaunchConfig_t m_config;
+#if !FREETOKEN_USE_ROCM
   cudaLaunchAttribute m_attr_cache;
+#endif
 };
 
 } // namespace host

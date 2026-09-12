@@ -122,7 +122,12 @@ def test_host_device_ptr_is_identity_under_uva():
         pytest.skip("non-UVA platform: host_device_ptr rejects unregistered memory instead")
     # Under UVA cudaHostGetDevicePointer degenerates to identity for any host pointer
     # (no registration validation); rejection of pageable memory only exists on
-    # non-identity platforms (Windows/WDDM), where the translation is real.
+    # non-identity CUDA platforms (Windows/WDDM), where the translation is real.
+    # HIP validates registration even though registered/pinned memory uses the
+    # identity address on Linux. Calling it with pageable memory also leaves a
+    # sticky HIP error, so the pinned identity case above is the relevant check.
+    if torch.version.hip is not None:
+        return
     pageable = torch.empty(64, dtype=torch.uint8)
     ext = _load_pinned_extension()
     assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
