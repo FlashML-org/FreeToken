@@ -46,7 +46,11 @@ git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
 uv pip install -e ".[accel]"
 ```
 
-See [docs/install.md](docs/install.md) for requirements. CUDA kernels are JIT-compiled on first use and need a CUDA 13 toolkit with `nvcc` on `PATH`.
+See [docs/install.md](docs/install.md) for requirements. CUDA kernels are JIT-compiled
+on first use. An explicit absolute `CUDA_HOME` must contain an `nvcc` matching
+PyTorch's exact CUDA release; otherwise FreeToken checks the matching versioned
+`/usr/local/cuda-X.Y` toolkit and then `PATH`. This selection does not change the
+supported PyTorch, driver, or GPU matrix.
 
 Run the tests with `pytest`. Most tests need an NVIDIA GPU. `-m "not slow"` skips the long kernel sweeps; tests marked `needs_weights` are off unless you point them at a local checkpoint (see [tests/README.md](tests/README.md)).
 

@@ -127,7 +127,6 @@ def launch_server(
     argv: list[str] | None = None,
     prog: str | None = None,
 ) -> None:
-    from .api_server import run_api_server
     from .args import parse_args
 
     server_args, run_shell = parse_args(
@@ -135,6 +134,15 @@ def launch_server(
         run_shell,
         prog=prog,
     )
+
+    # Publish an exact versioned toolkit before multiprocessing spawn. A mismatched
+    # PATH compiler is ignored here so a complete prebuilt cache can still serve;
+    # actual JIT/build entry points perform the strict check.
+    from freetoken.kernel._toolchain import configure_cuda_toolchain
+
+    configure_cuda_toolchain(reject_path_mismatch=False)
+
+    from .api_server import run_api_server
     logger = init_logger(__name__, "initializer")
 
     if server_args.gpu:
