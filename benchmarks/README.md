@@ -29,3 +29,12 @@ python benchmarks/bench_offload_cache_copy.py
 
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
+
+**`bench_kv_quant.py`** compares BF16, FP8 and NVFP4 KV storage bytes, one-step
+scatter latency and paged decode latency on synthetic inputs. No checkpoint is
+required. Keep the GPU idle and use identical arguments for A/B comparisons;
+this does not measure model quality or end-to-end serving throughput.
+
+```bash
+PYTHONPATH=python:. uv run python benchmarks/bench_kv_quant.py --lengths 1024,8192,32768
+```

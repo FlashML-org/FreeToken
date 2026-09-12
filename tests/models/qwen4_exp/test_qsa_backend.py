@@ -5,7 +5,10 @@
     exactly the causal prefix and the layer output must match ``TorchDenseQSAReference`` (fp32)
     and a flashinfer dense run over the same pool;
 (b) chunked prefill at unaligned cut points equals one-shot prefill (the dual-source compress);
-(c) a captured decode replay equals the eager decode step.
+(c) a captured decode replay equals the eager decode step;
+(d) an fp8 KV pool (``--kv-cache-dtype fp8``) keeps block selection bit-identical to the
+    16-bit run -- only the selected K/V rows are read back as e4m3 codes -- and the layer
+    output stays within quantization error of it.
 """
 
 from __future__ import annotations
@@ -248,3 +251,64 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+def _prefill_under_kv(monkeypatch, config, kv_quant: str, lengths):
+    """One prefill of the QSA layer under a given KV store.
+
+    Each call builds its own Fixture on purpose: a Fixture owns the global ctx (pool,
+    page table, backend), so two KV stores cannot share one scenario. The weight seed
+    (``Fixture.layer``) and the input seed (``_inputs``) are fixed, so the two runs differ
+    ONLY in how the K/V rows are stored.
+    """
+    fixture = Fixture(config, num_pages=128, kv_quant=kv_quant)
+    attn = fixture.layer(QSA_LAYER)
+    seen = selection_spy(monkeypatch, fixture.backend)
+    inputs = _inputs(fixture, lengths)
+    x = torch.cat([row[:n] for row, n in zip(inputs, lengths)])
+    reqs = [fixture.req(i, 0, n) for i, n in enumerate(lengths)]
+    batch = fixture.batch(reqs, "prefill")
+    out = attn.forward(x, batch)
+    # the selection lives in a scratch buffer the next forward overwrites
+    return fixture, out.clone(), seen["indices"].clone(), batch.positions.clone()
+
+
+@requires_cuda
+def test_fp8_kv_pool_keeps_selection_and_output(monkeypatch):
+    """--kv-cache-dtype fp8 through the real layer: e4m3 codes + per-row scales in, same
+    answer out to within quantization error -- and, because block selection scores 16-bit
+    compressed index keys that fp8 never touches, the SAME selection bit for bit."""
+    config = parsed_config()
+    lengths = [2051, 1000, 137]  # every complete block is selected here
+
+    plain, plain_out, plain_idx, _ = _prefill_under_kv(monkeypatch, config, "none", lengths)
+    quant, quant_out, quant_idx, positions = _prefill_under_kv(
+        monkeypatch, config, "fp8", lengths
+    )
+
+    # The tripwire for the field failure: the backend sizes its indexer scratch with
+    # pool.dtype, which must stay the COMPUTE dtype even when store_dtype is e4m3. An
+    # fp8 q_index compiles into qsa_mqa_paged's dot and dies at graph capture.
+    assert quant.backend.dtype is torch.bfloat16
+    assert plain.backend.dtype is torch.bfloat16
+    assert quant.pool.store_dtype != torch.bfloat16
+    assert quant.pool.kv_quant == "fp8" and plain.pool.kv_quant == "none"
+    assert quant.pool.k_cache(QSA_LAYER).element_size() == 1
+    assert quant.pool.v_cache(QSA_LAYER).element_size() == 1
+    assert plain.pool.k_scale(QSA_LAYER) is None and plain.pool.v_scale(QSA_LAYER) is None
+    pages, page_size, kv_heads = quant.pool.k_cache(QSA_LAYER).shape[:3]
+    assert quant.pool.k_scale(QSA_LAYER).shape == (pages * page_size, kv_heads)
+    assert quant.pool.k_scale(QSA_LAYER).dtype is torch.float32
+
+    for pool in (plain.pool, quant.pool):
+        assert pool.cmp_k_cache(0).dtype is torch.bfloat16
+    assert torch.equal(quant_idx, plain_idx), (
+        "quantizing the KV rows changed which blocks the indexer selected -- the index "
+        "tier is supposed to be 16-bit in both runs"
+    )
+    _assert_selection_is_causal_prefix(quant_idx, positions)
+
+    # Looser than the 2e-2 the 16-bit run needs against the same reference: e4m3 carries
+    # four significant bits, so ~1e-2 relative per stored element is the floor here.
+    torch.testing.assert_close(quant_out.float(), plain_out.float(), rtol=4e-2, atol=4e-2)
+

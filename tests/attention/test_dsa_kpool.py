@@ -49,8 +49,8 @@ def _args(num_layers=1):
     )
 
 
-@pytest.fixture()
-def harness(monkeypatch):
+@pytest.fixture(params=["none", "nvfp4"])
+def harness(monkeypatch, request):
     from freetoken.attention.dsa_indexer_kpool import Glm5NextDSABackend
     from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
 
@@ -58,7 +58,7 @@ def harness(monkeypatch):
         latent_dim=LATENT, num_layers=1, num_pages=8, page_size=64,
         dtype=torch.bfloat16, device=torch.device(DEV),
         index_head_dim=DI, num_index_layers=1,
-        index_ratio=KPOOL, num_req_slots=4,
+        index_ratio=KPOOL, num_req_slots=4, kv_quant=request.param,
     )
     page_table = torch.full((4, 512), -1, dtype=torch.int32, device=DEV)
     page_table[0, :512] = torch.arange(512, dtype=torch.int32, device=DEV)
@@ -74,6 +74,23 @@ def harness(monkeypatch):
     # The APE is a MODEL parameter, passed per call via DSAIndexerInputs.
     ape = torch.randn(KPOOL, DI, device=DEV, dtype=torch.float32) * 0.3
     return backend, pool, ape
+
+
+@pytest.mark.parametrize("kv_quant", ["fp8", "nvfp4"])
+def test_quantized_latent_cache_keeps_kpool_index_tiers_bf16(kv_quant):
+    from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
+
+    pool = KpoolDSAKVCache(
+        latent_dim=LATENT, num_layers=1, num_pages=8, page_size=64,
+        dtype=torch.bfloat16, device=torch.device(DEV),
+        index_head_dim=DI, num_index_layers=1,
+        index_ratio=KPOOL, num_req_slots=4, kv_quant=kv_quant,
+    )
+    assert pool.latent_rows(0).dtype is torch.uint8
+    assert pool.latent_scale(0).dtype is torch.float32
+    assert pool.index_k_cache(0).dtype is torch.bfloat16
+    assert pool.tail_k(0).dtype is torch.bfloat16
+    assert pool.tail_gate(0).dtype is torch.bfloat16
 
 
 def _req(device_len, cached_len=0):
@@ -113,10 +130,15 @@ def _rand_seq(total, seed=1):
 
 
 def _run(backend, batch, d, sl, ape):
+    d["kv_quant"] = backend.kvcache.kv_quant
+    backend.prepare_metadata(batch)
+    return _forward(backend, batch, d, sl, ape)
+
+
+def _forward(backend, batch, d, sl, ape):
     from freetoken.attention.dsa import DSAIndexerInputs
 
     t = batch.positions.shape[0]
-    backend.prepare_metadata(batch)
     return backend.mla_forward(
         d["q_nope"][sl], d["q_nope"].new_empty(t, H, 0),
         d["c_kv"][sl], d["c_kv"].new_empty(t, 0),
@@ -149,6 +171,14 @@ def _ref_scores(d, ape, q_idx_t, w_t, n_pools):
 def _ref_attend(d, q_t, positions):
     """Full softmax MLA over latent rows at ``positions`` for one query [H, LATENT]."""
     lat = d["c_kv"][positions].float()  # [n, LATENT]
+    if d.get("kv_quant") == "nvfp4":
+        from tests.kernels.test_kv_nvfp4 import _reference
+
+        packed, block, row = _reference(lat)
+        codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
+        grid = lat.new_tensor([0, .5, 1, 1.5, 2, 3, 4, 6,
+                               0, -.5, -1, -1.5, -2, -3, -4, -6])
+        lat = grid[codes] * block.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1) * row[:, None]
     logits = q_t.float() @ lat.T * SM_SCALE  # [H, n]
     p = torch.softmax(logits, dim=-1)
     return (p @ lat).to(torch.bfloat16)
@@ -367,3 +397,52 @@ def test_padding_and_empty_batch_leave_shadow_rows_clean():
         ratio=KPOOL,
     )
     assert torch.equal(slab, before)
+
+
+def test_decode_graph_replay_tracks_slots_and_lengths(harness):
+    backend, pool, ape = harness
+    total, extra = 60, 6
+    d = _rand_seq(total + extra, seed=81)
+    _run(backend, _prefill_batch(0, total), d, slice(0, total), ape)
+    static = {k: v[total:total + 1].clone() for k, v in d.items() if isinstance(v, torch.Tensor)}
+    batch = _decode_batch(total)
+    batch.size = batch.padded_size = 1
+    backend.init_capture_graph(512, [1])
+    backend.prepare_for_capture(batch)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            _forward(backend, batch, static, slice(None), ape)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _forward(backend, batch, static, slice(None), ape)
+    base = 0
+    for pos in range(total, total + extra):
+        if pos == total + 2:
+            from freetoken.attention.dsa import get_global_ctx
+
+            base = 256
+            pool.latent_rows(0)[base:base + 128].copy_(pool.latent_rows(0)[:128])
+            if pool.kv_quant == "nvfp4":
+                pool.latent_scale(0)[base:base + 128].copy_(pool.latent_scale(0)[:128])
+                pool.latent_block_scale(0)[base:base + 128].copy_(pool.latent_block_scale(0)[:128])
+            pool.index_k_cache(0)[64:96].copy_(pool.index_k_cache(0)[:32])
+            pool.tail_k(0)[1].copy_(pool.tail_k(0)[0])
+            pool.tail_gate(0)[1].copy_(pool.tail_gate(0)[0])
+            get_global_ctx().page_table[1, :128] = torch.arange(base, base + 128, device=DEV)
+            batch.active_table_idx.fill_(1)
+            batch.padded_reqs[0].table_idx = 1
+        for key, tensor in static.items():
+            tensor.copy_(d[key][pos:pos + 1])
+        batch.positions.fill_(pos)
+        batch.out_loc.fill_(base + pos)
+        batch.padded_reqs[0].device_len = pos + 1
+        backend.prepare_metadata(batch)
+        backend.prepare_for_replay(batch)
+        graph.replay()
+        selected = _ref_selected_positions(d, ape, d["qi"][pos], d["wi"][pos], pos)
+        ref = _ref_attend(d, d["q_nope"][pos], selected)
+        torch.testing.assert_close(out[0], ref, atol=3e-2, rtol=1e-2)
+    backend.reset_capture()

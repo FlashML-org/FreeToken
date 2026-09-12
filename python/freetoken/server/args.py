@@ -399,6 +399,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        dest="kv_quant",
+        type=str,
+        default=ServerArgs.kv_quant,
+        choices=["auto", "bf16", "fp8", "nvfp4"],
+        help=(
+            "KV-cache storage format. 'bf16' (default) stores the compute dtype; 'fp8'"
+            " stores e4m3 codes plus one fp32 scale per (token, kv head), roughly "
+            "doubling the tokens that fit in the same VRAM. Requires the triton"
+            " attention backend and a plain paged, hybrid-SWA or QSA sparse KV pool"
+            " (not MLA/DSA, DSV4, or MiniMax-M3 block-sparse models)."
+            " 'nvfp4' stores packed E2M1 with block/row scales; supports only"
+            " paged FULL, hybrid-SWA, or QSA sparse attention with head_dim divisible by 16."
+        ),
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,

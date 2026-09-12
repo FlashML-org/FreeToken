@@ -139,6 +139,14 @@ def qsa_mqa_paged(
         raise ValueError("QSA request mapping and positions must match query rows")
     if sequence_lengths.shape != (page_table.shape[0],):
         raise ValueError("QSA sequence lengths must match page-table requests")
+    if q.dtype not in (torch.bfloat16, torch.float16) or k_cache.dtype is not q.dtype:
+        # The dot below is a plain 16-bit matmul: an fp8 operand is not a slow path, it
+        # is a triton compile error that surfaces mid-CUDA-graph-capture. The KV cache
+        # may well be e4m3 codes (--kv-cache-dtype fp8) -- what must never reach here
+        # are those codes; the compressed index keys are their own 16-bit tier.
+        raise ValueError(
+            f"QSA scoring is 16-bit only, got query={q.dtype} keys={k_cache.dtype}"
+        )
     score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
     columns = logits.shape[1]
     if not q.shape[0] or not columns:
