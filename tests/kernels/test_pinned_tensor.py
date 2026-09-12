@@ -128,6 +128,23 @@ def test_host_device_ptr_is_identity_under_uva():
     assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
 
 
+def test_failed_pinned_call_leaves_the_context_usable():
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from freetoken.kernel.pinned import _load_pinned_extension
+
+    torch.cuda.init()
+    ext = _load_pinned_extension()
+    # A rejected registration is a normal outcome -- host_banks.pin() catches it.
+    # The runtime latches the status until someone reads it, so if the extension
+    # raises without draining it, the next unrelated CUDA call reports this
+    # failure as its own and a caller that handled the exception dies anyway.
+    with pytest.raises(RuntimeError, match="cudaHostRegister failed"):
+        ext.host_register(0, 64)
+    torch.randn(4, device="cuda").sum().item()
+
+
 def test_host_bank_pin_registers_and_translates():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
