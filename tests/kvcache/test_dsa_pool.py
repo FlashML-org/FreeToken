@@ -16,13 +16,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 LATENT, IDX_DIM = 80, 32  # latent 64+16: kernel spans need pow-2 dims (512+64 in the real model)
 
 
-def _pool(num_pages: int):
+def _pool(num_pages: int, kv_quant: str = "none"):
     from freetoken.kvcache.dsa_pool import DSAKVCache
 
     return DSAKVCache(
         latent_dim=LATENT, num_layers=2, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=torch.device("cuda"),
         index_head_dim=IDX_DIM, num_index_layers=1,
+        kv_quant=kv_quant,
     )
 
 
@@ -91,6 +92,39 @@ def test_sparse_decode_reads_grown_pool_through_backend_kernels():
     assert (o[0, 0].float() - ref_o).abs().max().item() < 2e-2
 
 
+def test_fp8_latent_rows_decode_with_their_scales():
+    """The DSA kernel must read codes and scales from matching physical rows."""
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kernel.triton.kv_quant import codes_to_f32
+
+    torch.manual_seed(7)
+    pool = _pool(128, kv_quant="fp8")
+    rows = torch.randperm(128, device="cuda")[:96].to(torch.int32)
+    c_kv = torch.randn(96, LATENT - 16, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(96, 16, device="cuda", dtype=torch.bfloat16)
+    pool.store_kv(c_kv, k_rope, rows, layer_id=0)
+    assert pool.latent_rows(0).dtype is torch.uint8
+    assert pool.latent_scale(0).dtype is torch.float32
+
+    q = torch.randn(1, 1, 4, LATENT, device="cuda", dtype=torch.bfloat16)
+    sel = rows[:64].view(1, 1, -1)
+    cnt = torch.tensor([[64]], device="cuda", dtype=torch.int32)
+    out = glm_dsa_sparse_attn(
+        q, pool.latent_rows(0), sel, 0.1, counts=cnt, d_v=LATENT - 16,
+        pool_scale=pool.latent_scale(0),
+    )
+    out_split = glm_dsa_sparse_attn(
+        q, pool.latent_rows(0), sel, 0.1, counts=cnt, d_v=LATENT - 16,
+        pool_scale=pool.latent_scale(0), force_splits=4,
+    )
+    decoded = codes_to_f32(pool.latent_rows(0)) * pool.latent_scale(0).unsqueeze(-1)
+    picked = decoded[sel.view(-1).long()]
+    logits = (q[0, 0].float() @ picked.T) * 0.1
+    ref = logits.softmax(-1) @ picked[:, : LATENT - 16]
+    assert (out[0, 0].float() - ref).abs().max().item() < 2e-2
+    assert (out_split.float() - ref).abs().max().item() < 2e-2
+
+
 def test_mla_pool_selected_by_group_spec():
     """The factory keys MLA/DSA pools off the attention-group spec, never the model
     payload -- and zeroed index dims (the dense ablation) fall back to MLAKVCache."""
@@ -120,6 +154,10 @@ def test_mla_pool_selected_by_group_spec():
     dsa = create_kvcache_pool(model_config=cfg(IDX_DIM, 1), num_pages=8, page_size=1,
                               device=torch.device("cuda"), dtype=torch.bfloat16)
     assert isinstance(dsa, DSAKVCache)
+    fp8_dsa = create_kvcache_pool(model_config=cfg(IDX_DIM, 1), num_pages=8, page_size=1,
+                                  device=torch.device("cuda"), dtype=torch.bfloat16,
+                                  kv_quant="fp8")
+    assert isinstance(fp8_dsa, DSAKVCache) and fp8_dsa.store_dtype is torch.uint8
     mla = create_kvcache_pool(model_config=cfg(0, 0), num_pages=8, page_size=1,
                               device=torch.device("cuda"), dtype=torch.bfloat16)
     assert isinstance(mla, MLAKVCache) and not isinstance(mla, DSAKVCache)

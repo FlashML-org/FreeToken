@@ -43,6 +43,7 @@ class MLAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: "tuple[int, ...] | None" = None,
+        kv_quant: str = "none",
     ) -> None:
         self._latent_dim = latent_dim
         if layer_ids is None:
@@ -54,6 +55,7 @@ class MLAKVCache(BaseKVCachePool):
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
+        self.kv_quant = kv_quant
         self._alloc(num_pages)
 
     def _local_layer(self, layer_id: int) -> int:
@@ -61,11 +63,21 @@ class MLAKVCache(BaseKVCachePool):
 
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
-        self._kv_buffer = torch.empty(
-            (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
-            device=self._device,
-            dtype=self._dtype,
-        )
+        shape = (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim)
+        if self.kv_quant == "fp8":
+            from freetoken.kernel.triton.kv_quant import alloc_codes
+
+            self._kv_buffer = alloc_codes(shape, self._device)
+            self._scale_buffer = torch.zeros(
+                (self._num_layers, num_pages * self._page_size),
+                device=self._device,
+                dtype=torch.float32,
+            )
+        elif self.kv_quant == "none":
+            self._kv_buffer = torch.empty(shape, device=self._device, dtype=self._dtype)
+            self._scale_buffer = None
+        else:
+            raise ValueError(f"unknown kv_quant {self.kv_quant!r}")
 
     # -- views (addressed by GLOBAL layer id; remapped when layer_ids was given) --
     def k_cache(self, layer_id: int) -> torch.Tensor:
@@ -81,6 +93,12 @@ class MLAKVCache(BaseKVCachePool):
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
         return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._latent_dim)
+
+    def latent_scale(self, layer_id: int) -> torch.Tensor | None:
+        """One FP32 scale per latent row, or ``None`` for the compute-dtype pool."""
+        if self._scale_buffer is None:
+            return None
+        return self._scale_buffer[self._local_layer(layer_id)]
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -98,6 +116,12 @@ class MLAKVCache(BaseKVCachePool):
         """
         rows = self.latent_rows(layer_id)
         split = rows.shape[1] - k_rope.shape[-1]
+        if self.kv_quant == "fp8":
+            from freetoken.kernel.triton.kv_quant import quantize_rows_to_cache
+
+            latent = torch.cat((c_kv, k_rope), dim=-1).contiguous()
+            quantize_rows_to_cache(latent, out_loc, rows, self.latent_scale(layer_id))
+            return
         rows[out_loc, :split] = c_kv
         rows[out_loc, split:] = k_rope
 
@@ -105,6 +129,7 @@ class MLAKVCache(BaseKVCachePool):
         """In-place resize (frees the old slab first; object identity preserved --
         callers re-derive views per forward, same contract as MHAKVCache.rebuild)."""
         self._kv_buffer = None
+        self._scale_buffer = None
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
@@ -127,7 +152,11 @@ class MLAKVCache(BaseKVCachePool):
 
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
-        return int(buf.numel() * buf.element_size()) // (self._num_pages * self._page_size), 0
+        tokens = self._num_pages * self._page_size
+        kv = int(buf.numel() * buf.element_size()) // tokens
+        if self._scale_buffer is not None:
+            kv += int(self._scale_buffer.numel() * self._scale_buffer.element_size()) // tokens
+        return kv, 0
 
     # -- pool properties ----------------------------------------------------------
     @property
@@ -137,6 +166,10 @@ class MLAKVCache(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    @property
+    def store_dtype(self) -> torch.dtype:
+        return self._kv_buffer.dtype
 
     @property
     def num_layers(self) -> int:
@@ -158,12 +191,13 @@ class DSAKVCache(MLAKVCache):
         index_head_dim: int,
         num_index_layers: int,
         layer_ids: "tuple[int, ...] | None" = None,
+        kv_quant: str = "none",
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         super().__init__(
             latent_dim, num_layers, num_pages, page_size, dtype, device,
-            layer_ids=layer_ids,
+            layer_ids=layer_ids, kv_quant=kv_quant,
         )
 
     def _index_rows(self, num_pages: int) -> int:

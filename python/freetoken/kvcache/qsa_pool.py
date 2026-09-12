@@ -63,6 +63,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_quant: str = "none",
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -98,6 +99,14 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            # "fp8" quantizes ONLY the KV tiers: codes + one scale per (slot, kv_head)
+            # replace the bf16 K/V, and store_kv's fused writer replaces the
+            # separate qsa_store_rows. The three index tiers below stay bf16 no matter
+            # what is asked for -- block selection reads a different tensor
+            # (models/qwen3_8_flash_next.py builds index_k in the engine dtype), so
+            # --kv-cache-dtype fp8 leaves retrieval quality, and the score kernel's
+            # dtype asserts, untouched.
+            kv_quant=kv_quant,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -105,8 +114,11 @@ class QSAKVCache(MHAKVCache):
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
-        # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        # unmasked read finite instead of model-poisoning. One memset per (re)allocation,
+        # through the byte view so it works whether the slab holds bf16 values or e4m3
+        # codes -- a memset is the one op both representations support, and the codes
+        # live in bytes on every architecture (kv_quant.kv_codes_dtype).
+        self._kv_buffer.view(torch.uint8).zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -145,6 +157,9 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            # Same reason as above on an fp8 pool: a grown K/V slab whose scales are gone
+            # would serve quantized rows at the wrong scale rather than fail.
+            self._scale_buffer = None
             raise
 
     @classmethod

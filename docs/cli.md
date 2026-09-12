@@ -71,7 +71,31 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--kv-cache-dtype` | bf16 | `bf16` or `fp8`: store the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+### FP8 KV cache
+
+`ft serve --kv-cache-dtype fp8` halves the bytes per cached token (8-bit codes instead
+of 16), so a card that held N tokens holds close to 2N. Each `(token, kv head)` row
+keeps its own fp32 scale, which costs ~3% back at `head_dim=128`. Requirements and
+trade-offs:
+
+- Needs the **triton** attention backend; `--attn auto` selects it (and refuses an
+  explicit `fi`/`fa`/`trtllm`, which cannot be shown to apply these scales).
+- Works on the plain paged, hybrid-SWA and QSA sparse (Qwen3.8-Flash-Next) KV pools.
+  On QSA the block-selection index keys stay 16-bit; only the selected K/V rows are
+  read back as codes. MLA/DSA latent KV, DeepSeek-V4's tiered pool and the block-sparse
+  MiniMax-M3 pool stay 16-bit; asking for fp8 there fails at startup rather than
+  silently ignoring the flag.
+- The same bytes on every GPU FreeToken targets: the codes sit in a plain byte buffer
+  and are decoded in software, so the cache holds identical data and produces identical
+  numbers on any card (the fp8 type is deliberately kept out of the kernels, which is
+  also what makes the feature work on the RTX 30 series).
+- Accuracy is checkpoint-dependent. Expect it to matter most on long contexts and on
+  models with outlier key channels; keep `bf16` when a run must be bit-reproducible.
+- `ft ctl stats` / `/v1/cache/status` report the smaller `kv_bytes_per_token`, and
+  `ft ctl cache --kv N` moves the same (now cheaper) pool.
 
 ### MoE offload
 

@@ -76,6 +76,22 @@ def harness(monkeypatch):
     return backend, pool, ape
 
 
+def test_fp8_latent_cache_keeps_kpool_index_tiers_bf16():
+    from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
+
+    pool = KpoolDSAKVCache(
+        latent_dim=LATENT, num_layers=1, num_pages=8, page_size=64,
+        dtype=torch.bfloat16, device=torch.device(DEV),
+        index_head_dim=DI, num_index_layers=1,
+        index_ratio=KPOOL, num_req_slots=4, kv_quant="fp8",
+    )
+    assert pool.latent_rows(0).dtype is torch.uint8
+    assert pool.latent_scale(0).dtype is torch.float32
+    assert pool.index_k_cache(0).dtype is torch.bfloat16
+    assert pool.tail_k(0).dtype is torch.bfloat16
+    assert pool.tail_gate(0).dtype is torch.bfloat16
+
+
 def _req(device_len, cached_len=0):
     return SimpleNamespace(
         table_idx=0, device_len=device_len, extend_len=device_len - cached_len,

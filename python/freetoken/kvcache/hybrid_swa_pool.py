@@ -23,6 +23,49 @@ class _KVGroupStorage:
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     storage_shape: tuple[int, int, int]
+    # (2, num_layers, num_slots, local_kv_heads) fp32, or None for an unquantized group.
+    scale_buffer: torch.Tensor | None = None
+
+
+def _alloc_group_storage(
+    *,
+    num_layers: int,
+    local_kv_heads: int,
+    head_dim: int,
+    device: torch.device,
+    store_dtype: torch.dtype,
+    outer_size: int,
+    inner_size: int,
+    quantized: bool,
+) -> _KVGroupStorage:
+    """One group's code buffer (+ fp8 scale buffer), shared by the initial allocation
+    and the in-place rebuild so the two can never drift.
+
+    A quantized buffer is zero-filled: a stale e4m3 code decodes to a real number, so
+    an unwritten slot (the dummy page, a padded request row) would poison attention,
+    while code 0x00 is exactly 0.0. One memset per allocation, same as
+    kvcache/bsa_pool.py. The 16-bit buffer keeps torch.empty.
+    """
+    shape = (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim)
+    if quantized:
+        from freetoken.kernel.triton.kv_quant import alloc_codes
+
+        buffer = alloc_codes(shape, device)
+        scale = torch.zeros(
+            (2, num_layers, outer_size * inner_size, local_kv_heads),
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        buffer = torch.empty(shape, device=device, dtype=store_dtype)
+        scale = None
+    return _KVGroupStorage(
+        buffer=buffer,
+        k_buffer=buffer[0],
+        v_buffer=buffer[1],
+        storage_shape=(outer_size * inner_size, local_kv_heads, head_dim),
+        scale_buffer=scale,
+    )
 
 
 class HybridSWAKVCache(BaseKVCachePool):
@@ -37,14 +80,22 @@ class HybridSWAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         num_swa_tokens: int | None = None,
+        kv_quant: str = "none",
     ) -> None:
         specs = {group.name: group for group in groups if group.num_layers > 0}
         if set(specs) != {"full", "swa"}:
             raise ValueError(f"HybridSWAKVCache requires full and swa groups, got {sorted(specs)}")
 
+        from .mha_pool import _kv_store_dtype
+
         self._num_layers = num_layers
         self._device = device
-        self._dtype = dtype
+        self.kv_quant = kv_quant
+        self._compute_dtype = dtype
+        # What the BUFFER holds -- fp8/uint8 codes when quantized -- reported as
+        # store_dtype. The dtype property keeps answering the compute dtype, same
+        # contract as MHAKVCache (kvcache/base.py): backends size their scratch with it.
+        self._store_dtype = _kv_store_dtype(dtype, kv_quant)
         self._full_num_tokens = num_full_pages * page_size
         self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
         self._page_size = page_size
@@ -63,6 +114,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             inner_size=page_size,
             dtype=dtype,
             device=device,
+            kv_quant=kv_quant,
         )
         self.swa_kv_pool = self._allocate_group(
             specs["swa"],
@@ -71,6 +123,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             inner_size=1,
             dtype=dtype,
             device=device,
+            kv_quant=kv_quant,
         )
         self._storages = {
             "full": self.full_kv_pool,
@@ -88,18 +141,20 @@ class HybridSWAKVCache(BaseKVCachePool):
         inner_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        kv_quant: str = "none",
     ) -> _KVGroupStorage:
+        from .mha_pool import _kv_store_dtype
+
         local_kv_heads = div_even(spec.num_kv_heads, tp_size, allow_replicate=True)
-        buffer = torch.empty(
-            (2, spec.num_layers, outer_size, inner_size, local_kv_heads, spec.head_dim),
+        return _alloc_group_storage(
+            num_layers=spec.num_layers,
+            local_kv_heads=local_kv_heads,
+            head_dim=spec.head_dim,
             device=device,
-            dtype=dtype,
-        )
-        return _KVGroupStorage(
-            buffer=buffer,
-            k_buffer=buffer[0],
-            v_buffer=buffer[1],
-            storage_shape=(outer_size * inner_size, local_kv_heads, spec.head_dim),
+            store_dtype=_kv_store_dtype(dtype, kv_quant),
+            outer_size=outer_size,
+            inner_size=inner_size,
+            quantized=kv_quant != "none",
         )
 
     @staticmethod
@@ -200,6 +255,16 @@ class HybridSWAKVCache(BaseKVCachePool):
         ref = self.layers_mapping[index]
         return self._storages[ref.group].v_buffer[ref.index]
 
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        ref = self.layers_mapping[index]
+        scale = self._storages[ref.group].scale_buffer
+        return None if scale is None else scale[0][ref.index]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        ref = self.layers_mapping[index]
+        scale = self._storages[ref.group].scale_buffer
+        return None if scale is None else scale[1][ref.index]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -207,13 +272,26 @@ class HybridSWAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
-        from freetoken.kernel import store_cache
-
         ref = self.layers_mapping[layer_id]
         storage = self._storages[ref.group]
         indices = out_loc
         if ref.group == "swa":
             indices = self.translate_loc_from_full_to_swa(out_loc)
+        if self.kv_quant == "fp8":
+            from freetoken.kernel.triton.kv_quant import quantize_kv_to_cache
+
+            quantize_kv_to_cache(
+                k=k,
+                v=v,
+                out_loc=indices,
+                k_cache=storage.k_buffer[ref.index].view(storage.storage_shape),
+                v_cache=storage.v_buffer[ref.index].view(storage.storage_shape),
+                k_scale=storage.scale_buffer[0][ref.index],
+                v_scale=storage.scale_buffer[1][ref.index],
+            )
+            return
+        from freetoken.kernel import store_cache
+
         store_cache(
             k_cache=storage.k_buffer[ref.index].view(storage.storage_shape),
             v_cache=storage.v_buffer[ref.index].view(storage.storage_shape),
@@ -236,7 +314,12 @@ class HybridSWAKVCache(BaseKVCachePool):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._dtype
+        return self._compute_dtype
+
+    @property
+    def store_dtype(self) -> torch.dtype:
+        """Element type of the KV buffers: e4m3/uint8 codes when quantized."""
+        return self._store_dtype
 
     @property
     def num_layers(self) -> int:
@@ -245,24 +328,31 @@ class HybridSWAKVCache(BaseKVCachePool):
     @staticmethod
     def _group_geometry(group: _KVGroupStorage) -> tuple:
         # Everything the realloc needs that does NOT pin the old buffer alive: layer count,
-        # kv heads, head_dim, device, dtype. (Plain ints + device/dtype handles, no tensor.)
+        # kv heads, head_dim, device, storage dtype, and whether codes are fp8.
+        # (Plain ints + device/dtype handles, no tensor.)
         _, num_layers, _old_outer, _old_inner, local_kv_heads, head_dim = group.buffer.shape
-        return (num_layers, local_kv_heads, head_dim, group.buffer.device, group.buffer.dtype)
+        return (
+            num_layers,
+            local_kv_heads,
+            head_dim,
+            group.buffer.device,
+            group.buffer.dtype,
+            group.scale_buffer is not None,
+        )
 
     @staticmethod
     def _alloc_group(geom: tuple, outer_size: int, inner_size: int) -> _KVGroupStorage:
         # Only the outer (page/token) dimension changes; the rest comes from ``geom``.
-        num_layers, local_kv_heads, head_dim, device, dtype = geom
-        buffer = torch.empty(
-            (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim),
+        num_layers, local_kv_heads, head_dim, device, store_dtype, quantized = geom
+        return _alloc_group_storage(
+            num_layers=num_layers,
+            local_kv_heads=local_kv_heads,
+            head_dim=head_dim,
             device=device,
-            dtype=dtype,
-        )
-        return _KVGroupStorage(
-            buffer=buffer,
-            k_buffer=buffer[0],
-            v_buffer=buffer[1],
-            storage_shape=(outer_size * inner_size, local_kv_heads, head_dim),
+            store_dtype=store_dtype,
+            outer_size=outer_size,
+            inner_size=inner_size,
+            quantized=quantized,
         )
 
     def rebuild(self, num_full_pages: int, num_swa_tokens: int | None = None) -> None:
@@ -346,10 +436,16 @@ class HybridSWAKVCache(BaseKVCachePool):
         full = self.full_kv_pool.buffer
         swa = self.swa_kv_pool.buffer
         full_tokens = int(full.shape[2]) * int(full.shape[3])
-        return (
-            int(full.numel() * full.element_size()) // full_tokens,
-            int(swa.numel() * swa.element_size()) // self._swa_num_tokens,
-        )
+        kv = int(full.numel() * full.element_size()) // full_tokens
+        swa_b = int(swa.numel() * swa.element_size()) // self._swa_num_tokens
+        # fp8 codes are priced with their scale sidecar, matching kv_cost exactly.
+        if self.full_kv_pool.scale_buffer is not None:
+            fs = self.full_kv_pool.scale_buffer
+            kv += int(fs.numel() * fs.element_size()) // full_tokens
+        if self.swa_kv_pool.scale_buffer is not None:
+            ss = self.swa_kv_pool.scale_buffer
+            swa_b += int(ss.numel() * ss.element_size()) // self._swa_num_tokens
+        return kv, swa_b
 
 
 # ---- SWA pool sizing (pure arithmetic; the pool family's geometry formulas) ----
