@@ -72,18 +72,18 @@ struct StoreKernel {
 
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
         .with_strides({Y, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
     TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
@@ -107,8 +107,8 @@ struct StoreKernel {
         .length = length,
     };
 
-    constexpr auto kWarpPerBlock = num_threads / 32;
-    static_assert(num_threads % 32 == 0);
+    constexpr auto kWarpPerBlock = num_threads / device::kWarpThreads;
+    static_assert(num_threads % device::kWarpThreads == 0);
     const auto num_blocks = div_ceil(length, kWarpPerBlock);
     const auto kernel = use_int32
                             ? store_kv_cache<num_threads, max_concurrency,

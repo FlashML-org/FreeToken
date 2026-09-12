@@ -1,4 +1,4 @@
-"""CUDA toolchain/torch consistency checks.
+"""CUDA/HIP toolchain/torch consistency checks.
 
 Standalone on purpose: setup.py and the kernel-cache build backend load this
 file by path, so it must not import the freetoken package.
@@ -14,6 +14,11 @@ import subprocess
 
 ALLOW_MISMATCH_ENV = "FREETOKEN_ALLOW_CUDA_MISMATCH"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _is_rocm() -> bool:
+    import torch
+    return getattr(torch.version, "hip", None) is not None
 
 
 def _nvcc_path() -> str | None:
@@ -49,6 +54,8 @@ def check_nvcc_matches_torch() -> None:
     nvcc-built binaries link libcudart.so.<nvcc major>; at runtime only the
     torch wheel's own CUDA runtime is guaranteed to be loadable.
     """
+    if _is_rocm():
+        return  # ROCm uses hipcc, not nvcc
     if os.getenv(ALLOW_MISMATCH_ENV, "").strip().lower() in _TRUE_VALUES:
         return
     torch_major = torch_cuda_major()
