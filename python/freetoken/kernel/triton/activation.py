@@ -23,6 +23,13 @@ from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 
 from freetoken.utils.arch import is_sm90_supported
 
+# _fast_tanh/_fast_ex2 below inline raw PTX text (tanh.approx.f32, ex2.approx.f32) via
+# tl.inline_asm_elementwise. HIP's inline-asm path doesn't reject PTX outright -- it
+# fails much later, deep in register allocation ("couldn't allocate output register
+# for constraint 'f'"), since the constraint syntax is generic LLVM inline-asm but the
+# instruction text is NVIDIA-ISA-only. Route ROCm through portable tl/libdevice ops.
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
+
 SILU = 0
 GELU = 1
 GELU_TANH = 2
@@ -50,6 +57,8 @@ def _pdl_supported() -> bool:
 
 @triton.jit
 def _fast_tanh(x):
+    if _IS_HIP:
+        return libdevice.tanh(x)
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
         "tanh.approx.f32 $0, $1;", "=f,f", [x],
@@ -59,6 +68,8 @@ def _fast_tanh(x):
 
 @triton.jit
 def _fast_ex2(x):
+    if _IS_HIP:
+        return tl.exp2(x)
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;", "=f,f", [x],
@@ -136,12 +147,16 @@ def _act_and_mul(
     M = x2.shape[0]
     grid = lambda meta: (M, triton.cdiv(d, meta["BLOCK_D"]))
     pdl = _pdl_supported()
+    # launch_pdl is a CUDA-Hopper-only Triton launch kwarg; the AMD backend's
+    # arg-packer rejects it outright (KeyError) even when passed as False, so it
+    # is only included on the one backend/arch combination that ever sets pdl=True.
+    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
     # Fixed via H100 sweep (72-config grid; 512/w4/s3 within 11% everywhere,
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **pdl_kwargs,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out

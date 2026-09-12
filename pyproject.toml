@@ -3,7 +3,7 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = ["setuptools>=77", "torch>=2.11,<2.14", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -54,10 +54,13 @@ dependencies = [
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
+    # ROCm note: on AMD (rocm.nightlies.amd.com builds) this range is intentionally
+    # loosened -- those wheels report their own local version segment
+    # (2.13.0a0+rocm...) which the sglang-kernel/cu130 constraint above doesn't apply to.
+    "torch>=2.11,<2.14",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
-    "triton==3.6.0; platform_system == 'Linux'",
+    "triton>=3.6,<3.8; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 

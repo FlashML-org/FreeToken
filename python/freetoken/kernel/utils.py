@@ -30,7 +30,13 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
-    flags = DEFAULT_CUDA_CFLAGS + extra
+    import torch
+
+    flags = list(DEFAULT_CUDA_CFLAGS)
+    if torch.version.hip is not None:
+        # nvcc-only: hipcc/clang rejects it outright.
+        flags = [f for f in flags if f != "--expt-relaxed-constexpr"]
+    flags = flags + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:
