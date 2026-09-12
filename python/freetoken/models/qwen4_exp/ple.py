@@ -19,6 +19,7 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
@@ -42,6 +43,14 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
+# Distinct (is_decode, shape, device) keys the n-gram row-id token index is memoized for.
+_TOKEN_INDEX_CACHE_SIZE = 64
+_FUSED_HASH_ENV = "FREETOKEN_PLE_FUSED_HASH"
+
+
+def _fused_row_ids_enabled() -> bool:
+    """The fused hash kernel, on unless ``FREETOKEN_PLE_FUSED_HASH=0`` takes it back to torch ops."""
+    return (os.getenv(_FUSED_HASH_ENV) or "1").strip() not in ("0", "false", "False")
 
 
 class PLETableBackend(Protocol):
@@ -416,6 +425,7 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
+        self._token_index_cache: dict[tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
@@ -462,8 +472,92 @@ class NGramEmbedding(BaseOP):
             shifted.append(torch.where(valid, gathered, packed.new_full((), self.eos_token_id)))
         return shifted
 
-    def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
-        """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
+    def _token_index(self, meta: PLEMetadata) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(req[T], local[T])`` int32: each token's request, and its offset inside it.
+
+        The fused kernel addresses the hash window through these instead of materializing the
+        ``[B, ctx+max_len]`` packed window. Memoized on the shape (which is all they depend on)
+        so a captured replay reads a stable address instead of re-running the build; a build
+        that happens DURING capture is not cached, since its buffers live in the graph pool.
+        """
+        device = meta.input_ids.device
+        num_tokens = meta.input_ids.numel()
+        capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        # is_decode is part of the key, not just the shape: a decode of B requests and a
+        # prefill of ONE B-token request are the same [T] and mean opposite things (one token
+        # per request at offset 0 vs B offsets inside one request).
+        key = (
+            meta.is_decode,
+            (num_tokens,) if meta.is_decode else tuple(meta.seq_lens),
+            str(device),
+        )
+        cached = self._token_index_cache.get(key)
+        if cached is not None:
+            return cached
+        if meta.is_decode:  # one token per request, each at offset 0
+            index = (
+                torch.arange(num_tokens, dtype=torch.int32, device=device),
+                torch.zeros(num_tokens, dtype=torch.int32, device=device),
+            )
+        else:
+            cu = meta.cu_seqlens.long()
+            flat_pos = torch.arange(num_tokens, device=device)
+            req = (torch.searchsorted(cu, flat_pos, right=True) - 1).clamp_(
+                max=len(meta.seq_lens) - 1
+            )
+            index = ((req).to(torch.int32), (flat_pos - cu[req]).to(torch.int32))
+        if not capturing:
+            if len(self._token_index_cache) >= _TOKEN_INDEX_CACHE_SIZE:
+                self._token_index_cache.pop(next(iter(self._token_index_cache)))
+            self._token_index_cache[key] = index
+        return index
+
+    def _use_fused_row_ids(self, meta: PLEMetadata) -> bool:
+        device = meta.input_ids.device
+        if device.type != "cuda":
+            return False
+        if not _fused_row_ids_enabled():
+            return False
+        return all(
+            t.device == device
+            for t in (
+                meta.ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+        )
+
+    def row_ids(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64.
+
+        One Triton program per token on CUDA; ``row_ids_reference`` is the same arithmetic in
+        torch ops and stays the oracle (and the CPU path).
+        """
+        if self._use_fused_row_ids(meta):
+            from freetoken.kernel.triton.ple_hash import ple_row_ids
+
+            req, local = self._token_index(meta)
+            return ple_row_ids(
+                meta.input_ids.long(),
+                meta.ngram_context,
+                req,
+                local,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                eos_token_id=self.eos_token_id,
+                heads_per_ngram=self.heads_per_ngram,
+                out=out,
+            )
+        rows = self.row_ids_reference(meta)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def row_ids_reference(self, meta: PLEMetadata) -> torch.Tensor:
+        """Torch-op transcription of the hash; the oracle the fused kernel is diffed against."""
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
         blocks = []
