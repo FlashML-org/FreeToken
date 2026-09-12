@@ -8,7 +8,7 @@ from types import ModuleType
 from typing import Any, List
 
 import torch
-from freetoken.message import TokenizeMsg
+from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
 
@@ -55,8 +55,8 @@ class TokenizeManager:
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
+        results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
@@ -71,7 +71,28 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            if msg.images:
+                from freetoken.mm.processor import get_mm_processor
+
+                processor = get_mm_processor(getattr(self.tokenizer, "name_or_path", ""))
+                if processor is None:
+                    raise ValueError("image input is not supported for this model")
+                mm = processor.apply(input_ids, msg.images, msg.mm_max_pixels)
+                results.append(
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=mm.input_ids,
+                        sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items,
+                        mrope_positions=mm.mrope_positions,
+                        mrope_delta=mm.mrope_delta,
+                    )
+                )
+            else:
+                results.append(
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                )
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:

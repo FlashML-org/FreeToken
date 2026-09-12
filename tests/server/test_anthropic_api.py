@@ -17,11 +17,14 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
+from freetoken.message import UserMsg  # noqa: E402
 from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import anthropic_api as A  # noqa: E402
 from freetoken.server.anthropic_models import AnthropicMessagesRequest  # noqa: E402
@@ -421,10 +424,12 @@ class FakeState:
         self._outputs = outputs
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(max_pixels=None, text_model_only=False, disabled_encoders=frozenset()),
             reasoning_parser=None,
             tool_call_parser="llama3",
             served_model_name="test-model",
             model_path="/test",
+            served_modalities=frozenset(),
         )
         self._uid = 0
         self._count_manager = None
@@ -605,23 +610,20 @@ def test_convert_native_thinking_toggle():
 # --------------------------------------------------------------------------- #
 # /v1/messages/count_tokens (route + neutral count_prompt_tokens primitive)
 # --------------------------------------------------------------------------- #
-class _FakeIds:
-    def __init__(self, n):
-        self._n = n
-
-    def numel(self):
-        return self._n
-
-
 class _FakeTokenizeManager:
-    """Counts tokens as len(str(prompt)) so tests are deterministic without a model."""
+    """Counts tokens as len(str(prompt)) so tests are deterministic without a model; returns the wire message like the real manager."""
 
     def __init__(self):
         self.msgs = []
 
     def tokenize(self, msgs):
+        import torch
+
         self.msgs.extend(msgs)
-        return [_FakeIds(len(str(m.text))) for m in msgs]
+        return [
+            UserMsg(uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params)
+            for m in msgs
+        ]
 
 
 def _count_client(manager=None, maintenance_state="serving"):
@@ -865,3 +867,49 @@ def test_tool_result_carries_the_wire_tool_use_id():
     results = [m for m in spec.messages if m["role"] == "tool"]
     assert [(m["tool_call_id"], m["content"]) for m in results] == [
         ("toolu_b", "60F"), ("toolu_a", "72F")]
+
+
+def test_count_tokens_reads_the_real_manager_return_contract():
+    import torch
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return "rendered"
+
+        def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+            return torch.tensor([[7, 8, 9, 10, 11]], dtype=torch.long)
+
+    client, _ = _count_client(TokenizeManager(_Tokenizer()))
+    r = client.post(
+        "/v1/messages/count_tokens",
+        json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"input_tokens": 5}
+
+
+def test_tool_result_image_is_rejected_not_dropped():
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                    }
+                ],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="tool results"):
+        A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(body), {})
+    r = _client(FakeState([])).post("/v1/messages", json=body)
+    assert r.status_code == 400, r.text
+    assert "tool results" in r.json()["error"]["message"]

@@ -14,6 +14,7 @@ from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
+from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
@@ -32,7 +33,6 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
-
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -328,6 +328,16 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        if config.active_encoders:
+            from freetoken.models.blocks import SupportsMultimodal
+
+            if not isinstance(self.model, SupportsMultimodal):
+                raise TypeError(
+                    f"{type(self.model).__name__} has encoders registered but lacks the SupportsMultimodal hooks; "
+                    "run with --text-model-only"
+                )
+            # before the residency snapshot, so streamed blocks are not charged as resident weights
+            self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -348,6 +358,27 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        self.encoder_cache = None
+        self.mm_processor = None
+        if config.active_encoders:
+            from freetoken.mm.encoder_cache import EncoderCache
+            from freetoken.mm.processor import get_mm_processor
+
+            self.mm_processor = get_mm_processor(config.model_path)
+            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            logger.info_rank0(
+                f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
+                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+            )
+            self._warmup_encoders()
+        elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
+            logger.info_rank0(
+                "Multimodal disabled: --text-model-only"
+                if config.mm.text_model_only
+                else "Multimodal disabled: --mm-disable"
+                if config.mm.disabled_encoders
+                else "Multimodal disabled: no encoder registered for this architecture"
+            )
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -429,6 +460,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -474,10 +506,43 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+                include_vision=bool(config.active_encoders),
             ),
             device=self.device,
         )
 
+    @torch.inference_mode()
+    def _warmup_encoders(self) -> None:
+        for item in self.mm_processor.dummy_items(self.dtype, self.device):
+            if item.modality in self.config.served_modalities:
+                self.model.encode(item)
+        torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()
+    def _run_mm_encoder(self, batch: Batch) -> None:
+        """Encode the chunk's cache-miss items and gather its embedding rows into batch.mm_embeds, right before the LM forward."""
+        cache = self.encoder_cache
+        jobs = batch.mm_encoder_jobs or ()
+        # a job whose rows are not gathered this chunk would be encoded and freed unread
+        planned = {row[1] for row in batch.mm_gather_plan}
+        orphans = [item.hash for item in jobs if item.hash not in planned]
+        assert not orphans, f"encoder jobs without gather rows: {orphans}"
+        for item in jobs:
+            if not cache.has(item.hash):
+                if item.precomputed_embeddings is not None:
+                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                else:
+                    emb = self.model.encode(item)
+                cache.put(item.hash, emb)
+            # cached now; free the ~MiB feature buffer
+            item.feature = None
+            item.precomputed_embeddings = None
+        parts = []
+        for uid, item_hash, lo, hi, _, _ in batch.mm_gather_plan:
+            parts.append(cache.get_slice(item_hash, lo, hi, self.device))
+            cache.consume(item_hash, uid, hi - lo)
+        if parts:
+            batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -906,10 +971,13 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -970,6 +1038,10 @@ class Engine:
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+                if self.config.model_config.model_is_mrope:
+                    batch.mrope_positions = (
+                        batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+                    )
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):

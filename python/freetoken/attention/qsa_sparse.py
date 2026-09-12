@@ -88,6 +88,10 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # mrope only, built once per forward: row r of the caches is token r's [cos | sin] (queries) or its group start's (keys)
+    rope_rows:        torch.Tensor | None = None  # [T] int32 arange
+    q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -129,6 +133,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
         self._index_cos_sin: torch.Tensor | None = None
+        self._section_table: torch.Tensor | None = None
+        if group.rotary_config.mrope_section is not None:
+            from freetoken.layers.rotary import build_section_table
+
+            self._section_table = build_section_table(
+                tuple(group.rotary_config.mrope_section), group.rotary_config.mrope_layout
+            ).to(self.device)
 
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
@@ -174,6 +185,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 )
             self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
+
+    def _index_rope_rows(self, positions: torch.Tensor) -> torch.Tensor:
+        """Per-token indexer cos/sin rows for [3, n] mrope positions."""
+        from freetoken.layers.rotary import mrope_cos_sin_rows
+
+        return mrope_cos_sin_rows(self._index_rope_cache(), positions, self._section_table)
 
     # ----- metadata -----------------------------------------------------------------------
     def prepare_metadata(self, batch: Batch) -> None:
@@ -298,6 +315,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.positions = batch.positions
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
+        if self._section_table is not None:
+            rope_positions = batch.get_attn_positions()
+            if rope_positions.dim() == 1:
+                rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
+            rope_positions = rope_positions.to(torch.int32)
+            self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
+            # groups are ratio-aligned within a page, so the group start is the slot rounded down
+            first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()
+            md.rope_rows = torch.arange(out_loc.numel(), dtype=torch.int32, device=self.device)
+            md.q_rope_cache = self._index_rope_rows(rope_positions)
+            md.k_rope_cache = self._index_rope_rows(first_pos)
         rows = torch.arange(out_loc.numel(), device=self.device)
         req = md.token_to_req.to(torch.int64)
         slots = md.ring_slots.to(torch.int64).index_select(0, req)
@@ -338,10 +366,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        if md.k_rope_cache is None:
+            rope_positions, rope_cache = first, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.k_rope_cache
         qsa_index_norm_rope(
             pooled,
-            first,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -364,10 +396,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
+        if md.q_rope_cache is None:
+            rope_positions, rope_cache = positions, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),

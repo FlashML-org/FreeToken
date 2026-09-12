@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -7,7 +8,8 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
-from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
+from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -87,6 +89,8 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
         if self.moe_backend is None:
@@ -102,12 +106,37 @@ class EngineConfig:
         return cached_load_hf_config(self.model_path)
 
     @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
+    def active_encoders(self) -> tuple[EncoderSpec, ...]:
+        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        return tuple(
+            e
+            for e in self.model_spec.encoders
+            if getattr(self.hf_config, e.config_key, None) is not None
+            and e.kind not in self.mm.disabled_encoders
+        )
+
+    @cached_property
+    def served_modalities(self) -> frozenset[str]:
+        """Modalities this process accepts."""
+        return frozenset(m for e in self.active_encoders for m in e.modalities)
+
+    @cached_property
     def model_config(self) -> ModelConfig:
-        spec = get_model_spec(self.hf_config.architectures[0])
-        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
+        hf_config = copy.copy(self.hf_config)
+        built = {e.config_key for e in self.active_encoders}
+        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
+            if key not in built:
+                setattr(hf_config, key, None)
+        spec = self.model_spec
+        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
-        parse_config = _load_attr(spec.module, spec.parse_config)
-        return replace(parse_config(self.hf_config), quant=quant)
+        model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        return replace(model_config, quant=quant)
 
     @property
     def max_seq_len(self) -> int:

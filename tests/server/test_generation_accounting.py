@@ -46,6 +46,7 @@ class FakeState:
 
     def __init__(self, replies: list[UserReply]) -> None:
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(max_pixels=None, text_model_only=False, disabled_encoders=frozenset()),
             model_path="/m",
             served_model_name="unit-model",
             tool_call_parser="llama3",

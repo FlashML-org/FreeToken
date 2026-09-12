@@ -218,7 +218,21 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
+                src = block.source or {}
+                stype = src.get("type")
+                data = src.get("data") if stype == "base64" else src.get("url")
+                if not data:
+                    # an unsupported image source must fail the request, not degrade to a text-only answer
+                    raise ValueError(f"unsupported image source type: {stype!r}")
+                content_parts.append(
+                    {
+                        "type": "image",
+                        "freetoken_ref": {
+                            "kind": "b64" if stype == "base64" else "url",
+                            "data": data,
+                        },
+                    }
+                )
                 continue
             elif block.type == "tool_use":
                 tool_calls.append(
@@ -347,6 +361,9 @@ def _tool_result_text(content) -> str:
     parts: list[str] = []
     for item in content:
         if isinstance(item, dict):
+            if item.get("type") == "image":
+                # chat templates render tool messages as plain text, so an image here has nowhere to go
+                raise ValueError("images inside tool results are not supported")
             parts.append(item.get("text") or "")
         else:
             parts.append(str(item))

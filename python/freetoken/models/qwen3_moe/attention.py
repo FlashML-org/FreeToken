@@ -57,6 +57,12 @@ class Qwen3MoeAttention(BaseOP):
                 if config.rotary_config.scaling
                 else None
             ),
+            mrope_section=(
+                tuple(config.rotary_config.mrope_section)
+                if config.rotary_config.mrope_section is not None
+                else None
+            ),
+            mrope_layout=config.rotary_config.mrope_layout,
         )
         self.o_proj = LinearOProj(
             head_dim * config.num_qo_heads,
@@ -76,7 +82,7 @@ class Qwen3MoeAttention(BaseOP):
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        q, k = self.rotary.forward(ctx.batch.get_attn_positions(), q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self.o_proj.forward(o.view(-1, self.qo_attn_dim))
