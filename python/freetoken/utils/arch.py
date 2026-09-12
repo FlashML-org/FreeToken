@@ -40,6 +40,10 @@ def is_sm100_family() -> bool:
     return _is_arch_family(10)
 
 
+def is_sm70_supported() -> bool:
+    return is_arch_supported(7, 0)
+
+
 def is_sm90_supported() -> bool:
     return is_arch_supported(9, 0)
 

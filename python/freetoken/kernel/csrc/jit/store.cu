@@ -25,7 +25,7 @@ struct StoreKernelParams {
 template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
           std::size_t kElementSize, std::integral T>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
-    store_kv_cache(const __grid_constant__ StoreKernelParams params) {
+    store_kv_cache(const FT_GRID_CONSTANT StoreKernelParams params) {
   using namespace device;
 
   constexpr auto kWarpPerBlock =

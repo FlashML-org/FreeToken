@@ -33,21 +33,31 @@ inline constexpr auto get_mem_package() {
     }
 }
 
+// The L1::no_allocate hint keeps this streaming host gather from evicting L1, but the
+// modifier is sm_70+ and Pascal's ptxas rejects it outright. It is a cache hint only, so
+// pre-sm_70 issues the plain load and loses nothing but the anti-pollution optimisation.
+// (st.global.wt below assembles fine on sm_6x, so the stores are left alone.)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define FT_LD_STREAM "ld.global."
+#else
+#define FT_LD_STREAM "ld.global.L1::no_allocate."
+#endif
+
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
-    asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
+    asm volatile(FT_LD_STREAM "b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
 }
 
 __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
     uint32_t tmp0, tmp1;
-    asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
+    asm volatile(FT_LD_STREAM "v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
 }
 
 __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
     uint32_t tmp0, tmp1, tmp2, tmp3;
-    asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
+    asm volatile(FT_LD_STREAM "v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
 }
 
@@ -485,7 +495,7 @@ struct MultiIndexCopyParams {
 
 template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank>
 __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
-    const __grid_constant__ MultiIndexCopyParams p
+    const FT_GRID_CONSTANT MultiIndexCopyParams p
 ) {
     const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
     if (b >= p.num_banks) {

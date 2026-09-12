@@ -6,6 +6,24 @@ import pytest
 import torch
 
 
+def _skip_if_smem_too_small(head_dim: int) -> None:
+    """Skip when no valid extend tile fits this device's per-block shared memory.
+
+    ``_select_extend_tiles`` bottoms out at (16, 16) -- ``tl.dot`` needs N >= 16 -- whose
+    q/k/v tiles alone want ``(16 + 2 * 16) * head_dim * 2`` bytes. Pre-Volta caps a block
+    at 48KB with no opt-in, so head_dim 512 has no fitting configuration on that hardware
+    rather than a merely slower one.
+    """
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    optin = int(getattr(props, "shared_memory_per_block_optin", 0))
+    # 0.8 mirrors the selector's own headroom for scores/acc/alignment/triton scratch.
+    if optin and (16 + 2 * 16) * head_dim * 2 > optin * 0.8:
+        pytest.skip(
+            f"head_dim {head_dim} needs more shared memory than this device offers "
+            f"per block ({optin} bytes); the smallest valid extend tile does not fit"
+        )
+
+
 def _reference_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -441,6 +459,7 @@ def test_extend_triton_attention_matches_reference(
 ):
     from freetoken.kernel.triton.attention import extend_paged_attention
 
+    _skip_if_smem_too_small(head_dim)
     torch.manual_seed(2)
     device = torch.device("cuda")
     num_q_heads = 16
@@ -603,15 +622,32 @@ def test_extend_triton_attention_with_sinks_matches_reference(use_split_inputs: 
         # unknown budget -> conservative small tiles (prior consumer-safe behavior)
         (256, 0, (64, 32)),
         (512, 0, (16, 16)),
+        # pre-Volta: 48KB per block, no opt-in
+        (64, 49152, (128, 64)),
+        (128, 49152, (64, 32)),
+        (256, 49152, (16, 16)),
     ],
 )
 def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expected):
+    """The first (largest) candidate is what a device actually runs, so it pins the
+    per-device choice; the rest of the ladder only comes into play when triton reports
+    the tile does not fit after all."""
     import triton
 
-    from freetoken.kernel.triton.attention import _select_extend_tile
+    from freetoken.kernel.triton.attention import _select_extend_tiles
 
     block_d = triton.next_power_of_2(head_dim)
-    assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
+    assert _select_extend_tiles(head_dim, block_d, smem_optin)[0] == expected
+
+
+def test_select_extend_tiles_descends_to_the_dot_floor():
+    import triton
+
+    from freetoken.kernel.triton.attention import _select_extend_tiles
+
+    tiles = _select_extend_tiles(128, triton.next_power_of_2(128), 49152)
+    assert tiles[-1] == (16, 16), "tl.dot needs N >= 16, so (16, 16) is the floor"
+    assert tiles == sorted(tiles, reverse=True), "candidates must descend"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")

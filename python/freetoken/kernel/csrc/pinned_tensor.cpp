@@ -10,6 +10,18 @@ void free_pinned(void *ptr) {
   }
 }
 
+// A failed CUDA runtime call leaves its status in the per-thread "last error" slot, so
+// the next unrelated C10_CUDA_CHECK anywhere in the process reports it instead of its
+// own result. Consume it before throwing to keep the failure local to this call. It
+// matters most for host_device_ptr, which drivers may legitimately reject (pre-sm_70
+// validates registration where newer arches let UVA degenerate the lookup to identity).
+void check_cuda(cudaError_t err, const char *what) {
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    TORCH_CHECK(false, what, ": ", cudaGetErrorString(err));
+  }
+}
+
 torch::Tensor create_pinned_tensor_like(torch::Tensor input) {
   TORCH_CHECK(input.device().is_cpu(), "Input tensor must be on CPU");
   TORCH_CHECK(input.layout() == torch::kStrided,
@@ -35,8 +47,7 @@ torch::Tensor create_pinned_tensor_like(torch::Tensor input) {
 
   void *data_ptr = nullptr;
   const cudaError_t alloc_err = cudaMallocHost(&data_ptr, alloc_nbytes);
-  TORCH_CHECK(alloc_err == cudaSuccess,
-              "cudaMallocHost failed: ", cudaGetErrorString(alloc_err));
+  check_cuda(alloc_err, "cudaMallocHost failed");
 
   auto options = input.options().device(torch::kCPU).pinned_memory(true);
 
@@ -60,8 +71,7 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
   void *data_ptr = nullptr;
   const cudaError_t alloc_err = cudaHostAlloc(
       &data_ptr, alloc_nbytes, cudaHostAllocPortable | cudaHostAllocMapped);
-  TORCH_CHECK(alloc_err == cudaSuccess,
-              "cudaHostAlloc failed: ", cudaGetErrorString(alloc_err));
+  check_cuda(alloc_err, "cudaHostAlloc failed");
 
   auto options = torch::TensorOptions()
                      .dtype(dtype)
@@ -77,7 +87,7 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
 bool host_ptr_identity() {
   int device = 0;
   const cudaError_t err = cudaGetDevice(&device);
-  TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
+  check_cuda(err, "cudaGetDevice failed");
   int uva = 0, reg = 0;
   cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
   cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
@@ -88,9 +98,8 @@ int64_t host_device_ptr(int64_t host_ptr) {
   void *dev_ptr = nullptr;
   const cudaError_t err =
       cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void *>(host_ptr), 0);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
-              cudaGetErrorString(err));
+  check_cuda(err,
+             "cudaHostGetDevicePointer failed (host memory must be pinned+mapped)");
   return reinterpret_cast<int64_t>(dev_ptr);
 }
 
@@ -98,15 +107,13 @@ void host_register(int64_t addr, int64_t nbytes) {
   const cudaError_t err =
       cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
                        cudaHostRegisterPortable | cudaHostRegisterMapped);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaHostRegister failed: ", cudaGetErrorString(err));
+  check_cuda(err, "cudaHostRegister failed");
 }
 
 int64_t driver_cuda_version() {
   int version = 0;  // stays 0 when no driver is installed
   const cudaError_t err = cudaDriverGetVersion(&version);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaDriverGetVersion failed: ", cudaGetErrorString(err));
+  check_cuda(err, "cudaDriverGetVersion failed");
   return version;
 }
 
