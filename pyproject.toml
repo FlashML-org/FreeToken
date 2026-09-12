@@ -89,9 +89,38 @@ accel = ["freetoken[fi,sgl]"]
 # indexes serve. `explicit = true` scopes each index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
+#
+# Which CUDA build of torch to pin is a *group* choice. cu130 is the default, so a plain
+# `uv sync` resolves exactly as it did before this was split out. CUDA 13 dropped Maxwell,
+# Pascal and Volta, so its wheels carry no cubin below sm_75 and simply cannot run on those
+# cards; the cu126 build still ships sm_50/60/70/75/80/86/90, and its sm_60 cubin runs on
+# sm_61 under CUDA's minor-version binary compatibility guarantee. For a pre-Turing GPU:
+#
+#     uv sync --no-default-groups --group cu126
+#
+# The groups are declared conflicting, so the two can never resolve into one environment.
+[dependency-groups]
+cu130 = ["torch>=2.11,<2.12"]
+cu126 = ["torch>=2.11,<2.12"]
+
+[tool.uv]
+default-groups = ["cu130"]
+conflicts = [[{ group = "cu126" }, { group = "cu130" }]]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = [
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu130", group = "cu130" },
+]
+# No cu126 counterpart on purpose: sglang-kernel publishes cu130 wheels only, and its AOT
+# kernels are sm_75+ regardless, so a pre-Turing install leaves the `sgl` extra off and
+# falls back to the pure-triton kernels. Same for flashinfer's `fi` extra (cu13 cubins).
 sglang-kernel = { index = "sglang-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
