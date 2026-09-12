@@ -261,9 +261,18 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         # ratio-0 layers have no compressed pool; the kernel never reads it there (n_window ==
         # topk), so alias the window pool to keep the two-pool stride assert happy.
         cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
+        # 8-bit pools carry a parallel scale array; alias it the same way the pool is aliased
+        # on a ratio-0 layer so the kernel's stride-sharing assert still holds.
+        win_s = getattr(pool, "window_scale", None)
+        if win_s is not None and win_s[layer_id] is not None:
+            cmp_s = pool.cmp_scale[layer_id] if has_compression else win_s[layer_id]
+        else:
+            cmp_s = None
         return sparse_attn_paged(
             q, pool.window_pool[layer_id], cmp, attn_sink,
             topk_idxs.int(), n_window, softmax_scale, cmp_counts=cmp_counts,
+            window_scale=win_s[layer_id] if win_s is not None else None,
+            cmp_scale=cmp_s,
         )
 
     # ----- internals --------------------------------------------------------------------

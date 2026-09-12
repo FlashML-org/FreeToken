@@ -36,6 +36,12 @@ class CompressorBackendMixin:
     def compress_pool(self, layer_id: int, tier: str) -> torch.Tensor:
         return getattr(self.pool, self._TIER_ATTRS[tier][0])[layer_id]
 
+    def compress_scale(self, layer_id: int, tier: str):
+        """Parallel scale array for an 8-bit compressed pool, else None."""
+        if tier != "attn":
+            return None
+        return getattr(self.pool, "cmp_scale", [None] * (layer_id + 1))[layer_id]
+
     def compress_state_ring(self, layer_id: int, tier: str):
         return getattr(self.pool, self._TIER_ATTRS[tier][1])[layer_id]
 
@@ -68,6 +74,13 @@ class CompressorBackendMixin:
         self, layer_id: int, tier: str, rows: torch.Tensor, kv: torch.Tensor
     ) -> None:
         pool = self.compress_pool(layer_id, tier)
+        # The attention tier's cmp_pool may be 8-bit; the indexer tier never is.
+        scales = self.compress_scale(layer_id, tier)
+        if scales is not None:
+            from freetoken.kernel.triton.dsv4.kv_quant import store_kv_quant
+
+            store_kv_quant(pool, scales, rows, kv.reshape(-1, pool.shape[1]))
+            return
         pool.index_copy_(0, rows, kv.to(pool.dtype))
 
     # ----- compress-state ring ---------------------------------------------------------

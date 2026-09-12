@@ -8,9 +8,11 @@ Four buffer families, sized from a budget (the cost model) not ``num_requests``:
 * ``state_ring[L]``   -- ratio>0 layers; the per-window-page compress-state ring
   (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot.
 
-The KV/compressed/indexer pools are bf16 (the fp8/fp4 quant is an in-place round-trip already
-baked into the bf16 value, so ``index_select`` staging is byte-exact); only the compress-state
-ring is fp32.
+The indexer pool is bf16 and the compress-state ring is fp32. The window and compressed
+pools are bf16 by default -- the fp8/fp4 quant is an in-place round-trip already baked into
+the bf16 value, so ``index_select`` staging is byte-exact -- or fp8 with a parallel fp16
+scale array under ``kv_quant`` (see :mod:`freetoken.kvcache.dsv4_kv_quant`), which stores
+those already-rounded values in 8 bits instead of 16.
 
 ``state_loc`` is DERIVED from a window slot, never stored:
     state_loc = where(ws < 0, -1, (ws // P) * ring_size + ws % ring_size)
@@ -29,6 +31,11 @@ from .dsv4_cost_model import (
     dsv4_kv_unit_bytes,
     dsv4_window_unit_bytes,
     ring_size_for_ratio,
+)
+from .dsv4_kv_quant import (
+    SCALE_DTYPE as KV_SCALE_DTYPE,
+    STORAGE_DTYPE as KV_STORAGE_DTYPE,
+    scale_width,
 )
 
 
@@ -151,6 +158,13 @@ class CompressStateRing:
         self._clear_scratch()
 
 
+def _store_kv_quant(pool, scales, slots, kv) -> None:
+    """Quantizing counterpart of ``index_copy_`` for an 8-bit pool."""
+    from freetoken.kernel.triton.dsv4.kv_quant import store_kv_quant
+
+    store_kv_quant(pool, scales, slots, kv.reshape(-1, pool.shape[1]))
+
+
 class DSV4PagedKVCache(BaseKVCachePool):
     def __init__(
         self,
@@ -160,8 +174,15 @@ class DSV4PagedKVCache(BaseKVCachePool):
         dtype: torch.dtype = torch.bfloat16,
         P: int = 128,
         n_scratch: int = 1,
+        kv_quant: bool = False,
     ) -> None:
-        assert dtype == torch.bfloat16, "KV pools are bf16 (fp4/fp8 is an in-place round-trip)"
+        assert dtype == torch.bfloat16, "the compute dtype is bf16"
+        # 8-bit storage for the window / compressed attention KV (see dsv4_kv_quant). The
+        # indexer pool and the compress-state rings keep their dtype: the indexer's K decides
+        # top-k *selection*, and the rings are fp32 accumulators, neither of which is a
+        # storage-bandwidth problem worth a routing or accumulation risk.
+        self.kv_quant = bool(kv_quant)
+        self._kv_storage_dtype = KV_STORAGE_DTYPE if self.kv_quant else dtype
         self.args = args
         self.sizes = sizes
         self._device = device
@@ -208,10 +229,20 @@ class DSV4PagedKVCache(BaseKVCachePool):
             self.full_loc_map: torch.Tensor | None = None
 
         # Window KV: every layer.
+        kvdt = self._kv_storage_dtype
         self.window_pool: list[torch.Tensor] = [
-            torch.zeros(sizes.n_win_slots, self.head_dim, device=device, dtype=dtype)
+            torch.zeros(sizes.n_win_slots, self.head_dim, device=device, dtype=kvdt)
             for _ in range(self._n_layers)
         ]
+        # Parallel scale arrays, one fp16 per quant block along head_dim. Empty when the
+        # pools are bf16, so the unquantized path allocates nothing extra.
+        nb = scale_width(self.head_dim) if self.kv_quant else 0
+        self.window_scale: list[torch.Tensor | None] = [
+            torch.zeros(sizes.n_win_slots, nb, device=device, dtype=KV_SCALE_DTYPE)
+            if self.kv_quant else None
+            for _ in range(self._n_layers)
+        ]
+        self.cmp_scale: list[torch.Tensor | None] = []
 
         # Compressed KV / Indexer KV / compress-state ring: per ratio-class.
         # ``state_ring`` is the ATTENTION compressor's ring (head_dim). Ratio-4
@@ -225,6 +256,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
             ratio = self.compress_ratios[L]
             if ratio == 0:
                 self.cmp_pool.append(None)
+                self.cmp_scale.append(None)
                 self.idx_pool.append(None)
                 self.state_ring.append(None)
                 self.indexer_state_ring.append(None)
@@ -235,8 +267,13 @@ class DSV4PagedKVCache(BaseKVCachePool):
             self.cmp_scratch_base.append(sizes.cmp_blocks[L])
             self.cmp_pool.append(
                 torch.zeros(
-                    sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=dtype
+                    sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=kvdt
                 )
+            )
+            self.cmp_scale.append(
+                torch.zeros(sizes.cmp_blocks[L] + self.n_scratch, nb,
+                            device=device, dtype=KV_SCALE_DTYPE)
+                if self.kv_quant else None
             )
             if ratio == 4:
                 self.idx_scratch_base.append(sizes.idx_blocks[L])
@@ -557,11 +594,18 @@ class DSV4PagedKVCache(BaseKVCachePool):
 
     # ----- specialized writes -----
     def store_window(self, k: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
+        if self.kv_quant:
+            _store_kv_quant(
+                self.window_pool[layer_id], self.window_scale[layer_id], window_slot, k)
+            return
         self.window_pool[layer_id].index_copy_(0, window_slot, k.to(self._dtype))
 
     def store_compressed(self, kv: torch.Tensor, layer_id: int, cmp_slot: torch.Tensor) -> None:
         pool = self.cmp_pool[layer_id]
         assert pool is not None, f"layer {layer_id} (ratio 0) has no compressed pool"
+        if self.kv_quant:
+            _store_kv_quant(pool, self.cmp_scale[layer_id], cmp_slot, kv)
+            return
         pool.index_copy_(0, cmp_slot, kv.to(self._dtype))
 
     def store_indexer(self, k: torch.Tensor, layer_id: int, idx_slot: torch.Tensor) -> None:

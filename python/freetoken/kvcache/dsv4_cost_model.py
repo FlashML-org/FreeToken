@@ -19,9 +19,11 @@ Byte conventions:
 
 from __future__ import annotations
 
+import math
 import os
-
 from dataclasses import dataclass, field
+
+from .dsv4_kv_quant import BYTES_PER_ELEMENT as KV_QUANT_BYTES_PER_ELEMENT
 
 _BF16_BYTES = 2
 _FP32_BYTES = 4
@@ -48,6 +50,16 @@ def ring_size_for_ratio(ratio: int) -> int:
 
 
 def _kv_bytes(args) -> int:
+    """Bytes per element in the window / compressed KV tiers.
+
+    Under ``kv_quant`` those two pools store fp8 plus one fp16 scale per 32 elements
+    (1.0625 B/elem); the indexer tier and the state rings are unaffected. This has to
+    agree with what the pool actually allocates: ``--moe-cache-auto`` divides the VRAM
+    budget by these numbers, so a stale 2 here would over-size the expert cache and then
+    fail at allocation.
+    """
+    if getattr(args, "kv_quant", False):
+        return math.ceil(args.head_dim * KV_QUANT_BYTES_PER_ELEMENT)
     return args.head_dim * _BF16_BYTES
 
 
