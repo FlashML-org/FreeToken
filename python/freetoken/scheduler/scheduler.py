@@ -133,6 +133,10 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._kv_ladder_waiting: list[UserMsg] = []
+        self._kv_ladder = (
+            self._make_kv_ladder_policy() if getattr(config, "enable_kv_ladder", False) else None
+        )
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -140,6 +144,54 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+    def _make_kv_ladder_policy(self):
+        """Bind the pure ladder arithmetic to this engine's measured cache costs."""
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, net_cache_budget_bytes
+        from freetoken.kvcache.linear_state_pool import state_pool_bytes
+
+        from .kv_ladder import KVLadderPolicy
+
+        if self.config.tp_info.size != 1:
+            raise ValueError("--enable-kv-ladder currently requires TP=1")
+        if self.config.max_running_req != 1:
+            raise ValueError("--enable-kv-ladder requires max_running_req=1")
+        if not self.cache_manager.supports_runtime_rebuild:
+            raise ValueError("--enable-kv-ladder is unsupported by this model's KV cache")
+        if getattr(self.config.model_config, "dsv4_args", None) is not None:
+            raise ValueError("--enable-kv-ladder does not yet support DSV4's owned KV tiers")
+        moe = self.engine.moe_offload_cache
+        if moe is None:
+            raise ValueError("--enable-kv-ladder requires an offloaded MoE slot cache")
+
+        cache_per_page, fixed_cache_size, _, _ = type(self.engine.kv_cache).kv_cost(self.config)
+        physical_mamba_slots = (
+            self.engine.linear_state_pool.num_slots
+            if self.engine.linear_state_pool is not None else None
+        )
+        fixed_cache_size += state_pool_bytes(self.config, physical_mamba_slots)
+        pool_budget = net_cache_budget_bytes(
+            self.config.memory_ratio,
+            self.engine._baseline_free,
+            self.engine._weights_bytes,
+            fixed_cache_size,
+        )
+        policy = KVLadderPolicy(
+            step_tokens=self.config.ladder_step_size,
+            max_context_tokens=self.config.max_seq_len,
+            page_size=self.config.page_size,
+            pool_budget_bytes=pool_budget,
+            kv_bytes_per_page=cache_per_page,
+            moe_bytes_per_slot=expert_bytes_per_slot(moe.bank_sources),
+            min_moe_slots=self.config.model_config.num_experts,
+        )
+        logger.info_rank0(
+            "KV ladder enabled: step=%d tokens, current=%d tokens, ceiling=%d tokens",
+            policy.step_tokens,
+            self.engine.num_pages * self.config.page_size,
+            policy.max_context_tokens,
+        )
+        return policy
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -210,6 +262,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or getattr(self, "_kv_ladder_waiting", None)
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -221,6 +274,12 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+
+        if last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        ):
+            self._drain_kv_ladder_waiting()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -255,6 +314,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or getattr(self, "_kv_ladder_waiting", None)
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -266,6 +326,12 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+
+        if not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        ):
+            self._drain_kv_ladder_waiting()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -474,6 +540,115 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _kv_ladder_plan(self, msg: UserMsg):
+        policy = getattr(self, "_kv_ladder", None)
+        if policy is None:
+            return None
+        moe = self.engine.moe_offload_cache
+        assert moe is not None
+        return policy.plan(
+            current_pages=self.engine.num_pages,
+            current_moe_slots=moe.cache_size,
+            input_tokens=len(msg.input_ids),
+            max_output_tokens=msg.sampling_params.max_tokens,
+        )
+
+    def _queue_for_kv_ladder(self, msg: UserMsg) -> bool:
+        """Hold a request until the next idle point if its possible length reaches this rung."""
+        from .kv_ladder import KVLadderCapacityError
+
+        # Preserve arrival order if an earlier request is already waiting for a rung change.
+        # max_running_req=1 means these drain one at a time and are re-planned against the
+        # geometry left by their predecessor.
+        if self._kv_ladder_waiting:
+            self._kv_ladder_waiting.append(msg)
+            return True
+        try:
+            plan = self._kv_ladder_plan(msg)
+        except KVLadderCapacityError as exc:
+            # Keep serving with the current geometry. Normal admission below will either clip
+            # max_tokens or return context_length_exceeded, rather than stranding the request.
+            logger.warning_rank0("KV ladder cannot grow for request %d: %s", msg.uid, exc)
+            return False
+        if plan is None:
+            return False
+        self._kv_ladder_waiting.append(msg)
+        logger.info_rank0(
+            "KV ladder queued request %d: possible length %d reaches %d-token rung; "
+            "next target %d tokens",
+            msg.uid, plan.required_tokens, plan.current_tokens, plan.target_tokens,
+        )
+        return True
+
+    def _drain_kv_ladder_waiting(self) -> None:
+        """At an idle safe point, grow the caches and then admit one held request."""
+        waiting = getattr(self, "_kv_ladder_waiting", None)
+        if not waiting:
+            return
+        assert not self.prefill_manager.runnable and not self.decode_manager.runnable
+        msg = waiting.pop(0)
+
+        from .kv_ladder import KVLadderCapacityError
+
+        try:
+            plan = self._kv_ladder_plan(msg)
+        except KVLadderCapacityError as exc:
+            logger.warning_rank0("KV ladder cannot grow for request %d: %s", msg.uid, exc)
+            plan = None
+        if plan is not None:
+            self._pending_rebuild = CacheRebuildBackendMsg(
+                request_id=f"auto-kv-ladder:{msg.uid}:{plan.target_pages}",
+                moe_cache_size=plan.target_moe_slots,
+                num_pages=plan.target_pages,
+            )
+            status = self._execute_pending_rebuild()
+            if status == "ok":
+                logger.info_rank0(
+                    "KV ladder advanced to %d tokens; MoE cache %d -> %d slots",
+                    plan.target_tokens, plan.current_moe_slots, plan.target_moe_slots,
+                )
+            else:
+                logger.warning_rank0(
+                    "KV ladder rebuild for request %d ended with status=%s; "
+                    "admitting against the retained geometry",
+                    msg.uid, status,
+                )
+        self._admit_user_msg(msg)
+
+    def _admit_user_msg(self, msg: UserMsg) -> None:
+        input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+        max_output_len = max_seq_len - input_len
+        if max_output_len <= 0:
+            logger.warning_rank0(
+                f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                f"request {msg.uid} is dropped."
+            )
+            # Tell the client instead of dropping silently — otherwise its wait_for_ack
+            # never sees a `finished` reply and hangs until the request times out.
+            self.send_result(
+                [
+                    ErrorReplyMsg(
+                        uid=msg.uid,
+                        # "prompt is too long: N tokens > M" is the phrasing Claude Code and
+                        # OpenClaw match on; the Anthropic wire has no error code to read.
+                        error=(
+                            f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                            f"(prompt + generation); shorten the prompt or increase the KV "
+                            f"cache budget"
+                        ),
+                        # OpenAI's standard class for this, for clients that read a code.
+                        code="context_length_exceeded",
+                    )
+                ]
+            )
+            return
+        if msg.sampling_params.max_tokens > max_output_len:
+            msg.sampling_params.max_tokens = max_output_len
+            logger.warning_rank0(
+                f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
+            )
+        self.prefill_manager.add_one_req(msg)
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -489,44 +664,17 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
-                logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
-                # Tell the client instead of dropping silently — otherwise its wait_for_ack
-                # never sees a `finished` reply and hangs until the request times out.
-                self.send_result(
-                    [
-                        ErrorReplyMsg(
-                            uid=msg.uid,
-                            # "prompt is too long: N tokens > M" is the phrasing Claude Code and
-                            # OpenClaw match on; the Anthropic wire has no error code to read.
-                            error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
-                                f"(prompt + generation); shorten the prompt or increase the KV "
-                                f"cache budget"
-                            ),
-                            # OpenAI's standard class for this, for clients that read a code.
-                            code="context_length_exceeded",
-                        )
-                    ]
-                )
-                return
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
-                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
-                )
-            self.prefill_manager.add_one_req(msg)
+            if not self._queue_for_kv_ladder(msg):
+                self._admit_user_msg(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
             tombstones[msg.uid] = None
+            waiting = getattr(self, "_kv_ladder_waiting", None)
+            if waiting:
+                waiting[:] = [req for req in waiting if req.uid != msg.uid]
             # Unknown aborts normally consume their tombstone when the cross-worker UserMsg
             # catches up. Bound hostile/no-followup abort traffic without affecting realistic
             # in-flight concurrency.
@@ -627,7 +775,7 @@ class Scheduler(SchedulerIOMixin):
             ]
         )
 
-    def _execute_pending_rebuild(self) -> None:
+    def _execute_pending_rebuild(self) -> str:
         from freetoken.engine.engine import CacheRebuildRejected
 
         msg = self._pending_rebuild
@@ -653,21 +801,21 @@ class Scheduler(SchedulerIOMixin):
             # Rejected before any destructive free — old cache intact, keep serving.
             logger.warning(f"cache rebuild rejected: {e}")
             self._reply_rebuild(msg.request_id, "rejected", error=str(e))
-            return
+            return "rejected"
         except Exception as e:  # noqa: BLE001
             if not getattr(self.engine, "rebuild_teardown_started", True):
                 # Failed before the destructive phase began: graphs and pools are untouched and
                 # the engine is still serving. A destructive rollback would only add risk.
                 logger.error(f"cache rebuild failed before teardown: {e!r} — old cache intact")
                 self._reply_rebuild(msg.request_id, "rejected", error=repr(e))
-                return
+                return "rejected"
             if self.config.tp_info.size > 1:
                 # A lone-rank failure cannot be rolled back symmetrically: rebuild_cache runs TP
                 # barriers, and ranks that succeeded will not re-enter them — a solo rollback
                 # would desync the group. Keep the latch-failed behavior for tp>1.
                 logger.error(f"cache rebuild failed: {e!r} — tp>1, latching failed")
                 self._reply_rebuild(msg.request_id, "failed", error=repr(e))
-                return
+                return "failed"
             # The destructive phase failed — typically a CUDA OOM while reallocating a pool or
             # recapturing graphs. The graphs/pools are already torn down, so the engine cannot
             # serve as-is. Rather than latch "failed" (which forces a full process restart),
@@ -687,17 +835,18 @@ class Scheduler(SchedulerIOMixin):
                     "failed",
                     error=f"{e!r}; rollback to the prior geometry also failed: {e2!r}",
                 )
-                return
+                return "failed"
             logger.warning("cache rebuild rolled back to the previous geometry — still serving")
             self._log_cache_geometry("Cache rolled back")
             self._reply_rebuild(
                 msg.request_id, "rejected", error=f"rebuild failed and was rolled back: {e!r}"
             )
-            return
+            return "rejected"
         # Outside the try: an ack/send failure after a fully-applied rebuild must not be
         # mistaken for a rebuild failure and roll back the geometry the engine now serves.
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
+        return "ok"
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
