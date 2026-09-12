@@ -134,10 +134,16 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "FreeToken"
     root: str
-    # The model's own limit, not the KV budget in force. Two spellings of the same number:
-    # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.
+    # What the server will actually ADMIT, i.e. min(model max_position, KV pool tokens). This is
+    # what a client must size its own window against: the scheduler rejects a request whose
+    # prompt reaches this number and clamps the output budget to the remainder. Two spellings of
+    # the same number: `max_model_len` is vLLM/SGLang's, `context_length` what most other
+    # clients look for.
     max_model_len: int | None = None
     context_length: int | None = None
+    # The checkpoint's own ceiling (config max_position), for reference. Larger than
+    # max_model_len whenever the KV pool was configured below the model's maximum.
+    model_max_len: int | None = None
     # The checkpoint's probed effort vocabulary (freetoken.tokenizer.effort); None
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None

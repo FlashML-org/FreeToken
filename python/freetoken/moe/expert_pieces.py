@@ -8,6 +8,7 @@ their ``_scale`` / ``_global`` companions, or an already fused ``gate_up``). The
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable, Iterable, Iterator
 
 import torch
@@ -38,7 +39,8 @@ def _model_hook(spec, name: str):
 
 
 def iter_expert_pieces(
-    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20
+    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
+    ownership=None,
 ) -> Iterator[Piece]:
     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
 
@@ -47,14 +49,29 @@ def iter_expert_pieces(
     experts come from the family's stacked ``iter_weights`` and NVFP4 experts from its
     ``nvfp4_expert_spec``. The reader is resolved here, before any bank is allocated, so a
     missing parallel reader raises ``NotImplementedError`` while a serial fallback is still cheap.
+
+    ``ownership`` (owner-local TP+EP) restricts the stream to this rank's experts and renumbers
+    them into rank-local bank rows; readers that cannot serve it raise ``NotImplementedError``.
     """
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:
-        pieces = hook(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
+        params = inspect.signature(hook).parameters
+        kw = dict(parallel=parallel, workers=workers, chunk=chunk)
+        if "ownership" in params:
+            kw["ownership"] = ownership
+        elif ownership is not None:
+            raise NotImplementedError(
+                f"{spec.module}.iter_expert_pieces does not support owner-local expert banks"
+            )
+        pieces = hook(model_path, config, kind, **kw)
         if pieces is not None:
             return pieces
     if kind is QuantKind.NONE:
+        if ownership is not None:
+            raise NotImplementedError(
+                f"{spec.module} has no owner-local reader for bf16 experts"
+            )
         return _bf16_pieces(model_path, config, spec, parallel=parallel, workers=workers, chunk=chunk)
     if kind is QuantKind.NVFP4:
         spec_hook = _model_hook(spec, "nvfp4_expert_spec")
@@ -63,7 +80,8 @@ def iter_expert_pieces(
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
         return iter_nvfp4_expert_pieces(
-            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers, chunk=chunk
+            model_path, config, spec_hook(model_path, config),
+            parallel=parallel, workers=workers, chunk=chunk, ownership=ownership,
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 

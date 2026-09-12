@@ -47,6 +47,9 @@ MODELS = {
     # gpt-oss MXFP4 (block-32 e2m1 codes + e8m0 scales), H == I == 2880, top-4 routing
     "gpt-oss-20b": ModelProfile(24, 32, 4, "mxfp4_triton", 2880, 2880),
     "gpt-oss-120b": ModelProfile(36, 128, 4, "mxfp4_triton", 2880, 2880),
+    # Qwen3.8-Flash-Next-NVFP4: 48 MoE layers, 512 experts, top-10; H=2560, moe_inter=640.
+    # 6-bank triton NVFP4 -> 2,772,480 B/expert (matches the served cache/status unit_bytes).
+    "qwen3.8-flash-next": ModelProfile(48, 512, 10, "nvfp4", 2560, 640),
 }
 
 

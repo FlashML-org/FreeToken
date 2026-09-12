@@ -194,6 +194,16 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
+    # The context ceiling the SCHEDULER actually enforces: min(model max_position, KV pool
+    # tokens). /v1/models must report this rather than the checkpoint's own ceiling, otherwise
+    # a client sizes its window from the model card and then gets a hard 400
+    # (context_length_exceeded) on prompts the card said were fine -- which is exactly what
+    # happened whenever the KV pool was configured below the model's max_position.
+    # 0 when it could not be read (fake engines in tests); consumers then keep their fallback.
+    try:
+        meta["max_seq_len"] = int(engine.max_seq_len or 0)
+    except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
+        meta["max_seq_len"] = 0
     # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)

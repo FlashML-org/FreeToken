@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
+from freetoken.models.qwen4_exp.config import qwen4_exp_tp_geometry
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -118,18 +120,39 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        geometry = qwen4_exp_tp_geometry(config)
+        self.num_q = geometry.num_q_heads
+        self.num_kv = geometry.num_kv_heads
         self.head_dim = config.head_dim
-        self.qo_attn_dim = self.num_q * self.head_dim
-        self.kv_attn_dim = self.num_kv * self.head_dim
+        self.qo_attn_dim = geometry.q_attn_dim
+        self.kv_attn_dim = geometry.kv_attn_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        # ``LinearColParallelMerged`` shards each segment by TP, so it is built from the
+        # GLOBAL sizes; the forward splits the rank-local output by ``self._qkv_split``.
+        self._qkv_global_split = [
+            2 * config.num_qo_heads * config.head_dim,
+            config.num_kv_heads * config.head_dim,
+            config.num_kv_heads * config.head_dim,
+        ]
+        # q|k|v are all quantized together (or all bf16), so the merged GEMM stays a
+        # single kernel; a modelopt MIXED_PRECISION checkpoint declares them FP8_PB_WO.
+        #
+        # The bf16 pair is column-parallel in, row-parallel out: ``qkv_proj`` hands each
+        # rank its own slice of heads, so ``o_proj`` must take that sharded input and
+        # all-reduce the partial sums. ``LinearOProj`` does both and degenerates to
+        # ``LinearReplicated`` at TP=1 (same weight, same GEMM, reduction skipped). A
+        # replicated ``o_proj`` here fails quietly under TP: each rank's partial sum still
+        # decodes to fluent-looking text.
+        if get_tp_info().size > 1 and getattr(config, "attn_quant", "none") != "none":
+            raise NotImplementedError(
+                "qwen4_exp dense TP currently supports the BF16 attention path only"
+            )
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
+            config.hidden_size, self._qkv_global_split, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
+        self.o_proj = LinearOProj(
+            config.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)

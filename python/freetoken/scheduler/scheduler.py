@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -397,6 +398,7 @@ class Scheduler(SchedulerIOMixin):
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
+            moe_stats = self._moe_stats_snapshot()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -405,6 +407,8 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if moe_stats is not None:
+                    m.moe_stats = moe_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -473,6 +477,27 @@ class Scheduler(SchedulerIOMixin):
         if self.device.type != "cuda":
             return 0
         return torch.cuda.memory_reserved(self.device)
+
+    def _moe_stats_snapshot(self) -> dict | None:
+        """Throttled MoE slot-cache snapshot for /v1/stats (miss/eviction/residency).
+
+        None when the model has no offload MoE cache. stats_snapshot() syncs the
+        device once per counter group, so sampling is rate-limited to ~1/s; between
+        samples the frontend keeps the last-known value (same semantics as kv/mamba).
+        A failing snapshot must never break the reply stream."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None:
+            return None
+        now = time.monotonic()
+        if now - getattr(self, "_moe_stats_last_at", 0.0) < 1.0:
+            return None
+        try:
+            snap = cache.stats_snapshot()
+        except Exception as e:  # noqa: BLE001 -- observability must not break serving
+            logger.warning(f"moe stats snapshot failed: {e!r}")
+            return None
+        self._moe_stats_last_at = now
+        return snap
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

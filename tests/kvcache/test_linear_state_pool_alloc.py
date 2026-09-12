@@ -189,3 +189,19 @@ def test_slot_state_bytes_for_the_real_geometry():
     delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
         linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def test_tp2_state_geometry_matches_byte_accounting():
+    group = _group()
+    pool = LinearStatePool(
+        group=group,
+        num_slots=5,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        tp_size=2,
+    )
+    # 2 key heads -> 1, 4 value heads -> 2 at TP2.
+    assert pool.conv_states.shape == (2, 5, 64, 3)
+    assert pool.recurrent_states.shape == (2, 5, 2, 16, 16)
+    expected = linear_state_bytes_per_req(group, 2, torch.bfloat16)
+    assert pool.bytes_per_slot() == expected

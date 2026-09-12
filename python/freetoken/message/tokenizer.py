@@ -48,6 +48,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Throttled MoE slot-cache snapshot (miss/eviction/residency counters, see
+    # OffloadMoeCache.stats_snapshot) for /v1/stats. None on non-offload models or
+    # between sample intervals (the frontend keeps the last-known value).
+    moe_stats: dict | None = None
 
 
 @dataclass

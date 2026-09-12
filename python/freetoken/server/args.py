@@ -265,6 +265,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-ep-size",
+        type=int,
+        default=1,
+        help=(
+            "Routed-expert owner group size. Default 1 keeps the legacy global-ID MoE cache; "
+            "values >1 are an explicit TP+EP opt-in and currently require the owner runtime "
+            "to be supported by the selected model."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
@@ -678,6 +689,51 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Enable the MoE offload cache's decode miss-rate counters (experts "
+            "active/missing/fetched per layer per step, captured into the decode "
+            "CUDA graph so they keep counting during replay). Cheap (device-side, "
+            "no per-step host sync); surfaces under /v1/stats 'moe' with the "
+            "residency/miss-rate numbers that explain decode-speed dips. Off by "
+            "default."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-collect-decode-freq",
+        action="store_true",
+        dest="moe_collect_decode_freq",
+        default=ServerArgs.moe_collect_decode_freq,
+        help=(
+            "Also collect the per-(layer, expert) decode routing histogram, giving "
+            "/v1/stats 'moe.routing' (working-set size, experts-to-90%%-of-activations, "
+            "oracle hit rate at the current cache size). Answers 'is it always the "
+            "same experts firing?'. Only accurate with CUDA graphs off "
+            "(--cuda-graph-max-bs 0): a captured graph replays without the host-side "
+            "histogram scatter. Implies --moe-collect-stats is NOT required, set both "
+            "for the full picture."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-trace-route",
+        type=str,
+        default=ServerArgs.moe_trace_route,
+        help=(
+            "Path to write an ORDERED MoE route trace: every ensure_experts call appends "
+            "its raw global expert ids (pre slot-rewrite) for offline LRU/EP replay "
+            "(freetoken/moe/route_trace.py, and tools/trace/replay_route_trace.py in the "
+            "deployment repo). Host-side, so NOT CUDA-graph "
+            "safe -- requires --cuda-graph-max-bs 0. Sampling/diagnostic only; never the "
+            "production perf path. Off by default."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -703,6 +759,14 @@ def parse_args(
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+        )
+
+    if kwargs["moe_ep_size"] < 1:
+        parser.error("--moe-ep-size must be >= 1")
+    if kwargs["moe_ep_size"] > 1 and kwargs["moe_ep_size"] != kwargs["tensor_parallel_size"]:
+        parser.error(
+            "--moe-ep-size must equal --tensor-parallel-size for the initial same-group TP+EP "
+            "topology"
         )
 
     # resolve some arguments

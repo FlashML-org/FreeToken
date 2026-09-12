@@ -21,6 +21,7 @@ from freetoken.models.qwen4_exp.weight import (
     _DenseFuser,
     iter_weights,
     load_ple_table,
+    shard_qwen4_exp_dense_tensor,
 )
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -310,6 +311,171 @@ def test_gdn_in_proj_slices_round_trip(loaded, checkpoint):
         assert torch.equal(part, back)
 
 
+def test_tp2_qsa_and_gdn_head_shards_reassemble(checkpoint):
+    _folder, raw = checkpoint
+    config = SimpleNamespace(
+        num_qo_heads=QH,
+        num_kv_heads=KVH,
+        head_dim=AHD,
+        linear_attention_group=lambda: SimpleNamespace(
+            num_key_heads=KH,
+            num_value_heads=VH,
+            key_head_dim=HD,
+            value_head_dim=HD,
+        ),
+    )
+
+    def shard(key):
+        return [
+            shard_qwen4_exp_dense_tensor(
+                key, raw[f"model.language_model.{key}"], config=config,
+                rank=rank, world_size=2,
+            )
+            for rank in range(2)
+        ]
+
+    qsa = "layers.1.self_attn.q_proj.weight"
+    assert torch.equal(torch.cat(shard(qsa), dim=0), raw[f"model.language_model.{qsa}"])
+    for proj in ("k_proj", "v_proj"):
+        key = f"layers.1.self_attn.{proj}.weight"
+        parts = shard(key)
+        assert torch.equal(torch.cat(parts, dim=0), raw[f"model.language_model.{key}"])
+
+    gdn_qkv = "layers.0.linear_attn.in_proj_qkv.weight"
+    qkv = raw[f"model.language_model.{gdn_qkv}"]
+    # The checkpoint's qkv part is [q, k, v] with q/k each KH*HD and v VH*HD.
+    q, k, v = torch.split(qkv, [KH * HD, KH * HD, VH * HD], dim=0)
+    shards = shard(gdn_qkv)
+    expected = [
+        torch.cat([q[: KH * HD // 2], k[: KH * HD // 2], v[: VH * HD // 2]], dim=0),
+        torch.cat([q[KH * HD // 2 :], k[KH * HD // 2 :], v[VH * HD // 2 :]], dim=0),
+    ]
+    assert all(torch.equal(got, want) for got, want in zip(shards, expected))
+
+    conv = "layers.0.linear_attn.conv1d.weight"
+    conv_shards = shard(conv)
+    cq, ck, cv = torch.split(
+        raw[f"model.language_model.{conv}"], [KH * HD, KH * HD, VH * HD], dim=0
+    )
+    assert torch.equal(
+        conv_shards[0],
+        torch.cat([cq[: KH * HD // 2], ck[: KH * HD // 2], cv[: VH * HD // 2]], dim=0),
+    )
+    assert torch.equal(
+        conv_shards[1],
+        torch.cat([cq[KH * HD // 2 :], ck[KH * HD // 2 :], cv[VH * HD // 2 :]], dim=0),
+    )
+
+    for key in (
+        "layers.0.linear_attn.in_proj_z.weight",
+        "layers.0.linear_attn.in_proj_b.weight",
+        "layers.0.linear_attn.in_proj_a.weight",
+        "layers.0.linear_attn.A_log",
+        "layers.0.linear_attn.dt_bias",
+    ):
+        value = raw[f"model.language_model.{key}"]
+        shards = [
+            shard_qwen4_exp_dense_tensor(
+                key, value, config=config, rank=rank, world_size=2
+            )
+            for rank in range(2)
+        ]
+        assert torch.equal(torch.cat(shards, dim=0), value), key
+
+
+def test_tp2_row_parallel_dense_weights_reassemble(checkpoint):
+    _folder, raw = checkpoint
+    config = SimpleNamespace(
+        num_qo_heads=QH,
+        num_kv_heads=KVH,
+        head_dim=AHD,
+        linear_attention_group=lambda: SimpleNamespace(
+            num_key_heads=KH, num_value_heads=VH, key_head_dim=HD, value_head_dim=HD,
+        ),
+    )
+    for key in (
+        "layers.1.self_attn.o_proj.weight",
+        "layers.0.linear_attn.out_proj.weight",
+        "layers.0.mlp.shared_expert.gate_proj.weight",
+        "layers.0.mlp.shared_expert.up_proj.weight",
+        "layers.0.mlp.shared_expert.down_proj.weight",
+    ):
+        value = raw[f"model.language_model.{key}"]
+        shards = [
+            shard_qwen4_exp_dense_tensor(
+                key, value, config=config, rank=rank, world_size=2
+            )
+            for rank in range(2)
+        ]
+        dim = 1 if key.endswith(("o_proj.weight", "out_proj.weight", "down_proj.weight")) else 0
+        assert torch.equal(torch.cat(shards, dim=dim), value), key
+
+    for key, raw_key in (
+        ("model.embed_tokens.weight", "model.language_model.embed_tokens.weight"),
+        ("lm_head.weight", "lm_head.weight"),
+    ):
+        value = raw[raw_key]
+        shards = [
+            shard_qwen4_exp_dense_tensor(
+                key, value, config=config, rank=rank, world_size=2
+            )
+            for rank in range(2)
+        ]
+        # The vocabulary axis is PADDED per rank to div_ceil(V, tp), not truncated: the
+        # model allocates that many rows (VocabParallelEmbedding.num_embeddings_tp) and its
+        # gather trims the padding -- see test_skeleton's parallel lm-head test. Only the
+        # real rows must reassemble.
+        rows = -(-value.shape[0] // 2)
+        assert [s.shape[0] for s in shards] == [rows, rows], key
+        assert torch.equal(torch.cat(shards, dim=0)[: value.shape[0]], value), key
+
+
+def test_tp2_short_final_vocabulary_shard_is_zero_padded():
+    """The vocabulary axis is padded, not truncated.
+
+    ``VocabParallelEmbedding`` always allocates ``div_ceil(vocab, tp)`` rows -- its
+    ``finish_idx`` clamps the token-index range, not the allocation -- so when the
+    vocabulary is not divisible by TP the final rank must still hand over a
+    full-width shard or strict loading fails on shape.
+    """
+    config = SimpleNamespace(linear_attention_group=lambda: None)
+    vocab, width = 7, 4  # 7 is not divisible by 2
+    value = torch.arange(vocab * width, dtype=torch.float32).reshape(vocab, width)
+    rows = -(-vocab // 2)
+
+    shards = [
+        shard_qwen4_exp_dense_tensor(
+            "model.embed_tokens.weight", value, config=config, rank=rank, world_size=2
+        )
+        for rank in range(2)
+    ]
+
+    assert [tuple(s.shape) for s in shards] == [(rows, width), (rows, width)]
+    assert torch.equal(shards[0], value[:rows])
+    # rank 1 carries the real tail rows plus a zero row no token id can reach
+    assert torch.equal(shards[1][: vocab - rows], value[rows:])
+    assert torch.count_nonzero(shards[1][vocab - rows :]) == 0
+    # the real vocabulary still reassembles exactly
+    assert torch.equal(torch.cat(shards, dim=0)[:vocab], value)
+
+
+def test_tp2_lm_head_short_final_shard_is_zero_padded_too():
+    config = SimpleNamespace(linear_attention_group=lambda: None)
+    vocab, width = 5, 3  # 5 % 4 != 0, so three of four ranks pad
+    value = torch.arange(vocab * width, dtype=torch.float32).reshape(vocab, width)
+    rows = -(-vocab // 4)
+
+    shards = [
+        shard_qwen4_exp_dense_tensor(
+            "lm_head.weight", value, config=config, rank=rank, world_size=4
+        )
+        for rank in range(4)
+    ]
+
+    assert all(tuple(s.shape) == (rows, width) for s in shards)
+    assert torch.equal(torch.cat(shards, dim=0)[:vocab], value)
+
+
 def test_shared_expert_gate_up_merge(loaded, checkpoint):
     _folder, raw = checkpoint
     base = "model.language_model.layers.1.mlp.shared_expert"
@@ -423,6 +589,117 @@ def test_read_range_into_rejects_a_short_destination(blob):
     bank = HostBank((1024,), torch.uint8)
     with pytest.raises(ValueError, match="destination holds"):
         read_range_into(bank.memoryview(), path, file_offset=0, nbytes=1 << 20)
+
+
+def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkeypatch):
+    """TP2 loader contract: `tp_shard=True` emits rank-local buffers whose concatenation
+    equals the TP1 loader's output for every dense tensor, and the fused groups keep their
+    head boundaries. No model is constructed; the comparison is against `iter_weights` TP1."""
+    import freetoken.distributed.info as info
+
+    folder, _raw = checkpoint
+    config = SimpleNamespace(
+        num_qo_heads=QH,
+        num_kv_heads=KVH,
+        head_dim=AHD,
+        linear_attention_group=lambda: SimpleNamespace(
+            num_key_heads=KH, num_value_heads=VH, key_head_dim=HD, value_head_dim=HD,
+        ),
+    )
+    tp1 = {
+        name: tensor
+        for name, tensor in iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+        )
+    }
+
+    shards: list[dict[str, torch.Tensor]] = []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=rank, size=2))
+        shards.append(
+            {
+                name: tensor
+                for name, tensor in iter_weights(
+                    folder, torch.device("cpu"), include_moe_experts=False,
+                    include_non_moe=True, tp_shard=True, config=config,
+                )
+            }
+        )
+
+    assert set(shards[0]) == set(shards[1]) == set(tp1)
+    # dim-0-concatenated groups vs dim-1 (row-parallel output projections).
+    dim1 = ("o_proj.weight", "out_proj.weight", "shared_expert.down_proj.weight")
+    # Replicated (not sharded) buffers must be bit-identical on both ranks.
+    replicated = (
+        ".q_norm.weight", ".k_norm.weight", ".hc_norm.weight",
+        "input_mix_weight_down.weight", "input_mix_weight_up.weight",
+        "input_mix_weight_down_block_inject.weight", "norm_key.weight", "norm_query.weight",
+        "norm_conv.weight", ".ple.", "layer_multipliers", "ngram_heads_offsets",
+        "ngram_heads_vocab_sizes", ".indexer.", ".mlp.gate.weight", "shared_expert_gate.weight",
+        ".linear_attn.norm.weight",
+    )
+    # Head-group buffers are sharded PER GROUP, so rank rows interleave (q0,k0,v0 | q1,k1,v1)
+    # instead of splitting the global fused rows in half. Sizes are the GLOBAL head groups.
+    qkv = (KH * HD, KH * HD, VH * HD)
+    head_group = {
+        "self_attn.qkv_proj.weight": (2 * QH * AHD, KVH * AHD, KVH * AHD),
+        "linear_attn.in_proj.weight": (*qkv, VH * HD, VH, VH),  # q|k|v|z|b|a
+        "linear_attn.conv1d.weight": qkv,
+        "shared_expert.gate_up_proj.weight": (I, I),  # gate|up, each halved by rank
+    }
+    for name, full in tp1.items():
+        if any(token in name for token in replicated):
+            assert torch.equal(shards[0][name], full) and torch.equal(shards[1][name], full), name
+            continue
+        group = next(
+            (sizes for suffix, sizes in head_group.items() if name.endswith(suffix)), None
+        )
+        if group is not None:
+            # Split the GLOBAL fused rows into head groups; each group halves by rank.
+            parts = torch.split(full, group, dim=0)
+            assert [p.shape[0] for p in parts] == list(group), name
+            for rank in range(2):
+                got = torch.split(shards[rank][name], [s // 2 for s in group], dim=0)
+                for part, half, size in zip(parts, got, group):
+                    expected = part[rank * (size // 2) : (rank + 1) * (size // 2)]
+                    assert torch.equal(half, expected), (name, rank)
+            continue
+        dim = 1 if name.endswith(dim1) else 0
+        if name in ("model.embed_tokens.weight", "lm_head.weight"):
+            # PADDED, not truncated: each rank holds div_ceil(V, tp) rows and the model's
+            # vocab gather trims the tail (see test_skeleton's parallel lm-head test), so
+            # only the real rows have to reassemble and the padding must be zero.
+            rows = -(-full.shape[0] // 2)
+            for rank in range(2):
+                got = shards[rank][name]
+                assert got.shape[0] == rows, name
+                real = full[rank * rows : (rank + 1) * rows]
+                assert torch.equal(got[: real.shape[0]], real), name
+                assert torch.count_nonzero(got[real.shape[0] :]) == 0, name
+            continue
+        merged = torch.cat([shards[0][name], shards[1][name]], dim=dim)
+        assert torch.equal(merged, full), name
+        assert shards[0][name].shape != full.shape or full.shape[dim] == 1, name
+
+    # The fused QSA qkv keeps [2*qo | kv | kv] ordering on each rank, so a naive split of
+    # the global fused buffer would NOT reproduce it.
+    key = "model.layers.1.self_attn.qkv_proj.weight"
+    per_rank = shards[0][key].shape[0]
+    assert per_rank == (2 * (QH // 2) + 2 * (KVH // 2)) * AHD
+    assert shards[0][key].shape[0] + shards[1][key].shape[0] == tp1[key].shape[0]
+
+
+def test_iter_weights_tp_shard_is_opt_in_and_fails_fast_without_it(checkpoint, monkeypatch):
+    import freetoken.distributed.info as info
+
+    folder, _raw = checkpoint
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=2))
+    with pytest.raises(NotImplementedError, match="tp_shard=True"):
+        list(
+            iter_weights(
+                folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+            )
+        )
 
 
 # ======================================================================================

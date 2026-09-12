@@ -174,6 +174,11 @@ class FrontendManager:
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
+    # Effective context ceiling the scheduler enforces, min(model max_position, KV pool
+    # tokens), from the same ack. /v1/models and /v1/stats report this so a client cannot
+    # size its window above what the server will actually admit; 0 until meta arrives (the
+    # metadata routes then fall back to the model's own ceiling).
+    max_seq_len: int = 0
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
@@ -475,6 +480,32 @@ async def _record_request_middleware(request: Request, call_next):
         )
     )
     return response
+
+
+# Minimal bearer auth for LAN exposure (`ft serve --host 0.0.0.0`): loopback callers
+# (desktop app, ft shell/ctl on this machine) are trusted; everyone else must send
+# `Authorization: Bearer $FREETOKEN_API_KEY` (OpenAI-style) or `x-api-key:
+# $FREETOKEN_API_KEY` (Anthropic-style — Copilot's "messages" apiType sends this).
+# Unset/empty env = auth disabled.
+# The X-Forwarded-For guard matters: uvicorn's proxy-headers middleware rewrites
+# request.client from that header, so a remote client could otherwise spoof 127.0.0.1.
+_API_KEY = os.environ.get("FREETOKEN_API_KEY", "").strip()
+
+
+@app.middleware("http")
+async def _api_key_auth(request: Request, call_next):
+    if not _API_KEY:
+        return await call_next(request)
+    client = request.client.host if request.client else ""
+    loopback = "x-forwarded-for" not in request.headers and client in ("127.0.0.1", "::1")
+    authorized = (
+        loopback
+        or request.headers.get("authorization", "") == f"Bearer {_API_KEY}"
+        or request.headers.get("x-api-key", "") == _API_KEY
+    )
+    if authorized:
+        return await call_next(request)
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 class CacheRebuildRequest(BaseModel):
@@ -1010,6 +1041,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
+        _GLOBAL_STATE.max_seq_len = int(meta.pop("max_seq_len", 0) or 0)
         _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])

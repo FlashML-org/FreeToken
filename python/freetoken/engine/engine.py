@@ -18,7 +18,13 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.offload_cache import (
+    OffloadMoeCache,
+    OwnerOffloadMoeCache,
+    attach_offload_moe_cache,
+    attach_owner_moe_cache,
+)
+from freetoken.moe.ownership import ExpertOwnership, OwnerCacheGeometry
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -45,6 +51,66 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
             f"--moe-strategy cpu always sizes its own fixed two-layer buffer and ignores "
             f"cache-sizing flags)."
         )
+
+
+def _owner_ep_enabled(config: EngineConfig) -> bool:
+    return config.moe_ep_size > 1
+
+
+def _validate_owner_ep_config(config: EngineConfig) -> None:
+    """Fail before model/bank allocation unless the initial owner topology is explicit."""
+    if config.moe_ep_size == 1:
+        return
+    if config.moe_ep_size != config.tp_info.size or config.tp_info.size != 2:
+        raise ValueError(
+            "owner EP currently requires the initial same-group TP2+EP2 topology "
+            "(--tensor-parallel-size 2 --moe-ep-size 2)"
+        )
+    if config.moe_strategy != "offload":
+        raise ValueError("owner EP currently requires --moe-strategy offload")
+    if config.moe_cache_rate is not None:
+        raise ValueError(
+            "owner EP sizes a LOCAL pool, so --moe-cache-rate (a fraction of the GLOBAL "
+            "expert count) has no owner-local meaning; use --moe-cache-size, or "
+            "--moe-cache-auto to fill whatever the KV pool leaves"
+        )
+    if config.moe_cache_size <= 0 and not config.moe_cache_auto:
+        raise ValueError(
+            "owner EP needs an explicit --moe-cache-size, or --moe-cache-auto (which now "
+            "solves against the owner-local expert geometry)"
+        )
+    if config.moe_cpu_layers:
+        raise ValueError(
+            "owner EP does not implement the CPU/hybrid expert path: the owner cache wraps "
+            "the GPU slot cache and _decode_owner is selected before the is_cpu_layer "
+            "branch, so --moe-cpu-layers would be accepted and then silently ignored"
+        )
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    if is_ftw_checkpoint(config.model_path):
+        raise ValueError(
+            "owner EP is not supported for FTW checkpoints: load_ftw_banks rebuilds "
+            "[num_experts, ...] GLOBAL expert rows with no ownership filter, so the banks "
+            "cannot bind to the owner-local geometry"
+        )
+    # CUDA graphs are allowed: decode admission goes through the fixed-shape, sync-free
+    # OwnerOffloadMoeCache.ensure_route_graph when graphs are on (see _owner_graph_safe).
+
+
+def _owner_graph_safe(config: EngineConfig) -> bool:
+    """Whether the owner decode route uses the fixed-shape graph-safe admission.
+
+    Default (``auto``): follow the resolved CUDA-graph setting -- capture is only possible on
+    the sync-free path, so the two always agree.  ``FREETOKEN_OWNER_GRAPH_SAFE=1/0`` forces
+    the admission implementation independently, which is what lets the graph-safe route be
+    A/B'd eagerly (graphs off) before trusting it inside a capture.
+    """
+    forced = os.getenv("FREETOKEN_OWNER_GRAPH_SAFE", "auto").strip().lower()
+    if forced in ("0", "false", "no", "off"):
+        return False
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    return bool(config.cuda_graph_max_bs)
 
 
 def _flashinfer_available() -> bool:
@@ -296,6 +362,7 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        _validate_owner_ep_config(config)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -430,6 +497,11 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        # NOTE: ``--moe-collect-decode-freq`` is CUDA-graph safe. The histogram lives on the
+        # device (``OffloadMoeCache.decode_freq``) and is accumulated by a device-side
+        # ``scatter_add_`` at the raw-ids point, so a captured decode graph replays the
+        # accumulation with every step. No warning is needed and graphs must not be disabled
+        # for it.
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -474,23 +546,48 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+                tp_shard=config.tp_info.size > 1,
             ),
             device=self.device,
         )
 
-
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(
+        self, config: EngineConfig, banks, method=None,
+        ownership: ExpertOwnership | None = None,
+    ) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
+
+        ``ownership`` switches the expert geometry to the OWNER-LOCAL namespace: under EP2 a
+        rank's pool only ever holds its own rows, so the floor/cap and the coverage the plan
+        is solved against are ``local_num_experts`` and ``num_layers * local_num_experts``.
+        Solving against the global counts would under-fill (the cap ``total_experts`` is 2x
+        too large and the floor is wrong), which is why owner EP used to demand an explicit
+        ``--moe-cache-size``.
+
+        A fixed KV pool (``--num-tokens``) is reserved EXACTLY, not at the
+        ``--kv-reserve-tokens`` floor: the caller has already pinned the KV geometry, so
+        every remaining byte belongs to the expert cache -- that is the whole point of
+        "pin KV, let MoE fill the rest".
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
-        num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
+        if ownership is None:
+            num_experts = config.model_config.num_experts
+            total_experts = config.model_config.num_moe_layers * num_experts
+        else:
+            num_experts = ownership.local_num_experts
+            total_experts = config.model_config.num_moe_layers * num_experts
+        # getattr: duck-typed test configs may predate the --num-tokens knob
+        num_token_override = getattr(config, "num_token_override", None)
+        if num_token_override is not None:
+            kv_reserve_tokens = num_token_override
+        else:
+            kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -501,12 +598,29 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        owner_ep = _owner_ep_enabled(config)
+        ownership = None
+        owner_geometry = None
+        if owner_ep:
+            if config.model_config.model_type != "qwen4_exp":
+                raise NotImplementedError("owner EP is currently implemented only for Qwen4Exp")
+            if config.model_config.expert_quant != "nvfp4":
+                raise NotImplementedError("owner EP currently requires native NVFP4 expert banks")
+            ownership = ExpertOwnership(
+                global_num_experts=config.model_config.num_experts,
+                world_size=config.moe_ep_size,
+                rank=config.tp_info.rank,
+            )
+            # owner_geometry is deliberately built LATER, once --moe-cache-auto has resolved
+            # the slot count: the geometry validates cache_size against the local expert
+            # count, so constructing it here with moe_cache_size == 0 (auto) would reject a
+            # perfectly valid request.
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
@@ -570,11 +684,14 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                ownership=ownership,
             )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            size, pages, overlap = self._resolve_auto_moe_cache_size(
+                config, banks, method, ownership=ownership
+            )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -590,7 +707,28 @@ class Engine:
                 f"--moe-cache-auto resolved moe_cache_size={size} "
                 f"num_pages={pages} (prefill_overlap={overlap})"
             )
-        _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+        if ownership is not None:
+            # Built here (not at the top) so an auto-sized moe_cache_size is already in
+            # config. Validates the local floor and the 2*local overlap minimum before
+            # any allocation.
+            owner_geometry = OwnerCacheGeometry(
+                global_num_experts=config.model_config.num_experts,
+                world_size=config.moe_ep_size,
+                rank=config.tp_info.rank,
+                num_layers=config.model_config.num_moe_layers,
+                cache_size=config.moe_cache_size,
+                prefill_overlap=config.moe_prefill_overlap,
+            )
+            if config.moe_prefill_overlap:
+                logger.info_rank0(
+                    f"owner EP prefill overlap enabled: slots "
+                    f"[0, {2 * ownership.local_num_experts}) of {config.moe_cache_size} "
+                    f"are borrowed as the two-layer prefill buffer"
+                )
+        _require_offload_cache_size(
+            config.moe_cache_size,
+            ownership.local_num_experts if ownership is not None else config.model_config.num_experts,
+        )
         layout = max_slots = None
         if method is not None:
             if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
@@ -600,22 +738,34 @@ class Engine:
                 )
             layout = method.layout()
             max_slots = method.slot_limit()
-        cache = OffloadMoeCache(
-            # Models with leading dense layers (GLM-4) only have experts on the MoE
-            # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-            num_layers=config.model_config.num_moe_layers,
-            num_experts=config.model_config.num_experts,
-            cache_size=config.moe_cache_size,
-            device=self.device,
-            cache_policy=config.moe_cache_policy,
-            prefill_overlap=config.moe_prefill_overlap,
-            prefill_hit_d2d=config.moe_prefill_hit_d2d,
-            quant_format=banks.quant_format,
-            decode_target=decode_target,
-            hybrid_max_fetch=config.moe_hybrid_max_fetch,
-            layout=layout,
-            max_slots=max_slots,
-        )
+        if owner_geometry is not None:
+            cache = OwnerOffloadMoeCache(
+                owner_geometry,
+                self.device,
+                cache_policy=config.moe_cache_policy,
+                prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                quant_format=banks.quant_format,
+                graph_safe=_owner_graph_safe(config),
+                layout=layout,
+                max_slots=max_slots,
+            )
+        else:
+            cache = OffloadMoeCache(
+                # Models with leading dense layers (GLM-4) only have experts on the MoE
+                # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
+                num_layers=config.model_config.num_moe_layers,
+                num_experts=config.model_config.num_experts,
+                cache_size=config.moe_cache_size,
+                device=self.device,
+                cache_policy=config.moe_cache_policy,
+                prefill_overlap=config.moe_prefill_overlap,
+                prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                quant_format=banks.quant_format,
+                decode_target=decode_target,
+                hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                layout=layout,
+                max_slots=max_slots,
+            )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
@@ -625,7 +775,43 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
-        layers = attach_offload_moe_cache(self.model, cache)
+        cache.collect_decode_freq = config.moe_collect_decode_freq
+        # Opt-in ordered route trace (moe/route_trace.py): records raw global expert
+        # ids per ensure_experts call for offline LRU/EP replay. Host-side (.cpu()),
+        # so it would break CUDA-graph capture -- refuse unless graphs are off, and do
+        # it here (before GraphRunner runs) so it fails fast, not mid-capture.
+        if config.moe_trace_route:
+            if config.cuda_graph_max_bs != 0:
+                raise ValueError(
+                    "--moe-trace-route records host-side per call and is NOT CUDA-graph "
+                    "safe; relaunch with --cuda-graph-max-bs 0 (diagnostic sampling only)."
+                )
+            from freetoken.moe.route_trace import RouteTraceRecorder
+
+            cache.route_recorder = RouteTraceRecorder(
+                config.moe_trace_route,
+                num_experts=(
+                    cache.global_num_experts
+                    if owner_geometry is not None
+                    else cache.num_experts
+                ),
+                num_layers=cache.num_layers,
+                cache_size=cache.cache_size,
+                top_k=config.model_config.num_experts_per_tok,
+                model=config.model_path,
+                decode_target=cache.decode_target,
+                # One file per rank: every rank records the same configured path, so sharing
+                # it would let the TP writers truncate each other's trace.
+                rank=config.tp_info.rank if config.tp_info.size > 1 else None,
+            )
+            logger.info_rank0(
+                f"--moe-trace-route: recording ordered decode route trace to "
+                f"{config.moe_trace_route} (graphs off; replay with "
+                f"tools/trace/replay_route_trace.py)"
+            )
+        # attach_offload_moe_cache walks the model for OffloadMoELayers (model-specific
+        # subclasses included, e.g. DSV4's DSV4OffloadMoELayer).
+        layers = attach_owner_moe_cache(self.model, cache) if owner_geometry is not None else attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
@@ -986,6 +1172,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        rec = getattr(self, "moe_offload_cache", None)
+        if rec is not None and getattr(rec, "route_recorder", None) is not None:
+            rec.route_recorder.close()  # flush the ordered route trace (meta + body)
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -1571,6 +1760,9 @@ def _adjust_config(config: EngineConfig):
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
         object.__setattr__(model_config, "decode_target", _decode_target(config))
+        # owner-local EP is decided by the engine, but the model builds its MoE layers
+        # first: expose the group size so they report an unsharded expert GEMM.
+        object.__setattr__(model_config, "moe_ep_size", getattr(config, "moe_ep_size", 1))
 
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.

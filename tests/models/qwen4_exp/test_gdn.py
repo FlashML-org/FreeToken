@@ -8,6 +8,8 @@ from the prefill state, ragged bs=3, both GQA head ratios, and the sigmoid outpu
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -68,7 +70,7 @@ def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
     return op, ref
 
 
-def _ctx(ratio: int, num_slots: int = 8) -> Context:
+def _ctx(ratio: int, num_slots: int = 8, tp_size: int = 1) -> Context:
     import freetoken.core as core
     from freetoken.kvcache.linear_state_pool import LinearStatePool
 
@@ -80,7 +82,9 @@ def _ctx(ratio: int, num_slots: int = 8) -> Context:
     )
     core._GLOBAL_CTX = None
     ctx = Context(page_size=64)
-    ctx.linear_state_pool = LinearStatePool(group, num_slots, torch.bfloat16, DEV, tp_size=1)
+    ctx.linear_state_pool = LinearStatePool(
+        group, num_slots, torch.bfloat16, DEV, tp_size=tp_size
+    )
     core.set_global_ctx(ctx)
     return ctx
 
@@ -147,6 +151,119 @@ def test_ragged_prefill_then_decode(ratio):
     for i, h in enumerate(hidden):
         full = _ref_out(ref, torch.cat([h, nxt[i:i + 1]], dim=0))
         torch.testing.assert_close(dec[i].float(), full[-1], rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("ratio", (2, 3))
+def test_tp2_rank_partials_sum_to_the_tp1_output(ratio, monkeypatch):
+    """P2 numeric gate: a TP2 rank's LOCAL GDN forward, summed over both ranks, equals the
+    TP1 output. Each rank runs the real kernel with its own head slice and its own state
+    pool; only the row-parallel all-reduce is emulated (it is a plain SUM)."""
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedCommunicator
+    from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.utils.torch_utils import torch_dtype
+
+    num_k, num_v = HEADS[ratio]
+    torch.manual_seed(ratio)
+    hidden = torch.randn(37, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    # TP1 reference: one op holding the full head set.
+    ref_op, _ref = _make_layer(ratio, seed=ratio)
+    ref_ctx = _ctx(ratio, tp_size=1)
+    with ref_ctx.forward_batch(_batch([37])):
+        want = ref_op.forward(hidden)
+
+    # TP2: the same checkpoint weights sharded per rank, then each rank's local forward.
+    full_state = {k: v.clone() for k, v in ref_op.state_dict().items()}
+    config = SimpleNamespace(
+        linear_attention_group=lambda: LinearGatedDeltaGroupConfig(
+            name="linear", layer_ids=(0,), num_key_heads=num_k, num_value_heads=num_v,
+            key_head_dim=HEAD_DIM, value_head_dim=HEAD_DIM, conv_kernel_dim=CONV_K,
+            output_gate="sigmoid",
+        )
+    )
+    from freetoken.models.qwen4_exp.weight import shard_qwen4_exp_dense_tensor
+
+    # The row-parallel out_proj would all-reduce in production; here we keep each rank's
+    # UNREDUCED partial and sum them ourselves, which is exactly the TP contract.
+    monkeypatch.setattr(DistributedCommunicator, "all_reduce", lambda self, x: x)
+
+    partials = []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=rank, size=2))
+        # Local dims: the op derives them from get_tp_info() at construction.
+        local_k = num_k // 2
+        local_v = num_v // 2
+        with torch.device("meta"), torch_dtype(torch.bfloat16):
+            op = Qwen4ExpGatedDeltaNet(
+                hidden_size=HIDDEN, num_k_heads=num_k, num_v_heads=num_v,
+                head_k_dim=HEAD_DIM, head_v_dim=HEAD_DIM, conv_kernel_size=CONV_K,
+                rms_norm_eps=EPS, layer_id=0, output_gate="sigmoid",
+            )
+        # Shard every raw checkpoint tensor with the tested P2 contract. The op's fused
+        # in_proj is rebuilt by slicing its parts (qkv|z|b|a) separately.
+        sharded = {}
+        prefix = "model.layers.0."
+        # TP1 in_proj layout: q|k|v (2*K*D + V*D) | z (V*D) | b (V) | a (V).
+        qkv_rows = 2 * num_k * HEAD_DIM + num_v * HEAD_DIM
+        z_rows = num_v * HEAD_DIM
+        for key, value in full_state.items():
+            if key == "in_proj.weight":
+                qkv = shard_qwen4_exp_dense_tensor(
+                    prefix + "linear_attn.in_proj_qkv.weight",
+                    value[:qkv_rows],
+                    config=config, rank=rank, world_size=2,
+                )
+                z = shard_qwen4_exp_dense_tensor(
+                    prefix + "linear_attn.in_proj_z.weight",
+                    value[qkv_rows : qkv_rows + z_rows],
+                    config=config, rank=rank, world_size=2,
+                )
+                b = shard_qwen4_exp_dense_tensor(
+                    prefix + "linear_attn.in_proj_b.weight",
+                    value[qkv_rows + z_rows : qkv_rows + z_rows + num_v],
+                    config=config, rank=rank, world_size=2,
+                )
+                a = shard_qwen4_exp_dense_tensor(
+                    prefix + "linear_attn.in_proj_a.weight",
+                    value[qkv_rows + z_rows + num_v :],
+                    config=config, rank=rank, world_size=2,
+                )
+                sharded[key] = torch.cat([qkv, z, b, a], dim=0)
+                continue
+            key_name = {
+                "conv1d.weight": "linear_attn.conv1d.weight",
+                "A_log": "linear_attn.A_log",
+                "dt_bias": "linear_attn.dt_bias",
+                "norm.weight": "linear_attn.norm.weight",
+                "out_proj.weight": "linear_attn.out_proj.weight",
+            }[key]
+            sharded[key] = shard_qwen4_exp_dense_tensor(
+                prefix + key_name, value, config=config, rank=rank, world_size=2
+            )
+        op.load_state_dict(sharded)
+        assert op.num_k_heads == local_k and op.num_v_heads == local_v
+        assert op.conv_dim == 2 * local_k * HEAD_DIM + local_v * HEAD_DIM
+
+        ctx = _ctx(ratio, tp_size=2)
+        with ctx.forward_batch(_batch([37])):
+            partials.append(op.forward(hidden))
+
+    # Row-parallel out_proj emits an UNREDUCED local partial; the SUM is the TP contract.
+    merged = partials[0] + partials[1]
+    torch.testing.assert_close(merged.float(), want.float(), rtol=RTOL, atol=ATOL)
+    assert DistributedCommunicator.plugins[-1] is not None
+
+
+def _batch(lengths):
+    reqs = [
+        Req(input_ids=torch.zeros(n, dtype=torch.int32), table_idx=i + 1, cached_len=0,
+            output_len=1, uid=i, sampling_params=SamplingParams(), cache_handle=None)
+        for i, n in enumerate(lengths)
+    ]
+    batch = Batch(reqs=reqs, phase="prefill")
+    batch.padded_reqs = reqs
+    return batch
 
 
 def test_chunk_and_recurrent_rules_agree():

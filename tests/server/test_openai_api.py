@@ -452,6 +452,28 @@ def test_models_route_publishes_the_model_context_length():
 
     assert card["max_model_len"] == 262144
     assert card["context_length"] == 262144
+    assert card["model_max_len"] == 262144
+
+
+def test_models_route_reports_the_enforced_ceiling_when_the_kv_pool_is_smaller():
+    """A KV pool below the model's max_position must not be advertised as usable.
+
+    The scheduler admits a request only while prompt_tokens < min(model max_position, KV pool
+    tokens), so a card promising the model's own ceiling makes a correctly-configured client
+    (one that sizes its window from this route, as `ft launch` does) send prompts the server
+    then rejects with context_length_exceeded. The enforced number is what the engine publishes
+    on its readiness meta; `model_max_len` keeps the raw checkpoint ceiling visible.
+    """
+    state = FakeState([])
+    state.config.max_seq_len = 262144          # checkpoint ceiling
+    state.max_seq_len = 245760                 # what the engine actually admits
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    card = TestClient(app).get("/v1/models").json()["data"][0]
+
+    assert card["max_model_len"] == 245760 and card["context_length"] == 245760
+    assert card["model_max_len"] == 262144
 
 
 async def _collect(generator):

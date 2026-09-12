@@ -45,6 +45,10 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # MoE slot-cache snapshot (miss_rate / residency / routing concentration), passed
+    # through from DetokenizeMsg on the scheduler's throttled interval. None when the
+    # model has no offload cache or the sample hasn't arrived yet.
+    moe_stats: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

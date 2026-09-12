@@ -55,6 +55,7 @@ class MoELayer(BaseOP):
         layer_id: int | None = None,
         strategy: str = "resident",
         decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -69,6 +70,10 @@ class MoELayer(BaseOP):
         tp_info = get_tp_info()
         self.tp_rank = tp_info.rank
         self.tp_size = tp_size = tp_info.size
+        # The routed-expert GEMM is tensor-parallel only for the resident/fused path; under
+        # owner-local EP every rank holds whole, disjoint experts, so the kernel sees an
+        # UNSHARDED intermediate and the layer all-reduces once at the output.
+        self.expert_tp_size = expert_tp_size if expert_tp_size is not None else tp_size
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -132,6 +137,8 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        *,
+        reduce: bool = True,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -139,7 +146,8 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        return self._maybe_all_reduce(out) if reduce else out
 
 
 class OffloadMoELayer(MoELayer):
@@ -161,6 +169,7 @@ class OffloadMoELayer(MoELayer):
         has_bias: bool = False,
         strategy: str = "offload",
         decode_target: str = "gpu",
+        expert_tp_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -181,28 +190,36 @@ class OffloadMoELayer(MoELayer):
             layer_id=layer_id,
             strategy=strategy,
             decode_target=decode_target,
+            expert_tp_size=expert_tp_size,
             quant_config=quant_config,
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # Owner-local EP cache (``OwnerOffloadMoeCache``). When attached, decode routes through
+        # ``ensure_route`` and the local-row slot ids, never the global-ID ``ensure_experts``.
+        self.owner_cache = None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        *,
+        reduce: bool = True,
     ):
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+        return self._maybe_all_reduce(final_hidden_states) if reduce else final_hidden_states
 
     def routed_forward(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -216,7 +233,7 @@ class OffloadMoELayer(MoELayer):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        return self._maybe_all_reduce(out) if reduce else out
 
     def decode_forward(
         self,
@@ -270,6 +287,8 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if self.owner_cache is not None:
+            return self._decode_owner(hidden_states, topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -288,6 +307,49 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_owner(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Owner-local EP decode: global route -> local bank row -> owner cache slot -> GEMM.
+
+        The wrapped cache only ever sees ``local_num_experts`` rows, so the route MUST go
+        through the owner admission path: it masks remote entries to zero weight, rewrites
+        owned entries to owner-local slot ids, and returns tensors the existing
+        ``_expert_gemm`` already accepts unchanged (decode kernels index slots directly).
+        Passing the raw global ids here would read another rank's bank rows -- the kernels
+        do not range-check.
+
+        Two implementations, selected by ``owner.graph_safe``: the sync-free fixed-shape
+        ``ensure_route_graph`` under CUDA-graph capture, else the eager ``ensure_route``.
+        Both admit the same rows and mask remote entries identically.
+        """
+        owner = self.owner_cache
+        if owner.graph_safe:
+            update = owner.ensure_route_graph(self.layer_id, topk_weights, topk_ids)
+        else:
+            update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
+        owner.copy_missing()
+        out = self._expert_gemm(
+            owner,
+            hidden_states,
+            update.weights,
+            update.slot_ids,
+            views=owner.bank_views(),
+            n=None,
+            alphas=owner.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        if __debug__ and not owner.graph_safe and update.slot_ids.numel():
+            # Guardrail: a slot id outside the local pool would be an unchecked OOB read.
+            # Skipped when graph_safe: this read is a device->host sync, illegal in capture.
+            assert int(update.slot_ids.max()) < owner.cache_size, (
+                "owner-local slot id escaped the local pool"
+            )
+        return out
 
     def _decode_hybrid(
         self,
@@ -350,6 +412,8 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if self.owner_cache is not None:
+            return self._prefill_owner(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -376,6 +440,54 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_owner(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Owner-local EP prefill: materialize the local layer, then route into local rows.
+
+        Prefill kernels take bank-row ids (``position == expert id`` for the global cache);
+        for the owner wrapper that namespace is the LOCAL row, so the global route is
+        remapped here and remote entries are zero-weighted. The global fused buffer is never
+        used, which is why this cannot reuse ``_prefill_routed``.
+        """
+        owner = self.owner_cache
+        if owner.geometry.prefill_overlap:
+            # Same begin -> prefetch(current) -> prefetch(next) -> wait -> release
+            # choreography as the global-ID path (_wait_prefill_overlap): the NEXT layer's
+            # H2D runs on the copy stream while THIS layer's GEMMs run on the compute
+            # stream.  Prefetching only the current layer would serialize copy and compute
+            # and lose the whole point of overlap.  prefetch_prefill_layer is a no-op past
+            # the last layer, so the lookahead needs no bounds check here.
+            if self.layer_id == 0:
+                owner.begin_prefill()
+            owner.prefetch_prefill_layer(self.layer_id)
+            owner.prefetch_prefill_layer(self.layer_id + 1)
+            views = owner.wait_prefill_layer(self.layer_id)
+        else:
+            owner.materialize_layer(self.layer_id, buffer_id=0)
+            views = owner.bank_views(owner.num_experts)
+        local_ids, owned = owner.geometry.global_to_local(topk_ids)
+        safe_ids = torch.where(owned, local_ids, torch.zeros_like(local_ids)).contiguous()
+        safe_weights = torch.where(
+            owned, topk_weights, torch.zeros_like(topk_weights)
+        ).contiguous()
+        out = self._expert_gemm(
+            owner,
+            hidden_states,
+            safe_weights,
+            safe_ids,
+            views=views,
+            n=owner.num_experts,
+            alphas=owner.alphas_for_layer(self.layer_id),
+            is_prefill=True,
+        )
+        if owner.geometry.prefill_overlap:
+            owner.release_prefill_layer(self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
@@ -483,4 +595,7 @@ def make_moe_layer(
         kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
+    if getattr(config, "moe_ep_size", 1) > 1:
+        # owner-local EP: whole disjoint experts per rank -> the expert GEMM is not sharded
+        kwargs["expert_tp_size"] = 1
     return layer_cls(**kwargs)

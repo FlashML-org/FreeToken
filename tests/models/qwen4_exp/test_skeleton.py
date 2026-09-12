@@ -131,6 +131,38 @@ def test_hc_merged_gemm_layout_and_top_level_mixer():
     assert torch.allclose(x, ref_x, rtol=1e-5, atol=1e-6)
 
 
+def test_parallel_lm_head_gathers_vocab_shards_in_rank_order(monkeypatch):
+    """The TP lm-head must restore rank-major vocab rows and trim padding."""
+    import freetoken.distributed.info as info
+    from freetoken.layers.embedding import ParallelLMHead
+
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=2))
+    head0 = ParallelLMHead(num_embeddings=7, embedding_dim=3)
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=1, size=2))
+    head1 = ParallelLMHead(num_embeddings=7, embedding_dim=3)
+
+    full_weight = torch.arange(21, dtype=torch.float32).view(7, 3) / 10
+    head0.weight.copy_(full_weight[:4])
+    head1.weight.copy_(torch.cat((full_weight[4:], torch.zeros(1, 3))))
+    x = torch.tensor([[1.0, -2.0, 0.5]])
+    local0 = F.linear(x, head0.weight)
+    local1 = F.linear(x, head1.weight)
+    expected = F.linear(x, full_weight)
+
+    ctx = _fresh_ctx()
+    batch = SimpleNamespace(size=1, is_prefill=False)
+    monkeypatch.setattr(
+        type(head0._comm), "all_gather", lambda _self, _x: torch.cat((local0, local1))
+    )
+    with ctx.forward_batch(batch):
+        got0 = head0.forward(x)
+    torch.testing.assert_close(got0, expected)
+
+    with ctx.forward_batch(batch):
+        got1 = head1.forward(x)
+    torch.testing.assert_close(got1, expected)
+
+
 # --------------------------------------------------------------------------------------
 # PLE
 # --------------------------------------------------------------------------------------

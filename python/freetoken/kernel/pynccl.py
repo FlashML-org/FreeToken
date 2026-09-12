@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import functools
+import os
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
@@ -27,7 +30,23 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    # NVIDIA's pip/conda NCCL wheel intentionally ships only the SONAME file
+    # ``libnccl.so.2`` (no development symlink ``libnccl.so``), while a system NCCL
+    # development package normally provides the latter. ``-lnccl`` therefore works on
+    # the system layout but fails in zl_freetoken even when LD_LIBRARY_PATH is correct.
+    # Pass the wheel's absolute path when present; retain ``-lnccl`` for system installs.
+    candidates = []
+    env_nccl = os.environ.get("NCCL_LIB")
+    if env_nccl:
+        candidates.append(Path(env_nccl) / "libnccl.so.2")
+    candidates.extend(
+        Path(entry) / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
+        for entry in sys.path
+        if entry
+    )
+    nccl = next((path for path in candidates if path.is_file()), None)
+    ldflags = [str(nccl)] if nccl is not None else ["-lnccl"]
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=ldflags)
 
 
 @functools.cache

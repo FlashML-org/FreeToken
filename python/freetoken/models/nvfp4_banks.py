@@ -8,6 +8,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.moe.ownership import ExpertOwnership
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -73,6 +74,7 @@ def iter_nvfp4_expert_pieces(
     chunk: int = 8 << 20,
     drop_page_cache: DropPageCache | None = None,
     primary: bool = True,
+    ownership: ExpertOwnership | None = None,
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
@@ -80,6 +82,10 @@ def iter_nvfp4_expert_pieces(
 
     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+
+    ``ownership`` (owner-local TP+EP): keep only this rank's experts and renumber them into the
+    rank-local bank rows ``[0, local_num_experts)``, so the pieces land in the owner-local banks
+    the cache actually allocates. Without it every expert is loaded at its global row.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
@@ -89,6 +95,15 @@ def iter_nvfp4_expert_pieces(
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
 
+    global_E = config.num_experts
+    if ownership is not None and ownership.global_num_experts != global_E:
+        raise ValueError(
+            f"expert ownership has global_num_experts={ownership.global_num_experts}, "
+            f"but checkpoint config has num_experts={global_E}"
+        )
+    local_E = ownership.local_num_experts if ownership is not None else global_E
+    global_start = ownership.global_start if ownership is not None else 0
+
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:
         match = spec.key_pattern.match(name)
@@ -97,14 +112,17 @@ def iter_nvfp4_expert_pieces(
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
+        expert = int(match.group("expert"))
+        if ownership is not None and not ownership.owns(expert):
+            continue
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = _canon_kind(spec, match.group("kind"))
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * config.num_experts * 9
+        wanted[name] = (bank_layer, expert - global_start, spec.proj_to_role[proj] + _kind_suffix(kind))
+    expected = _num_moe_layers(config) * local_E * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 

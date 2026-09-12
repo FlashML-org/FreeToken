@@ -75,6 +75,7 @@ def build_expert_banks(
     device: torch.device,
     layer_sink=None,
     dummy: bool = False,
+    num_experts: int | None = None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -89,7 +90,9 @@ def build_expert_banks(
 
     kernel = method.kernel
     layout = method.layout()
-    E = method.cfg.num_experts
+    # Owner-local EP fills only this rank's rows, so the bank's E dim is the local expert
+    # count, not the layer's (global) routing count. ``num_experts`` overrides it.
+    E = method.cfg.num_experts if num_experts is None else num_experts
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
     hb = alloc_layer_banks(specs, num_layers)
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
@@ -178,30 +181,39 @@ _PROVIDERS = {
 }
 
 
-def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, ownership=None) -> ExpertBanks:
     expert_quant = model_config.expert_quant
     if expert_quant not in _PROVIDERS:
         raise ValueError(
             f"{expert_quant!r} experts load through their MoE quant method; "
             f"only {sorted(_PROVIDERS)} still have a format provider"
         )
+    provider_kwargs = dict(
+        parallel=parallel, workers=workers, chunk=chunk,
+        decode_target=decode_target, layer_sink=layer_sink,
+    )
+    if ownership is not None:
+        provider_kwargs["ownership"] = ownership
     return _PROVIDERS[expert_quant](
-        model_path, model_config, device, dtype, dummy,
-        parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
+        model_path, model_config, device, dtype, dummy, **provider_kwargs
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, ownership=None) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
+    # owner-local EP: the banks hold only this rank's rows
+    E = ownership.local_num_experts if ownership is not None else None
     if dummy:
-        return build_expert_banks(method, num_layers, None, device=device, dummy=True)
+        return build_expert_banks(method, num_layers, None, device=device, dummy=True, num_experts=E)
     pieces = iter_expert_pieces(
-        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,
+        ownership=ownership,
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+    return build_expert_banks(
+        method, num_layers, pieces, device=device, layer_sink=layer_sink, num_experts=E
+    )
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -286,6 +298,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    ownership=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -314,6 +327,15 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if ownership is not None:
+            # ``load_ftw_banks`` rebuilds ``[num_experts, ...]`` GLOBAL rows and has no
+            # ownership filter, so the banks could not bind to the owner-local geometry.
+            # The engine rejects this combination up front; guard the loader too so a
+            # converter/tool call cannot reach the same inconsistent state.
+            raise NotImplementedError(
+                "owner-local expert banks are not supported for FTW checkpoints: the FTW "
+                "bank loader rebuilds global expert rows and does not filter by ownership"
+            )
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
@@ -354,8 +376,8 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
-        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, ownership)
+        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink, ownership)
 
     with requested_residency(layer_residency) as residency_plan:
         try:

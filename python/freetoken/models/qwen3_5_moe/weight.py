@@ -346,11 +346,13 @@ def _moe_dims(model_config):
     )
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20, ownership=None):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
+    if ownership is not None:
+        raise NotImplementedError("block-FP8 expert banks do not support owner-local TP+EP")
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel

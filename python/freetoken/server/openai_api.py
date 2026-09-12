@@ -142,6 +142,7 @@ def register_openai_routes(
             root=state.config.model_path,
             max_model_len=ctx,
             context_length=ctx,
+            model_max_len=_checkpoint_context_length(state),
             supported_reasoning_efforts=efforts,
             default_reasoning_effort=default_effort,
         )])
@@ -698,9 +699,34 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
+    """The context a client should budget for: min(model ceiling, KV pool tokens).
+
+    Deliberately NOT the checkpoint's own ceiling. Clients size their window from this route,
+    so advertising more than the scheduler admits produces hard 400s
+    (``context_length_exceeded``: "prompt is too long: N tokens > M maximum (prompt +
+    generation)") on prompts the model card said were fine -- exactly what a KV pool configured
+    below the model's max_position used to cause. The engine publishes the enforced value in its
+    readiness meta; while that is still in flight, or on an engine that sends none, fall back to
+    the ceiling. ``model_max_len`` on the card keeps the raw ceiling visible.
+    """
+    ceiling = 0
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
+        ceiling = int(state.config.max_seq_len)
+    except Exception:  # noqa: BLE001
+        ceiling = 0
+    enforced = 0
+    try:
+        enforced = int(getattr(state, "max_seq_len", 0) or 0)
+    except (TypeError, ValueError):
+        enforced = 0
+    value = enforced if enforced > 0 else ceiling
+    return value if value > 0 else None
+
+
+def _checkpoint_context_length(state: Any) -> int | None:
+    """The checkpoint's OWN ceiling (config max_position), reported for reference next to the
+    enforced ``max_model_len``/``context_length``. None when it cannot be read."""
+    try:
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None

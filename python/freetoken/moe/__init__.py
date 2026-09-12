@@ -9,9 +9,20 @@ from __future__ import annotations
 MOE_STRATEGIES = ("fused", "offload", "cpu", "hybrid")
 OFFLOAD_MOE_STRATEGIES = frozenset({"offload", "cpu", "hybrid"})
 
+# Owner-local expert placement (TP+EP): the expert-parallel group size, the per-rank bank
+# geometry derived from it, and the incremental update a runtime resize hands back.
+from .ownership import ExpertOwnership, OwnerCacheGeometry, OwnerCacheUpdate
+
 
 def is_offload_moe_strategy(strategy: str) -> bool:
     return strategy in OFFLOAD_MOE_STRATEGIES
 
 
-__all__ = ["MOE_STRATEGIES", "OFFLOAD_MOE_STRATEGIES", "is_offload_moe_strategy"]
+__all__ = [
+    "MOE_STRATEGIES",
+    "OFFLOAD_MOE_STRATEGIES",
+    "is_offload_moe_strategy",
+    "ExpertOwnership",
+    "OwnerCacheGeometry",
+    "OwnerCacheUpdate",
+]

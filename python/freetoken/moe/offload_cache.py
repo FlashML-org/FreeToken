@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator
 
 import torch
@@ -26,6 +26,8 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
 from freetoken.utils import init_logger
+
+from .ownership import OwnerCacheGeometry, OwnerCacheUpdate, same_device
 
 logger = init_logger(__name__)
 
@@ -102,6 +104,11 @@ MARLIN_MAX_CACHE_SIZE = 992
 
 @dataclass
 class OffloadMoeCache:
+    # Marks the global-ID cache. ``OwnerOffloadMoeCache`` overrides this so the MoE layer
+    # can dispatch to the owner-local route adapter without importing the wrapper (which
+    # would be a cycle: the wrapper wraps this class).
+    is_owner_local = False
+
     num_layers: int
     num_experts: int
     cache_size: int
@@ -141,11 +148,27 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # Explicit owner-local geometry is opt-in. The legacy cache uses global expert IDs
+    # throughout its kernels and must not silently accept local owner rows.
+    owner_geometry: OwnerCacheGeometry | None = None
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
 
     def __post_init__(self) -> None:
+        if self.owner_geometry is not None:
+            self.owner_geometry.validate_cache_binding(
+                num_layers=self.num_layers,
+                num_experts=self.num_experts,
+                cache_size=self.cache_size,
+                prefill_overlap=self.prefill_overlap,
+            )
+            raise NotImplementedError(
+                "owner-local cache geometry is validated but the OffloadMoeCache runtime "
+                "namespace mapping is not enabled; leave owner_geometry unset until "
+                "global/local/slot IDs are wired through every cache kernel"
+            )
+
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
@@ -246,6 +269,11 @@ class OffloadMoeCache:
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
         self.collect_decode_freq = False
+        # Opt-in ordered route trace recorder (moe/route_trace.RouteTraceRecorder),
+        # attached by the engine when --moe-trace-route is set. Records RAW global
+        # expert ids in call order before lru_ensure rewrites them to slots. None =
+        # disabled (production default, zero overhead).
+        self.route_recorder = None
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
@@ -354,7 +382,11 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
+            # Remote owner-route entries use slot zero with zero weight. Decode kernels still
+            # load the slot row before applying the weight, so an uninitialized row can turn
+            # ``0 * NaN`` into NaN and poison logits. Zero-fill the data plane; bookkeeping
+            # workspaces below remain uninitialized for graph/performance reasons.
+            self.bank_caches[name] = torch.zeros(
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
@@ -492,7 +524,7 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -848,6 +880,9 @@ class OffloadMoeCache:
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.route_recorder is not None:
+            # same raw-ids point: append the ordered trace BEFORE the in-place rewrite.
+            self.route_recorder.record(layer_id, expert_ids, phase=0)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -867,6 +902,8 @@ class OffloadMoeCache:
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.route_recorder is not None:
+            self.route_recorder.record(layer_id, expert_ids, phase=0)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
@@ -993,6 +1030,13 @@ class OffloadMoeCache:
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
         oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
+        # The realized cache is ONE unified LRU slot pool shared across layers, so the
+        # tight per-row bound is the top-cache_size rows of the flattened (layer, expert)
+        # activation distribution -- how often a perfect policy would find the expert
+        # already resident. The per-layer figure above assumes an even per-layer split.
+        flat = freq.reshape(-1)
+        top = torch.sort(flat, descending=True).values[: self.cache_size]
+        oracle_hit_global = (top.sum() / flat.sum().clamp(min=1)).item()
         ws = (freq > 0).sum(dim=1).float()
         cdf = torch.cumsum(sorted_f, dim=1) / total.clamp(min=1).unsqueeze(1)
         cover90 = ((cdf < 0.9).sum(dim=1).float() + 1)[valid]
@@ -1005,15 +1049,73 @@ class OffloadMoeCache:
             "working_set_max": int(ws[valid].max().item()),
             "experts_for_90pct": cover90.mean().item(),
             "oracle_hit_at_slots": oracle_hit,
+            "oracle_hit_global": oracle_hit_global,
             "norm_entropy": norm_ent,
         }
+
+    def stats_snapshot(self) -> dict:
+        """Cross-process snapshot of the slot-cache counters for /v1/stats.
+
+        Built for the scheduler's throttled stamp onto the reply stream: ONE device
+        sync per counter group (stack + tolist) instead of decode_miss_stats()'s
+        per-field .item()s. ``resident`` (slots holding a live expert, vs the
+        ``cache_size`` capacity and ``total_experts`` expert-layer pairs) is always
+        available; miss/fetch counters require ``collect_stats``, and the routing
+        concentration block requires ``collect_decode_freq``. All values are
+        since-process-start (or the last rebuild/reset), like the other getters."""
+        out: dict = {
+            "cache_size": self.cache_size,
+            "total_experts": self.num_layers * self.num_experts,
+            "resident": int(self.usage.gt(0).sum().item()),
+            "target": self.decode_target,
+        }
+        if self.decode_target == "hybrid":
+            active, missing, calls, fetched = (
+                int(x)
+                for x in torch.stack(
+                    [self.stat_active, self.stat_missing, self.stat_calls, self.stat_fetched]
+                ).tolist()
+            )
+        elif self.collect_stats:
+            active, missing, calls = (int(x) for x in self.lru_stats.sum(0).tolist())
+            fetched = int(self.stat_fetched.item())
+        else:
+            active = missing = calls = fetched = 0
+        out.update(
+            {
+                "layer_calls": calls,
+                "active_per_layer": (active / calls) if calls else 0.0,
+                "missing_per_layer": (missing / calls) if calls else 0.0,
+                "miss_rate": (missing / active) if active else 0.0,
+                "fetched_per_layer": (fetched / calls) if calls else 0.0,
+                "fetch_rate": (fetched / missing) if missing else 0.0,
+                "prefill_hit_rows": self.prefill_hit_rows,
+                "prefill_rows": self.prefill_total_rows,
+            }
+        )
+        if self.collect_decode_freq and int(self.decode_freq.sum().item()) > 0:
+            try:
+                out["routing"] = self.decode_routing_stats()
+            except Exception:  # noqa: BLE001 -- stats must never break the reply path
+                pass
+        return out
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        whole_layer = self._pending_whole_layer
+        # Consume the staged state exactly ONCE. ``src_indices``/``evict_slots`` are shared
+        # buffers overwritten by the next layer's staging, so leaving ``_pending_src_layer``
+        # set makes it impossible for a caller to tell "nothing staged" from "staged two
+        # layers ago" -- and the owner wrapper's ``is None`` guard depends on that
+        # distinction. Clearing here (before the copies, which only need the captured locals
+        # plus the already-staged slot tensors) also means a mid-copy exception leaves the
+        # cache in a clean "nothing staged" state instead of a stale one.
+        self._pending_src_layer = None
+        self._pending_whole_layer = False
         if layer_id in self._unpinned_layers:
-            if not self._pending_whole_layer:
+            if not whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "
@@ -1053,6 +1155,442 @@ class OffloadMoeCache:
             )
 
 
+class OwnerOffloadMoeCache:
+    """Owner-local adapter over the existing GPU slot-cache implementation.
+
+    The wrapped cache sees only ``local_num_experts`` rows.  Callers must use
+    :meth:`ensure_route` rather than the legacy ``ensure_experts`` entry point: the adapter
+    compacts owned route entries before LRU admission, then restores the original route shape
+    with zero-weight slot-zero placeholders for remote entries.  This class is opt-in and is
+    not attached by ``attach_offload_moe_cache``; prefill/collective/model wiring remains a
+    separate P3 task.
+
+    Two admission paths share the same namespace boundary:
+
+    * :meth:`ensure_route` -- eager: compacts the route to its owned positions and reports
+      miss/eviction diagnostics.  The compaction needs a device->host read per layer
+      (``nonzero`` + ``num_indices.item()``), so it cannot be captured.
+    * :meth:`ensure_route_graph` -- fixed-shape, sync-free sentinel admission for CUDA-graph
+      decode (see its docstring).  Selected by the ``graph_safe`` constructor flag.
+    """
+
+    is_owner_local = True  # MoELayer dispatches to ensure_route() on this flag
+
+    def __init__(
+        self,
+        geometry: OwnerCacheGeometry,
+        device: torch.device,
+        *,
+        cache_policy: str = "lru",
+        quant_format: str = "bf16",
+        prefill_hit_d2d: bool = False,
+        graph_safe: bool = False,
+        layout: dict | None = None,
+        max_slots: int | None = None,
+    ) -> None:
+        if layout is None and quant_format not in _BANK_SCHEMAS:
+            raise ValueError(f"unknown quant_format {quant_format!r}")
+        self.geometry = geometry
+        # The owner adapter is GPU-only: it wraps the GPU slot cache and `_decode_owner` is
+        # selected before the `is_cpu_layer` branch, so a CPU/hybrid target could not be
+        # honoured. `_validate_owner_ep_config` rejects `--moe-cpu-layers` under owner EP
+        # rather than accepting a configuration this class would silently ignore.
+        self._cache = OffloadMoeCache(
+            num_layers=geometry.num_layers,
+            num_experts=geometry.local_num_experts,
+            cache_size=geometry.cache_size,
+            device=device,
+            cache_policy=cache_policy,
+            prefill_overlap=geometry.prefill_overlap,
+            prefill_hit_d2d=prefill_hit_d2d,
+            quant_format=quant_format,
+            decode_target="gpu",
+            layout=layout,
+            max_slots=max_slots,
+        )
+        self._pending_owned = False
+        # Decode admission implementation: True selects the fixed-shape, sync-free
+        # ``ensure_route_graph`` (required for CUDA-graph capture), False keeps the eager
+        # compacting ``ensure_route`` with its miss/eviction diagnostics.
+        self.graph_safe = graph_safe
+
+    @property
+    def global_num_experts(self) -> int:
+        return self.geometry.global_num_experts
+
+    @property
+    def num_experts(self) -> int:
+        """The row count visible to the wrapped local bank and slot kernels."""
+        return self.geometry.local_num_experts
+
+    @property
+    def cache_size(self) -> int:
+        return self.geometry.cache_size
+
+    @property
+    def resident(self) -> int:
+        """Number of resident owner-local slots."""
+        return int(self._cache.id_of_slot.ge(0).sum().item())
+
+    @property
+    def device(self) -> torch.device:
+        return self._cache.device
+
+    def __getattr__(self, name):
+        # Keep the wrapper small while preserving the existing cache's read-only reports and
+        # bank-view helpers. Explicit route methods below prevent unsafe legacy admission.
+        cache = object.__getattribute__(self, "_cache")
+        return getattr(cache, name)
+
+    # --- engine-assigned flags: forward BOTH directions to the wrapped cache -----------
+    # ``__getattr__`` only handles reads; a plain assignment would land on the wrapper while
+    # the inner cache keeps its own default (False / empty), silently disabling stats, the
+    # route trace and CPU-layer routing. These properties keep the two objects in sync.
+    @property
+    def cpu_layer_ids(self):
+        return self._cache.cpu_layer_ids
+
+    @cpu_layer_ids.setter
+    def cpu_layer_ids(self, value):
+        self._cache.cpu_layer_ids = value
+
+    @property
+    def collect_stats(self):
+        return self._cache.collect_stats
+
+    @collect_stats.setter
+    def collect_stats(self, value):
+        self._cache.collect_stats = value
+
+    @property
+    def collect_decode_freq(self):
+        return self._cache.collect_decode_freq
+
+    @collect_decode_freq.setter
+    def collect_decode_freq(self, value):
+        self._cache.collect_decode_freq = value
+
+    @property
+    def route_recorder(self):
+        return self._cache.route_recorder
+
+    @route_recorder.setter
+    def route_recorder(self, value):
+        self._cache.route_recorder = value
+
+    @property
+    def decode_target(self):
+        return self._cache.decode_target
+
+    @decode_target.setter
+    def decode_target(self, value):
+        self._cache.decode_target = value
+
+    @property
+    def hybrid_max_fetch(self):
+        return self._cache.hybrid_max_fetch
+
+    @hybrid_max_fetch.setter
+    def hybrid_max_fetch(self, value):
+        self._cache.hybrid_max_fetch = value
+
+    @property
+    def hybrid_fetch_fraction(self):
+        return self._cache.hybrid_fetch_fraction
+
+    @hybrid_fetch_fraction.setter
+    def hybrid_fetch_fraction(self, value):
+        self._cache.hybrid_fetch_fraction = value
+
+    def set_bank_sources(
+        self,
+        sources: dict[str, list[torch.Tensor]],
+        layer_residency: list[str] | None = None,
+    ) -> None:
+        """Attach banks whose first dimension is the owner-local expert count."""
+        self.geometry.validate_source_banks(sources)
+        self._cache.set_bank_sources(sources, layer_residency=layer_residency)
+
+    def set_alphas(
+        self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
+    ) -> None:
+        """Attach owner-local per-layer alpha vectors for tiled quantized backends."""
+        if gate_up_alpha is None and down_alpha is None:
+            return
+        if gate_up_alpha is None or down_alpha is None:
+            raise ValueError("gate_up_alpha and down_alpha must be provided together")
+        expected = (self.geometry.num_layers * self.num_experts,)
+        if gate_up_alpha.shape != expected or down_alpha.shape != expected:
+            raise ValueError(
+                f"owner alpha vectors must have shape {expected}, got "
+                f"{tuple(gate_up_alpha.shape)} and {tuple(down_alpha.shape)}"
+            )
+        self._cache.set_alphas(gate_up_alpha, down_alpha)
+
+    def ensure_experts(self, *_args, **_kwargs) -> None:
+        raise RuntimeError(
+            "owner-local cache requires ensure_route(weights, global_expert_ids); "
+            "raw ensure_experts would admit remote global IDs"
+        )
+
+    def ensure_experts_hybrid(self, *_args, **_kwargs) -> None:
+        raise NotImplementedError(
+            "owner-local hybrid admission is not implemented; use the GPU owner adapter"
+        )
+
+    def ensure_route(
+        self, layer_id: int, weights: torch.Tensor, global_expert_ids: torch.Tensor
+    ) -> OwnerCacheUpdate:
+        """Admit only owned route entries and return slot IDs safe for local GEMM.
+
+        Admission is compacted to owned positions because the legacy LRU kernel has no mask
+        argument.  The returned tensors retain the input route shape; remote positions use
+        local-row zero, slot zero, and zero weight.  The caller must invoke ``copy_missing``
+        before reading the slot bank views.
+        """
+        if self._pending_owned:
+            raise RuntimeError("copy_missing must complete the previous owner route first")
+        if not same_device(weights.device, self.device) or not same_device(
+            global_expert_ids.device, self.device
+        ):
+            raise ValueError(
+                f"owner route tensors must be on {self.device}, got "
+                f"{weights.device} and {global_expert_ids.device}"
+            )
+        if not 0 <= layer_id < self.geometry.num_layers:
+            raise ValueError(
+                f"layer_id {layer_id} is outside [0, {self.geometry.num_layers})"
+            )
+        if self.route_recorder is not None:
+            # The recorder contract is global route IDs before any owner-local remap.
+            self.route_recorder.record(layer_id, global_expert_ids, phase=0)
+        route = self.geometry.partition_route(weights, global_expert_ids)
+        flat_ids, owned = self.geometry.global_to_local_flat(layer_id, global_expert_ids)
+        owned_positions = owned.reshape(-1).nonzero(as_tuple=False).flatten()
+        slot_ids_flat = torch.zeros(
+            (global_expert_ids.numel(),), dtype=torch.int32, device=self.device
+        )
+        missing = torch.empty((0,), dtype=torch.int32, device=self.device)
+        evicted = torch.empty((0,), dtype=torch.int32, device=self.device)
+
+        if owned_positions.numel():
+            local_ids = route.local_ids.reshape(-1).index_select(0, owned_positions)
+            local_ids = local_ids.to(dtype=torch.int32).contiguous()
+            old_id_of_slot = self._cache.id_of_slot.clone()
+            # The inner cache must not record the compressed local IDs as if they were the
+            # raw global route. Owner mode records at this boundary, before local remapping.
+            recorder = self._cache.route_recorder
+            self._cache.route_recorder = None
+            try:
+                self._cache.ensure_experts(layer_id, local_ids)
+            finally:
+                self._cache.route_recorder = recorder
+            self._pending_owned = True
+
+            count = int(self._cache.num_indices.item())
+            missing = self._cache.src_indices[:count].clone()
+            victim_slots = self._cache.evict_slots[:count].long()
+            old_ids = old_id_of_slot.index_select(0, victim_slots)
+            evicted = old_ids[old_ids.ge(0)].to(dtype=torch.int32)
+            slot_ids_flat.index_copy_(0, owned_positions, local_ids)
+
+        return OwnerCacheUpdate(
+            slot_ids=slot_ids_flat.reshape(global_expert_ids.shape),
+            local_ids=route.local_ids,
+            local_flat_ids=torch.where(owned, flat_ids, torch.zeros_like(flat_ids)),
+            weights=route.weights,
+            owned_mask=route.owned_mask,
+            missing_local_ids=missing,
+            evicted_flat_ids=evicted,
+        )
+
+    def ensure_route_graph(
+        self, layer_id: int, weights: torch.Tensor, global_expert_ids: torch.Tensor
+    ) -> OwnerCacheUpdate:
+        """CUDA-graph-safe owner admission: fixed shape, zero device->host reads.
+
+        The eager :meth:`ensure_route` compacts the route onto its owned positions, which
+        both makes the admitted tensor's LENGTH data-dependent and forces a sync per layer
+        (``nonzero`` to find the positions, ``num_indices.item()`` to size the diagnostics).
+        Both are illegal inside ``torch.cuda.graph`` capture.
+
+This variant never changes the shape.  Remote entries are remapped to a row that is
+        already owned by the SAME route instead of being dropped::
+
+            local_row = owned ? global_id - global_start : row_of_first_owned_position
+
+        The flashlib LRU kernel accepts a full route unchanged (no masked-admission API is
+        needed) and its in-place rewrite yields a valid slot id for EVERY position; a remote
+        position simply points at an owned row's slot with ``weight == 0``, contributing
+        exactly nothing to the grouped GEMM.  Those rows hold real expert weights (finite), so
+        the zero weighting never relies on ``0 * NaN``.
+
+        Reusing an owned row keeps the admitted row set identical to the eager compaction's,
+        so the two paths place the same rows in the same slots and share one cache behaviour.
+        The counters do report the full top-k as active, since every position is submitted.
+
+        Diagnostics that need a device->host read (``missing_local_ids`` /
+        ``evicted_flat_ids``) are returned empty; use the eager path when those are needed.
+        """
+        if self._pending_owned:
+            raise RuntimeError("copy_missing must complete the previous owner route first")
+        if not same_device(weights.device, self.device) or not same_device(
+            global_expert_ids.device, self.device
+        ):
+            raise ValueError(
+                f"owner route tensors must be on {self.device}, got "
+                f"{weights.device} and {global_expert_ids.device}"
+            )
+        if not 0 <= layer_id < self.geometry.num_layers:
+            raise ValueError(
+                f"layer_id {layer_id} is outside [0, {self.geometry.num_layers})"
+            )
+        if weights.shape != global_expert_ids.shape:
+            raise ValueError(
+                f"route weights and expert IDs must have the same shape, got "
+                f"{tuple(weights.shape)} and {tuple(global_expert_ids.shape)}"
+            )
+        if global_expert_ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+            raise TypeError(
+                f"router expert IDs must be an integer tensor, got {global_expert_ids.dtype}"
+            )
+        if self.route_recorder is not None:
+            raise RuntimeError(
+                "--moe-trace-route records host-side and cannot run inside a CUDA graph; "
+                "disable it or serve with --cuda-graph-max-bs 0"
+            )
+
+        # Sync-free equivalents of geometry.partition_route / global_to_local_flat: those
+        # helpers validate with `if torch.any(...)`, which is itself a device->host read.
+        ownership = self.geometry.ownership
+        local_ids, owned = ownership.global_to_local(global_expert_ids)
+        zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
+        if owned.ndim == 0 or owned.shape[-1] == 0:
+            raise ValueError("owner route needs at least one candidate position per row")
+        # Remote entries reuse an OWNED row of the SAME route (the row of its first owned
+        # position) rather than a fixed sentinel row.  Their weight is zeroed below, so which
+        # row they point at cannot affect the math -- but reusing an owned row keeps the
+        # admitted row set EXACTLY the owned rows, i.e. identical to what the eager
+        # compaction admits.  A fixed sentinel would instead add one always-touched row per
+        # layer, and that row measurably churns (missing/layer 0.72 -> 1.35 measured), which
+        # is pure extra PCIe traffic.
+        first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
+        fallback = local_ids.gather(-1, first_owned)
+        # All-remote row (rare): there is no owned row to borrow, so fall back to row zero.
+        fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
+        safe_row = torch.where(owned, local_ids, fallback)
+        # ``admit`` is rewritten IN PLACE into slot ids by the LRU kernel, and ``.to(int32)``
+        # returns the same tensor when the route is already int32 -- so every value that must
+        # survive as a bank ROW has to be materialized before the kernel runs.
+        local_rows = safe_row.clone()
+        # Computed before the rewrite as well (this allocates a fresh tensor, but keep the
+        # ordering explicit so a future in-place tweak cannot alias it).
+        local_flat = layer_id * self.geometry.local_num_experts + safe_row
+        admit = safe_row.to(dtype=torch.int32).contiguous()
+
+        recorder = self._cache.route_recorder
+        self._cache.route_recorder = None
+        try:
+            # Admits row zero for remote-only routes too, so the copy plan is never empty and
+            # the captured kernel sequence is identical on every replay.
+            self._cache.ensure_experts(layer_id, admit)
+        finally:
+            self._cache.route_recorder = recorder
+        self._pending_owned = True
+
+        zero_weight = torch.zeros((), dtype=weights.dtype, device=weights.device)
+        empty = torch.empty((0,), dtype=torch.int32, device=self.device)
+        return OwnerCacheUpdate(
+            # ``admit`` was rewritten in place: owned positions carry their slot id, remote
+            # positions carry row zero's slot id (harmless: their weight is zero).
+            slot_ids=admit.reshape(global_expert_ids.shape),
+            local_ids=local_rows,
+            local_flat_ids=local_flat,
+            weights=torch.where(owned, weights, zero_weight).contiguous(),
+            owned_mask=owned,
+            missing_local_ids=empty,
+            evicted_flat_ids=empty,
+        )
+
+    def copy_missing(self) -> None:
+        """Copy the pending owned misses; remote-only routes are a no-op."""
+        if not self._pending_owned:
+            # materialize_layer stages a whole-layer copy without setting the decode
+            # admission flag; the inner cache still has pending state to complete.
+            if self._cache._pending_src_layer is None:
+                return
+        self._cache.copy_missing()
+        self._pending_owned = False
+
+    def rebuild(self, cache_size: int) -> None:
+        """Resize the wrapped slot cache and keep the owner geometry in step.
+
+        ``__getattr__`` would otherwise forward ``rebuild`` to the inner cache, whose
+        implementation disables ``prefill_overlap`` when the new size cannot hold two complete
+        local layers. ``geometry`` is frozen and would keep the old ``cache_size`` /
+        ``prefill_overlap``, so ``materialize_layer`` would still take the overlap path and
+        later call ``wait_prefill_layer`` against an inner cache that has overlap disabled --
+        buffers that no longer exist. Re-derive the geometry from the inner cache instead.
+        """
+        self._cache.rebuild(cache_size)
+        self.geometry = replace(
+            self.geometry,
+            cache_size=self._cache.cache_size,
+            prefill_overlap=self._cache.prefill_overlap,
+        )
+
+    def begin_prefill(self) -> None:
+        """Start the borrowed-buffer lifecycle for an owner-local prefill."""
+        self._cache.begin_prefill()
+
+    def prefetch_prefill_layer(self, layer_id: int) -> None:
+        self._cache.prefetch_prefill_layer(layer_id)
+
+    def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        return self._cache.wait_prefill_layer(layer_id)
+
+    def release_prefill_layer(self, layer_id: int) -> None:
+        self._cache.release_prefill_layer(layer_id)
+
+    def materialize_layer(self, layer_id: int, buffer_id: int = 0) -> torch.Tensor:
+        """Materialize all local rows using the legacy prefill choreography."""
+        if self.geometry.prefill_overlap:
+            if buffer_id != layer_id % 2:
+                raise ValueError(
+                    "owner prefill buffer_id must match layer_id % 2 for the legacy buffers"
+                )
+            self._cache.prefetch_prefill_layer(layer_id)
+        else:
+            if buffer_id != 0:
+                raise ValueError("owner prefill overlap is disabled; buffer_id must be 0")
+            self._cache.materialize_layer(layer_id)
+            # materialize_layer only stages the whole-layer copy in the legacy cache;
+            # complete it before owner GEMM reads the local bank rows.
+            self.copy_missing()
+        return torch.arange(
+            buffer_id * self.num_experts,
+            (buffer_id + 1) * self.num_experts,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def reset(self) -> None:
+        self._cache.reset()
+        self._pending_owned = False
+
+    def validate_invariants(self) -> None:
+        """Validate the wrapped cache maps in the owner-local flat-ID namespace."""
+        self.geometry.validate_slot_maps(self._cache.slot_for_id, self._cache.id_of_slot)
+        for slot, flat in enumerate(self._cache.id_of_slot.tolist()):
+            if flat < 0:
+                continue
+            layer, local = divmod(flat, self.num_experts)
+            if int(self._cache.slot_for_id[layer, local].item()) != slot:
+                raise AssertionError(
+                    f"owner cache reverse map mismatch at slot={slot}, flat_id={flat}"
+                )
+
+
 def iter_offload_moe_layers(model) -> Iterator:
     from freetoken.layers import BaseOP, OffloadMoELayer
 
@@ -1074,4 +1612,19 @@ def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
     for layer in layers:
         layer.offload_cache = cache
+    return layers
+
+
+def attach_owner_moe_cache(model, owner_cache) -> list:
+    """Attach an ``OwnerOffloadMoeCache`` to every offload MoE layer.
+
+    Sets ``layer.owner_cache`` and leaves ``layer.offload_cache`` pointing at the adapter.
+    This prevents bespoke subclasses from bypassing global-to-local route remapping through
+    the inner global-ID cache. Opt-in: nothing calls this unless a caller explicitly builds
+    an owner cache, and the global-ID cache path is untouched when it is absent.
+    """
+    layers = list(iter_offload_moe_layers(model))
+    for layer in layers:
+        layer.owner_cache = owner_cache
+        layer.offload_cache = owner_cache
     return layers
