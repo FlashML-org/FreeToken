@@ -1,0 +1,80 @@
+{
+  "status": "serverless_inference_and_concurrency_benchmark_verified_lifecycle_pending",
+  "observed_at": "2026-09-07T05:16:03Z",
+  "provider": "Vast.ai Serverless",
+  "endpoint_id": 36422,
+  "endpoint_name": "tekizai-glm53-full-freetoken-global",
+  "workergroup_id": 45647,
+  "worker_instance_id": 50124528,
+  "machine_id": 147075,
+  "region": "JP",
+  "hardware": {
+    "gpu": "H200 NVL",
+    "gpu_memory_mib": 143771,
+    "effective_cpu_cores": 32,
+    "disk_gib": 520
+  },
+  "checkpoint": "LibertAIDAI/GLM-5.3-NVFP4",
+  "served_model": "glm-5.3-nvfp4",
+  "runtime": "FreeToken 0.1.2",
+  "template_id": 696081,
+  "template_hash": "af9cd2b7d62b225ac623902af890bb35",
+  "readiness": {
+    "freetoken_api_ready_at_utc": "2026-09-07T05:09:16Z",
+    "vast_model_loaded_at_utc": "2026-09-07T05:11:34Z",
+    "vast_worker_idle_at_utc": "2026-09-07T05:11:44.757Z"
+  },
+  "semantic_smoke": {
+    "artifact": "glm53-full-h200-serverless-smoke-20260907.json",
+    "transport": "authenticated_vast_serverless_endpoint",
+    "prompt": "What is 17 + 25? Reply with only the number.",
+    "actual": "42",
+    "answer_correct": true,
+    "finish_reason": "stop",
+    "latency_s": 10.402,
+    "requests_succeeded": 1,
+    "requests_failed": 0
+  },
+  "concurrency_benchmark": {
+    "artifact": "glm53-full-h200-serverless-c8-c16-20260907.json",
+    "transport": "authenticated_vast_serverless_endpoint",
+    "measurement_mode": "nonstreaming_end_to_end_including_routing_queue_and_prefill",
+    "prompt": "Write a concise Python function that merges two sorted iterables.",
+    "max_tokens": 128,
+    "reasoning_effort": "low",
+    "levels": [
+      {
+        "concurrency": 8,
+        "requests_succeeded": 8,
+        "requests_failed": 0,
+        "wall_s": 57.136,
+        "aggregate_output_tokens_per_s": 17.782,
+        "latency_mean_s": 57.133,
+        "latency_p95_s": 57.135,
+        "output_tokens": 1016
+      },
+      {
+        "concurrency": 16,
+        "requests_succeeded": 16,
+        "requests_failed": 0,
+        "wall_s": 112.747,
+        "aggregate_output_tokens_per_s": 18.023,
+        "latency_mean_s": 85.6,
+        "latency_p95_s": 112.738,
+        "output_tokens": 2032
+      }
+    ],
+    "note": "All responses contained assistant output and reached the fixed 128-token cap. These are single-run throughput measurements, not full-completion quality measurements or repeated statistical qualification."
+  },
+  "lifecycle": {
+    "autoscaled_worker_creation_verified": true,
+    "serverless_routing_verified": true,
+    "idle_stop_verified": false,
+    "cached_restart_verified": false
+  },
+  "notes": [
+    "FreeToken loaded the full checkpoint, allocated 8384 KV tokens, and captured CUDA graphs for batch sizes 1, 2, 4, and 8.",
+    "The workergroup permits eight running requests, so the c16 result includes serverless queueing above the worker's active-request limit.",
+    "The semantic smoke is the completion-quality check; the capped c8/c16 workload is the throughput check."
+  ]
+}

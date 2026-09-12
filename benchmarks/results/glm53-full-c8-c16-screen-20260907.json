@@ -1,0 +1,330 @@
+{
+  "destination": "http://127.0.0.1:1919/v1/chat/completions",
+  "levels": [
+    {
+      "aggregate_output_tokens_per_s": 3.937,
+      "concurrency": 8,
+      "errors": {},
+      "failures": 0,
+      "latency_mean_s": 62.983,
+      "latency_p50_s": 62.984,
+      "latency_p95_s": 62.989,
+      "output_tokens": 248,
+      "per_request_end_to_end_tokens_per_s_mean": 0.492,
+      "per_request_end_to_end_tokens_per_s_min": 0.492,
+      "requests": [
+        {
+          "end_to_end_output_tokens_per_s": 0.49223106866956284,
+          "finish_reason": "length",
+          "latency_s": 62.97855209300178,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation from merge sort. Let me think about the best approach",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4921702335061453,
+          "finish_reason": "length",
+          "latency_s": 62.98633661601343,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4921495640537958,
+          "finish_reason": "length",
+          "latency_s": 62.98898193601053,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4921891551813523,
+          "finish_reason": "length",
+          "latency_s": 62.98391517500568,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4921968928358253,
+          "finish_reason": "length",
+          "latency_s": 62.98292502699769,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4921741144299024,
+          "finish_reason": "length",
+          "latency_s": 62.9858399520017,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4922074220686618,
+          "finish_reason": "length",
+          "latency_s": 62.98157770500984,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation from merge sort. Let me think about the best approach",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.4922283824304707,
+          "finish_reason": "length",
+          "latency_s": 62.978895786000066,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        }
+      ],
+      "successes": 8,
+      "wall_s": 62.991
+    },
+    {
+      "aggregate_output_tokens_per_s": 6.297,
+      "concurrency": 16,
+      "errors": {},
+      "failures": 0,
+      "latency_mean_s": 58.434,
+      "latency_p50_s": 78.748,
+      "latency_p95_s": 78.751,
+      "output_tokens": 496,
+      "per_request_end_to_end_tokens_per_s_mean": 0.603,
+      "per_request_end_to_end_tokens_per_s_min": 0.394,
+      "requests": [
+        {
+          "end_to_end_output_tokens_per_s": 0.8132105022173712,
+          "finish_reason": "length",
+          "latency_s": 38.12051112900372,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132176628103,
+          "finish_reason": "length",
+          "latency_s": 38.12017546799325,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132419070784376,
+          "finish_reason": "length",
+          "latency_s": 38.1190390339907,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132222097296122,
+          "finish_reason": "length",
+          "latency_s": 38.11996232900128,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation, like the merge step in merge sort.\n\nLet me",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132897467680965,
+          "finish_reason": "length",
+          "latency_s": 38.116796778995194,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation, like the merge step in merge sort.\n\nLet me",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132410764508141,
+          "finish_reason": "length",
+          "latency_s": 38.11907796798914,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation, like the merge step in merge sort.\n\nLet me",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132650815359663,
+          "finish_reason": "length",
+          "latency_s": 38.11795280998922,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation, like the merge step in merge sort.\n\nLet me",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.8132933970384179,
+          "finish_reason": "length",
+          "latency_s": 38.11662570098997,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.3936418548815157,
+          "finish_reason": "length",
+          "latency_s": 78.75178824500472,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation, like the merge step in merge sort.\n\nLet me",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.39364414520863655,
+          "finish_reason": "length",
+          "latency_s": 78.75133004599775,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation from merge sort. Let me think about the best approach",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.3936464434401844,
+          "finish_reason": "length",
+          "latency_s": 78.7508702710038,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.39364954688392906,
+          "finish_reason": "length",
+          "latency_s": 78.75024941700394,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.3936553884015476,
+          "finish_reason": "length",
+          "latency_s": 78.74908082898764,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation from merge sort. Let me think about the best way",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.39365080062907953,
+          "finish_reason": "length",
+          "latency_s": 78.74999860399112,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.39365950476823347,
+          "finish_reason": "length",
+          "latency_s": 78.74825737600622,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic merge operation from merge sort. Let me think about the best way",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        },
+        {
+          "end_to_end_output_tokens_per_s": 0.3936625684556411,
+          "finish_reason": "length",
+          "latency_s": 78.74764451599913,
+          "message": {
+            "content": "",
+            "reasoning_content": "The user wants a concise Python function that merges two sorted iterables. This is a classic problem \u2014 essentially the \"merge\" step of merge sort, generalized",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 31
+        }
+      ],
+      "successes": 16,
+      "wall_s": 78.767
+    }
+  ],
+  "max_tokens": 32,
+  "measurement_mode": "nonstreaming_end_to_end_including_routing_queue_and_prefill",
+  "model": "glm-5.3-nvfp4",
+  "prompt": "Write a concise Python function that merges two sorted iterables.",
+  "started_at_utc": "2026-09-07T04:08:06.498640+00:00"
+}
