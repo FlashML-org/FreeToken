@@ -13,6 +13,8 @@ from typing import Sequence
 import safetensors
 import torch
 
+from freetoken.mm import MM_PAD_SHIFT_VALUE, restore_placeholder
+
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
@@ -118,6 +120,7 @@ class DiskRowTable:
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
         self.eos_token_id = int(hash_constants["eos_token_id"])
+        self.image_token_id = hash_constants.get("image_token_id")
         sizes = [int(x) for x in hash_constants["per_head_vocab_sizes"]]
         offsets = [int(x) for x in hash_constants["per_head_offsets"]]
         need = max(o + s for o, s in zip(offsets, sizes))
@@ -191,6 +194,16 @@ class DiskRowTable:
             offset += run.numel() - 2
         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
 
+    def _ple_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.image_token_id is None:
+            return input_ids
+        return restore_placeholder(input_ids, self.image_token_id)
+
+    def _ple_context(self, ids: torch.Tensor, position: int) -> list[int]:
+        if self.image_token_id is None:
+            return _context(ids, position, self.eos_token_id)
+        return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
+
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
         eos = self.eos_token_id
@@ -205,7 +218,7 @@ class DiskRowTable:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
                                 for r, t in zip(reqs, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
@@ -218,14 +231,14 @@ class DiskRowTable:
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
                     for r, t in zip(reqs, tokens)]
             self.fill(runs, graph=use_graph)
             return None
         runs = [
             torch.cat((
-                torch.tensor(_context(req.input_ids, req.cached_len, eos), dtype=torch.int64),
-                req.input_ids[req.cached_len : req.device_len].to(torch.int64),
+                torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
+                self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
             ))
             for req in batch.padded_reqs
         ]

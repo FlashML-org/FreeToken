@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -30,6 +32,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mm import plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -89,7 +92,10 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
         )
 
         # some alias for easy access
@@ -133,6 +139,7 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._model_is_mrope = config.model_config.model_is_mrope
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -489,6 +496,17 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.mm_items and self.engine.encoder_cache is None:
+                # no encoder runtime: fail loudly instead of decoding unexpanded placeholders
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="image input is not supported by this server",
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -534,6 +552,15 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if (
+                req_to_free is not None
+                and req_to_free.mm_items
+                and self.engine.encoder_cache is not None
+            ):
+                # drop the aborted request's claims; entries it held alone die here
+                self.engine.encoder_cache.release(
+                    msg.uid, [item.hash for item in req_to_free.mm_items]
+                )
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -781,6 +808,8 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        if self._model_is_mrope:
+            batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -819,14 +848,12 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
+        jobs, plan, rows = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        if plan:
+            batch.mm_encoder_jobs = jobs
+            batch.mm_gather_plan = plan
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -872,6 +899,28 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        out = host[:, offset : offset + length]
+        full = req.mrope_positions_full
+        if full is not None and req.device_len <= full.shape[1]:
+            out.copy_(full[:, req.cached_len : req.device_len])
+        else:
+            row = torch.arange(
+                req.cached_len + req.mrope_delta,
+                req.device_len + req.mrope_delta,
+                dtype=torch.int32,
+            )
+            out.copy_(row.unsqueeze(0).expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

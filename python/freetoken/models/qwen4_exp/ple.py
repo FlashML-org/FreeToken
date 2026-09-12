@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.mm import restore_placeholder
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -333,12 +334,16 @@ def build_ple_metadata(
     )
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
+    # image rows hash as the placeholder token, never as the content pad ids
+    input_ids = batch.input_ids
+    if args.image_token_id is not None:
+        input_ids = restore_placeholder(input_ids, args.image_token_id)
 
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
         return PLEMetadata(
-            input_ids=batch.input_ids,
+            input_ids=input_ids,
             cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
             seq_lens=(1,) * bs,
             ngram_context=context_pool.index_select(0, slots).long(),
@@ -360,7 +365,7 @@ def build_ple_metadata(
     context = context_pool.index_select(0, slots).long()
     context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
-        input_ids=batch.input_ids,
+        input_ids=input_ids,
         cu_seqlens=cu,
         seq_lens=tuple(lens),
         ngram_context=context,

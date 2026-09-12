@@ -48,6 +48,8 @@ checkpoint is set:
 | `FREETOKEN_AIME_MAX_TOKENS`| `e2e/test_aime.py` — per-sample token budget (default `16384`) |
 | `FREETOKEN_AIME_SAMPLES`   | `e2e/test_aime.py` — pass@N sample count when sampling (default `3`) |
 | `FREETOKEN_AIME_MIN_FREE_GIB` | `e2e/test_aime.py` — required free GPU memory (default `70`) |
+| `FREETOKEN_QWEN36_MODEL`   | `tokenizer/test_mm_tokenize.py` — local Qwen3.6 checkpoint (image processor + tokenizer) |
+| `FREETOKEN_QWEN3VL_MODEL`  | `tokenizer/test_mm_tokenize.py` — local Qwen3-VL checkpoint (same expansion, DeepStack family) |
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |

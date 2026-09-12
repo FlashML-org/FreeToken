@@ -278,9 +278,9 @@ def _install(folder: str) -> None:
     set_quant_config(checkpoint_quant_config(folder, hf, get_model_spec(hf.architectures[0])))
 
 
-def _load(folder: str, *, experts: bool = False) -> dict[str, torch.Tensor]:
+def _load(folder: str, *, experts: bool = False, vision: bool = True) -> dict[str, torch.Tensor]:
     _install(folder)
-    return {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_moe_experts=experts, include_non_moe=True)}
+    return {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_moe_experts=experts, include_non_moe=True, include_vision=vision)}
 
 
 def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
@@ -288,11 +288,13 @@ def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
     from freetoken.models import create_model
     from freetoken.utils.torch_utils import torch_dtype
 
     strategy = "offload" if cached_load_hf_config(folder).architectures[0].startswith("Qwen3_5Moe") else "auto"
-    config = EngineConfig(model_path=folder, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy)
+    config = EngineConfig(model_path=folder, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy,
+                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", strategy)
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE
@@ -319,14 +321,14 @@ def checkpoint(request, tmp_path_factory):
 def test_emitted_keys_are_the_model_state_dict(checkpoint):
     """Every layout fills exactly the buffers the engine builds from the same config, with the buffers' shapes and (for the weights) dtypes."""
     _name, folder, _raw = checkpoint
-    loaded, state = _load(folder), _meta_state_dict(folder)
+    loaded, state = _load(folder, vision=False), _meta_state_dict(folder)
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():
         assert tensor.shape == state[key].shape, key
         if key.endswith(".weight"):
             assert tensor.dtype is state[key].dtype, key
     assert not any(k.endswith((".input_global_scale", ".weight_scale_2", ".weight_global_scale", ".k_scale")) for k in loaded)
-    assert not any(".mlp.experts." in k or k.startswith(("mtp.", "model.visual.")) for k in loaded)
+    assert not any(".mlp.experts." in k or k.startswith("mtp.") for k in loaded)
 
 
 def test_expert_quant_tag_follows_the_config(checkpoint):

@@ -157,6 +157,8 @@ async def handle_responses(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return _error_response(400, str(exc), exc.code)
     except ValueError as exc:
         return _error_response(400, str(exc))
 
@@ -260,7 +262,7 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         role = item.get("role", "user")
         if role == "developer":
             role = "system"
-        return [{"role": role, "content": _input_text(item.get("content"))}]
+        return [{"role": role, "content": _input_content(item.get("content"))}]
     if itype == "function_call":
         return [
             {
@@ -326,6 +328,29 @@ def _merge_assistant_run(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         if m.get("tool_calls"):
             prev["tool_calls"] = (prev.get("tool_calls") or []) + m["tool_calls"]
     return merged
+
+
+def _input_content(content: Any) -> str | list[dict[str, Any]]:
+    """Like _input_text, but keeps input_image parts as template-ready image parts."""
+    if not isinstance(content, list):
+        return _input_text(content)
+    parts: list[dict[str, Any]] = []
+    has_image = False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "input_image":
+            url = part.get("image_url") or part.get("url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not url:
+                # an input_image without a url (e.g. a file_id) is not servable; fail rather than answer text-only
+                raise ValueError("input_image without image_url is not supported")
+            parts.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+            continue
+        parts.append({"type": "text", "text": _input_text([part])})
+    if not has_image:
+        return "".join(p["text"] for p in parts)
+    return parts
 
 
 def _input_text(content: Any) -> str:

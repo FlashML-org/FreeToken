@@ -30,6 +30,7 @@ class FakeState:
         reasoning_parser: str | None = None,
     ) -> None:
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(max_pixels=None, text_model_only=False, disabled_encoders=frozenset()),
             model_path="/models/unit-model",
             served_model_name="unit-model",
             tool_call_parser=tool_call_parser,

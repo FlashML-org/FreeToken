@@ -9,7 +9,6 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
     detect_expert_quant,
-    vision_load_enabled,
 )
 
 
@@ -43,15 +42,6 @@ def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
 def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | None:
     vc = getattr(top_cfg, "vision_config", None)
     if vc is None:
-        return None
-    # Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    # resident, never-quantized (bf16) GPU weights that text-only serving never touches:
-    # forward() ignores them and _merge_multimodal is a no-op without image embeds. Default
-    # to text-only so that VRAM goes to KV / the expert cache; set FREETOKEN_LOAD_VISION=1
-    # to load it. Returning None here is the single switch -- both the model build (model.py)
-    # and weight loading (weight.py `include_vision = config.is_multimodal`) flow through
-    # parse_config, so is_multimodal flips off consistently across both.
-    if not vision_load_enabled():
         return None
     rope_params = getattr(vc, "rope_parameters", None) or {}
     act = getattr(vc, "hidden_activation", "gelu_pytorch_tanh")

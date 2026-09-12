@@ -1,21 +1,11 @@
 from __future__ import annotations
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
-# State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
-# config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
-_VISION_TRUE = {"1", "true", "yes", "on"}
-
-
-def vision_load_enabled() -> bool:
-    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
-    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
-    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+# State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -98,6 +88,18 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves vision
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
+
+
+def mrope_layout_from_rope_params(rope_params: Any) -> str:
+    """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved, else contiguous."""
+    if rope_params.get("mrope_interleaved_glm"):
+        return "interleaved_glm"
+    if rope_params.get("mrope_interleaved"):
+        return "interleaved"
+    return "contiguous"
 
 
 @dataclass(frozen=True)
@@ -356,6 +358,14 @@ class ModelConfig:
     @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """True when any full-attention layer uses 3-axis (t/h/w) rope positions."""
+        return any(
+            getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None
+            for g in self.attention_groups
+        )
 
     @property
     def has_hybrid_attention(self) -> bool:

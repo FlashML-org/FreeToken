@@ -37,23 +37,9 @@ class LLM(Scheduler):
             **kwargs,
         )
         super().__init__(config)
-        self.pending_requests: List[Tuple[List[int] | str, SamplingParams]] = []
+        self.pending_requests: List[Tuple[List[int] | str, SamplingParams, List[bytes] | None]] = []
         self.status_map: Dict[int, RequestStatus] = {}
-        self.mm_embeds_map: Dict[int, torch.Tensor] = {}
         self.counter = 0
-
-    @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Run the vision tower + projector on processor outputs, returning the
-        ``[num_image_tokens, hidden]`` soft-token embeddings (on device)."""
-        model = self.engine.model
-        if not hasattr(model, "encode_images"):
-            raise RuntimeError(f"{type(model).__name__} does not support image inputs")
-        return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
-        )
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):
@@ -66,25 +52,34 @@ class LLM(Scheduler):
             raise RequestAllFinished()
         results: List[BaseBackendMsg] = []
         added, sum_input_len = 0, 0
-        for tokens_or_prompt, sampling_params in self.pending_requests:
+        for tokens_or_prompt, sampling_params, images in self.pending_requests:
             if sum_input_len >= self.prefill_budget:
                 break
             input_ids = self._tokenize_one(tokens_or_prompt)
-            sum_input_len += len(input_ids)
-            uid, added = self.counter + added, added + 1
-            results.append(
-                UserMsg(
-                    uid=uid,
+            msg = UserMsg(uid=0, input_ids=input_ids, sampling_params=sampling_params)
+            if images:
+                from freetoken.mm.processor import get_mm_processor
+
+                processor = get_mm_processor(self.config.model_path)
+                if processor is None:
+                    raise ValueError("image input is not supported for this model")
+                r = processor.apply(input_ids, images, max_pixels=None)
+                input_ids = r.input_ids
+                msg = UserMsg(
+                    uid=0,
                     input_ids=input_ids,
                     sampling_params=sampling_params,
-                    mm_embeds=self.mm_embeds_map.get(uid),
+                    mm_items=r.mm_items,
+                    mrope_positions=r.mrope_positions,
+                    mrope_delta=r.mrope_delta,
                 )
-            )
+            sum_input_len += len(input_ids)
+            uid, added = self.counter + added, added + 1
+            msg.uid = uid
+            results.append(msg)
             self.status_map[uid] = RequestStatus(
                 uid=uid,
-                input_ids=(
-                    input_ids.tolist() if isinstance(tokens_or_prompt, str) else tokens_or_prompt
-                ),
+                input_ids=input_ids.tolist(),
                 output_ids=[],
             )
         self.counter += added
@@ -106,30 +101,18 @@ class LLM(Scheduler):
         self,
         prompts: List[str] | List[List[int]],
         sampling_params: List[SamplingParams] | SamplingParams,
-        mm_inputs: List[Dict[str, torch.Tensor] | None] | None = None,
+        images: List[List[bytes] | None] | None = None,
     ) -> List[Dict[str, str | List[int]]]:
-        """Offline generation.
-
-        ``mm_inputs`` (optional) is aligned with ``prompts``; each entry is either
-        ``None`` (text-only) or a dict with ``pixel_values`` ``[N, P, 3*patch**2]`` and
-        ``image_position_ids`` ``[N, P, 2]`` from the HF processor. For multimodal
-        prompts pass token-id ``prompts`` containing ``image_token_id`` placeholders.
-        """
+        """Offline generation; images is aligned with prompts: the raw image files of each prompt in placeholder order, or None."""
         self.pending_requests = []
         self.status_map = {}
-        self.mm_embeds_map = {}
         self.counter = 0
         if isinstance(sampling_params, SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.pending_requests.append((prompt, sp))
-        if mm_inputs is not None:
-            for uid, mm in enumerate(mm_inputs):
-                if mm is not None:
-                    self.mm_embeds_map[uid] = self.encode_images(
-                        mm["pixel_values"], mm["image_position_ids"]
-                    )
-            torch.cuda.synchronize(self.device)
+        if images is None:
+            images = [None] * len(prompts)
+        for prompt, sp, imgs in zip(prompts, sampling_params, images, strict=True):
+            self.pending_requests.append((prompt, sp, imgs))
         try:
             self.run_forever()
         except RequestAllFinished:

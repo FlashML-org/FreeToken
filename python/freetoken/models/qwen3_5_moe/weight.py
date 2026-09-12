@@ -13,6 +13,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import ShardReader, iter_weight_files
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.models.register import ModelSpec, get_model_spec
@@ -20,6 +21,7 @@ from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 # bf16 checkpoints store the routed experts pre-stacked per layer
 _STACKED_EXPERT_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$")
@@ -53,16 +55,12 @@ _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
-    if raw_name.startswith("model.language_model."):
-        return "model." + raw_name[len("model.language_model."):]
-    if raw_name.startswith("language_model."):
-        return "model." + raw_name[len("language_model."):]
-    return raw_name
+    return rename_vl_prefix(raw_name)
 
 
 def _is_gemma_norm(name: str) -> bool:
@@ -225,6 +223,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense weights fused to the model's buffers, and the routed experts only where a resident path takes them from here: bf16 stacked experts as stored, block-fp8 experts restacked per layer.
 
@@ -237,17 +236,19 @@ def iter_weights(
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked)
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool):
+def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is None or _EXPERT_RE.search(name):
+                    continue
+                if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:

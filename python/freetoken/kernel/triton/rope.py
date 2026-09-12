@@ -141,3 +141,130 @@ def apply_rope_with_cos_sin_cache_inplace(
 
 
 __all__ = ["apply_rope_with_cos_sin_cache_inplace"]
+
+
+@triton.jit(do_not_specialize=["nnz"])
+def _mrope_tiled(
+    Q, K, POS, CACHE, SEC,
+    stride_qbs, stride_qh, stride_qd,
+    stride_kbs, stride_kh, stride_kd,
+    nnz,
+    HEAD_Q, HEAD_K, rotary_dim, half,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DHALF: tl.constexpr,
+):
+    # _rope_tiled with 3-axis positions: POS is [3, nnz], SEC[half] picks the axis each frequency slot reads
+    seq_pid = tl.program_id(0)
+    head_pid = tl.program_id(1)
+
+    seq_range = seq_pid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    head_range = head_pid * BLOCK_HEAD + tl.arange(0, BLOCK_HEAD)
+    d = tl.arange(0, BLOCK_DHALF)
+
+    seq_mask = seq_range < nnz
+    dmask = d < half
+
+    sec = tl.load(SEC + d, mask=dmask, other=0).to(tl.int64)  # (D,) in {0,1,2}
+    pos_ptr = POS + sec[None, :] * nnz + seq_range[:, None]
+    cs_mask = seq_mask[:, None] & dmask[None, :]
+    pos = tl.load(pos_ptr, mask=cs_mask, other=0).to(tl.int64)  # (S,D)
+    cache_row = CACHE + pos * rotary_dim
+    cos = tl.load(cache_row + d[None, :], mask=cs_mask, other=0.0)
+    sin = tl.load(cache_row + half + d[None, :], mask=cs_mask, other=0.0)
+    cos = cos[:, None, :]
+    sin = sin[:, None, :]
+
+    d0 = d[None, None, :]
+    d1 = (half + d)[None, None, :]
+
+    qmask = (seq_mask[:, None, None]
+             & (head_range[None, :, None] < HEAD_Q)
+             & dmask[None, None, :])
+    base_q = seq_range[:, None, None] * stride_qbs + head_range[None, :, None] * stride_qh
+    q0 = tl.load(Q + base_q + d0 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
+    q1 = tl.load(Q + base_q + d1 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
+    tl.store(Q + base_q + d0 * stride_qd, (q0 * cos - q1 * sin).to(Q.dtype.element_ty), mask=qmask)
+    tl.store(Q + base_q + d1 * stride_qd, (q1 * cos + q0 * sin).to(Q.dtype.element_ty), mask=qmask)
+
+    kmask = (seq_mask[:, None, None]
+             & (head_range[None, :, None] < HEAD_K)
+             & dmask[None, None, :])
+    base_k = seq_range[:, None, None] * stride_kbs + head_range[None, :, None] * stride_kh
+    k0 = tl.load(K + base_k + d0 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
+    k1 = tl.load(K + base_k + d1 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
+    tl.store(K + base_k + d0 * stride_kd, (k0 * cos - k1 * sin).to(K.dtype.element_ty), mask=kmask)
+    tl.store(K + base_k + d1 * stride_kd, (k1 * cos + k0 * sin).to(K.dtype.element_ty), mask=kmask)
+
+
+def apply_mrope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_table: torch.Tensor,
+) -> None:
+    """3-axis rope: positions is [3, nnz], section_table [rotary_dim//2] maps each frequency slot to its axis row; NeoX layout only."""
+    if str(cos_sin_cache.dtype) != "torch.float32":
+        raise ValueError("cos_sin_cache should be float32")
+    assert positions.dim() == 2 and positions.shape[0] == 3
+    assert query.is_cuda and key.is_cuda and positions.is_cuda
+    assert cos_sin_cache.is_contiguous() and positions.is_contiguous()
+
+    nnz = query.shape[0]
+    if nnz == 0:
+        return
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+
+    head_q = query.shape[1] // head_size
+    head_k = key.shape[1] // head_size
+    qv = query.view(nnz, head_q, head_size)
+    kv = key.view(nnz, head_k, head_size)
+    max_head = max(head_q, head_k)
+
+    grid = lambda META: (
+        triton.cdiv(nnz, META["BLOCK_SEQ"]),
+        triton.cdiv(max_head, META["BLOCK_HEAD"]),
+    )
+    _mrope_tiled[grid](
+        qv, kv, positions, cos_sin_cache, section_table,
+        qv.stride(0), qv.stride(1), qv.stride(2),
+        kv.stride(0), kv.stride(1), kv.stride(2),
+        nnz, head_q, head_k, rotary_dim, half,
+        BLOCK_DHALF=triton.next_power_of_2(half),
+        BLOCK_SEQ=16,
+        BLOCK_HEAD=1,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+def apply_mrope_torch_fallback(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_table: torch.Tensor,
+) -> None:
+    """Pure-torch mrope (Triton unavailable); same in-place contract as the kernel."""
+    nnz = query.shape[0]
+    if nnz == 0:
+        return
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+    pos = positions[section_table.long(), :].transpose(0, 1)  # [nnz, half]
+    cs = cos_sin_cache[pos]  # [nnz, half, 2*half] rows gathered per slot
+    idx = torch.arange(half, device=query.device)
+    cos = cs[:, idx, idx].unsqueeze(1).float()
+    sin = cs[:, idx, half + idx].unsqueeze(1).float()
+    for t, heads in ((query, query.shape[1] // head_size), (key, key.shape[1] // head_size)):
+        v = t.view(nnz, heads, head_size)
+        lo, hi = v[..., :half].float(), v[..., half:rotary_dim].float()
+        v[..., :half] = (lo * cos - hi * sin).to(v.dtype)
+        v[..., half:rotary_dim] = (hi * cos + lo * sin).to(v.dtype)
+
+
+__all__ = ["apply_rope_with_cos_sin_cache_inplace", "apply_mrope_with_cos_sin_cache_inplace"]

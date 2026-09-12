@@ -9,6 +9,13 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class EncoderSpec:
+    kind: str  # "vision" | "audio", the name --mm-disable takes
+    config_key: str  # the checkpoint config section that builds the tower
+    modalities: tuple[str, ...]  # inputs it serves, as implemented
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     module: str
     model_cls: str
@@ -22,10 +29,17 @@ class ModelSpec:
     packed_modules_mapping: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # checkpoint-name globs the family serves in bf16 although the quantization_config covers them
     unquantized_modules: tuple[str, ...] = ()
+    # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
+    mm_processor: str | None = None
+    encoders: tuple[EncoderSpec, ...] = ()
 
 
 # Multimodal wrappers store the text tower under model.language_model.
 _LANGUAGE_MODEL_ROOT = (("model", "model.language_model"),)
+_QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
+_QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
+# TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
+_QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -34,6 +48,8 @@ _DENSE_PACKED = (
 # per-expert checkpoints: probe the first expert's projections for the experts container
 _EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
+# pre-stacked expert checkpoints (Qwen3-VL-MoE): the container's own two tensors are the probe
+_STACKED_EXPERTS_PACKED = (("experts", ("experts.gate_up_proj", "experts.down_proj")),)
 _QWEN3_5_PACKED = _DENSE_PACKED + (
     ("in_proj_qkvz", ("in_proj_qkv", "in_proj_z")),
     ("in_proj_ba", ("in_proj_b", "in_proj_a")),
@@ -81,6 +97,23 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
     ),
+    # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
+    "Qwen3VLForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLForConditionalGeneration",
+        checkpoint_roots=_QWEN_VL_ROOTS,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3VLMoeForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLMoeForConditionalGeneration",
+        checkpoint_roots=_QWEN_VL_ROOTS,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        packed_modules_mapping=_DENSE_PACKED + _STACKED_EXPERTS_PACKED,
+    ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",
@@ -113,19 +146,36 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
-        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        "Qwen3_5MoeForConditionalGeneration",
+        checkpoint_roots=_QWEN_VL_ROOTS,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
+    # text-only Qwen3.5 releases: text_config is the top-level config and there is no tower
+    "Qwen3_5MoeForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoeForCausalLM",
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
+    "Qwen3_5ForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5ForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
-    # text_config, weights under model.language_model.); served text-only. 36 GDN + 12 QSA
+    # text_config, weights under model.language_model.). 36 GDN + 12 QSA
     # compressed-sparse attention layers on 4 hyper-connection residual streams, a PLE
     # n-gram embedding layer, 512 NVFP4 routed experts top-10 + a gated shared expert.
     "Qwen4ExpForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen4_exp",
-        "Qwen4ExpForCausalLM",
-        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        "Qwen4ExpForConditionalGeneration",
+        checkpoint_roots=_QWEN_VL_ROOTS,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
@@ -133,8 +183,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # loader handles the compressed-tensors NVFP4 layout.
     "Qwen3_5ForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
-        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        "Qwen3_5ForConditionalGeneration",
+        checkpoint_roots=_QWEN_VL_ROOTS,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),

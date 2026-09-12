@@ -8,7 +8,9 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    mrope_layout_from_rope_params,
 )
+from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
 def _expert_quant(hf_config: Any, text: Any) -> tuple[str, tuple[int, int] | None]:
@@ -74,12 +76,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    # 3-axis rope only with vision; text-only serving keeps the 1-D partial rope and the decode-graph layout
+    vision_config = parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=(
+            list(rope_params["mrope_section"])
+            if vision_config is not None and "mrope_section" in rope_params
+            else None
+        ),
+        mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -127,7 +137,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
-        vision_config=None,  # text-only milestone
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,

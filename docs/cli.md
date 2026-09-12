@@ -99,6 +99,25 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 
+### Image input
+
+Experimental. Needs a vision-capable checkpoint (Qwen3.6, Qwen3.8-Flash-Next, Qwen3-VL); a request carrying images is
+rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
+Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside Anthropic
+`tool_result` blocks are rejected with a 400: chat templates render tool messages as plain text.
+`GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
+so a client can gate its attachment controls without reading the checkpoint config.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
+| `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
+| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute (about 60 MiB of VRAM instead of the whole tower; small images encode slower, about 17 ms instead of 7 ms for 448x448); `gpu` keeps them resident |
+| `--mm-max-pixels` | processor default | Per-image pixel budget handed to the image processor; larger images are downscaled to fit. Qwen VL's processor default is 16384 tokens per image and an explicit value replaces it; each 1024 pixels of the resized image costs one token |
+| `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
+| `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
+| `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |
+
 ## ft shell
 
 ```bash
@@ -118,7 +137,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
 | `health` | `GET /health` | Server status, model, load progress |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, accepted input modalities |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |

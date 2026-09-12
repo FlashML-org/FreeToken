@@ -12,7 +12,6 @@ _TYPE_KEY = "__type__"
 # reading it as a serialized class -- without this, a request could crash the tokenizer worker.
 _RAW_DICT_KEY = "__raw_dict__"
 
-
 def _serialize_any(value: Any) -> Any:
     if isinstance(value, dict):
         encoded = {k: _serialize_any(v) for k, v in value.items()}
@@ -32,10 +31,16 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        assert not self.is_cuda, "wire tensors must live on CPU"
+        t = self.contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        serialized["dtype"] = str(t.dtype)
+        # 1-D tensors omit the shape so the payload matches the legacy wire format.
+        if t.dim() != 1:
+            serialized["shape"] = list(t.shape)
+        if t.dtype == torch.bfloat16:
+            t = t.view(torch.uint16)  # numpy has no bf16; ship the raw bytes
+        serialized["buffer"] = t.numpy().tobytes()
         return serialized
 
     # normal type
@@ -64,14 +69,17 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        is_bf16 = dtype_str == "bfloat16"
+        np_tensor = np.frombuffer(buffer, dtype=getattr(np, "uint16" if is_bf16 else dtype_str))
+        tensor = torch.from_numpy(np_tensor.copy())
+        if is_bf16:
+            tensor = tensor.view(torch.bfloat16)
+        shape = data.get("shape")
+        return tensor if shape is None else tensor.view(shape)
 
     cls = cls_map.get(type_name)
     if cls is None:

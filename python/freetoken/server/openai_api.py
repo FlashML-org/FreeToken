@@ -196,7 +196,10 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)

@@ -193,12 +193,12 @@ def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config)
     return str(folder), {**raw, **table}
 
 
-def _load(folder: str) -> dict[str, torch.Tensor]:
+def _load(folder: str, *, vision: bool = True) -> dict[str, torch.Tensor]:
     install_quant_config(folder)
     return {
         name: tensor.clone()
         for name, tensor in iter_weights(
-            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True, include_vision=vision
         )
     }
 
@@ -227,38 +227,13 @@ def loaded_fp8(checkpoint_fp8) -> dict[str, torch.Tensor]:
     return _load(checkpoint_fp8[0])
 
 
-def _expected_names() -> set[str]:
-    names = {"model.embed_tokens.weight", "lm_head.weight"}
-    names |= {f"model.hyper_connection_mixer.{leaf}" for leaf in
-              ("hc_norm.weight", "input_mix_weight_down.weight", "input_mix_weight_up.weight")}
-    for layer in (0, 1):
-        for hc in ("attn_hyper_connection", "mlp_hyper_connection"):
-            names |= {f"model.layers.{layer}.{hc}.{leaf}" for leaf in (
-                "hc_norm.weight", "input_mix_weight_down_block_inject.weight",
-                "input_mix_weight_up.weight")}
-        names |= {f"model.layers.{layer}.mlp.{leaf}" for leaf in (
-            "gate.weight", "shared_expert.gate_up_proj.weight",
-            "shared_expert.down_proj.weight", "shared_expert_gate.weight")}
-    names |= {f"model.layers.0.linear_attn.{leaf}" for leaf in (
-        "in_proj.weight", "conv1d.weight", "A_log", "dt_bias", "norm.weight", "out_proj.weight")}
-    names |= {f"model.layers.0.ple.{leaf}" for leaf in (
-        "key_proj.weight", "value_proj.weight", "norm_key.weight", "norm_query.weight",
-        "norm_conv.weight", "conv1d.weight", "ple_embedding.layer_multipliers",
-        "ple_embedding.ngram_heads_offsets", "ple_embedding.ngram_heads_vocab_sizes")}
-    names |= {f"model.layers.1.self_attn.{leaf}" for leaf in (
-        "qkv_proj.weight", "o_proj.weight", "q_norm.weight", "k_norm.weight",
-        "indexer.index_qk_proj.weight", "indexer.q_layernorm.weight",
-        "indexer.k_layernorm.weight")}
-    return names
+def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
+    assert {n for n in loaded if "visual" in n} == {"visual.blocks.0.attn.qkv.weight", "visual.merger.norm.weight"}
 
 
-def test_key_map_is_exactly_the_model_state_dict(loaded):
-    assert set(loaded) == _expected_names()
-
-
-def test_mtp_visual_experts_and_table_never_loaded(loaded):
+def test_mtp_experts_and_table_never_loaded(loaded):
     for name in loaded:
-        assert not name.startswith(("mtp.", "model.visual."))
+        assert not name.startswith("mtp.")
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_scale_inv"))
@@ -486,7 +461,7 @@ FP8_MODULES = (
 def test_emitted_keys_are_the_model_state_dict(fixture, request):
     """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
     folder, _raw = request.getfixturevalue(fixture)
-    loaded, state = _load(folder), meta_state_dict(folder)
+    loaded, state = _load(folder, vision=False), meta_state_dict(folder)
     assert set(loaded) == set(state)
     if fixture != "checkpoint_fp8":
         assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16

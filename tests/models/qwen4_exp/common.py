@@ -231,6 +231,8 @@ class Fixture:
             is_prefill=phase == "prefill",
             is_decode=phase == "decode",
             positions=positions,
+            get_attn_positions=lambda: positions,
+            mm_embeds=None,
             out_loc=out_loc,
             attn_metadata=None,
             active_table_idx=torch.tensor(
@@ -353,12 +355,14 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
     from freetoken.models import create_model
     from freetoken.utils.torch_utils import torch_dtype
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload")
+    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
+                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE

@@ -123,16 +123,8 @@ class Gemma4ForCausalLM(BaseLLMModel):
             convert_gemma4_to_gguf(self, config)
 
     @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Run the vision tower + projector. Returns ``[num_valid_soft_tokens, text_hidden]``.
-
-        ``pixel_values``: ``[num_images, num_patches, 3*patch**2]``;
-        ``image_position_ids``: ``[num_images, num_patches, 2]`` with ``(-1, -1)`` padding.
-        """
-        features = self.vision_tower.forward(pixel_values, image_position_ids)
-        return self.embed_vision.forward(features)
+    def encode(self, item) -> torch.Tensor:
+        raise NotImplementedError("gemma4 image input needs an MMProcessor (freetoken.mm.processors)")
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
