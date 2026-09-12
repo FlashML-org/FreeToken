@@ -102,6 +102,7 @@ def _build_jit_cache() -> None:
     }
     # Multi-arch fatbin: one SASS cubin per listed arch, plus the PTX of the highest one.
     # A GPU whose arch is not listed and is below the highest one has no usable image.
+    #   7.0  -> V100, GV100                             (Volta; sm_70 — added for the sm70/cu128 build)
     #   8.0  -> A100, A800, A30                      (Ampere, datacenter)
     #   8.6  -> RTX 30 series, A10, A40              (Ampere, consumer / workstation)
     #   8.9  -> RTX 40 series, L4, L40, RTX 6000 Ada (Ada Lovelace)
@@ -110,9 +111,11 @@ def _build_jit_cache() -> None:
     #   12.0 -> RTX 50 series, RTX PRO 6000 Blackwell (Blackwell, consumer / workstation)
     # Override with FREETOKEN_KERNEL_CACHE_ARCHES (space-separated maj.min) or
     # TVM_FFI_CUDA_ARCH_LIST directly. Needs an nvcc that supports every listed arch.
+    # NOTE (sm70 build): 7.0 (Volta / Tesla V100) is added to the defaults so a cu128
+    # kernel-cache wheel carries sm_70 SASS instead of forcing JIT on first use.
     if "TVM_FFI_CUDA_ARCH_LIST" not in os.environ:
         os.environ["TVM_FFI_CUDA_ARCH_LIST"] = os.getenv(
-            "FREETOKEN_KERNEL_CACHE_ARCHES", "8.0 8.6 8.9 9.0 10.0 12.0"
+            "FREETOKEN_KERNEL_CACHE_ARCHES", "7.0 8.0 8.6 8.9 9.0 10.0 12.0"
         )
     compile_and_package_kernels(
         out_dir=out_dir,

@@ -3,7 +3,9 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+# NOTE (sm_70/V100 build): torch floor lowered from 2.11 to 2.10 — torch 2.11 (all CUDA
+# builds) dropped sm_70 (Volta) kernels; 2.10.x cu128 still ships them.
+requires = ["setuptools>=77", "torch>=2.10,<2.11", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -51,10 +53,11 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
-    # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
-    # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
-    # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
+    # NOTE (sm_70/V100 build): floor lowered from 2.11 to 2.10 — torch 2.10.x cu128
+    # (https://download.pytorch.org/whl/cu128) is the last 2.x line with sm_70 kernels and
+    # runs on driver r570 (CUDA 12.8). PyPI's plain torch 2.10.0 wheel is a cu130 build, so
+    # uv's explicit pytorch-cu128 index below must be used for the +cu128 variant.
+    "torch>=2.10,<2.11",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
     "triton==3.6.0; platform_system == 'Linux'",
@@ -74,10 +77,16 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+# NOTE (cu12/V100 build): switched flashinfer from [cu13] to [cu12] so the stack runs on
+# CUDA 12.x drivers (r570, CUDA 12.8) and Volta sm_70 (Tesla V100). flashinfer's fused
+# kernels target sm_80+; on V100 the runtime falls back to pure-Triton kernels, so the
+# flashinfer wheel is optional here and may be omitted entirely.
+fi = ["flashinfer-python[cu12]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
-accel = ["freetoken[fi,sgl]"]
+# NOTE (cu12/V100 build): sglang-kernel 0.4.5 has no cu128 wheel (only cu130-era builds),
+# and its fused kernels target sm_80+ anyway; dropped from accel for the cu12 build.
+accel = ["freetoken[fi]"]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
 # core transformers>=5.5 requirement. It is therefore not a lockable extra and is left
@@ -89,18 +98,15 @@ accel = ["freetoken[fi,sgl]"]
 # indexes serve. `explicit = true` scopes each index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
+# NOTE (cu12/V100 build): torch index repointed from cu130 to cu128 — torch
+# 2.11.0+cu128 is the last build that ships sm_70 (Volta/V100) kernels and runs on
+# driver r570 (CUDA 12.8). sglang-kernel index removed (no cu128 wheel for 0.4.5).
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-sglang-kernel = { index = "sglang-cu130" }
+torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "sglang-cu130"
-url = "https://docs.sglang.io/whl/cu130"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.setuptools]
