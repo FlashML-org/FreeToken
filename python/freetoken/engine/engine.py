@@ -41,9 +41,7 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
         raise ValueError(
             f"moe_cache_size={cache_size} is too small: need at least num_experts={num_experts} "
             f"slots. Pass --moe-cache-size/--moe-cache-rate, or use --moe-cache-auto "
-            f"(the default for offload/hybrid backends when no cache-sizing flag is given; "
-            f"--moe-strategy cpu always sizes its own fixed two-layer buffer and ignores "
-            f"cache-sizing flags)."
+            f"(the default for offload/hybrid backends when no cache-sizing flag is given)."
         )
 
 
@@ -1111,6 +1109,27 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
 
 
+def _resolve_cpu_moe_cache(
+    moe_cache_size: int, moe_prefill_overlap: bool, num_experts: int
+) -> tuple[int, bool]:
+    """Resolve the GPU prefill slot cache for ``--moe-strategy cpu``.
+
+    An explicit ``--moe-cache-size`` is authoritative -- the pre-0.1.3 code
+    unconditionally replaced it with ``2 * num_experts``, silently doubling
+    a user-requested cache (256 -> 512 slots on a 256-expert model), VRAM that
+    small GPUs cannot spare. A cache below ``2 * num_experts`` cannot feed the
+    two-buffer prefill overlap, so it disables overlap (synchronous
+    single-buffer prefill). With no explicit size, the historical default
+    stays: the two-layer double buffer (``2 * num_experts``, overlap on).
+
+    Pure function so the config resolution stays CPU-testable.
+    """
+    if moe_cache_size > 0:
+        overlap = moe_prefill_overlap and moe_cache_size >= 2 * num_experts
+        return moe_cache_size, overlap
+    return 2 * num_experts, True
+
+
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
     """MoE layer ids whose decode runs on the CPU executor.
 
@@ -1533,18 +1552,32 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_auto", False)
 
     if is_moe and config.moe_strategy == "cpu":
-        # CPU-compute decode keeps experts in host RAM and computes them on the CPU;
-        # the GPU only holds the two-layer prefill double buffer. So the slot cache is
-        # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
-        # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
+        # CPU-compute decode keeps experts in host RAM and computes them on the CPU.
+        # See _resolve_cpu_moe_cache: an explicit --moe-cache-size is authoritative
+        # (the old code silently replaced it with 2*num_experts); the default keeps
+        # the historical two-layer prefill double buffer.
         num_experts = config.model_config.num_experts
+
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
-        override("moe_cache_size", 2 * num_experts)
-        override("moe_prefill_overlap", True)
+
+        size, overlap = _resolve_cpu_moe_cache(
+            config.moe_cache_size, config.moe_prefill_overlap, num_experts
+        )
+        if not overlap and config.moe_prefill_overlap:
+            # Explicit size below 2*num_experts cannot feed the two-buffer
+            # prefill overlap; say so instead of silently flipping it off.
+            logger.warning_rank0(
+                f"MoE strategy 'cpu': explicit moe_cache_size={size} < "
+                f"2*num_experts={2 * num_experts}; disabling prefill overlap "
+                f"(synchronous single-buffer prefill)"
+            )
+        override("moe_cache_size", size)
+        override("moe_prefill_overlap", overlap)
         logger.info_rank0(
-            f"MoE backend 'cpu': decode computes experts on CPU; GPU keeps a "
-            f"two-layer prefill buffer (moe_cache_size={2 * num_experts})"
+            f"MoE strategy 'cpu': decode computes experts on CPU; "
+            f"GPU prefill cache size={config.moe_cache_size}, "
+            f"overlap={config.moe_prefill_overlap}"
         )
 
     if (
