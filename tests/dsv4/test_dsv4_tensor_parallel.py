@@ -118,6 +118,13 @@ def test_ranks_cover_the_vocabulary_exactly_once(args, tp):
 # --------------------------------------------------------------------------------------
 
 
+def _numel(shape) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
 def _moe_cfg(args, tp: int, rank: int = 0):
     from freetoken.layers.quantization.moe.base import MoEConfig
 
@@ -149,15 +156,13 @@ def test_expert_banks_divide_and_tile_the_intermediate_dim(args, tp):
         covered += i_local
         for name, spec in layout.items():
             whole, part = full[name].shape, spec.shape
-            assert part[0] == i_local or whole[0] == i_local * tp or part[-1] * tp == whole[-1], (
-                f"{name}: {part} is not a 1/{tp} split of {whole} on either axis"
+            # Exactly one axis shrinks -- the one that carries I. gate_up and its scale
+            # carry it on the fused 2*i row axis; down and its scale on the column axis.
+            axes = [d for d in range(len(whole)) if whole[d] != part[d]]
+            assert axes == [0 if name.startswith("gate_up") else 1], (
+                f"{name}: {whole} -> {part} shrinks on {axes}"
             )
-            n = 1
-            for d in part:
-                n *= d
-            m = 1
-            for d in whole:
-                m *= d
+            n, m = _numel(part), _numel(whole)
             assert n * tp == m, f"{name}: {part} is not 1/{tp} of {whole}"
             assert spec.dtype == full[name].dtype
     assert covered == args.moe_inter_dim
@@ -236,6 +241,7 @@ def test_sharded_pieces_pack_into_the_ranks_bank(rank):
     )
 
 
+@pytest.mark.parametrize("dim", [0, 1])
 def test_a_shard_does_not_keep_its_parent_alive(dim):
     """A shard must own its storage.
 
