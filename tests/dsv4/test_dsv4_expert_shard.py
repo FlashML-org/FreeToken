@@ -45,14 +45,15 @@ def _shard(role, t, rank):
 def test_rank_slices_rebuild_the_piece_exactly(role):
     """Disjoint, gapless, in order: concatenating every rank reproduces the source."""
     shape, axis, div = ROLES[role]
+    # The axis under test really is the intermediate dim: its length times the packing
+    # divisor is I. That is what makes "divide this axis by tp" the same cut as
+    # "take the rank's I-block", and why no //2 / //32 bookkeeping is needed downstream.
+    assert shape[axis] * div == I, f"{role}: axis {axis} is not the I axis"
     t = torch.arange(shape[0] * shape[1], dtype=torch.int32).view(*shape)
 
     parts = [_shard(role, t, r) for r in range(TP)]
 
-    i_local = I // TP
-    n_axis = shape[axis] // div
-    assert n_axis % TP == 0, f"{shape[axis]} on axis {axis} must divide over {TP} ranks"
-    assert all(p.shape[axis] == n_axis // TP for p in parts), f"{role}: wrong slice width"
+    assert all(p.shape[axis] == shape[axis] // TP for p in parts), f"{role}: wrong slice width"
     assert torch.equal(torch.cat(parts, dim=axis), t), f"{role}: ranks do not tile the I axis"
 
 

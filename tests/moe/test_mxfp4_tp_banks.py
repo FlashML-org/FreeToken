@@ -116,17 +116,20 @@ def test_rank_partials_sum_to_the_single_rank_output():
     y_full = routed_experts_fp4(x, ids.clone(), wts, *_banks(I), limit)
 
     # Build the per-rank banks by slicing the SAME full banks, so rank 0 + rank 1
-    # together are exactly the full expert.
-    i = I // TP
+    # together are exactly the full expert. gate|up rows are CONCATENATED (all I gate
+    # rows, then all I up rows -- fused_piece cats them on the row axis), so a rank's
+    # block is two slices, not one 2*i-wide one.
+    i_local = I // TP
     full = _banks(I)
     partial = None
     for r in range(TP):
-        rows = slice(r * 2 * i, (r + 1) * 2 * i)          # gate|up rows carry I (x2, fused)
-        cols = slice(r * i // 2, (r + 1) * i // 2)        # down packs 2 codes per byte
-        scale_cols = slice(r * i // 32, (r + 1) * i // 32)  # one e8m0 per 32
+        lo = r * i_local
+        rows = [slice(lo, lo + i_local), slice(I + lo, I + lo + i_local)]
+        cols = slice(lo // 2, (lo + i_local) // 2)          # down packs 2 codes per byte
+        scale_cols = slice(lo // 32, (lo + i_local) // 32)  # one e8m0 per 32 along I
         banks = [
-            full[0][:, rows].contiguous(),
-            full[1][:, rows].contiguous(),
+            torch.cat([full[0][:, s] for s in rows], dim=1).contiguous(),
+            torch.cat([full[1][:, s] for s in rows], dim=1).contiguous(),
             full[2][:, :, cols].contiguous(),
             full[3][:, :, scale_cols].contiguous(),
         ]
