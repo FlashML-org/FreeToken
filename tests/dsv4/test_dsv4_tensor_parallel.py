@@ -7,6 +7,13 @@ Replicated tensors (the MLA latent KV path, the compressors, the Lightning Index
 router) must keep their full shape, because every rank reads the same latent KV and must
 select the same blocks.
 
+The split is split across two owners on purpose, and these tests pin the seam between
+them: the shared TP-aware layer classes (``freetoken.layers``) declare the rank-local
+SHAPE, and the family's weight reader is the only thing that cuts the checkpoint to
+match -- the loader binds state-dict entries by exact shape and never narrows. So
+``model.*`` is asserted against ``state_dict()``, not ``named_parameters()``: a DSV4
+module is a ``BaseOP``, not an ``nn.Module``.
+
 CPU-only: shapes are read off a meta-device build, so no weights and no GPU.
 """
 
@@ -20,7 +27,6 @@ import torch
 import freetoken.distributed.info as info_mod
 from freetoken.distributed import DistributedInfo
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
-from freetoken.models.deepseek_v4.weight import _expert_bank_specs, _place_dsfp4
 
 # o_groups=8 bounds the split: a rank must own whole output groups.
 TP_SIZES = (2, 4, 8)
@@ -47,13 +53,13 @@ def _set_tp(size: int, rank: int = 0) -> None:
     info_mod._TP_INFO = DistributedInfo(rank, size)
 
 
-def _shapes(args: DeepseekV4Args, tp: int, rank: int = 0) -> dict[str, tuple[int, ...]]:
+def _shapes(args: DeepseekV4Args, tp: int, rank: int = 0) -> dict[str, torch.Size]:
     _set_tp(tp, rank)
     from freetoken.models.deepseek_v4.model import Transformer
 
     with torch.device("meta"):
         model = Transformer(args)
-    return {n: tuple(p.shape) for n, p in model.named_parameters()}
+    return {n: tuple(p.shape) for n, p in model.state_dict().items()}
 
 
 @pytest.fixture(autouse=True)
@@ -88,41 +94,148 @@ def test_replicated_tensors_keep_their_full_shape(args, tp):
 
 @pytest.mark.parametrize("tp", TP_SIZES)
 def test_ranks_cover_the_vocabulary_exactly_once(args, tp):
-    _set_tp(tp)
+    """Vocab rows are partitioned, not replicated, on both the embed and the head.
+
+    ``VocabParallelEmbedding`` owns the split (div_ceil rows per rank, the last rank
+    short); ``ParallelLMHead`` inherits it, so the two agree on which rows a rank holds.
+    """
     from freetoken.models.deepseek_v4.model import Transformer
 
-    covered = 0
-    for rank in range(tp):
-        _set_tp(tp, rank)
-        with torch.device("meta"):
-            model = Transformer(args)
-        assert model.vocab_start == covered
-        covered += model.vocab_local
-    assert covered == args.vocab_size
+    for attr in ("embed", "head"):
+        covered = 0
+        for rank in range(tp):
+            _set_tp(tp, rank)
+            with torch.device("meta"):
+                model = Transformer(args)
+            start, rows = getattr(model, attr).vocab_range
+            assert start == covered, f"{attr}: rank {rank} starts at {start}, expected {covered}"
+            covered += rows
+        assert covered == args.vocab_size, f"{attr}: ranks cover {covered} of {args.vocab_size}"
+
+
+# --------------------------------------------------------------------------------------
+# Routed FP4 expert banks.
+# --------------------------------------------------------------------------------------
+
+
+def _moe_cfg(args, tp: int, rank: int = 0):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+
+    return MoEConfig(
+        num_experts=args.n_routed_experts, hidden=args.dim,
+        intermediate=args.moe_inter_dim, top_k=args.n_activated_experts,
+        tp_rank=rank, tp_size=tp, strategy="offload",
+    )
 
 
 @pytest.mark.parametrize("tp", TP_SIZES)
 def test_expert_banks_divide_and_tile_the_intermediate_dim(args, tp):
-    _set_tp(1)
-    full, full_i, _ = _expert_bank_specs(args)
+    """A rank's bank bytes are exactly 1/tp of the whole -- the memory win, on disk.
+
+    The kernel owns the layout; the reader is only allowed to cut along the axis the
+    layout puts I on. Both come from ``MoEConfig.local_intermediate``, which is the one
+    place the split is decided.
+    """
+    from freetoken.layers.quantization.moe.mxfp4 import TritonMxfp4MoEKernel
+
+    kernel = TritonMxfp4MoEKernel()
+    full = kernel.layout(_moe_cfg(args, 1))
 
     covered = 0
     for rank in range(tp):
-        _set_tp(tp, rank)
-        specs, i_local, i_lo = _expert_bank_specs(args)
-        assert i_lo == covered, "rank slices must tile the intermediate dim with no gap"
+        layout = kernel.layout(_moe_cfg(args, tp, rank))
+        i_local = args.moe_inter_dim // tp
+        assert i_local * tp == args.moe_inter_dim
         covered += i_local
-        assert i_local * tp == full_i
-        # A rank's bank bytes are exactly 1/tp of the whole -- the memory win.
-        for name, (shape, dtype) in specs.items():
-            whole = torch.Size(full[name][0]).numel()
-            part = torch.Size(shape).numel()
-            assert part * tp == whole, f"{name}: {shape} is not 1/{tp} of {full[name][0]}"
-            assert dtype == full[name][1]
-    assert covered == full_i
+        for name, spec in layout.items():
+            whole, part = full[name].shape, spec.shape
+            assert part[0] == i_local or whole[0] == i_local * tp or part[-1] * tp == whole[-1], (
+                f"{name}: {part} is not a 1/{tp} split of {whole} on either axis"
+            )
+            n = 1
+            for d in part:
+                n *= d
+            m = 1
+            for d in whole:
+                m *= d
+            assert n * tp == m, f"{name}: {part} is not 1/{tp} of {whole}"
+            assert spec.dtype == full[name].dtype
+    assert covered == args.moe_inter_dim
 
 
-@pytest.mark.parametrize("dim", [0, 1])
+@pytest.mark.parametrize("rank", range(4))
+def test_sharded_pieces_pack_into_the_ranks_bank(rank):
+    """The bank CONTENTS, not only their shapes, must tile the packed I axis.
+
+    This is the reader -> kernel seam end to end: per-expert pieces cut by
+    ``shard_expert_piece`` are concatenated by the kernel's own ``pack`` into the
+    ``[gate(I_local) | up(I_local)]`` row block the layout asked for. A cut on the wrong
+    axis, or a forgotten /2 //32 on a scale, lands the wrong expert's bytes in the bank
+    and nothing downstream notices.
+    """
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.mxfp4 import TritonMxfp4MoEKernel
+    from freetoken.models.deepseek_v4.weight import shard_expert_piece
+
+    tp, full_i, hidden = 4, 128, 64
+    local_i, e8m0 = full_i // tp, torch.float8_e8m0fnu
+    i_lo = rank * local_i
+
+    def payload(shape, offset, dtype=torch.int8):
+        raw = (torch.arange(torch.Size(shape).numel(), dtype=torch.int64) + offset) % 251
+        return raw.to(torch.uint8).reshape(shape).view(dtype)
+
+    def cut(role, t):
+        # One expert at a time: the stream is per-expert 2-D, and pack prepends the E dim.
+        return shard_expert_piece(role, t, rank=rank, tp_size=tp).unsqueeze(0)
+
+    pieces = {
+        "gate": cut("gate", payload((full_i, hidden // 2), 1)),
+        "up": cut("up", payload((full_i, hidden // 2), 17)),
+        "down": cut("down", payload((hidden, full_i // 2), 33)),
+        "gate_scale": cut("gate_scale", payload((full_i, hidden // 32), 49, e8m0)),
+        "up_scale": cut("up_scale", payload((full_i, hidden // 32), 65, e8m0)),
+        "down_scale": cut("down_scale", payload((hidden, full_i // 32), 81, e8m0)),
+    }
+    out = {
+        n: torch.zeros((1, *shape), dtype=dtype)
+        for n, (shape, dtype) in {
+            "gate_up": ((2 * local_i, hidden // 2), torch.uint8),
+            "gate_up_scale": ((2 * local_i, hidden // 32), e8m0),
+            "down": ((hidden, local_i // 2), torch.uint8),
+            "down_scale": ((hidden, local_i // 32), e8m0),
+        }.items()
+    }
+    cfg = MoEConfig(
+        num_experts=1, hidden=hidden, intermediate=full_i, top_k=2,
+        tp_rank=rank, tp_size=tp, strategy="offload",
+    )
+    TritonMxfp4MoEKernel().pack(pieces, cfg, out)
+
+    # gate occupies the first I_local rows, up the second half -- the concatenated order
+    # the kernel documents, which is why a rank's rows are two blocks, not one 2I block.
+    assert torch.equal(out["gate_up"][0, :local_i], payload((full_i, hidden // 2), 1)[i_lo:i_lo + local_i].view(torch.uint8))
+    assert torch.equal(out["gate_up"][0, local_i:], payload((full_i, hidden // 2), 17)[i_lo:i_lo + local_i].view(torch.uint8))
+    assert torch.equal(
+        out["down"][0],
+        payload((hidden, full_i // 2), 33)[:, i_lo // 2:(i_lo + local_i) // 2].view(torch.uint8),
+    )
+    assert torch.equal(
+        out["gate_up_scale"][0, :local_i].view(torch.uint8),
+        payload((full_i, hidden // 32), 49, e8m0)[i_lo:i_lo + local_i].view(torch.uint8),
+    )
+    # up's rows land in the SECOND half of the fused gate_up_scale bank -- there is no
+    # "up_scale" bank, and asserting one would be asserting a layout that does not exist.
+    assert torch.equal(
+        out["gate_up_scale"][0, local_i:].view(torch.uint8),
+        payload((full_i, hidden // 32), 65, e8m0)[i_lo:i_lo + local_i].view(torch.uint8),
+    )
+    assert torch.equal(
+        out["down_scale"][0].view(torch.uint8),
+        payload((hidden, full_i // 32), 81, e8m0)[:, i_lo // 32:(i_lo + local_i) // 32].view(torch.uint8),
+    )
+
+
 def test_a_shard_does_not_keep_its_parent_alive(dim):
     """A shard must own its storage.
 
@@ -150,87 +263,6 @@ def test_a_split_that_does_not_divide_o_groups_fails_loudly(args):
     _set_tp(16)  # o_groups == 8, so a rank cannot own a whole group
     with pytest.raises(ValueError, match="o_groups"):
         validate_tp(args)
-
-
-@pytest.mark.parametrize("rank", range(4))
-def test_expert_loader_places_exact_rank_slice(rank):
-    """The bank contents, not only their shapes, must tile the packed I axis."""
-
-    full_i, local_i, hidden = 128, 32, 64
-    i_lo = rank * local_i
-    e8m0 = torch.float8_e8m0fnu
-
-    def payload(shape, offset, dtype=torch.int8):
-        raw = (torch.arange(torch.Size(shape).numel(), dtype=torch.int64) + offset) % 251
-        return raw.to(torch.uint8).reshape(shape).view(dtype)
-
-    w1 = payload((full_i, hidden // 2), 1)
-    w3 = payload((full_i, hidden // 2), 17)
-    w2 = payload((hidden, full_i // 2), 33)
-    s1 = payload((full_i, hidden // 32), 49, e8m0)
-    s3 = payload((full_i, hidden // 32), 65, e8m0)
-    s2 = payload((hidden, full_i // 32), 81, e8m0)
-    banks = {
-        "gate_up_packed": [torch.zeros(1, 2 * local_i, hidden // 2, dtype=torch.uint8)],
-        "gate_up_scale": [torch.zeros(1, 2 * local_i, hidden // 32, dtype=e8m0)],
-        "down_packed": [torch.zeros(1, hidden, local_i // 2, dtype=torch.uint8)],
-        "down_scale": [torch.zeros(1, hidden, local_i // 32, dtype=e8m0)],
-    }
-
-    for proj, kind, tensor in (
-        ("w1", "weight", w1),
-        ("w3", "weight", w3),
-        ("w2", "weight", w2),
-        ("w1", "scale", s1),
-        ("w3", "scale", s3),
-        ("w2", "scale", s2),
-    ):
-        _place_dsfp4(banks, (0, 0, proj, kind), tensor, local_i, i_lo)
-
-    assert torch.equal(
-        banks["gate_up_packed"][0][0, :local_i],
-        w1.view(torch.uint8)[i_lo:i_lo + local_i],
-    )
-    assert torch.equal(
-        banks["gate_up_packed"][0][0, local_i:],
-        w3.view(torch.uint8)[i_lo:i_lo + local_i],
-    )
-    assert torch.equal(
-        banks["down_packed"][0][0],
-        w2.view(torch.uint8)[:, i_lo // 2:(i_lo + local_i) // 2],
-    )
-    assert torch.equal(
-        banks["gate_up_scale"][0][0, :local_i].view(torch.uint8),
-        s1[i_lo:i_lo + local_i].view(torch.uint8),
-    )
-    assert torch.equal(
-        banks["gate_up_scale"][0][0, local_i:].view(torch.uint8),
-        s3[i_lo:i_lo + local_i].view(torch.uint8),
-    )
-    assert torch.equal(
-        banks["down_scale"][0][0].view(torch.uint8),
-        s2[:, i_lo // 32:(i_lo + local_i) // 32].view(torch.uint8),
-    )
-
-
-def test_serial_expert_loader_does_not_slice_pre_sliced_rows_twice():
-    full_i, local_i, hidden, i_lo = 128, 32, 64, 64
-    full = torch.arange(full_i * (hidden // 2), dtype=torch.int64)
-    full = (full % 251).to(torch.uint8).reshape(full_i, hidden // 2).view(torch.int8)
-    rank_rows = full[i_lo:i_lo + local_i]
-    bank = torch.zeros(1, 2 * local_i, hidden // 2, dtype=torch.uint8)
-    banks = {"gate_up_packed": [bank]}
-
-    _place_dsfp4(
-        banks,
-        (0, 0, "w1", "weight"),
-        rank_rows,
-        local_i,
-        i_lo,
-        rows_ready=True,
-    )
-
-    assert torch.equal(bank[0, :local_i], rank_rows.view(torch.uint8))
 
 
 def test_tp_rejects_ftw_tp1_layout_before_model_setup(tmp_path):

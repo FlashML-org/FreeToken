@@ -253,9 +253,17 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         def sharded():
             for name, t in stream:
                 loc = locate(name)
-                if loc is None or t.ndim != 2:
+                if loc is None:
                     yield name, t
                     continue
+                if t.ndim != 2:
+                    # Never pass an expert piece through unsharded: the rank would build a
+                    # full-width bank inside a layout sized for I/tp, and the loader's shape
+                    # assert is the only thing that would notice -- long after the read.
+                    raise ValueError(
+                        f"DeepSeek-V4 expert piece {name!r} is {t.ndim}-D; the reader yields "
+                        f"per-expert 2-D pieces and only their I axis is sharded"
+                    )
                 yield name, shard_expert_piece(loc[2], t, rank=tp.rank, tp_size=tp.size)
 
         return sharded()
