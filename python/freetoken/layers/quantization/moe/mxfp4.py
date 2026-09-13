@@ -16,16 +16,32 @@ class TritonMxfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "ds_fp4"
+    # The decode GEMV tiles K in 128-byte blocks, and ``down`` packs two e2m1 codes per
+    # byte -- so a rank's slice of the intermediate dim has to stay a whole number of
+    # tiles wide. Owned here because it is a property of these kernels, not of the model.
+    _K_TILE_BYTES = 128
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.interleaved:
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
+        if reason is not None:
+            return reason
+        if cfg.tp_size > 1 and (cfg.local_intermediate // 2) % self._K_TILE_BYTES:
+            return (
+                f"TP={cfg.tp_size} leaves {cfg.local_intermediate} of the expert intermediate, "
+                f"whose packed down tile is {cfg.local_intermediate // 2} B; needs a multiple "
+                f"of {self._K_TILE_BYTES}"
+            )
+        return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # Rank-local on I, full on H: every rank reads all of the hidden dim and holds
+        # only its own block of the intermediate dim, which is what divides the 143 GB of
+        # host expert banks by the TP size.
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), E8M0),

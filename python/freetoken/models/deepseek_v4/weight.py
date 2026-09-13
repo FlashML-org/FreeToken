@@ -192,6 +192,36 @@ _EXPERT_RE = re.compile(
 )
 _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
+# Which axis of each per-expert piece carries the intermediate dim. A scale companion's
+# axis is a fixed subdivision of I (the e8m0 grid, or 2 e2m1 codes per byte), so dividing
+# THAT axis by the TP size is exactly the i_lo//2 and i_lo//32 arithmetic -- no per-role
+# divisor to keep in sync.
+_I_AXIS = {"gate": 0, "up": 0, "gate_scale": 0, "up_scale": 0, "down": 1, "down_scale": 1}
+
+
+def shard_expert_piece(role: str, t: torch.Tensor, *, rank: int, tp_size: int) -> torch.Tensor:
+    """This rank's block of the intermediate dim in one routed-expert piece.
+
+    ``gate``/``up`` (checkpoint ``w1``/``w3``) and their e8m0 companions carry I on the
+    ROW axis -- the scale grid blocks along H, so a scale splits on the same axis as its
+    weight, undivided. ``down`` and its scale carry I on the COLUMN axis.
+
+    The copy is the point: a ``narrow`` view keeps the whole parent tensor alive behind a
+    1/N slice, so every rank would pay for the experts it just threw away -- measured at
+    5.1 GiB per GPU on DeepSeek-V4-Flash at TP=4, silently charged to the model and out
+    of the KV / expert-cache budget.
+    """
+    if tp_size == 1:
+        return t
+    axis = _I_AXIS[role]
+    total = t.shape[axis]
+    if total % tp_size != 0:
+        raise ValueError(
+            f"DeepSeek-V4 expert piece {role!r} has {total} entries on axis {axis}, which "
+            f"does not divide over {tp_size} ranks"
+        )
+    step = total // tp_size
+    return t.narrow(axis, rank * step, step).clone(memory_format=torch.contiguous_format)
 
 
 def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
@@ -212,14 +242,9 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
     # TP: the expert kernel sizes its banks from MoEConfig.local_intermediate (= I // tp),
-    # so a rank yields only its own block of the intermediate dim. That is the memory win
-    # that makes the model fit: the host expert banks divide by the TP size. gate/up carry
-    # I on their ROW axis (their e8m0 grid blocks along H, so the scale cuts on the SAME
-    # axis undivided); down carries I on the COLUMN axis, packed two e2m1 per byte and
-    # scaled every 32 -- hence the //2 and //32. validate_tp() checks the divisibility.
+    # so a rank must yield only its own block of the intermediate dim. That is the memory
+    # win that makes the model fit -- the host expert banks divide by the TP size.
     tp = get_tp_info()
-    I = args.moe_inter_dim // tp.size
-    i_lo = tp.rank * I
 
     def _cut(stream):
         if tp.size == 1:
@@ -231,17 +256,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
                 if loc is None or t.ndim != 2:
                     yield name, t
                     continue
-                role = loc[2]
-                if role.startswith(("gate", "up")):
-                    piece = t[i_lo:i_lo + I]
-                elif role == "down":
-                    piece = t[:, i_lo // 2:(i_lo + I) // 2]
-                else:  # down_scale
-                    piece = t[:, i_lo // 32:(i_lo + I) // 32]
-                # The clone is the point: a narrow() view keeps the WHOLE parent tensor
-                # alive behind the 1/N slice, so every rank would pay for the experts it
-                # just threw away.
-                yield name, piece.clone()
+                yield name, shard_expert_piece(loc[2], t, rank=tp.rank, tp_size=tp.size)
 
         return sharded()
 
