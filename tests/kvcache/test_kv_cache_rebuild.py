@@ -64,6 +64,13 @@ def test_mla_and_dsa_rebuild_from_config_and_unit_bytes():
     # the index slab's per-token bytes ride on top of the latent slab's, each floored on its own
     assert dsa.unit_bytes() == (layers * latent * 2 + n_idx * idx_dim * 2, 0)
 
+    fp8 = MLAKVCache(latent_dim=latent, num_layers=layers, num_pages=8, page_size=1,
+                     dtype=torch.bfloat16, device=torch.device("cpu"), kv_quant="fp8")
+    fp8.rebuild_from_config(config=None, num_pages=20)
+    assert fp8.latent_rows(0).dtype is torch.uint8
+    # One byte per latent element plus one FP32 scale for each latent layer.
+    assert fp8.unit_bytes() == (layers * latent + layers * 4, 0)
+
 
 def _hybrid_groups():
     from freetoken.models.config import KVCacheGroupSpec

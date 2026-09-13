@@ -71,7 +71,31 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--kv-cache-dtype` | bf16 | `bf16`, `fp8`, or `nvfp4` (see [NVFP4 KV cache](#nvfp4-kv-cache)): FP8 stores the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+### FP8 KV cache
+
+`ft serve --kv-cache-dtype fp8` halves the bytes per cached token (8-bit codes instead
+of 16), so a card that held N tokens holds close to 2N. Each `(token, kv head)` row
+keeps its own fp32 scale, which costs ~3% back at `head_dim=128`. Requirements and
+trade-offs:
+
+- Needs the **triton** attention backend; `--attn auto` selects it (and refuses an
+  explicit `fi`/`fa`/`trtllm`, which cannot be shown to apply these scales).
+- Works on the plain paged, hybrid-SWA and QSA sparse (Qwen3.8-Flash-Next) KV pools.
+  On QSA the block-selection index keys stay 16-bit; only the selected K/V rows are
+  read back as codes. MLA/DSA latent KV, DeepSeek-V4's tiered pool and the block-sparse
+  MiniMax-M3 pool stay 16-bit; asking for fp8 there fails at startup rather than
+  silently ignoring the flag.
+- The same bytes on every GPU FreeToken targets: the codes sit in a plain byte buffer
+  and are decoded in software, so the cache holds identical data and produces identical
+  numbers on any card (the fp8 type is deliberately kept out of the kernels, which is
+  also what makes the feature work on the RTX 30 series).
+- Accuracy is checkpoint-dependent. Expect it to matter most on long contexts and on
+  models with outlier key channels; keep `bf16` when a run must be bit-reproducible.
+- `ft ctl stats` / `/v1/cache/status` report the smaller `kv_bytes_per_token`, and
+  `ft ctl cache --kv N` moves the same (now cheaper) pool.
 
 ### MoE offload
 
@@ -176,3 +200,33 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
 
+
+### NVFP4 KV cache
+
+`ft serve --model <checkpoint> --kv-cache-dtype nvfp4 --attention-backend triton`
+opts into packed E2M1 KV storage. The initial implementation supports plain paged
+FULL attention (MHA/GQA), hybrid-SWA, and the full-attention portion of hybrid-linear
+models, QSA, and MLA/DSA (including GLM-5.3-Flash). Head dimensions must be
+divisible by 16. DSV4 and BSA pools are rejected at startup. `auto` selects
+Triton, QSA sparse, or DSA attention for supported models. For MLA/DSA use
+`--attention-backend auto` or `--attention-backend dsa`. Only the latent slab is
+quantized; indexer keys, kpool tails/gates, and recurrent states retain their
+existing precision. A 512-element latent row occupies 292 bytes instead of 1024
+bytes in BF16, excluding those other tiers.
+
+Each K or V row stores `head_dim / 2` packed bytes, `head_dim / 16` E4M3 block-scale
+bytes, and one FP32 row scale. At head_dim 128 this is 76 bytes, versus 256 for
+BF16 and 132 for the existing FP8 format. Pool management, recurrent states,
+attention workspace and model weights consume additional memory.
+
+The second-level scale is dynamic per token/head, so appending a token never
+rescales an existing prefix. This is a FreeToken KV layout, not an external
+NVFP4 checkpoint or attention-library ABI. K/V are restored inside attention;
+Q and attention arithmetic retain their compute precision. The MoE weight option
+`--nvfp4-backend` is independent. Paged MHA prefill uses fresh compute-dtype K/V
+while cached prefixes are restored, as in the FP8 path. MLA/DSA stores fresh
+latent rows first and reads the quantized cache in both prefill and decode.
+
+NVFP4 is opt-in: assess quality on your checkpoint and workload before using it
+for long-context inference. Capacity savings do not guarantee faster decode;
+packing, reconstruction, and the selected attention backend affect throughput.

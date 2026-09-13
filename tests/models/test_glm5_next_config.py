@@ -23,6 +23,28 @@ _DSA_IDS = tuple(range(3, _NUM_LAYERS, 4))  # 3, 7, ..., 43
 _KDA_IDS = tuple(i for i in range(_NUM_LAYERS) if i not in _DSA_IDS)
 
 
+def test_nvfp4_pool_factory_preserves_glm5_hybrid_geometry():
+    import torch
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
+
+    cfg = parse_config(_hf_config())
+    pool = create_kvcache_pool(
+        cfg, num_pages=2, page_size=64, dtype=torch.bfloat16,
+        device=torch.device("cpu"), num_req_slots=3, kv_quant="nvfp4",
+    )
+    assert isinstance(pool, KpoolDSAKVCache)
+    spec, = cfg.kv_cache_group_specs()
+    assert pool.num_layers == len(_DSA_IDS)
+    for layer in _DSA_IDS:
+        assert pool.latent_rows(layer).shape == (128, spec.head_dim // 2)
+        assert pool.latent_block_scale(layer).shape == (128, spec.head_dim // 16)
+    with pytest.raises(KeyError):
+        pool.latent_rows(_KDA_IDS[0])
+    assert pool.index_k_cache(0).dtype == torch.bfloat16
+    assert pool.tail_gate(0).dtype == torch.bfloat16
+
+
 def _layer_types() -> list[str]:
     return [
         "deepseek_sparse_attention" if i in _DSA_IDS else "linear_attention"
