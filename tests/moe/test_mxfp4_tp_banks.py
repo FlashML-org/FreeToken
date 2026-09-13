@@ -134,6 +134,9 @@ def test_rank_partials_sum_to_the_single_rank_output():
             full[3][:, :, scale_cols].contiguous(),
         ]
         y_rank = routed_experts_fp4(x, ids.clone(), wts, *banks, limit)
+        # Accumulate in fp32: the kernel returns bf16, and summing bf16 partials would
+        # add the test's own rounding on top of the kernel's.
+        y_rank = y_rank.float()
         partial = y_rank if partial is None else partial + y_rank
 
     # Same decode function, same bytes, partitioned input axis: only the fp32
