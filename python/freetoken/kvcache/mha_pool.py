@@ -127,6 +127,14 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+
+        # FP8 KV: store the incoming BF16 K/V using the pool storage dtype.
+        # FlashInfer receives the query and KV dtypes separately.
+        buf_dtype = self._kv_buffer.dtype
+        if k.dtype != buf_dtype:
+            k = k.to(buf_dtype)
+            v = v.to(buf_dtype)
+
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),

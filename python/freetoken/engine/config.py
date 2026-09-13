@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.layers.quantization import set_quant_config
-from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
-from freetoken.utils import cached_load_hf_config, init_logger
+from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.utils import cached_load_hf_config
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
-
-logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,15 +18,14 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # KV-cache storage dtype. "auto" keeps the model compute dtype;
+    # fp8_e4m3/fp8_e5m2 reduce KV VRAM while compute remains bf16.
+    kv_dtype: str = "auto"
     max_running_req: int = 4
     attention_backend: str = "auto"
-    moe_strategy: str = "auto"
-    # old name of moe_strategy; __post_init__ folds it in
-    moe_backend: str | None = field(default=None, repr=False)
-    # --quant-backend: layer[.kind]=kernel entries, comma separated
-    quant_backend: str | None = None
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
-    ple_backend: str = "disk"
+    moe_backend: str = "auto"
+    # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
+    nvfp4_backend: str = "triton"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -46,16 +42,16 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
-    # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
+    # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
-    # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
+    # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
-    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-strategy cpu
+    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
-    # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
+    # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
@@ -65,6 +61,9 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    # KV-cache storage dtype. None means the model/activation dtype.
+    # Queries remain in model dtype when KV is stored as FP8.
+    kv_dtype: object | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -88,15 +87,6 @@ class EngineConfig:
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
 
-    def __post_init__(self):
-        if self.moe_backend is None:
-            return
-        if self.moe_strategy != "auto":
-            raise ValueError("moe_backend is the old name of moe_strategy; pass only moe_strategy")
-        logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
-        object.__setattr__(self, "moe_strategy", self.moe_backend)
-        object.__setattr__(self, "moe_backend", None)
-
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)
@@ -104,10 +94,36 @@ class EngineConfig:
     @cached_property
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
-        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
-        set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return replace(parse_config(self.hf_config), quant=quant)
+        return parse_config(self.hf_config)
+
+    @property
+    def resolved_kv_dtype(self):
+        """Storage dtype for paged KV; queries/activations stay in dtype."""
+        return self.kv_dtype if self.kv_dtype is not None else self.dtype
+
+
+
+    @property
+    def resolved_kv_dtype(self) -> torch.dtype:
+        # argparse currently resolves --kv-dtype to torch.dtype objects.
+        # Accept those directly as well as string values for programmatic callers.
+        if isinstance(self.kv_dtype, torch.dtype):
+            return self.kv_dtype
+
+        mapping = {
+            "auto": self.dtype,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp8_e4m3": torch.float8_e4m3fn,
+            "fp8_e5m2": torch.float8_e5m2,
+        }
+        try:
+            return mapping[self.kv_dtype]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported KV dtype: {self.kv_dtype!r}"
+            ) from exc
 
     @property
     def max_seq_len(self) -> int:

@@ -58,6 +58,7 @@ class FIMetadata(BaseAttnMetadata):
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
+    q_dtype:            torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
     # fmt: on
@@ -86,6 +87,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
+        self.q_dtype = get_global_ctx().compute_dtype
         self.device = self.kvcache.device
         # fa2 split-KV prefill needs ``tmp_v <= qo_heads_local * padded_batch_size *
         # cta_tile_q * head_dim * 4`` bytes of scratch, where flashinfer's scheduler
@@ -110,7 +112,7 @@ class FlashInferBackend(BaseAttnBackend):
         cta_tile_q = 64 if config.head_dim >= 256 else 128
         padded_batch = -(-2 * sm_count // max(1, kv_local))
         tmp_v_bound = qo_local * padded_batch * cta_tile_q * config.head_dim * 4
-        workspace_bytes = max(256 * 1024 * 1024, tmp_v_bound + 32 * 1024 * 1024)
+        workspace_bytes = max(32 * 1024 * 1024, tmp_v_bound + 32 * 1024 * 1024)
         self.float_workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=self.device
         )
@@ -165,8 +167,7 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
             )
@@ -182,7 +183,7 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
                 causal=True,
@@ -256,6 +257,7 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
+            q_dtype=self.q_dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 
