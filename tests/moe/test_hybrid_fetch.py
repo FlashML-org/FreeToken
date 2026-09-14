@@ -66,6 +66,46 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
 
 
+def test_backend_pick_follows_the_served_expert_geometry(tmp_path):
+    """Numbers from an RTX 4070 SUPER: the nvfp4 dtype bench (3072x1536, 7.97 MB experts) says
+    hybrid at 89.7 GB/s CPU vs 25.2 PCIe, but Qwen3.6-35B-A3B's own geometry (2048x512,
+    1.78 MB) benches at 32.2 GB/s -> offload, and hybrid decodes 3x slower than offload there."""
+    small = {"hidden": 2048, "inter": 512, "experts": 256, "top_k": 8}
+    prof = {
+        "gpu": {"name": "FAKE GPU"},
+        "dtypes": {"nvfp4": "hybrid"},
+        "dtype_kernels": {"nvfp4": {
+            "expert_bytes": 7974912, "cpu_moe_gbs": 89.7, "pcie_gather_gbs": 25.2,
+            "cpu_moe_overlap_gbs": 74.1, "pcie_gather_overlap_gbs": 25.2,
+        }},
+        "workloads": {"qwen3.6-moe": {
+            "model": dict(small),
+            "kernels": {"nvfp4": {
+                "expert_bytes": 1775616, "recommended": "offload", "cpu_moe_gbs": 32.2,
+                "pcie_gather_gbs": 25.9, "cpu_moe_overlap_gbs": 28.2, "pcie_gather_overlap_gbs": 25.4,
+            }},
+        }},
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    p = str(path)
+
+    # a bench of exactly this geometry beats the dtype verdict, for the pick and the split
+    assert load_backend_recommendation("nvfp4", path=p, expert_bytes=1775616, geometry=small) == "offload"
+    assert load_hybrid_fetch_fraction("nvfp4", path=p, expert_bytes=1775616, geometry=small) == pytest.approx(25.4 / (25.4 + 28.2))
+    # callers that pass no geometry keep the format-only join
+    assert load_backend_recommendation("nvfp4", path=p) == "hybrid"
+
+    # no bench of this geometry: a verdict from 4.5x larger experts is not applied ...
+    del prof["workloads"]
+    path.write_text(json.dumps(prof))
+    assert load_backend_recommendation("nvfp4", path=p, expert_bytes=1775616, geometry=small) is None
+    assert load_hybrid_fetch_fraction("nvfp4", path=p, expert_bytes=1775616, geometry=small) is None
+    # ... while comparable experts (within 2x) inherit it as before
+    assert load_backend_recommendation("nvfp4", path=p, expert_bytes=6_000_000, geometry={"hidden": 3072, "inter": 1024, "experts": 128, "top_k": 8}) == "hybrid"
+    assert load_hybrid_fetch_fraction("nvfp4", path=p, expert_bytes=6_000_000) == pytest.approx(25.2 / (25.2 + 74.1))
+
+
 def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.delenv("FREETOKEN_BENCHBW_PATH", raising=False)
