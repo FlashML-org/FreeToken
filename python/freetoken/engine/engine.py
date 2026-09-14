@@ -112,8 +112,7 @@ def _backend_requirements_met(name: str) -> bool:
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
         return False
-    # FA3 is Hopper (sm_90a) cubins; FA4 is datacenter Blackwell (sm_100a). Ada / Ampere /
-    # consumer Blackwell have neither, even when sgl_kernel is installed.
+    # requires_sm90 also admits sm_100 (FA4). Hopper-only would reject B200.
     if any(i.requires_sm90 for i in infos) and not (is_sm90_family() or is_sm100_family()):
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
