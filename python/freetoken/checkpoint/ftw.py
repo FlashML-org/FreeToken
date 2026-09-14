@@ -106,6 +106,14 @@ def is_ftw_checkpoint(path: str) -> bool:
     return os.path.isfile(os.path.join(path, INDEX_NAME))
 
 
+def ftw_quant_format(path: str) -> str | None:
+    """The ``quant_format`` an FTW checkpoint's expert banks were packed for; None when ``path`` is not an FTW checkpoint or holds no banks."""
+    if not is_ftw_checkpoint(path):
+        return None
+    with open(os.path.join(path, INDEX_NAME)) as f:
+        return json.load(f).get("quant_format")
+
+
 # ============================== writer ==============================
 class FTWWriter:
     """Stream tensors into the FTW, rolling shard files at ``shard_limit``.
@@ -384,7 +392,8 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
                 reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
                 dt = _dtype_of(e["dtype"])
                 t = torch.frombuffer(buf, dtype=dt, count=e["nbytes"] // _elsize(dt))
-                if not _put((e["name"], t.view(*e["shape"]) if e["shape"] else t, buf, e["nbytes"])):
+                # a 0-d entry (a per-tensor scale) comes back 0-d, not [1]
+                if not _put((e["name"], t.view(*e["shape"]) if e["shape"] else t.view(()), buf, e["nbytes"])):
                     return
         except BaseException as ex:  # surface to consumer
             err.append(ex)
@@ -590,7 +599,13 @@ def load_ftw_banks(
             views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
         sources[name] = views
 
+    from freetoken.moe.legacy_format import canonical_role, kind_kernel_for
     from freetoken.moe.expert_banks import ExpertBanks
+
+    # the file names the banks the legacy way; the quant_format tag names the (kind, kernel) they were packed for
+    sources = {canonical_role(name): views for name, views in sources.items()}
+    quant_format = reader.meta("quant_format")
+    kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
 
     # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
     applied = list(residency)
@@ -628,8 +643,8 @@ def load_ftw_banks(
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
     return ExpertBanks(
-        reader.meta("quant_format"), sources, **alpha_kw,
-        layer_residency=applied,
+        quant_format, sources, **alpha_kw,
+        layer_residency=applied, kind=kind, kernel=kernel,
     )
 
 

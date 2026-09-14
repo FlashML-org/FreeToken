@@ -3,29 +3,26 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch.nn.functional as F
-from freetoken.layers import BaseOP
+from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.utils import nvtx_annotate
-
-from .nvfp4_linear import LinearNVFP4
 
 if TYPE_CHECKING:
     import torch
 
+    from freetoken.layers.quantization import QuantConfig
+
 
 class GlmGatedMLP(BaseOP):
-    """SwiGLU MLP whose projections keep the checkpoint's native NVFP4 weights.
+    """SwiGLU MLP for the leading dense layers (``intermediate_size``) and each MoE layer's
+    always-on shared expert (``moe_intermediate_size``); the projections take whatever the
+    checkpoint stores for their prefix (NVFP4 in the GLM-4 releases)."""
 
-    Used for both the leading dense layers (``intermediate_size``) and each MoE layer's
-    always-on shared expert (``moe_intermediate_size``). GLM-4 ships these in NVFP4; we keep
-    them NVFP4 and dequantize in the forward (:class:`LinearNVFP4`) -- identical math to the
-    routed experts (faithful to the checkpoint) and the smallest footprint, which matters
-    because GLM activates 89*8 experts per token. Activations stay bf16.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        self.gate_proj = LinearNVFP4(hidden_size, intermediate_size)
-        self.up_proj = LinearNVFP4(hidden_size, intermediate_size)
-        self.down_proj = LinearNVFP4(intermediate_size, hidden_size)
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, *, quant_config: QuantConfig | None = None, prefix: str = ""
+    ):
+        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
+        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.up_proj")
+        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

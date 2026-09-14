@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
-    from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 
@@ -40,9 +39,10 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
-    # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
-    # hidden]) scattered at image-token positions during this request's prefill.
-    mm_embeds: torch.Tensor | None = None
+    # per-item processor outputs and the tokenizer's precomputed mrope rows and delta
+    mm_items: list | None = None
+    mrope_positions_full: torch.Tensor | None = None  # [3, prompt_len] int32, CPU
+    mrope_delta: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -116,6 +116,8 @@ class Batch:
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
+    # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
+    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
     # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
     # decode to gather/scatter recurrent+conv state without host-side loops (so the
@@ -133,8 +135,14 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
+    # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    mm_rows: torch.Tensor | None = field(default=None, init=False)
+    # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
+    mm_block_ends: torch.Tensor | None = field(default=None, init=False)
+    # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
+    mm_encoder_jobs: list | None = field(default=None, init=False)
+    mm_gather_plan: list | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
@@ -155,6 +163,9 @@ class Batch:
     def is_decode(self) -> bool:
         return self.phase == "decode"
 
+    def get_attn_positions(self) -> torch.Tensor:
+        return self.mrope_positions if self.mrope_positions is not None else self.positions
+
     @property
     def size(self) -> int:
         return len(self.reqs)
@@ -170,7 +181,6 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
-    moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for

@@ -46,7 +46,7 @@ def test_out_of_range_raises(spec):
 
 
 def _cfg(backend, spec=None):
-    return SimpleNamespace(moe_backend=backend, moe_cpu_layers=spec)
+    return SimpleNamespace(moe_strategy=backend, moe_cpu_layers=spec)
 
 
 def test_resolve_backend_dispatch():

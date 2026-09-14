@@ -150,7 +150,7 @@ def test_linear_state_pool_rebuild_resizes_preserves_identity_and_dtypes():
     _init_tp()
     group = LinearGatedDeltaGroupConfig(
         name="linear", layer_ids=(0, 1, 2), num_key_heads=4, num_value_heads=8,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
     )
     pool = LinearStatePool(group=group, num_slots=10, dtype=torch.bfloat16, device=torch.device("cpu"))
     pid = id(pool)

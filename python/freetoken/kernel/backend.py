@@ -10,6 +10,8 @@ from __future__ import annotations
 import functools
 import importlib.util
 
+import torch
+
 
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
@@ -32,14 +34,17 @@ def is_sgl_kernel_installed() -> bool:
 
 
 @functools.cache
-def is_triton_kernels_installed() -> bool:
-    """OpenAI's ``triton_kernels`` (the fused MoE router used by ``moe.fused.fused_topk``).
+def is_vllm_installed() -> bool:
+    return _importable("vllm")
 
-    Distinct from the ``triton`` runtime we always depend on: it ships with the Triton
-    source tree and has no Windows wheel. It is also not one of the six ops
-    ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
-    """
-    return _importable("triton_kernels")
+
+@functools.cache
+def device_capability() -> tuple[int, int]:
+    """Compute capability of the current device as (major, minor); (0, 0) without CUDA."""
+    if not torch.cuda.is_available():
+        return (0, 0)
+    major, minor = torch.cuda.get_device_capability()
+    return (int(major), int(minor))
 
 
 @functools.cache

@@ -16,9 +16,9 @@ if TYPE_CHECKING:
 
 
 class MiniMaxM2DecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = MiniMaxM2Attention(config, layer_id)
-        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config, layer_id)
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.self_attn = MiniMaxM2Attention(config, layer_id, prefix=f"{prefix}.self_attn")
+        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config, layer_id, prefix=f"{prefix}.block_sparse_moe")
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps
@@ -37,13 +37,16 @@ class MiniMaxM2DecoderLayer(BaseOP):
 
 
 class MiniMaxM2Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [MiniMaxM2DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                MiniMaxM2DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
@@ -63,6 +66,8 @@ class MiniMaxM2ForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         super().__init__()
 

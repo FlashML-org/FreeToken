@@ -123,10 +123,12 @@ def _iter_weights_compressed_tensors(
                     if emit is not None:
                         yield from emit
                     else:  # standalone: o_proj, down_proj
-                        w, s, g = parts
+                        w, s, g, a = parts
                         yield base + ".weight", w
                         yield base + ".weight_scale", s
                         yield base + ".weight_global", g
+                        if a is not None:
+                            yield base + ".input_scale", a
                     continue
                 yield name, reader.get_tensor(raw_name)
     finally:

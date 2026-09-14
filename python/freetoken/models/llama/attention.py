@@ -22,6 +22,7 @@ class LlamaAttention(BaseOP):
         *,
         has_attn_bias: bool = False,
         has_qk_norm: bool = False,
+        prefix: str = "",
     ):
         head_dim = config.head_dim
         self.layer_id = layer_id
@@ -37,6 +38,8 @@ class LlamaAttention(BaseOP):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=has_attn_bias,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         if has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -59,6 +62,8 @@ class LlamaAttention(BaseOP):
             head_dim * config.num_qo_heads,
             config.hidden_size,
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
 
     @nvtx_annotate("MHA")

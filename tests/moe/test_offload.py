@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.layers.quantization import QuantKind
 
 
 def _init_tp():
@@ -11,18 +12,22 @@ def _init_tp():
         set_tp_info(rank=0, size=1)
 
 
-def _make_layer_and_cache():
+def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size: int, intermediate_size: int):
+    """A bf16 offload layer on the fused kernel."""
     from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization import NoQuantConfig
+
+    return OffloadMoELayer(
+        layer_id, num_experts, top_k, hidden_size, intermediate_size,
+        quant_config=NoQuantConfig(), prefix=f"model.layers.{layer_id}.mlp.experts",
+    )
+
+
+def _make_layer_and_cache():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    layer = OffloadMoELayer(
-        layer_id=0,
-        num_experts=4,
-        top_k=2,
-        hidden_size=8,
-        intermediate_size=16,
-    )
+    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=4,
@@ -34,34 +39,41 @@ def _make_layer_and_cache():
     return layer, cache
 
 
-def test_dummy_expert_sources_use_moe_layer_count(monkeypatch):
-    from types import SimpleNamespace
+def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
 
-    import freetoken.models.weight as weight
+    from freetoken.kernel import backend
+    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
+    from freetoken.moe.expert_banks import build_expert_banks
 
     _init_tp()
-    config = SimpleNamespace(
-        num_layers=5,
-        num_moe_layers=3,
-        num_experts=4,
-        hidden_size=6,
-        moe_intermediate_size=8,
-    )
+    L, E, H, I = 3, 4, 64, 32
+    monkeypatch.setattr(backend, "device_capability", lambda: (0, 0))
+    monkeypatch.setattr(backend, "is_vllm_installed", lambda: False)
+    monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: False)
 
-    gate_up, down = weight.dummy_moe_expert_sources(config, dtype=torch.float16)
+    def _bound(quant):
+        layer = _bf16_offload_layer(0, E, 2, H, I) if quant is None else None
+        if layer is None:
+            from freetoken.layers.moe import OffloadMoELayer
 
-    assert len(gate_up) == 3 and all(t.shape == (4, 16, 6) for t in gate_up)
-    assert len(down) == 3 and all(t.shape == (4, 6, 8) for t in down)
+            layer = OffloadMoELayer(0, E, 2, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
+        return layer
 
-    monkeypatch.setattr(
-        weight,
-        "alloc_pinned_tensor",
-        lambda *shape, dtype: torch.empty(*shape, dtype=dtype),
-    )
-    banks = weight.dummy_nvfp4_expert_sources(config)
+    bf16 = _bound(None)
+    banks = build_expert_banks(bf16.quant_method, L, None, device=torch.device("cpu"), dummy=True)
+    assert banks.kind is QuantKind.NONE and set(banks.sources) == {"gate_up", "down"}
+    assert len(banks.sources["gate_up"]) == L and all(t.shape == (E, 2 * I, H) for t in banks.sources["gate_up"])
+    assert all(t.shape == (E, H, I) for t in banks.sources["down"])
 
-    assert {len(layers) for layers in banks.values()} == {3}
-    assert {t.shape[0] for layers in banks.values() for t in layers} == {4}
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    nvfp4 = _bound(quant)
+    banks = build_expert_banks(nvfp4.quant_method, L, None, device=torch.device("cpu"), dummy=True)
+    assert banks.kind is QuantKind.NVFP4 and banks.kernel == "triton"
+    assert {len(layers) for layers in banks.sources.values()} == {L}
+    assert {t.shape[0] for layers in banks.sources.values() for t in layers} == {E}
+    assert torch.all(banks.sources["gate_up_scale"][0].float() == 1.0)
+    assert torch.all(banks.sources["gate_up_global"][0].float() > 0)
 
 
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
@@ -87,6 +99,8 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         calls["w1"] = w1
         calls["w2"] = w2
@@ -94,7 +108,7 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         calls["topk_ids"] = got_topk_ids.clone()
         return hidden_states
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
     out = layer.prefill_forward(hidden_states, router_logits)
 
@@ -112,22 +126,12 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
 
 
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
-    from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
     num_layers = 3
     num_experts = 4
-    layers = [
-        OffloadMoELayer(
-            layer_id=layer_id,
-            num_experts=num_experts,
-            top_k=2,
-            hidden_size=8,
-            intermediate_size=16,
-        )
-        for layer_id in range(num_layers)
-    ]
+    layers = [_bf16_offload_layer(layer_id, num_experts, 2, 8, 16) for layer_id in range(num_layers)]
     cache = OffloadMoeCache(
         num_layers=num_layers,
         num_experts=num_experts,
@@ -172,6 +176,8 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         layer_id = len(fused_calls)
         fused_calls.append(
@@ -186,7 +192,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         )
         return hidden_states + layer_id
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
     out = hidden_states
     for layer in layers:
@@ -353,6 +359,8 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         calls["w1"] = w1
         calls["w2"] = w2
@@ -360,7 +368,7 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         calls["topk_ids"] = got_topk_ids.clone()
         return hidden_states
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_decode_impl", fake_fused_decode)
 
     out = layer.decode_forward(hidden_states, router_logits)
 
@@ -429,17 +437,17 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
             num_moe_layers=10,
             num_experts=8,
             expert_quant="none",
-            moe_backend="auto",
+            moe_strategy="auto",
         ),
     )
 
     _adjust_config(config)
 
-    from freetoken.moe import is_offload_moe_backend
+    from freetoken.moe import is_offload_moe_strategy
 
     assert config.moe_cache_size == 24
     # Family, not member: a box with a benchbw profile resolves bf16 experts to hybrid.
-    assert is_offload_moe_backend(config.moe_backend)
+    assert is_offload_moe_strategy(config.moe_strategy)
 
 
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):

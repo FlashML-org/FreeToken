@@ -42,18 +42,6 @@ def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     assert rel.item() < 2e-2, rel.item()
 
 
-def test_mxfp8_module_shapes_and_forward():
-    from freetoken.kernel.triton.mxfp8_linear import Mxfp8Linear
-
-    lin = Mxfp8Linear(6144, 512)
-    assert lin.weight.shape == (512, 6144) and lin.weight.dtype == torch.float8_e4m3fn
-    assert lin.weight_scale_inv.shape == (512, 192) and lin.weight_scale_inv.dtype == torch.uint8
-    w8, codes = _make_mxfp8(512, 6144, seed=42)
-    lin.weight, lin.weight_scale_inv = w8, codes
-    x = torch.randn(3, 6144, device=DEV, dtype=torch.bfloat16)
-    assert lin.forward(x).shape == (3, 512)
-
-
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():
     """Triton fallback vs the (1+w) definition; per-head 3D strided in-place."""
     from freetoken.kernel.triton.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm

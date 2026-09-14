@@ -6,22 +6,14 @@ The checkpoint is the multimodal wrapper layout: every text-tower tensor carries
 ``multi_modal_projector.`` / ``patch_merge_mlp.``) is never read (text-only serving).
 
 Resident (non routed-expert) dense projections are MXFP8 in the checkpoint
-(fp8-e4m3 ``weight`` + uint8 e8m0 block-32 ``weight_scale_inv``). What this loader
-yields follows the quant modes RESOLVED IN ``parse_config`` (``ModelConfig.attn_quant``
-/ ``dense_quant``, from the FREETOKEN_M3_*_MXFP8 switches, default on): in the default
-mode the fp8 weight and its scale codes stream through verbatim (merged output-wise for
-the fused qkv / index-qk / gate-up projections -- the scales are per-output-row, so
-fusion is exact); with a switch off the projections are dequantized to bf16 at load.
+(fp8-e4m3 ``weight`` + uint8 e8m0 block-32 ``weight_scale_inv``): the fp8 weight and
+its scale codes stream through verbatim (merged output-wise for the fused qkv /
+index-qk / gate-up projections -- the scales are per-output-row, so fusion is exact).
 Norms, the router gate, ``e_score_correction_bias`` (kept fp32), embeddings and
 lm_head are unquantized and stream through verbatim. Routed experts are NVFP4
 (``w1/w3/w2`` = gate/up/down, same ModelOpt layout as MiniMax-M2) and go to the
-offload cache via ``load_nvfp4_expert_sources``; expert ``input_scale`` calibration
+offload cache from their NVFP4 pieces; expert ``input_scale`` calibration
 tensors are unused (W4A16) and never match the bank spec.
-
-FTW caveat: an FTW checkpoint stores whatever iter_weights yielded at CONVERSION time,
-and the model is built from the env at SERVE time -- the two must agree (a mismatch
-fails loudly in load_state_dict on the ``*.weight_scale_inv`` keys). The active modes
-are logged at load so conversion logs record the choice.
 """
 
 from __future__ import annotations
@@ -37,7 +29,6 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
@@ -153,7 +144,7 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "MiniMax-M3 stores routed experts as NVFP4 and only supports the offload MoE "
-        "backend; experts are loaded into the offload cache via load_nvfp4_expert_sources()."
+        "backend; experts are loaded into the offload cache from their NVFP4 pieces."
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
@@ -170,8 +161,7 @@ def iter_weights(
 
         init_logger(__name__).info(
             f"MiniMax-M3 resident quant: attn={config.attn_quant} dense={config.dense_quant} "
-            f"lm_head={config.lm_head_quant} (FREETOKEN_M3_ATTN_MXFP8/FREETOKEN_M3_MLP_MXFP8; "
-            "an FTW conversion records these choices implicitly -- serve with the same flags)"
+            f"lm_head={config.lm_head_quant}"
         )
     try:
         for layer in tqdm(
@@ -248,36 +238,8 @@ def iter_weights(
         reader.close()
 
 
-def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
-
-
-__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
+__all__ = ["iter_weights", "nvfp4_expert_spec"]

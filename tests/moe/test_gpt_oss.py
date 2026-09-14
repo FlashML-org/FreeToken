@@ -61,17 +61,28 @@ def tp1(monkeypatch):
     return tp_info
 
 
+def _offload_layer(config, layer_id, cache):
+    """gpt-oss offload experts as GptOssMLP builds them, kernel bound the way the engine does."""
+    from freetoken.layers.quantization import QuantConfig
+    from freetoken.models.gpt_oss.moe import GptOssOffloadMoELayer
+
+    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "mxfp4", "modules_to_not_convert": []}})
+    layer = GptOssOffloadMoELayer(
+        layer_id, config.num_experts, config.num_experts_per_tok, config.hidden_size,
+        config.moe_intermediate_size, renormalize=True, activation="gpt_oss_swiglu",
+        alpha=config.hidden_act_alpha, limit=config.swiglu_limit, interleaved=True, has_bias=True,
+        quant_config=quant, prefix=f"model.layers.{layer_id}.mlp.experts",
+    )
+    layer.offload_cache = cache
+    return layer
+
+
 def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=False):
-    from freetoken.moe.expert_banks import load_expert_banks
+    from freetoken.moe.expert_banks import build_expert_banks
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    banks = load_expert_banks(
-        None,
-        config,
-        device=device,
-        dtype=torch.bfloat16,
-        dummy=True,
-    )
+    probe = _offload_layer(config, 0, None)
+    banks = build_expert_banks(probe.quant_method, config.num_layers, None, device=device, dummy=True)
     cache = OffloadMoeCache(
         num_layers=config.num_layers,
         num_experts=config.num_experts,
@@ -80,6 +91,7 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
         cache_policy="lru",
         prefill_overlap=prefill_overlap,
         quant_format=banks.quant_format,
+        layout=banks.layout,
     )
     cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
     cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
@@ -188,7 +200,6 @@ def test_run_mxfp4_prefill_experts_t_matches_reference(M):
 @CUDA
 def test_offload_decode_bit_identical_under_eviction(tp1):
     """Offload decode matches direct split-K across a real evict+reload cycle."""
-    from freetoken.models.gpt_oss.moe import GptOssMxfp4OffloadMoELayer
     from freetoken.moe.fused_mxfp4 import (
         run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts,
     )
@@ -199,10 +210,8 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
 
     cache = _make_offload_cache(c, dev, cache_size=E)  # 4 slots, 8 total experts -> eviction
 
-    layer1 = GptOssMxfp4OffloadMoELayer(c, layer_id=1)
-    layer1.offload_cache = cache
-    layer0 = GptOssMxfp4OffloadMoELayer(c, layer_id=0)
-    layer0.offload_cache = cache
+    layer1 = _offload_layer(c, 1, cache)
+    layer0 = _offload_layer(c, 0, cache)
 
     torch.manual_seed(42)
     hidden = 0.1 * torch.randn(1, H, device=dev, dtype=torch.bfloat16)
@@ -213,8 +222,8 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
         tid_ref = torch.tensor([expert_ids], dtype=torch.int32, device=dev)
         return _run_mxfp4_splitk_decode_experts(
             hidden, tw, tid_ref,
-            g("gate_up_blocks"), g("gate_up_scales"), g("gate_up_bias"),
-            g("down_blocks"), g("down_scales"), g("down_bias"),
+            g("gate_up"), g("gate_up_scale"), g("gate_up_bias"),
+            g("down"), g("down_scale"), g("down_bias"),
             top_k=tk, hidden_act_alpha=c.hidden_act_alpha, swiglu_limit=c.swiglu_limit,
         )
 
@@ -241,7 +250,7 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
 @pytest.mark.parametrize("M", [16])
 def test_offload_prefill_overlap_matches_reference(M, tp1):
     """Prefill overlap must not crash and must match the direct _t kernel."""
-    from freetoken.models.gpt_oss.moe import GptOssMxfp4OffloadMoELayer
+    from freetoken.kernel import gpt_oss_fused_routing
     from freetoken.moe.fused_mxfp4 import (
         run_mxfp4_prefill_experts_t as _run_mxfp4_prefill_experts_t,
     )
@@ -253,21 +262,20 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     cache = _make_offload_cache(c, dev, prefill_overlap=True)
     # layer_id=0 is mandatory: _wait_prefill_overlap gates begin_prefill() on layer_id==0,
     # so only layer 0 exercises the previously-crashing code path.
-    layer = GptOssMxfp4OffloadMoELayer(c, layer_id=0)
-    layer.offload_cache = cache
+    layer = _offload_layer(c, 0, cache)
 
     torch.manual_seed(2)
     hidden = 0.1 * torch.randn(M, H, device=dev, dtype=torch.bfloat16)
     logits = torch.randn(M, E, device=dev, dtype=torch.bfloat16)
-    tw, tid = layer._topk(logits.contiguous())
+    tw, tid = gpt_oss_fused_routing(logits.contiguous(), tk)
 
     out_overlap = layer._prefill_routed(hidden, tw, tid.clone())  # must not raise
 
     g = lambda k: cache.bank_sources[k][0].to(dev)  # layer-0 source rows
     out_ref = _run_mxfp4_prefill_experts_t(
         hidden, tw, tid,
-        g("gate_up_blocks"), g("gate_up_scales"), g("gate_up_bias"),
-        g("down_blocks"), g("down_scales"), g("down_bias"),
+        g("gate_up"), g("gate_up_scale"), g("gate_up_bias"),
+        g("down"), g("down_scale"), g("down_bias"),
         top_k=tk, hidden_act_alpha=c.hidden_act_alpha, swiglu_limit=c.swiglu_limit,
     )
     max_diff = (out_overlap - out_ref).abs().max().item()

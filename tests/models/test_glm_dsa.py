@@ -298,11 +298,15 @@ def test_backend_ragged_prefill_identity_and_selection():
     q_pe = torch.randn(t, h, dr, device="cuda", dtype=torch.bfloat16)
     c_kv = torch.randn(t, dv, device="cuda", dtype=torch.bfloat16)
     k_rope = torch.randn(t, dr, device="cuda", dtype=torch.bfloat16)
-    qkw = (torch.randn(t, idx_h, idx_d, device="cuda", dtype=torch.bfloat16),
-           torch.randn(t, idx_d, device="cuda", dtype=torch.bfloat16),
-           torch.randn(t, idx_h, device="cuda").abs())
+    from freetoken.attention.dsa import DSAIndexerInputs
 
-    o0 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch, indexer_qkw=qkw)
+    qkw = DSAIndexerInputs(
+        q=torch.randn(t, idx_h, idx_d, device="cuda", dtype=torch.bfloat16),
+        k=torch.randn(t, idx_d, device="cuda", dtype=torch.bfloat16),
+        w=torch.randn(t, idx_h, device="cuda").abs(),
+    )
+
+    o0 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch, indexer_inputs=qkw)
 
     # request A (kv <= topk): selection covers all live -> equals dense reference
     q_cat = torch.cat([q_nope, q_pe], -1)
@@ -313,7 +317,7 @@ def test_backend_ragged_prefill_identity_and_selection():
         assert (o0[j].float() - ref).abs().max().item() < 3e-2, f"A q{j}"
 
     # request B (kv > topk): causal top-k reference from the same scoring math
-    q_idx, k_idx, w = qkw
+    q_idx, k_idx, w = qkw.q, qkw.k, qkw.w
     for j in (0, 11):  # first and last of B's queries
         row = 8 + j
         pos = 88 + j
@@ -327,7 +331,7 @@ def test_backend_ragged_prefill_identity_and_selection():
 
     # leader/follower: layer 1 (shared, no indexer) reuses layer 0's selection; with
     # identical latent content its output must match layer 0's
-    o1 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 1, batch, indexer_qkw=None)
+    o1 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 1, batch, indexer_inputs=None)
     assert (o0.float() - o1.float()).abs().max().item() < 3e-2
 
     # identity wiring (dense ablation): same batch through an MLAKVCache backend
@@ -338,7 +342,7 @@ def test_backend_ragged_prefill_identity_and_selection():
     batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
                               active_table_idx=None, attn_metadata=None)
     backend_d.prepare_metadata(batch_d)
-    od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_qkw=None)
+    od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_inputs=None)
     slab_d = ctx_d.kv_cache.latent_rows(0)
     for j in range(8):
         live = ctx_d.page_table[0, : 33 + j]

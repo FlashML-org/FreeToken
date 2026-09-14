@@ -1,4 +1,4 @@
-"""Multi-CTA (split-vocab) Triton sampling ops (provenance: sampling<-vllm Qrita).
+"""Multi-CTA (split-vocab) Triton sampling ops.
 
 Optional pure-triton drop-in for freetoken.kernel.sampling / flashinfer.sampling
 (softmax / top-k / top-p / combined + draw), self-contained.
@@ -6,21 +6,26 @@ Optional pure-triton drop-in for freetoken.kernel.sampling / flashinfer.sampling
 Design:
   * Every row is split across many CTAs (``_plan`` -> G column-chunks) so bs=1 uses
     the whole GPU, unlike a single-block-per-row kernel that is single-SM-bound.
-  * softmax is a multi-CTA online softmax; top-p uses a small fixed number of
-    histogram-bracket refinement passes instead of a ~48-iter bisection; the draw
-    is a multi-CTA inverse-CDF.
-  * The top-k path is adapted from vLLM's Qrita kernel
-    (v1/sample/ops/topk_topp_triton.py::_topk_topp_kernel): gather the small set of
-    "outlier" candidates (probs >= rmax*FRAC) into a compact per-row buffer in ONE
-    full-vocab pass, then run the k-th-value search on that tiny buffer (3 full-vocab
-    passes total vs ~6 for a pure histogram top-k). The outlier-pivot heuristic is
-    swapped for the probs domain (truncate at rmax*FRAC; softmax probs are not
-    Gaussian). Rows overflowing CAP silently drop the smallest gathered candidates;
-    the refine still finds the exact k-th since every value >= threshold is kept, and
-    an in-kernel guard keeps everything if fewer than k finite candidates are gathered.
+  * softmax is a multi-CTA online softmax; the draw is a multi-CTA inverse-CDF.
+  * top-k and top-p each use one Triton kernel: the row's CTAs bin their chunk over
+    the fp32 bit pattern (order-preserving for x >= 0), meet at a per-row spin barrier, and all
+    redo the refine so they share the bracket. Four rounds of 256 bins bring the 2**31 range
+    down to one bit pattern, so the threshold is exactly the k-th largest prob (top-k, counts)
+    or the value where the descending cumulative mass reaches p (top-p, exact per-bin mass).
+    Every boundary tie is kept, matching flashinfer, then the same kernel renormalizes or
+    draws. No candidate buffer, data-dependent shape, or host sync is needed. Results are
+    exact up to fp32 atomic summation order.
+  * If a cooperative launch is unavailable, the same exact kernel is retried with one CTA
+    per row; only parallelism changes.
+  * deterministic, generator and check_nan exist for flashinfer signature compatibility and are
+    ignored; seed and offset are honored. Given a seed, top-k draws reproduce; top-p may pick a
+    different token on rows whose cumulative mass sits within fp32 rounding of p.
 """
 
 from __future__ import annotations
+
+import logging
+from functools import cache
 
 import torch
 import triton
@@ -28,13 +33,19 @@ import triton.language as tl
 
 from freetoken.kernel.triton.autotune_cache import autotune_cache_kwargs
 
-_NUM_SM = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+logger = logging.getLogger(__name__)
+
 _MIN_CHUNK = 4096  # do not split a row finer than this
 
 
-def _plan(B, V):
+@cache
+def _num_sm(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _plan(B, V, device):
     """Return (G, CHUNK): split each row into G column-chunks of size CHUNK."""
-    g_by_sm = max(1, _NUM_SM // B)
+    g_by_sm = max(1, _num_sm(device) // B)
     g_by_chunk = max(1, triton.cdiv(V, _MIN_CHUNK))
     G = min(g_by_sm, g_by_chunk)
     CHUNK = triton.cdiv(V, G)
@@ -123,8 +134,10 @@ def _sm_finalize(
 def softmax(logits, temperature=None, enable_pdl=None):
     logits = logits.float()
     B, V = logits.shape
+    if B == 0:
+        return logits.clone()
     probs = torch.empty_like(logits)
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, logits.device)
     if temperature is None:
         temperature = 1.0
     if isinstance(temperature, torch.Tensor):
@@ -141,13 +154,6 @@ def softmax(logits, temperature=None, enable_pdl=None):
     return probs
 
 
-# ===========================================================================
-# multi-CTA top-p via histogram-bracket refinement.  Every full-vocab pass is
-# split across all SMs; the sequential refine step is a tiny grid=(B,) kernel.
-# ===========================================================================
-_PBINS = 64        # top-p uses count-hist + bin-center mass (64**4 ~ 1.7e7)
-_PR = 4
-
 _SR_CFGS = [
     triton.Config({"BLOCK_SIZE": bs}, num_warps=w, num_stages=s)
     for bs in (1024, 2048, 4096)
@@ -156,184 +162,9 @@ _SR_CFGS = [
 ]
 
 
-@triton.jit
-def _rmax_pass(probs_ptr, rmax_ptr, V, G, CHUNK, row_stride, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    row = pid // G
-    base = row * row_stride
-    start = (pid % G) * CHUNK
-    end = tl.minimum(start + CHUNK, V)
-    m = 0.0
-    for s0 in tl.range(start, end, BLOCK_SIZE):
-        offs = s0 + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        m = tl.maximum(m, tl.max(x, 0))
-    tl.atomic_max(rmax_ptr + row, m)
-
-
-@triton.autotune(configs=_SR_CFGS, key=["CHUNK"], reset_to_zero=["hist_ptr"], **autotune_cache_kwargs)
-@triton.jit
-def _count_hist_pass(
-    probs_ptr, lo_ptr, hi_ptr, hist_ptr, V, G, CHUNK, row_stride,
-    BINS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    row = pid // G
-    lo = tl.load(lo_ptr + row)
-    hi = tl.load(hi_ptr + row)
-    invw = BINS / tl.maximum(hi - lo, 1e-30)
-    base = row * row_stride
-    start = (pid % G) * CHUNK
-    end = tl.minimum(start + CHUNK, V)
-    acc = tl.zeros([BINS], tl.int32)
-    for s0 in tl.range(start, end, BLOCK_SIZE):
-        offs = s0 + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        x = tl.load(probs_ptr + base + offs, mask=mask, other=-1.0).to(tl.float32)
-        inrange = mask & (x >= lo) & (x < hi)
-        b = ((x - lo) * invw).to(tl.int32)
-        # tl.histogram does NOT cleanly drop out-of-range indices; route every
-        # out-of-bracket element to bin 0 and then subtract that count back out so
-        # the histogram holds ONLY in-[lo,hi) counts (out-of-range is tracked via
-        # `above`/excluded, exactly like the one-hot path).
-        b = tl.where(inrange, tl.maximum(0, tl.minimum(b, BINS - 1)), 0)
-        hcnt = tl.histogram(b, BINS)
-        noor = tl.sum((mask & (~inrange)).to(tl.int32))
-        hcnt = hcnt - tl.where(tl.arange(0, BINS) == 0, noor, 0)
-        acc += hcnt
-    tl.atomic_add(hist_ptr + row * BINS + tl.arange(0, BINS), acc.to(tl.float32))
-
-
-@triton.jit
-def _refine_pass(lo_ptr, hi_ptr, above_ptr, hist_ptr, target_ptr, BINS: tl.constexpr):
-    row = tl.program_id(0)
-    lo = tl.load(lo_ptr + row)
-    hi = tl.load(hi_ptr + row)
-    above = tl.load(above_ptr + row)
-    target = tl.load(target_ptr + row)
-    w = (hi - lo) / BINS
-    jj = tl.arange(0, BINS)
-    h = tl.load(hist_ptr + row * BINS + jj)
-    prefix = tl.cumsum(h, 0)
-    total = tl.sum(h, 0)
-    c_ge_bottom = above + total - prefix + h
-    ok = c_ge_bottom >= target
-    j = tl.max(tl.where(ok, jj, -1))
-    prefix_j = tl.sum(tl.where(jj <= j, h, 0.0))
-    upd = j >= 0
-    tl.store(lo_ptr + row, tl.where(upd, lo + j * w, lo))
-    tl.store(hi_ptr + row, tl.where(upd, lo + (j + 1) * w, hi))
-    tl.store(above_ptr + row, tl.where(upd, above + total - prefix_j, above))
-    # zero the row so the next iteration's atomic_add starts clean (reset_to_zero
-    # only fires during autotuning, not on production calls)
-    tl.store(hist_ptr + row * BINS + jj, 0.0)
-
-
-@triton.jit
-def _refine_mass_pass(lo_ptr, hi_ptr, above_ptr, hist_ptr, target_ptr, BINS: tl.constexpr):
-    # top-p refine: hist holds COUNTS; approximate per-bin MASS as count*bin_center
-    # (exact in the limit as the bracket narrows).  target is the p mass threshold.
-    row = tl.program_id(0)
-    lo = tl.load(lo_ptr + row)
-    hi = tl.load(hi_ptr + row)
-    above = tl.load(above_ptr + row)
-    target = tl.load(target_ptr + row)
-    w = (hi - lo) / BINS
-    jj = tl.arange(0, BINS)
-    h = tl.load(hist_ptr + row * BINS + jj)
-    center = lo + (jj.to(tl.float32) + 0.5) * w
-    massbin = h * center
-    prefix = tl.cumsum(massbin, 0)
-    total = tl.sum(massbin, 0)
-    c_ge_bottom = above + total - prefix + massbin
-    ok = c_ge_bottom >= target
-    j = tl.max(tl.where(ok, jj, -1))
-    prefix_j = tl.sum(tl.where(jj <= j, massbin, 0.0))
-    upd = j >= 0
-    tl.store(lo_ptr + row, tl.where(upd, lo + j * w, lo))
-    tl.store(hi_ptr + row, tl.where(upd, lo + (j + 1) * w, hi))
-    tl.store(above_ptr + row, tl.where(upd, above + total - prefix_j, above))
-    tl.store(hist_ptr + row * BINS + jj, 0.0)
-
-
-@triton.autotune(configs=_SR_CFGS, key=["CHUNK"], reset_to_zero=["ksum_ptr"], **autotune_cache_kwargs)
-@triton.jit
-def _ksum_pass(probs_ptr, thr_ptr, ksum_ptr, V, G, CHUNK, row_stride, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    row = pid // G
-    thr = tl.load(thr_ptr + row)
-    base = row * row_stride
-    start = (pid % G) * CHUNK
-    end = tl.minimum(start + CHUNK, V)
-    s = 0.0
-    for s0 in tl.range(start, end, BLOCK_SIZE):
-        offs = s0 + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        s += tl.sum(tl.where(x >= thr, x, 0.0), 0)
-    tl.atomic_add(ksum_ptr + row, s)
-
-
-@triton.autotune(configs=_SR_CFGS, key=["CHUNK"], **autotune_cache_kwargs)
-@triton.jit
-def _write_pass(probs_ptr, out_ptr, thr_ptr, ksum_ptr, V, G, CHUNK, row_stride, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    row = pid // G
-    thr = tl.load(thr_ptr + row)
-    inv_s = 1.0 / tl.load(ksum_ptr + row)
-    base = row * row_stride
-    start = (pid % G) * CHUNK
-    end = tl.minimum(start + CHUNK, V)
-    for s0 in tl.range(start, end, BLOCK_SIZE):
-        offs = s0 + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(out_ptr + base + offs, tl.where(x >= thr, x * inv_s, 0.0), mask=mask)
-
-
-def _search(probs, target, mass, R, BINS):
-    """Return per-row threshold: keep x >= thr, with count/mass(>=thr) ~ target."""
-    B, V = probs.shape
-    dev = probs.device
-    G, CHUNK = _plan(B, V)
-    grid = (B * G,)
-    rmax = torch.zeros(B, device=dev, dtype=torch.float32)
-    _rmax_pass[grid](probs, rmax, V, G, CHUNK, probs.stride(0), BLOCK_SIZE=2048, num_warps=8)
-    lo = torch.zeros(B, device=dev, dtype=torch.float32)
-    hi = (rmax * 1.0000001).contiguous()
-    above = torch.zeros(B, device=dev, dtype=torch.float32)
-    hist = torch.zeros(B * BINS, device=dev, dtype=torch.float32)
-    for _ in range(R):
-        _count_hist_pass[grid](probs, lo, hi, hist, V, G, CHUNK, probs.stride(0), BINS)
-        if mass:
-            _refine_mass_pass[(B,)](lo, hi, above, hist, target, BINS)
-        else:
-            _refine_pass[(B,)](lo, hi, above, hist, target, BINS)
-    return lo
-
-
-def _renorm(probs, thr):
-    B, V = probs.shape
-    dev = probs.device
-    G, CHUNK = _plan(B, V)
-    grid = (B * G,)
-    out = torch.empty_like(probs)
-    ksum = torch.zeros(B, device=dev, dtype=torch.float32)
-    _ksum_pass[grid](probs, thr, ksum, V, G, CHUNK, probs.stride(0))
-    _write_pass[grid](probs, out, thr, ksum, V, G, CHUNK, probs.stride(0))
-    return out
-
-
 def top_p_renorm_probs(probs, top_p):
     probs = probs.float()
-    B, V = probs.shape
-    if isinstance(top_p, torch.Tensor):
-        target = top_p.float().to(probs.device).contiguous()
-    else:
-        target = torch.full((B,), float(top_p), device=probs.device, dtype=torch.float32)
-    thr = _search(probs, target, True, _PR, _PBINS)
-    return _renorm(probs, thr)
+    return _topp(probs, _topp_target(top_p, probs.size(0), probs.device), None, False)
 
 
 # ---------------------------------------------------------------------------
@@ -358,38 +189,47 @@ def _draw_part(probs_ptr, thr_ptr, psum_ptr, V, G, CHUNK, row_stride, BLOCK_SIZE
 
 
 @triton.jit
-def _draw_scan(psum_ptr, choff_ptr, u_ptr, target_ptr, G, G_POW2: tl.constexpr):
+def _draw_scan(psum_ptr, choff_ptr, u_ptr, target_ptr, last_ptr, G, G_POW2: tl.constexpr):
     row = tl.program_id(0)
     goff = tl.arange(0, G_POW2)
     gmask = goff < G
     ps = tl.load(psum_ptr + row * G + goff, mask=gmask, other=0.0)
     tl.store(choff_ptr + row * G + goff, tl.cumsum(ps, 0) - ps, mask=gmask)
     tl.store(target_ptr + row, tl.load(u_ptr + row) * tl.sum(ps, 0))
+    tl.store(last_ptr + row, tl.max(tl.where(gmask & (ps > 0), goff, -1), 0))
 
 
 @triton.autotune(configs=_SR_CFGS, key=["CHUNK"], **autotune_cache_kwargs)
 @triton.jit
-def _draw_find(probs_ptr, thr_ptr, choff_ptr, target_ptr, out_ptr, V, G, CHUNK, row_stride,
+def _draw_find(probs_ptr, thr_ptr, choff_ptr, target_ptr, psum_ptr, last_ptr, out_ptr, V, G, CHUNK, row_stride,
                BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     row = pid // G
     thr = tl.load(thr_ptr + row)
     target = tl.load(target_ptr + row)
     acc = tl.load(choff_ptr + pid)
+    incl = acc + tl.load(psum_ptr + pid)
     base = row * row_stride
     start = (pid % G) * CHUNK
     end = tl.minimum(start + CHUNK, V)
+    last_kept = start * 0 - 1
     for s0 in tl.range(start, end, BLOCK_SIZE):
         offs = s0 + tl.arange(0, BLOCK_SIZE)
         mask = offs < end
         x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        wv = tl.where((x >= thr) & mask, x, 0.0)
+        kept = (x >= thr) & mask
+        wv = tl.where(kept, x, 0.0)
         cval = acc + tl.cumsum(wv, 0)
         idx = tl.where(cval > target, offs, V)
         blk_min = tl.min(idx, 0)
         if (blk_min < V) and (acc <= target):
             tl.store(out_ptr + row, blk_min)
         acc += tl.sum(wv, 0)
+        last_kept = tl.maximum(last_kept, tl.max(tl.where(kept, offs, -1), 0))
+    # see _keep_tail: the CTA owning an fp rounding gap writes its last kept token
+    is_last_mass = tl.load(last_ptr + row) == pid % G
+    if (acc <= target) and (last_kept >= 0) and ((incl > target) or is_last_mass):
+        tl.store(out_ptr + row, last_kept)
 
 
 _UGEN = {}
@@ -412,16 +252,19 @@ def _gen_u(B, device, seed, offset):
 def _draw(probs, thr, seed, offset):
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    if B == 0:
+        return torch.empty(0, device=dev, dtype=torch.int32)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     psum = torch.empty(B * G, device=dev, dtype=torch.float32)
     choff = torch.empty(B * G, device=dev, dtype=torch.float32)
     target = torch.empty(B, device=dev, dtype=torch.float32)
-    out = torch.empty(B, device=dev, dtype=torch.int32)
+    last = torch.empty(B, device=dev, dtype=torch.int32)
+    out = torch.zeros(B, device=dev, dtype=torch.int32)
     u = _gen_u(B, dev, seed, offset)
     _draw_part[grid](probs, thr, psum, V, G, CHUNK, probs.stride(0))
-    _draw_scan[(B,)](psum, choff, u, target, G, _next_pow2(G))
-    _draw_find[grid](probs, thr, choff, target, out, V, G, CHUNK, probs.stride(0))
+    _draw_scan[(B,)](psum, choff, u, target, last, G, _next_pow2(G))
+    _draw_find[grid](probs, thr, choff, target, psum, last, out, V, G, CHUNK, probs.stride(0))
     return out
 
 
@@ -442,155 +285,348 @@ def top_p_sampling_from_probs(probs, top_p, indices=None, deterministic=True, ge
                               check_nan=False, seed=None, offset=None, return_valid=False):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    if isinstance(top_p, torch.Tensor):
-        target = top_p.float().to(src.device).contiguous()
-    else:
-        target = torch.full((src.size(0),), float(top_p), device=src.device, dtype=torch.float32)
-    thr = _search(src, target, True, _PR, _PBINS)
-    out = _draw(src, thr, seed, offset)
+    out = _topp(src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
 
 # ===========================================================================
-# top-k via Qrita outlier-gather + tiny-buffer refine (adapted from vLLM)
-# Passes: rmax (full) + gather (full) + refine (tiny, buffer-only) + write (full)
-# = 3 full-vocab passes.  Keeps the multi-CTA vocab split so bs=1 uses the whole GPU.
+# top-k: one cooperative kernel per call. Every CTA of a row histograms its column chunk
+# over the fp32 bit pattern, the row's CTAs meet at a spin barrier, then each one redoes
+# the tiny refine step so all of them hold the same bracket. Four rounds (exponent, then
+# 8+8+7 mantissa bits) end on a single bit pattern, so thr is exactly the k-th largest
+# prob. The same kernel then either renormalizes (DRAW=0) or draws a token (DRAW=1).
 # ===========================================================================
-_FRAC = 0.05         # outlier gather pivot: keep probs >= rmax*FRAC
-_CAP = 8192          # per-row candidate buffer capacity
-_KBINS = 256         # bins per refine bracket iteration
-_KR = 3              # refine iterations (256**3 ~ 1.7e7 resolution over [0, rmax])
-
-
-@triton.autotune(configs=_SR_CFGS, key=["CHUNK"], reset_to_zero=["cnt_ptr"], **autotune_cache_kwargs)
-@triton.jit
-def _gather_pass(
-    probs_ptr, rmax_ptr, buf_ptr, cnt_ptr, V, G, CHUNK, row_stride,
-    FRAC, CAP: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    row = pid // G
-    thr0 = tl.load(rmax_ptr + row) * FRAC
-    base = row * row_stride
-    bufbase = row * CAP
-    start = (pid % G) * CHUNK
-    end = tl.minimum(start + CHUNK, V)
-    for s0 in tl.range(start, end, BLOCK_SIZE):
-        offs = s0 + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        m = mask & (x >= thr0)
-        mi = m.to(tl.int32)
-        n = tl.sum(mi)
-        posbase = tl.atomic_add(cnt_ptr + row, n)
-        cpos = posbase + tl.cumsum(mi, 0) - 1
-        wmask = m & (cpos < CAP)
-        tl.store(buf_ptr + bufbase + cpos, x, mask=wmask)
-
-
-@triton.jit
-def _refine_topk(
-    buf_ptr, cnt_ptr, rmax_ptr, target_ptr, thr_ptr, ksum_ptr,
-    CAP: tl.constexpr, R: tl.constexpr, BINS: tl.constexpr, BLK: tl.constexpr,
-):
-    # single-CTA-per-row refine on the tiny buffer -> (threshold, kept-sum):
-    # histogram-bracket the k-th largest, then sum the kept mass (all kept values
-    # are in the buffer since threshold >= gather pivot).
-    row = tl.program_id(0)
-    cnt = tl.load(cnt_ptr + row)
-    cnt = tl.minimum(cnt, CAP)
-    target = tl.load(target_ptr + row)
-    base = row * CAP
-    jj = tl.arange(0, BINS)
-    lo = 0.0
-    hi = tl.load(rmax_ptr + row) * 1.0000001
-    above = 0.0
-    for _it in tl.static_range(R):
-        denom = tl.maximum(hi - lo, 1e-30)
-        w = denom / BINS
-        invw = BINS / denom
-        hc = tl.zeros([BINS], tl.int32)
-        for s0 in tl.range(0, cnt, BLK):
-            offs = s0 + tl.arange(0, BLK)
-            mask = offs < cnt
-            x = tl.load(buf_ptr + base + offs, mask=mask, other=-1.0)
-            inrange = mask & (x >= lo) & (x < hi)
-            b = ((x - lo) * invw).to(tl.int32)
-            b = tl.where(inrange, tl.maximum(0, tl.minimum(b, BINS - 1)), 0)
-            hcnt = tl.histogram(b, BINS)
-            noor = tl.sum((mask & (~inrange)).to(tl.int32))
-            hc += hcnt - tl.where(jj == 0, noor, 0)
-        h = hc.to(tl.float32)
-        prefix = tl.cumsum(h, 0)
-        total = tl.sum(h, 0)
-        c_ge = above + total - prefix + h
-        ok = c_ge >= target
-        j = tl.max(tl.where(ok, jj, -1))
-        prefix_j = tl.sum(tl.where(jj <= j, h, 0.0))
-        upd = j >= 0
-        new_lo = lo + j * w
-        new_hi = lo + (j + 1) * w
-        new_above = above + total - prefix_j
-        lo = tl.where(upd, new_lo, lo)
-        hi = tl.where(upd, new_hi, hi)
-        above = tl.where(upd, new_above, above)
-    thr = lo
-    # guard: if fewer finite candidates than k were gathered, keep everything.
-    if cnt < target:
-        thr = 0.0
-    ks = 0.0
-    for s0 in tl.range(0, cnt, BLK):
-        offs = s0 + tl.arange(0, BLK)
-        mask = offs < cnt
-        x = tl.load(buf_ptr + base + offs, mask=mask, other=0.0)
-        ks += tl.sum(tl.where(x >= thr, x, 0.0))
-    tl.store(thr_ptr + row, thr)
-    tl.store(ksum_ptr + row, ks)
+_KBINS = 256
+_INF_BITS = tl.constexpr(0x7F800000)
+_FUSED_BLOCK = 2048
 
 
 def _topk_target(top_k, B, dev):
     if isinstance(top_k, torch.Tensor):
-        return top_k.float().to(dev).contiguous()
-    return torch.full((B,), float(int(top_k)), device=dev, dtype=torch.float32)
+        return top_k.to(device=dev, dtype=torch.int32).contiguous()
+    return torch.full((B,), max(int(top_k), 1), device=dev, dtype=torch.int32)
 
 
-def _topk_thr_ksum(probs, top_k):
-    """Return (threshold[B], kept_sum[B]) for a top-k keep: x >= threshold."""
+@triton.jit
+def _row_barrier(bar_ptr, need):
+    # the row's CTAs must be co-resident (cooperative launch), or a lone CTA (G == 1) passes at once.
+    # every warp's preceding atomics must be issued before thread 0 announces arrival
+    tl.debug_barrier()
+    tl.atomic_add(bar_ptr, 1)
+    n = tl.atomic_add(bar_ptr, 0)
+    while n < need:
+        n = tl.atomic_add(bar_ptr, 0)
+
+
+@triton.jit
+def _bits_round(
+    probs_ptr, base, start, end, hist_ptr, bar_ptr, target, lo, above, need,
+    S: tl.constexpr, WIDTH: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    jj = tl.arange(0, BINS)
+    acc = tl.zeros([BINS], tl.int32)
+    for s0 in tl.range(start, end, BLOCK):
+        offs = s0 + tl.arange(0, BLOCK)
+        mask = offs < end
+        y = tl.load(probs_ptr + base + offs, mask=mask, other=-1.0).to(tl.float32).to(tl.int32, bitcast=True)
+        d = y - lo
+        if WIDTH == 0:
+            inrange = mask & (y >= lo) & (y <= _INF_BITS)
+        else:
+            inrange = mask & (y >= lo) & (d < WIDTH) & (y <= _INF_BITS)
+        # every out-of-bracket lane (padding included) lands in bin 0 and is subtracted back out
+        b = tl.where(inrange, d >> S, 0)
+        h = tl.histogram(b, BINS)
+        acc += h - tl.where(jj == 0, tl.sum((~inrange).to(tl.int32)), 0)
+    tl.atomic_add(hist_ptr + jj, acc)
+    _row_barrier(bar_ptr, need)
+    h = tl.load(hist_ptr + jj, cache_modifier=".cg")
+    prefix = tl.cumsum(h, 0)
+    total = tl.sum(h, 0)
+    ok = above + total - prefix + h >= target
+    j = tl.max(tl.where(ok, jj, -1))
+    prefix_j = tl.sum(tl.where(jj <= j, h, 0))
+    upd = j >= 0
+    lo = tl.where(upd, lo + (j << S), lo)
+    above = tl.where(upd, above + total - prefix_j, above)
+    return lo, above
+
+
+@triton.jit
+def _topk_fused(
+    probs_ptr, target_ptr, hist_ptr, bar_ptr, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr,
+    V, G, CHUNK, row_stride,
+    DRAW: tl.constexpr, G_POW2: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid // G
+    cta = pid % G
+    base = row * row_stride
+    start = cta * CHUNK
+    end = tl.minimum(start + CHUNK, V)
+    target = tl.maximum(tl.load(target_ptr + row), 1)
+    hrow = hist_ptr + row * 4 * BINS
+    brow = bar_ptr + row
+    lo = 0
+    above = lo
+    lo, above = _bits_round(probs_ptr, base, start, end, hrow, brow, target, lo, above, G, 23, 0, BINS, BLOCK)
+    lo, above = _bits_round(probs_ptr, base, start, end, hrow + BINS, brow, target, lo, above, 2 * G, 15, 1 << 23, BINS, BLOCK)
+    lo, above = _bits_round(probs_ptr, base, start, end, hrow + 2 * BINS, brow, target, lo, above, 3 * G, 7, 1 << 15, BINS, BLOCK)
+    lo, above = _bits_round(probs_ptr, base, start, end, hrow + 3 * BINS, brow, target, lo, above, 4 * G, 0, 1 << 7, BINS, BLOCK)
+    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow, 5 * G,
+               ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
+
+
+@triton.jit
+def _keep_tail(
+    probs_ptr, base, start, end, pid, row, cta, thr, bar_ptr, need,
+    ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G,
+    DRAW: tl.constexpr, G_POW2: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # Keep x >= thr over this chunk. This deliberately retains every boundary tie,
+    # matching flashinfer's top-k and top-p filtering semantics.
+    s = 0.0
+    for s0 in tl.range(start, end, BLOCK):
+        offs = s0 + tl.arange(0, BLOCK)
+        mask = offs < end
+        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        s += tl.sum(tl.where(mask & (x >= thr), x, 0.0), 0)
+    if DRAW:
+        tl.store(psum_ptr + pid, s)
+        _row_barrier(bar_ptr, need)
+        goff = tl.arange(0, G_POW2)
+        gmask = goff < G
+        ps = tl.load(psum_ptr + row * G + goff, mask=gmask, other=0.0, cache_modifier=".cg")
+        acc = tl.sum(tl.where(goff < cta, ps, 0.0), 0)
+        incl = tl.sum(tl.where(goff <= cta, ps, 0.0), 0)
+        tgt = tl.load(u_ptr + row) * tl.sum(ps, 0)
+        last_kept = start * 0 - 1
+        for s0 in tl.range(start, end, BLOCK):
+            offs = s0 + tl.arange(0, BLOCK)
+            mask = offs < end
+            x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            kept = mask & (x >= thr)
+            wv = tl.where(kept, x, 0.0)
+            cval = acc + tl.cumsum(wv, 0)
+            idx = tl.where(cval > tgt, offs, V)
+            blk_min = tl.min(idx, 0)
+            if (blk_min < V) and (acc <= tgt):
+                tl.store(tok_ptr + row, blk_min)
+            acc += tl.sum(wv, 0)
+            last_kept = tl.maximum(last_kept, tl.max(tl.where(kept & (x > 0), offs, -1), 0))
+        # fp rounding can leave tgt between this CTA's running sum and the next CTA's prefix, or past the total;
+        # the CTA that owns that gap (or the last one holding mass) writes its last kept token instead
+        is_last_mass = tl.sum(tl.where((goff > cta) & (ps > 0), 1, 0), 0) == 0
+        if (acc <= tgt) and (last_kept >= 0) and ((incl > tgt) or is_last_mass):
+            tl.store(tok_ptr + row, last_kept)
+    else:
+        tl.atomic_add(ksum_ptr + row, s)
+        _row_barrier(bar_ptr, need)
+        inv = 1.0 / tl.atomic_add(ksum_ptr + row, 0.0)
+        for s0 in tl.range(start, end, BLOCK):
+            offs = s0 + tl.arange(0, BLOCK)
+            mask = offs < end
+            x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            tl.store(out_ptr + base + offs, tl.where(x >= thr, x * inv, 0.0), mask=mask)
+
+
+_PMBINS = 256
+
+
+@triton.jit
+def _pmass_round(
+    probs_ptr, base, start, end, priv_ptr, mass_ptr, bar_ptr, target, lo, above, need,
+    S: tl.constexpr, WIDTH: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # top-p round over the bit pattern: per-bin MASS (exact up to fp32 atomic order) via scatter-add into this
+    # CTA's private buffer, then one reduction into the row buffer, so the bin holding the p crossing is known
+    jj = tl.arange(0, BINS)
+    for s0 in tl.range(start, end, BLOCK):
+        offs = s0 + tl.arange(0, BLOCK)
+        mask = offs < end
+        x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        y = x.to(tl.int32, bitcast=True)
+        d = y - lo
+        if WIDTH == 0:
+            inrange = mask & (y >= lo) & (y <= _INF_BITS)
+        else:
+            inrange = mask & (y >= lo) & (d < WIDTH) & (y <= _INF_BITS)
+        tl.atomic_add(priv_ptr + tl.where(inrange, d >> S, 0), x, mask=inrange)
+    # every warp's scatter-adds must land before any thread reads the private bins back
+    tl.debug_barrier()
+    tl.atomic_add(mass_ptr + jj, tl.load(priv_ptr + jj))
+    _row_barrier(bar_ptr, need)
+    m = tl.load(mass_ptr + jj, cache_modifier=".cg")
+    prefix = tl.cumsum(m, 0)
+    total = tl.sum(m, 0)
+    ok = above + total - prefix + m >= target
+    # p above the total mass (fp rounding at p = 1): keep the whole bracket
+    j = tl.maximum(tl.max(tl.where(ok, jj, -1)), 0)
+    prefix_j = tl.sum(tl.where(jj <= j, m, 0.0))
+    return lo + (j << S), above + total - prefix_j
+
+
+@triton.jit
+def _topp_fused(
+    probs_ptr, tp_ptr, tk_ptr, hist_ptr, priv_ptr, mass_ptr, bar_ptr, ksumk_ptr, ksum_ptr, psum_ptr, u_ptr,
+    out_ptr, tok_ptr, V, G, CHUNK, row_stride,
+    TOPK: tl.constexpr, DRAW: tl.constexpr, G_POW2: tl.constexpr, KBINS: tl.constexpr, PBINS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # top-p, optionally after an exact top-k stage: the top-k threshold becomes the lower edge of the top-p
+    # bracket and the p target is scaled by the kept top-k mass, so no renormalized copy is ever written
+    pid = tl.program_id(0)
+    row = pid // G
+    cta = pid % G
+    base = row * row_stride
+    start = cta * CHUNK
+    end = tl.minimum(start + CHUNK, V)
+    brow = bar_ptr + row
+    lo = 0
+    if TOPK:
+        tk = tl.maximum(tl.load(tk_ptr + row), 1)
+        hk = hist_ptr + row * 4 * KBINS
+        above_i = lo
+        lo, above_i = _bits_round(probs_ptr, base, start, end, hk, brow, tk, lo, above_i, G, 23, 0, KBINS, BLOCK)
+        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + KBINS, brow, tk, lo, above_i, 2 * G, 15, 1 << 23, KBINS, BLOCK)
+        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + 2 * KBINS, brow, tk, lo, above_i, 3 * G, 7, 1 << 15, KBINS, BLOCK)
+        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + 3 * KBINS, brow, tk, lo, above_i, 4 * G, 0, 1 << 7, KBINS, BLOCK)
+        thr_k = lo.to(tl.float32, bitcast=True)
+        s = 0.0
+        for s0 in tl.range(start, end, BLOCK):
+            offs = s0 + tl.arange(0, BLOCK)
+            mask = offs < end
+            x = tl.load(probs_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            s += tl.sum(tl.where(mask & (x >= thr_k), x, 0.0), 0)
+        tl.atomic_add(ksumk_ptr + row, s)
+        _row_barrier(brow, 5 * G)
+        target = tl.load(tp_ptr + row) * tl.atomic_add(ksumk_ptr + row, 0.0)
+        done = 5
+    else:
+        target = tl.load(tp_ptr + row)
+        done = 0
+    mp = mass_ptr + row * 4 * PBINS
+    pp = priv_ptr + pid * 4 * PBINS
+    above = 0.0
+    lo, above = _pmass_round(probs_ptr, base, start, end, pp, mp, brow, target, lo, above, (done + 1) * G,
+                            23, 0, PBINS, BLOCK)
+    lo, above = _pmass_round(probs_ptr, base, start, end, pp + PBINS, mp + PBINS, brow, target, lo, above,
+                            (done + 2) * G, 15, 1 << 23, PBINS, BLOCK)
+    lo, above = _pmass_round(probs_ptr, base, start, end, pp + 2 * PBINS, mp + 2 * PBINS, brow, target, lo, above,
+                            (done + 3) * G, 7, 1 << 15, PBINS, BLOCK)
+    lo, above = _pmass_round(probs_ptr, base, start, end, pp + 3 * PBINS, mp + 3 * PBINS, brow, target, lo, above,
+                            (done + 4) * G, 0, 1 << 7, PBINS, BLOCK)
+    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow,
+               (done + 5) * G, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
+
+
+_COOPERATIVE_DISABLED = set()
+_COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
+
+
+def _fused_plan(B, V, device, force_single=False):
+    if force_single:
+        return 1, V
+    # the cooperative launch needs the whole grid co-resident, so cap B*G by an occupancy budget instead of _plan's one CTA per SM
+    g_by_sm = max(1, (_COOP_CTAS_PER_SM * _num_sm(device)) // B)
+    g_by_chunk = max(1, triton.cdiv(V, _MIN_CHUNK))
+    G = min(g_by_sm, g_by_chunk)
+    return G, triton.cdiv(V, G)
+
+
+def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False):
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
-    grid = (B * G,)
-    target = _topk_target(top_k, B, dev)
-    rmax = torch.zeros(B, device=dev, dtype=torch.float32)
-    _rmax_pass[grid](probs, rmax, V, G, CHUNK, probs.stride(0), BLOCK_SIZE=2048, num_warps=8)
-    buf = torch.empty(B * _CAP, device=dev, dtype=torch.float32)
-    cnt = torch.zeros(B, device=dev, dtype=torch.int32)
-    _gather_pass[grid](probs, rmax, buf, cnt, V, G, CHUNK, probs.stride(0), _FRAC, _CAP)
-    thr = torch.empty(B, device=dev, dtype=torch.float32)
-    ksum = torch.empty(B, device=dev, dtype=torch.float32)
-    _refine_topk[(B,)](buf, cnt, rmax, target, thr, ksum, _CAP, _KR, _KBINS, 2048)
-    return thr, ksum
+    G, CHUNK = _fused_plan(B, V, dev, force_single)
+    n_hist = 4 * _KBINS if (kernel is _topk_fused or tk is not None) else 0
+    n_mass = 4 * _PMBINS if kernel is _topp_fused else 0
+    # hist[B, n_hist] | mass[B, n_mass] | priv[B * G, n_mass] | bar/ksum/ksum_k/tok[B]
+    ws = torch.zeros(B * (n_hist + n_mass) + B * G * n_mass + 4 * B, device=dev, dtype=torch.int32)
+    hist = ws[:B * n_hist]
+    mass = ws[B * n_hist:B * (n_hist + n_mass)].view(torch.float32)
+    priv = ws[B * (n_hist + n_mass):B * (n_hist + n_mass) + B * G * n_mass].view(torch.float32)
+    tail = B * (n_hist + n_mass) + B * G * n_mass
+    bar = ws[tail:tail + B]
+    ksum = ws[tail + B:tail + 2 * B].view(torch.float32)
+    ksum_k = ws[tail + 2 * B:tail + 3 * B].view(torch.float32)
+    if draw:
+        psum = torch.empty(B * G, device=dev, dtype=torch.float32)
+        u = _gen_u(B, dev, seed, offset)
+        res = ws[tail + 3 * B:]
+        out, tok = probs, res
+    else:
+        psum, u = ksum, ksum
+        res = torch.empty_like(probs)
+        out, tok = res, bar
+    # a lone CTA per row in a single wave streams faster with more warps; with G > 1 the co-residency budget caps warps
+    wide = G == 1 and B <= _num_sm(dev)
+    common = dict(DRAW=draw, G_POW2=_next_pow2(G), BLOCK=8192 if wide else _FUSED_BLOCK, num_warps=32 if wide else 8,
+                  launch_cooperative_grid=G > 1)
+    if kernel is _topk_fused:
+        _topk_fused[(B * G,)](probs, tk, hist, bar, ksum, psum, u, out, tok, V, G, CHUNK, probs.stride(0),
+                              BINS=_KBINS, **common)
+    else:
+        _topp_fused[(B * G,)](probs, tp, tk if tk is not None else tp, hist, priv, mass, bar, ksum_k, ksum, psum, u, out, tok,
+                              V, G, CHUNK, probs.stride(0), TOPK=tk is not None, KBINS=_KBINS, PBINS=_PMBINS, **common)
+    return res
+
+
+def _cooperative_key(probs, kernel, tk, draw):
+    kind = "topk" if kernel is _topk_fused else "topk_topp" if tk is not None else "topp"
+    return probs.device, kind, draw
+
+
+def _is_cooperative_launch_error(exc):
+    message = str(exc).lower()
+    return "cooperative" in message or "too many resources requested for launch" in message
+
+
+def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
+    key = _cooperative_key(probs, kernel, tk, draw)
+    force_single = key in _COOPERATIVE_DISABLED
+    G, _ = _fused_plan(*probs.shape, probs.device, force_single)
+    try:
+        return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single)
+    except RuntimeError as exc:
+        if force_single or G == 1 or not _is_cooperative_launch_error(exc):
+            raise
+        _COOPERATIVE_DISABLED.add(key)
+        logger.warning("cooperative triton sampling unavailable on %s (%s); retrying with one CTA per row",
+                       probs.device, exc)
+        return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=True)
+
+
+def _topk(probs, target, draw, seed=None, offset=None):
+    if probs.size(0) == 0:
+        return torch.empty(0, device=probs.device, dtype=torch.int32) if draw else probs.clone()
+
+    return _exact_launch(probs, _topk_fused, target, None, draw, seed, offset)
+
+
+def _topp(probs, tp, tk, draw, seed=None, offset=None):
+    if probs.size(0) == 0:
+        return torch.empty(0, device=probs.device, dtype=torch.int32) if draw else probs.clone()
+
+    return _exact_launch(probs, _topp_fused, tk, tp, draw, seed, offset)
+
+
+def _topp_target(top_p, B, dev):
+    if isinstance(top_p, torch.Tensor):
+        return top_p.float().to(dev).contiguous()
+    return torch.full((B,), float(top_p), device=dev, dtype=torch.float32)
 
 
 def top_k_renorm_probs(probs, top_k):
     probs = probs.float()
-    B, V = probs.shape
-    dev = probs.device
-    G, CHUNK = _plan(B, V)
-    grid = (B * G,)
-    thr, ksum = _topk_thr_ksum(probs, top_k)
-    out = torch.empty_like(probs)
-    _write_pass[grid](probs, out, thr, ksum, V, G, CHUNK, probs.stride(0))
-    return out
+    return _topk(probs, _topk_target(top_k, probs.size(0), probs.device), False)
 
 
 def top_k_sampling_from_probs(probs, top_k, indices=None, deterministic=True, generator=None,
                               check_nan=False, seed=None, offset=None, return_valid=False):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    r = top_k_renorm_probs(src, top_k)
-    out = _draw(r, _zeros_thr(src.size(0), src.device), seed, offset)
+    out = _topk(src, _topk_target(top_k, src.size(0), src.device), True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -601,13 +637,8 @@ def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
                                     return_valid=False):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    r = top_k_renorm_probs(src, top_k)
-    if isinstance(top_p, torch.Tensor):
-        target = top_p.float().to(src.device).contiguous()
-    else:
-        target = torch.full((src.size(0),), float(top_p), device=src.device, dtype=torch.float32)
-    thr = _search(r, target, True, _PR, _PBINS)
-    out = _draw(r, thr, seed, offset)
+    B = src.size(0)
+    out = _topp(src, _topp_target(top_p, B, src.device), _topk_target(top_k, B, src.device), True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 

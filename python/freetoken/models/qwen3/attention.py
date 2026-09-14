@@ -22,6 +22,7 @@ class Qwen3Attention(BaseOP):
         *,
         has_attn_bias: bool = False,
         has_qk_norm: bool = False,
+        prefix: str = "",
     ):
         head_dim = config.head_dim
         self.layer_id = layer_id
@@ -37,6 +38,8 @@ class Qwen3Attention(BaseOP):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=has_attn_bias,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         if has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -54,11 +57,19 @@ class Qwen3Attention(BaseOP):
                 if config.rotary_config.scaling
                 else None
             ),
+            mrope_section=(
+                tuple(config.rotary_config.mrope_section)
+                if config.rotary_config.mrope_section is not None
+                else None
+            ),
+            mrope_layout=config.rotary_config.mrope_layout,
         )
         self.o_proj = LinearOProj(
             head_dim * config.num_qo_heads,
             config.hidden_size,
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
 
     @nvtx_annotate("MHA")
@@ -71,7 +82,7 @@ class Qwen3Attention(BaseOP):
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        q, k = self.rotary.forward(ctx.batch.get_attn_positions(), q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self.o_proj.forward(o.view(-1, self.qo_attn_dim))
