@@ -112,6 +112,10 @@ def _backend_requirements_met(name: str) -> bool:
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
         return False
+    # FA3 is Hopper (sm_90a) cubins; FA4 is datacenter Blackwell (sm_100a). Ada / Ampere /
+    # consumer Blackwell have neither, even when sgl_kernel is installed.
+    if any(i.requires_sm90 for i in infos) and not (is_sm90_family() or is_sm100_family()):
+        return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
     return True
@@ -211,6 +215,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
                 "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
+            )
+        if info.requires_sm90 and not (is_sm90_family() or is_sm100_family()):
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} requires a compute capability "
+                "9.x GPU (FA3, sm_90 cubins) or 10.x GPU (FA4). Ada (sm_89) and consumer "
+                "Blackwell (sm_12x) are not in the published sgl_kernel flash_ops set. "
+                "Use --attention-backend fi (or triton) instead."
             )
         if info.requires_sm100 and not is_sm100_family():
             raise RuntimeError(
