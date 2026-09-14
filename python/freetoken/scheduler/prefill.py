@@ -196,6 +196,8 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            mm_embeds=pending_req.mm_embeds,
+            media=pending_req.media,
         )
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
@@ -264,6 +266,8 @@ class PrefillManager:
                 req.uid,
                 req.input_ids,
                 req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                media=req.media,
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,

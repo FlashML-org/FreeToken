@@ -29,6 +29,11 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 _SWA_RETAIN_GAP = 16
 
 
+def _has_unkeyed_media(req: PendingReq | Req) -> bool:
+    # Native media placeholders lack content hashes; MMItem pads already key the image.
+    return getattr(req, "mm_embeds", None) is not None or bool(getattr(req, "media", None))
+
+
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None):
@@ -93,7 +98,7 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1]
+        ids = req.input_ids[:0] if _has_unkeyed_media(req) else req.input_ids[: input_len - 1]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -296,6 +301,14 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
+        if _has_unkeyed_media(req):
+            if finished:
+                self.unlock(old_handle)
+                tail = self._padded_tail(req, old_handle.cached_len)
+                if self.swa_paged:
+                    self._free_swa(tail)
+                self._free(tail)
+            return
         insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
@@ -335,6 +348,13 @@ class CacheManager:
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
+
+        if _has_unkeyed_media(req):
+            if finished:
+                self.unlock(old_handle)
+                self._free(page_indices[old_handle.cached_len :])
+                self._free_req_slots(req)
+            return
 
         if finished:
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
@@ -422,6 +442,14 @@ class CacheManager:
 
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
+
+        if _has_unkeyed_media(req):
+            if finished:
+                self.unlock(old_handle)
+                tail = self._padded_tail(req, old_handle.cached_len)
+                self._free_swa(tail)
+                self._free(tail)
+            return
 
         insert_len = align_down(req.cached_len, self.page_size)
         freed = page_indices[:0]

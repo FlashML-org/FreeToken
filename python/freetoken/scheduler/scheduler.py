@@ -32,7 +32,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .mm import plan_mm_batch
+from .mm import gather_legacy_mm_batch, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -736,7 +736,7 @@ class Scheduler(SchedulerIOMixin):
         config = self.config
         mc = config.model_config
         num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
+        if getattr(mc, "dsv4_args", None) is not None or getattr(mc, "dsv41_args", None) is not None:
             sizes = getattr(eng.kv_cache, "sizes", None)
             if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
                 num_swa_pages = max(0, sizes.n_win_pages - 1)
@@ -853,7 +853,12 @@ class Scheduler(SchedulerIOMixin):
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        parts, legacy_rows = gather_legacy_mm_batch(batch.padded_reqs, self.config.model_config.image_token_id)
+        if parts:
+            batch.mm_embeds = torch.cat([part.to(self.device) for part in parts], dim=0)
+            rows.extend(legacy_rows)
+        if rows:
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=torch.cuda.is_available()).to(self.device, non_blocking=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

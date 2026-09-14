@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from freetoken.message import MMItem
 from freetoken.mm.encoder_cache import EncoderCache
-from freetoken.scheduler.mm import mm_rows_after, plan_mm_batch, plan_mm_chunk
+from freetoken.scheduler.mm import gather_legacy_mm_batch, mm_rows_after, plan_mm_batch, plan_mm_chunk
 
 CPU = torch.device("cpu")
 
@@ -90,3 +93,48 @@ def test_batch_rows_follow_the_reqs_in_batch_order():
     assert [j.hash for j in jobs] == [7, 8]
     assert plan == [(1, 7, 0, 3, 3, 2), (2, 8, 1, 5, 5, 0)]
     assert rows == [2, 3, 4, 6, 7, 8, 9]  # req 2 starts at batch row 6; its image rows 1..5 land on its first four tokens
+
+
+def test_legacy_soft_tokens_slice_at_chunk_boundaries():
+    embeds = torch.arange(24).reshape(3, 8)
+    prefix_req = SimpleNamespace(extend_len=3)
+    req = SimpleNamespace(input_ids=torch.tensor([9, 1, 9, 9, 2]), mm_embeds=embeds)
+    gathered = []
+    for lo, hi, expected_rows in ((0, 2, [3]), (2, 4, [3, 4]), (4, 5, [])):
+        req.cached_len, req.device_len, req.extend_len = lo, hi, hi - lo
+        parts, rows = gather_legacy_mm_batch([prefix_req, req], image_token_id=9)
+        assert rows == expected_rows
+        gathered.extend(parts)
+    assert torch.equal(torch.cat(gathered), embeds)
+
+
+@pytest.mark.parametrize("image_token_id,embeds,message", [
+    (None, torch.zeros(1, 8), "require an image_token_id"),
+    (9, torch.zeros(8), "must have shape"),
+    (9, torch.zeros(0, 8), "slots exceed"),
+])
+def test_legacy_soft_tokens_reject_incompatible_metadata(image_token_id, embeds, message):
+    req = SimpleNamespace(input_ids=torch.tensor([9]), mm_embeds=embeds,
+                          cached_len=0, device_len=1, extend_len=1)
+    with pytest.raises(ValueError, match=message):
+        gather_legacy_mm_batch([req], image_token_id)
+
+
+def test_scheduler_appends_legacy_rows_after_canonical_rows():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    embeds = torch.arange(8).reshape(1, 8)
+    legacy = SimpleNamespace(uid=1, mm_items=None, input_ids=torch.tensor([9, 5]),
+                             mm_embeds=embeds, cached_len=0, device_len=2, extend_len=2)
+    canonical = SimpleNamespace(uid=2, mm_items=[_item(7, [[1, 3]])],
+                                cached_len=0, device_len=3, extend_len=3)
+    batch = SimpleNamespace(padded_reqs=[legacy, canonical], mm_embeds=None, mm_rows=None)
+    scheduler = SimpleNamespace(engine=SimpleNamespace(encoder_cache=None), device=CPU,
+                                config=SimpleNamespace(model_config=SimpleNamespace(image_token_id=9)))
+
+    Scheduler._gather_multimodal(scheduler, batch)
+
+    assert batch.mm_rows.tolist() == [3, 4, 0]
+    assert torch.equal(batch.mm_embeds, embeds)
+    assert batch.mm_encoder_jobs == canonical.mm_items
+    assert batch.mm_gather_plan == [(2, 7, 0, 2, 2, 1)]

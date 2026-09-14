@@ -19,6 +19,9 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 
+This branch also includes experimental DeepSeek-V4.1 Flash NVFP4 text and image
+support. See [the V4.1 setup and validation notes](deepseek-v41.md).
+
 Qwen3.6 (both variants, every listed weight format), Qwen3.8-Flash-Next and Qwen3-VL also accept image input by default;
 pass `--text-model-only` to skip the vision tower; see [CLI reference](cli.md#image-input).
 
@@ -45,4 +48,9 @@ pass `--text-model-only` to skip the vision tower; see [CLI reference](cli.md#im
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
-- Multimodal checkpoints are served text-only.
+- `--kv-cache-dtype fp8` (see [cli.md](cli.md#fp8-kv-cache)) covers the plain paged,
+  hybrid-SWA and QSA sparse KV pools — gpt-oss, Qwen3/3.5/3.6, GLM-4.x, Gemma-4,
+  MiniMax-M2.5, Muse-Glimmer, Llama/Qwen2/Mistral, Qwen3.8-Flash-Next (on QSA only the
+  selected K/V rows are read back as codes; block selection keeps 16-bit index keys).
+  MLA/DSA (GLM-5.2), DeepSeek-V4's tiered pool and MiniMax-M3's block-sparse pool stay
+  16-bit and reject it.

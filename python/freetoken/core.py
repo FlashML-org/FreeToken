@@ -39,6 +39,10 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
+    # hidden]) scattered at image-token positions during this request's prefill.
+    mm_embeds: torch.Tensor | None = None
+    media: list[dict] | None = None
     # per-item processor outputs and the tokenizer's precomputed mrope rows and delta
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None  # [3, prompt_len] int32, CPU

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Tuple
 
+import torch
+
 if TYPE_CHECKING:
     from freetoken.message import MMItem
     from freetoken.mm.encoder_cache import EncoderCache
@@ -61,4 +63,28 @@ def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem
     return jobs, plan, rows
 
 
-__all__ = ["mm_rows_after", "plan_mm_batch", "plan_mm_chunk"]
+def gather_legacy_mm_batch(reqs, image_token_id: int | None) -> tuple[List[torch.Tensor], List[int]]:
+    """Slice request-owned embeddings at this chunk's original image placeholders."""
+    parts: List[torch.Tensor] = []
+    rows: List[int] = []
+    offset = 0
+    for req in reqs:
+        embeds = getattr(req, "mm_embeds", None)
+        if embeds is not None:
+            if image_token_id is None:
+                raise ValueError("precomputed mm_embeds require an image_token_id")
+            if embeds.ndim != 2:
+                raise ValueError("precomputed mm_embeds must have shape [image_tokens, hidden]")
+            start = int((req.input_ids[:req.cached_len] == image_token_id).sum())
+            positions = (req.input_ids[req.cached_len:req.device_len] == image_token_id).nonzero().flatten()
+            end = start + positions.numel()
+            if end > embeds.shape[0]:
+                raise ValueError("image-token slots exceed precomputed mm_embeds rows")
+            if end > start:
+                parts.append(embeds[start:end])
+                rows.extend((positions + offset).tolist())
+        offset += req.extend_len
+    return parts, rows
+
+
+__all__ = ["gather_legacy_mm_batch", "mm_rows_after", "plan_mm_batch", "plan_mm_chunk"]

@@ -182,6 +182,20 @@ def test_vision_turns_on_mrope_and_the_tower():
 def test_text_only_keeps_the_1d_rope():
     config = parse_config(_hf_config())
     assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+
+
+def test_released_yarn_config_preserves_scaling_when_vision_adds_mrope():
+    hf = _hf_config()
+    hf.text_config.max_position_embeddings = 1048576
+    hf.text_config.rope_parameters.update(rope_type="yarn", factor=4.0,
+                                          original_max_position_embeddings=262144)
+    plain = parse_config(hf).rotary_config
+    hf.vision_config = _vision_config()
+    multimodal = parse_config(hf).rotary_config
+    assert plain.scaling == multimodal.scaling
+    assert multimodal.scaling["rope_type"] == "yarn" and multimodal.scaling["factor"] == 4.0
+    assert multimodal.rotary_dim == 64 and multimodal.max_position == 1048576
+    assert multimodal.mrope_section == [11, 11, 10] and multimodal.mrope_layout == "interleaved"
 # the merged-projection prefixes the model asks the QuantConfig about (attention.py / gdn.py)
 DENSE_PREFIXES = (
     "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",

@@ -74,6 +74,10 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
+    # the in-process offline path; remains None for the (serialized) online path.
+    mm_embeds: torch.Tensor | None = None
+    media: list[dict] | None = None
     # per-image processor outputs, in prompt order
     mm_items: List[MMItem] | None = None
     # precomputed [3, len(input_ids)] mrope positions and decode delta; None for text-only requests and 1-D rope models

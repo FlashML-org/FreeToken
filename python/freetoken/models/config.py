@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.", "vision.", "aligner.", "image_")
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -206,11 +206,22 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     sliding_window: int  # the P-token window page
 
 
+@dataclass(frozen=True)
+class DSV41AttentionGroupConfig(BaseAttentionGroupConfig):
+    kind: ClassVar[Literal["dsv41"]] = "dsv41"
+    cache_kind: ClassVar[Literal["dsv41_paged"]] = "dsv41_paged"
+
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int
+
+
 AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
+    | DSV41AttentionGroupConfig
 )
 
 
@@ -318,6 +329,7 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
@@ -440,6 +452,8 @@ class ModelConfig:
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
             return AttnType.DSV4
+        if isinstance(group, DSV41AttentionGroupConfig):
+            return AttnType.DSV41
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -482,7 +496,7 @@ class ModelConfig:
                         attn_type=AttnType.SWA,
                     )
                 )
-            elif isinstance(group, DSV4AttentionGroupConfig):
+            elif isinstance(group, (DSV4AttentionGroupConfig, DSV41AttentionGroupConfig)):
                 # Matrix/taxonomy entry only: DSV4 sizing never reads this spec
                 # (the pool prices itself from dsv4_args), and is_swa/mla stay
                 # False so no generic spec walker treats it as SWA or MLA.
@@ -493,7 +507,7 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV4,
+                        attn_type=(AttnType.DSV41 if isinstance(group, DSV41AttentionGroupConfig) else AttnType.DSV4),
                     )
                 )
         return tuple(specs)

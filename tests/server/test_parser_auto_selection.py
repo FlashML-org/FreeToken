@@ -94,3 +94,7 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_deepseek_v41_uses_space_delimited_dsml():
+    assert _inferred("DeepseekV41ForCausalLM") == ("deepseekv41", "deepseekv32")

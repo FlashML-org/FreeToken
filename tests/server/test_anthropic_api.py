@@ -433,6 +433,7 @@ class FakeState:
         )
         self._uid = 0
         self._count_manager = None
+        self.last_sent = None
 
     def frontend_tokenizer(self):
         return self._count_manager
@@ -442,6 +443,7 @@ class FakeState:
         return self._uid
 
     async def send_one(self, msg):
+        self.last_sent = msg
         return None
 
     async def wait_for_ack(self, uid):
@@ -741,6 +743,22 @@ def test_count_tokens_excluded_from_request_ring():
     request_ring.reset()
 
 
+def test_anthropic_preserves_images_in_messages_and_tool_results():
+    source = {"type": "base64", "media_type": "image/png", "data": "YWJj"}
+    req = AnthropicMessagesRequest.model_validate({"model": "deepseek-v41", "max_tokens": 4,
+        "messages": [
+            {"role": "user", "content": [{"type": "image", "source": source}, {"type": "text", "text": "describe"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call1", "name": "capture", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call1", "content": [
+                {"type": "text", "text": "screenshot"}, {"type": "image", "source": source},
+            ]}]},
+        ]})
+    messages, *_ = A.convert_anthropic_prompt(req, preserve_tool_images=True)
+    assert messages[0]["content"][0]["freetoken_ref"] == {"kind": "b64", "data": source["data"]}
+    assert messages[2]["role"] == "tool"
+    assert messages[2]["content"][1]["freetoken_ref"] == {"kind": "b64", "data": source["data"]}
+
+
 def test_count_tokens_image_only_message_400():
     # Message list is non-empty on the wire but empty after block filtering: the neutral
     # count_prompt_tokens raises ValueError -> 400, not a 500 from an empty chat template.
@@ -928,7 +946,8 @@ def test_tool_result_image_moves_to_the_following_user_turn():
     assert "vision" in r.json()["error"]["message"]
 
 
-def test_tool_result_image_outside_a_user_message_is_rejected():
+@pytest.mark.parametrize("preserve_tool_images", [False, True])
+def test_tool_result_image_outside_a_user_message_is_rejected(preserve_tool_images):
     # Anthropic only allows tool_result in user messages; an image there has no user turn to ride on.
     body = {
         "model": "claude-x",
@@ -948,7 +967,7 @@ def test_tool_result_image_outside_a_user_message_is_rejected():
         ],
     }
     with pytest.raises(ValueError, match="user message"):
-        A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+        A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body), preserve_tool_images=preserve_tool_images)
 
 
 def test_image_only_tool_result_keeps_an_empty_tool_message():
@@ -976,3 +995,59 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "role": "user",
         "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
     }
+
+
+@pytest.mark.parametrize("model_cls", ["DeepseekV41ForCausalLM", "Qwen4ExpForCausalLM"])
+def test_tool_images_use_model_encoding_and_match_token_count(model_cls):
+    body = {
+        "model": "client-alias", "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "compare the screenshots"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "shot", "input": {}},
+                {"type": "tool_use", "id": "call_2", "name": "shot", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "Zmlyc3Q="}},
+                    {"type": "text", "text": "after"},
+                ]},
+                {"type": "tool_result", "tool_use_id": "call_2", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "c2Vjb25k"}},
+                ]},
+                {"type": "text", "text": "compare now"},
+            ]},
+        ],
+    }
+    original = json.dumps(body)
+    fake = FakeState([("done", True, 5, 1)])
+    fake.config.model_spec = SimpleNamespace(model_cls=model_cls)
+    fake.config.served_modalities = frozenset({"image"})
+    fake._count_manager = _FakeTokenizeManager()
+    client = _client(fake)
+    response = client.post("/v1/messages", json=body)
+    assert response.status_code == 200, response.text
+    generated = fake.last_sent
+    if model_cls == "DeepseekV41ForCausalLM":
+        assert generated.text[-3:] == [
+            {"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": "before"}, {"type": "image"}, {"type": "text", "text": "after"},
+            ]},
+            {"role": "tool", "tool_call_id": "call_2", "content": [{"type": "image"}]},
+            {"role": "user", "content": "compare now"},
+        ]
+    else:
+        assert generated.text[-3:] == [
+            {"role": "tool", "tool_call_id": "call_1", "content": "beforeafter"},
+            {"role": "tool", "tool_call_id": "call_2", "content": ""},
+            {"role": "user", "content": [
+                {"type": "image"}, {"type": "image"}, {"type": "text", "text": "compare now"},
+            ]},
+        ]
+    assert generated.images == [b"first", b"second"]
+    response = client.post("/v1/messages/count_tokens", json={k: v for k, v in body.items() if k != "max_tokens"})
+    assert response.status_code == 200, response.text
+    counted = fake._count_manager.msgs[-1]
+    assert counted.text == generated.text and counted.images == generated.images
+    assert json.dumps(body) == original

@@ -31,6 +31,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     cover duck-typed test configs that don't implement it."""
     from freetoken.attention import AttnType
 
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        return DSV41PagedKVCache
+
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
@@ -42,6 +47,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
+    if AttnType.DSV41 in types:
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        return DSV41PagedKVCache
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -76,6 +85,17 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
+def _reject_unsupported_quant(pool: str, kv_quant: str) -> None:
+    """A pool family that has no fp8 store/scale-read path must say so at startup,
+    not silently serve a 16-bit cache the budget priced for an fp8 one."""
+    if kv_quant != "none":
+        raise ValueError(
+            f"--kv-cache-dtype {kv_quant} is not implemented for the {pool} KV pool "
+            "(only the plain paged / hybrid-SWA pools, served by the triton attention "
+            "backend); use --kv-cache-dtype bf16."
+        )
+
+
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -85,10 +105,26 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
+    kv_quant = getattr(config, "kv_quant", "none")
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv41_cost_model import _dsv41_pool_sizes
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        if kv_quant not in ("none", "fp8-fp4"):
+            _reject_unsupported_quant("DeepSeek-V4.1 paged", kv_quant)
+        pool = DSV41PagedKVCache(
+            sizes=_dsv41_pool_sizes(config, num_pages + 1), args=model_config.dsv41_args,
+            device=device, dtype=dtype, P=model_config.dsv41_args.window_size,
+            n_scratch=config.max_running_req + 1,
+            kv_quant=kv_quant,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
+        _reject_unsupported_quant("DSV4 paged", kv_quant)
         pool = DSV4PagedKVCache(
             sizes=_dsv4_pool_sizes(config, num_pages + 1),  # +1 for dummy page
             args=model_config.dsv4_args,
@@ -117,6 +153,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_quant=kv_quant,
     )
 
 
@@ -128,7 +165,22 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_quant: str = "none",
 ) -> BaseKVCachePool:
+    if kv_quant == "fp8-fp4":
+        raise ValueError("--kv-cache-dtype fp8-fp4 requires the DeepSeek-V4.1 paged pool")
+    if kv_quant == "nvfp4":
+        from freetoken.attention import AttnType
+
+        if any(
+            spec.attn_type not in (AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA)
+            or spec.head_dim % 16
+            for spec in model_config.kv_cache_group_specs()
+        ):
+            raise ValueError(
+                "--kv-cache-dtype nvfp4 requires paged FULL, hybrid-SWA, QSA, or MLA/DSA groups "
+                "with head_dim divisible by 16"
+            )
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -140,6 +192,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_quant=kv_quant,
         )
 
     from .mha_pool import MHAKVCache
@@ -167,6 +220,7 @@ def create_kvcache_pool(
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache
 
+        _reject_unsupported_quant("block-sparse (BSA)", kv_quant)
         spec = kv_specs[0]
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
@@ -204,6 +258,7 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            kv_quant=kv_quant,
             mrope=model_config.model_is_mrope,
         )
 
@@ -225,6 +280,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_quant=kv_quant,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -244,6 +300,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_quant=kv_quant,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
@@ -256,6 +313,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_quant=kv_quant,
     )
 
 

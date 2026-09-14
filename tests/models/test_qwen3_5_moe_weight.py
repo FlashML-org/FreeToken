@@ -342,6 +342,25 @@ def test_emitted_keys_are_the_model_state_dict(checkpoint):
     assert not any(".mlp.experts." in k or k.startswith("mtp.") for k in loaded)
 
 
+@pytest.mark.parametrize("layout", ["modelopt_mixed_a16", "modelopt_mixed_noinput"])
+def test_sidecar_only_modelopt_uses_the_same_schemes_for_model_and_reader(tmp_path, layout):
+    moe, quant, raw = _layout(layout)
+    folder = _write(tmp_path, moe, None, raw)
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({
+        "producer": {"name": "modelopt"},
+        "quantization": {key: value for key, value in quant.items() if key != "quant_method"},
+    }))
+    loaded, state = _load(folder, vision=False), _meta_state_dict(folder)
+    assert set(loaded) == set(state)
+    for key, tensor in loaded.items():
+        assert tensor.shape == state[key].shape and tensor.dtype == state[key].dtype, key
+    assert loaded["model.layers.0.mlp.shared_expert.down_proj.weight"].dtype is torch.uint8
+    assert not any(key.startswith("model.layers.0.mlp.shared_expert.") and key.endswith("input_scale")
+                   for key in loaded)
+    fp8_scale = "model.layers.1.self_attn.qkv_proj.input_scale"
+    assert (fp8_scale in loaded) == (layout == "modelopt_mixed_a16")
+
+
 def test_expert_quant_tag_follows_the_config(checkpoint):
     name, folder, _raw = checkpoint
     config = parse_config(cached_load_hf_config(folder))

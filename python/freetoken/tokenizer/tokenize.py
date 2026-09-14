@@ -4,7 +4,7 @@ import importlib.util
 import json
 import os
 import threading
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, List
 
 import torch
@@ -54,6 +54,8 @@ class TokenizeManager:
         self.tokenizer = tokenizer
         self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
+        self._dsv41 = bool(getattr(self._dsv4_encoder, "IS_DSV41", False))
+        self._vision_args = _dsv41_vision_args(_load_dsv41_config(tokenizer)) if self._dsv41 else None
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
@@ -63,6 +65,28 @@ class TokenizeManager:
         results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
+            if self._dsv41 and isinstance(msg.text, list):
+                from freetoken.models.deepseek_v41.image_processor import prepare_vl_inputs
+
+                prompt, payload = _apply_dsv4_chat_encoder(
+                    self._dsv4_encoder, _dsv41_image_sources(msg.text, msg.images), msg.tools,
+                    self._sanitize_effort(msg.chat_template_kwargs or {}), return_media=True,
+                )
+                args = self.mm_processor.args if self.mm_processor is not None else self._vision_args
+                ids, _types, images = prepare_vl_inputs(prompt, payload["images"], self.tokenizer, args)
+                input_ids = torch.tensor(ids, dtype=torch.int32)
+                if self.mm_processor is not None:
+                    mm = self.mm_processor.from_media(input_ids, images or [])
+                    results.append(UserMsg(
+                        uid=msg.uid, input_ids=mm.input_ids, sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items, mrope_positions=mm.mrope_positions, mrope_delta=mm.mrope_delta,
+                    ))
+                else:
+                    msg.media = [vars(item) for item in images] if images else None
+                    results.append(UserMsg(
+                        uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params, media=msg.media,
+                    ))
+                continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
@@ -103,8 +127,9 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
+        messages = _dsv41_image_sources(msg.text, msg.images) if self._dsv41 else msg.text
         return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+            messages, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
 
     def _render(
@@ -115,6 +140,8 @@ class TokenizeManager:
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
+        if not self._dsv41 and self.mm_processor is None and _contains_images(messages):
+            raise ValueError("this model does not support image content")
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
@@ -171,6 +198,10 @@ class TokenizeManager:
         if "reasoning_effort" not in chat_template_kwargs:
             return chat_template_kwargs
         raw = chat_template_kwargs.get("reasoning_effort")
+        if self._dsv41 and type(raw) is int:
+            if not 1 <= raw <= 100:
+                raise ValueError("DeepSeek-V4.1 reasoning_effort must be between 1 and 100")
+            return chat_template_kwargs
         mapped = quantize_effort(raw, self.effort_profile())
         if mapped == raw:
             return chat_template_kwargs
@@ -191,7 +222,89 @@ class TokenizeManager:
         return sanitized
 
 
+def _contains_images(value) -> bool:
+    if isinstance(value, dict):
+        return value.get("type") in ("image", "image_url", "input_image") or any(_contains_images(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_images(v) for v in value)
+    return False
+
+
+def _dsv41_image_sources(messages: list[dict], images: list[bytes] | None) -> list[dict]:
+    """Bind image bytes before the native encoder reorders tool-result messages."""
+    image_index = 0
+
+    def blocks(content):
+        nonlocal image_index
+        if not isinstance(content, list):
+            return content
+        result = []
+        for block in content:
+            if not isinstance(block, dict):
+                result.append(block)
+                continue
+            part = dict(block)
+            if part.get("type") in ("image", "image_url"):
+                if images is not None:
+                    if image_index >= len(images):
+                        raise ValueError("image parts and supplied image bytes do not match")
+                    part = {"type": "image", "data": images[image_index]}
+                    image_index += 1
+                elif isinstance(part.get("freetoken_ref"), dict):
+                    ref = part["freetoken_ref"]
+                    key = "data" if ref.get("kind") == "b64" else "url"
+                    part = {"type": "image", key: ref.get("data")}
+            elif part.get("type") == "tool_result":
+                part["content"] = blocks(part.get("content"))
+            result.append(part)
+        return result
+
+    rendered = []
+    for message in messages:
+        item = dict(message)
+        for key in ("content", "content_blocks"):
+            if key in item:
+                item[key] = blocks(item[key])
+        rendered.append(item)
+    if images is not None and image_index != len(images):
+        raise ValueError("image parts and supplied image bytes do not match")
+    return rendered
+
+
+def _load_dsv41_config(tokenizer) -> dict | None:
+    model_path = str(getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", ""))
+    config_path = os.path.join(model_path, "config.json")
+    data = None
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    elif "deepseek" in model_path.lower() and any(v in model_path.lower() for v in ("v4.1", "v41")):
+        from freetoken.utils import cached_load_hf_config
+
+        data = cached_load_hf_config(model_path).to_dict()
+    if data and (data.get("model_type") == "deepseek_v41" or "DeepseekV41ForCausalLM" in data.get("architectures", [])):
+        return data
+    return None
+
+
+def _dsv41_vision_args(data: dict):
+    vision = data.get("vision_config") or {}
+    return SimpleNamespace(
+        image_token_id=data.get("image_token_id", 129264),
+        vision_enabled=bool(vision.get("num_hidden_layers", 0)),
+        vision_patch_size=vision.get("patch_size", 14),
+        vision_downsample_ratio=vision.get("downsample_ratio", 3),
+        vision_max_wh_ratio=vision.get("max_wh_ratio"),
+        vision_min_pixels=vision.get("min_pixels", 295936),
+        vision_max_n_token=vision.get("max_image_tokens", 1024),
+    )
+
+
 def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:
+    if _load_dsv41_config(tokenizer) is not None:
+        from freetoken.models.deepseek_v41 import encoding
+
+        return encoding
     if getattr(tokenizer, "chat_template", None):
         return None
     model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
@@ -215,7 +328,9 @@ def _apply_dsv4_chat_encoder(
     messages: list[dict],
     tools: list[dict] | None,
     chat_template_kwargs: dict,
-) -> str:
+    *,
+    return_media: bool = False,
+):
     rendered_messages = [dict(message) for message in messages]
     for message in rendered_messages:
         if message.get("tool_calls"):
@@ -225,10 +340,12 @@ def _apply_dsv4_chat_encoder(
 
     # No effort filtering here: the caller sanitized already, and the probe
     # needs raw values to reach the encoder's own validation.
+    extra = {"return_multi_modal_data": True} if return_media else {}
     return encoder.encode_messages(
         rendered_messages,
         thinking_mode=resolve_thinking_mode(chat_template_kwargs, tools),
         reasoning_effort=chat_template_kwargs.get("reasoning_effort"),
+        **extra,
     )
 
 

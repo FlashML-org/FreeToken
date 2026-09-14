@@ -167,6 +167,8 @@ async def handle_chat_completion(
     # Case/whitespace and the "off" disable synonym stay accepted here because
     # effort_toggle_kwargs normalizes and honors them downstream.
     effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None
+    if type(req.reasoning_effort) is int and not 1 <= req.reasoning_effort <= 100:
+        return create_error_response("numeric reasoning_effort must be between 1 and 100", param="reasoning_effort")
     if effort and effort not in _ACCEPTED_EFFORTS:
         return create_error_response(
             f"reasoning_effort must be one of {', '.join(_ACCEPTED_EFFORTS)}; "

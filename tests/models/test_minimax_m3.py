@@ -9,6 +9,9 @@ geometry, the MoE/router knobs, the resolved quant modes and the env switches.
 
 from __future__ import annotations
 
+from importlib import import_module
+from types import SimpleNamespace
+
 import pytest
 import torch
 from freetoken.layers.quantization import MoEConfig
@@ -261,3 +264,62 @@ def test_expert_source_spec_layer_to_bank():
     assert _NVFP4_SOURCE_SPEC.layer_to_bank(3, cfg) == 0
     assert _NVFP4_SOURCE_SPEC.layer_to_bank(59, cfg) == 56
     assert _NVFP4_SOURCE_SPEC.layer_to_bank(0, cfg) is None
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3])
+@pytest.mark.parametrize("family,class_name", [
+    ("minimax_m3", "MiniMaxM3SparseMoeBlock"),
+    ("glm4_moe", "Glm4MoeSparseBlock"),
+    ("glm_moe_dsa", "GlmMoeDsaSparseBlock"),
+    ("glm5_next", "Glm5NextSparseBlock"),
+    ("deepseek_v41", "MoE"),
+    ("qwen3_5_moe", "Qwen3_5MoE"),
+    ("qwen4_exp", "Qwen4ExpMoE"),
+])
+def test_shared_experts_keep_original_input_when_routed_experts_overwrite_it(
+    monkeypatch, family, class_name, num_tokens,
+):
+    """An in-place routed result must not feed the independent shared expert or its gate."""
+    module = import_module(f"freetoken.models.{family}.moe")
+    cls = getattr(module, class_name)
+    original = torch.arange(num_tokens * 4, dtype=torch.float32).view(num_tokens, 4) / 4 - 1
+    hidden = original.clone()
+    weights = torch.ones(num_tokens, 1)
+    ids = torch.zeros(num_tokens, 1, dtype=torch.int32)
+
+    def shared(x):
+        return x.square()
+
+    def routed(hidden_states, *args, **kwargs):
+        hidden_states.mul_(2).add_(3)
+        return hidden_states
+
+    block = SimpleNamespace(
+        _route=lambda x: (weights, ids),
+        shared_experts=SimpleNamespace(forward=shared),
+        experts=SimpleNamespace(routed_forward=routed, forward=routed),
+    )
+    expected = original * 2 + 3 + original.square()
+    if family == "deepseek_v41":
+        block.dim = 4
+        block.gate = lambda x, image_mask: (weights, ids)
+        block.shared_experts = shared
+        hidden = hidden.unsqueeze(0)
+        expected = expected.unsqueeze(0)
+    elif family.startswith("qwen"):
+        gate_weight = torch.tensor([[-0.5, 0.25, 0.75, 1.0]])
+        block.gate = SimpleNamespace(forward=lambda x: x[:, :2].clone())
+        block.shared_expert = SimpleNamespace(forward=shared)
+        block.shared_expert_gate = SimpleNamespace(
+            weight=gate_weight, forward=lambda x: x @ gate_weight.t(),
+        )
+        expected = original * 2 + 3 + original.square() * torch.sigmoid(original @ gate_weight.t())
+        if family == "qwen4_exp":
+            # Exercise the model's branch ordering on CPU; the gate kernels have their own GPU tests.
+            monkeypatch.setattr(module, "shared_gate_sigmoid", lambda x, w: torch.sigmoid(x @ w))
+            monkeypatch.setattr(module, "shared_gate_mul_add", lambda routed, shared, gate: routed + shared * gate[:, None])
+
+    got = cls.forward(block, hidden)
+
+    torch.testing.assert_close(hidden.reshape_as(original), original * 2 + 3)
+    torch.testing.assert_close(got, expected)

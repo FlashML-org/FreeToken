@@ -201,6 +201,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         return glm_dsa_sparse_attn(
             q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
             counts=cnt, d_v=self.kv_lora_rank,
+            pool_scale=self.kvcache.latent_scale(layer_id),
+            kv_quant=self.kvcache.kv_quant,
+            pool_block_scale=self.kvcache.latent_block_scale(layer_id),
         )
 
     def mla_forward(

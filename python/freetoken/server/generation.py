@@ -192,9 +192,7 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize text/tool messages while preserving ordered image content."""
     return [_render_message(m) for m in messages]
 
 
@@ -252,7 +250,15 @@ def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
             out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
             has_image = True
         elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
-            out.append(part)
+            out.append(dict(part))
+            has_image = True
+        elif ptype == "image":
+            source = part.get("source") or {}
+            kind = "b64" if source.get("type") == "base64" else "url"
+            data = source.get("data") if kind == "b64" else (source.get("url") or part.get("url"))
+            if not isinstance(data, str) or not data:
+                raise ValueError("image content part carries no source")
+            out.append({"type": "image", "freetoken_ref": {"kind": kind, "data": data}})
             has_image = True
         else:
             raise ValueError(f"Unsupported content part type: {ptype}")

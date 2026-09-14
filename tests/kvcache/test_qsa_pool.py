@@ -37,7 +37,8 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None,
+          kv_quant="none", mrope=False):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +53,8 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        kv_quant=kv_quant,
+        mrope=mrope,
     )
 
 
@@ -185,23 +188,42 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
 
 
-def test_unit_bytes_matches_the_cost_model():
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_unit_bytes_matches_the_cost_model(kv_quant, mrope):
     spec = _spec()
     config = _config(spec)
-    pool = _pool()
+    config.kv_quant = kv_quant
+    config.model_config.model_is_mrope = mrope
+    pool = _pool(kv_quant=kv_quant, mrope=mrope)
     kv_bytes, swa_bytes = pool.unit_bytes()
     assert swa_bytes == 0
     # the scratch rows and the ring must NOT inflate the per-token slider
-    assert kv_bytes == spec_kv_bytes_per_token(spec, config)
+    assert kv_bytes == spec_kv_bytes_per_token(spec, config) + (12 if mrope else 0)
     assert kv_bytes * 64 == QSAKVCache.kv_cost(config)[0]
+    for num_pages in (4, 9):
+        if num_pages != 4:
+            pool.rebuild(num_pages)
+        per_page, fixed, _, _ = QSAKVCache.kv_cost(config)
+        buffers = [pool._kv_buffer, pool._scale_buffer, pool._block_scale_buffer,
+                   pool._cmp_k_buffer, pool._pending_ring, pool._rope_positions]
+        actual_bytes = sum(t.numel() * t.element_size() for t in buffers if t is not None)
+        assert actual_bytes == per_page * num_pages + fixed
+        assert pool.unit_bytes() == (kv_bytes, 0)
+        assert pool.cmp_k_cache(0).dtype == pool.pending_ring(0).dtype == torch.bfloat16
+        if mrope:
+            assert pool.rope_positions.shape == (num_pages * 64, 3)
+            assert pool.rope_positions.dtype == torch.int32
 
 
-def test_resolve_pool_class_and_factory():
+@pytest.mark.parametrize("kv_quant", ["none", "nvfp4"])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_resolve_pool_class_and_factory(kv_quant, mrope):
     from freetoken.kvcache import create_kvcache_pool, resolve_pool_class
 
     spec = _spec()
     mc = SimpleNamespace(
-        model_is_mrope=False,
+        model_is_mrope=mrope,
         num_layers=8, has_swa_attention=False, has_linear_attention=True,
         num_kv_heads=2, head_dim=64, dsv4_args=None,
     )
@@ -209,11 +231,18 @@ def test_resolve_pool_class_and_factory():
     assert resolve_pool_class(mc) is QSAKVCache
 
     pool = create_kvcache_pool(
-        mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV, num_req_slots=4
+        mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV, num_req_slots=4,
+        kv_quant=kv_quant,
     )
     assert isinstance(pool, QSAKVCache)
     assert pool._kv_buffer.shape[1] == 4  # not the model's 8 layers
     assert pool.cmp_k_cache(0).shape == (4 * 64 // 4 + 4, 32)
+    assert pool.kv_quant == kv_quant
+    assert (pool._rope_positions is not None) == mrope
+    if kv_quant == "nvfp4":
+        assert pool.k_cache(1).dtype == torch.uint8
+        assert pool.k_cache(1).shape[-1] == 32
+        assert pool.k_block_scale(1).shape[-1] == 4
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)

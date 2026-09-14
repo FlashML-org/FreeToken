@@ -502,3 +502,144 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         decode_logits = model.forward()
     assert decode_logits.shape == (len(prompts), config.vocab_size)
     assert torch.isfinite(decode_logits.float()).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("checkpoint", ["radixark", "nvidia"])
+@torch.inference_mode()
+def test_nvfp4_experts_and_kv_preserve_full_model_continuation(checkpoint, monkeypatch):
+    """Real GDN/QSA/PLE and NVFP4 MoE across ragged chunks, ratio-4 groups and page 64."""
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+    from freetoken.layers.quantization import NameMap, QuantBackend, QuantConfig, QuantKind
+    from freetoken.layers.quantization import finalize_quant
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForConditionalGeneration
+    from freetoken.models.qwen4_exp.ple import PLE_CONV_STATE, PLE_NGRAM_STATE
+    from freetoken.models.register import get_model_spec
+    from freetoken.moe.expert_banks import build_expert_banks
+    from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, iter_offload_moe_layers
+    from freetoken.utils.torch_utils import torch_dtype
+
+    from .common import Fixture, NVIDIA_NVFP4, RADIXARK_NVFP4
+
+    hf = toy_hf_config()
+    hf.quantization_config = deepcopy(RADIXARK_NVFP4 if checkpoint == "radixark" else NVIDIA_NVFP4)
+    spec = get_model_spec(hf.architectures[0])
+    quant = QuantConfig.from_hf(hf, name_map=NameMap(
+        roots=spec.checkpoint_roots, segments=spec.checkpoint_segments,
+        packed=spec.packed_modules_mapping), unquantized=spec.unquantized_modules)
+    config = replace(parse_config(hf), quant=quant, moe_strategy="offload", decode_target="gpu")
+    monkeypatch.setattr("freetoken.layers.quantization.quant_backend._QUANT_BACKEND",
+                        QuantBackend.parse("moe.nvfp4=triton"))
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    with torch.device(device), torch_dtype(dtype):
+        model = Qwen4ExpForConditionalGeneration(config)
+    gen = torch.Generator(device=device).manual_seed(63)
+    _fill(model, gen, scale=.03)
+    assert finalize_quant(model) > config.num_layers
+    experts = list(iter_offload_moe_layers(model))
+    assert len(experts) == config.num_layers
+    assert all(layer.quant_method.kind is QuantKind.NVFP4 for layer in experts)
+    assert all(layer.quant_method.kernel.name == "triton" for layer in experts)
+    torch.manual_seed(64)
+    banks = build_expert_banks(experts[0].quant_method, config.num_layers, None,
+                               device=device, dummy=True)
+    cache = OffloadMoeCache(config.num_layers, config.num_experts, 2 * config.num_experts,
+                            device, quant_format=banks.quant_format, layout=banks.layout)
+    cache.set_bank_sources(banks.sources)
+    attach_offload_moe_cache(model, cache)
+    for ple in model.model.ple_layers:
+        multipliers, sizes, offsets = hash_constants(config.qwen4_args)
+        emb = ple.ple_embedding
+        emb.layer_multipliers.copy_(multipliers)
+        emb.ngram_heads_vocab_sizes.copy_(sizes)
+        emb.ngram_heads_offsets.copy_(offsets)
+        table = torch.randn(int(offsets[-1] + sizes[-1]), config.qwen4_args.ngram_head_dim,
+                             generator=gen, device=device, dtype=dtype) * .03
+        emb.attach_table(GpuResidentTable(table, dtype=dtype))
+
+    tokens = [((torch.arange(length) * 3 + offset) % 500).long()
+              for length, offset in ((67, 13), (71, 101))]
+    tokens[0][29], tokens[1][33] = EOS, EOS
+
+    selected = []
+    select = QSASparseAttnBackend._select
+
+    def capture_selection(backend, index, metadata, slot):
+        indices = select(backend, index, metadata, slot)
+        selected[:] = [indices.clone()]
+        return indices
+
+    monkeypatch.setattr(QSASparseAttnBackend, "_select", capture_selection)
+
+    def run(chunks, kv_quant):
+        fixture = Fixture(config, num_pages=8, max_running_req=3, kv_quant=kv_quant)
+        pool = fixture.pool
+        assert isinstance(pool, QSAKVCache) and pool.kv_quant == kv_quant
+        states = LinearStatePool(config.linear_attention_group(), 4, dtype, device,
+                                  slot_states=config.slot_states)
+        fixture.ctx.linear_state_pool = states
+        cache.reset()
+        reqs = [SimpleNamespace(table_idx=i + 1, linear_slot_idx=i + 1, cached_len=0,
+                                device_len=0, extend_len=0, mamba_ping_pong=None) for i in range(2)]
+        for phase, lengths in chunks:
+            for req, length in zip(reqs, lengths):
+                fixture.allocate(req.table_idx, req.device_len, length)
+                req.cached_len, req.device_len = req.device_len, length
+                req.extend_len = length - req.cached_len
+            batch = fixture.batch(reqs, phase)
+            batch.input_ids = torch.cat([ids[req.cached_len:req.device_len]
+                                         for ids, req in zip(tokens, reqs)]).to(device)
+            batch.linear_table_idx = torch.tensor([1, 2], dtype=torch.int32, device=device)
+            batch.fla_metadata = None
+            with fixture.ctx.forward_batch(batch):
+                logits = model.forward()
+            assert logits.shape == (2, config.vocab_size) and torch.isfinite(logits).all()
+            assert not torch.equal(logits[0], logits[1])
+            context = states.slot_state(PLE_NGRAM_STATE)[1:3]
+            expected = torch.stack([ids[length - 2:length] for ids, length in zip(tokens, lengths)]).to(device)
+            torch.testing.assert_close(context.long(), expected, rtol=0, atol=0)
+        locations = torch.cat([fixture.page_table[req.table_idx, :req.device_len] for req in reqs]).long()
+        for kind in ("k", "v"):
+            codes = getattr(pool, f"{kind}_cache")(3)
+            if kv_quant == "none":
+                assert codes.dtype == dtype and codes.shape[-1] == config.head_dim
+                continue
+            scales = getattr(pool, f"{kind}_scale")(3)[locations]
+            blocks = getattr(pool, f"{kind}_block_scale")(3)[locations]
+            assert codes.dtype == torch.uint8 and codes.shape[-1] == config.head_dim // 2
+            assert codes.view(-1, config.num_kv_heads, config.head_dim // 2)[locations].any()
+            assert scales.dtype == torch.float32 and torch.isfinite(scales).all() and (scales > 0).all()
+            assert blocks.dtype == torch.uint8 and blocks.shape[-1] == config.head_dim // 16
+            assert torch.isfinite(blocks.view(torch.float8_e4m3fn).float()).all() and blocks.any()
+        assert pool.cmp_k_cache(0).dtype == pool.pending_ring(0).dtype == dtype
+        grouped_locations = torch.cat([fixture.page_table[req.table_idx, :req.device_len // 4 * 4:4] // 4
+                                       for req in reqs]).long()
+        compressed = pool.cmp_k_cache(0)[grouped_locations].clone()
+        assert compressed.abs().max() > 0 and torch.isfinite(compressed).all()
+        rec = states.recurrent_states[:, 1:3].clone()
+        conv = states.conv_states[:, 1:3].clone()
+        ple_conv = states.slot_state(PLE_CONV_STATE, config.qwen4_args.ple_layer_ids[0])[1:3].clone()
+        assert rec.abs().max() > 0 and ple_conv.abs().max() > 0
+        return logits.clone(), rec, conv, ple_conv, compressed, selected[0]
+
+    full = [("prefill", (67, 71))]
+    chunks = [("prefill", (31, 35)), ("prefill", (63, 67))]
+    chunks += [("decode", (64 + step, 68 + step)) for step in range(4)]
+    bf16 = [run(schedule, "none") for schedule in (full, chunks)]
+    nvfp4 = [run(schedule, "nvfp4") for schedule in (full, chunks)]
+
+    for dense, packed in zip(bf16, nvfp4):
+        # QSA is last, so changing its KV storage cannot change the earlier states or indexer.
+        for actual, expected in zip(packed[1:], dense[1:]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for reference, continued in (bf16, nvfp4):
+        for actual, expected in zip(continued[1:4], reference[1:4]):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=.02, atol=.002)
+    torch.testing.assert_close(bf16[1][0].float(), bf16[0][0].float(), rtol=.02, atol=.002)
+    # GDN's prefill/decode rounding can cross FP4 bins; logits need a separate error budget.
+    torch.testing.assert_close(nvfp4[1][0].float(), nvfp4[0][0].float(), rtol=.02, atol=.006)

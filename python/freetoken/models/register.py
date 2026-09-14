@@ -29,6 +29,7 @@ class ModelSpec:
     packed_modules_mapping: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # checkpoint-name globs the family serves in bf16 although the quantization_config covers them
     unquantized_modules: tuple[str, ...] = ()
+    quant_config: str | None = None
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
@@ -143,6 +144,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
+    ),
+    "DeepseekV41ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        quant_config="checkpoint_quant_config",
+        mm_processor="freetoken.models.deepseek_v41.mm_processor:DeepseekV41MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -299,6 +307,9 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
     """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
+    if spec.quant_config is not None:
+        return _load_attr(spec.module, spec.quant_config)(hf_config)
+
     from freetoken.layers.quantization import NameMap, QuantConfig
 
     if spec.parse_config == "parse_gguf_config":

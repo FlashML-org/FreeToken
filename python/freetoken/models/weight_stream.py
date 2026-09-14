@@ -112,11 +112,13 @@ class BlockWeightStreamer:
             slots, _ = self._layouts[i]
             for s in slots:
                 setattr(s.owner, s.attr, s.view(self.staging[buf]))
-            yield i, op
-            self.release_events[buf].record(compute)
-            self._has_release[buf] = True
-            for s in slots:
-                setattr(s.owner, s.attr, s.view(self.bank[i]))
+            try:
+                yield i, op
+            finally:
+                self.release_events[buf].record(compute)
+                self._has_release[buf] = True
+                for s in slots:
+                    setattr(s.owner, s.attr, s.view(self.bank[i]))
 
 
 __all__ = ["BlockWeightStreamer"]

@@ -1,4 +1,4 @@
-"""DSV4 through the GENERIC CacheManager (CPU, no model) -- the unified serving path.
+"""DSV4/V4.1 through the GENERIC CacheManager (CPU, no model) -- the unified serving path.
 
 The shared page_table is the virtual full-token coordinate (ShadowRadix); DSV4PagedKVCache plugs
 in as the swa_pool: window pages bind page-atomically behind token-face alloc_swa/free_swa, the
@@ -9,6 +9,9 @@ and the decode-snapshot staging contract.
 """
 
 from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +26,22 @@ DEVICE = torch.device("cpu")
 P = 128
 RATIOS = (0, 0, 4, 128, 4, 128, 4, 0)
 MRR = 4
+
+
+@pytest.fixture(autouse=True, params=["v4", "v41"])
+def _pool_family(request, monkeypatch):
+    if request.param == "v41":
+        from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+        from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+
+        module = sys.modules[__name__]
+        monkeypatch.setattr(module, "_args", lambda: SimpleNamespace(
+            n_layers=5, compress_ratios=(0, 2, 2, 1, 1), max_seq_len=8192,
+            kv_source_layers=(1, 3), index_source_layers=(1, 3, 4),
+            head_dim=32, index_head_dim=16, window_size=P,
+        ))
+        monkeypatch.setattr(module, "dsv4_pool_sizes", dsv41_pool_sizes)
+        monkeypatch.setattr(module, "DSV4PagedKVCache", DSV41PagedKVCache)
 
 
 def _args():

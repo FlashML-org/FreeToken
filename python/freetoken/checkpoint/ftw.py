@@ -605,7 +605,8 @@ def load_ftw_banks(
     # the file names the banks the legacy way; the quant_format tag names the (kind, kernel) they were packed for
     sources = {canonical_role(name): views for name, views in sources.items()}
     quant_format = reader.meta("quant_format")
-    kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
+    # Q4_0 still uses its GGUF provider rather than a quant method.
+    kind, kernel = kind_kernel_for(quant_format) if quant_format not in (None, "q4_0") else (None, None)
 
     # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
     applied = list(residency)

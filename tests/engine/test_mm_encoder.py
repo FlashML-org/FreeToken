@@ -57,17 +57,21 @@ def test_entry_lives_until_its_consumer_gathers_the_last_row():
     assert eng.model.calls == 1
 
 
-def test_shared_image_is_encoded_once_and_sliced_per_request():
+@pytest.mark.parametrize("legacy_embeds", [False, True])
+def test_shared_image_is_encoded_once_and_sliced_per_request(legacy_embeds):
     cache = EncoderCache(storage="cpu")
     eng = _engine(cache)
     a, b = _item(h=5, n_tokens=4), _item(h=5, n_tokens=4)
     cache.register(5, 1, 4)
     cache.register(5, 2, 4)
     batch = _batch([a, b], [(1, 5, 0, 4, 4, 0), (2, 5, 0, 2, 4, 4)])
+    expected = torch.full((6, H), 5.0)
+    if legacy_embeds:
+        batch.mm_embeds = torch.full((2, H), 7.0)
+        expected = torch.cat([expected, batch.mm_embeds])
     Engine._run_mm_encoder(eng, batch)
     assert eng.model.calls == 1
-    assert batch.mm_embeds.shape == (6, H)
-    assert torch.equal(batch.mm_embeds, torch.full((6, H), 5.0))
+    assert torch.equal(batch.mm_embeds, expected)
     # request 1 consumed its image; request 2 still has rows to gather in its next chunk
     assert cache._entries[5].remaining == {2: 2}
 

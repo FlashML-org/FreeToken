@@ -23,6 +23,28 @@ _DSA_IDS = tuple(range(3, _NUM_LAYERS, 4))  # 3, 7, ..., 43
 _KDA_IDS = tuple(i for i in range(_NUM_LAYERS) if i not in _DSA_IDS)
 
 
+def test_nvfp4_pool_factory_preserves_glm5_hybrid_geometry():
+    import torch
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
+
+    cfg = parse_config(_hf_config())
+    pool = create_kvcache_pool(
+        cfg, num_pages=2, page_size=64, dtype=torch.bfloat16,
+        device=torch.device("cpu"), num_req_slots=3, kv_quant="nvfp4",
+    )
+    assert isinstance(pool, KpoolDSAKVCache)
+    spec, = cfg.kv_cache_group_specs()
+    assert pool.num_layers == len(_DSA_IDS)
+    for layer in _DSA_IDS:
+        assert pool.latent_rows(layer).shape == (128, spec.head_dim // 2)
+        assert pool.latent_block_scale(layer).shape == (128, spec.head_dim // 16)
+    with pytest.raises(KeyError):
+        pool.latent_rows(_KDA_IDS[0])
+    assert pool.index_k_cache(0).dtype == torch.bfloat16
+    assert pool.tail_gate(0).dtype == torch.bfloat16
+
+
 def _layer_types() -> list[str]:
     return [
         "deepseek_sparse_attention" if i in _DSA_IDS else "linear_attention"
@@ -129,11 +151,15 @@ _CT_MIXED_QUANT = {
         "group_0": {
             "targets": ["re:.*\\.layers\\.(?:[3-9]|[1-3][0-9]|4[0-4])\\.mlp\\.experts\\..*(gate|up|down)_proj$"],
             "weights": {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"},
+            "input_activations": {"num_bits": 4, "type": "float", "group_size": 16,
+                                  "strategy": "tensor_group", "dynamic": "local"},
             "format": "nvfp4-pack-quantized",
         },
         "group_1": {
             "targets": ["re:.*\\.layers\\.45\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"],
-            "weights": {"num_bits": 8, "type": "float", "strategy": "block"},
+            "weights": {"num_bits": 8, "type": "float", "strategy": "block", "block_structure": [128, 128]},
+            "input_activations": {"num_bits": 8, "type": "float", "group_size": 128,
+                                  "strategy": "group", "dynamic": True},
             "format": "float-quantized",
         },
     },
@@ -269,6 +295,22 @@ def test_compressed_tensors_mixed_precision_detected():
     still resolve to nvfp4, not to the raw quant_method."""
     cfg = parse_config(_hf_config(_CT_MIXED_QUANT))
     assert cfg.expert_quant == "nvfp4"
+
+
+def test_published_nvfp4_config_binds_only_routed_experts(tmp_path):
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    hf = _hf_config(_CT_MIXED_QUANT)
+    quant = checkpoint_quant_config(str(tmp_path), hf, get_model_spec(hf.architectures[0]))
+    for layer in (3, 4, 44):
+        scheme = quant.scheme_for(f"model.layers.{layer}.mlp.experts")
+        assert scheme.kind is QuantKind.NVFP4 and scheme.has("input_scale")
+        assert quant.scheme_for(f"model.layers.{layer}.mlp.shared_experts.gate_proj") is None
+        assert quant.scheme_for(f"model.layers.{layer}.mlp.gate") is None
+    for prefix in ("model.layers.0.self_attn.in_proj", "model.layers.3.self_attn.q_b_proj", "lm_head"):
+        assert quant.scheme_for(prefix) is None
+    assert quant.scheme_for("model.layers.45.mlp.experts").kind is QuantKind.FP8_BLOCK
 
 
 def test_compressed_tensors_mixed_precision_reads_the_expert_group():

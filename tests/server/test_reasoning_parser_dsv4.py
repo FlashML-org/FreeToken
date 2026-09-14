@@ -47,6 +47,16 @@ def test_thinking_with_end_token():
     assert content == "The answer is 42."
 
 
+def test_v41_space_delimited_calls_end_reasoning():
+    block = '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather"></｜DSML｜ invoke></｜DSML｜ calls>'
+    text = "Let me check." + block
+    for split in range(1, len(text)):
+        parser = ReasoningParser("deepseekv32", force_reasoning=True)
+        reasoning, content = _stream(parser, [text[:split], text[split:]])
+        assert reasoning == "Let me check."
+        assert content == block
+
+
 def test_thinking_with_tool_block_after_end_token():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
     text = f"Let me check the weather.</think>Sure!\n\n{TOOL_BLOCK}"

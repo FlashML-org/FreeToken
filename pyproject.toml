@@ -47,7 +47,7 @@ dependencies = [
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
-    "pillow>=10,<13",
+    "pillow>=11,<13",
     "prompt_toolkit>=3.0,<4",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
@@ -117,6 +117,7 @@ where = ["python"]
 
 [tool.setuptools.package-data]
 "*" = ["csrc/**/*", "moe/configs/**/*.json"]
+"freetoken.models.deepseek_v41" = ["NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
