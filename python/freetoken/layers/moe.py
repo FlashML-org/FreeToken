@@ -124,6 +124,9 @@ class MoELayer(BaseOP):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         The resident path does not mutate it today, but callers must not rely on
         that.
+
+        ``hidden_states`` may also be overwritten by the expert kernel. Compute
+        shared branches that need the original input before calling this method.
         """
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
@@ -210,6 +213,9 @@ class OffloadMoELayer(MoELayer):
         scores, selection bias, group-limited top-k, ...); identical to ``forward``
         past the router. ``topk_ids`` must be safe to mutate in place (decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
+
+        ``hidden_states`` may also be overwritten by the expert kernel. Compute
+        shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
