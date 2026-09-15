@@ -205,3 +205,142 @@ def test_scheduler_with_policy_takes_decode_when_due():
     got = [Scheduler._schedule_next_batch(s) for _ in range(4)]
     assert got[0] is prefill_batch and got[1] is prefill_batch and got[2] is prefill_batch
     assert got[3] is decode_batch, "4th slot must be the forced decode"
+
+
+# --------------------------------------------------------------------------- #
+# Truth table against the REAL scheduler (codex review: _decide is a model of
+# the decision, not the decision -- it can drift from the code it describes).
+# --------------------------------------------------------------------------- #
+def _real_scheduler(every=None, prefill=True, decode=True):
+    """Build a Scheduler whose two managers are stubs with call counters."""
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.interleave import DecodeInterleavePolicy
+
+    calls = {"prefill": 0, "decode": 0}
+    pf = SimpleNamespace(is_prefill=True, prompt_admissions=[])
+    dc = SimpleNamespace(is_prefill=False, prompt_admissions=[])
+
+    def _pf(budget):
+        calls["prefill"] += 1
+        return pf if prefill else None
+
+    def _dc():
+        calls["decode"] += 1
+        return dc if decode else None
+
+    s = Scheduler.__new__(Scheduler)
+    s.prefill_budget = 384
+    s.prefill_manager = SimpleNamespace(schedule_next_batch=_pf)
+    s.decode_manager = SimpleNamespace(schedule_next_batch=_dc)
+    s._prepare_batch = lambda value: value
+    s.send_result = lambda messages: None
+    if every is not None:
+        s._interleave = DecodeInterleavePolicy(every)
+    return s, calls, pf, dc
+
+
+@pytest.mark.parametrize("every,expected", [
+    # (policy N, expected sequence of slot winners over 9 slots)
+    (None, ["p"] * 9),                       # disabled -> always prefill
+    # streak starts at 0, so slot 0 is prefill; then strict alternation
+    (1, ["p", "d", "p", "d", "p", "d", "p", "d", "p"]),
+    (3, ["p", "p", "p", "d", "p", "p", "p", "d", "p"]),
+    (8, ["p"] * 8 + ["d"]),
+])
+def test_truth_table_against_real_scheduler(every, expected):
+    """The real _schedule_next_batch must produce exactly this slot sequence."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=every)
+    got = []
+    for _ in range(9):
+        b = Scheduler._schedule_next_batch(s)
+        got.append("p" if b is pf else ("d" if b is dc else "?"))
+    assert got == expected, f"every={every}: got {got}, want {expected}"
+
+
+def test_every_one_alternates_while_both_stay_runnable():
+    """every=1 is the degenerate case: one decode between every prefill."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=1)
+    seq = []
+    for _ in range(6):
+        b = Scheduler._schedule_next_batch(s)
+        seq.append("p" if b is pf else "d")
+    # slot 0 prefill (streak starts at 0), then alternation
+    assert seq == ["p", "d", "p", "d", "p", "d"]
+
+
+def test_latch_releases_when_decode_becomes_available():
+    """Due decode unavailable -> keep prefilling -> decode becomes available -> it fires.
+
+    Exercises the subtle path: the policy must not lose its 'decode is due' state
+    while waiting, and must not fire twice once it does.
+    """
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=2)
+    # phase 1: no decode runnable at all
+    s.decode_manager.schedule_next_batch = lambda: None
+    for _ in range(5):
+        assert Scheduler._schedule_next_batch(s) is pf
+    # phase 2: decode becomes available -> next slot must be decode
+    s.decode_manager.schedule_next_batch = lambda: dc
+    assert Scheduler._schedule_next_batch(s) is dc, "latch did not release"
+
+
+def test_no_work_returns_none():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, _, _, _ = _real_scheduler(every=8, prefill=False, decode=False)
+    assert Scheduler._schedule_next_batch(s) is None
+
+
+def test_pure_decode_fallback_when_nothing_to_prefill():
+    """With no prefill available every slot is decode (no policy interference)."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=2, prefill=False, decode=True)
+    got = [Scheduler._schedule_next_batch(s) for _ in range(5)]
+    assert all(b is dc for b in got)
+
+
+def test_disabled_policy_object_not_just_missing_attribute():
+    """codex: cover a policy that EXISTS but is disabled, not only an absent one."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=None)
+    s._interleave = __import__(
+        "freetoken.scheduler.interleave", fromlist=["DecodeInterleavePolicy"]
+    ).DecodeInterleavePolicy(0)          # present but disabled
+    got = [Scheduler._schedule_next_batch(s) for _ in range(6)]
+    assert all(b is pf for b in got), "a disabled policy must never take a slot"
+
+
+def test_decode_manager_not_probed_when_policy_disabled():
+    """When disabled, the decode manager must not be consulted at all (no extra call)."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    s, calls, pf, dc = _real_scheduler(every=None)
+    Scheduler._schedule_next_batch(s)
+    assert calls["decode"] == 0, "disabled policy should not probe decode"
+
+
+def test_config_to_scheduler_wiring():
+    """codex: cover CLI/config -> Scheduler.__init__ wiring."""
+    import inspect
+
+    from freetoken.engine.config import EngineConfig
+    from freetoken.scheduler import scheduler as sched_mod
+
+    assert "decode_interleave_every" in {f.name for f in __import__("dataclasses").fields(EngineConfig)}
+    src = inspect.getsource(sched_mod.Scheduler.__init__)
+    assert "_interleave" in src and "decode_interleave_every" in src, (
+        "Scheduler.__init__ must build the policy from the config field"
+    )
+    # and the CLI exposes it
+    from freetoken.server.args import ServerArgs
+    assert hasattr(ServerArgs, "decode_interleave_every")
