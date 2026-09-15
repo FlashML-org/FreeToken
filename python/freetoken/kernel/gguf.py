@@ -51,7 +51,13 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    # ``-std=c++20`` is load-bearing, not a modernization: nvcc's host pass rewrites
+    # ``static_cast<typename decltype(impl_->list)::difference_type>`` in libtorch's
+    # ``ATen/core/List_inl.h`` into a form that drops the ``typename``, which every
+    # g++ we have (12/13/15) rejects under C++17. C++20 (P0634) makes ``typename``
+    # implicit in a static_cast type-id, so the rewritten form compiles. torch only
+    # appends its own ``-std=c++17`` when no ``-std=`` is present, so this wins.
+    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr", "-std=c++20"]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
