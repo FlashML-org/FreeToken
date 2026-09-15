@@ -72,6 +72,21 @@ class DecodeStatus:
     surr_offset: int  # length of surr ids
     sent_offset: int  # length of sent out string
 
+    def update(self, read_str: str, surr_str: str) -> str:
+        new_text = read_str[len(surr_str) :]
+        if len(new_text) > 0 and not new_text.endswith("�"):
+            self.decoded_str += new_text
+            self.surr_offset = self.read_offset
+            self.read_offset = len(self.decoded_ids)
+            return self.decoded_str
+        return self.decoded_str + find_printable_text(new_text)
+
+    def decode(self, tokenizer: PreTrainedTokenizerBase) -> str:
+        return self.update(
+            tokenizer.decode(self.decoded_ids[self.surr_offset :]),
+            tokenizer.decode(self.decoded_ids[self.surr_offset : self.read_offset]),
+        )
+
 
 class DetokenizeManager:
     def __init__(
@@ -91,6 +106,9 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # Each message must advance its request's decode state before the next one.
+        if len({msg.uid for msg in msgs}) != len(msgs):
+            return [self.detokenize([msg])[0] for msg in msgs]
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
@@ -103,7 +121,9 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
+            if not (
+                msg.finished and not msg.matched_stop and msg.next_token in self.eos_token_ids
+            ):
                 s.decoded_ids.append(msg.next_token)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
@@ -114,16 +134,7 @@ class DetokenizeManager:
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
-            new_text = read_str[len(surr_str) :]
-            # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
-                output_str = s.decoded_str + new_text
-                s.decoded_str = output_str
-                s.surr_offset = s.read_offset
-                s.read_offset = len(s.decoded_ids)
-            else:
-                new_text = find_printable_text(new_text)
-                output_str = s.decoded_str + new_text
+            output_str = s.update(read_str, surr_str)
 
             prev_sent = s.sent_offset
             if msg.finished:

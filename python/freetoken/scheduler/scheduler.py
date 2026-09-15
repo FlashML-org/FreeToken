@@ -428,16 +428,31 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:
-        """First stop string present in this request's generated tail, else None. Decodes
-        only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        """Match stops against the same incrementally decoded text as the frontend."""
+        from freetoken.tokenizer.detokenize import DecodeStatus
+
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end = len(req.input_ids)
+        # The frontend omits a terminal EOS, including at the output limit with ignore_eos.
+        if (
+            end > prompt_len
+            and not req.can_decode
+            and int(req.input_ids[-1]) in self.eos_token_ids
+        ):
+            end -= 1
+        if end <= prompt_len:
             return None
+        if req.stop_decode_status is None:
+            req.stop_decode_status = DecodeStatus(
+                decoded_ids=[], decoded_str="", read_offset=0, surr_offset=0, sent_offset=0
+            )
+        state = req.stop_decode_status
+        state.decoded_ids.extend(req.input_ids[prompt_len + len(state.decoded_ids) : end].tolist())
+        tail = state.decode(self.tokenizer)
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        # Bound the text used for matching, retaining token context for incomplete characters.
+        state.decoded_str = state.decoded_str[-max_chars:]
         for s in stop_strs:
             if s in tail:
                 return s
