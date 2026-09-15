@@ -29,15 +29,17 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.layers.mhc import hc_contract, hc_expand, mhc_fused_post_pre, mhc_post, mhc_pre
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import Glm5NextAttention
 from .kda import Glm5NextKDA
 from .mlp import Glm5NextGatedMLP
 from .moe import Glm5NextSparseBlock
+from .vision import Glm5NextVisionModel
 
 if TYPE_CHECKING:
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
 
@@ -147,7 +149,7 @@ class Glm5NextModel(BaseOP):
         self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual = post = comb = None
         for layer in self.layers.op_list:
             x, residual, post, comb = layer.forward(x, residual, post, comb)
@@ -181,4 +183,17 @@ class Glm5NextForCausalLM(BaseLLMModel):
         return self.lm_head.forward(output)
 
 
-__all__ = ["Glm5NextForCausalLM"]
+class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.visual = Glm5NextVisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.visual.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.visual.forward(item.feature, [item.grid_thw])
+
+
+__all__ = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]

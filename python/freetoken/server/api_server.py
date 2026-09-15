@@ -206,10 +206,13 @@ class FrontendManager:
         ``_frontend_tokenizer`` field). Called from a worker thread — never on the event loop."""
         with self._frontend_tokenizer_lock:
             if self._frontend_tokenizer is None:
+                from freetoken.mm.processor import get_mm_processor
                 from freetoken.tokenizer.tokenize import TokenizeManager
                 from freetoken.utils import load_tokenizer
 
-                self._frontend_tokenizer = TokenizeManager(load_tokenizer(self.config.model_path))
+                self._frontend_tokenizer = TokenizeManager(
+                    load_tokenizer(self.config.model_path), get_mm_processor(self.config.model_path, self.config.mm)
+                )
             return self._frontend_tokenizer
 
     def warm_frontend_tokenizer(self) -> None:

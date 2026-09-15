@@ -132,21 +132,23 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    def rename_key(raw_name: str, *, include_vision: bool) -> str | None:
+    def rename_key(raw_name: str) -> str | None:
         prefix = "model.language_model."
         if raw_name.startswith(prefix):
             return _rename_language_key(raw_name)
         if raw_name.startswith("language_model."):
             return _rename_language_key(raw_name)
-        if include_vision:
-            if raw_name.startswith("model.vision_tower."):
-                return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(
-                    ".linear.",
-                    ".",
-                )
-            if raw_name.startswith("model.embed_vision."):
-                return "embed_vision." + raw_name[len("model.embed_vision.") :]
+        if raw_name.startswith("model.vision_tower."):
+            return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(
+                ".linear.",
+                ".",
+            )
+        if raw_name.startswith("model.embed_vision."):
+            return "embed_vision." + raw_name[len("model.embed_vision.") :]
+        if raw_name.startswith("model.vision_embedder."):
+            return "vision_embedder." + raw_name[len("model.vision_embedder.") :]
         return None
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
@@ -160,7 +162,6 @@ def iter_weights(
     if tp_info.size > 1:
         raise NotImplementedError("Gemma 4 weight loading currently supports TP=1 only")
 
-    include_vision = config.is_multimodal
     k_eq_v_layers = {
         layer_id
         for layer_id in range(config.num_layers)
@@ -178,7 +179,7 @@ def iter_weights(
         ):
             with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
                 for raw_name in f.keys():
-                    name = rename_key(raw_name, include_vision=include_vision)
+                    name = rename_key(raw_name)
                     if name is None:
                         continue
 
@@ -191,7 +192,9 @@ def iter_weights(
                     if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
                         continue
 
-                    is_vision = name.startswith(("vision_tower.", "embed_vision."))
+                    is_vision = name.startswith(("vision_tower.", "embed_vision.", "vision_embedder."))
+                    if is_vision and not include_vision:
+                        continue
                     is_expert = (
                         not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
                     )

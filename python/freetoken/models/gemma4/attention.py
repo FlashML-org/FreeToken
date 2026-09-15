@@ -50,6 +50,7 @@ class Gemma4Attention(BaseOP):
         self.attn_spec = AttentionSpec(
             sliding_window=group.sliding_window if self.is_swa else None,
             sm_scale=config.attn_sm_scale,
+            bidirectional_mm_blocks=self.is_swa and group.bidirectional_mm_blocks,
         )
         self.rotary = get_rope(
             head_dim=self.head_dim,

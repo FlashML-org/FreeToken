@@ -346,7 +346,9 @@ def test_qsa_layer_matches_hf_dense():
     x = (torch.randn(seq_len, config.hidden_size, device=device, dtype=dtype) * 0.5)
     positions = torch.arange(seq_len, device=device, dtype=torch.int64)
     req = SimpleNamespace(extend_len=seq_len, cached_len=0, table_idx=1)
-    batch = SimpleNamespace(padded_reqs=[req], reqs=[req], positions=positions)
+    batch = SimpleNamespace(
+        padded_reqs=[req], reqs=[req], positions=positions, get_attn_positions=lambda: positions
+    )
 
     backend = TorchDenseQSAReference(config, num_slots=4, max_len=64, device=device, dtype=dtype)
     _fresh_ctx(attn_backend=backend)
@@ -473,10 +475,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     last = torch.tensor(
         [sum(len(p) for p in prompts[: i + 1]) - 1 for i in range(len(prompts))], device=device
     )
+    positions = torch.cat([torch.arange(len(p)) for p in prompts]).to(device)
     batch = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=True, is_decode=False,
         input_ids=torch.tensor(flat, dtype=torch.int64, device=device),
-        positions=torch.cat([torch.arange(len(p)) for p in prompts]).to(device),
+        positions=positions, get_attn_positions=lambda: positions, mm_embeds=None,
         attn_metadata=SimpleNamespace(get_last_indices=lambda bs: last[:bs]),
     )
     with ctx.forward_batch(batch):
@@ -488,10 +491,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         r.cached_len = len(p)
         r.extend_len = 1
         r.input_ids = torch.cat([r.input_ids, torch.tensor([14], dtype=torch.int64)])
+    decode_positions = torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device)
     decode = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=False, is_decode=True,
         input_ids=torch.tensor([14] * len(reqs), dtype=torch.int64, device=device),
-        positions=torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device),
+        positions=decode_positions, get_attn_positions=lambda: decode_positions, mm_embeds=None,
         attn_metadata=None,
     )
     with ctx.forward_batch(decode):

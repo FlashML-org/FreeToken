@@ -22,6 +22,7 @@ from .norm import (
     GemmaPlusOneRMSNorm,
     GemmaPlusOneRMSNormFused,
     GemmaRMSNorm,
+    LayerNorm,
     RMSNorm,
     RMSNormFused,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "LinearRowParallel",
     "LinearOProj",
     "LinearQKVMerged",
+    "LayerNorm",
     "RMSNorm",
     "RMSNormFused",
     "GatedRMSNorm",

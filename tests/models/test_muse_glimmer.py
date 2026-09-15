@@ -21,10 +21,31 @@ class _Cfg:
 
     def __init__(self, data: dict):
         for k, v in data.items():
-            setattr(self, k, _Cfg(v) if isinstance(v, dict) and k == "text_config" else v)
+            setattr(self, k, _Cfg(v) if isinstance(v, dict) and k in ("text_config", "vision_config") else v)
 
 
-def _hf_config(num_layers: int = 52, quantized: bool = False) -> _Cfg:
+def _vision_section() -> dict:
+    """A tiny vision_config in the checkpoint's shape (the real tower is 50 x 1536)."""
+    return {
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "hidden_act": "gelu",
+        "layer_types": ["window_attention"] * 3 + ["full_attention"],
+        "patch_size": 2,
+        "patch_temporal": 2,
+        "merge_size": 2,
+        "pos_emb_height": 4,
+        "pos_emb_width": 4,
+        "layer_norm_eps": 1e-5,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "max_position_embeddings": 16,
+        "model_type": "muse_glimmer_vision",
+    }
+
+
+def _hf_config(num_layers: int = 52, quantized: bool = False, vision: bool = False) -> _Cfg:
     pattern = ["sliding_attention"] * 3 + ["full_attention"]
     thetas = [500000.0] * 3 + [0.0]
     reps = (num_layers + 3) // 4
@@ -55,6 +76,13 @@ def _hf_config(num_layers: int = 52, quantized: bool = False) -> _Cfg:
             "model_type": "muse_glimmer_text",
         },
     }
+    if vision:
+        data |= {
+            "vision_config": _vision_section(),
+            "out_hidden_size": 16 * 4,
+            "projector_hidden_size": 24,
+            "projector_hidden_act": "gelu",
+        }
     if quantized:
         data["quantization_config"] = {
             "quant_method": "compressed-tensors",
@@ -91,7 +119,7 @@ def test_parse_config_full_model():
     assert cfg.final_logit_softcapping == 20.0
     assert cfg.output_multiplier == pytest.approx(0.19611613513818404)
     assert cfg.embedding_scale is None  # NormedEmbedding, not Gemma's sqrt(hidden) scale
-    assert cfg.vision_config is None  # served text-only
+    assert cfg.vision_config is None  # no vision_config section: the engine asked for no tower
 
     groups = {g.name: g for g in cfg.attention_groups}
     assert groups["swa"].layer_ids == tuple(i for i in range(52) if (i + 1) % 4 != 0)
@@ -110,6 +138,27 @@ def test_parse_config_full_model():
     # BF16 checkpoint: nothing quantized.
     assert cfg.attn_quant == "none" and cfg.dense_quant == "none"
     assert cfg.lm_head_quant == "none"
+
+
+def test_parse_vision_config():
+    from freetoken.models.muse_glimmer.config import parse_vision_config
+
+    vc = parse_config(_hf_config(vision=True)).vision_config
+    assert (vc.hidden_size, vc.intermediate_size, vc.num_layers, vc.num_heads) == (16, 32, 4, 2)
+    assert vc.layer_types == ("window_attention",) * 3 + ("full_attention",)
+    assert (vc.patch_size, vc.temporal_patch_size, vc.merge_size, vc.pos_emb_side) == (2, 2, 2, 4)
+    assert vc.patch_dim == 2 * 3 * 2 * 2 and vc.out_hidden_size == 64
+    assert (vc.projector_hidden_size, vc.text_hidden_size, vc.text_rms_norm_eps) == (24, 6656, 1e-5)
+    assert vc.layer_norm_eps == 1e-5 and vc.rope_theta == 10000.0
+
+    hf = _hf_config(vision=True)
+    hf.vision_config.hidden_act = "silu"
+    with pytest.raises(NotImplementedError, match="only gelu"):
+        parse_vision_config(hf)
+    hf = _hf_config(vision=True)
+    hf.out_hidden_size = 16  # the adapter must take the pixel-shuffled width
+    with pytest.raises(AssertionError, match="pixel-shuffled"):
+        parse_vision_config(hf)
 
 
 def test_parse_config_nvfp4_checkpoint():
@@ -162,7 +211,9 @@ def test_registry_resolves_architecture():
 
     spec = get_model_spec("MuseGlimmerForConditionalGeneration")
     assert spec.module == "freetoken.models.muse_glimmer"
-    assert spec.model_cls == "MuseGlimmerForCausalLM"
+    assert spec.model_cls == "MuseGlimmerForConditionalGeneration"
+    assert spec.mm_processor == "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
+    assert [(e.kind, e.config_key, e.modalities) for e in spec.encoders] == [("vision", "vision_config", ("image",))]
 
 
 def test_aot_table_covers_the_checkpoints():
@@ -179,17 +230,27 @@ def test_weight_rename_and_fusion():
     import torch
 
     from freetoken.models.loader import ct_bf16_fuse
-    from freetoken.models.muse_glimmer.weight import _FUSIONS, _rename
+    from freetoken.models.muse_glimmer.weight import _FUSIONS, _rename, _vision_name, _vision_tensors
 
-    # Text tower renamed, vision dropped, lm_head untouched.
+    # Text tower renamed, lm_head untouched; the image path lands under the wrapper's vision_tower.
     assert _rename("model.language_model.layers.0.self_attn.q_proj.weight") == (
         "model.layers.0.self_attn.q_proj.weight"
     )
     assert _rename("model.language_model.embed_tokens.weight") == "model.embed_tokens.weight"
     assert _rename("lm_head.weight") == "lm_head.weight"
-    assert _rename("model.vision_tower.layers.0.attn.q_proj.weight") is None
-    assert _rename("model.vision_adapter.fc1.weight") is None
-    assert _rename("model.vision_projection.weight") is None
+    assert _vision_name("model.language_model.norm.weight") is None
+    assert _vision_name("model.vision_tower.layers.0.attn.q_proj.weight") == "vision_tower.layers.0.attn.q_proj.weight"
+    assert _vision_name("model.vision_adapter.fc1.weight") == "vision_tower.adapter.fc1.weight"
+    assert _vision_name("model.vision_projection.weight") == "vision_tower.projection.weight"
+
+    # vision q/k/v fuse into attn.qkv in that order, biases like weights; other tensors pass through
+    vbuf: dict = {}
+    assert _vision_tensors("vision_tower.layers.0.attn.q_proj.bias", torch.zeros(2), vbuf) == []
+    assert _vision_tensors("vision_tower.layers.0.attn.v_proj.bias", torch.full((2,), 2.0), vbuf) == []
+    ((key, bias),) = _vision_tensors("vision_tower.layers.0.attn.k_proj.bias", torch.ones(2), vbuf)
+    assert key == "vision_tower.layers.0.attn.qkv.bias" and bias.tolist() == [0, 0, 1, 1, 2, 2] and not vbuf
+    ((key, weight),) = _vision_tensors("vision_tower.layers.0.attn.proj.weight", torch.zeros(2, 2), vbuf)
+    assert key == "vision_tower.layers.0.attn.proj.weight" and torch.equal(weight, torch.zeros(2, 2))
 
     # q/k/v + the attention gate fuse into qkvg_proj in declaration order.
     buf: dict = {}
@@ -234,6 +295,41 @@ def _write_shards(tmp_path, shards: dict[str, dict]):
     )
 
 
+def _vision_checkpoint_tensors(hf) -> dict:
+    """The image path in the checkpoint's naming: separate q/k/v with biases, an nn.Embedding position table, bias-free adapter and projection."""
+    import torch
+
+    vc = hf.vision_config
+    H, I, P = vc.hidden_size, vc.intermediate_size, hf.projector_hidden_size
+    bf16 = torch.bfloat16
+    tensors = {
+        "model.vision_tower.patch_embedder.patch_embedding.weight": torch.randn(H, vc.patch_temporal * 3 * vc.patch_size**2, dtype=bf16),
+        "model.vision_tower.patch_embedder.position_embedding_table.weight": torch.randn(vc.pos_emb_height * vc.pos_emb_width, H, dtype=bf16),
+        "model.vision_tower.ln_pre.weight": torch.randn(H, dtype=bf16),
+        "model.vision_tower.ln_pre.bias": torch.randn(H, dtype=bf16),
+        "model.vision_tower.ln_post.weight": torch.randn(H, dtype=bf16),
+        "model.vision_tower.ln_post.bias": torch.randn(H, dtype=bf16),
+        "model.vision_adapter.fc1.weight": torch.randn(P, hf.out_hidden_size, dtype=bf16),
+        "model.vision_adapter.fc2.weight": torch.randn(P, P, dtype=bf16),
+        "model.vision_projection.weight": torch.randn(hf.text_config.hidden_size, P, dtype=bf16),
+    }
+    for i in range(vc.num_hidden_layers):
+        lp = f"model.vision_tower.layers.{i}."
+        for name in ("attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.proj"):
+            tensors[lp + name + ".weight"] = torch.randn(H, H, dtype=bf16)
+            tensors[lp + name + ".bias"] = torch.randn(H, dtype=bf16)
+        tensors |= {
+            lp + "mlp.fc1.weight": torch.randn(I, H, dtype=bf16),
+            lp + "mlp.fc1.bias": torch.randn(I, dtype=bf16),
+            lp + "mlp.fc2.weight": torch.randn(H, I, dtype=bf16),
+            lp + "mlp.fc2.bias": torch.randn(H, dtype=bf16),
+        }
+        for name in ("norm1", "norm2"):
+            tensors[lp + name + ".weight"] = torch.randn(H, dtype=bf16)
+            tensors[lp + name + ".bias"] = torch.randn(H, dtype=bf16)
+    return tensors
+
+
 def _bf16_checkpoint_tensors(hf) -> dict:
     import torch
 
@@ -246,11 +342,7 @@ def _bf16_checkpoint_tensors(hf) -> dict:
         p + "embed_tokens.weight": torch.randn(text.vocab_size, H, dtype=torch.bfloat16),
         p + "norm.weight": torch.randn(H, dtype=torch.bfloat16),
         "lm_head.weight": torch.randn(text.vocab_size, H, dtype=torch.bfloat16),
-        # vision tensors must be dropped, not loaded
-        "model.vision_tower.ln_pre.weight": torch.randn(4, dtype=torch.bfloat16),
-        "model.vision_adapter.fc1.weight": torch.randn(4, 4, dtype=torch.bfloat16),
-        "model.vision_projection.weight": torch.randn(4, 4, dtype=torch.bfloat16),
-    }
+    } | _vision_checkpoint_tensors(hf)
     for i in range(text.num_hidden_layers):
         lp = f"{p}layers.{i}."
         tensors |= {
@@ -270,33 +362,43 @@ def _bf16_checkpoint_tensors(hf) -> dict:
     return tensors
 
 
-def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch):
+@pytest.mark.parametrize("include_vision", [False, True])
+def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, include_vision):
     """The BF16 loader must produce exactly the model's state-dict keys with the
-    right shapes (rename + qkvg / gate_up fusion, vision dropped, norms raw)."""
+    right shapes (rename + qkvg / gate_up fusion, norms raw); the image path only
+    when an encoder is built, then with q/k/v fused into attn.qkv."""
     import torch
 
     from freetoken.distributed import set_tp_info, try_get_tp_info
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    from freetoken.models.muse_glimmer.model import MuseGlimmerForCausalLM
+    from freetoken.models.muse_glimmer.model import MuseGlimmerForConditionalGeneration
     from freetoken.models.muse_glimmer.weight import iter_weights
 
-    hf = _hf_config(num_layers=4)
+    hf = _hf_config(num_layers=4, vision=True)
     tensors = _bf16_checkpoint_tensors(hf)
     _write_shards(tmp_path, {"model-00001-of-00001.safetensors": tensors})
     import freetoken.models.muse_glimmer.weight as w
 
     monkeypatch.setattr(w, "cached_load_hf_config", lambda _p: hf)
 
-    loaded = dict(
-        iter_weights(str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True)
-    )
-    model = MuseGlimmerForCausalLM(parse_config(hf))
+    loaded = dict(iter_weights(
+        str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=include_vision,
+    ))
+    if not include_vision:
+        hf.vision_config = None  # what the engine's text-only model_config looks like
+    model = MuseGlimmerForConditionalGeneration(parse_config(hf))
     expected = model.state_dict()
     assert set(loaded) == set(expected)
+    assert any(k.startswith("vision_tower.") for k in expected) is include_vision
     for k in expected:
         assert loaded[k].shape == expected[k].shape, k
+    if include_vision:
+        v = "model.vision_tower.layers.1.attn."
+        assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.weight"], torch.cat([tensors[v + f"{n}_proj.weight"] for n in "qkv"]))
+        assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.bias"], torch.cat([tensors[v + f"{n}_proj.bias"] for n in "qkv"]))
+        assert torch.equal(loaded["vision_tower.projection.weight"], tensors["model.vision_projection.weight"])
     # fusion order [q, k, v, gate] against the raw parts
     fused = loaded["model.layers.0.self_attn.qkvg_proj.weight"]
     p = "model.language_model.layers.0.self_attn."
@@ -311,12 +413,18 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     """compressed-tensors loader: native FP4 parts fused with per-part scales, the
     reciprocal global, and sibling scales resolved through the index even when they
     land in a different shard than their weight_packed (the real checkpoint splits
-    layer 49's down_proj across the shard boundary)."""
+    layer 49's down_proj across the shard boundary); the bf16 image path rides along
+    with its q/k/v fused across shards."""
     import torch
 
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    from freetoken.models.muse_glimmer import MuseGlimmerVisionModel, parse_vision_config
     from freetoken.models.muse_glimmer.weight import iter_weights
 
-    hf = _hf_config(num_layers=1, quantized=True)
+    hf = _hf_config(num_layers=1, quantized=True, vision=True)
     text = hf.text_config
     text.hidden_size, text.intermediate_size = 64, 96
     text.num_attention_heads, text.num_key_value_heads, text.head_dim = 4, 2, 16
@@ -357,6 +465,11 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
         "pre_feedforward_layernorm", "post_feedforward_layernorm",
     ):
         shard1[p + name + ".weight"] = torch.randn(H, dtype=torch.bfloat16)
+    # the image path stays bf16; layer 0's q_proj lands in shard 1 and its k/v in shard 2
+    vision = _vision_checkpoint_tensors(hf)
+    q_keys = {k for k in vision if ".layers.0.attn.q_proj." in k}
+    shard1 |= {k: vision[k] for k in q_keys}
+    shard2 |= {k: v for k, v in vision.items() if k not in q_keys}
     _write_shards(tmp_path, {
         "model-00001-of-00002.safetensors": shard1,
         "model-00002-of-00002.safetensors": shard2,
@@ -381,6 +494,16 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     assert loaded[dp + ".input_scale"].item() == pytest.approx(1.0)
     assert loaded[qkvg + ".input_scale"].shape == ()
     assert not any(k.endswith(".input_global_scale") for k in loaded)
+    expected_vision = {"vision_tower." + k for k in MuseGlimmerVisionModel(parse_vision_config(hf)).state_dict()}
+    assert {k for k in loaded if k.startswith("vision_tower.")} == expected_vision
+    v = "model.vision_tower.layers.0.attn."
+    assert torch.equal(loaded["vision_tower.layers.0.attn.qkv.weight"], torch.cat([vision[v + f"{n}_proj.weight"] for n in "qkv"]))
+    assert torch.equal(loaded["vision_tower.layers.0.attn.qkv.bias"], torch.cat([vision[v + f"{n}_proj.bias"] for n in "qkv"]))
+    assert loaded["vision_tower.projection.weight"].dtype == torch.bfloat16
+    text_only = dict(iter_weights(
+        str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=False,
+    ))
+    assert not any(k.startswith("vision_tower.") for k in text_only) and qkvg + ".weight" in text_only
 
 
 def test_raw_config_shim_serves_unknown_model_type(tmp_path):

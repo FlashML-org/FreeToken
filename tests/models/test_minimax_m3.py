@@ -14,7 +14,7 @@ import torch
 from freetoken.layers.quantization import MoEConfig
 
 from freetoken.attention.base import AttnType
-from freetoken.models.minimax_m3.config import parse_config
+from freetoken.models.minimax_m3.config import VisionConfig, parse_config
 
 
 class _Cfg:
@@ -213,16 +213,51 @@ def test_sparse_ablation_env(monkeypatch):
     assert resolve_pool_class(cfg) is MHAKVCache
 
 
+def _vision_section(native: bool) -> _Cfg:
+    section = {
+        "hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16, "intermediate_size": 5120,
+        "num_channels": 3, "patch_size": 14, "hidden_act": "gelu", "layer_norm_eps": 1e-5,
+    }
+    if native:
+        section.update(temporal_patch_size=2, spatial_merge_size=2, rope_parameters={"rope_theta": 10000.0, "rope_type": "axial"})
+    else:
+        section.update(rope_theta=10000.0, img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2})
+    return _Cfg(section)
+
+
+def test_parse_config_vision_section_in_both_config_shapes(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_M3_MAX_LAYERS", raising=False)
+    expected = VisionConfig(
+        hidden_size=1280, num_layers=32, num_heads=16, intermediate_size=5120, num_channels=3, patch_size=14, temporal_patch_size=2,
+        spatial_merge_size=2, layer_norm_eps=1e-5, rope_theta=10000.0, projector_hidden_size=6144, text_hidden_size=6144,
+    )
+    raw = _hf_config()
+    raw.vision_config, raw.image_token_index, raw.projector_hidden_size = _vision_section(native=False), 200025, 6144
+    native = _hf_config_native()
+    native.vision_config, native.image_token_id, native.projector_hidden_size = _vision_section(native=True), 200025, 6144
+    for cfg in (raw, native):
+        parsed = parse_config(cfg)
+        assert parsed.is_multimodal and parsed.vision_config == expected and parsed.image_token_id == 200025
+    # a text-only engine hands over a config without the section
+    assert not parse_config(_hf_config()).is_multimodal
+
+
 def test_registry_resolves_both_architectures():
     from freetoken.models.register import get_model_spec
 
     for arch in ("MiniMaxM3SparseForConditionalGeneration", "MiniMaxM3SparseForCausalLM"):
         spec = get_model_spec(arch)
         assert spec.module == "freetoken.models.minimax_m3"
+    multimodal = get_model_spec("MiniMaxM3SparseForConditionalGeneration")
+    assert multimodal.model_cls == "MiniMaxM3ForConditionalGeneration"
+    assert multimodal.mm_processor == "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
+    assert [(e.kind, e.config_key, e.modalities) for e in multimodal.encoders] == [("vision", "vision_config", ("image",))]
+    assert get_model_spec("MiniMaxM3SparseForCausalLM").encoders == ()
 
 
-def test_auto_backend_resolution():
+def test_auto_backend_resolution(monkeypatch):
     from freetoken.attention import attention_backend_info
+    from freetoken.attention.m3_sparse import _pick_inner_backend
     from freetoken.engine.engine import _required_attn_types, _resolve_auto_attention_backend
 
     cfg = parse_config(_hf_config())
@@ -230,6 +265,9 @@ def test_auto_backend_resolution():
     assert required == frozenset({AttnType.BSA})
     assert _resolve_auto_attention_backend(required) == "m3_sparse"
     assert attention_backend_info("m3_sparse").page_sizes == (128,)
+    # the dense leading layers take a FULL backend from the same resolver, filtered to 128-token pages
+    monkeypatch.delenv("FREETOKEN_M3_INNER_BACKEND", raising=False)
+    assert _pick_inner_backend(128) in ("fa,fi", "fi", "triton")
 
 
 def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):

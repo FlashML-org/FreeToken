@@ -68,8 +68,10 @@ class Qwen3Model(BaseOP):
 
 
 class Qwen3MoeForCausalLM(BaseLLMModel):
+    model_cls = Qwen3Model
+
     def __init__(self, config: ModelConfig):
-        self.model = Qwen3Model(config)
+        self.model = self.model_cls(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,

@@ -1,6 +1,7 @@
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .base import BaseOP
 
@@ -190,3 +191,15 @@ class GatedRMSNorm(BaseOP):
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
             is_rms_norm=True, norm_before_gate=True, activation=self.activation,
         )
+
+
+class LayerNorm(BaseOP):
+    """LayerNorm with bias on torch's fused kernel; the decoders use the RMSNorm family."""
+
+    def __init__(self, size: int, eps: float) -> None:
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.bias = torch.empty(size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)

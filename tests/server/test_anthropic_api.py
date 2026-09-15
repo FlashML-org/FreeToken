@@ -17,11 +17,14 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
+from freetoken.message import UserMsg  # noqa: E402
 from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import anthropic_api as A  # noqa: E402
 from freetoken.server.anthropic_models import AnthropicMessagesRequest  # noqa: E402
@@ -421,10 +424,12 @@ class FakeState:
         self._outputs = outputs
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             reasoning_parser=None,
             tool_call_parser="llama3",
             served_model_name="test-model",
             model_path="/test",
+            served_modalities=frozenset(),
         )
         self._uid = 0
         self._count_manager = None
@@ -605,23 +610,20 @@ def test_convert_native_thinking_toggle():
 # --------------------------------------------------------------------------- #
 # /v1/messages/count_tokens (route + neutral count_prompt_tokens primitive)
 # --------------------------------------------------------------------------- #
-class _FakeIds:
-    def __init__(self, n):
-        self._n = n
-
-    def numel(self):
-        return self._n
-
-
 class _FakeTokenizeManager:
-    """Counts tokens as len(str(prompt)) so tests are deterministic without a model."""
+    """Counts tokens as len(str(prompt)) so tests are deterministic without a model; returns the wire message like the real manager."""
 
     def __init__(self):
         self.msgs = []
 
     def tokenize(self, msgs):
+        import torch
+
         self.msgs.extend(msgs)
-        return [_FakeIds(len(str(m.text))) for m in msgs]
+        return [
+            UserMsg(uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params)
+            for m in msgs
+        ]
 
 
 def _count_client(manager=None, maintenance_state="serving"):
@@ -811,10 +813,10 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
 
     orig_load, orig_tm = _utils.load_tokenizer, _tok.TokenizeManager
     _utils.load_tokenizer = _slow_load
-    _tok.TokenizeManager = lambda tok: tok
+    _tok.TokenizeManager = lambda tok, mm=None: tok
     try:
         fm = FrontendManager(
-            config=SimpleNamespace(model_path="dedupe-test"),
+            config=SimpleNamespace(model_path="dedupe-test", mm=None),
             send_tokenizer=None,
             recv_tokenizer=None,
         )
@@ -865,3 +867,112 @@ def test_tool_result_carries_the_wire_tool_use_id():
     results = [m for m in spec.messages if m["role"] == "tool"]
     assert [(m["tool_call_id"], m["content"]) for m in results] == [
         ("toolu_b", "60F"), ("toolu_a", "72F")]
+
+
+def test_count_tokens_reads_the_real_manager_return_contract():
+    import torch
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return "rendered"
+
+        def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+            return torch.tensor([[7, 8, 9, 10, 11]], dtype=torch.long)
+
+    client, _ = _count_client(TokenizeManager(_Tokenizer()))
+    r = client.post(
+        "/v1/messages/count_tokens",
+        json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"input_tokens": 5}
+
+
+def test_tool_result_image_moves_to_the_following_user_turn():
+    # Claude Code's Read on an image file: the tool_result carries the image, the user turn carries the reminder text.
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "shot taken"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                        ],
+                    },
+                    {"type": "text", "text": "<system-reminder>look</system-reminder>"},
+                ],
+            },
+        ],
+    }
+    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+    assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": "shot taken"}
+    assert messages[-1] == {
+        "role": "user",
+        "content": [
+            {"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}},
+            {"type": "text", "text": "<system-reminder>look</system-reminder>"},
+        ],
+    }
+    # On a server without vision the image is refused as an image input, not dropped.
+    r = _client(FakeState([])).post("/v1/messages", json=body)
+    assert r.status_code == 400, r.text
+    assert "vision" in r.json()["error"]["message"]
+
+
+def test_tool_result_image_outside_a_user_message_is_rejected():
+    # Anthropic only allows tool_result in user messages; an image there has no user turn to ride on.
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                    }
+                ],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="user message"):
+        A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+
+
+def test_image_only_tool_result_keeps_an_empty_tool_message():
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                    }
+                ],
+            },
+        ],
+    }
+    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+    assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": ""}
+    assert messages[-1] == {
+        "role": "user",
+        "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
+    }

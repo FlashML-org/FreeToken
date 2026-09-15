@@ -11,14 +11,16 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import MiniMaxM3Attention
 from .mlp import MiniMaxM3MLP
 from .moe import MiniMaxM3SparseMoeBlock
+from .vision import MiniMaxM3VisionModel
 
 if TYPE_CHECKING:
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
 
@@ -79,7 +81,7 @@ class MiniMaxM3Model(BaseOP):
         self.norm = GemmaPlusOneRMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -105,4 +107,17 @@ class MiniMaxM3ForCausalLM(BaseLLMModel):
         return self.lm_head.forward(output)
 
 
-__all__ = ["MiniMaxM3ForCausalLM"]
+class MiniMaxM3ForConditionalGeneration(MiniMaxM3ForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.vision_tower = MiniMaxM3VisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.vision_tower.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.vision_tower.forward(item.feature, item.grid_thw)
+
+
+__all__ = ["MiniMaxM3ForCausalLM", "MiniMaxM3ForConditionalGeneration"]

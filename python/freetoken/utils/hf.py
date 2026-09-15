@@ -191,19 +191,48 @@ def _raw_config_json(model_path: str) -> dict:
         return json.load(f)
 
 
+def sidecar_quantization_config(model_path: str) -> dict | None:
+    """The ``quantization_config`` an old ModelOpt export keeps only in ``hf_quant_config.json``, or None."""
+    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
+    if sidecar is None:
+        return None
+    with open(sidecar, encoding="utf-8") as f:
+        quant = json.load(f).get("quantization")
+    if not isinstance(quant, dict):
+        return None
+    return {"quant_method": "modelopt", **quant}
+
+
+def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
+    # config.json wins when it has one; the sidecar is only read for exports that never wrote it there
+    if getattr(config, "quantization_config", None) is not None:
+        return
+    if getattr(getattr(config, "text_config", None), "quantization_config", None) is not None:
+        return
+    quant = sidecar_quantization_config(model_path)
+    if quant is None:
+        return
+    if isinstance(config, RawConfigShim):
+        config._data["quantization_config"] = quant
+    else:
+        config.quantization_config = quant
+
+
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.
     try:
-        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except ValueError as exc:
         # Unknown model_type on this transformers version: serve off the raw JSON.
         # Anything else (bad path, malformed JSON) stays fatal.
         if "model type" not in str(exc):
             raise
-        return RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+        config = RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+    _merge_sidecar_quantization_config(config, model_path)
+    return config
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:

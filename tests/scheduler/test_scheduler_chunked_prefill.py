@@ -150,3 +150,90 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     batch = pm.schedule_next_batch(16)
     assert batch is not None
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
+
+
+def test_chunk_ends_before_an_image_it_would_cut_on_bidirectional_models():
+    from freetoken.core import SamplingParams
+    from freetoken.message import MMItem
+    from freetoken.scheduler.utils import PendingReq
+
+    def chunk_lens(keep_images_whole):
+        cm, tm, dm, pm = _build_managers(num_pages=64)
+        pm.keep_images_whole = keep_images_whole
+        image = MMItem(modality="image", hash=1, pad_value=1, offsets=[[10, 20]], feature=torch.zeros(1))
+        pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(30, dtype=torch.int32),
+                                      sampling_params=SamplingParams(max_tokens=4), mm_items=[image])]
+        lens = []
+        while pm.runnable:
+            batch = pm.schedule_next_batch(15)
+            cm.allocate_paged(batch.reqs)
+            for r in batch.reqs:
+                lens.append(r.extend_len)
+                r.complete_one()
+        return lens
+
+    assert chunk_lens(True) == [10, 15, 5]  # a 15-token chunk would cut the image at 10..20: stop at 10, the image goes whole into the next chunk
+    assert chunk_lens(False) == [15, 15]  # causal models lose nothing to a cut image and keep the plain chunking
+
+
+def test_a_shared_pass_defers_an_image_it_cannot_hold_whole():
+    """Another request took most of the pass: the image waits for a pass of its own instead of being cut at the leftover."""
+    from freetoken.core import SamplingParams
+    from freetoken.message import MMItem
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, tm, dm, pm = _build_managers(num_pages=128)
+    pm.keep_images_whole = True
+    text = PendingReq(uid=UID, input_ids=torch.arange(35, dtype=torch.int32), sampling_params=SamplingParams(max_tokens=4))
+    image = MMItem(modality="image", hash=1, pad_value=1, offsets=[[0, 20]], feature=torch.zeros(1))
+    with_image = PendingReq(uid=UID + 1, input_ids=torch.arange(100, 130, dtype=torch.int32),
+                            sampling_params=SamplingParams(max_tokens=4), mm_items=[image])
+    pm.pending_list = [text, with_image]
+    first = pm.schedule_next_batch(40)
+    assert [(r.uid, r.extend_len) for r in first.reqs] == [(UID, 35)]  # the 5 tokens left cannot hold the 20-token image
+    cm.allocate_paged(first.reqs)
+    for r in first.reqs:
+        r.complete_one()
+    second = pm.schedule_next_batch(40)
+    assert [(r.uid, r.extend_len) for r in second.reqs] == [(UID + 1, 30)]
+
+
+def test_the_sliding_window_pool_cap_cannot_recut_an_image():
+    """The image boundary is decided after the pool cap: a pool of 5000 tokens ends the chunk before the image at 4900, not inside it."""
+    from freetoken.core import SamplingParams
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.message import MMItem
+    from freetoken.models.config import KVCacheGroupSpec
+    from freetoken.scheduler.cache import CacheManager
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.mm import cut_image_spans
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    _setup_context()
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    groups = (
+        KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
+        KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=1024),
+    )
+    pool = HybridSWAKVCache(groups=groups, num_layers=2, num_full_pages=8192, page_size=1, dtype=torch.bfloat16,
+                            device=torch.device("cpu"), num_swa_tokens=5000)
+    pt = torch.zeros((MAX_RUNNING + 1, 8192), dtype=torch.int32)
+    cm = CacheManager(num_pages=8192, page_size=1, page_table=pt, type="swa_radix", swa_pool=pool, sliding_window_size=1024)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=MAX_RUNNING, page_table=pt), DecodeManager(1), keep_images_whole=True)
+    image = MMItem(modality="image", hash=1, pad_value=1, offsets=[[4900, 5156]], feature=torch.zeros(1))
+    pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(6000, dtype=torch.int32),
+                                  sampling_params=SamplingParams(max_tokens=1), mm_items=[image])]
+    ends = []
+    while pm.runnable:
+        batch = pm.schedule_next_batch(8192)
+        assert cut_image_spans(batch.reqs) == []
+        ends.append(batch.reqs[0].device_len)
+        cm.free_swa_out_of_window_extend(batch.reqs)
+        cm.allocate_paged(batch.reqs)
+        for r in batch.reqs:
+            r.complete_one()
+    assert ends[0] == 4900 and ends[-1] == 6000

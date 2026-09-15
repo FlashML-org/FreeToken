@@ -9,7 +9,6 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
     detect_expert_quant,
-    vision_load_enabled,
 )
 
 
@@ -29,7 +28,18 @@ class VisionConfig:
     hidden_act: str
     standardize: bool
     use_clipped_linears: bool
-    soft_tokens_per_image: int
+    text_hidden_size: int
+
+
+@dataclass(frozen=True)
+class UnifiedVisionConfig:
+    """The gemma4_unified release's encoder-free vision path: one super-patch becomes one soft token."""
+
+    hidden_size: int
+    patch_dim: int
+    posemb_size: int
+    layer_norm_eps: float
+    rms_norm_eps: float
     text_hidden_size: int
 
 
@@ -40,19 +50,22 @@ def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
     return hf_config, top_architectures, hf_config
 
 
-def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | None:
+def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | UnifiedVisionConfig | None:
     vc = getattr(top_cfg, "vision_config", None)
     if vc is None:
         return None
-    # Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    # resident, never-quantized (bf16) GPU weights that text-only serving never touches:
-    # forward() ignores them and _merge_multimodal is a no-op without image embeds. Default
-    # to text-only so that VRAM goes to KV / the expert cache; set FREETOKEN_LOAD_VISION=1
-    # to load it. Returning None here is the single switch -- both the model build (model.py)
-    # and weight loading (weight.py `include_vision = config.is_multimodal`) flow through
-    # parse_config, so is_multimodal flips off consistently across both.
-    if not vision_load_enabled():
-        return None
+    if getattr(vc, "num_attention_heads", None) is None:
+        # the gemma4_unified release's section describes a linear embedder without attention; any other tower-less section is not served
+        if getattr(vc, "model_patch_size", None) is None:
+            return None
+        return UnifiedVisionConfig(
+            hidden_size=vc.mm_embed_dim,
+            patch_dim=3 * vc.model_patch_size**2,
+            posemb_size=vc.mm_posemb_size,
+            layer_norm_eps=1e-5,  # the reference builds torch LayerNorms with the default eps
+            rms_norm_eps=vc.rms_norm_eps,
+            text_hidden_size=text_hidden_size,
+        )
     rope_params = getattr(vc, "rope_parameters", None) or {}
     act = getattr(vc, "hidden_activation", "gelu_pytorch_tanh")
     act = "gelu_tanh" if "tanh" in act else act
@@ -72,10 +85,6 @@ def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | 
         hidden_act=act,
         standardize=bool(getattr(vc, "standardize", True)),
         use_clipped_linears=bool(getattr(vc, "use_clipped_linears", False)),
-        soft_tokens_per_image=int(
-            getattr(top_cfg, "vision_soft_tokens_per_image", None)
-            or getattr(vc, "default_output_length", 280)
-        ),
         text_hidden_size=text_hidden_size,
     )
 
@@ -196,9 +205,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
                 head_dim=sliding_head_dim,
                 rotary_config=swa_rotary_config,
                 sliding_window=cfg.sliding_window,
+                bidirectional_mm_blocks=getattr(cfg, "use_bidirectional_attention", None) == "vision",
             ),
         ),
     )
 
 
-__all__ = ["VisionConfig", "parse_config"]
+__all__ = ["UnifiedVisionConfig", "VisionConfig", "parse_config"]

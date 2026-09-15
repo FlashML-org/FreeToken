@@ -71,7 +71,7 @@ def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
 
 
 def _config(spec, *, page_size=64, max_running_req=3):
-    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True)
+    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False)
     mc.kv_cache_group_specs = lambda: (spec,)
     return SimpleNamespace(
         model_config=mc,
@@ -201,6 +201,7 @@ def test_resolve_pool_class_and_factory():
 
     spec = _spec()
     mc = SimpleNamespace(
+        model_is_mrope=False,
         num_layers=8, has_swa_attention=False, has_linear_attention=True,
         num_kv_heads=2, head_dim=64, dsv4_args=None,
     )

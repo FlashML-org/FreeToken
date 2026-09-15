@@ -18,7 +18,7 @@ class ModelOptConfig(QuantConfig):
 
     SCHEMES: ClassVar[dict[str, QuantScheme]] = {
         "NVFP4": nvfp4_scheme(input_scale=True),
-        "NVFP4_NO_INPUT": nvfp4_scheme(input_scale=False),
+        "W4A16_NVFP4": nvfp4_scheme(input_scale=False),
         "FP8": fp8_tensor_scheme("fp32", input_scale=True),
         "FP8_PER_CHANNEL_PER_TOKEN": fp8_tensor_scheme("fp32", per_row=True),
         "FP8_PB_WO": fp8_block_scheme("fp32"),
@@ -39,10 +39,15 @@ class ModelOptConfig(QuantConfig):
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)
         self.algo = str(q.get("quant_algo") or "").upper()
+        # Inferact exports carry this key; false says the FP8 and NVFP4 layers store no input_scale, and an explicit value wins over the config_groups rule below
+        self.with_input_scale = q.get("with_input_scale")
+        groups = q.get("config_groups")
+        # an export with no activation quantizer can still say NVFP4; every config group then has input_activations null (vLLM applies the same rule)
+        if self.with_input_scale is None and self.algo == "NVFP4" and isinstance(groups, dict) and groups and all(isinstance(g, dict) and g.get("input_activations") is None for g in groups.values()):
+            self.algo = "W4A16_NVFP4"
         self.ignore = name_set(tuple(q.get("ignore") or q.get("exclude_modules") or ()))
         layers = q.get("quantized_layers") or {}
         self.quantized_layers = {k: str((v or {}).get("quant_algo") or "").upper() for k, v in layers.items()} if isinstance(layers, dict) else {}
-        self.with_input_scale = bool(q.get("with_input_scale", True))
         if self.algo == "MIXED_PRECISION" and not self.quantized_layers:
             raise NotImplementedError("ModelOpt MIXED_PRECISION without quantized_layers in quantization_config")
         if self.algo != "MIXED_PRECISION":
@@ -64,8 +69,11 @@ class ModelOptConfig(QuantConfig):
         return None
 
     def _scheme_of(self, algo: str) -> QuantScheme:
-        if algo in ("NVFP4", "W4A16_NVFP4"):
-            return self.SCHEMES["NVFP4" if self.with_input_scale else "NVFP4_NO_INPUT"]
+        if self.with_input_scale is False:
+            if algo == "FP8":
+                return fp8_tensor_scheme("fp32")  # ModelOpt has no algo name for fp8 without an activation scale
+            if algo == "NVFP4":
+                algo = "W4A16_NVFP4"
         try:
             return self.SCHEMES[algo]
         except KeyError:

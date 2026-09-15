@@ -7,8 +7,9 @@ supported: text-only key layouts, TP > 1, resident routed experts.
 
 Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
 other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
-renamed ``model.language_model.X`` -> ``model.X``. ``model.visual.*`` and the trailing
-MTP layer are never read.
+renamed ``model.language_model.X`` -> ``model.X``. The vision tower loads as stored under
+``model.visual.X`` -> ``visual.X`` when an encoder is built; the trailing MTP layer is
+never read.
 
 Load-time fusions (must mirror the module split orders):
 
@@ -157,12 +158,19 @@ def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
         yield f"{dst}.indexer.{part}", reader.get(f"{src}.indexer.{part}").to(dtype)
 
 
+def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]:
+    for name in weight_map:
+        if name.startswith("model.visual."):
+            yield "visual." + name[len("model.visual.") :], reader.get(name).to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
@@ -224,6 +232,8 @@ def iter_weights(
         ).to(torch.bfloat16)
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
         yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        if include_vision:
+            yield from _iter_vision(reader, weight_map)
     finally:
         reader.close()
 

@@ -18,7 +18,7 @@ PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
 
 def _pend(ids):
     t = torch.tensor(ids, dtype=torch.int32)
-    return SimpleNamespace(input_ids=t, input_len=len(ids), mm_embeds=None)
+    return SimpleNamespace(input_ids=t, input_len=len(ids))
 
 
 def _admit(cm, page_table, table_idx, ids, handle):

@@ -41,6 +41,8 @@ class AttentionSpec:
     sliding_window: int | None = None
     sm_scale: float | None = None
     sinks: torch.Tensor | None = None
+    # rows of a multimodal span (batch.mm_block_ends) also attend to the span's later keys
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass

@@ -23,6 +23,7 @@ The checkpoint is served in the precision its quantization_config declares.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -35,6 +36,46 @@ from freetoken.models.config import (
 
 from .args import load_args
 
+
+@dataclass(frozen=True)
+class VisionConfig:
+    hidden_size: int
+    depth: int
+    num_heads: int
+    intermediate_size: int
+    projection_intermediate_size: int
+    out_hidden_size: int
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    rms_norm_eps: float
+    swiglu_limit: float
+    attention_bias: bool
+
+
+def parse_vision_config(hf_config: Any) -> VisionConfig | None:
+    """None when the config carries no vision section, which is how a text-only engine asks for no tower."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    if vc.hidden_act != "silu":
+        raise NotImplementedError(f"glm5_next vision tower activation {vc.hidden_act!r}; only silu is implemented")
+    return VisionConfig(
+        hidden_size=vc.hidden_size,
+        depth=vc.depth,
+        num_heads=vc.num_heads,
+        intermediate_size=vc.intermediate_size,
+        projection_intermediate_size=vc.projection_intermediate_size,
+        out_hidden_size=vc.out_hidden_size,
+        in_channels=vc.in_channels,
+        patch_size=vc.patch_size,
+        temporal_patch_size=vc.temporal_patch_size,
+        spatial_merge_size=vc.spatial_merge_size,
+        rms_norm_eps=vc.rms_norm_eps,
+        swiglu_limit=vc.swiglu_limit,
+        attention_bias=bool(vc.attention_bias),
+    )
 
 
 def _dsa_on(args, dsa_layer_ids) -> bool:
@@ -204,10 +245,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=args.qk_head_dim**-0.5,
         has_attn_bias=bool(getattr(text, "attention_bias", False)),
         swiglu_limit=args.swiglu_limit,
-        vision_config=None,  # text-only milestone; model.visual.* weights are dropped
+        vision_config=parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         glm5_args=args,
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["VisionConfig", "parse_config", "parse_vision_config"]

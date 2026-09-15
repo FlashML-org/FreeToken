@@ -175,6 +175,10 @@ MODELOPT_MIXED = {
         **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for l in (0, 1)},
     },
 }
+# ornith-ai/Ornith-1.5-35B-A3B-NVFP4: the same mix with W4A16 experts
+MODELOPT_MIXED_A16 = {**MODELOPT_MIXED, "quantized_layers": {
+    **MODELOPT_MIXED["quantized_layers"], **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16} for l in (0, 1)}}}
+MODELOPT_MIXED_NOINPUT = {**MODELOPT_MIXED, "with_input_scale": False}
 # sakamakismile/Qwen3.6-27B-NVFP4: every Linear of the dense model, GDN in_proj included
 CT_NVFP4_DENSE = _ct({"group_0": {**NVFP4_GROUP, "targets": ["Linear"]}}, ["lm_head"], "nvfp4-pack-quantized")
 # RedHatAI/Qwen3.6-35B-A3B-NVFP4: every Linear but the GDN, the routers and lm_head
@@ -209,11 +213,18 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
         _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, lambda w: _fp8_block(w, ct=False))
         _experts(raw, lambda w: _fp8_block(w, ct=False))
         return moe, QWEN_FP8, raw
-    if name == "modelopt_mixed":
+    if name.startswith("modelopt_mixed"):
         _quantize(raw, GDN_QKVZ_OUT + ATTN, _fp8_tensor)
         _quantize(raw, SHARED + ["lm_head"], lambda w: _nvfp4(w, ct=False))
         _experts(raw, lambda w: _nvfp4(w, ct=False))
-        return moe, MODELOPT_MIXED, raw
+        # _a16: the W4A16 layers ship no activation scale (ornith-ai); _noinput: no layer does and the config says with_input_scale false (jhone888)
+        if name == "modelopt_mixed_a16":
+            stripped = lambda k: ".mlp." in k or k.startswith("lm_head")
+        else:
+            stripped = lambda k: name == "modelopt_mixed_noinput"
+        for key in [k for k in raw if k.endswith(".input_scale") and stripped(k)]:
+            del raw[key]
+        return moe, {"modelopt_mixed_a16": MODELOPT_MIXED_A16, "modelopt_mixed_noinput": MODELOPT_MIXED_NOINPUT}.get(name, MODELOPT_MIXED), raw
     if name == "ct_nvfp4_dense":
         _quantize(raw, GDN_QKVZ_OUT + GDN_BA + ATTN + DENSE_MLP, lambda w: _nvfp4(w, ct=True))
         return moe, CT_NVFP4_DENSE, raw
@@ -242,7 +253,7 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
     raise KeyError(name)
 
 
-LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
+LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "modelopt_mixed_a16", "modelopt_mixed_noinput", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
 
 
 def _config_json(moe: bool, quantization_config) -> dict:
@@ -278,9 +289,9 @@ def _install(folder: str) -> None:
     set_quant_config(checkpoint_quant_config(folder, hf, get_model_spec(hf.architectures[0])))
 
 
-def _load(folder: str, *, experts: bool = False) -> dict[str, torch.Tensor]:
+def _load(folder: str, *, experts: bool = False, vision: bool = True) -> dict[str, torch.Tensor]:
     _install(folder)
-    return {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_moe_experts=experts, include_non_moe=True)}
+    return {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_moe_experts=experts, include_non_moe=True, include_vision=vision)}
 
 
 def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
@@ -288,11 +299,13 @@ def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
     from freetoken.models import create_model
     from freetoken.utils.torch_utils import torch_dtype
 
     strategy = "offload" if cached_load_hf_config(folder).architectures[0].startswith("Qwen3_5Moe") else "auto"
-    config = EngineConfig(model_path=folder, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy)
+    config = EngineConfig(model_path=folder, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy,
+                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", strategy)
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE
@@ -319,14 +332,14 @@ def checkpoint(request, tmp_path_factory):
 def test_emitted_keys_are_the_model_state_dict(checkpoint):
     """Every layout fills exactly the buffers the engine builds from the same config, with the buffers' shapes and (for the weights) dtypes."""
     _name, folder, _raw = checkpoint
-    loaded, state = _load(folder), _meta_state_dict(folder)
+    loaded, state = _load(folder, vision=False), _meta_state_dict(folder)
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():
         assert tensor.shape == state[key].shape, key
         if key.endswith(".weight"):
             assert tensor.dtype is state[key].dtype, key
     assert not any(k.endswith((".input_global_scale", ".weight_scale_2", ".weight_global_scale", ".k_scale")) for k in loaded)
-    assert not any(".mlp.experts." in k or k.startswith(("mtp.", "model.visual.")) for k in loaded)
+    assert not any(".mlp.experts." in k or k.startswith("mtp.") for k in loaded)
 
 
 def test_expert_quant_tag_follows_the_config(checkpoint):
@@ -399,25 +412,28 @@ def test_block_fp8_fuses_weight_and_scale_per_kind(checkpoint):
 
 def test_modelopt_fp8_scales_broadcast_per_part_and_input_scale_is_the_max(checkpoint):
     name, folder, raw = checkpoint
-    if name != "modelopt_mixed":
-        pytest.skip("modelopt layout only")
+    if not name.startswith("modelopt_mixed"):
+        pytest.skip("modelopt layouts only")
     loaded = _load(folder)
     attn = f"{LM}.layers.1.self_attn"
     scale = loaded["model.layers.1.self_attn.qkv_proj.weight_scale"]
     assert scale.dtype is torch.float32 and scale.shape == (2 * QH * AHD + 2 * KVH * AHD,)
     expected = torch.cat([raw[f"{attn}.{p}_proj.weight_scale"].expand(raw[f"{attn}.{p}_proj.weight"].shape[0]) for p in "qkv"])
     assert torch.equal(scale, expected)
-    assert torch.equal(loaded["model.layers.1.self_attn.qkv_proj.input_scale"], torch.stack([raw[f"{attn}.{p}_proj.input_scale"] for p in "qkv"]).max())
-    assert loaded["model.layers.1.self_attn.o_proj.input_scale"].shape == ()
-    # NVFP4 shared expert: each part keeps its own block scales and global; the input scale is the max of the parts
+    if name == "modelopt_mixed_noinput":
+        assert not any(k.endswith(".input_scale") for k in loaded)
+    else:
+        assert torch.equal(loaded["model.layers.1.self_attn.qkv_proj.input_scale"], torch.stack([raw[f"{attn}.{p}_proj.input_scale"] for p in "qkv"]).max())
+        assert loaded["model.layers.1.self_attn.o_proj.input_scale"].shape == ()
+    # NVFP4 shared expert: each part keeps its own block scales and global
     shared = f"{LM}.layers.0.mlp.shared_expert"
     fused = "model.layers.0.mlp.shared_expert.gate_up_proj"
     assert _same(loaded[f"{fused}.weight"][:I], raw[f"{shared}.gate_proj.weight"])
     assert _same(loaded[f"{fused}.weight_scale"][I:], raw[f"{shared}.up_proj.weight_scale"])
     glob = loaded[f"{fused}.weight_global"]
     assert glob.dtype is torch.float16 and torch.equal(glob[:I], raw[f"{shared}.gate_proj.weight_scale_2"].to(torch.float16).expand(I))
-    assert torch.equal(loaded[f"{fused}.input_scale"], torch.stack([raw[f"{shared}.{p}_proj.input_scale"] for p in ("gate", "up")]).max())
-    assert loaded["lm_head.input_scale"].shape == ()
+    # W4A16: no activation quantizer, so the layer has no input_scale even when the export ships one
+    assert f"{fused}.input_scale" not in loaded and "lm_head.input_scale" not in loaded
     assert loaded["lm_head.weight"].dtype is torch.uint8 and loaded["lm_head.weight_global"].shape == (V,)
 
 
@@ -484,7 +500,7 @@ def test_static_fp8_keeps_the_activation_scale_and_ignored_expert_containers_do_
 
 def test_nvfp4_expert_pieces_read_either_dialect_from_a_single_file(checkpoint):
     name, folder, raw = checkpoint
-    if name not in ("modelopt_mixed", "ct_nvfp4_moe", "ct_tensor_fp8_moe"):
+    if not name.startswith("modelopt_mixed") and name not in ("ct_nvfp4_moe", "ct_tensor_fp8_moe"):
         pytest.skip("NVFP4 expert layouts only")
     _install(folder)
     config = parse_config(cached_load_hf_config(folder))
@@ -494,7 +510,7 @@ def test_nvfp4_expert_pieces_read_either_dialect_from_a_single_file(checkpoint):
     layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
     assert (e0, e1) == (2, 3)
     base = f"{LM}.layers.1.mlp.experts.2.gate_proj"
-    if name == "modelopt_mixed":
+    if name.startswith("modelopt_mixed"):
         assert _same(piece["gate"][0], raw[f"{base}.weight"])
         assert torch.equal(piece["gate_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).to(torch.float16))
     else:
@@ -557,13 +573,18 @@ REJECTED = [
     pytest.param(None, lambda w: {f"{ATTN1}.o_proj.weight": w.to(FP8)},
                  r"o_proj\.weight is torch\.float8", id="fp8 weight the config declares bf16"),
     pytest.param(MODELOPT_MIXED, lambda w: {f"{ATTN1}.o_proj.weight": w, f"{ATTN1}.o_proj.weight_scale": torch.rand(()), f"{ATTN1}.o_proj.input_scale": torch.rand(())},
-                 r"o_proj: weight is torch\.bfloat16", id="bf16 weight the config declares fp8"),
+                 r"o_proj\.weight is torch\.bfloat16 but .*declares .*fp8_tensor", id="bf16 weight the config declares fp8"),
+    pytest.param({"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4"}, lambda w: {f"{ATTN1}.o_proj.weight": w},
+                 r"o_proj\.weight is torch\.bfloat16 but .*declares .*nvfp4", id="bf16 weight the config declares nvfp4"),
+    pytest.param({"quant_method": "modelopt", "quant_algo": "NVFP4"},
+                 lambda w: {f"{ATTN1}.o_proj.weight": torch.zeros(H, QH * AHD // 2, dtype=torch.uint8), f"{ATTN1}.o_proj.weight_scale": torch.zeros(H, QH * AHD // 16, dtype=FP8), f"{ATTN1}.o_proj.weight_scale_2": torch.rand(()), f"{ATTN1}.k_proj.input_scale": torch.rand(())},
+                 r"(?s)o_proj: missing \['input_scale'\] \(an export without activation scales declares W4A16_NVFP4", id="w4a4 config with one input_scale missing"),
     pytest.param(CT_MIXED_FAST, lambda w: {f"{ATTN1}.o_proj.weight": w.to(FP8), f"{ATTN1}.o_proj.weight_scale": torch.rand(3, 1)},
                  "expected 1 or", id="per-channel scale with the wrong row count"),
     pytest.param(CT_BLOCK_MOE, lambda w: {f"{ATTN1}.o_proj.weight": w.to(FP8), f"{ATTN1}.o_proj.weight_scale": torch.rand(2, 1)},
                  r"weight_scale_inv is \(2, 1\), expected \(1, 2\)", id="block scale of the wrong shape"),
     pytest.param(CT_NVFP4_MOE, lambda w: {f"{ATTN1}.o_proj.weight_packed": torch.zeros(H, QH * AHD // 2, dtype=torch.uint8), f"{ATTN1}.o_proj.weight_global_scale": torch.rand(1)},
-                 "missing tensors of .*o_proj", id="quantized module without its block scale"),
+                 r"(?s)missing tensors the quant config declares.*o_proj: missing \['input_scale', 'weight_scale'\]", id="quantized module without its block scale"),
 ]
 
 

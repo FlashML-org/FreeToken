@@ -12,6 +12,8 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import embed_input_ids
+from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen3_5Attention
@@ -87,7 +89,7 @@ class Qwen3_5Model(BaseOP):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -95,7 +97,7 @@ class Qwen3_5Model(BaseOP):
         return x
 
 
-class Qwen3_5MoEForCausalLM(BaseLLMModel):
+class Qwen3_5ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
         self.lm_head = ParallelLMHead(
@@ -113,4 +115,25 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         return self.lm_head.forward(output)
 
 
-__all__ = ["Qwen3_5MoEForCausalLM"]
+class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    """The MoE releases share the dense code path: the decoder picks the routed or dense MLP from config.num_experts."""
+
+
+class Qwen3_5ForConditionalGeneration(QwenVLVisionMixin, Qwen3_5ForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.5 consumes no DeepStack features"
+            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+
+
+class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    """The MoE releases with the vision tower; see Qwen3_5MoeForCausalLM."""
+
+
+__all__ = [
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+]
