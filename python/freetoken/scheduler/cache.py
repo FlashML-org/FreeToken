@@ -452,18 +452,20 @@ class CacheManager:
             # Soft-pin the prompt-end window: decode never re-stamps the prompt path, so after
             # the unlock above it is the stalest LRU entry and the first evict_swa victim. A
             # follow-up turn diverges at the prompt end when the client drops reasoning; a cut
-            # there only needs the trailing window live, so eagerly reclaim the head's swa
-            # (full KV stays for the full-attn layers) and re-stamp the retained tail -- still
+            # there only needs the trailing window live, so re-stamp the retained tail -- still
             # unlocked, so it remains reclaimable under real pressure.
+            #
+            # Do NOT eagerly free the head's windowed KV. A shared prefix is reused by FAN-OUT,
+            # not only by append: many requests that share a system prompt (and tool schemas)
+            # and each carry their own message diverge a whole message before the previous
+            # prompt's end. Reuse needs windowed KV live at the divergence point, so reclaiming
+            # everything below `prompt_len - window - gap` means every such request re-prefills
+            # the shared prefix -- measured 0% reuse against 99% for the append case, i.e. the
+            # fan-out paid a full 8k-token prefill (issue #200). The head stays unlocked and
+            # untombstoned, so under real pressure it is still the first thing evict_swa
+            # reclaims; the pool reclaims it lazily instead of eagerly.
             prompt_len = align_down(req.max_device_len - req.output_len, self.page_size)
             if prompt_len > 0:
-                keep_from = align_down(
-                    max(prompt_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0),
-                    self.page_size,
-                )
-                if keep_from > 0:
-                    self._free_swa(
-                        self.prefix_cache.trim_head_swa(req.input_ids[:prompt_len], keep_from))
                 self.prefix_cache.match_prefix(req.input_ids[:prompt_len])
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
