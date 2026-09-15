@@ -77,6 +77,11 @@ class EngineConfig:
     # DSV4 window/full ratio directly. Used only when swa_num_pages_override is None (a runtime
     # rebuild can pin an absolute window instead).
     swa_full_tokens_ratio: float = 0.2
+    # Force one decode step after this many consecutive prefill steps, so a long chunked
+    # prefill cannot starve in-flight decodes. None/0 keeps the historical prefill-first
+    # order (the scheduler's own TODO names this: "support other policies: e.g. DECODE
+    # first"). At 8 the cost is ~1% of prefill wall time.
+    decode_interleave_every: int | None = None
     # Absolute window-pool size in the pool's own pages (usable, dummy excluded); None -> use the
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
