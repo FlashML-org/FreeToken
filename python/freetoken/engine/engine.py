@@ -1022,12 +1022,9 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
 
 def _fused_resident_ok(model_config) -> bool:
     """Whether the resident ('fused') MoE path can hold this model's experts.
-
-    Mirrors the validation further down: fused requires expert_quant in
-    {none, fp8_block}. Legacy weight formats (mxfp4/q4_0 via moe_weight_format)
-    still dispatch on the offload cache's format tag, so they stay offload-only.
-    NVFP4 checkpoints have a resident_view since the quant-method refactor, but
-    the nvfp4-fused combination is not yet validated; keep it offload until it is."""
+   
+       FIXME: auto resolves to fused only for bf16 and fp8_block experts; drop this gate once the other quant formats support fused.
+       """
     expert_quant = getattr(model_config, "expert_quant", "none")
     if expert_quant not in ("none", "fp8_block"):
         return False
