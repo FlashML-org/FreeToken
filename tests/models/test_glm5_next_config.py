@@ -101,7 +101,12 @@ def _hf_config(quantization_config: dict | None = None) -> RawConfigShim:
         "architectures": ["Glm5NextForConditionalGeneration"],
         "model_type": "glm5_next",
         "text_config": _text_config(),
-        "vision_config": {"model_type": "glm5_next_vision", "depth": 24},
+        "vision_config": {
+            "model_type": "glm5_next_vision", "depth": 24, "hidden_size": 1024, "num_heads": 16, "intermediate_size": 4096,
+            "projection_intermediate_size": 10240, "out_hidden_size": 4096, "in_channels": 3, "patch_size": 14,
+            "temporal_patch_size": 2, "spatial_merge_size": 2, "rms_norm_eps": 1e-5, "swiglu_limit": 10.0,
+            "attention_bias": True, "hidden_act": "silu",
+        },
         "image_token_id": 154854,
     }
     if quantization_config is not None:
@@ -204,8 +209,19 @@ def test_moe_and_scalars():
     assert cfg.is_moe
     # checkpoint-faithful: the resident projections follow the quantization_config, never a switch
     assert (cfg.attn_quant, cfg.dense_quant, cfg.lm_head_quant) == ("none",) * 3
-    # Text-only serving: the vision tower is never built.
-    assert cfg.vision_config is None
+
+
+def test_vision_section_parses_into_the_tower_config():
+    cfg = parse_config(_hf_config())
+    # the merger lands in the text width, so the soft tokens scatter into the embeddings unprojected
+    assert cfg.vision_config.out_hidden_size == cfg.hidden_size
+    # a text-only engine hands the parser a config without the section
+    assert parse_config(RawConfigShim({**_hf_config().to_dict(), "vision_config": None})).vision_config is None
+    # the tower implements the clamped SwiGLU only
+    data = _hf_config().to_dict()
+    data["vision_config"]["hidden_act"] = "gelu"
+    with pytest.raises(NotImplementedError, match="silu"):
+        parse_config(RawConfigShim(data))
 
 
 def test_args_alias_folding_and_nope():
@@ -233,7 +249,7 @@ def test_registry_resolves_glm5_next():
 
     spec = get_model_spec("Glm5NextForConditionalGeneration")
     assert spec.module == "freetoken.models.glm5_next"
-    assert spec.model_cls == "Glm5NextForCausalLM"
+    assert spec.model_cls == "Glm5NextForConditionalGeneration"
     assert get_model_spec("Glm5NextForCausalLM").module == spec.module
 
 

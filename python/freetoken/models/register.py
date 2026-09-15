@@ -65,6 +65,8 @@ _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
 )
+_GLM5_NEXT_PROCESSOR = "freetoken.mm.processors.glm5_next:Glm5NextMMProcessor"
+_GLM5_NEXT_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 # Gemma 4 keeps HF's flat layer children (mlp / experts / router) under one feed_forward block.
 _GEMMA4_SEGMENTS = (
     ("feed_forward.shared_mlp", "mlp"),
@@ -75,9 +77,13 @@ _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
 _GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
+_MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
     ("index_qk_proj", ("index_q_proj", "index_k_proj")),
 ) + _EXPERTS_W123_PACKED
+_MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
+_MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LlamaForCausalLM": ModelSpec(
@@ -123,14 +129,17 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W123_PACKED,
     ),
     # MiniMax-M3 (model_type minimax_m3_vl): multimodal wrapper config (text tower in
-    # text_config, weights under language_model.); served text-only. GQA + block-sparse
-    # attention (lightning indexer, top-k 128-token blocks) on the trailing layers,
-    # sigmoid/bias-routed NVFP4 experts + MXFP8 shared expert, swigluoai activation.
+    # text_config, weights under language_model.); the CLIP-style tower under vision_tower.
+    # serves image input. GQA + block-sparse attention (lightning indexer, top-k 128-token
+    # blocks) on the trailing layers, sigmoid/bias-routed NVFP4 experts + MXFP8 shared
+    # expert, swigluoai activation.
     "MiniMaxM3SparseForConditionalGeneration": ModelSpec(
         "freetoken.models.minimax_m3",
-        "MiniMaxM3ForCausalLM",
+        "MiniMaxM3ForConditionalGeneration",
         checkpoint_roots=(("model", "language_model.model"), ("lm_head", "language_model.lm_head")),
         packed_modules_mapping=_MINIMAX_M3_PACKED,
+        mm_processor=_MINIMAX_M3_PROCESSOR,
+        encoders=_MINIMAX_M3_ENCODERS,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "MiniMaxM3SparseForCausalLM": ModelSpec(
@@ -194,18 +203,21 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
-    # text_config, weights under model.language_model.); served text-only. Dense gated GQA
-    # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered
-    # (1+w) sandwich norms and softcapped logits; the NVFP4 release is compressed-tensors
-    # W4A16 on every text Linear.
+    # text_config, weights under model.language_model.); the windowed ViT under
+    # model.vision_tower. serves image input. Dense gated GQA with a [SWA x3, full]
+    # pattern -- full layers are NoPE -- weightless qk norms, centered (1+w) sandwich norms
+    # and softcapped logits; the NVFP4 release is compressed-tensors W4A16 on every text
+    # Linear.
     "MuseGlimmerForConditionalGeneration": ModelSpec(
         "freetoken.models.muse_glimmer",
-        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=(
             ("qkvg_proj", ("q_proj", "k_proj", "v_proj", "gate_proj")),
             ("gate_up_proj", ("gate_proj", "up_proj")),
         ),
+        mm_processor=_MUSE_GLIMMER_PROCESSOR,
+        encoders=_MUSE_GLIMMER_ENCODERS,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
@@ -275,12 +287,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # GLM-5.3-Flash (model_type glm5_next): hybrid KDA linear attention (34/45 layers)
     # + NoPE-MLA/DSA with a kpool-compressed indexer (11/45), mHC x4 residual streams,
     # 288-expert sigmoid/noaux_tc MoE; natively-multimodal wrapper config (text tower
-    # in text_config, weights under model.language_model.), served text-only.
+    # in text_config, weights under model.language_model.); the patch-grid vision tower
+    # under model.visual. serves image input.
     "Glm5NextForConditionalGeneration": ModelSpec(
         "freetoken.models.glm5_next",
-        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_GLM5_NEXT_PACKED,
+        mm_processor=_GLM5_NEXT_PROCESSOR,
+        encoders=_GLM5_NEXT_ENCODERS,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "Glm5NextForCausalLM": ModelSpec(

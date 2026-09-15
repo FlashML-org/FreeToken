@@ -3,7 +3,8 @@
 The checkpoint is the multimodal wrapper layout: every text-tower tensor carries a
 ``language_model.`` prefix (``language_model.model.layers.N...``,
 ``language_model.lm_head.weight``); the ViT stack (``vision_tower.`` /
-``multi_modal_projector.`` / ``patch_merge_mlp.``) is never read (text-only serving).
+``multi_modal_projector.`` / ``patch_merge_mlp.``) is read by ``_iter_vision`` only when
+the engine builds the vision encoder (``include_vision``).
 
 Resident (non routed-expert) dense projections are MXFP8 in the checkpoint
 (fp8-e4m3 ``weight`` + uint8 e8m0 block-32 ``weight_scale_inv``): the fp8 weight and
@@ -135,12 +136,31 @@ def _emit_fused(
     )
 
 
+_VISION_ATTN = "vision_tower.vision_model.encoder.layers.{}.self_attn"
+
+
+def _iter_vision(reader: _ShardReader, weight_map: dict, num_layers: int) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower under its checkpoint names with q/k/v fused, the projector and patch-merge MLP under the tower prefix; all bf16 (the patch embedding is stored fp32)."""
+    for name in weight_map:
+        if name.startswith(("multi_modal_projector.", "patch_merge_mlp.")):
+            yield "vision_tower." + name, reader.get(name).to(torch.bfloat16)
+        elif name.startswith("vision_tower.") and ".self_attn." not in name:
+            yield name, reader.get(name).to(torch.bfloat16)
+    for layer in range(num_layers):
+        attn = _VISION_ATTN.format(layer)
+        for kind in ("weight", "bias"):
+            parts = [reader.get(f"{attn}.{proj}.{kind}") for proj in ("q_proj", "k_proj", "v_proj")]
+            yield f"{attn}.qkv.{kind}", torch.cat(parts, dim=0).to(torch.bfloat16)
+            yield f"{attn}.out_proj.{kind}", reader.get(f"{attn}.out_proj.{kind}").to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "MiniMax-M3 stores routed experts as NVFP4 and only supports the offload MoE "
@@ -234,6 +254,23 @@ def iter_weights(
         yield "model.embed_tokens.weight", reader.get("language_model.model.embed_tokens.weight")
         yield "model.norm.weight", reader.get("language_model.model.norm.weight")
         yield "lm_head.weight", reader.get("language_model.lm_head.weight")
+        if include_vision and config.vision_config is not None:
+            yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
+    finally:
+        reader.close()
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    config = parse_config(cached_load_hf_config(model_path))
+    if config.vision_config is None:
+        return
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
     finally:
         reader.close()
 

@@ -221,8 +221,10 @@ def load_weight(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES
 
+    # a text-only engine never built the tower, so its tensors are not even read
+    keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
-        weights = iter_ftw_weights(model_path)
+        weights = iter_ftw_weights(model_path, keep=keep)
     else:
         _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
@@ -236,10 +238,28 @@ def load_weight(
             **kwargs,
         )
     for name, tensor in weights:
-        # the FTW replay has no reader to skip the tower; a text-only engine never built it
-        if not include_vision and name.startswith(VISION_KEY_PREFIXES):
+        if keep is not None and not keep(name):
             continue
         yield name, tensor
+
+
+def load_vision_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+    """The vision encoder tensors alone, named as load_weight names them, read by the family's encoder-only reader."""
+    _config, spec = _spec_for_model_path(model_path)
+    reader = _model_override(spec, "iter_vision_weights")
+    if reader is None:
+        raise ValueError(f"{spec.module} has no encoder-only weight reader")
+    return reader(model_path, device)
+
+
+def ftw_lacks_vision(model_path: str) -> bool:
+    """True for an FTW that holds no vision encoder tensors: converted by a build before the family served images."""
+    from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
+    from freetoken.models.config import VISION_KEY_PREFIXES
+
+    if not is_ftw_checkpoint(model_path):
+        return False
+    return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
 
 
 def load_q4_0_moe_expert_sources(
@@ -262,6 +282,8 @@ def load_q4_0_moe_expert_sources(
 
 __all__ = [
     "load_weight",
+    "load_vision_weight",
+    "ftw_lacks_vision",
     "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

@@ -1,4 +1,4 @@
-"""Clamped-SwiGLU MLP for GLM-5.3-Flash's leading dense layers and shared experts.
+"""Clamped-SwiGLU MLP for GLM-5.3-Flash's leading dense layers, shared experts and vision tower.
 
 Same shape as glm_moe_dsa's GlmDsaGatedMLP (every projection built from the QuantConfig), but the activation
 is the GLM-5.3 clamped SwiGLU (``swiglu_limit``):
@@ -22,12 +22,13 @@ class Glm5NextGatedMLP(BaseOP):
         intermediate_size: int,
         swiglu_limit: float | None = None,
         *,
+        has_bias: bool = False,
         quant_config=None,
         prefix: str = "",
     ):
-        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
+        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
+        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")

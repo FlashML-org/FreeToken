@@ -91,6 +91,16 @@ def iter_weights(
     yield from iter_merged_tensors(tensors(), _MERGE_RULES, model_name="qwen3_vl")
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                name = rename_vl_prefix(raw_name)
+                if name.startswith(VISION_KEY_PREFIXES):
+                    yield name, f.get_tensor(raw_name)
+
+
 def iter_weights_parallel(
     model_path: str,
     device: torch.device,

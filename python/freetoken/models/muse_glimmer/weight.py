@@ -17,15 +17,13 @@ from freetoken.models.loader import (
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
-# Vision stack of the multimodal wrapper -- served text-only, always dropped.
-_VISION_PREFIXES = (
-    "model.vision_tower.",
-    "model.vision_adapter.",
-    "model.vision_projection.",
-    "vision_tower.",
-    "vision_adapter.",
-    "vision_projection.",
+# The image path loads under the wrapper's vision_tower, adapter and projection included, so one prefix covers it.
+_VISION_RENAMES = (
+    ("model.vision_tower.", "vision_tower."),
+    ("model.vision_adapter.", "vision_tower.adapter."),
+    ("model.vision_projection.", "vision_tower.projection."),
 )
+_VISION_QKV_PARTS = (".attn.q_proj", ".attn.k_proj", ".attn.v_proj")
 
 # Fused projections, concatenated on the output dim in this exact order to match the
 # model's merged-linear splits. The attention gate rides the q/k/v fusion (it is computed
@@ -39,15 +37,36 @@ _FUSIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _rename(raw_name: str) -> str | None:
-    """HF key -> FreeToken state-dict key, or None to skip (vision stack)."""
-    if raw_name.startswith(_VISION_PREFIXES):
-        return None
+def _rename(raw_name: str) -> str:
+    """HF text key -> FreeToken state-dict key."""
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
     if raw_name.startswith("language_model."):
         return "model." + raw_name[len("language_model.") :]
     return raw_name  # lm_head.weight
+
+
+def _vision_name(raw_name: str) -> str | None:
+    """FreeToken state-dict key of an image-path tensor, None for text keys."""
+    for hf_prefix, prefix in _VISION_RENAMES:
+        if raw_name.startswith(hf_prefix):
+            return prefix + raw_name[len(hf_prefix) :]
+    return None
+
+
+def _vision_tensors(name: str, tensor: torch.Tensor, buf: dict) -> list[tuple[str, torch.Tensor]]:
+    """What one image-path tensor yields: q/k/v weights and biases wait in buf and leave as one fused attn.qkv."""
+    stem, _, leaf = name.rpartition(".")
+    for idx, part in enumerate(_VISION_QKV_PARTS):
+        if stem.endswith(part):
+            key = f"{stem[: -len(part)]}.attn.qkv.{leaf}"
+            slots = buf.setdefault(key, {})
+            slots[idx] = tensor
+            if len(slots) < len(_VISION_QKV_PARTS):
+                return []
+            del buf[key]
+            return [(key, torch.cat([slots[i] for i in range(len(_VISION_QKV_PARTS))], dim=0))]
+    return [(name, tensor)]
 
 
 def iter_weights(
@@ -56,6 +75,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     if not include_non_moe:
         return  # dense model: there is no experts-only pass
@@ -63,10 +83,11 @@ def iter_weights(
         raise NotImplementedError("muse_glimmer weight loading currently supports TP=1 only")
 
     if detect_compressed_tensors_nvfp4(cached_load_hf_config(model_path)):
-        yield from _iter_weights_compressed_tensors(model_path, device)
+        yield from _iter_weights_compressed_tensors(model_path, device, include_vision)
         return
 
     fuse_buf: dict = {}
+    vision_buf: dict = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -74,9 +95,12 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
-                if name is None:
+                vision = _vision_name(raw_name)
+                if vision is not None:
+                    if include_vision:
+                        yield from _vision_tensors(vision, f.get_tensor(raw_name), vision_buf)
                     continue
+                name = _rename(raw_name)
                 tensor = f.get_tensor(raw_name)
                 if name.endswith(".weight"):
                     emit = ct_bf16_fuse(name[: -len(".weight")], tensor, fuse_buf, _FUSIONS)
@@ -88,10 +112,23 @@ def iter_weights(
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
+    assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    vision_buf: dict = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                vision = _vision_name(raw_name)
+                if vision is not None:
+                    yield from _vision_tensors(vision, f.get_tensor(raw_name), vision_buf)
+    assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
 
 
 def _iter_weights_compressed_tensors(
-    model_path: str, device: torch.device
+    model_path: str, device: torch.device, include_vision: bool
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the compressed-tensors NVFP4 checkpoint.
 
@@ -99,10 +136,11 @@ def _iter_weights_compressed_tensors(
     (W4A16): ``.weight`` (uint8 packed) + ``.weight_scale`` (fp8 block) + ``.weight_global``
     (fp16 per-row, the reciprocal of the stored quant-side global). q/k/v/gate fuse into
     ``qkvg_proj`` and gate/up into ``gate_up_proj`` on the output dim, each part keeping
-    its own scales, so the fused FP4 weights are exact. Embeddings, norms and lm_head are
-    bf16 (the checkpoint's ignore list). Scale lookups go through the shard-map reader:
-    they can land in a different shard than their weight_packed."""
+    its own scales, so the fused FP4 weights are exact. Embeddings, norms, lm_head and the
+    vision tower are bf16 (the checkpoint's ignore list). Scale lookups go through the
+    shard-map reader: they can land in a different shard than their weight_packed."""
     nvfp4_buf: dict = {}
+    vision_buf: dict = {}
     reader = ShardReader(model_path, device)
     try:
         for file in tqdm(
@@ -113,9 +151,12 @@ def _iter_weights_compressed_tensors(
             for raw_name in reader.names_in(file):
                 if raw_name.endswith(CT_SCALE_SUFFIXES):
                     continue  # consumed with their weight_packed
-                name = _rename(raw_name)
-                if name is None:
+                vision = _vision_name(raw_name)
+                if vision is not None:
+                    if include_vision:
+                        yield from _vision_tensors(vision, reader.get_tensor(raw_name), vision_buf)
                     continue
+                name = _rename(raw_name)
                 if raw_name.endswith(".weight_packed"):
                     base = name[: -len(".weight_packed")]
                     parts = nvfp4_parts_ct(reader, raw_name[: -len(".weight_packed")])
@@ -135,6 +176,7 @@ def _iter_weights_compressed_tensors(
         reader.close()
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
+    assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
 
 
 __all__ = ["iter_weights"]

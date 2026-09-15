@@ -10,7 +10,7 @@ contact_links:
     url: https://discord.gg/MsA277cJzZ
     about: Ask on the Community Discord instead of opening an issue.
   - name: Usage questions (WeChat, CN)
-    url: https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png
+    url: https://github.com/FlashML-org/FreeToken/issues/482
     about: Scan the QR code to join the Community WeChat group.
   - name: Development discussion
     url: https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA

@@ -109,6 +109,27 @@ def _emit_nvfp4_dense_mlp(reader: ShardReader, base: str, raw_base: str, buf: di
     return out
 
 
+def _rename_vision_key(raw_name: str) -> str | None:
+    """Encoder checkpoint key -> state-dict key, or None for anything else; the tower's clipped-linear wrapper is dropped."""
+    if raw_name.startswith("model.vision_tower."):
+        return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(".linear.", ".")
+    if raw_name.startswith("model.embed_vision."):
+        return "embed_vision." + raw_name[len("model.embed_vision.") :]
+    if raw_name.startswith("model.vision_embedder."):
+        return "vision_embedder." + raw_name[len("model.vision_embedder.") :]
+    return None
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision encoder alone, named as iter_weights names it."""
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                name = _rename_vision_key(raw_name)
+                if name is not None:
+                    yield name, f.get_tensor(raw_name)
+
+
 def _rename_language_key(raw_name: str) -> str:
     name = raw_name.removeprefix("model.language_model.")
     name = "model." + name.removeprefix("language_model.")
@@ -140,16 +161,7 @@ def iter_weights(
             return _rename_language_key(raw_name)
         if raw_name.startswith("language_model."):
             return _rename_language_key(raw_name)
-        if raw_name.startswith("model.vision_tower."):
-            return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(
-                ".linear.",
-                ".",
-            )
-        if raw_name.startswith("model.embed_vision."):
-            return "embed_vision." + raw_name[len("model.embed_vision.") :]
-        if raw_name.startswith("model.vision_embedder."):
-            return "vision_embedder." + raw_name[len("model.vision_embedder.") :]
-        return None
+        return _rename_vision_key(raw_name)
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
         for suffix, rule in _MERGE_RULES.items():

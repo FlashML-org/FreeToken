@@ -5,7 +5,7 @@ from .model import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
-from .weight import iter_expert_pieces, iter_weights, iter_weights_parallel, nvfp4_expert_spec
+from .weight import iter_expert_pieces, iter_vision_weights, iter_weights, iter_weights_parallel, nvfp4_expert_spec
 
 __all__ = [
     "Qwen3_5ForCausalLM",
@@ -13,6 +13,7 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "parse_config",
+    "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",

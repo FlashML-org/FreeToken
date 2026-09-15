@@ -14,6 +14,9 @@ python scripts/ftw_hotfix.py --ftw ~/models/DeepSeek-V4-Flash-0731-FTW
 # old Qwen3.8-Flash-Next FTW: add the 47.7 GiB PLE table from a local copy of the checkpoint, into a new dir
 python scripts/ftw_hotfix.py --ftw ~/models/Qwen3.8-Flash-Next-NVFP4-FTW --source ~/models/Qwen3.8-Flash-Next-NVFP4 --out ~/models/Qwen3.8-Flash-Next-NVFP4-FTW-fixed
 
+# Qwen3-VL FTW converted before image input: add the vision encoder (about 1 GiB) from the Hub, in place
+python scripts/ftw_hotfix.py --ftw ~/models/Qwen3-VL-8B-Instruct-FTW --repo Qwen/Qwen3-VL-8B-Instruct
+
 # just show what would change
 python scripts/ftw_hotfix.py --ftw ~/models/GLM-5.2-NVFP4-FTW --dry-run
 ```
@@ -29,6 +32,7 @@ byte range, never the whole checkpoint; `--revision` pins the Hub revision to re
 | `KeyError: 'model.embed.weight'` | deepseek-ai/DeepSeek-V4-Flash-0731 | rename the index entries | none |
 | `RuntimeError: Unexpected keys ... .weight_scale` | nvidia/GLM-5.2-NVFP4 | dequantize the old runtime-fp8 weights back to bf16 | none |
 | `PLE shard indices are not contiguous 0..N-1: []` | Qwen3.8-Flash-Next (FTWs converted before #420) | write the PLE table as `ple-table-*.safetensors` | 47.7 GiB |
+| `ValueError: ... holds no vision encoder tensors` | image-input families (Qwen3-VL, Qwen3.6, Qwen3.8-Flash-Next, Gemma-4, GLM-5.3-Flash, Muse-Glimmer, MiniMax-M3) converted before the family served images | add the vision encoder: the tower's checkpoint tensors are fetched and the family's own weight reader emits them as the converter would | 1 to 4 GiB |
 
 The script decides by itself: it builds the current model from the FTW's `config.json`, compares
 the FTW index with the tensors the model declares, and applies only the repairs that are needed.

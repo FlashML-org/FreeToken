@@ -5,7 +5,7 @@ from .model import (
     deepstack_add,
 )
 from .vision import Qwen3VLVisionModel
-from .weight import iter_weights, iter_weights_parallel, rename_vl_prefix
+from .weight import iter_vision_weights, iter_weights, iter_weights_parallel, rename_vl_prefix
 
 __all__ = [
     "Qwen3VLForConditionalGeneration",
@@ -13,6 +13,7 @@ __all__ = [
     "Qwen3VLVisionModel",
     "VisionConfig",
     "deepstack_add",
+    "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",
     "parse_config",
