@@ -52,7 +52,18 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
         _detach_process_group()
     from freetoken.tokenizer import tokenize_worker
 
-    tokenize_worker(**kwargs)
+    ack_queue = kwargs.get("ack_queue")
+    try:
+        tokenize_worker(**kwargs)
+    except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
+        # Same contract as _run_scheduler: without this, a tokenizer/detokenizer that dies
+        # before its ready ack reaches the parent only as a dead process, so the supervisor
+        # reports the generic "backend worker freetoken-detokenizer-0 exited during load" and
+        # the real cause (an unreadable tokenizer.json, a missing checkpoint file, a ZMQ bind
+        # clash) is lost. The traceback still prints and the process still exits non-zero.
+        if ack_queue is not None:
+            _report_startup_error(ack_queue, exc)
+        raise
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
