@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tokenizers import AddedToken
+
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
@@ -46,6 +48,42 @@ def load_gguf_tokenizer(model_path: str):
         unk_token=tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
+
+    # GGUF user-defined tokens already exist in the model vocabulary with fixed
+    # IDs, but transformers' GGUF conversion may not register them as AddedToken
+    # entries. In that state convert_tokens_to_ids("<think>") returns the correct
+    # vocabulary ID while encode("<think>") incorrectly splits it into ordinary
+    # subword tokens. Restore their atomic-token behavior without marking them
+    # special and without changing vocabulary size or IDs.
+    token_types = tok_dict.get("token_type")
+    if token_types is not None:
+        added_tokens = []
+        for token_id, (token, token_type) in enumerate(zip(tokens, token_types)):
+            if int(token_type) != 4:
+                continue
+            if tokenizer.convert_tokens_to_ids(token) != token_id:
+                continue
+            if tokenizer.encode(token, add_special_tokens=False) == [token_id]:
+                continue
+            added_tokens.append(
+                AddedToken(
+                    token,
+                    single_word=False,
+                    lstrip=False,
+                    rstrip=False,
+                    normalized=False,
+                    special=False,
+                )
+            )
+
+        if added_tokens:
+            vocab_size_before = len(tokenizer)
+            tokenizer.add_tokens(added_tokens, special_tokens=False)
+            if len(tokenizer) != vocab_size_before:
+                raise RuntimeError(
+                    "restoring GGUF user-defined tokens unexpectedly changed vocabulary size"
+                )
+
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:
         tokenizer.chat_template = chat_template
