@@ -142,9 +142,13 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # PDL only on the contiguous (decode-replay) path: on the strided qk-norm's
     # 32k-CTA prefill grids the per-CTA gdc_wait poll costs more than it hides.
     pdl = contig and is_sm90_supported()
+    # launch_pdl is a CUDA-Hopper-only Triton launch kwarg; the AMD backend's
+    # arg-packer rejects it outright (KeyError) even when passed as False, so it
+    # is only included on the one backend/arch combination that ever sets pdl=True.
+    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma, **pdl_kwargs,
         num_warps=_num_warps(A * B), num_stages=1,
     )
     return out
@@ -170,9 +174,10 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     _, _, sra, srb = _leading(residual)
     contig = input.ndim == 2 and input.is_contiguous() and residual.is_contiguous()
     pdl = contig and is_sm90_supported()
+    pdl_kwargs = {"launch_pdl": pdl} if pdl else {}
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma, **pdl_kwargs,
         num_warps=_num_warps(A * B), num_stages=1,
     )
 
