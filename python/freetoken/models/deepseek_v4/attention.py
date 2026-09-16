@@ -15,6 +15,7 @@ from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
 from .layers import get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+from .parallel import div_tp, tp_size
 
 
 class Attention(BaseOP):
@@ -29,28 +30,41 @@ class Attention(BaseOP):
     def __init__(self, layer_id: int, args: DeepseekV4Args, *, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
+        # Head parallelism: a rank owns whole o_groups, and therefore whole heads. The
+        # per-group head width (wo_a_k) is a property of one group, so it does NOT shard.
+        # n_heads / n_groups are the RANK-LOCAL counts: the head and bmm math below runs at
+        # local width. The *Parallel classes take the FULL counts and derive their own TP-local
+        # shape themselves, so handing them the local counts would shard twice.
+        self.tp_size = tp_size()
+        self.n_heads = div_tp(args.n_heads, "n_heads")
+        self.n_groups = div_tp(args.o_groups, "o_groups")
+        heads = args.n_heads * self.head_dim
+        groups = args.o_groups * self.o_lora_rank
+
         self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
-        # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
+        # wq_a / wkv / kv_norm stay replicated: the MLA latent KV is shared by every head.
         self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [heads], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
         self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
         wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
+        wo_a_k = heads // args.o_groups
+        # Each rank holds whole groups' worth of wo_a rows, matching the heads its wq_b
+        # shard produced; the reader slices dim 0 by group, the width is unsharded.
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
-        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        # Row-parallel over the full groups: each rank consumes its own groups and
+        # contributes a partial sum, which the layer all-reduces.
+        self.wo_b = LinearRowParallel(groups, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
@@ -99,6 +113,9 @@ class Attention(BaseOP):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
+        # Under TP, ``o`` holds only this rank's heads, so the grouped einsum and wo_b
+        # produce a PARTIAL sum over the full output dim. ``wo_b`` is row-parallel and
+        # all-reduces it -- the single attention-side collective per block.
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)

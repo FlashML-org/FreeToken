@@ -40,6 +40,7 @@ from .moe import MoE
 from .compress import Compressor, Indexer  # noqa: F401
 from .layers import get_compress_topk_idxs, get_window_topk_idxs  # noqa: F401
 from .moe import Expert, Gate  # noqa: F401
+from .parallel import validate_tp
 
 
 class Block(BaseOP):
@@ -123,10 +124,20 @@ class Block(BaseOP):
 
 class Transformer(BaseOP):
     def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", prefix: str = ""):
+        # Check every tensor-parallel split before building a single layer, so a bad
+        # --tensor-parallel-size fails with one clear message, not a reshape deep in a
+        # forward. embed / head / norm / hyper-connections stay replicated or are split
+        # by the shared TP-aware layer classes.
+        validate_tp(args)
         self.args = args
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
+        # The embedding table and the output head are the two largest tensors (~3.0 GiB
+        # together), so they are vocabulary-parallel: VocabParallelEmbedding keeps one
+        # contiguous block of rows per rank and all-reduces the masked lookup, and
+        # ParallelLMHead all-gathers its logit slice and picks each request's final
+        # token off the attention metadata. Both live in freetoken.layers.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
         self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)

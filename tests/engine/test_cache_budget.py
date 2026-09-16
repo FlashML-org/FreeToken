@@ -7,6 +7,7 @@ import torch
 
 import os
 
+from freetoken.distributed import DistributedInfo
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
 from freetoken.engine.engine import _pin_budget_bytes
 
@@ -145,6 +146,10 @@ def _dsv4_adjust_cfg(**over):
         page_size = 1
         attention_backend = "dsv4_sparse"
         moe_cpu_layers = None
+        # EngineConfig always carries tp_info (server/args.py builds it from
+        # --tensor-parallel-size); _adjust_dsv4_config reads it to reject an FTW
+        # checkpoint under TP, so this stub has to be the real shape too.
+        tp_info = DistributedInfo(0, 1)
         num_page_override = None
         num_token_override = None
 
