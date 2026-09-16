@@ -3,7 +3,8 @@
 Supported checkpoints, all in the multimodal-wrapper layout (``model.language_model.*``):
 NVFP4 exports (ModelOpt tensor kinds from LibertAIDAI, compressed-tensors kinds from
 RedHatAI, selected by ``quantization_config``) and the zai-org block-fp8 release. Not
-supported: text-only key layouts, TP > 1, resident routed experts.
+supported: text-only key layouts, resident routed experts, block-fp8 experts or fp8
+projections under TP > 1.
 
 Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
 other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
@@ -13,8 +14,12 @@ never read.
 
 Load-time fusions (must mirror the module split orders):
 
-* KDA ``in_proj``  = q|k|v|b|f_a|g_a projections concatenated on the output axis
-* KDA ``conv1d``   = q|k|v depthwise conv weights concatenated on the channel axis
+* KDA ``in_proj``    = q|k|v|b projections concatenated on the output axis
+* KDA ``in_proj_fg`` = f_a|g_a projections concatenated on the output axis
+* KDA ``conv1d``     = q|k|v depthwise conv weights concatenated on the channel axis
+
+Under TP each part is cut to this rank's heads BEFORE it is fused, so the fused tensor is
+rank-major within each part, the order the module's splits read.
 
 fp32-kept tensors: ``A_log`` / ``dt_bias``, the mHC ``hc_*`` tensors, the indexer
 APE, and the router ``e_score_correction_bias``.
@@ -35,7 +40,7 @@ from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
 from tqdm import tqdm
 
 from .args import Glm5NextArgs
@@ -91,8 +96,28 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
     method = str(get("quant_method") or "").lower()
     return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
-# KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
-_KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
+# KDA fusion orders; MUST match Glm5NextKDA's in_proj / in_proj_fg splits.
+_KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj")
+_KDA_IN_PROJ_FG = ("f_a_proj", "g_a_proj")
+
+
+def _shard(t: torch.Tensor, dim: int | None) -> torch.Tensor:
+    """This rank's contiguous block of ``t`` along ``dim`` in its own storage; ``dim=None`` replicates."""
+    tp = get_tp_info()
+    if dim is None or tp.size == 1:
+        return t
+    step = div_even(t.shape[dim], tp.size)
+    return t.narrow(dim, tp.rank * step, step).clone(memory_format=torch.contiguous_format)
+
+
+def _shard_vocab(t: torch.Tensor) -> torch.Tensor:
+    """Vocabulary rows split exactly like VocabParallelEmbedding / ParallelLMHead size them."""
+    tp = get_tp_info()
+    if tp.size == 1:
+        return t
+    per = div_ceil(t.shape[0], tp.size)
+    lo = tp.rank * per
+    return t[lo:min(lo + per, t.shape[0])].clone(memory_format=torch.contiguous_format)
 
 # zai-org fp8 release: fp8 codes + fp32 128x128 block scales per expert projection
 _FP8_EXPERT_RE = re.compile(
@@ -101,14 +126,17 @@ _FP8_EXPERT_RE = re.compile(
 )
 
 
-def _proj(reader, src: str, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
-    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales."""
+def _proj(reader, src: str, dst: str, split: int | None = None) -> Iterator[tuple[str, torch.Tensor]]:
+    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales.
+    ``split=0`` is column-parallel (output rows), ``split=1`` row-parallel (input columns)."""
     w = reader.get(f"{src}.weight")
     if w.dtype == torch.float8_e4m3fn:
+        if split is not None and get_tp_info().size > 1:
+            raise NotImplementedError(f"{src}: fp8 projections are not sharded for TP > 1")
         yield f"{dst}.weight", w
         yield f"{dst}.weight_scale_inv", reader.get(f"{src}.weight_scale_inv")
     else:
-        yield f"{dst}.weight", w.to(torch.bfloat16)
+        yield f"{dst}.weight", _shard(w, split).to(torch.bfloat16)
 
 
 def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
@@ -119,29 +147,32 @@ def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
     # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
-    parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
+    parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ + _KDA_IN_PROJ_FG]
     if any(p.dtype == torch.float8_e4m3fn for p in parts):
         raise NotImplementedError("fp8 KDA input projections are not fused by this reader")
-    yield f"{dst}.in_proj.weight", torch.cat([p.to(torch.bfloat16) for p in parts], dim=0)
+    n = len(_KDA_IN_PROJ)
+    yield f"{dst}.in_proj.weight", torch.cat([_shard(p, 0).to(torch.bfloat16) for p in parts[:n]], dim=0)
+    yield f"{dst}.in_proj_fg.weight", torch.cat([p.to(torch.bfloat16) for p in parts[n:]], dim=0)
+    del parts
     # One merged depthwise conv over the q|k|v stream (channel-axis concat).
     conv = torch.cat(
-        [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
+        [_shard(reader.get(f"{src}.{p}_conv1d.weight"), 0).to(torch.bfloat16) for p in ("q", "k", "v")],
         dim=0,
     )
     yield f"{dst}.conv1d.weight", conv
-    for p in ("f_b_proj", "g_b_proj", "o_proj"):
-        yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}")
-    # Gate params stay fp32 (the recurrent kernels read them as fp32).
-    yield f"{dst}.A_log", reader.get(f"{src}.A_log").to(torch.float32)
-    yield f"{dst}.dt_bias", reader.get(f"{src}.dt_bias").to(torch.float32)
+    for p, split in (("f_b_proj", 0), ("g_b_proj", 0), ("o_proj", 1)):
+        yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}", split)
+    # Gate params stay fp32 (the recurrent kernels read them as fp32); both are per head.
+    yield f"{dst}.A_log", _shard(reader.get(f"{src}.A_log"), 0).to(torch.float32)
+    yield f"{dst}.dt_bias", _shard(reader.get(f"{src}.dt_bias"), 0).to(torch.float32)
     yield f"{dst}.o_norm.weight", reader.get(f"{src}.o_norm.weight").to(torch.bfloat16)
 
 
 def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
-    for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-        yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}")
+    for proj, split in (("q_a_proj", None), ("q_b_proj", 0), ("kv_a_proj_with_mqa", None), ("kv_b_proj", 0), ("o_proj", 1)):
+        yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}", split)
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
         yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
     # kpool indexer (every DSA layer owns one). Kept bf16; the APE is fp32.
@@ -176,11 +207,6 @@ def iter_weights(
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
-    if get_tp_info().size > 1:
-        # The loader emits full fused KDA/DSA tensors; TP sharding (per-head q|k|v|b
-        # splits, replicated f_a|g_a, row-parallel o_proj) is not implemented yet --
-        # same status as every other linear-hybrid / offload-family model in tree.
-        raise NotImplementedError("glm5_next weight loading currently supports TP=1 only")
     config = parse_config(cached_load_hf_config(model_path))
     args: Glm5NextArgs = config.glm5_args
     folder = download_hf_weight(model_path)
@@ -212,8 +238,8 @@ def iter_weights(
                 )
 
             if layer < config.first_k_dense_replace:
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield from _proj(reader, f"{src}.mlp.{proj}", f"{dst}.mlp.{proj}")
+                for proj, split in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
+                    yield from _proj(reader, f"{src}.mlp.{proj}", f"{dst}.mlp.{proj}", split)
             else:
                 yield f"{dst}.mlp.gate.weight", reader.get(f"{src}.mlp.gate.weight").to(
                     torch.bfloat16
@@ -224,14 +250,14 @@ def iter_weights(
                     # cast would perturb top-8 selection on fp32-bias checkpoints).
                     reader.get(f"{src}.mlp.gate.e_score_correction_bias").to(torch.float32),
                 )
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
+                for proj, split in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
+                    yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}", split)
 
-        yield f"{_MODEL}.embed_tokens.weight", reader.get(
+        yield f"{_MODEL}.embed_tokens.weight", _shard_vocab(reader.get(
             f"{_CKPT}.embed_tokens.weight"
-        ).to(torch.bfloat16)
+        )).to(torch.bfloat16)
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        yield "lm_head.weight", _shard_vocab(reader.get("lm_head.weight")).to(torch.bfloat16)
         if include_vision:
             yield from _iter_vision(reader, weight_map)
     finally:
