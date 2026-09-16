@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
@@ -51,7 +52,11 @@ class Gate(BaseOP):
 
 
 class Expert(BaseOP):
-    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
+    """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4).
+
+    Under TP the intermediate dim splits on its own: ``w1``/``w3`` are column-parallel
+    and ``w2`` row-parallel, so the pair of classes derives the rank-local width and
+    ``w2`` all-reduces this expert's output. The reader supplies the rank's slice."""
 
     def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
         self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
@@ -106,6 +111,26 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+
+        # A speculative verify is a decode wearing a prefill's clothes. The scheduler
+        # marks the batch "prefill" because the block is an extend over several
+        # positions, but it carries block_size rows per request, not a prompt -- and it
+        # runs on the critical path of every decode step.
+        #
+        # The path below fetches EVERY missing expert over PCIe, uncapped, with no CPU
+        # overlap. That is the right trade for a prompt, where the fetch amortizes over
+        # hundreds of tokens. For a 5-row block it moves up to T*top_k experts per layer
+        # with nothing hiding the latency: measured at ~0.4s per block against a 0.06s
+        # single-token step, which is the whole reason speculation lost to plain decode
+        # here rather than a low acceptance rate.
+        #
+        # Hybrid decode caps the fetch and overlaps the overflow on the CPU pool, which
+        # is what a handful of rows wants.
+        if (
+            getattr(get_global_ctx().batch, "speculative", False)
+            and cache.decode_target == "hybrid"
+        ):
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:

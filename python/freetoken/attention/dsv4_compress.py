@@ -51,7 +51,7 @@ class CompressorBackendMixin:
 
     def decode_compress_rows(
         self, rows: torch.Tensor, pos: torch.Tensor, ratio: int, layer_id: int, tier: str,
-        completed: torch.Tensor,
+        completed: torch.Tensor, ti: int | None = None,
     ) -> torch.Tensor:
         """Per-row decode store destination: the completed block's arithmetic row, or the row's
         OWN scratch row when this step did not finish a block.
@@ -59,8 +59,17 @@ class CompressorBackendMixin:
         Reads the decode SNAPSHOT (not the live map) so a concurrent allocate_paged cannot
         redirect the write; scratch keeps the masked store free of negative indices (which
         ``index_copy_`` would treat as out of bounds) and collision-free across rows.
+
+        ``ti`` addresses the LIVE map by table index instead, for a caller that is not a
+        decode batch. A speculative block walks the compressor per token from inside a
+        prefill, where no decode snapshot exists -- and it is safe there for the same
+        reason the rest of prefill is: the batch owns its rows for the whole forward.
         """
-        row_of_block = self.pool.cmp_rows(self.snapshot()[rows, pos], ratio)
+        source = (
+            self.pool.full_loc_map[ti, pos] if ti is not None
+            else self.snapshot()[rows, pos]
+        )
+        row_of_block = self.pool.cmp_rows(source, ratio)
         scratch = rows + self.compress_scratch_base(layer_id, tier)
         return torch.where(completed, row_of_block, scratch)
 

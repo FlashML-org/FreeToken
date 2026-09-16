@@ -7,6 +7,7 @@ import torch
 
 import os
 
+from freetoken.distributed import DistributedInfo
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
 from freetoken.engine.engine import _pin_budget_bytes
 
@@ -145,6 +146,10 @@ def _dsv4_adjust_cfg(**over):
         page_size = 1
         attention_backend = "dsv4_sparse"
         moe_cpu_layers = None
+        # EngineConfig always carries tp_info (server/args.py builds it from
+        # --tensor-parallel-size); _adjust_dsv4_config reads it to reject an FTW
+        # checkpoint under TP, so this stub has to be the real shape too.
+        tp_info = DistributedInfo(0, 1)
         num_page_override = None
         num_token_override = None
 
@@ -168,6 +173,15 @@ def test_adjust_config_allows_auto_for_dsv4():
     assert cfg.moe_strategy == "offload"
     assert cfg.moe_cache_auto is True  # resolved later at engine init, not here
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
+
+
+def test_adjust_config_honors_dsv4_prefill_chunk_limit():
+    """DSV4 continuation prefill is stateful, so a safety cap must survive resolution."""
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(max_seq_len=8192, max_extend_tokens=1024)
+    _adjust_config(cfg)
+    assert cfg.max_extend_tokens == 1024
 
 
 def test_adjust_config_resolves_num_tokens_for_dsv4():

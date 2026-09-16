@@ -72,22 +72,12 @@ inline constexpr auto template_fn =
 struct NCCLWrapper : public tvm::ffi::Object {
 public:
   NCCLWrapper(int rank, int world_size, const size_t max_bytes, NCCLIDList uid)
-      : m_rank(rank), m_world_size(world_size), m_max_bytes(max_bytes) {
+      : m_rank(rank), m_world_size(world_size) {
+    (void)max_bytes;
     ncclUniqueId id = get_uid(uid);
     ncclComm_t comm;
     NCCL_CHECK(::ncclCommInitRank(&comm, m_world_size, id, m_rank));
     m_comm = {comm, template_fn<::ncclCommDestroy>};
-
-    void *buf;
-    NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
-    m_sym_mem = {buf, template_fn<::ncclMemFree>};
-
-    ncclWindow_t win;
-    NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
-                                        NCCL_WIN_COLL_SYMMETRIC));
-    m_win = {win, [comm = m_comm](ncclWindow_t w) {
-               return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
-             }};
   }
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
@@ -97,40 +87,17 @@ public:
     RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());
-    const auto size_bytes = size_dim * (t.dtype().bits / 8);
     const auto data_ptr = t.data_ptr();
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
-
-    if (size_bytes <= m_max_bytes) { // use internal buffer
-      const auto buf_ptr = m_sym_mem.get();
-      const auto need_memcpy = (buf_ptr != data_ptr);
-      if (need_memcpy) {
-        CUDA_CHECK(::cudaMemcpyAsync(buf_ptr, data_ptr, size_bytes,
-                                     ::cudaMemcpyDeviceToDevice, stream));
-      }
-      NCCL_CHECK(::ncclAllReduce(
-          /*sendbuff=*/buf_ptr,
-          /*recvbuff=*/buf_ptr,
-          /*count=*/size_dim,
-          /*datatype=*/dtype,
-          /*op=*/reduce_op,
-          /*comm=*/m_comm.get(),
-          /*stream=*/stream));
-      if (need_memcpy) {
-        CUDA_CHECK(::cudaMemcpyAsync(data_ptr, buf_ptr, size_bytes,
-                                     ::cudaMemcpyDeviceToDevice, stream));
-      }
-    } else {
-      NCCL_CHECK(::ncclAllReduce(
-          /*sendbuff=*/data_ptr,
-          /*recvbuff=*/data_ptr,
-          /*count=*/size_dim,
-          /*datatype=*/dtype,
-          /*op=*/reduce_op,
-          /*comm=*/m_comm.get(),
-          /*stream=*/stream));
-    }
+    NCCL_CHECK(::ncclAllReduce(
+        /*sendbuff=*/data_ptr,
+        /*recvbuff=*/data_ptr,
+        /*count=*/size_dim,
+        /*datatype=*/dtype,
+        /*op=*/reduce_op,
+        /*comm=*/m_comm.get(),
+        /*stream=*/stream));
   }
 
   auto all_gather(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) const
@@ -160,18 +127,13 @@ public:
         /*stream=*/stream));
   }
 
-  auto get_buffer() const -> void * { return m_sym_mem.get(); }
-
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("freetoken.NCCLWrapper", NCCLWrapper,
                                     tvm::ffi::Object);
 
 private:
   int m_rank;
   int m_world_size;
-  size_t m_max_bytes;
   shared_obj<ncclComm_t> m_comm;
-  shared_ptr<void> m_sym_mem;
-  shared_obj<ncclWindow_t> m_win;
 };
 
 TVM_FFI_STATIC_INIT_BLOCK() {
@@ -179,8 +141,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::ObjectDef<NCCLWrapper>()
       .def(refl::init<int, int, size_t, NCCLIDList>(), "__init__")
       .def("all_reduce", &NCCLWrapper::all_reduce)
-      .def("all_gather", &NCCLWrapper::all_gather)
-      .def("get_buffer", &NCCLWrapper::get_buffer);
+      .def("all_gather", &NCCLWrapper::all_gather);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_nccl_uid, &create_uid);

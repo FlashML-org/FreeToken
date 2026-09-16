@@ -126,3 +126,21 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+def test_hybrid_fetch_spends_cap_on_most_repeated_current_miss():
+    """q* still counts unique misses, but its copies should remove the most CPU routes."""
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=16, cache_size=20, device=torch.device("cpu"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1,
+    )
+    # Expert 2 was historically recent, but expert 7 occurs three times in this
+    # multi-row verify. Fetching 7 avoids three CPU GEMVs for the price of one copy.
+    cache.step.fill_(11)
+    cache.expert_recency[0, 2] = 10
+    ids = torch.tensor([7, 2, 7, 3, 7], dtype=torch.int32)
+    cache.ensure_experts_hybrid(0, ids)
+
+    assert ids[0] >= 0 and ids[2] == ids[0] and ids[4] == ids[0]
+    assert ids[1] == -1 and ids[3] == -1
+    assert int(cache.src_indices[0]) == 7

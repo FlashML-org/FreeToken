@@ -167,13 +167,13 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self._device = device
         self._dtype = dtype
         self.P = P
-        self._n_layers = args.n_layers
+        # Every layer that OWNS KV, target and dSpark draft alike. The draft layers'
+        # ids continue past the target's, so a pool sized to n_layers alone leaves them
+        # indexing past the end of window_pool the moment one stores its KV.
+        self.compress_ratios = args.layer_compress_ratios
+        self._n_layers = len(self.compress_ratios)
         self.head_dim = args.head_dim
         self.index_head_dim = args.index_head_dim
-        # The checkpoint can ship one extra trailing ratio (44 for 43 layers); the model only uses
-        # the first n_layers, so truncate to match.
-        self.compress_ratios = tuple(args.compress_ratios)[: self._n_layers]
-        assert len(self.compress_ratios) == self._n_layers
         # Scratch rows appended to each cmp/idx pool tensor BEYOND the allocator's capacity
         # (never handed out): batched decode routes each row whose compressed block did NOT
         # complete this step to its own scratch row ``cmp_scratch_base + row`` (a discarded

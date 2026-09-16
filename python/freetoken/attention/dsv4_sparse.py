@@ -208,6 +208,18 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
     def prepare_for_replay(self, batch: Batch) -> None:
         self._point_to_capture(batch, batch.padded_size, self._table_rows(batch))
 
+    def prepare_for_spec_capture(self, batch: Batch) -> None:
+        """Point a fixed-width DSpark target capture at the reserved dummy row."""
+        bs = batch.padded_size
+        rows = torch.full(
+            (bs,), batch.padded_reqs[0].table_idx, dtype=torch.int64, device=self.device
+        )
+        self._point_to_capture(batch, bs, rows)
+
+    def prepare_for_spec_replay(self, batch: Batch) -> None:
+        """Stage one snapshot row per request for a DSpark target replay."""
+        self._point_to_capture(batch, batch.padded_size, self._table_rows(batch))
+
     # ----- DSV4 addressing vocabulary ---------------------------------------------------
     def snapshot(self) -> torch.Tensor:
         """The current decode batch's snapshot (see ``DSV4AttnMetadata.full_snapshot``);
@@ -220,6 +232,18 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         """Window slots for a prefill/extend range, off the request's LIVE full locs (positions
         that have slid out of the window translate to -1)."""
         return self.pool.translate_full_to_window(self.pool.full_loc_map[ti, lo:hi])
+
+    def window_slots_at(self, rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Window slots for SCATTERED ``(row, position)`` pairs, one per token.
+
+        ``window_slots_of`` covers one request's contiguous range. A flat batch spans
+        several requests, and its tokens arrive as parallel row/position vectors, so the
+        same lookup is a gather rather than a slice. Positions that have slid out of the
+        window translate to -1, exactly as they do there.
+        """
+        return self.pool.translate_full_to_window(
+            self.pool.full_loc_map[rows.long(), positions.long()]
+        )
 
     def win_cols_to_global(self, win_cols: torch.Tensor, slot_lut: torch.Tensor) -> torch.Tensor:
         """Per-query window columns (or -1) -> GLOBAL window-pool slots via ``slot_lut``."""
@@ -279,11 +303,14 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         """
         assert self.capture is not None and bs <= self.max_graph_bs
         cap = self.capture
+        prior = getattr(batch, "attn_metadata", None)
+        segments = getattr(prior, "segments", None)
         src = self.pool.full_loc_map.index_select(0, rows_ti)
         w = min(src.shape[1], cap.full_snap.shape[1])
         cap.full_snap[:bs, :w].copy_(src[:bs, :w])
         batch.attn_metadata = DSV4AttnMetadata(
-            last_indices=cap.last_indices[:bs], full_snap=cap.full_snap[:bs],
+            last_indices=cap.last_indices[:bs], segments=segments,
+            full_snap=cap.full_snap[:bs],
             window_ar=self._window_ar,
         )
 
