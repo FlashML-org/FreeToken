@@ -214,14 +214,19 @@ def shard_expert_piece(role: str, t: torch.Tensor, *, rank: int, tp_size: int) -
     if tp_size == 1:
         return t
     axis = _I_AXIS[role]
-    total = t.shape[axis]
+    lo, step = _i_block(role, t.shape[axis], rank=rank, tp_size=tp_size)
+    return t.narrow(axis, lo, step).clone(memory_format=torch.contiguous_format)
+
+
+def _i_block(role: str, total: int, *, rank: int, tp_size: int) -> tuple[int, int]:
+    """``(start, length)`` of this rank's block along a piece's I axis of ``total`` entries."""
     if total % tp_size != 0:
         raise ValueError(
-            f"DeepSeek-V4 expert piece {role!r} has {total} entries on axis {axis}, which "
-            f"does not divide over {tp_size} ranks"
+            f"DeepSeek-V4 expert piece {role!r} has {total} entries on axis {_I_AXIS[role]}, "
+            f"which does not divide over {tp_size} ranks"
         )
     step = total // tp_size
-    return t.narrow(axis, rank * step, step).clone(memory_format=torch.contiguous_format)
+    return rank * step, step
 
 
 def iter_expert_pieces(
@@ -278,19 +283,35 @@ def iter_expert_pieces(
         return per_expert_pieces(_cut(tensors), locate, tensors_per_expert=6)
 
     def _serial():
-        reader = _ShardReader(model_path, _weight_map(model_path), torch.device("cpu"))
-        try:
-            for li in tqdm(range(L), desc="Loading DSV4 experts (serial)", disable=not get_tp_info().is_primary()):
-                for e in range(E):
-                    base = f"layers.{li}.ffn.experts.{e}"
-                    for proj in ("w1", "w3", "w2"):
-                        for kind_ in ("weight", "scale"):
-                            name = f"{base}.{proj}.{kind_}"
-                            yield name, reader.get(name)
-        finally:
-            reader.close()
+        # One shard at a time, its page cache dropped as soon as its pieces are out: the
+        # host banks and a whole checkpoint's page cache do not both fit in host RAM, and
+        # under TP every rank reads the same files at once. Holding every shard open until
+        # the last layer let that cache build up to the full checkpoint on top of the banks.
+        by_shard: dict[str, list[str]] = {}
+        for name, shard_file in _weight_map(model_path).items():
+            if locate(name) is not None:
+                by_shard.setdefault(shard_file, []).append(name)
+        for shard_file in by_shard:
+            drop_page_cache(os.path.join(model_path, shard_file))
+        for shard_file in tqdm(sorted(by_shard), desc="Loading DSV4 experts (serial)", disable=not tp.is_primary()):
+            path = os.path.join(model_path, shard_file)
+            try:
+                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                    for name in by_shard[shard_file]:
+                        role = locate(name)[2]
+                        if tp.size > 1 and _I_AXIS[role] == 0:
+                            # gate/up and their scales carry I on the ROW axis, which is
+                            # contiguous in the file: read just this rank's rows. down's I is
+                            # the column axis, so it is read whole and cut below.
+                            rows = f.get_slice(name)
+                            lo, step = _i_block(role, rows.get_shape()[0], rank=tp.rank, tp_size=tp.size)
+                            yield name, rows[lo:lo + step].clone(memory_format=torch.contiguous_format)
+                        else:
+                            yield name, shard_expert_piece(role, f.get_tensor(name), rank=tp.rank, tp_size=tp.size)
+            finally:
+                drop_page_cache(path)
 
-    return per_expert_pieces(_cut(_serial()), locate, tensors_per_expert=6)
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
 __all__ = ["iter_weights", "iter_expert_pieces"]
