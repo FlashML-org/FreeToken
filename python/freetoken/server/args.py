@@ -49,6 +49,12 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Server-wide default thinking mode for reasoning-capable models: "auto" keeps the
+    # current per-request behavior; "chat" forces enable_thinking=False for every request
+    # that does not explicitly set it in chat_template_kwargs (for OpenAI-compatible
+    # clients that never send template kwargs, like Vercel AI SDK or llama-swap);
+    # "thinking" forces thinking on the same way.
+    default_thinking_mode: str = "auto"
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -580,6 +586,20 @@ def parse_args(
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
             "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
             "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
+        ),
+    )
+
+    parser.add_argument(
+        "--default-thinking-mode",
+        type=str,
+        default=ServerArgs.default_thinking_mode,
+        choices=["auto", "chat", "thinking"],
+        help=(
+            "Server-wide default thinking mode for reasoning-capable models. 'auto' keeps "
+            "the current per-request behavior; 'chat' forces enable_thinking=False for "
+            "every request that does not explicitly set it in chat_template_kwargs (for "
+            "OpenAI-compatible clients that never send template kwargs, like Vercel AI SDK "
+            "or llama-swap); 'thinking' forces thinking on the same way."
         ),
     )
 
