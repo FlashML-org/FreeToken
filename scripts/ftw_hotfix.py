@@ -263,7 +263,8 @@ def is_checkpoint_tower_name(name: str) -> bool:
     head = name.split(".")
     if head[0] == "model" and len(head) > 1:
         head = head[1:]
-    return "vision" in head[0] or "visual" in head[0] or head[0] in _TOWER_SEGMENTS
+    return ("vision" in head[0] or "visual" in head[0] or head[0] in _TOWER_SEGMENTS
+            or head[0] in {"image_start", "image_end", "image_newline"})
 
 
 def read_tower(source: TensorSource, ftw_dir: str, checkpoint_names: list[str]) -> dict[str, torch.Tensor]:

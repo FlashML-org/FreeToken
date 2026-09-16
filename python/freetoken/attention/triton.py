@@ -151,10 +151,19 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
-        assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        kv_heads, stored_dim = k_raw.shape[-2], k_raw.shape[-1]
+        head_dim = q.shape[-1]
+        kv_quant = getattr(self.kvcache, "kv_quant", "none")
+        assert stored_dim == (head_dim // 2 if kv_quant == "nvfp4" else head_dim)
+        k_cache = k_raw.view(-1, kv_heads, stored_dim)
+        v_cache = v_raw.view(-1, kv_heads, stored_dim)
+        k_block_scale = self.kvcache.k_block_scale(layer_id) if kv_quant == "nvfp4" else None
+        v_block_scale = self.kvcache.v_block_scale(layer_id) if kv_quant == "nvfp4" else None
+        # An fp8 KV pool hands us its per-(token, head) scales; a 16-bit pool returns
+        # None and every kernel below keeps its original (scale-free) code path.
+        k_scale = self.kvcache.k_scale(layer_id)
+        v_scale = self.kvcache.v_scale(layer_id)
+        assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
 
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
@@ -182,6 +191,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                kv_quant=kv_quant,
+                k_block_scale=k_block_scale,
+                v_block_scale=v_block_scale,
             )
         if (
             (not metadata.is_decode)
@@ -202,6 +216,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale,
+                v_scale=v_scale,
+                kv_quant=kv_quant,
+                k_block_scale=k_block_scale,
+                v_block_scale=v_block_scale,
                 block_ends=block_ends,
             )
         if block_ends is not None:
@@ -217,6 +236,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_quant=kv_quant,
+            k_block_scale=k_block_scale,
+            v_block_scale=v_block_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

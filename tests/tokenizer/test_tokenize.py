@@ -27,6 +27,151 @@ class FakeTokenizer:
         return torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 
+class FakeDsv41Tokenizer:
+    chat_template = "must use the V4.1 encoder instead"
+    unk_token_id = -1
+
+    def __init__(self, folder):
+        self.name_or_path = str(folder)
+        self.prompt = None
+        (folder / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "image_token_id": 9,
+            "vision_config": {"num_hidden_layers": 1, "patch_size": 2,
+                              "downsample_ratio": 2, "min_pixels": 16, "max_image_tokens": 24},
+        }))
+
+    def convert_tokens_to_ids(self, token):
+        return 9
+
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+        from freetoken.models.deepseek_v41.encoding import IMAGE_PLACEHOLDER
+        assert not add_special_tokens
+        self.prompt = prompt
+        parts = prompt.split(IMAGE_PLACEHOLDER)
+        ids = []
+        for i, part in enumerate(parts):
+            if i:
+                ids.append(9)
+            ids.extend(100 + ord(c) for c in part)
+        return ids if return_tensors is None else torch.tensor([ids])
+
+
+def test_dsv41_numeric_effort_and_image_span_survive_tokenization(tmp_path):
+    import base64
+    import io
+    from PIL import Image
+    from freetoken.message import BaseBackendMsg, UserMsg
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 4), "red").save(buffer, format="PNG")
+    tokenizer = FakeDsv41Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(uid=7, text=[{"role": "user", "content": [
+        {"type": "text", "text": "What is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()}},
+    ]}], sampling_params=SamplingParams(), chat_template_kwargs={"enable_thinking": True, "reasoning_effort": 63})
+    [wire] = manager.tokenize([msg])
+    ids = wire.input_ids
+    assert "Reasoning Effort: 63" in tokenizer.prompt
+    assert len(msg.media) == 1
+    item = msg.media[0]
+    assert item["types"].tolist() == [0, 1, 1, 2, 3]
+    assert ids[item["start"]:item["start"] + 5].tolist() == [9] * 5
+    received = BaseBackendMsg.decoder(wire.encoder())
+    torch.testing.assert_close(received.media[0]["patches"], item["patches"])
+    assert received.media[0]["patches"].shape == (8, 3, 2, 2)
+    assert received.media[0]["start"] == item["start"]
+
+
+def test_dsv41_main_mm_wire_keeps_reordered_tool_images_aligned(tmp_path):
+    import base64
+    import io
+    from PIL import Image
+    from freetoken.message import BaseBackendMsg, BaseTokenizerMsg
+    from freetoken.mm.config import MultimodalConfig
+    from freetoken.mm.media import collect_image_refs
+    from freetoken.models.deepseek_v41.mm_processor import DeepseekV41MMProcessor
+    from freetoken.server.generation import render_messages
+    from freetoken.utils.hf import RawConfigShim
+
+    def png(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 4), color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    red, blue = png("red"), png("blue")
+    tokenizer = FakeDsv41Tokenizer(tmp_path)
+    hf = RawConfigShim(json.loads((tmp_path / "config.json").read_text()))
+    processor = DeepseekV41MMProcessor(hf, str(tmp_path), MultimodalConfig())
+    manager = TokenizeManager(tokenizer, processor)
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": name, "type": "function", "function": {"name": "capture", "arguments": "{}"}}
+        for name in ("first", "second")
+    ]}]
+    for name, image in (("second", blue), ("first", red)):
+        messages.append({"role": "tool", "tool_call_id": name, "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode()}},
+        ]})
+    messages = render_messages(messages)
+    msg = TokenizeMsg(7, messages, SamplingParams(), {"enable_thinking": True, "reasoning_effort": 63})
+    assert "Reasoning Effort: 63" in manager.render_prompt(msg)
+    refs = collect_image_refs(messages)
+    assert len(refs) == 2
+    msg.images = [blue, red]
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    result, = manager.tokenize([decoded])
+    received = BaseBackendMsg.decoder(result.encoder())
+    assert received.media is None and received.mm_embeds is None
+    assert received.mrope_positions is None and received.mrope_delta == 0
+    assert len(received.mm_items) == 2
+    first, second = received.mm_items
+    assert first.hash != second.hash and first.pad_value != second.pad_value
+    assert first.feature[:, 0].mean() > second.feature[:, 0].mean()
+    for item in received.mm_items:
+        assert item.feature.dtype == torch.bfloat16 and item.feature.device.type == "cpu"
+        assert item.types == [0, 1, 1, 2, 3]
+        assert item.feature.shape == (8, 3, 2, 2)
+        start, end = item.offsets[0]
+        assert received.input_ids[start:end].tolist() == [item.pad_value] * 5
+    assert decoded.text == messages
+    with pytest.raises(ValueError, match="image parts"):
+        manager.tokenize([TokenizeMsg(8, messages, SamplingParams(), images=[red])])
+
+
+def test_dsv41_effort_range_is_validated(tmp_path):
+    manager = TokenizeManager(FakeDsv41Tokenizer(tmp_path))
+    for effort in (0, 101):
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            manager.render_prompt(TokenizeMsg(1, [{"role": "user", "content": "hi"}], SamplingParams(),
+                                              {"enable_thinking": True, "reasoning_effort": effort}))
+
+
+def test_text_model_rejects_images_before_jinja():
+    manager = TokenizeManager(FakeTokenizer())
+    with pytest.raises(ValueError, match="does not support image"):
+        manager.render_prompt(TokenizeMsg(1, [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/p.png"}},
+        ]}], SamplingParams()))
+
+
+def test_dsv41_images_follow_sorted_tool_result_order():
+    from freetoken.models.deepseek_v41.encoding import encode_messages
+
+    tool_calls = [
+        {"id": name, "type": "function", "function": {"name": "capture", "arguments": "{}"}}
+        for name in ("first", "second")
+    ]
+    messages = [{"role": "assistant", "tool_calls": tool_calls}]
+    for name in ("second", "first"):
+        messages.append({"role": "tool", "tool_call_id": name, "content": [
+            {"type": "image_url", "image_url": {"url": f"https://example.com/{name}.png"}},
+        ]})
+    _, payload = encode_messages(messages, "thinking", return_multi_modal_data=True)
+    assert [item["url"] for item in payload["images"]] == [
+        "https://example.com/first.png", "https://example.com/second.png",
+    ]
+
+
 def test_tokenize_manager_passes_chat_template_kwargs():
     tokenizer = FakeTokenizer()
     manager = TokenizeManager(tokenizer)

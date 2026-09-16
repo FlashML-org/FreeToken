@@ -1,7 +1,7 @@
-"""Glm5NextForCausalLM wiring smoke test (tiny random model, dense MLPs).
+"""Glm5NextForCausalLM wiring with dense BF16 or offloaded NVFP4 experts.
 
 The per-op math is covered elsewhere (KDA kernels/op, kpool backend, mHC); this
-test checks the ASSEMBLY: a 2-layer hybrid (KDA + DSA) model with mHC threading
+test checks the assembly: a hybrid KDA + DSA model with mHC threading
 runs prefill and decode through the real backends/pools, and the strongest
 cache invariant holds -- decoding token T after prefilling [0, T) produces the
 same logits as prefilling [0, T] outright (state handoff across the KDA
@@ -24,7 +24,7 @@ LATENT = 32
 DEV = "cuda"
 
 
-def _hf_config():
+def _hf_config(nvfp4=False):
     from freetoken.utils.hf import RawConfigShim
 
     text = {
@@ -52,24 +52,48 @@ def _hf_config():
         "n_group": 1, "topk_group": 1, "swiglu_limit": 10.0,
         "attention_bias": False, "model_type": "glm5_next_text",
     }
-    return RawConfigShim({
+    data = {
         "architectures": ["Glm5NextForConditionalGeneration"],
         "model_type": "glm5_next", "text_config": text,
-    })
+    }
+    if nvfp4:
+        from tests.models.test_glm5_next_config import _CT_MIXED_QUANT
+
+        # Preserve the published regex's layer IDs and feed a routed MoE output into KDA.
+        text.update(
+            num_hidden_layers=5,
+            layer_types=["linear_attention"] * 3 + ["deepseek_sparse_attention", "linear_attention"],
+            mlp_layer_types=["dense"] * 3 + ["sparse"] * 2,
+            first_k_dense_replace=3, indexer_types=["full"] * 5,
+            moe_intermediate_size=64,
+        )
+        data["quantization_config"] = _CT_MIXED_QUANT
+    return RawConfigShim(data)
 
 
-@pytest.fixture()
-def rig(monkeypatch):
+@pytest.fixture(params=["dense-bf16", "RedHatAI-nvfp4"])
+def rig(monkeypatch, request, tmp_path):
     from freetoken.attention.dsa_indexer_kpool import Glm5NextDSABackend
     from freetoken.distributed import set_tp_info, try_get_tp_info
-    from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
+    from freetoken.kvcache import create_kvcache_pool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.layers.quantization import QuantBackend, QuantKind, finalize_quant
     from freetoken.models.glm5_next.config import parse_config
     from freetoken.models.glm5_next.model import Glm5NextForCausalLM
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    config = parse_config(_hf_config())
+    nvfp4 = request.param == "RedHatAI-nvfp4"
+    hf = _hf_config(nvfp4)
+    config = parse_config(hf)
+    quant = checkpoint_quant_config(str(tmp_path), hf, get_model_spec(hf.architectures[0]))
+    object.__setattr__(config, "quant", quant)
+    object.__setattr__(config, "moe_strategy", "offload" if nvfp4 else "resident")
+    monkeypatch.setattr(
+        "freetoken.layers.quantization.quant_backend._QUANT_BACKEND",
+        QuantBackend.parse("moe.nvfp4=triton"),
+    )
 
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
@@ -91,12 +115,13 @@ def rig(monkeypatch):
             t = t.abs() + 0.5
         rand[k] = t.to(v.dtype)
     model.load_state_dict(rand)
+    assert finalize_quant(model) > 0
+    model.prepare_for_runtime()
 
-    kv = KpoolDSAKVCache(
-        latent_dim=LATENT, num_layers=2, num_pages=4, page_size=64,
+    kv = create_kvcache_pool(
+        config, num_pages=4, page_size=64,
         dtype=torch.bfloat16, device=torch.device(DEV),
-        index_head_dim=IDX_D, num_index_layers=1,
-        index_ratio=4, num_req_slots=4,
+        num_req_slots=4, kv_quant="nvfp4" if nvfp4 else "none",
     )
     page_table = torch.full((2, 256), -1, dtype=torch.int32, device=DEV)
     page_table[0] = torch.arange(256, dtype=torch.int32, device=DEV)
@@ -107,7 +132,7 @@ def rig(monkeypatch):
 
     ctx = SimpleNamespace(
         kv_cache=kv, page_table=page_table, linear_state_pool=linear_pool,
-        attn_backend=None, batch=None,
+        attn_backend=None, batch=None, moe_offload_cache=None,
     )
     for mod in (
         "freetoken.attention.dsa.get_global_ctx",
@@ -115,9 +140,46 @@ def rig(monkeypatch):
         "freetoken.models.glm5_next.attention.get_global_ctx",
         "freetoken.models.glm5_next.model.get_global_ctx",
         "freetoken.layers.embedding.get_global_ctx",
+        "freetoken.layers.moe.get_global_ctx",
     ):
         monkeypatch.setattr(mod, lambda: ctx)
     ctx.attn_backend = Glm5NextDSABackend(config)
+    if nvfp4:
+        from freetoken.moe.expert_banks import build_expert_banks
+        from freetoken.moe.offload_cache import (
+            OffloadMoeCache, attach_offload_moe_cache, iter_offload_moe_layers,
+        )
+
+        experts = list(iter_offload_moe_layers(model))
+        assert len(experts) == 2
+        for expert in experts:
+            method = expert.quant_method
+            assert method.kind is QuantKind.NVFP4
+            assert method.kernel.name == "triton"
+            assert method.cfg.activation == "swiglu_clamp" and method.cfg.limit == 10.0
+            assert method.cfg.strategy == "offload" and method.cfg.decode_target == "gpu"
+        banks = build_expert_banks(
+            experts[0].quant_method, len(experts), None, device=torch.device(DEV), dummy=True,
+        )
+        cache = OffloadMoeCache(
+            num_layers=len(experts), num_experts=config.num_experts,
+            cache_size=config.num_experts, device=torch.device(DEV),
+            quant_format=banks.quant_format, layout=banks.layout, prefill_overlap=False,
+            max_slots=experts[0].quant_method.slot_limit(),
+        )
+        cache.set_bank_sources(banks.sources)
+        cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        cache.reset()
+        assert len(attach_offload_moe_cache(model, cache)) == len(experts)
+        ctx.moe_offload_cache = cache
+        assert kv.num_layers == 1
+        assert kv.latent_rows(3).shape == (256, LATENT // 2)
+        assert kv.latent_rows(3).dtype == torch.uint8
+        assert kv.latent_block_scale(3).shape == (256, LATENT // 16)
+        assert kv.latent_block_scale(3).dtype == torch.uint8
+        assert kv.latent_scale(3).dtype == torch.float32
+        assert kv.index_k_cache(0).dtype == torch.bfloat16
+        assert kv.tail_k(0).dtype == kv.tail_gate(0).dtype == torch.bfloat16
     return model, ctx
 
 
@@ -163,12 +225,32 @@ def _reset(ctx):
     ctx.kv_cache._index_k_buffer.zero_()
     ctx.kv_cache._tail_k.zero_()
     ctx.kv_cache._tail_gate.zero_()
+    if ctx.kv_cache.kv_quant == "nvfp4":
+        ctx.kv_cache._scale_buffer.zero_()
+        ctx.kv_cache._block_scale_buffer.zero_()
+        ctx.moe_offload_cache.reset()
+
+
+def _state(ctx):
+    pool = ctx.linear_state_pool
+    return pool.recurrent_states[:, 1].clone(), pool.conv_states[:, 1].clone()
+
+
+def _assert_state_close(actual, expected):
+    for name, got, ref in zip(("recurrent", "convolution"), actual, expected):
+        assert torch.isfinite(got).all()
+        for layer, (got_layer, ref_layer) in enumerate(zip(got, ref)):
+            scale = ref_layer.float().abs().max().item()
+            assert scale > 0
+            err = (got_layer.float() - ref_layer.float()).abs().max().item()
+            assert err / scale < 3e-2, f"{name} layer {layer} divergence: {err} (scale {scale})"
 
 
 def test_prefill_decode_consistency(rig):
     model, ctx = rig
     torch.manual_seed(1)
-    total = 24
+    nvfp4 = ctx.kv_cache.kv_quant == "nvfp4"
+    total, decode_tokens = (40, 3) if nvfp4 else (24, 1)
     ids = torch.randint(0, VOCAB, (total,)).tolist()
 
     # One-shot prefill over the full sequence: last-token logits per position
@@ -178,33 +260,51 @@ def test_prefill_decode_consistency(rig):
     full_logits = model.forward()  # [1, VOCAB] logits of the last position
     assert full_logits.shape == (1, VOCAB)
     assert torch.isfinite(full_logits.float()).all()
+    full_state = _state(ctx)
 
-    # Prefill [0, total-1) then decode the last token: must match the one-shot run.
+    # Continue through incomplete and completed kpool tails using the same request state.
     _reset(ctx)
-    _batch(ctx, ids[:-1], 0, "prefill")
+    prefix = total - decode_tokens
+    _batch(ctx, ids[:prefix], 0, "prefill")
     model.forward()
-    _batch(ctx, ids[-1:], total - 1, "decode")
-    dec_logits = model.forward()
+    if nvfp4:
+        packed_prefix = ctx.kv_cache.latent_rows(3)[:prefix].clone()
+        scale_prefix = ctx.kv_cache.latent_scale(3)[:prefix].clone()
+        block_prefix = ctx.kv_cache.latent_block_scale(3)[:prefix].clone()
+        assert packed_prefix.any() and block_prefix.any()
+        assert torch.isfinite(scale_prefix).all() and (scale_prefix > 0).all()
+    for pos in range(prefix, total):
+        _batch(ctx, ids[pos:pos + 1], pos, "decode")
+        dec_logits = model.forward()
     err = (dec_logits.float() - full_logits.float()).abs().max().item()
     scale = full_logits.float().abs().max().item() + 1e-8
     assert err / scale < 3e-2, f"decode/prefill divergence: {err} (scale {scale})"
+    _assert_state_close(_state(ctx), full_state)
+    if nvfp4:
+        assert torch.equal(ctx.kv_cache.latent_rows(3)[:prefix], packed_prefix)
+        assert torch.equal(ctx.kv_cache.latent_scale(3)[:prefix], scale_prefix)
+        assert torch.equal(ctx.kv_cache.latent_block_scale(3)[:prefix], block_prefix)
+        assert (ctx.kv_cache.latent_scale(3)[prefix:total] > 0).all()
 
 
 def test_chunked_prefill_consistency(rig):
     model, ctx = rig
     torch.manual_seed(2)
-    total = 28  # split 16 + 12; chunk boundary pool-aligned (16 % 4 == 0)
+    nvfp4 = ctx.kv_cache.kv_quant == "nvfp4"
+    total, split = (44, 17) if nvfp4 else (28, 16)
     ids = torch.randint(0, VOCAB, (total,)).tolist()
 
     _reset(ctx)
     _batch(ctx, ids, 0, "prefill")
     full_logits = model.forward()
+    full_state = _state(ctx)
 
     _reset(ctx)
-    _batch(ctx, ids[:16], 0, "prefill")
+    _batch(ctx, ids[:split], 0, "prefill")
     model.forward()
-    _batch(ctx, ids[16:], 16, "prefill")
+    _batch(ctx, ids[split:], split, "prefill")
     chunk_logits = model.forward()
     err = (chunk_logits.float() - full_logits.float()).abs().max().item()
     scale = full_logits.float().abs().max().item() + 1e-8
     assert err / scale < 3e-2, f"chunked/one-shot divergence: {err} (scale {scale})"
+    _assert_state_close(_state(ctx), full_state)

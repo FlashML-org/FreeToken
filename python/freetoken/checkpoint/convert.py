@@ -8,6 +8,8 @@ no per-model conversion code is needed.
 * offload experts = exactly what ``load_expert_banks(parallel=True)`` produces (post
   backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
   told apart at load by their reserved names, so they need no separate kind).
+* V4.1 Engram tables = original compressed FP8 or FP4 bytes in separate mapped files,
+  with their dtype and scale layout recorded in ``engram_tables.json``.
 
 The output directory is a self-contained checkpoint (config + tokenizer copied), so you can
 point ``--model`` straight at it; the load path auto-detects the FTW and reads it (FTW).
@@ -296,6 +298,10 @@ def convert_checkpoint(
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
+    if getattr(mc, "dsv41_args", None) is not None and mc.dsv41_args.engram_layer_ids:
+        from freetoken.models.deepseek_v41.engram import export_engram_tables
+
+        copied.extend(export_engram_tables(model_path, out_dir, mc.dsv41_args))
 
     try:
         fingerprint = _source_fingerprint(model_path, mc, device=dev)

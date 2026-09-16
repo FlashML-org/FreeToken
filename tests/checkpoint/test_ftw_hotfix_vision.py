@@ -34,6 +34,11 @@ def hotfix():
     ("vision_tower.vision_model.embeddings.patch_embedding.weight", True),
     ("multi_modal_projector.linear_1.weight", True),
     ("patch_merge_mlp.linear_2.bias", True),
+    ("vision.patch_embed.proj.weight", True),
+    ("aligner.w1.weight", True),
+    ("image_start", True),
+    ("image_end", True),
+    ("image_newline", True),
     ("model.embed_audio.embedding_projection.weight", False),
     ("model.language_model.layers.0.self_attn.q_proj.weight", False),
     ("model.layers.3.mlp.experts.0.gate_proj.weight", False),
@@ -76,3 +81,57 @@ def test_every_family_with_an_encoder_has_an_encoder_only_reader():
     for spec in _MODEL_REGISTRY.values():
         if spec.encoders:
             assert callable(_load_attr(spec.module, "iter_vision_weights")), spec.module
+
+
+def test_native_v41_hotfix_reads_only_vision_tensors(hotfix, tmp_path, monkeypatch):
+    import safetensors.torch
+    import torch
+
+    from freetoken.models.deepseek_v41 import weight
+    from freetoken.models.weight import load_vision_weight
+
+    checkpoint = tmp_path / "source"
+    checkpoint.mkdir()
+    config = {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41", "n_layers": 1,
+              "compress_ratios": [0], "kv_source_layers": [], "index_source_layers": [],
+              "candidate_source_layer": -1, "engram_layer_ids": [], "engram_num_embeddings": [],
+              "vision_n_layers": 1, "quantization_config": {"expert_dtype": "nvfp4"}}
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    tensors = {
+        "vision.patch_embed.proj.weight": torch.arange(6, dtype=torch.bfloat16).view(2, 3),
+        "vision.norm.weight": torch.arange(2, dtype=torch.float32),
+        "aligner.w1.weight": torch.ones(2, 3, dtype=torch.bfloat16),
+        "image_start": torch.full((4,), 1.0, dtype=torch.bfloat16),
+        "image_end": torch.full((4,), 2.0, dtype=torch.bfloat16),
+        "image_newline": torch.full((4,), 3.0, dtype=torch.bfloat16),
+    }
+    safetensors.torch.save_file(tensors, checkpoint / "vision.safetensors")
+    index = {name: "vision.safetensors" for name in tensors}
+    index["head.weight"] = "unavailable-text.safetensors"
+    index["layers.0.ffn.experts.0.w1.weight"] = "unavailable-experts.safetensors"
+    index["layers.0.engram.embed.weight"] = "unavailable-engram.safetensors"
+    (checkpoint / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+    reads = []
+    original_get = weight._ShardReader.get
+
+    def get(reader, name):
+        reads.append(name)
+        return original_get(reader, name)
+
+    monkeypatch.setattr(weight._ShardReader, "get", get)
+    direct = dict(load_vision_weight(str(checkpoint), torch.device("cpu")))
+    assert set(direct) == set(reads) == set(tensors)
+    reads.clear()
+    ftw_like = tmp_path / "ftw"
+    ftw_like.mkdir()
+    ftw_dir = _config_dir(hotfix, checkpoint, ftw_like)
+    source = hotfix.TensorSource(None, str(checkpoint))
+    selected = [name for name in source.weight_map if hotfix.is_checkpoint_tower_name(name)]
+    got = hotfix.read_tower(source, ftw_dir, selected)
+    assert set(got) == set(tensors)
+    assert set(reads) == set(tensors)
+    for name, expected in tensors.items():
+        assert direct[name].dtype == expected.dtype
+        assert torch.equal(direct[name], expected)
+        assert got[name].dtype == expected.dtype
+        assert torch.equal(got[name], expected)

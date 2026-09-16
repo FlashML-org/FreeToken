@@ -20,6 +20,9 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 
+This branch also includes experimental DeepSeek-V4.1 Flash NVFP4 text and image
+support. See [the V4.1 setup and validation notes](deepseek-v41.md).
+
 ### Image input
 
 These families accept image input by default; pass `--text-model-only` to skip the vision encoder. The flags are described in the
@@ -27,6 +30,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 | Family | Image tokens | `--image-min-tokens` / `--image-max-tokens` | `--mm-processor-kwargs` example |
 | --- | --- | --- | --- |
+| DeepSeek-V4.1 Flash (experimental, native ViT tower) | resized patch grid with start, row-newline and end tokens | maximum covers the entire image span; minimum is rejected; use `vision_min_pixels` instead | `{"vision_min_pixels": 295936, "vision_max_n_token": 2048}` |
 | Qwen3.6 (both variants, every listed weight format), Qwen3.8-Flash-Next, Qwen3-VL | one token per 32x32 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 64 to 16384 tokens | `{"size": {"longest_edge": 1048576}}` |
 | Gemma-4 26B-A4B, 31B (`gemma4`: ViT tower, streamed under `--mm-encoder-weights host`) | one of the soft-token budgets 70 / 140 / 280 / 560 / 1120, every image scaled to its budget as far as the aspect ratio allows | the maximum picks the largest budget within it, below 70 is refused at start-up; the minimum has no effect | `{"max_soft_tokens": 1120}` |
 | Gemma-4 12B (`gemma4_unified`: linear patch embedder, resident under either placement) | same budgets, one 48x48 super-patch per soft token | same as the tower releases | same |
@@ -38,7 +42,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
-- **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
+- **fused** — experts resident on GPU (needs the memory); auto-selected on unified-memory GPUs for supported BF16 and block-FP8 formats.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
@@ -46,7 +50,8 @@ These families accept image input by default; pass `--text-model-only` to skip t
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
-  recommends it.
+  recommends it. On unified-memory GPUs, supported resident formats resolve to
+  `fused`; other formats keep `offload` and skip the hybrid upgrade.
 
 ## Notes
 
@@ -60,3 +65,9 @@ These families accept image input by default; pass `--text-model-only` to skip t
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- `--kv-cache-dtype fp8` (see [cli.md](cli.md#fp8-kv-cache)) covers the plain paged,
+  hybrid-SWA and QSA sparse KV pools — gpt-oss, Qwen3/3.5/3.6, GLM-4.x, Gemma-4,
+  MiniMax-M2.5, Muse-Glimmer, Llama/Qwen2/Mistral, Qwen3.8-Flash-Next (on QSA only the
+  selected K/V rows are read back as codes; block selection keeps 16-bit index keys).
+  MLA/DSA (GLM-5.2), DeepSeek-V4's tiered pool and MiniMax-M3's block-sparse pool stay
+  16-bit and reject it.

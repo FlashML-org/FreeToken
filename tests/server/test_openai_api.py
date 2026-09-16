@@ -51,6 +51,23 @@ class FakeState:
             yield reply
 
 
+def test_openai_image_request_preserves_content_and_numeric_effort():
+    state = FakeState([UserReply(uid=42, incremental_output="red", finished=True)])
+    state.config.served_modalities = frozenset({"image"})
+    request = ChatCompletionRequest.model_validate({
+        "model": "deepseek-v41", "reasoning_effort": 63,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YWJj"}},
+        ]}],
+    })
+    result = run(handle_chat_completion(request, request=None, state=state, model_sampling={}))
+    assert result["choices"][0]["message"]["content"] == "red"
+    assert state.sent.text[0]["content"][1] == {"type": "image"}
+    assert state.sent.images == [b"abc"]
+    assert state.sent.chat_template_kwargs["reasoning_effort"] == 63
+
+
 def tool_schema():
     return [
         {

@@ -201,3 +201,86 @@ def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
     assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
     with pytest.raises(ValueError, match="Missing MoE expert source layers"):
         list(stacked_expert_pieces(tensors[:3], config))
+
+
+@pytest.mark.parametrize("per_layer", [False, True], ids=["flat", "per-layer"])
+@pytest.mark.parametrize("quant_format", ["q4_0", "unknown-format"])
+def test_ftw_legacy_q4_0_banks_keep_native_bytes(tmp_path, monkeypatch, per_layer, quant_format):
+    from freetoken.checkpoint.ftw import FTWWriter, layer_bank_entry_name, load_ftw_banks
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    sources = {
+        "gate_up": torch.arange(2 * 2 * 72, dtype=torch.int64).to(torch.uint8).reshape(2, 2, 72),
+        "down": torch.arange(2 * 2 * 36, dtype=torch.uint8).reshape(2, 2, 36),
+    }
+    for name, value in sources.items():
+        if per_layer:
+            for layer, rows in enumerate(value):
+                writer.add_tensor(layer_bank_entry_name(name, layer), rows, kind="experts_bank")
+        else:
+            writer.add_tensor(name, value.flatten(0, 1), kind="experts_bank")
+    writer.finalize({"quant_format": quant_format, "expert_bank_num_layers": 2})
+
+    if quant_format != "q4_0":
+        with pytest.raises(KeyError, match="unknown-format"):
+            load_ftw_banks(str(tmp_path), num_layers=2, layer_residency=["pageable"] * 2)
+        return
+    banks = load_ftw_banks(str(tmp_path), num_layers=2, layer_residency=["pageable"] * 2)
+    assert banks.quant_format == "q4_0"
+    assert banks.kind is None and banks.kernel is None
+    assert banks.layer_residency == ["pageable"] * 2
+    assert set(banks.sources) == set(sources)
+    for name, value in sources.items():
+        assert len(banks.sources[name]) == 2
+        for layer, rows in enumerate(banks.sources[name]):
+            assert rows.dtype is torch.uint8
+            torch.testing.assert_close(rows, value[layer], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("include_vision", [False, True])
+def test_ftw_text_only_filters_native_and_qwen_vision_weights(tmp_path, include_vision):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.models.weight import load_weight
+
+    vision_keys = ("vision.blocks.0.norm1.weight", "aligner.mlp.0.weight",
+                   "image_start", "image_end", "image_newline", "visual.blocks.0.norm1.weight")
+    text_keys = ("embed.weight", "layers.0.attn.wq_a.weight", "head.weight")
+    weights = {name: torch.full((2, 3), float(i), dtype=torch.bfloat16)
+               for i, name in enumerate((*vision_keys, *text_keys))}
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    for name, value in weights.items():
+        writer.add_tensor(name, value)
+    writer.finalize({})
+
+    actual = dict(load_weight(str(tmp_path), torch.device("cpu"), include_vision=include_vision))
+    assert set(actual) == set(weights if include_vision else text_keys)
+    for name, value in actual.items():
+        torch.testing.assert_close(value, weights[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_input_scale", [False, True])
+def test_ftw_activation_scale_follows_the_current_model_scheme(tmp_path, with_input_scale):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.engine.engine import _materialize_loaded_weight_state_dict
+    from freetoken.models.weight import load_weight
+
+    layer = torch.nn.Linear(3, 2, bias=False, dtype=torch.bfloat16)
+    layer.register_buffer("weight_scale", torch.empty((), dtype=torch.float32))
+    if with_input_scale:
+        layer.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
+    model = torch.nn.ModuleDict({"linear": layer})
+    weights = {"linear.weight": torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+               "linear.weight_scale": torch.tensor(0.25), "linear.input_scale": torch.tensor(0.5)}
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    for name, value in weights.items():
+        writer.add_tensor(name, value)
+    writer.finalize({})
+
+    loaded = _materialize_loaded_weight_state_dict(
+        model.state_dict(), load_weight(str(tmp_path), torch.device("cpu")), device=torch.device("cpu"),
+    )
+    model.load_state_dict(loaded, strict=True)
+    assert set(loaded) == set(model.state_dict())
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, weights[name], rtol=0, atol=0)

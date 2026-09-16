@@ -32,7 +32,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .mm import cut_image_spans, plan_mm_batch
+from .mm import cut_image_spans, gather_legacy_mm_batch, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -739,7 +739,7 @@ class Scheduler(SchedulerIOMixin):
         config = self.config
         mc = config.model_config
         num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
+        if getattr(mc, "dsv4_args", None) is not None or getattr(mc, "dsv41_args", None) is not None:
             sizes = getattr(eng.kv_cache, "sizes", None)
             if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
                 num_swa_pages = max(0, sizes.n_win_pages - 1)
@@ -856,8 +856,13 @@ class Scheduler(SchedulerIOMixin):
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=torch.cuda.is_available()).to(self.device, non_blocking=True)
+        parts, legacy_rows = gather_legacy_mm_batch(batch.padded_reqs, self.config.model_config.image_token_id)
+        if parts:
+            batch.mm_embeds = torch.cat([part.to(self.device) for part in parts], dim=0)
+            rows.extend(legacy_rows)
+        if rows:
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=torch.cuda.is_available()).to(self.device, non_blocking=True)
         if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]

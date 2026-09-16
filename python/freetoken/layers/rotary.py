@@ -160,6 +160,8 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         super().__init__(*args, **kwargs)
         assert self.is_neox, "mrope is defined on the NeoX half-rotation layout"
+        if self._cos_sin_cache.shape[1] != self.rotary_dim:
+            raise ValueError("mrope does not support partial proportional rotary embeddings")
         half = self.rotary_dim // 2
         assert sum(mrope_section) == half, (mrope_section, half)
         self._section_table = build_section_table(tuple(mrope_section), layout)
@@ -200,16 +202,18 @@ def _get_rope(
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
     is_neox: bool = True,
+    *,
+    rotary_cls: Callable[..., RotaryEmbedding] = RotaryEmbedding,
 ) -> RotaryEmbedding:
     if rope_scaling is None:
-        return RotaryEmbedding(head_dim, rotary_dim, max_position, base, is_neox=is_neox)
+        return rotary_cls(head_dim, rotary_dim, max_position, base, is_neox=is_neox)
     # need to test some cases:
     match rope_scaling["rope_type"]:
         case "default":
-            return RotaryEmbedding(head_dim, rotary_dim, max_position, base, is_neox=is_neox)
+            return rotary_cls(head_dim, rotary_dim, max_position, base, is_neox=is_neox)
 
         case "proportional":
-            return RotaryEmbedding(
+            return rotary_cls(
                 head_dim,
                 rotary_dim,
                 max_position,
@@ -240,7 +244,7 @@ def _get_rope(
                 factor = (1 - smooth) / scaling_factor + smooth
                 return factor * inv_freq
 
-            return RotaryEmbedding(
+            return rotary_cls(
                 head_dim, rotary_dim, max_position, base, post_process, is_neox=is_neox
             )
 
@@ -296,7 +300,7 @@ def _get_rope(
                 )
                 return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
 
-            return RotaryEmbedding(
+            return rotary_cls(
                 head_dim,
                 rotary_dim,
                 max_position,
@@ -331,14 +335,13 @@ def get_rope(
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
 
     def build() -> RotaryEmbedding:
+        rotary_cls = RotaryEmbedding
         if mrope_section is not None:
-            assert rope_map is None or rope_map.get("rope_type", "default") == "default"
-            return MRotaryEmbedding(
-                head_dim, rotary_dim, max_position, base,
-                is_neox=is_neox, mrope_section=tuple(mrope_section),
-                layout=mrope_layout,
+            rotary_cls = functools.partial(
+                MRotaryEmbedding, mrope_section=tuple(mrope_section), layout=mrope_layout,
             )
-        return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
+        return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox,
+                         rotary_cls=rotary_cls)
 
     t = torch.tensor([])
     if t.device == torch.device("meta"):

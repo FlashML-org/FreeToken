@@ -7,7 +7,7 @@ def _supports_swa_ratio(config) -> bool:
     """Whether ``swa_full_tokens_ratio`` sizes a separate window pool for this model -- DSV4
     (always) or a radix-SWA model (Gemma). Gates the ratio in telemetry and rebuild."""
     mc = config.model_config
-    if mc.dsv4_args is not None:
+    if mc.dsv4_args is not None or getattr(mc, "dsv41_args", None) is not None:
         return True
     return mc.has_swa_attention and config.cache_type == "swa_radix"
 
@@ -129,8 +129,8 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
         from .hybrid_swa_pool import _swa_pool_floor
 
         mc = config.model_config
-        if mc.dsv4_args is not None:
-            P = mc.dsv4_args.window_size
+        if mc.dsv4_args is not None or getattr(mc, "dsv41_args", None) is not None:
+            P = (getattr(mc, "dsv41_args", None) or mc.dsv4_args).window_size
             return int(_dsv4_window_floor_pages(config, P) * P)
         if not (mc.has_swa_attention and config.cache_type == "swa_radix"):
             return 0
@@ -165,8 +165,8 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
             # (num_swa_pages, usable count). Same source as the scheduler's _current_cache_geometry.
             # Both 0 for models without a window pool. Lets a client denominate the swa control.
             mc = config.model_config
-            if mc.dsv4_args is not None:
-                pools["swa_page_size"] = int(mc.dsv4_args.window_size or 0)
+            if mc.dsv4_args is not None or getattr(mc, "dsv41_args", None) is not None:
+                pools["swa_page_size"] = int((getattr(mc, "dsv41_args", None) or mc.dsv4_args).window_size or 0)
                 sizes = getattr(engine.kv_cache, "sizes", None)  # usable = physical minus dummy
                 if sizes is not None:
                     pools["num_swa_pages"] = max(0, int(sizes.n_win_pages) - 1)

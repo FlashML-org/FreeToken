@@ -65,6 +65,9 @@ def _model_config(kind):
     elif kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
         specs = (_spec("dsv4", AttnType.DSV4, sliding_window=128),)
+    elif kind == "dsv41":
+        mc.dsv41_args = SimpleNamespace(window_size=128)
+        specs = (_spec("dsv41", AttnType.DSV41, sliding_window=128),)
     elif kind == "bsa":
         # MiniMax-M3 shape: one FULL-family group, mla=False + index dims -> BSA.
         specs = (_spec("full", AttnType.BSA, index_head_dim=128),)
@@ -114,6 +117,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
         ("mla", "dsa"),  # plain latent MLA
         ("dsa", "dsa"),  # MLA + DSA indexer (GLM-5.2 shape)
         ("dsv4", "dsv4_sparse"),
+        ("dsv41", "dsv41_sparse"),
         ("bsa", "m3_sparse"),  # MiniMax-M3 block-sparse GQA
         ("qsa", "qsa_sparse"),  # Qwen3.8-Flash-Next compressed-block sparse
     ],
@@ -192,12 +196,81 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
     assert config.page_size == 128
 
 
+def test_v41_resolves_eager_window_pages_and_preserves_context(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("dsv41", attention_backend="auto")
+    _adjust_config(config)
+    assert config.page_size == 128
+    assert config.cache_type == "swa_radix"
+    assert config.cuda_graph_max_bs == 0 and config.cuda_graph_bs == []
+    assert config.model_config.dsv41_args.max_seq_len == config.max_seq_len
+
+
+def test_v41_long_context_preserves_bounded_prefill_staging(monkeypatch):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.scheduler.config import SchedulerConfig
+
+    _patch_env(monkeypatch)
+    config = SchedulerConfig(
+        model_path="/tmp/freetoken-test-model", tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16, max_seq_len_override=1 << 20, max_extend_tokens=1024,
+    )
+    object.__setattr__(config, "model_config", _model_config("dsv41"))
+    _adjust_config(config)
+    assert config.max_seq_len == 1 << 20
+    assert config.max_forward_len == config.max_extend_tokens == 1024
+
+
+def test_v41_rejects_prefill_budget_that_cannot_admit_a_page(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("dsv41", max_seq_len_override=1 << 20)
+    object.__setattr__(config, "max_extend_tokens", 127)
+    with pytest.raises(ValueError, match="max-prefill-length must fit one 128-token page"):
+        _adjust_config(config)
+
+
+@pytest.mark.parametrize("ratio", [0, -1, 1.1])
+def test_v41_rejects_invalid_window_ratio(monkeypatch, ratio):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    with pytest.raises(ValueError, match="swa_full_tokens_ratio"):
+        _adjust_config(_config("dsv41", swa_full_tokens_ratio=ratio))
+
+
+@pytest.mark.parametrize("kwargs", [{"cuda_graph_max_bs": 1}, {"cuda_graph_bs": [1]}])
+def test_v41_rejects_explicit_graph_until_supported(monkeypatch, kwargs):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    with pytest.raises(ValueError, match="eager execution"):
+        _adjust_config(_config("dsv41", **kwargs))
+
+
+def test_v41_rejects_dtype_before_allocating_quantized_pools(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("dsv41")
+    object.__setattr__(config, "dtype", torch.float32)
+    with pytest.raises(ValueError, match="bfloat16"):
+        _adjust_config(config)
+
+
 @pytest.mark.parametrize(
     "kind, backend",
     [
         # reverse gates: type-specific backends on models without the type
         ("full", "dsa"),
         ("full", "dsv4_sparse"),
+        ("full", "dsv41_sparse"),
+        ("dsv41", "dsv4_sparse"),
+        ("dsv41", "triton"),
         ("full", "m3_sparse"),
         ("swa", "dsa"),
         ("full", "qsa_sparse"),

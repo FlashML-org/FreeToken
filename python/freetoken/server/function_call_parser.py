@@ -1563,13 +1563,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.2
     """
 
+    _dsml_token = "｜DSML｜"
+    _block_name = "function_calls"
+    _alt_block_name = "tool_calls"
+
     def __init__(self):
         super().__init__()
-        self.dsml_token = "｜DSML｜"
-        self.bot_token = f"<{self.dsml_token}function_calls>"
-        self.eot_token = f"</{self.dsml_token}function_calls>"
-        self.alt_bot_token = f"<{self.dsml_token}tool_calls>"
-        self.alt_eot_token = f"</{self.dsml_token}tool_calls>"
+        self.dsml_token = self._dsml_token
+        self.bot_token = f"<{self.dsml_token}{self._block_name}>"
+        self.eot_token = f"</{self.dsml_token}{self._block_name}>"
+        self.alt_bot_token = f"<{self.dsml_token}{self._alt_block_name}>"
+        self.alt_eot_token = f"</{self.dsml_token}{self._alt_block_name}>"
         self.invoke_start_prefix = f"<{self.dsml_token}invoke"
         self.invoke_end_token = f"</{self.dsml_token}invoke>"
         self.param_end_token = f"</{self.dsml_token}parameter>"
@@ -1881,6 +1885,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.prev_tool_call_arr and residual.strip() == "":
             return ""
         return residual
+
+
+class DeepSeekV41Detector(DeepSeekV32Detector):
+    """V4.1 uses a space after the DSML marker and names its outer block calls."""
+
+    _dsml_token = "｜DSML｜ "
+    _block_name = "calls"
+    _alt_block_name = "calls"
 
 
 class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
@@ -3523,6 +3535,7 @@ class FunctionCallParser:
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "deepseekv32": DeepSeekV32Detector,
+        "deepseekv41": DeepSeekV41Detector,
         "gemma4": Gemma4Detector,
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,

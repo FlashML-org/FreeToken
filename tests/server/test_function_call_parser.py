@@ -275,6 +275,25 @@ def _feed(parser, chunks):
     return texts, calls
 
 
+def test_deepseek_v41_calls_across_every_split():
+    block = (
+        '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        '<｜DSML｜ parameter name="city" string="true">Tokyo</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="days" string="false">2</｜DSML｜ parameter>'
+        '</｜DSML｜ invoke></｜DSML｜ calls>'
+    )
+    parser = FunctionCallParser(TOOLS, tool_call_parser="deepseekv41")
+    complete = parser.parse_non_stream(block)
+    assert complete.calls[0].name == "get_weather"
+    assert json.loads(complete.calls[0].parameters) == {"city": "Tokyo", "days": 2}
+    for split in range(1, len(block)):
+        parser = FunctionCallParser(TOOLS, tool_call_parser="deepseekv41")
+        texts, calls = _feed(parser, [block[:split], block[split:], ""])
+        assert not ("".join(texts) + parser.finish_stream()).strip()
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert json.loads("".join(call.parameters for call in calls)) == {"city": "Tokyo", "days": 2}
+
+
 @pytest.mark.parametrize("parser_name", ["qwen25", "glm47", "gemma4", "minimax", "deepseekv32", "qwen3_coder"])
 def test_streaming_plain_text_releases_per_chunk(parser_name):
     # A pure-text response must stream out chunk by chunk, not buffer to the end.

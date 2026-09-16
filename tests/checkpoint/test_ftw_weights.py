@@ -1,5 +1,6 @@
 """FTW replay: dropping entries by name before their bytes are read, and the vision-tower presence check."""
 
+import pytest
 import torch
 
 from freetoken.checkpoint.ftw import FTWReader, FTWWriter, ftw_tensor_names, iter_ftw_weights
@@ -54,3 +55,22 @@ def test_ftw_lacks_vision(tmp_path):
     assert not ftw_lacks_vision(str(tmp_path / "vl"))
     assert not ftw_lacks_vision(str(tmp_path))
     assert ftw_tensor_names(str(tmp_path / "vl"), "weight") == ["model.a.weight", "visual.b.weight"]
+
+
+@pytest.mark.parametrize("name", [
+    "vision_embedder.patch_embedding.weight", "vision.patch_embed.proj.weight",
+    "aligner.w1.weight", "image_start", "image_end", "image_newline",
+])
+def test_native_encoder_ftw_presence_and_text_only_read(tmp_path, monkeypatch, name):
+    _write_ftw(tmp_path, ["model.a.weight", name])
+    assert not ftw_lacks_vision(str(tmp_path))
+    reads = []
+    original = FTWReader.read_into
+
+    def spy(self, dest, entry, **kwargs):
+        reads.append(entry["name"])
+        return original(self, dest, entry, **kwargs)
+
+    monkeypatch.setattr(FTWReader, "read_into", spy)
+    got = dict(load_weight(str(tmp_path), torch.device("cpu"), include_vision=False))
+    assert list(got) == reads == ["model.a.weight"]

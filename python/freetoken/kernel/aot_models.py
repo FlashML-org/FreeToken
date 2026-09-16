@@ -11,12 +11,14 @@ Derivations, which must be kept in lockstep with the runtime call sites by hand
 (a drifted derivation misses the prebuilt cache by spec name and falls back to
 JIT, which needs nvcc):
 
-- store: ``element_size = num_kv_heads * head_dim * 2`` (bf16 KV row), one per
-  paged-KV attention group (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py).
-  DSV4 writes its MLA latent via torch scatter and contributes nothing.
+- store: ``element_size = num_kv_heads * head_dim * dtype_bytes``, one per
+  paged-KV attention group (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py) and
+  per KV width: 2 for the 16-bit cache, 1 for an fp8 one (``--kv-cache-dtype
+  fp8``, kvcache/mha_pool.py). DSV4/V4.1 write MLA latents via torch scatter and
+  contribute nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
-  DSV4 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
+  DSV4/V4.1 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
 
 The whole table targets the shipped serving configuration: TP=1 (TP>1 shards
 kv heads, shrinking the store row) and a 2-byte compute dtype (``--dtype
@@ -33,7 +35,8 @@ from dataclasses import dataclass
 
 from .index import num_splits_for
 
-KV_CACHE_DTYPE_BYTES = 2  # every current model allocates bf16 paged KV
+KV_CACHE_DTYPE_BYTES = 2  # the default paged KV is the 16-bit compute dtype
+FP8_KV_CACHE_DTYPE_BYTES = 1  # --kv-cache-dtype fp8 stores one e4m3 code per element
 EMBED_DTYPE_BYTES = 2  # embedding weights stay bf16 on the indexing() path
 
 
@@ -332,6 +335,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
     ),
+    AotModel(
+        name="s-zaizen/DeepSeek-V4.1-Flash-NVFP4",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("nvfp4",),
+        embed_indexing=False,
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",
@@ -395,8 +408,9 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
 )
 
 
-def store_element_sizes(model: AotModel) -> set[int]:
-    return {kv * hd * KV_CACHE_DTYPE_BYTES for kv, hd in model.kv_groups}
+def store_element_sizes(model: AotModel, dtype_bytes: int = KV_CACHE_DTYPE_BYTES) -> set[int]:
+    """Store-kernel row sizes for one model's paged-KV groups at a given bytes/elem."""
+    return {kv * hd * dtype_bytes for kv, hd in model.kv_groups}
 
 
 def index_variants(model: AotModel) -> set[tuple[int, int]]:
@@ -418,9 +432,17 @@ def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
 
 
 def aggregate_store_element_sizes() -> tuple[int, ...]:
+    """Every store row size the runtime can ask for.
+
+    Both KV widths ship: the 16-bit default and the fp8 (``--kv-cache-dtype fp8``)
+    code buffer, whose rows are exactly half as wide. A missing size is not a
+    correctness bug -- it is a kernel-cache miss that falls back to JIT and fails
+    the ``FREETOKEN_DISABLE_JIT=1`` release gate.
+    """
     sizes: set[int] = set()
     for model in SUPPORTED_MODELS:
-        sizes.update(store_element_sizes(model))
+        for dtype_bytes in (KV_CACHE_DTYPE_BYTES, FP8_KV_CACHE_DTYPE_BYTES):
+            sizes.update(store_element_sizes(model, dtype_bytes))
     return tuple(sorted(sizes))
 
 

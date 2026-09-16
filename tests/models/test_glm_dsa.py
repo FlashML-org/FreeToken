@@ -225,7 +225,7 @@ def test_splitk_matches_single_program():
     assert (o_single.float() - o_split.float()).abs().max().item() < 1e-2
 
 
-def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64, pages=400):
+def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64, pages=400, kv_quant="none"):
     """Minimal ctx + pool + DSAAttnBackend (no engine)."""
     from types import SimpleNamespace
 
@@ -239,9 +239,9 @@ def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64
     ctx.page_table = torch.zeros(4, pages, dtype=torch.int32, device="cuda")
     if dsa:
         ctx.kv_cache = DSAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"),
-                                  index_head_dim=idx_dim, num_index_layers=1)
+                                  index_head_dim=idx_dim, num_index_layers=1, kv_quant=kv_quant)
     else:
-        ctx.kv_cache = MLAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"))
+        ctx.kv_cache = MLAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"), kv_quant=kv_quant)
     set_global_ctx(ctx)
     args = SimpleNamespace(
         kv_lora_rank=dv, qk_rope_head_dim=latent - dv, qk_head_dim=latent,
@@ -258,7 +258,8 @@ def _ref_attend(q_cat, pool_rows, live_rows, scale, dv):
     return s.softmax(-1) @ k[:, :dv]
 
 
-def test_backend_ragged_prefill_identity_and_selection():
+@pytest.mark.parametrize("kv_quant", ["none", "nvfp4"])
+def test_backend_ragged_prefill_identity_and_selection(kv_quant):
     """Two-request ragged prefill through the BACKEND (page-table slicing,
     counts = positions + 1, per-request segmentation, leader/follower reuse):
     request A stays under index_topk (selection == identity == dense), request B
@@ -267,7 +268,7 @@ def test_backend_ragged_prefill_identity_and_selection():
 
     torch.manual_seed(5)
     dv, dr, h, idx_h, idx_d, topk = 64, 16, 8, 16, 32, 64
-    backend, ctx = _make_backend(dsa=True, topk=topk)
+    backend, ctx = _make_backend(dsa=True, topk=topk, kv_quant=kv_quant)
     pool = ctx.kv_cache
     scale = backend.sm_scale
 
@@ -311,6 +312,10 @@ def test_backend_ragged_prefill_identity_and_selection():
     # request A (kv <= topk): selection covers all live -> equals dense reference
     q_cat = torch.cat([q_nope, q_pe], -1)
     slab = pool.latent_rows(0)
+    if kv_quant == "nvfp4":
+        from tests.kernels.test_kv_nvfp4 import _decode_latent
+
+        slab = _decode_latent(pool)
     for j in range(8):  # A's queries, positions 32..39
         live = ctx.page_table[0, : 33 + j]
         ref = _ref_attend(q_cat[j], slab, live, scale, dv)
@@ -335,15 +340,17 @@ def test_backend_ragged_prefill_identity_and_selection():
     assert (o0.float() - o1.float()).abs().max().item() < 3e-2
 
     # identity wiring (dense ablation): same batch through an MLAKVCache backend
-    backend_d, ctx_d = _make_backend(dsa=False)
+    backend_d, ctx_d = _make_backend(dsa=False, kv_quant=kv_quant)
     ctx_d.page_table.copy_(ctx.page_table)
-    for lid in (0, 1):
-        ctx_d.kv_cache._kv_buffer.copy_(pool._kv_buffer)
+    ctx_d.kv_cache._kv_buffer.copy_(pool._kv_buffer)
+    if kv_quant == "nvfp4":
+        ctx_d.kv_cache._scale_buffer.copy_(pool._scale_buffer)
+        ctx_d.kv_cache._block_scale_buffer.copy_(pool._block_scale_buffer)
     batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
                               active_table_idx=None, attn_metadata=None)
     backend_d.prepare_metadata(batch_d)
     od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_inputs=None)
-    slab_d = ctx_d.kv_cache.latent_rows(0)
+    slab_d = _decode_latent(ctx_d.kv_cache) if kv_quant == "nvfp4" else ctx_d.kv_cache.latent_rows(0)
     for j in range(8):
         live = ctx_d.page_table[0, : 33 + j]
         ref = _ref_attend(q_cat[j], slab_d, live, scale, dv)

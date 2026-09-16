@@ -28,6 +28,26 @@ from freetoken.message import (
 from freetoken.core import SamplingParams
 
 
+def test_multidimensional_cpu_tensor_wire_roundtrip_and_validation():
+    import pytest
+    import torch
+    from freetoken.message import UserMsg
+    from freetoken.message.utils import serialize_type, deserialize_type
+
+    for dtype in (torch.float32, torch.bfloat16, torch.int64):
+        source = torch.arange(24).to(dtype).reshape(2, 3, 4).transpose(0, 1)
+        payload = serialize_type(source)
+        result = deserialize_type({}, payload)
+        torch.testing.assert_close(result, source)
+        payload["shape"] = [25]
+        with pytest.raises(ValueError, match="shape"):
+            deserialize_type({}, payload)
+    legacy = {"__type__": "Tensor", "dtype": "torch.int32", "buffer": torch.tensor([4, 5], dtype=torch.int32).numpy().tobytes()}
+    assert deserialize_type({}, legacy).tolist() == [4, 5]
+    empty = torch.empty(0, 3)
+    assert deserialize_type({}, serialize_type(empty)).shape == (0, 3)
+
+
 def test_cache_rebuild_msg_roundtrip():
     msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))

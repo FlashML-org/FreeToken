@@ -18,6 +18,52 @@ REFERENCE_TABLES = {
     "interleaved_glm": [0, 1, 2] * 10 + [0, 1],
 }
 
+YARN = (("rope_type", "yarn"), ("factor", 4.0), ("original_max_position_embeddings", 262144))
+
+
+def _hf_yarn_parameters(device):
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    class Config:
+        head_dim = hidden_size = HEAD
+        num_attention_heads = 1
+        max_position_embeddings = 1048576
+        rope_parameters = {"rope_theta": 1e7, "partial_rotary_factor": .25, **dict(YARN)}
+
+        def standardize_rope_params(self):
+            pass
+
+    return ROPE_INIT_FUNCTIONS["yarn"](Config(), device=torch.device(device))
+
+
+def test_yarn_mrope_keeps_scaled_main_and_index_frequencies():
+    from freetoken.layers.rotary import MRotaryEmbedding, get_rope
+
+    get_rope.cache_clear()
+    kwargs = dict(rotary_dim=ROT, max_position=257, base=1e7, rope_scaling=YARN)
+    plain = get_rope(head_dim=HEAD, **kwargs)
+    main = get_rope(head_dim=HEAD, mrope_section=SECTION, **kwargs)
+    index = get_rope(head_dim=128, mrope_section=SECTION, **kwargs)
+    assert isinstance(main, MRotaryEmbedding) and isinstance(index, MRotaryEmbedding)
+    inv_freq, amplitude = _hf_yarn_parameters("cpu")
+    angles = torch.outer(torch.arange(257, dtype=torch.float32), inv_freq)
+    expected = torch.cat((angles.cos(), angles.sin()), dim=-1) * amplitude
+    for rope in (plain, main, index):
+        torch.testing.assert_close(rope._cos_sin_cache, expected, rtol=0, atol=1e-6)
+    torch.testing.assert_close(main._cos_sin_cache, plain._cos_sin_cache, rtol=0, atol=0)
+    torch.testing.assert_close(index._cos_sin_cache, plain._cos_sin_cache, rtol=0, atol=0)
+    assert main._section_table.tolist() == REFERENCE_TABLES["interleaved"]
+    assert amplitude > 1.0
+    get_rope.cache_clear()
+
+
+def test_mrope_rejects_partial_proportional_cache_layout():
+    from freetoken.layers.rotary import get_rope
+
+    with pytest.raises(ValueError, match="partial proportional"):
+        get_rope(head_dim=HEAD, rotary_dim=ROT, max_position=8, base=1e7,
+                 rope_scaling=(("rope_type", "proportional"),), mrope_section=SECTION)
+
 
 def test_section_tables():
     from freetoken.layers.rotary import build_section_table
@@ -112,3 +158,34 @@ def test_kernel_matches_torch_fallback():
     apply_mrope_torch_fallback(pos3, q2, k2, HEAD, cache, sec)
     assert torch.allclose(q.float(), q2.float(), atol=1e-2, rtol=1e-2)
     assert torch.allclose(k.float(), k2.float(), atol=1e-2, rtol=1e-2)
+
+
+@cuda
+@pytest.mark.parametrize("head_dim", [128, HEAD], ids=["index", "attention"])
+def test_yarn_mrope_cuda_matches_hf_frequencies_and_preserves_partial_tail(head_dim):
+    from freetoken.layers.rotary import get_rope
+
+    get_rope.cache_clear()
+    with torch.device("cuda"):
+        rope = get_rope(head_dim=head_dim, rotary_dim=ROT, max_position=4096, base=1e7,
+                        rope_scaling=YARN, mrope_section=SECTION)
+    gen = torch.Generator(device="cuda").manual_seed(29)
+    positions = torch.randint(0, 4096, (3, 37), device="cuda", dtype=torch.int32, generator=gen)
+    q = torch.randn(37, 3 * head_dim, device="cuda", dtype=torch.bfloat16, generator=gen)
+    k = torch.randn(37, head_dim, device="cuda", dtype=torch.bfloat16, generator=gen)
+    expected = [q.clone(), k.clone()]
+    inv_freq, amplitude = _hf_yarn_parameters("cuda")
+    axes = torch.tensor(REFERENCE_TABLES["interleaved"], device="cuda")
+    angles = positions[axes].T.float() * inv_freq
+    cos, sin = (angles.cos() * amplitude).unsqueeze(1), (angles.sin() * amplitude).unsqueeze(1)
+    for tensor in expected:
+        value = tensor.view(37, -1, head_dim)
+        lo, hi = value[..., :ROT // 2].float(), value[..., ROT // 2:ROT].float()
+        value[..., :ROT // 2] = (lo * cos - hi * sin).to(value.dtype)
+        value[..., ROT // 2:ROT] = (hi * cos + lo * sin).to(value.dtype)
+    rope.forward(positions, q, k)
+    for actual, reference in zip((q, k), expected):
+        torch.testing.assert_close(actual, reference, rtol=.02, atol=.02)
+        torch.testing.assert_close(actual.view(37, -1, head_dim)[..., ROT:],
+                                    reference.view(37, -1, head_dim)[..., ROT:], rtol=0, atol=0)
+    get_rope.cache_clear()

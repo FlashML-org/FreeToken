@@ -455,6 +455,61 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     assert is_offload_moe_strategy(config.moe_strategy)
 
 
+@pytest.mark.parametrize("unified_memory,requested,expert_quant,expected", [
+    (True, "auto", "none", "fused"),
+    (True, "auto", "fp8_block", "fused"),
+    (True, "auto", "nvfp4", "offload"),
+    (True, "offload", "none", "offload"),
+    (True, "offload", "fp8_block", "offload"),
+    (True, "offload", "nvfp4", "offload"),
+    (False, "auto", "none", "offload"),
+    (False, "auto", "fp8_block", "offload"),
+    (False, "auto", "nvfp4", "offload"),
+])
+def test_adjust_config_unified_memory_respects_expert_format(monkeypatch, unified_memory, requested, expert_quant, expected):
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    import freetoken.engine.engine as engine_module
+
+    profile_reads = []
+
+    def recommendation(fmt, **identity):
+        profile_reads.append((fmt, identity))
+        return "hybrid" if unified_memory else None
+
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: unified_memory)
+    monkeypatch.setattr(engine_module, "_profile_gpu", lambda index=None: ("test-gpu", "test-uuid"))
+    monkeypatch.setattr("freetoken.moe.bench_profile.load_backend_recommendation", recommendation)
+    config = EngineConfig(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        attention_backend="triton",
+        moe_strategy=requested,
+        moe_cache_auto=True,
+        quant_backend="moe.nvfp4=triton" if expert_quant == "nvfp4" else None,
+    )
+    model = SimpleNamespace(
+        has_swa_attention=False, has_linear_attention=False, is_moe=True,
+        num_layers=10, num_moe_layers=10, num_experts=8,
+        expert_quant=expert_quant, moe_strategy=requested,
+    )
+    object.__setattr__(config, "model_config", model)
+
+    engine_module._adjust_config(config)
+
+    assert config.moe_strategy == model.moe_strategy == expected
+    assert config.moe_cache_auto == (expected == "offload")
+    assert model.decode_target == "gpu"
+    if unified_memory:
+        assert profile_reads == []
+    else:
+        assert profile_reads == [("bf16" if expert_quant == "none" else expert_quant,
+                                  {"gpu_name": "test-gpu", "gpu_uuid": "test-uuid"})]
+
+
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     import freetoken.core as core
     from freetoken.core import Context, Req, get_global_ctx

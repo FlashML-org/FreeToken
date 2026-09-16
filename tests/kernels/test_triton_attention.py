@@ -49,6 +49,34 @@ def _reference_paged_attention(
     return torch.stack(outs, dim=0)
 
 
+def _mm_test_pool(monkeypatch, heads, head_dim, num_slots, kv_quant):
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    monkeypatch.setattr(
+        "freetoken.kvcache.mha_pool.get_tp_info", lambda: SimpleNamespace(size=1)
+    )
+    return MHAKVCache(
+        heads, 1, head_dim, num_slots, 1, torch.bfloat16,
+        torch.device("cuda"), kv_quant=kv_quant,
+    )
+
+
+def _restored_mha_cache(pool, which):
+    codes = getattr(pool, f"{which}_cache")(0).flatten(0, 1)
+    if pool.kv_quant == "none":
+        return codes.float()
+    row_scale = getattr(pool, f"{which}_scale")(0)
+    if pool.kv_quant == "fp8":
+        return codes.view(torch.float8_e4m3fn).float() * row_scale[..., None]
+    code = torch.stack((codes & 15, codes >> 4), -1).flatten(-2).long()
+    values = torch.tensor(
+        [0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6],
+        device=codes.device,
+    )
+    block_scale = getattr(pool, f"{which}_block_scale")(0).view(torch.float8_e4m3fn).float()
+    return values[code] * block_scale.repeat_interleave(16, -1) * row_scale[..., None]
+
+
 def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
@@ -69,6 +97,14 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
 
         def v_cache(self, layer_id):
             return self.v
+
+        # A 16-bit pool answers None here. The backend reads it on every path since the
+        # fp8 store landed, so the double answers it too.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
 
     kv_cache = FakeKVCache()
     monkeypatch.setattr(
@@ -517,7 +553,10 @@ def test_extend_triton_attention_matches_reference(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("use_split_inputs", [False, True])
 @pytest.mark.parametrize("sliding_window", [None, 48])
-def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(use_split_inputs: bool, sliding_window: int | None):
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
+def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(
+    monkeypatch, use_split_inputs: bool, sliding_window: int | None, kv_quant: str,
+):
     """Rows of an image span see the span's later keys across q tiles, text rows stay causal, the window still bounds the past."""
     from freetoken.kernel.triton.attention import extend_paged_attention
 
@@ -531,9 +570,13 @@ def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(use
     q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
     k_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    row_gain = torch.linspace(.25, 2, total_kv * num_kv_heads, device=device).view(total_kv, num_kv_heads, 1)
+    block_gain = torch.linspace(.5, 1.5, head_dim // 16, device=device).repeat_interleave(16)
+    k_cache.mul_(row_gain * block_gain)
+    v_cache.mul_(row_gain.flip(0) * block_gain.flip(0))
     qo_indptr = torch.tensor([0] + extend_lens, dtype=torch.int32, device=device).cumsum_(0)
     kv_indptr = torch.tensor([0] + seq_lens, dtype=torch.int32, device=device).cumsum_(0)
-    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    indices = torch.randperm(total_kv, device=device).to(torch.int32)
     prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
     q_to_req = torch.empty(total_q, dtype=torch.int32, device=device)
     q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
@@ -548,16 +591,29 @@ def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(use
     k_extend = torch.cat([k_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)])
     v_extend = torch.cat([v_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)])
     sm_scale = head_dim**-0.5
+    pool = _mm_test_pool(monkeypatch, num_kv_heads, head_dim, total_kv, kv_quant)
+    pool.store_kv(k_cache.flatten(1), v_cache.flatten(1), indices, 0)
+    k_ref, v_ref = [_restored_mha_cache(pool, which) for which in ("k", "v")]
+    if use_split_inputs:
+        for i, cached_len in enumerate(cached_lens):
+            slots = indices[kv_indptr[i] + cached_len : kv_indptr[i + 1]].long()
+            k_ref[slots] = k_extend[qo_indptr[i] : qo_indptr[i + 1]].float()
+            v_ref[slots] = v_extend[qo_indptr[i] : qo_indptr[i + 1]].float()
+    if kv_quant == "nvfp4":
+        k_ref, v_ref = [value.to(q.dtype).float() for value in (k_ref, v_ref)]
 
     actual = extend_paged_attention(
-        q, k_cache, v_cache, qo_indptr, kv_indptr, indices, prefix_lens, max(extend_lens), sm_scale,
+        q, pool.k_cache(0).flatten(0, 1), pool.v_cache(0).flatten(0, 1),
+        qo_indptr, kv_indptr, indices, prefix_lens, max(extend_lens), sm_scale,
         sliding_window=sliding_window, block_ends=block_ends,
         k_extend=k_extend if use_split_inputs else None, v_extend=v_extend if use_split_inputs else None,
+        k_scale=pool.k_scale(0), v_scale=pool.v_scale(0), kv_quant=kv_quant,
+        k_block_scale=pool.k_block_scale(0), v_block_scale=pool.v_block_scale(0),
     )
     expected = _reference_paged_attention(
-        q, k_cache, v_cache, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, block_ends=block_ends
+        q, k_ref, v_ref, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, block_ends=block_ends
     )
-    causal_only = _reference_paged_attention(q, k_cache, v_cache, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window)
+    causal_only = _reference_paged_attention(q, k_ref, v_ref, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window)
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
     assert not torch.allclose(expected.float(), causal_only.float(), atol=2e-2, rtol=2e-2)
@@ -666,6 +722,36 @@ def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expecte
     assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
 
 
+@pytest.mark.parametrize(
+    ("head_dim", "smem_optin", "expected_16bit", "expected_fp8"),
+    [
+        # consumer opt-in smem (sm_86/sm_89 ~99KB): a 1-byte cache buys BLOCK_N 32 -> 64
+        (256, 101376, (64, 32), (64, 64)),
+        # where the fast tile already fits, the cache dtype changes nothing
+        (256, 232448, (128, 64), (128, 64)),
+        # unknown budget stays conservative for both
+        (256, 0, (64, 32), (64, 32)),
+    ],
+)
+def test_select_extend_tile_uses_kv_cache_element_size(
+    head_dim, smem_optin, expected_16bit, expected_fp8
+):
+    """The q tile is always 2 bytes/element but K and V follow the cache, so charging
+    K/V at 2 bytes regardless makes an fp8 cache run a smaller tile than it has shared
+    memory for. On an RTX 3070 (sm_86, 99KB opt-in, head_dim 256) that was BLOCK_N 32
+    where 64 fits, worth ~9% of prefill time at 99k context.
+
+    The 16-bit column is the no-regression half: ``kv_bytes=2`` reproduces the previous
+    budget identically, since (M + 2N) * D * 2 == (M*2 + 2N*2) * D."""
+    import triton
+
+    from freetoken.kernel.triton.attention import _select_extend_tile
+
+    block_d = triton.next_power_of_2(head_dim)
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 2) == expected_16bit
+    assert _select_extend_tile(head_dim, block_d, smem_optin, 1) == expected_fp8
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
     from freetoken.attention import AttentionSpec
@@ -687,6 +773,14 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
 
         def v_cache(self, layer_id):
             return self.v
+
+        # A 16-bit pool answers None here. The backend reads it on every path since the
+        # fp8 store landed, so the double answers it too.
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
 
     device = torch.device("cuda")
     head_dim = 256
@@ -737,38 +831,29 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
-def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(monkeypatch):
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
+def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(monkeypatch, kv_quant):
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend
 
-    class FakeKVCache:
-        def __init__(self, device: torch.device, head_dim: int):
-            self.device = device
-            self.dtype = torch.bfloat16
-            self.k = torch.randn(3, 1, head_dim, device=device, dtype=torch.bfloat16)
-            self.v = torch.randn(3, 1, head_dim, device=device, dtype=torch.bfloat16)
-
-        def store_kv(self, k, v, out_loc, layer_id):
-            self.k[out_loc.to(torch.long)] = k.view(k.shape[0], 1, -1)
-            self.v[out_loc.to(torch.long)] = v.view(v.shape[0], 1, -1)
-
-        def k_cache(self, layer_id):
-            return self.k
-
-        def v_cache(self, layer_id):
-            return self.v
-
+    torch.manual_seed(19)
     device = torch.device("cuda")
     head_dim = 256
-    kv_cache = FakeKVCache(device, head_dim)
-    ctx = SimpleNamespace(kv_cache=kv_cache, page_table=torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device))
+    kv_cache = _mm_test_pool(monkeypatch, 1, head_dim, 4, kv_quant)
+    page_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device=device)
+    kv_cache.store_kv(
+        torch.randn(4, head_dim, device=device, dtype=torch.bfloat16),
+        torch.randn(4, head_dim, device=device, dtype=torch.bfloat16),
+        page_table.flatten(), 0,
+    )
+    ctx = SimpleNamespace(kv_cache=kv_cache, page_table=page_table)
     monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: ctx)
     backend = TritonAttentionBackend(SimpleNamespace())
     # one request: cached token 0, chunk tokens 1 and 2 forming one image span [1, 3)
     batch = SimpleNamespace(
         padded_reqs=[SimpleNamespace(extend_len=2, device_len=3, cached_len=1, table_idx=0)],
         positions=torch.tensor([1, 2], dtype=torch.int64, device=device),
-        out_loc=torch.tensor([1, 2], dtype=torch.int32, device=device),
+        out_loc=page_table[0, 1:3],
         mm_block_ends=torch.tensor([3, 3], dtype=torch.int32, device=device),
     )
     # bf16 takes the extend kernel path; fp32 would fall back to the paged kernel, which has no block mask
@@ -777,14 +862,37 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
     v = torch.randn(2, head_dim, device=device, dtype=torch.bfloat16)
     backend.prepare_metadata(batch)
     md = batch.attn_metadata
-    ref = lambda ends: _reference_paged_attention(
-        q, kv_cache.k, kv_cache.v, md.indptr, md.indices, md.q_to_req, md.q_positions, head_dim**-0.5, None, block_ends=ends
-    )
+    def ref(ends, split_inputs=True):
+        k_ref, v_ref = [_restored_mha_cache(kv_cache, which) for which in ("k", "v")]
+        if split_inputs:
+            k_ref[batch.out_loc.long()] = k.view(-1, 1, head_dim).float()
+            v_ref[batch.out_loc.long()] = v.view(-1, 1, head_dim).float()
+        if kv_quant == "nvfp4":
+            k_ref, v_ref = [value.to(q.dtype).float() for value in (k_ref, v_ref)]
+        return _reference_paged_attention(
+            q, k_ref, v_ref, md.indptr, md.indices, md.q_to_req, md.q_positions,
+            head_dim**-0.5, None, block_ends=ends,
+        )
+
     causal = backend.forward(q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=head_dim**-0.5))
     torch.testing.assert_close(causal.float(), ref(None).float(), atol=2e-2, rtol=2e-2)
     blocks = backend.forward(q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=head_dim**-0.5, bidirectional_mm_blocks=True))
     torch.testing.assert_close(blocks.float(), ref(batch.mm_block_ends).float(), atol=2e-2, rtol=2e-2)
     assert not torch.allclose(blocks[0].float(), causal[0].float(), atol=2e-2, rtol=2e-2)  # token 1 now sees token 2
+
+    batch = SimpleNamespace(
+        padded_reqs=[SimpleNamespace(extend_len=1, device_len=4, cached_len=3, table_idx=0)],
+        positions=torch.tensor([3], dtype=torch.int64, device=device),
+        out_loc=page_table[0, 3:4],
+        mm_block_ends=None,
+    )
+    q = torch.randn(1, 2, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(1, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(1, head_dim, device=device, dtype=torch.bfloat16)
+    backend.prepare_metadata(batch)
+    md = batch.attn_metadata
+    decoded = backend.forward(q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(bidirectional_mm_blocks=True))
+    torch.testing.assert_close(decoded.float(), ref(None, split_inputs=False).float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
@@ -884,3 +992,271 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+def _fp8_cache(k_rows: torch.Tensor, v_rows: torch.Tensor):
+    """Quantize ``[slots, heads, dim]`` KV into codes + scales, in the layout the
+    attention kernels expect."""
+    from freetoken.kernel.triton.kv_quant import alloc_codes, quantize_kv_to_cache
+
+    slots, heads, dim = k_rows.shape
+    k_cache = alloc_codes((slots, heads, dim), k_rows.device)
+    v_cache = alloc_codes((slots, heads, dim), k_rows.device)
+    k_scale = torch.zeros((slots, heads), dtype=torch.float32, device=k_rows.device)
+    v_scale = torch.zeros((slots, heads), dtype=torch.float32, device=k_rows.device)
+    quantize_kv_to_cache(
+        k=k_rows.reshape(slots, heads * dim),
+        v=v_rows.reshape(slots, heads * dim),
+        out_loc=torch.arange(slots, dtype=torch.int32, device=k_rows.device),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+    return k_cache, v_cache, k_scale, v_scale
+
+
+def _dequantized(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Host-side decode (torch's e4m3 cast), so the reference never reuses the
+    software decoder the kernel is being tested against."""
+    from freetoken.kernel.triton.kv_quant import codes_to_f32
+
+    return codes_to_f32(codes) * scale.unsqueeze(-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize(("head_dim", "num_kv_heads"), [(64, 4), (128, 2)])
+def test_decode_paged_attention_decodes_fp8_scales(head_dim: int, num_kv_heads: int):
+    """fp8 decode must equal the SAME data dequantized by hand.
+
+    Not compared against the bf16 cache: the fp8-vs-bf16 gap is quantization error,
+    already bounded in tests/kernels/test_kv_fp8.py. What this pins is that the
+    kernel applies the right scale to the right row -- a dropped or mis-indexed
+    scale is off by a factor of amax/448, which no tolerance hides.
+    """
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    batch, num_q_heads, max_kv_splits = 2, 8, 8
+    seq_lens = [6, 9]
+    total_kv = sum(seq_lens)
+    q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    # Row magnitudes far from 1, so a missing scale cannot pass by luck.
+    k_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 8.0).to(
+        torch.bfloat16
+    )
+    v_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.05).to(
+        torch.bfloat16
+    )
+    indptr = torch.tensor([0, seq_lens[0], total_kv], dtype=torch.int32, device=device)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    q_positions = torch.tensor(
+        [seq_lens[0] - 1, seq_lens[1] - 1], dtype=torch.int64, device=device
+    )
+    q_to_req = torch.arange(batch, dtype=torch.int32, device=device)
+    attn_logits = torch.empty(
+        batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=device
+    )
+    attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device)
+    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
+    sm_scale = head_dim**-0.5
+
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_rows, v_rows)
+    actual = decode_paged_attention(
+        q,
+        k_codes,
+        v_codes,
+        indptr,
+        indices,
+        q_positions,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        _dequantized(k_codes, k_scale),
+        _dequantized(v_codes, v_scale),
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    # The kernel rounds the decoded operands to the compute dtype before tl.dot; the
+    # reference stays in fp32, hence the same tolerance the bf16 tests already use.
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_paged_attention_decodes_fp8_scales():
+    """The non-tl.dot fallback kernel takes the same scales (it serves head_dim > 256
+    with a short prefill, and every decode batch when the grouped path is not used)."""
+    from freetoken.kernel.triton.attention import paged_attention
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 4
+    seq_lens = [5, 3]
+    total_kv = sum(seq_lens)
+    q = torch.randn(total_kv, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 16.0).to(
+        torch.bfloat16
+    )
+    v_rows = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.02).to(
+        torch.bfloat16
+    )
+    indptr = torch.tensor([0, seq_lens[0], total_kv], dtype=torch.int32, device=device)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    q_to_req = torch.tensor(
+        [0] * seq_lens[0] + [1] * seq_lens[1], dtype=torch.int32, device=device
+    )
+    q_positions = torch.cat(
+        [
+            torch.arange(seq_lens[0], dtype=torch.int64, device=device),
+            torch.arange(seq_lens[1], dtype=torch.int64, device=device),
+        ]
+    )
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_rows, v_rows)
+    actual = paged_attention(
+        q,
+        k_codes,
+        v_codes,
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        head_dim**-0.5,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        _dequantized(k_codes, k_scale),
+        _dequantized(v_codes, v_scale),
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        head_dim**-0.5,
+        None,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("use_split_inputs", [False, True])
+def test_extend_paged_attention_decodes_fp8_scales(use_split_inputs: bool):
+    """Prefill over an fp8 cache.
+
+    With ``use_split_inputs`` the kernel reads a request's own new tokens from
+    ``k_extend`` (compute dtype, never quantized) and only the cached prefix from the
+    fp8 codes; without it every row is served from the codes. The reference mirrors
+    that split, so a scale leaking onto the extend path -- or failing to apply to the
+    cache path -- cannot pass.
+    """
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    torch.manual_seed(14)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 8
+    cached_lens, extend_lens = [4, 2], [3, 2]
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    total_q, total_kv = sum(extend_lens), sum(seq_lens)
+    q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
+        torch.bfloat16
+    )
+    v_extend = (torch.randn(total_q, num_kv_heads, head_dim, device=device) * 3.0).to(
+        torch.bfloat16
+    )
+    # Magnitudes far from 1: a dropped scale is then off by orders of magnitude.
+    k_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 0.3).to(
+        torch.bfloat16
+    )
+    v_cache = (torch.randn(total_kv, num_kv_heads, head_dim, device=device) * 3.0).to(
+        torch.bfloat16
+    )
+    qo_indptr = torch.tensor([0] + extend_lens, dtype=torch.int32, device=device).cumsum_(0)
+    kv_indptr = torch.tensor([0] + seq_lens, dtype=torch.int32, device=device).cumsum_(0)
+    # KV positions are logical, but FP8 codes and their scales are addressed by the
+    # physical slots from the page table. A contiguous table masks a regression that
+    # looks scales up with the logical position instead of the slot.
+    indices = torch.tensor(
+        [10, 3, 8, 1, 9, 0, 7, 2, 6, 4, 5], dtype=torch.int32, device=device
+    )
+    prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
+    q_to_req = torch.empty(total_q, dtype=torch.int32, device=device)
+    q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
+    q_off = kv_off = 0
+    for req_idx, (cached_len, extend_len) in enumerate(zip(cached_lens, extend_lens)):
+        q_to_req[q_off : q_off + extend_len].fill_(req_idx)
+        q_positions[q_off : q_off + extend_len] = torch.arange(
+            cached_len, cached_len + extend_len, dtype=torch.int64, device=device
+        )
+        # The step's own tokens are what the engine stores at the tail of the span.
+        k_cache[kv_off + cached_len : kv_off + cached_len + extend_len] = k_extend[
+            q_off : q_off + extend_len
+        ]
+        v_cache[kv_off + cached_len : kv_off + cached_len + extend_len] = v_extend[
+            q_off : q_off + extend_len
+        ]
+        q_off += extend_len
+        kv_off += cached_len + extend_len
+    sm_scale = head_dim**-0.5
+
+    num_slots = total_kv + 1
+    k_slots = torch.zeros(
+        num_slots, num_kv_heads, head_dim, dtype=k_cache.dtype, device=device
+    )
+    v_slots = torch.zeros_like(k_slots)
+    k_slots[indices.to(torch.long)] = k_cache
+    v_slots[indices.to(torch.long)] = v_cache
+    k_codes, v_codes, k_scale, v_scale = _fp8_cache(k_slots, v_slots)
+    k_ref = _dequantized(k_codes, k_scale).clone()
+    v_ref = _dequantized(v_codes, v_scale).clone()
+    if use_split_inputs:
+        q_off = kv_off = 0
+        for cached_len, extend_len in zip(cached_lens, extend_lens):
+            current_slots = indices[
+                kv_off + cached_len : kv_off + cached_len + extend_len
+            ].to(torch.long)
+            k_ref[current_slots] = k_extend[q_off : q_off + extend_len].float()
+            v_ref[current_slots] = v_extend[q_off : q_off + extend_len].float()
+            q_off += extend_len
+            kv_off += cached_len + extend_len
+
+    actual = extend_paged_attention(
+        q=q,
+        k_cache=k_codes,
+        v_cache=v_codes,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=indices,
+        prefix_lens=prefix_lens,
+        max_q_len=max(extend_lens),
+        sm_scale=sm_scale,
+        k_extend=k_extend if use_split_inputs else None,
+        v_extend=v_extend if use_split_inputs else None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _reference_paged_attention(
+        q,
+        k_ref,
+        v_ref,
+        kv_indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=3e-2, rtol=3e-2)
