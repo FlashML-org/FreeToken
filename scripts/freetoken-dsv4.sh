@@ -29,9 +29,9 @@ EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 # disappear from the log's `layers=` count, which is the quickest way to tell which
 # mode a run was in.
 SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
-# Experimental request-local circuit breaker. A zero acceptance threshold leaves
-# production behavior unchanged. The measured Lenovo A/B starts at 0.60/32/64.
-DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0}"
+# Request-local circuit breaker: persistently weak drafts fall back to target-only decode.
+# 0.60/32/64 is the measured Lenovo A/B setting; DSPARK_FALLBACK_ACCEPTANCE=0 disables it.
+DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0.60}"
 DSPARK_FALLBACK_MIN_DRAFTED="${DSPARK_FALLBACK_MIN_DRAFTED:-32}"
 DSPARK_FALLBACK_STEPS="${DSPARK_FALLBACK_STEPS:-64}"
 # Which base dspark_target_layer_ids is read with (0 or 1). Exported so it reaches the
