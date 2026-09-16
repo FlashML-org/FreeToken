@@ -1,4 +1,3 @@
-import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -6,6 +5,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
+from freetoken.moe.hybrid_decode import HybridDecodeRequest
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 
@@ -19,12 +19,6 @@ if TYPE_CHECKING:
 # is computed outside the MoE layer. Such models call ``routed_forward`` with a
 # precomputed routing instead of going through the generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
-
-# Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
-# default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
-# GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
-_HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
-
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -281,7 +275,17 @@ class OffloadMoELayer(MoELayer):
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+            executor = cache.hybrid_decode_executor
+            assert executor is not None, "Hybrid decode executor was not initialized"
+            return executor.decode(
+                HybridDecodeRequest(
+                    layer_id=self.layer_id,
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                ),
+                gpu_expert_runner=self._run_cached_decode_experts,
+            )
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -295,54 +299,25 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
 
-    def _decode_hybrid(
+    def _run_cached_decode_experts(
         self,
-        cache: OffloadMoeCache,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
+        slot_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
-        computes the overflow misses, overlapped, then the partials merge.
-
-        The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
-        the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
-        """
-        executor = cache.cpu_executor
-        assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
-
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
-
-        # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
-        # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
-        cpu_routed_early = (
-            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
-        )
-
-        cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
-        gpu_routed = self._expert_gemm(
+        """Run model/format-specific decode GEMM against the current slot cache."""
+        cache = self.offload_cache
+        assert cache is not None
+        return self._expert_gemm(
             cache,
             hidden_states,
-            gpu_w,
-            gpu_slots,
+            topk_weights,
+            slot_ids,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
 
     def _prefill_routed(
         self,
