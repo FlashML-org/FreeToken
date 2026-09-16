@@ -84,7 +84,18 @@ def test_serial_reader_yields_rank_pieces_and_drops_each_shard_before_the_next(t
         return real_open(path, *a, **kw)
 
     monkeypatch.setattr(weight.safetensors, "safe_open", recording_open)
-    monkeypatch.setattr(weight, "drop_page_cache", lambda path: events.append(("drop", os.path.basename(path))))
+    mapped_at_drop: list[str] = []
+
+    def recording_drop(path):
+        events.append(("drop", os.path.basename(path)))
+        # Mapped pages survive POSIX_FADV_DONTNEED, so nothing may still map the shard
+        # (a lingering slice handle or a zero-copy tensor view) when its cache is dropped.
+        if os.path.exists("/proc/self/maps"):
+            with open("/proc/self/maps") as maps:
+                if any(line.rstrip().endswith(os.path.realpath(path)) for line in maps):
+                    mapped_at_drop.append(os.path.basename(path))
+
+    monkeypatch.setattr(weight, "drop_page_cache", recording_drop)
 
     pieces = {}
     for layer, e0, e1, piece in weight.iter_expert_pieces(str(tmp_path), None, QuantKind.MXFP4, parallel=False):
@@ -93,6 +104,7 @@ def test_serial_reader_yields_rank_pieces_and_drops_each_shard_before_the_next(t
         pieces[(layer, e0)] = piece
 
     assert sorted(pieces) == [(layer, e) for layer in range(L) for e in range(E)]
+    assert not mapped_at_drop, f"shards still mapped when their cache was dropped: {mapped_at_drop}"
     for (layer, e), piece in pieces.items():
         for (proj, kind), _ in SHAPES.items():
             role = ROLE[proj] + ("_scale" if kind == "scale" else "")

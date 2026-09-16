@@ -283,10 +283,8 @@ def iter_expert_pieces(
         return per_expert_pieces(_cut(tensors), locate, tensors_per_expert=6)
 
     def _serial():
-        # One shard at a time, its page cache dropped as soon as its pieces are out: the
-        # host banks and a whole checkpoint's page cache do not both fit in host RAM, and
-        # under TP every rank reads the same files at once. Holding every shard open until
-        # the last layer let that cache build up to the full checkpoint on top of the banks.
+        # One shard at a time, dropping its page cache before the next: the banks and a whole
+        # checkpoint's cache do not both fit in host RAM when every TP rank reads at once.
         by_shard: dict[str, list[str]] = {}
         for name, shard_file in _weight_map(model_path).items():
             if locate(name) is not None:
@@ -300,14 +298,17 @@ def iter_expert_pieces(
                     for name in by_shard[shard_file]:
                         role = locate(name)[2]
                         if tp.size > 1 and _I_AXIS[role] == 0:
-                            # gate/up and their scales carry I on the ROW axis, which is
-                            # contiguous in the file: read just this rank's rows. down's I is
-                            # the column axis, so it is read whole and cut below.
+                            # gate/up carry I on the contiguous row axis, so read only this rank's rows
                             rows = f.get_slice(name)
                             lo, step = _i_block(role, rows.get_shape()[0], rank=tp.rank, tp_size=tp.size)
-                            yield name, rows[lo:lo + step].clone(memory_format=torch.contiguous_format)
+                            piece = rows[lo:lo + step].clone(memory_format=torch.contiguous_format)
+                            del rows  # a live slice handle keeps the shard mapped, and mapped pages survive the drop
                         else:
-                            yield name, shard_expert_piece(role, f.get_tensor(name), rank=tp.rank, tp_size=tp.size)
+                            piece = shard_expert_piece(role, f.get_tensor(name), rank=tp.rank, tp_size=tp.size)
+                            if tp.size == 1:
+                                piece = piece.clone()  # get_tensor maps the file; a held view would pin the shard's cache
+                        yield name, piece
+                        del piece
             finally:
                 drop_page_cache(path)
 
