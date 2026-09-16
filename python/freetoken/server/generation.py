@@ -194,8 +194,27 @@ def resolve_sampling(
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
-    return [_render_message(m) for m in messages]
+    ValueError on a non-text content part (text-only server). Shared by all adapters.
+
+    Some chat templates (e.g. Qwen3.6) require the system message at index 0;
+    hoist system messages to the front and merge multiples into one to satisfy
+    that constraint."""
+    rendered = [_render_message(m) for m in messages]
+    system_msgs = [m for m in rendered if m.get("role") == "system"]
+    if system_msgs and rendered[0].get("role") != "system":
+        non_system = [m for m in rendered if m.get("role") != "system"]
+        rendered = system_msgs + non_system
+    # Merge multiple system messages into one (Qwen3.6 template rejects
+    # system messages that are not at loop.first, i.e. after the first).
+    system_msgs = [m for m in rendered if m.get("role") == "system"]
+    if len(system_msgs) > 1:
+        sep = chr(10) + chr(10)
+        merged_content = sep.join(
+            str(m.get("content") or "") for m in system_msgs if m.get("content")
+        )
+        non_system = [m for m in rendered if m.get("role") != "system"]
+        rendered = [{"role": "system", "content": merged_content}] + non_system
+    return rendered
 
 
 def _render_message(message: dict[str, Any]) -> dict[str, Any]:
