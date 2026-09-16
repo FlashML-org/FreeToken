@@ -26,6 +26,11 @@ def fused_experts_gguf_q4_0(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str,
+    *,
+    gate_up_quant_type: int = GGML_Q4_0,
+    down_quant_type: int = GGML_Q4_0,
+    intermediate_size: int | None = None,
+    hidden_size: int | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
@@ -34,16 +39,19 @@ def fused_experts_gguf_q4_0(
         raise ValueError(f"unsupported MoE activation {activation!r}")
 
     num_tokens = hidden_states.shape[0]
-    n2 = gate_up_q.shape[1]  # 2 * intermediate
-    h = down_q.shape[1]  # hidden
+    n2 = 2 * intermediate_size if intermediate_size is not None else gate_up_q.shape[1]
+    h = hidden_size if hidden_size is not None else down_q.shape[1]
     top_k = topk_ids.shape[1]
-    qt = int(GGML_Q4_0)
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-    gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
+    gate_up = ggml_moe_a8_vec(
+        hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_quant_type), n2, num_tokens
+    )
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
+    out = ggml_moe_a8_vec(
+        inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k
+    )
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )
