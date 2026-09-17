@@ -72,7 +72,7 @@ class MiniMaxM3MMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
         t, h, w = item.grid_thw
         full = [IMAGE_START_ID] + [self.image_token_id] * ((t * h * w) // (self.merge * self.merge)) + [IMAGE_END_ID]
         return PromptReplacement.select_token_id(full, self.image_token_id)

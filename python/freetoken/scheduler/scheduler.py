@@ -32,7 +32,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .mm import cut_image_spans, plan_mm_batch
+from .mm import cut_image_spans, mm_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -858,6 +858,9 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_gather_plan = plan
             batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
             batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            # the same spans as (start, end) pairs, off the list just built: backends that
+            # build per-span candidate lists cannot scan the device tensor without a sync
+            batch.mm_spans = mm_spans(block_ends, batch.padded_reqs) or None
         if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]

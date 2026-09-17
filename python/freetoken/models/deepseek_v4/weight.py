@@ -78,12 +78,16 @@ def iter_weights(
     *,
     include_moe_experts: bool = True,
     include_non_moe: bool = True,
+    include_vision: bool = True,
 ):
     """Stream resident (non-expert) weights as ``(name, tensor)`` keyed to engine params.
 
     Routed MXFP4 experts come from the offload cache, so ``include_moe_experts`` must be
     False (DeepSeek-V4 only runs ``--moe-strategy offload``). Tensors yielded in checkpoint
     dtype (fp8 + e8m0 preserved); ``wo_a`` dequantized to bf16 to match the reference einsum.
+    ``include_vision`` (the engine's active-encoder set) drops the ``vision.*`` / ``aligner.*``
+    / ``image_*`` tower tensors; the router biases stay in either way, since the gate builds
+    them on any vision checkpoint.
     """
     if include_moe_experts:
         raise ValueError(
@@ -111,6 +115,9 @@ def iter_weights(
         yield "model.head.weight", get("head.weight")
         for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             yield f"model.{nm}", get(nm)
+
+        if include_vision:
+            yield from _iter_vision(reader, args)
 
         for L in range(args.n_layers):
             a = f"layers.{L}.attn"
@@ -147,8 +154,13 @@ def iter_weights(
             yield f"model.{g}.weight", get(f"{g}.weight")
             if L < args.n_hash_layers:
                 yield f"model.{g}.tid2eid", get(f"{g}.tid2eid")
+                if args.vision_n_layers > 0:
+                    # a vision checkpoint gives its hash layers a text bias too
+                    yield f"model.{g}.bias", get(f"{g}.bias")
             else:
                 yield f"model.{g}.bias", get(f"{g}.bias")
+            if args.vision_n_layers > 0:
+                yield f"model.{g}.bias_vl", get(f"{g}.bias_vl")
             for proj in ("w1", "w2", "w3"):
                 src = f"layers.{L}.ffn.shared_experts.{proj}"
                 yield from linear(src, f"model.{src}")
@@ -158,6 +170,56 @@ def iter_weights(
                 "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
             ):
                 yield f"model.layers.{L}.{nm}", get(f"layers.{L}.{nm}")
+    finally:
+        reader.close()
+
+
+# --------------------------------------------------------------------------------------
+# Vision tower.
+# --------------------------------------------------------------------------------------
+# The wrapper keeps the tower unprefixed (``vision.*``, ``aligner.*``, ``image_*``), so the
+# checkpoint's own names are the model's names and nothing is renamed on either side.
+_VISION_BLOCK_SUFFIXES = (
+    "norm1.weight",
+    "attn.wqkv.weight",
+    "attn.wqkv.bias",
+    "attn.wo.weight",
+    "attn.wo.bias",
+    "norm2.weight",
+    "mlp.w1.weight",
+    "mlp.w2.weight",
+)
+_VISION_TAIL = (
+    "vision.patch_embed.proj.weight",
+    "vision.patch_embed.proj.bias",
+    "vision.norm.weight",
+    "aligner.w1.weight",
+    "aligner.w1.bias",
+    "aligner.w2.weight",
+    "aligner.w2.bias",
+    "image_start",
+    "image_end",
+    "image_newline",
+    "image_pad",
+)
+
+
+def _iter_vision(reader, args: DeepseekV4Args):
+    if args.vision_n_layers <= 0:
+        return
+    for L in range(args.vision_n_layers):
+        for suffix in _VISION_BLOCK_SUFFIXES:
+            yield f"vision.blocks.{L}.{suffix}", reader.get(f"vision.blocks.{L}.{suffix}")
+    for name in _VISION_TAIL:
+        yield name, reader.get(name)
+
+
+def iter_vision_weights(model_path: str, device):
+    """The vision tower alone, for the engine's encoder-only load and the FTW converter."""
+    args = load_args(model_path, max_batch_size=1)
+    reader = _ShardReader(model_path, _weight_map(model_path), device)
+    try:
+        yield from _iter_vision(reader, args)
     finally:
         reader.close()
 
@@ -212,4 +274,4 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces"]
+__all__ = ["iter_weights", "iter_expert_pieces", "iter_vision_weights"]

@@ -6,7 +6,14 @@ import torch
 
 from freetoken.message import MMItem
 from freetoken.mm.encoder_cache import EncoderCache
-from freetoken.scheduler.mm import cut_image_spans, mm_chunk_end, mm_rows_after, plan_mm_batch, plan_mm_chunk
+from freetoken.scheduler.mm import (
+    cut_image_spans,
+    mm_chunk_end,
+    mm_rows_after,
+    mm_spans,
+    plan_mm_batch,
+    plan_mm_chunk,
+)
 
 CPU = torch.device("cpu")
 
@@ -112,3 +119,33 @@ def test_cut_image_spans_reports_the_image_a_chunk_ends_inside():
     text = SimpleNamespace(mm_items=None, device_len=5)
     assert cut_image_spans([text, req(30)]) == [(22, 40)]
     assert cut_image_spans([req(8)]) == cut_image_spans([req(20)]) == cut_image_spans([req(40)]) == []  # outside every span or on a boundary
+
+
+def test_mm_spans_recover_the_runs_the_batch_ends_report():
+    from types import SimpleNamespace
+
+    # req 1: image on [2, 5) from the start; req 2: chunk [4, 10) of a prompt whose image spans [3, 8)
+    a = SimpleNamespace(uid=1, table_idx=0, mm_items=[_item(7, [[2, 5]])], cached_len=0, device_len=6, extend_len=6)
+    b = SimpleNamespace(uid=2, table_idx=1, mm_items=[_item(8, [[3, 8]])], cached_len=4, device_len=10, extend_len=6)
+    _jobs, _plan, _rows, block_ends = plan_mm_batch([a, b], None)
+    # req 2's span is only partly in its chunk, and the pair is in request coordinates
+    assert mm_spans(block_ends, [a, b]) == {0: [(2, 5)], 1: [(4, 8)]}
+
+
+def test_mm_spans_keep_two_images_of_one_request_apart():
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(uid=1, table_idx=3, mm_items=[_item(7, [[1, 3], [6, 9]])], cached_len=0, device_len=10, extend_len=10)
+    _jobs, _plan, _rows, block_ends = plan_mm_batch([req], None)
+    assert block_ends == [0, 3, 3, 0, 0, 0, 9, 9, 9, 0]
+    assert mm_spans(block_ends, [req]) == {3: [(1, 3), (6, 9)]}
+
+
+def test_mm_spans_are_empty_for_text_and_for_images_wholly_in_the_cached_prefix():
+    from types import SimpleNamespace
+
+    text = SimpleNamespace(uid=1, table_idx=0, mm_items=None, cached_len=0, device_len=4, extend_len=4)
+    cached = SimpleNamespace(uid=2, table_idx=1, mm_items=[_item(7, [[2, 5]])], cached_len=10, device_len=12, extend_len=2)
+    _jobs, _plan, _rows, block_ends = plan_mm_batch([text, cached], None)
+    assert block_ends == [0] * 6  # nothing left to encode: no rows, no spans
+    assert mm_spans(block_ends, [text, cached]) == {}

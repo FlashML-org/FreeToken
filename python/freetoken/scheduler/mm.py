@@ -88,4 +88,34 @@ def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem
     return jobs, plan, rows, block_ends
 
 
-__all__ = ["cut_image_spans", "mm_chunk_end", "mm_rows_after", "plan_mm_batch", "plan_mm_chunk"]
+def mm_spans(block_ends: List[int], reqs) -> dict[int, List[Tuple[int, int]]]:
+    """The batch's image spans as absolute ``(start, end)`` pairs per page-table row.
+
+    ``plan_mm_batch`` reports one end per batch token; a span is a maximal run of tokens
+    sharing one, so the pairs are recovered here -- in the scheduler, off the same list the
+    batch field is built from, rather than on the device in the forward path. Backends that
+    build per-span candidate lists (DSV4's sparse attention) read this; the block-tiled ones
+    read ``batch.mm_block_ends``.
+    """
+    spans: dict[int, List[Tuple[int, int]]] = {}
+    offset = 0
+    for req in reqs:
+        seg = block_ends[offset : offset + req.extend_len]
+        i = 0
+        req_spans: List[Tuple[int, int]] = []
+        while i < len(seg):
+            if not seg[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(seg) and seg[j] == seg[i]:
+                j += 1
+            req_spans.append((req.cached_len + i, req.cached_len + j))
+            i = j
+        if req_spans:
+            spans[req.table_idx] = req_spans
+        offset += req.extend_len
+    return spans
+
+
+__all__ = ["cut_image_spans", "mm_chunk_end", "mm_rows_after", "mm_spans", "plan_mm_batch", "plan_mm_chunk"]

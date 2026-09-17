@@ -61,7 +61,7 @@ class QwenVLMMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
         t, h, w = item.grid_thw
         n_tokens = (t * h * w) // (self.merge * self.merge)
         return PromptReplacement([self.image_token_id] * n_tokens)
