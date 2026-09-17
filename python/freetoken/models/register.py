@@ -268,7 +268,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
