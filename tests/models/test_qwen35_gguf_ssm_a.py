@@ -53,7 +53,7 @@ def test_qwen_gguf_gdn_value_head_rows_restore_complete_quantized_rows():
         dtype=torch.uint8,
     )
 
-    restored = _restore_gdn_value_head_rows(grouped, num_key_heads=4, head_dim=2)
+    restored = _restore_gdn_value_head_rows(grouped, num_key_heads=4, head_dim=1)
 
     expected = torch.tensor(
         [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]],

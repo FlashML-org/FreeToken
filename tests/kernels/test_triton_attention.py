@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
 def _reference_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,

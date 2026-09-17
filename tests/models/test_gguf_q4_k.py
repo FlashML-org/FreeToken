@@ -27,7 +27,7 @@ def test_q4_k_reference_decoder_handles_scale_minimum_and_nibble_order():
     raw[0, 8] = 4
     raw[0, 5] = 3
     raw[0, 9] = 4
-    raw[0, 16:32] = 0xF1  # low nibble 1, high nibble 15 for the first 32-value group.
+    raw[0, 16:48] = 0xF1  # low nibble 1, high nibble 15 for the first 32-value group.
 
     decoded = dequant_q4_k(raw, torch.float32)
     # group 0: 2 * 3 * q - 0.5 * 4. The first 32 values use low nibbles.
