@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -111,6 +112,11 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
+        # uid -> monotonic clock at admission, for the per-request prefill span shipped on the
+        # first sampled token. An entry existing IS the "this is the first token" test, so it is
+        # popped there; _free_req_resources pops too, so a request aborted mid-prefill (which
+        # never samples) cannot leave one behind.
+        self._prefill_start: dict[int, float] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
@@ -370,6 +376,10 @@ class Scheduler(SchedulerIOMixin):
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
+                # Present only until this request's first token is sampled, i.e. off its last
+                # prefill chunk -- so popping it both ends the prefill span and marks this as
+                # the one reply that carries it.
+                started_at = self._prefill_start.pop(req.uid, None)
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -378,6 +388,10 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        prefill_ms=(
+                            0.0 if started_at is None
+                            else (time.monotonic() - started_at) * 1000.0
+                        ),
                     )
                 )
 
@@ -631,6 +645,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # A request freed without ever sampling (aborted mid-prefill) would otherwise keep its
+        # admission timestamp forever; a normally-finished one popped it at its first token.
+        self._prefill_start.pop(req.uid, None)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -886,6 +903,11 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        # Before the forward, which is what makes this the prefill START: _schedule_next_batch
+        # has prepared the batch but not run it.
+        now = time.monotonic()
+        for uid, _, _ in batch.prompt_admissions:
+            self._prefill_start[uid] = now
         self.send_result(
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)

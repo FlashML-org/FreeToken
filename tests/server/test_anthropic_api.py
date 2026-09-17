@@ -33,6 +33,7 @@ from freetoken.server.generation import (  # noqa: E402
     ContentDelta,
     GenDone,
     GenResult,
+    GenTimings,
     ReasoningDelta,
     ToolCallsDelta,
 )
@@ -43,12 +44,14 @@ async def _aiter(items):
         yield it
 
 
-def _collect_events(events, model="claude-x", uid=1, cache_report=False):
+def _collect_events(events, model="claude-x", uid=1, cache_report=False, metrics=False):
     """Run the Anthropic event stream over neutral GenEvents; return [(type, data), ...]."""
 
     async def run():
         out = []
-        async for frame in A.anthropic_event_stream(_aiter(events), model, uid, cache_report=cache_report):
+        async for frame in A.anthropic_event_stream(
+            _aiter(events), model, uid, cache_report=cache_report, metrics=metrics
+        ):
             etype = None
             data = None
             for line in frame.split("\n"):
@@ -976,3 +979,52 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "role": "user",
         "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Per-request metrics (--enable-metrics-report)
+# --------------------------------------------------------------------------- #
+def _timed_result() -> GenResult:
+    return GenResult(
+        reasoning="", content="hi", tool_calls=[], finish_reason="stop",
+        prompt_tokens=11, completion_tokens=5, cached_tokens=8,
+        timings=GenTimings(ttft_ms=30.0, prefill_ms=12.0, decode_ms=40.0, total_ms=70.0),
+    )
+
+
+def test_full_response_metrics_absent_unless_asked_for():
+    """Anthropic's wire has no `metrics` field, so /v1/messages must stay byte-identical for
+    every client that did not opt in -- absent, not null."""
+    resp = A.anthropic_full_response(_timed_result(), "claude-x", uid=9)
+    assert "metrics" not in resp.model_dump(exclude_none=True)
+
+
+def test_full_response_metrics_report_the_untouched_prompt_split():
+    """cache_report rewrites usage.input_tokens to exclude the cached prefix; metrics must
+    still describe the real prefill, which is prompt_tokens - cached_tokens."""
+    resp = A.anthropic_full_response(
+        _timed_result(), "claude-x", uid=9, cache_report=True, metrics=True
+    )
+    body = resp.model_dump(exclude_none=True)
+    assert body["usage"]["input_tokens"] == 3
+    assert body["metrics"]["prefill_tokens"] == 3
+    assert body["metrics"]["cached_prompt_tokens"] == 8
+    assert body["metrics"]["prefill_time_ms"] == 12.0
+    assert body["metrics"]["ttft_ms"] == 30.0
+
+
+def test_stream_message_delta_carries_metrics():
+    events = [
+        ContentDelta("hi"),
+        GenDone("stop", 4, 2, cached_tokens=1,
+                timings=GenTimings(ttft_ms=5.0, prefill_ms=2.0, decode_ms=9.0, total_ms=14.0)),
+    ]
+    collected = _collect_events(events, metrics=True)
+    md = next(e[1] for e in collected if e[0] == "message_delta")
+    assert md["metrics"]["prefill_time_ms"] == 2.0
+    assert md["metrics"]["prefill_tokens"] == 3
+    # Only the terminal event carries them.
+    assert sum(1 for _, data in collected if isinstance(data, dict) and "metrics" in data) == 1
+
+    off = _collect_events(events)
+    assert all("metrics" not in data for _, data in off if isinstance(data, dict))

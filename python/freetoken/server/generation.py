@@ -108,12 +108,33 @@ class ToolCallsDelta:
 
 
 @dataclass
+class GenTimings:
+    """Per-request inference timings, in milliseconds.
+
+    ``prefill_ms`` is the scheduler's own span (admission to the token sampled off the
+    request's last prefill chunk), shipped over the wire because it is the one boundary a
+    client cannot see; the rest are measured here, around the engine ack loop, so they carry
+    the same IPC hops the client's own HTTP timestamps would.
+
+    Under concurrency every span is this request's SHARE of shared work -- its prefill chunk
+    is co-scheduled with other prompts, its decode steps batched with other requests -- so
+    the derived rates describe this request under that load, not isolated engine throughput.
+    """
+
+    ttft_ms: float = 0.0
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+@dataclass
 class GenDone:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: GenTimings = field(default_factory=GenTimings)
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -129,6 +150,7 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: GenTimings = field(default_factory=GenTimings)
 
 
 @dataclass
@@ -491,6 +513,83 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
             task.cancel()
 
 
+class _Timer:
+    """Times one generation off the raw ack stream.
+
+    Deliberately fed from acks rather than from emitted GenEvents: a reasoning or tool-call
+    parser holds text back, sometimes to the end of the stream, so the first EVENT can lag the
+    first generated token by a lot. Acks are also the one path both the streaming and the
+    buffered generator share, so TTFT means the same thing on either.
+    """
+
+    def __init__(self) -> None:
+        self.start = time.monotonic()
+        self.first_token_at: float | None = None
+        self.end: float | None = None
+        self.prefill_ms = 0.0
+
+    def observe(self, ack: Any) -> None:
+        if ack.prefill_ms:
+            self.prefill_ms = ack.prefill_ms
+        # completion_tokens_delta, not incremental_output: the detokenizer holds back a
+        # trailing partial-stop prefix, so a real generated token can arrive with empty text.
+        if self.first_token_at is None and ack.completion_tokens_delta:
+            self.first_token_at = time.monotonic()
+        if ack.finished:
+            # Stamped here, not in finish(): the callers run the reasoning split and the
+            # tool-call drain between the terminal ack and building their result, and that
+            # post-processing is not inference time.
+            self.end = time.monotonic()
+
+    def finish(self) -> GenTimings:
+        # A stream cut short (client disconnect) never saw a terminal ack; time it to here.
+        end = self.end if self.end is not None else time.monotonic()
+        first = self.first_token_at
+        return GenTimings(
+            ttft_ms=0.0 if first is None else (first - self.start) * 1000.0,
+            prefill_ms=self.prefill_ms,
+            decode_ms=0.0 if first is None else (end - first) * 1000.0,
+            total_ms=(end - self.start) * 1000.0,
+        )
+
+
+def build_metrics(
+    *, prompt_tokens: int, completion_tokens: int, cached_tokens: int, timings: GenTimings
+) -> dict[str, Any]:
+    """The `metrics` object served under --enable-metrics-report, identical on every protocol.
+
+    ``cached_prompt_tokens`` is the real prefix-cache hit whatever --enable-cache-report says:
+    that flag governs BILLING fields in `usage`, and gating the hit here instead would leave
+    prefill_tokens_per_second silently computed over tokens that were never forwarded.
+
+    Decode throughput divides by completion_tokens - 1, not completion_tokens: the first token
+    falls out of prefill, so decode_time_ms spans only the intervals after it (the convention
+    vLLM's and sglang's serving benchmarks use).
+    """
+    prefill_tokens = max(prompt_tokens - cached_tokens, 0)
+    prefill_s = timings.prefill_ms / 1000.0
+    decode_s = timings.decode_ms / 1000.0
+    return {
+        "ttft_ms": round(timings.ttft_ms, 3),
+        "prefill_tokens": prefill_tokens,
+        "cached_prompt_tokens": cached_tokens,
+        "prefill_time_ms": round(timings.prefill_ms, 3),
+        "prefill_tokens_per_second": round(prefill_tokens / prefill_s, 2) if prefill_s > 0 else 0.0,
+        "decode_tokens": completion_tokens,
+        "decode_time_ms": round(timings.decode_ms, 3),
+        "decode_tokens_per_second": (
+            round((completion_tokens - 1) / decode_s, 2)
+            if decode_s > 0 and completion_tokens > 1
+            else 0.0
+        ),
+        "total_time_ms": round(timings.total_ms, 3),
+    }
+
+
+def metrics_enabled(state: Any) -> bool:
+    return bool(getattr(state.config, "enable_metrics_report", False))
+
+
 def _record_generation(
     *,
     source: str | None,
@@ -532,27 +631,24 @@ async def generate_events(
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
     if the drop lands before `GenDone`, the only event carrying the totals."""
-    start = time.monotonic()
+    timer = _Timer()
     prompt_tokens = 0
     completion_tokens = 0
-    first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(uid, spec, state, timer):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
-            elif first_token_at is None:
-                first_token_at = time.monotonic()
             yield ev
     except GenerationError as exc:
         error = str(exc)
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
+            source=source, stream=True, start=timer.start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            first_token_at=timer.first_token_at,
         )
 
 
@@ -561,25 +657,29 @@ async def generate_full(
 ) -> GenResult:
     """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
     a `GenerationError` as a failed row."""
-    start = time.monotonic()
+    timer = _Timer()
     result: GenResult | None = None
     error: str | None = None
     try:
-        result = await _generate_full_impl(uid, spec, state)
+        result = await _generate_full_impl(uid, spec, state, timer)
         return result
     except GenerationError as exc:
         error = str(exc)
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source, stream=False, start=timer.start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
+            # No first_token_at: non-streaming rows deliberately carry no TTFT, because
+            # requests_ttft_mean_ms averages only the rows that have one. `metrics` still does.
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, timer: _Timer
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -686,6 +786,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
+        timer.observe(ack)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
@@ -771,10 +872,11 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        timings=timer.finish(),
     )
 
 
-async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
+async def _generate_full_impl(uid: int, spec: GenSpec, state: Any, timer: _Timer) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
@@ -786,6 +888,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
+        timer.observe(ack)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
@@ -815,4 +918,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        timings=timer.finish(),
     )
