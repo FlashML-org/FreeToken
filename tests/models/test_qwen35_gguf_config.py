@@ -115,3 +115,29 @@ def test_qwen35_dense_gguf_metadata_maps_to_dense_hybrid_geometry():
     assert config.moe_enabled is False
     assert config.moe_weight_format == "qwen35_dense"
     assert config.expert_quant == "none"
+
+
+def test_qwen35_gguf_gdn_keeps_its_native_q8_projection():
+    """GGUF's packed qkv|z path must not depend on a generic QuantConfig scheme."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.gguf import GGUFLinear
+    from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    gdn = Qwen3_5GatedDeltaNet(
+        hidden_size=64,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+        layer_id=0,
+        gguf_q8=True,
+    )
+
+    assert gdn._split_in_proj
+    assert isinstance(gdn.in_proj_qkvz, GGUFLinear)
+    assert hasattr(gdn, "in_proj_ba")
+    assert not hasattr(gdn, "in_proj")
