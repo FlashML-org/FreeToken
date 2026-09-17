@@ -30,6 +30,43 @@
 # variant, a mismatched cache wheel, or development builds.
 set -euo pipefail
 
+# AppImage launchers prepend bundle-private libraries to LD_LIBRARY_PATH so the
+# GUI can resolve its own dependencies. That environment is inherited here by
+# system children such as curl; on newer distros, system libcurl can then bind
+# an older bundled libnghttp2 with the same SONAME and fail before uv bootstrap.
+# Strip only entries inside APPDIR: preserve user/system paths and leave every
+# non-AppImage invocation unchanged.
+_sanitize_appimage_ld_library_path() {
+  [ -n "${APPDIR:-}" ] || return 0
+  [ -n "${LD_LIBRARY_PATH:-}" ] || return 0
+
+  local appdir="${APPDIR%/}"
+  [ -n "$appdir" ] || appdir="$APPDIR"
+  local entry cleaned="" rest="${LD_LIBRARY_PATH}:"
+  local kept=0
+  while [ -n "$rest" ]; do
+    entry="${rest%%:*}"
+    rest="${rest#*:}"
+    case "$entry" in
+      "$appdir"|"$appdir"/*) continue ;;
+    esac
+    if [ "$kept" -eq 1 ]; then
+      cleaned="$cleaned:$entry"
+    else
+      cleaned="$entry"
+      kept=1
+    fi
+  done
+
+  if [ "$kept" -eq 1 ]; then
+    export LD_LIBRARY_PATH="$cleaned"
+  else
+    unset LD_LIBRARY_PATH
+  fi
+}
+_sanitize_appimage_ld_library_path
+unset -f _sanitize_appimage_ld_library_path
+
 DEFAULT_WHEEL_URL=""   # filled in once GitHub Releases are live
 DEFAULT_KERNEL_CACHE_WHEEL_URL=""   # filled in once GitHub Releases are live
 
