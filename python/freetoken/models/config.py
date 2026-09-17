@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os
+
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
@@ -6,6 +8,16 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
 VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
+_VISION_TRUE = {"1", "true", "yes", "on"}
+
+
+def vision_load_enabled() -> bool:
+    """Return whether the optional vision tower should be built and loaded.
+
+    Vision weights are resident bf16 parameters, so text-only serving leaves them
+    disabled unless the caller explicitly opts in with ``FREETOKEN_LOAD_VISION``.
+    """
+    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 
 def detect_expert_quant(hf_config: Any) -> str:
