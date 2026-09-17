@@ -46,6 +46,12 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
             f"cache-sizing flags)."
         )
 
+# Headroom the KV host offload keeps out of the GPU pool solve: the bigger logical index slab
+# is priced exactly, but prefill transients (GDN chunk workspaces, QSA score logits) also grow
+# with the logical width and need this slack (a 0.8 GiB post-capture margin OOMed a 4096-token
+# prefill; the pre-offload runs sat at ~1.05 GiB).
+_KV_OFFLOAD_SERVING_MARGIN = 512 << 20
+
 
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
@@ -389,10 +395,35 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
-        self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        if config.kv_host_pages > 0:
+            # KV host offload: the scheduler, page table and radix tree run in a LOGICAL page
+            # space of num_gpu_pages + kv_host_pages; the GPU K/V buffer stays a
+            # num_gpu_pages LRU cache over a pinned host mirror (kvcache/kv_host_offload.py).
+            # The QSA index slab is per LOGICAL page, so reserve its growth before solving
+            # the GPU page count.
+            from freetoken.kvcache.qsa_pool import QSAKVCache
+
+            if not issubclass(self._pool_cls, QSAKVCache):
+                raise ValueError(
+                    f"--kv-host-pages requires the QSA paged KV pool, got {self._pool_cls.__name__}"
+                )
+            spec = next(s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0)
+            slab_per_page = (
+                (config.page_size // spec.index_ratio)
+                * spec.num_index_layers * spec.index_head_dim * 2
+            )
+            # The two-pass solve prices the logical-space slab growth AND hands back the
+            # serving-margin the growth would otherwise eat (prefill transients need it).
+            reserve = config.kv_host_pages * slab_per_page + _KV_OFFLOAD_SERVING_MARGIN
+            num_gpu_pages = self._pool_cls.solve_num_pages(config, available_memory - reserve)
+            self.num_pages = num_gpu_pages + config.kv_host_pages
+        else:
+            self.num_pages = num_gpu_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, num_gpu_pages, device=self.device, dtype=self.dtype,
+            num_index_pages=self.num_pages if config.kv_host_pages > 0 else None,
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -425,6 +456,21 @@ class Engine:
         # re-point here (and again on any table realloc). The graph-input snapshot that reads
         # through them belongs to the attention backend, built later in init_capture_graph.
         self.kv_cache.attach_page_table(self.page_table)
+
+        # ======================= KV host offload ========================
+        # Attached before create_attention_backend: the QSA backend reads ctx.kv_offloader
+        # at construction.
+        self.kv_offloader = None
+        if config.kv_host_pages > 0:
+            from freetoken.kvcache.kv_host_offload import KVHostOffloader
+
+            self.kv_offloader = KVHostOffloader(self.kv_cache, self.num_pages, self.device)
+            self.ctx.kv_offloader = self.kv_offloader
+            logger.info_rank0(
+                f"Allocating {num_tokens} tokens for KV cache (logical): "
+                f"{num_gpu_pages} GPU-resident pages + {config.kv_host_pages} host pages, "
+                f"pinned mirror {mem_GB(self.kv_offloader.mirror_bytes)}"
+            )
 
         # ======================= Attention backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -865,6 +911,14 @@ class Engine:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
+        if num_pages is not None and self.kv_offloader is not None:
+            # The logical/physical split (host mirror, LRU maps, QSA index slab sized to the
+            # logical space) is built once at startup; a runtime resize would have to rebuild
+            # all of it. Reject recoverably instead.
+            raise CacheRebuildRejected(
+                "num_pages rebuild is not supported with --kv-host-pages (restart with a "
+                "different --kv-host-pages / --memory-ratio instead)"
+            )
         if num_mamba_slots is not None:
             if self.linear_state_pool is None:
                 raise CacheRebuildRejected(
