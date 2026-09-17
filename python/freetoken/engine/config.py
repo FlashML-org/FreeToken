@@ -131,7 +131,11 @@ class EngineConfig:
         built = {e.config_key for e in self.active_encoders}
         for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
             if key not in built:
-                setattr(hf_config, key, None)
+                # Recent Transformers configs may be frozen dataclasses.  This
+                # is the private shallow copy used to remove disabled encoder
+                # sections before parsing, so bypass their public mutation
+                # guard without modifying the cached checkpoint config.
+                object.__setattr__(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
