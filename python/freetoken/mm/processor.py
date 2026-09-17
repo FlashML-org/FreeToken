@@ -98,8 +98,13 @@ class MMProcessor(ABC):
         """One MMItem per image with feature and hash; offsets are assigned by apply."""
 
     @abstractmethod
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
-        """The token sequence that stands in for this item's placeholder in the prompt."""
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
+        """The token sequence that stands in for this item's placeholder in the prompt.
+
+        ``start`` is where the replacement begins in input_ids; families whose block layout
+        depends on its absolute position (deepseek_v4 aligns the block to a compressor
+        stride) read it, the rest ignore it.
+        """
 
     def positions(self, length: int, items: list[MMItem]) -> tuple[torch.Tensor, int] | None:
         """[3, length] t/h/w rope positions and the decode delta; None for 1-D rope families."""
@@ -127,9 +132,9 @@ class MMProcessor(ABC):
         out: list[int] = []
         cursor = 0
         for slot, item in zip(slots, items):
-            repl = self.prompt_replacement(item)
             out.extend(ids[cursor:slot])
             base = len(out)
+            repl = self.prompt_replacement(item, base)
             full = list(repl.full)
             spans = repl.embed_spans()
             # embedding slots carry the content pad id so radix keys and the model's scatter mask see the image
@@ -200,7 +205,8 @@ def get_mm_processor(model_path: str, mm: MultimodalConfig | None = None) -> MMP
     served = [e for e in spec.encoders if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders]
     if spec.mm_processor is None or not served:
         return None
-    check_mm_pad_shift(config.text_config.vocab_size)
+    # families with a flat checkpoint config (deepseek_v4) carry vocab_size at the top level
+    check_mm_pad_shift(getattr(config, "text_config", config).vocab_size)
     module, _, cls = spec.mm_processor.partition(":")
     return getattr(importlib.import_module(module), cls)(config, model_path, mm)
 
