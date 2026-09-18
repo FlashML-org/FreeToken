@@ -72,6 +72,7 @@ from .generation import (
     generate_events,
     generate_full,
     render_messages,
+    reject_image_content,
     resolve_sampling,
     split_tool_lists,
     submit_generation,
@@ -157,7 +158,7 @@ async def handle_responses(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
-    except ValueError as exc:
+    except (ValueError, GenerationError) as exc:
         return _error_response(400, str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
@@ -335,6 +336,7 @@ def _input_text(content: Any) -> str:
         return content
     parts: list[str] = []
     for part in content:
+        reject_image_content(part)
         if isinstance(part, dict):
             if part.get("type") in ("input_text", "output_text", "text") or "text" in part:
                 parts.append(part.get("text") or "")

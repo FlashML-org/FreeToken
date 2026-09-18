@@ -47,6 +47,7 @@ from .generation import (
     generate_events,
     generate_full,
     render_messages,
+    reject_image_content,
     resolve_sampling,
     split_tool_lists,
     submit_generation,
@@ -118,7 +119,7 @@ async def handle_anthropic_messages(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
-    except ValueError as exc:
+    except (ValueError, GenerationError) as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
@@ -151,11 +152,11 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
         messages, template_tools, _, ctk = convert_anthropic_prompt(
             req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
         )
-    except ValueError as exc:
+    except (ValueError, GenerationError) as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     if not messages:
-        # Non-empty on the wire but nothing survived conversion (e.g. image-only blocks on
-        # this text-only server) — a client error, not a tokenizer fault.
+        # Non-empty on the wire but nothing survived conversion (e.g. opaque
+        # redacted-thinking blocks) — a client error, not a tokenizer fault.
         return _anthropic_error_response(
             400, "invalid_request_error", "messages: no tokenizable content"
         )
@@ -190,9 +191,7 @@ def convert_anthropic_prompt(
         if isinstance(req.system, str):
             system_texts.append(req.system)
         else:
-            system_texts.append(
-                "".join(b.text for b in req.system if b.type == "text" and b.text)
-            )
+            system_texts.append(_content_text(req.system))
 
     other: list[dict[str, Any]] = []
     for msg in req.messages:
@@ -208,14 +207,14 @@ def convert_anthropic_prompt(
         tool_calls: list[dict[str, Any]] = []
         thinking_parts: list[str] = []
         for block in msg.content:
+            # Silently dropping an image changes the question the model answers.
+            # Use the shared GenerationError, including for image aliases.
+            reject_image_content(block)
             if block.type == "text" and block.text:
                 content_parts.append({"type": "text", "text": block.text})
             elif block.type == "thinking" and block.thinking:
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
-            elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -255,7 +254,7 @@ def convert_anthropic_prompt(
             else:
                 openai_msg["content"] = content_parts
         elif not tool_calls and not thinking_parts:
-            # Nothing usable in this message (e.g. image-only) — skip it.
+            # Nothing usable in this message (e.g. opaque redacted thinking) — skip it.
             continue
         other.append(openai_msg)
 
@@ -330,6 +329,8 @@ def _content_text(content) -> str:
         return ""
     if isinstance(content, str):
         return content
+    for block in content:
+        reject_image_content(block)
     return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
 
 
@@ -340,6 +341,7 @@ def _tool_result_text(content) -> str:
         return content
     parts: list[str] = []
     for item in content:
+        reject_image_content(item)
         if isinstance(item, dict):
             parts.append(item.get("text") or "")
         else:

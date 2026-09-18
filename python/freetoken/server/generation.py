@@ -190,7 +190,8 @@ def resolve_sampling(
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    GenerationError on images and ValueError on other unsupported content parts.
+    Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -230,9 +231,17 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
+def reject_image_content(part: Any) -> None:
+    """Reject image blocks consistently before any adapter can discard their payload."""
+    kind = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+    if kind in {"image", "image_url", "input_image"}:
+        raise GenerationError("image content not supported by this text-only server")
+
+
 def _flatten_text_parts(parts: list[Any]) -> str:
     texts: list[str] = []
     for part in parts:
+        reject_image_content(part)
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
             texts.append((part.get("text") if isinstance(part, dict) else None) or "")

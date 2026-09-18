@@ -180,7 +180,7 @@ async def handle_chat_completion(
 
     try:
         spec = chat_request_to_genspec(req, model_sampling)
-    except ValueError as exc:
+    except (ValueError, GenerationError) as exc:
         return create_error_response(str(exc))
 
     if req.stream:
