@@ -36,6 +36,7 @@ from freetoken.utils import (
 from pydantic import BaseModel
 
 from .args import ServerArgs
+from .admission import AdmissionThrottledError, admission_limit
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
@@ -233,6 +234,11 @@ class FrontendManager:
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
             )
+        limit = admission_limit(self.config)
+        # Admission and map insertion contain no await: concurrent adapters on this
+        # loop cannot both claim the final slot. Check before changing uid/accounting.
+        if limit and max(len(self.ack_map), len(self.event_map)) >= limit:
+            raise AdmissionThrottledError()
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
@@ -337,6 +343,13 @@ class FrontendManager:
                 self.ack_map[uid] = []
                 ack = None
                 for ack in pending:
+                    if ack.finished:
+                        # Consumers break on this yield; async-generator finalization
+                        # may otherwise wait until after their next admission attempt.
+                        # Release synchronously at the terminal ack so a completed
+                        # request cannot spuriously occupy the only configured slot.
+                        self.ack_map.pop(uid, None)
+                        self.event_map.pop(uid, None)
                     yield ack
                 if ack and ack.finished:
                     break
@@ -827,7 +840,13 @@ async def generate(req: GenerateRequest, request: Request):
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
-    uid = state.new_user()
+    try:
+        uid = state.new_user()
+    except AdmissionThrottledError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=429,
+            headers={"Retry-After": str(exc.retry_after)},
+        )
     await state.send_one(
         TokenizeMsg(
             uid=uid,

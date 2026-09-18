@@ -15,6 +15,9 @@ from freetoken.utils import init_logger
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # 0 keeps existing desktop clients unlimited; -1 explicitly derives a cap from
+    # max_running_req. Positive values also bound work waiting for tokenization.
+    max_concurrent_requests: int = 0
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -631,8 +634,23 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=ServerArgs.max_concurrent_requests,
+        help=(
+            "Cap outstanding frontend requests (including tokenization, queued work "
+            "and streams). 0 (default) is unlimited for existing desktop clients; "
+            "-1 opts in to the scheduler's --max-running-requests limit, or give a positive "
+            "cap. Excess requests get HTTP 429 with a Retry-After estimate instead of "
+            "growing frontend queues; a small cap may reduce throughput."
+        ),
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if kwargs["max_concurrent_requests"] < -1:
+        parser.error("--max-concurrent-requests must be -1, 0 or a positive integer")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

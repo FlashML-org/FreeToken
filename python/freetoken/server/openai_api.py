@@ -22,6 +22,7 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .admission import AdmissionThrottledError
 from .generation import (
     ContentDelta,
     GenDone,
@@ -190,7 +191,10 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state)
+    except AdmissionThrottledError as exc:
+        return _throttled_response(exc)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
@@ -395,7 +399,10 @@ async def handle_completion(
     if req.stream:
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
-        uid = state.new_user()
+        try:
+            uid = state.new_user()
+        except AdmissionThrottledError as exc:
+            return _throttled_response(exc)
         await state.send_one(
             TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
         )
@@ -409,7 +416,10 @@ async def handle_completion(
     completion_tokens = 0
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
-        uid = state.new_user()
+        try:
+            uid = state.new_user()
+        except AdmissionThrottledError as exc:
+            return _throttled_response(exc)
         await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
         text = ""
         finish_reason = "stop"
@@ -492,6 +502,14 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
             }
         )
     yield b"data: [DONE]\n\n"
+
+
+def _throttled_response(exc: AdmissionThrottledError) -> JSONResponse:
+    response = create_error_response(
+        str(exc), status_code=429, err_type="rate_limit_error", code="rate_limit_exceeded",
+    )
+    response.headers["Retry-After"] = str(exc.retry_after)
+    return response
 
 
 def create_error_response(
