@@ -94,11 +94,19 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
 
 
 def _as_last_data(batch):
-    return (
-        SimpleNamespace(batch=batch),
-        (None, torch.tensor([42], dtype=torch.int32),
-         SimpleNamespace(synchronize=lambda: None)),
+    # Mirrors engine.ForwardOutput's drain-facing fields. _process_last_data reads
+    # attributes (next_tokens_cpu, copy_done_event, the *_cpu logprob columns), so a
+    # bare tuple no longer works; a namespace keeps this test off the engine import
+    # chain, whose kernel packages a scheduler unit test should not require.
+    outputs = SimpleNamespace(
+        next_tokens_gpu=None,
+        next_tokens_cpu=torch.tensor([42], dtype=torch.int32),
+        copy_done_event=SimpleNamespace(synchronize=lambda: None),
+        chosen_logprobs_cpu=None,
+        top_ids_cpu=None,
+        top_logprobs_cpu=None,
     )
+    return (SimpleNamespace(batch=batch), outputs)
 
 
 def test_abort_inflight_final_chunk_marks_then_drains():

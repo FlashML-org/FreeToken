@@ -56,6 +56,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # Neutral sampled-token logprobs entry for this token (see
+    # tokenizer.detokenize.build_logprobs_entry); None when the request did not ask.
+    logprobs: dict | None = None
 
 
 @dataclass
