@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -57,6 +58,25 @@ def register_control_routes(
     @app.get("/health")
     async def health():
         return build_health(get_state(), app.version)
+
+    @app.get("/healthz")
+    async def healthz():
+        # Liveness is deliberately independent of engine startup/rebuild/failure.
+        # Restarting an HTTP process just because weights are loading only repeats
+        # that loading forever. Readiness below carries the admission signal.
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz():
+        state = get_state()
+        ready = (
+            getattr(state, "maintenance_state", None) == "serving"
+            and not getattr(state, "fatal_error", None)
+        )
+        # Preserve the same lifecycle/phase/progress document as /health. The
+        # status code, not a replacement body, tells an orchestrator when to route.
+        # /health itself stays a 200 even during startup: the desktop depends on it.
+        return JSONResponse(build_health(state, app.version), status_code=200 if ready else 503)
 
     from . import request_ring
 
