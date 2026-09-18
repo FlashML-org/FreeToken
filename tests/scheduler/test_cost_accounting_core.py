@@ -199,8 +199,9 @@ def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
 
 def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
-    scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
+    scheduler.config = SimpleNamespace(offline_mode=False)
+    scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None, pending_list=[])
+    scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None, running_reqs=set())
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
@@ -212,10 +213,14 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
 
     Scheduler.normal_loop(scheduler)
 
-    assert len(sent) == 2
+    assert len(sent) == 3
     assert sent[0] == [late_sample]
     assert isinstance(sent[1][0], ErrorReplyMsg)
     assert sent[1][0].uid == 5 and sent[1][0].error == "request aborted"
+    # Telemetry follows the terminal barrier; it cannot overtake a sampled token.
+    from freetoken.message import QueueStatsMsg
+
+    assert sent[2] == [QueueStatsMsg(running=0, waiting=0)]
 
 
 def test_tokenizer_drain_sends_sampled_reply_before_abort_terminal():

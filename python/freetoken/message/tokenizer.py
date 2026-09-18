@@ -114,3 +114,11 @@ class ErrorReplyMsg(BaseTokenizerMsg):
     # can react without parsing prose. Today only "context_length_exceeded" (prompt longer than
     # the servable context); None = no specific class, the message is all there is.
     code: str | None = None
+
+
+@dataclass
+class QueueStatsMsg(BaseTokenizerMsg):
+    """Last scheduler queue snapshot; independent of per-request accounting."""
+
+    running: int
+    waiting: int

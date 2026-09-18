@@ -68,3 +68,11 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+
+
+@dataclass
+class QueueStatsReply(BaseFrontendMsg):
+    """Last scheduler queue snapshot; independent of per-request accounting."""
+
+    running: int
+    waiting: int

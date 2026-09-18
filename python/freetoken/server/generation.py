@@ -458,6 +458,7 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
 def _record_generation(
     *,
     source: str | None,
+    state: Any,
     stream: bool,
     start: float,
     prompt_tokens: int,
@@ -473,21 +474,23 @@ def _record_generation(
         return
     from .api_server import _served_model_name  # lazy: api_server imports this module
 
-    request_ring.record_request(
-        request_ring.RequestRecord(
-            ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            method="POST",
-            path=source,
-            status=500 if error else 200,
-            model=_served_model_name(),
-            duration_ms=int((time.monotonic() - start) * 1000),
-            ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            stream=stream,
-            error=error,
-        )
+    record = request_ring.RequestRecord(
+        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        method="POST",
+        path=source,
+        status=500 if error else 200,
+        model=_served_model_name(),
+        duration_ms=int((time.monotonic() - start) * 1000),
+        ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        stream=stream,
+        error=error,
     )
+    request_ring.record_request(record)
+    stats = getattr(state, "stats", None)
+    if stats is not None:
+        stats.observe_request(record)
 
 
 async def generate_events(
@@ -514,7 +517,7 @@ async def generate_events(
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
+            source=source, state=state, stream=True, start=start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
             first_token_at=first_token_at,
         )
@@ -536,7 +539,7 @@ async def generate_full(
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source, state=state, stream=False, start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,

@@ -11,7 +11,7 @@ from typing import Any
 
 
 class StatsTracker:
-    def __init__(self, window_s: float = 5.0) -> None:
+    def __init__(self, window_s: float = 5.0, model_name: str = "") -> None:
         self.window_s = window_s
         # maxlen bounds memory on the headless path: stale-sample eviction is poll-driven
         # (only _rate() trims to window_s), and clients that never hit /v1/stats (e.g.
@@ -37,6 +37,13 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # None until the scheduler sends its first real snapshot. Admission in the
+        # frontend includes tokenizer/queue time, so active cannot stand in for either.
+        self.scheduler_running: int | None = None
+        self.scheduler_waiting: int | None = None
+        from .metrics import TrackerMetrics
+
+        self.metrics = TrackerMetrics(self, model_name)
 
     @property
     def active(self) -> int:
@@ -82,6 +89,14 @@ class StatsTracker:
                     self._aborting.discard(uid)
                 else:
                     self.completed += 1
+
+    def observe_queue(self, running: int, waiting: int) -> None:
+        self.scheduler_running = running
+        self.scheduler_waiting = waiting
+
+    def observe_request(self, record: Any) -> None:
+        """Observe a completed shared-generation record once, alongside ring insertion."""
+        self.metrics.observe_request(record)
 
     def _rate(self, window: "deque[tuple[float, int]]", now: float | None) -> float:
         t = time.monotonic() if now is None else now
@@ -167,6 +182,8 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         },
         "requests": {
             "active": tr.active,
+            "running": tr.scheduler_running,
+            "waiting": tr.scheduler_waiting,
             "completed": tr.completed,
             "p95_ms": p95_ms,
             "ttft_mean_ms": ttft_mean_ms,

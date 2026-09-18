@@ -25,6 +25,7 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     TokenizeMsg,
+    QueueStatsReply,
     UserReply,
 )
 from freetoken.utils import (
@@ -45,6 +46,7 @@ from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
 from .responses_api import register_responses_routes
 from .stats import StatsTracker
+from .metrics import register_metrics_routes
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -199,7 +201,7 @@ class FrontendManager:
 
     def __post_init__(self) -> None:
         if self.stats is None:
-            self.stats = StatsTracker()
+            self.stats = StatsTracker(model_name=getattr(self.config, "served_model_name", None) or "")
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -243,6 +245,9 @@ class FrontendManager:
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            if isinstance(msg, QueueStatsReply):
+                self.stats.observe_queue(msg.running, msg.waiting)
+                continue
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
@@ -419,6 +424,7 @@ register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+register_metrics_routes(app, get_global_state)
 register_accounting_routes(app, get_global_state)
 
 

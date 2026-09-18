@@ -17,6 +17,7 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    QueueStatsMsg,
     UserMsg,
 )
 from freetoken.utils import (
@@ -145,6 +146,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self._report_queue_stats()
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -248,6 +250,7 @@ class Scheduler(SchedulerIOMixin):
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
         self._flush_abort_acks()
+        self._report_queue_stats()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -276,6 +279,7 @@ class Scheduler(SchedulerIOMixin):
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
+        self._report_queue_stats()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -854,6 +858,21 @@ class Scheduler(SchedulerIOMixin):
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
             ]
         )
+
+    def _report_queue_stats(self) -> None:
+        """Publish manager counts, including zero after a queued-only abort.
+
+        This runs after the batch/abort drain and before the next blocking receive.
+        No forward or accounting message is reordered; the rank-aware send path
+        publishes only from rank zero. Avoid a per-token IPC when counts are stable.
+        """
+        if self.config.offline_mode:
+            return
+        snapshot = (len(self.decode_manager.running_reqs), len(self.prefill_manager.pending_list))
+        if snapshot == getattr(self, "_last_queue_stats", None):
+            return
+        self.send_result([QueueStatsMsg(running=snapshot[0], waiting=snapshot[1])])
+        self._last_queue_stats = snapshot
 
     def _flush_abort_acks(self) -> None:
         pending = getattr(self, "_pending_abort_acks", None)

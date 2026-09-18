@@ -20,6 +20,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    QueueStatsMsg,
+    QueueStatsReply,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -171,7 +173,9 @@ def tokenize_worker(
             # Cache-rebuild control messages are pure passthrough (no tokenization):
             # CacheRebuildMsg (api -> scheduler) and CacheRebuildResultMsg (scheduler -> api).
             for m in pending_msg:
-                if isinstance(m, CacheRebuildMsg):
+                if isinstance(m, QueueStatsMsg):
+                    send_frontend.put(QueueStatsReply(running=m.running, waiting=m.waiting))
+                elif isinstance(m, CacheRebuildMsg):
                     send_backend.put(
                         CacheRebuildBackendMsg(
                             request_id=m.request_id,
@@ -197,7 +201,7 @@ def tokenize_worker(
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg, QueueStatsMsg),
                 )
                 for m in pending_msg
             )

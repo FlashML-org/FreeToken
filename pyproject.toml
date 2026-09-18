@@ -48,6 +48,7 @@ dependencies = [
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
     "prompt_toolkit>=3.0,<4",
+    "prometheus-client>=0.20,<1",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
