@@ -36,6 +36,7 @@ from freetoken.utils import (
 from pydantic import BaseModel
 
 from .args import ServerArgs
+from .auth import install_auth
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
@@ -950,6 +951,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
+    # CORS is outermost so browser preflights can negotiate Authorization; actual
+    # requests still pass through auth before any adapter admits engine work.
+    install_auth(app, config.api_key)
     install_cors(app, config.cors_origins)
     init_request_logging()
     # Hide the frequent health/stats/requests/cache-status polling of the desktop app (and of

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -15,6 +15,9 @@ from freetoken.utils import init_logger
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # Empty preserves the loopback desktop deployment. repr=False keeps secrets out
+    # of diagnostic config reprs; remote deployments must explicitly opt in.
+    api_key: str = field(default="", repr=False)
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -628,6 +631,19 @@ def parse_args(
         help=(
             "Comma-separated CORS allow-list for browser/webview clients "
             "(default: local Tauri/Vite dev origins). '' disables, '*' allows any."
+        ),
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=ServerArgs.api_key,
+        help=(
+            "Comma-separated bearer API keys accepted by all routes except health "
+            "probes and the separately loopback-gated /v1/admin/* endpoints. "
+            "Empty (default) disables authentication for local desktop clients; "
+            "set keys before exposing the server remotely and send Authorization: "
+            "Bearer <key>. Multiple keys allow clients to rotate without downtime."
         ),
     )
 
