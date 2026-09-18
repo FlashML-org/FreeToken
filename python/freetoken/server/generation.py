@@ -17,7 +17,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import request_ring
@@ -140,6 +140,8 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
 
+    structured_output_schema: dict | None = None
+
     @property
     def parse_tools(self) -> bool:
         return self.parser_tools is not None
@@ -241,6 +243,47 @@ def _flatten_text_parts(parts: list[Any]) -> str:
     return "".join(texts)
 
 
+def parse_response_format(response_format: dict[str, Any] | None) -> dict | None:
+    """Validate the wire schema, without claiming the engine can enforce it.
+
+    JSON Schema validation uses the declared standard's meta-schema, not a
+    hand-written subset. check_schema does not retrieve user $ref targets; the
+    future constraint compiler must define which references/features it supports.
+    """
+    if response_format is None or response_format.get("type") in (None, "text"):
+        return None
+    if response_format.get("type") != "json_schema":
+        raise GenerationError("response_format must be text or json_schema")
+    descriptor = response_format.get("json_schema")
+    if not isinstance(descriptor, dict):
+        raise GenerationError("response_format.json_schema must be an object")
+    import re
+
+    name = descriptor.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise GenerationError("response_format.json_schema.name must be a 1-64 character identifier")
+    if descriptor.get("strict") is not None and not isinstance(descriptor["strict"], bool):
+        raise GenerationError("response_format.json_schema.strict must be a boolean")
+    schema = descriptor.get("schema")
+    if not isinstance(schema, dict):
+        raise GenerationError("response_format.json_schema.schema must be a JSON Schema object")
+    from copy import deepcopy
+
+    from jsonschema import Draft202012Validator, SchemaError
+    from jsonschema.validators import validator_for
+
+    if "$schema" in schema and not isinstance(schema["$schema"], str):
+        raise GenerationError("response_format.json_schema.$schema must be a URI string")
+    validator = validator_for(schema, default=Draft202012Validator if "$schema" not in schema else None)
+    if validator is None:
+        raise GenerationError("response_format.json_schema uses an unsupported $schema dialect")
+    try:
+        validator.check_schema(schema)
+    except SchemaError as exc:
+        raise GenerationError(f"invalid response_format.json_schema: {exc.message}") from exc
+    return deepcopy(schema)
+
+
 def split_tool_lists(
     all_tool_dicts: list[dict[str, Any]] | None, selected_name: str | None = None
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
@@ -261,12 +304,29 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    schema = spec.structured_output_schema
+    if schema is None:
+        schema = getattr(spec.sampling_params, "structured_output_schema", None)
+    if schema is not None:
+        from freetoken.scheduler.structured_output import ensure_structured_output_supported
+
+        try:
+            # Same scheduler-owned gate as direct IPC admission. Checking before
+            # allocating a uid also prevents a streaming adapter sending HTTP 200
+            # before an unsupported constraint comes back as a backend error.
+            ensure_structured_output_supported(schema)
+        except NotImplementedError as exc:
+            raise GenerationError(str(exc), "unsupported_response_format") from exc
+    params = (
+        replace(spec.sampling_params, structured_output_schema=schema)
+        if schema is not None else spec.sampling_params
+    )
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
             uid=uid,
             text=spec.messages,
-            sampling_params=spec.sampling_params,
+            sampling_params=params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
         )

@@ -25,6 +25,9 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # Transport only until the scheduler has a grammar logits processor. Never
+    # interpret this as permission to sample unconstrained text for a schema request.
+    structured_output_schema: dict | None = None
 
     @property
     def is_greedy(self) -> bool:

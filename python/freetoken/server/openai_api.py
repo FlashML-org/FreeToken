@@ -34,6 +34,7 @@ from .generation import (
     generate_events,
     generate_full,
     prerender_error,
+    parse_response_format,
     render_messages,
     resolve_sampling,
     submit_generation,
@@ -77,6 +78,7 @@ def chat_request_to_genspec(
             model_sampling=model_sampling,
             stop=req.stop,
         ),
+        structured_output_schema=parse_response_format(req.response_format),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -154,7 +156,7 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
-    if _response_format_unsupported(req.response_format):
+    if _response_format_unsupported(req.response_format) and req.response_format.get("type") != "json_schema":
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",
             param="response_format",
@@ -180,6 +182,8 @@ async def handle_chat_completion(
 
     try:
         spec = chat_request_to_genspec(req, model_sampling)
+    except GenerationError as exc:
+        return create_error_response(str(exc), param="response_format", code=exc.code)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -190,7 +194,10 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return create_error_response(str(exc), param="response_format", code=exc.code)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)

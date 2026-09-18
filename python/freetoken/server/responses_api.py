@@ -75,6 +75,7 @@ from .generation import (
     resolve_sampling,
     split_tool_lists,
     submit_generation,
+    parse_response_format,
     with_keepalive,
 )
 from .request_logger import log_request
@@ -100,6 +101,7 @@ class ResponsesRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     reasoning: dict[str, Any] | None = None
+    text: dict[str, Any] | None = None
     # Stateful features are accepted but ignored in this subset.
     store: bool = False
     previous_response_id: str | None = None
@@ -157,6 +159,8 @@ async def handle_responses(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return _error_response(400, str(exc), exc.code)
     except ValueError as exc:
         return _error_response(400, str(exc))
 
@@ -249,7 +253,22 @@ def convert_responses_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        structured_output_schema=parse_response_format(
+            _responses_response_format(req.text)
+        ),
     )
+
+
+def _responses_response_format(text: dict[str, Any] | None) -> dict | None:
+    """Normalize Responses' text.format wrapper; all validation stays shared."""
+    fmt = (text or {}).get("format")
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict):
+        raise GenerationError("text.format must be an object")
+    if fmt.get("type") == "json_schema":
+        return {"type": "json_schema", "json_schema": fmt}
+    return fmt
 
 
 def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
