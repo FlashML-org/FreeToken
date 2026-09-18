@@ -65,8 +65,11 @@ class Qwen3_5MoE(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None):
+        eq = getattr(config, "expert_quant", "none")
         weight_format = (
-            "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block" else "bf16"
+            "fp8_block" if eq == "fp8_block"
+            else "nvfp4" if eq == "nvfp4"
+            else "bf16"
         )
         self.experts = make_moe_layer(
             config, layer_id=layer_id, renormalize=True, weight_format=weight_format

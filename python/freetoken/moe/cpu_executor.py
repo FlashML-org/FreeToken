@@ -115,7 +115,9 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
+def resolve_threads_and_affinity(
+    requested: int, rank: int = 0, world_size: int = 1
+) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
@@ -123,14 +125,25 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spin-barrier degrades badly when oversubscribed). An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
+
+    Under TP (``world_size > 1``) each rank process gets a disjoint round-robin
+    slice of the physical cores (``reps[rank::world_size]``). Without this every
+    rank auto-pins the whole machine and the rank pools time-slice on the same
+    cores (measured ~4x decode loss on a 2x3090 box); round-robin also keeps a
+    fair P/E-core mix on heterogeneous CPUs.
     """
     reps = physical_core_cpus()
+    if world_size > 1:
+        reps = reps[rank % world_size :: world_size]
     if requested and requested > 0:
         n = int(requested)
         try:
             allowed = sorted(os.sched_getaffinity(0))
         except AttributeError:
             allowed = list(range(os.cpu_count() or 1))
+        if world_size > 1:
+            rank_reps = set(reps)
+            allowed = [c for c in allowed if c in rank_reps]
         # physical-core reps first, then the rest of the logical CPUs.
         order = reps + [c for c in allowed if c not in set(reps)]
         if not order:
@@ -213,7 +226,13 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        from freetoken.distributed import try_get_tp_info
+
+        tp_info = try_get_tp_info()
+        tp_rank, tp_world = (tp_info.rank, tp_info.size) if tp_info else (0, 1)
+        nthreads, core_ids = resolve_threads_and_affinity(
+            num_threads, rank=tp_rank, world_size=tp_world
+        )
         coord_core = -1
         if self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
@@ -242,7 +261,8 @@ class CpuMoeExecutor:
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        rank_core_count = len(physical_core_cpus()[tp_rank::tp_world]) if tp_world > 1 else len(physical_core_cpus())
+        spare = rank_core_count - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
@@ -310,11 +330,14 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
-        logger.info_rank0(
+        # Log on ALL ranks (not info_rank0): under TP the per-rank core partition
+        # must be visible per rank, or a pinning collision is invisible in the logs.
+        logger.info(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
-            f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
-            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
+            f"{core_ids[0]}..{core_ids[-1]}) tp_rank={tp_rank}/{tp_world} isa={self.isa} "
+            f"fmt={fmt} H={self.H} I={self.I} experts={self.num_experts} "
+            f"layers={self.num_layers} top_k={self.top_k} act={activation} "
+            f"max_tokens={self.max_tokens}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:

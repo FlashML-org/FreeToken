@@ -92,7 +92,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         if self._fp8:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False

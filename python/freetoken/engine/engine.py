@@ -1331,9 +1331,12 @@ def _adjust_config(config: EngineConfig):
 
     if (
         is_moe
-        and expert_quant not in ("none", "fp8_block")
+        and expert_quant not in ("none", "fp8_block", "nvfp4")
         and not is_offload_moe_backend(config.moe_backend)
     ):
+        # The resident (fused) backend supports bf16 ("none"), block-fp8, and native NVFP4
+        # experts (TP-sharded on the intermediate dim); the other quant formats (mxfp4,
+        # q4_0, ds_fp4, ...) have no resident allocation and need the offload/cpu backends.
         raise ValueError(
             f"{expert_quant} experts require --moe-backend offload or cpu, "
             f"got {config.moe_backend!r}"

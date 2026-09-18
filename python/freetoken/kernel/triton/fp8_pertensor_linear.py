@@ -327,18 +327,61 @@ class Fp8PerTensorLinear(BaseOP):
 
 
 class Fp8PerTensorColMerged(Fp8PerTensorLinear):
-    """Column-merged per-tensor-FP8 linear (drop-in for ``LinearColParallelMerged`` at TP=1):
+    """Column-merged per-tensor-FP8 linear (drop-in for ``LinearColParallelMerged``):
     one fp8 weight concatenating several projections along the output dim; the caller splits
-    the bf16 output by ``output_sizes`` as before."""
+    the bf16 output by the (TP-local) part sizes.
 
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+    With ``local_output_sizes`` (TP>1) each part is sharded along the output dim
+    independently -- including GQA KV-head replication when ``num_kv_heads < tp_size`` --
+    and the per-row ``weight_scale`` is sharded identically (it is piecewise-constant, one
+    scalar per part, so row sharding keeps every part's scale exact)."""
+
+    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False,
+                 local_output_sizes: list[int] | None = None):
         self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+        if local_output_sizes is not None:
+            assert len(local_output_sizes) == len(output_sizes), (
+                local_output_sizes, output_sizes
+            )
+            out_features = sum(local_output_sizes)
+        else:
+            out_features = sum(output_sizes)
+        super().__init__(in_features, out_features, has_bias)
+
+class Fp8PerTensorRowParallel(Fp8PerTensorLinear):
+    """Row-parallel per-tensor-FP8 linear (drop-in for ``LinearRowParallel``): fp8 ``weight``
+    ``[out, in/tp]`` + per-row ``weight_scale`` ``[out]`` (the output dim is not sharded).
+    Each rank reduces over its input shard only, so the result is a partial sum that the
+    all-reduce completes. The bias (if any) is added once, after the all-reduce.
+
+    ``input_scale`` is unchanged: every rank quantizes its own activation shard with the
+    same per-tensor scale, so the W8A8 path stays exact per rank."""
+
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
+        from freetoken.distributed import DistributedCommunicator, get_tp_info
+        from freetoken.utils import div_even
+
+        tp_info = get_tp_info()
+        self._tp_size = tp_info.size
+        self._comm = DistributedCommunicator() if tp_info.size > 1 else None
+        super().__init__(div_even(in_features, tp_info.size), out_features, has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = fp8_pertensor_linear(
+            x, self.weight, self.weight_scale, None,
+            self.input_scale, self._uniform_scale,
+        )
+        if self._tp_size > 1:
+            y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y + self.bias.to(y.dtype)
+        return y
 
 
 __all__ = [
     "FP8",
     "Fp8PerTensorLinear",
     "Fp8PerTensorColMerged",
+    "Fp8PerTensorRowParallel",
     "fp8_pertensor_linear",
 ]

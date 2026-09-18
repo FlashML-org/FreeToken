@@ -77,6 +77,23 @@ class MoELayer(BaseOP):
             self.down_proj = torch.empty(n, h, i, dtype=FP8)
             self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
             return
+        if self.weight_format == "nvfp4":
+            # Native ModelOpt NVFP4 rows (W4A16), TP-sharded on the intermediate dim:
+            # gate_up is column-parallel (shard the 2*I output rows), down is row-parallel
+            # (shard the I input cols); the down global scale keeps the full H output rows.
+            # The plain *_nvfp4 Triton kernels read these directly (inline dequant in the
+            # K-loop, no pre-tile, no BF16 copy) -- the resident mirror of the offload
+            # cache's "nvfp4" quant_format.
+            n, h = self.num_experts, self.hidden_size
+            i = intermediate_size_per_partition
+            fp8 = torch.float8_e4m3fn
+            self.gate_up_packed = torch.empty(n, 2 * i, h // 2, dtype=torch.uint8)
+            self.gate_up_scale = torch.empty(n, 2 * i, h // 16, dtype=fp8)
+            self.gate_up_global = torch.empty(n, 2 * i, dtype=torch.float16)
+            self.down_packed = torch.empty(n, h, i // 2, dtype=torch.uint8)
+            self.down_scale = torch.empty(n, h, i // 16, dtype=fp8)
+            self.down_global = torch.empty(n, h, dtype=torch.float16)
+            return
         assert self.weight_format == "bf16", (
             f"no resident expert allocation for weight_format {self.weight_format!r}"
         )
@@ -138,6 +155,37 @@ class MoELayer(BaseOP):
             return fused_experts_decode_fp8_block(
                 hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
                 self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
+            )
+        if self.weight_format == "nvfp4":
+            # Native NVFP4 rows: the plain *_nvfp4 Triton kernels read the banks directly
+            # (inline dequant in the K-loop, no BF16 copy). One kernel per phase, mirroring
+            # OffloadMoELayer._expert_gemm's "nvfp4" branch. The swigluoai scalars (if any)
+            # live on the layer via make_moe_layer's extra_attrs and are ignored by the
+            # plain *_and_mul activations.
+            act_alpha = getattr(self, "hidden_act_alpha", 1.702)
+            act_limit = getattr(self, "swiglu_limit", None)
+            # None == "no clamp" everywhere else in the repo (mxfp4 maps it to +inf).
+            act_limit = float("inf") if act_limit is None else act_limit
+            if get_global_ctx().batch.is_prefill:
+                from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+                return fused_experts_nvfp4(
+                    hidden_states,
+                    self.gate_up_packed, self.gate_up_scale, self.gate_up_global,
+                    self.down_packed, self.down_scale, self.down_global,
+                    topk_weights, topk_ids, self.num_experts,
+                    self.activation, self.apply_router_weight_on_input,
+                    act_alpha, act_limit,
+                )
+            from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states,
+                self.gate_up_packed, self.gate_up_scale, self.gate_up_global,
+                self.down_packed, self.down_scale, self.down_global,
+                topk_weights, topk_ids,
+                self.activation, self.apply_router_weight_on_input,
+                act_alpha, act_limit,
             )
         assert self.weight_format == "bf16", (
             f"no resident expert kernel for weight_format {self.weight_format!r}"

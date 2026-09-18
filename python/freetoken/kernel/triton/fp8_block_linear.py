@@ -294,23 +294,63 @@ class Fp8BlockLinear(BaseOP):
 
 
 class Fp8BlockColMerged(Fp8BlockLinear):
-    """Block-fp8 column-merged linear (drop-in for ``LinearColParallelMerged`` at TP=1).
+    """Block-fp8 column-merged linear (drop-in for ``LinearColParallelMerged``).
 
     Holds one fp8 weight that is the concatenation of several projections along the output
-    dim; the caller splits the bf16 output by ``output_sizes`` exactly as before. Each part's
-    out dim must be a multiple of 128 so the concatenated ``weight_scale_inv`` blocks align."""
+    dim; the caller splits the bf16 output by the (TP-local) part sizes. Each part's
+    out dim must be a multiple of 128 so the concatenated ``weight_scale_inv`` blocks align.
 
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+    With ``local_output_sizes`` (TP>1) each part is sharded along the output dim
+    independently (GQA KV-head replication included) and ``weight_scale_inv`` is sharded
+    identically along its row axis."""
+
+    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False,
+                 local_output_sizes: list[int] | None = None):
         for o in output_sizes:
             assert o % _BLOCK == 0, (output_sizes, "each merged output size must be /128 for fp8")
         self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+        if local_output_sizes is not None:
+            assert len(local_output_sizes) == len(output_sizes), (
+                local_output_sizes, output_sizes
+            )
+            for o in local_output_sizes:
+                assert o % _BLOCK == 0, (local_output_sizes, "local sizes must be /128 for fp8")
+            out_features = sum(local_output_sizes)
+        else:
+            out_features = sum(output_sizes)
+        super().__init__(in_features, out_features, has_bias)
+
+
+class Fp8BlockRowParallel(Fp8BlockLinear):
+    """Row-parallel block-fp8 linear (drop-in for ``LinearRowParallel``): fp8 ``weight``
+    ``[out, in/tp]`` + ``weight_scale_inv`` ``[out//128, in/tp//128]``. Each rank reduces
+    over its input shard only (activations are quantized per 128-K group *within* the
+    shard, so the dequant stays exact per rank); the all-reduce completes the sum and the
+    bias (if any) is added once, after it."""
+
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
+        from freetoken.distributed import DistributedCommunicator, get_tp_info
+        from freetoken.utils import div_even
+
+        tp_info = get_tp_info()
+        self._tp_size = tp_info.size
+        self._comm = DistributedCommunicator() if tp_info.size > 1 else None
+        super().__init__(div_even(in_features, tp_info.size), out_features, has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = block_fp8_linear(x, self.weight, self.weight_scale_inv, None)
+        if self._tp_size > 1:
+            y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y + self.bias.to(y.dtype)
+        return y
 
 
 __all__ = [
     "FP8",
     "Fp8BlockLinear",
     "Fp8BlockColMerged",
+    "Fp8BlockRowParallel",
     "block_fp8_linear",
     "block_fp8_matmul",
     "per_token_group_quant_fp8",

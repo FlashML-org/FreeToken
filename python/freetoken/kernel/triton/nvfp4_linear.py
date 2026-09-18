@@ -884,14 +884,55 @@ class Nvfp4DenseLinear(BaseOP):
 
 
 class Nvfp4DenseColMerged(Nvfp4DenseLinear):
-    """Column-merged NVFP4 dense linear (drop-in for ``LinearColParallelMerged`` at TP=1):
+    """Column-merged NVFP4 dense linear (drop-in for ``LinearColParallelMerged``):
     one packed weight concatenating several projections on the output dim; each part keeps its
     own per-row ``weight_global`` (and block scales), so the fused weight is exact. The caller
-    splits the output by ``output_sizes`` (e.g. shared-expert gate|up) as before."""
+    splits the output by the (TP-local) part sizes (e.g. shared-expert gate|up).
 
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+    With ``local_output_sizes`` (TP>1) each part is sharded along the output dim
+    independently and the block scales / per-row globals are sharded identically."""
+
+    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False,
+                 local_output_sizes: list[int] | None = None):
         self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+        if local_output_sizes is not None:
+            assert len(local_output_sizes) == len(output_sizes), (
+                local_output_sizes, output_sizes
+            )
+            out_features = sum(local_output_sizes)
+        else:
+            out_features = sum(output_sizes)
+        super().__init__(in_features, out_features, has_bias)
+
+
+class Nvfp4DenseRowParallel(Nvfp4DenseLinear):
+    """Row-parallel NVFP4 dense linear (drop-in for ``LinearRowParallel``): packed ``weight``
+    ``[out, in/tp//2]`` + block ``weight_scale`` ``[out, in/tp//16]`` + per-row
+    ``weight_global`` ``[out]`` (the output dim is not sharded). Each rank reduces over its
+    input shard only; the all-reduce completes the sum and the bias (if any) is added once,
+    after it. The K-major repack at load is an exact permutation, so it works on the shard."""
+
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
+        from freetoken.distributed import DistributedCommunicator, get_tp_info
+        from freetoken.utils import div_even
+
+        tp_info = get_tp_info()
+        self._tp_size = tp_info.size
+        self._comm = DistributedCommunicator() if tp_info.size > 1 else None
+        super().__init__(div_even(in_features, tp_info.size), out_features, has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._transposed:
+            y = nvfp4_dense_linear_t(
+                x, self.weight, self.weight_scale, self.weight_global, None
+            )
+        else:
+            y = nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global, None)
+        if self._tp_size > 1:
+            y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y + self.bias.to(y.dtype)
+        return y
 
 
 class Nvfp4LMHead(BaseOP):
@@ -937,5 +978,6 @@ __all__ = [
     "nvfp4_transpose_resident",
     "Nvfp4DenseLinear",
     "Nvfp4DenseColMerged",
+    "Nvfp4DenseRowParallel",
     "Nvfp4LMHead",
 ]

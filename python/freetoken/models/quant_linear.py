@@ -14,21 +14,26 @@ from __future__ import annotations
 def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
                           output_sizes: list[int], has_bias: bool = False,
                           local_output_sizes: list[int] | None = None):
-    """Column-merged linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16."""
-    if local_output_sizes is not None and (expert_quant != "none" or attn_quant != "none"):
-        raise NotImplementedError("local_output_sizes (GQA KV replication) not yet supported for quantized checkpoints")
+    """Column-merged linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16.
+
+    ``local_output_sizes`` (TP>1) shards each part along the output dim independently
+    (GQA KV-head replication included); the quantized layers carry their per-row / per-block
+    scales, which the weight loader shards identically."""
     if expert_quant == "fp8_block":
         from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 
-        return Fp8BlockColMerged(in_f, output_sizes, has_bias)
+        return Fp8BlockColMerged(in_f, output_sizes, has_bias,
+                                 local_output_sizes=local_output_sizes)
     if attn_quant == "fp8_pertensor":
         from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 
-        return Fp8PerTensorColMerged(in_f, output_sizes, has_bias)
+        return Fp8PerTensorColMerged(in_f, output_sizes, has_bias,
+                                     local_output_sizes=local_output_sizes)
     if attn_quant == "nvfp4":  # compressed-tensors W4A16 attention (q/k/v fused)
         from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
 
-        return Nvfp4DenseColMerged(in_f, output_sizes, has_bias)
+        return Nvfp4DenseColMerged(in_f, output_sizes, has_bias,
+                                   local_output_sizes=local_output_sizes)
     from freetoken.layers import LinearColParallelMerged
 
     return LinearColParallelMerged(in_f, output_sizes, has_bias=has_bias,
@@ -60,11 +65,17 @@ def make_row_parallel_quant(expert_quant: str, attn_quant: str, in_f: int, out_f
     """Row-parallel linear for a dense projection: block-fp8 / per-tensor-fp8 / nvfp4 / bf16.
     Shards the input dimension by tp_size and all-reduces on forward."""
     if expert_quant == "fp8_block":
-        raise NotImplementedError("row-parallel Fp8BlockLinear not yet implemented")
+        from freetoken.kernel.triton.fp8_block_linear import Fp8BlockRowParallel
+
+        return Fp8BlockRowParallel(in_f, out_f, has_bias)
     if attn_quant == "fp8_pertensor":
-        raise NotImplementedError("row-parallel Fp8PerTensorLinear not yet implemented")
+        from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorRowParallel
+
+        return Fp8PerTensorRowParallel(in_f, out_f, has_bias)
     if attn_quant == "nvfp4":
-        raise NotImplementedError("row-parallel Nvfp4DenseLinear not yet implemented")
+        from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseRowParallel
+
+        return Nvfp4DenseRowParallel(in_f, out_f, has_bias)
     from freetoken.layers import LinearOProj
 
     return LinearOProj(in_f, out_f, has_bias=has_bias)
@@ -91,7 +102,7 @@ def make_col_merged(config, in_f: int, output_sizes: list[int], has_bias: bool =
 
 
 def make_row_parallel(config, in_f: int, out_f: int, has_bias: bool = False):
-    """Config-driven row-parallel linear: ``LinearOProj`` (bf16); quant variants TBD."""
+    """Config-driven row-parallel linear: quant variants (W4A16 / W8A16) or ``LinearOProj`` (bf16)."""
     return make_row_parallel_quant(
         getattr(config, "expert_quant", "none"), getattr(config, "attn_quant", "none"),
         in_f, out_f, has_bias,
