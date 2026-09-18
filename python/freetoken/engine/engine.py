@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import gc
 import math
 import os
@@ -272,6 +274,31 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+class WeightLoadError(RuntimeError):
+    """The checkpoint itself could not be read. Resource and config failures keep their own type."""
+
+
+def _is_resource_failure(exc: Exception) -> bool:
+    if isinstance(exc, (torch.OutOfMemoryError, MemoryError, PinFailed)):
+        return True
+    # an anonymous mmap that does not fit raises ENOMEM, not MemoryError
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return True
+    # torch has no type for a failed CPU allocation
+    return isinstance(exc, RuntimeError) and "DefaultCPUAllocator" in str(exc)
+
+
+@contextlib.contextmanager
+def _weight_load_context():
+    """Wrap a checkpoint read so the startup failure reason (log and /health) starts with WeightLoadError."""
+    try:
+        yield
+    except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
+        raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -330,8 +357,7 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
-        finalize_quant(self.model)
+        self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -357,7 +383,8 @@ class Engine:
         # planning sees the pin quota the table already spent.
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
-            self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            with _weight_load_context():
+                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -497,16 +524,21 @@ class Engine:
             assert tp_cpu_group is not None
         return tp_cpu_group
 
-    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
-        model_state = self.model.state_dict()
-        if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device)
-        if config.active_encoders and ftw_lacks_vision(config.model_path):
+    def _load_weights(self, config: EngineConfig) -> None:
+        if config.active_encoders and not config.use_dummy_weight and ftw_lacks_vision(config.model_path):
             raise ValueError(
                 f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
+        with _weight_load_context():
+            self.model.load_state_dict(self._load_weight_state_dict(config))
+        finalize_quant(self.model)
+
+    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        model_state = self.model.state_dict()
+        if config.use_dummy_weight:
+            return _make_dummy_weight_state_dict(model_state, device=self.device)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
@@ -635,17 +667,18 @@ class Engine:
                 for i in range(config.model_config.num_moe_layers)
             ]
         try:
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                method=method,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
-            )
+            with _weight_load_context():
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    method=method,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                    layer_residency=requested_residency,
+                )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
@@ -1368,7 +1401,8 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     from freetoken.checkpoint.ftw import ftw_quant_format
     from freetoken.moe.legacy_format import kind_kernel_for
 
-    fmt = ftw_quant_format(model_path) if model_path else None
+    with _weight_load_context():
+        fmt = ftw_quant_format(model_path) if model_path else None
     if fmt is None:
         return quant_backend
     try:
