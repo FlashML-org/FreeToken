@@ -343,3 +343,132 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+# One class per concrete detector makes format coverage visible in pytest output.
+# A shared contract avoids accidentally giving a newly added format weaker checks.
+class _DetectorContract:
+    parser_name: str
+    block: str
+    truncate_before: str
+    buffered_recovery = False
+
+    def parser(self):
+        return FunctionCallParser(OPENCODE_TOOLS, self.parser_name)
+
+    def test_complete_call(self):
+        result = self.parser().parse_non_stream(self.block)
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "read"
+        assert json.loads(result.calls[0].parameters) == {"filePath": "/tmp/test_calc.py"}
+
+    def test_every_character_boundary(self):
+        parser = self.parser()
+        texts, calls = _feed(parser, self.block)
+        assert "".join(texts) + parser.finish_stream() == ""
+        assert [call.name for call in calls if call.name] == ["read"]
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "filePath": "/tmp/test_calc.py"
+        }
+        # A completed call must never be duplicated by the end-of-stream recovery.
+        assert parser.recover_truncated_call() == []
+
+    def test_truncated_mid_call_recovery(self):
+        parser = self.parser()
+        cut = self.block.rindex(self.truncate_before)
+        texts, calls = _feed(parser, self.block[:cut])
+        recovered = parser.recover_truncated_call()
+        assert bool(recovered) is self.buffered_recovery
+        # Incremental detectors have already consumed the opener and emitted the
+        # call identity. Their recovery method MUST NOT invent a duplicate call:
+        # generation.py recovers missing arguments from their partial-parse ledger.
+        # Buffered M3 instead recovers a complete call from the retained markup.
+        all_calls = calls + recovered
+        assert [call.name for call in all_calls if call.name] == ["read"]
+        arguments = "".join(call.parameters for call in all_calls)
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            parsed = json.loads(parser.unstreamed_arguments(0))
+        assert parsed == {"filePath": "/tmp/test_calc.py"}
+        assert parser.recover_truncated_call() == []
+        assert "".join(texts) + parser.finish_stream() == ""
+
+
+class TestQwen25Detector(_DetectorContract):
+    parser_name = 'qwen25'
+    block = '<tool_call>{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}</tool_call>'
+    truncate_before = '</tool_call>'
+
+
+class TestMistralDetector(_DetectorContract):
+    parser_name = 'mistral'
+    block = '[TOOL_CALLS] [{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}]'
+    truncate_before = '}]'
+
+
+class TestLlama32Detector(_DetectorContract):
+    parser_name = 'llama3'
+    block = '<|python_tag|>{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}'
+    truncate_before = '}'
+
+
+class TestGlm47Detector(_DetectorContract):
+    parser_name = 'glm47'
+    block = '<tool_call>read<arg_key>filePath</arg_key><arg_value>/tmp/test_calc.py</arg_value></tool_call>'
+    truncate_before = '</tool_call>'
+
+
+class TestDeepSeekV32Detector(_DetectorContract):
+    parser_name = 'deepseekv32'
+    block = '<｜DSML｜function_calls><｜DSML｜invoke name="read"><｜DSML｜parameter name="filePath" string="true">/tmp/test_calc.py</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>'
+    truncate_before = '</｜DSML｜invoke>'
+
+
+class TestQwen3CoderDetector(_DetectorContract):
+    parser_name = 'qwen3_coder'
+    block = '<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter></function></tool_call>'
+    truncate_before = '</function>'
+
+
+class TestGemma4Detector(_DetectorContract):
+    parser_name = 'gemma4'
+    block = '<|tool_call>call:read{filePath:<|"|>/tmp/test_calc.py<|"|>}<tool_call|>'
+    truncate_before = '<tool_call|>'
+
+
+class TestMiniMaxDetector(_DetectorContract):
+    parser_name = 'minimax'
+    block = '<minimax:tool_call><invoke name="read"><parameter name="filePath">/tmp/test_calc.py</parameter></invoke></minimax:tool_call>'
+    truncate_before = '</invoke>'
+
+
+class TestMiniMaxM3Detector(_DetectorContract):
+    parser_name = 'minimax_m3'
+    block = ']<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name="read">]<]minimax[>[<filePath>/tmp/test_calc.py]<]minimax[>[</filePath>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>'
+    truncate_before = ']<]minimax[>[</invoke>'
+    buffered_recovery = True
+
+
+class TestGptOssDetector(_DetectorContract):
+    parser_name = 'gpt_oss'
+    block = '<|start|>assistant<|channel|>commentary to=functions.read <|constrain|>json<|message|>{"filePath": "/tmp/test_calc.py"}<|end|>'
+    truncate_before = '<|end|>'
+
+
+class TestMuseGlimmerDetector(_DetectorContract):
+    parser_name = 'muse_glimmer'
+    block = '<|start|>assistant to=read<|message|><atem:function_calls>\n<atem:invoke name="read">\n<atem:parameter name="filePath">/tmp/test_calc.py</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>'
+    truncate_before = '</atem:invoke>'
+
+
+def test_contract_classes_cover_every_concrete_detector():
+    from freetoken.server.function_call_parser import BaseFormatDetector
+
+    covered = {
+        type(cls().parser().detector)
+        for cls in _DetectorContract.__subclasses__()
+    }
+    assert covered == set(BaseFormatDetector.__subclasses__())
+    assert covered == set(FunctionCallParser.ToolCallParserEnum.values())

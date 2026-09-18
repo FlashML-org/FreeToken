@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import queue
 
 from queue import Empty as _Empty
@@ -270,3 +272,38 @@ def test_byte_bar_emits_to_installed_sink_then_stops_after_clear():
     bar.update(100)
     bar.close()
     assert seen == []
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_shutdown_flag_is_read_at_later_worker_death(monkeypatch, shutdown):
+    """Readiness must not snapshot shutdown state: the flag changes on a later poll.
+
+    Keep TP0 alive and kill a different worker, so the first process cannot mask
+    a dead tokenizer. No real processes or sleep timing enter the assertion.
+    """
+    import queue
+    from types import SimpleNamespace
+    from freetoken.server import supervisor
+
+    alive = {"scheduler": True, "tokenizer": True}
+    processes = [SimpleNamespace(name=name, is_alive=lambda name=name: alive[name])
+                 for name in alive]
+    acks = queue.Queue()
+    acks.put("scheduler ready")
+    acks.put("tokenizer ready")
+    handle = BackendHandle(ack_queue=acks, processes=processes, expected_acks=2)
+    stopping = False
+    seen = []
+
+    def next_poll(_):
+        nonlocal stopping
+        stopping = shutdown
+        alive["tokenizer"] = False
+
+    monkeypatch.setattr(supervisor.time, "sleep", next_poll)
+    supervisor.run_backend_supervisor(
+        handle, LoadProgress(), on_ready=lambda: seen.append("ready"),
+        on_failure=lambda message: seen.append(message),
+        is_shutting_down=lambda: stopping,
+    )
+    assert seen == (["ready"] if shutdown else ["ready", "backend worker tokenizer exited"])
