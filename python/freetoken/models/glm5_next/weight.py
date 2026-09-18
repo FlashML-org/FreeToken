@@ -238,6 +238,18 @@ def iter_weights(
         reader.close()
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        yield from _iter_vision(reader, weight_map)
+    finally:
+        reader.close()
+
+
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:

@@ -9,6 +9,7 @@ FTW index against the tensors that model declares, and repairs the differences:
 - renames (DeepSeek-V4: the dense tree moved under ``model.`` and ``.scale`` became ``.weight_scale_inv``)
 - fp8 weights the current model declares as bf16 (old runtime fp8 residue) are dequantized, their ``.weight_scale`` dropped
 - tensors the model declares but the FTW lacks (``input_scale``) are fetched from the HF repo by byte range
+- an FTW converted before its family served images gets its vision encoder: the tower's checkpoint tensors are fetched into a scratch checkpoint dir and the family's own weight reader emits them under the names the FTW needs
 - a Qwen3.8-Flash-Next FTW without the PLE n-gram table gets it written as ``ple-table-*.safetensors``
 
 Before anything is written the FTW is checked against the model: shapes, dtypes, byte counts and
@@ -33,10 +34,12 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 
 import torch
 
 from freetoken.checkpoint.ftw import ALIGN, FORMAT_TAG, INDEX_NAME, _align_up, _dtype_of, _dtype_str, _SHARD_FMT
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.config import EngineConfig
 from freetoken.engine.engine import _decode_target
@@ -61,7 +64,7 @@ _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
 _PLE_FILE_RE = re.compile(r"^ple-table-\d{5}\.safetensors$")
 _PLE_FILE_BYTES = 4 << 30
 # tensors an old FTW may carry that the text model does not declare; they are kept and never count as errors
-_IGNORED_PREFIXES = ("vision_tower.", "embed_vision.")
+_IGNORED_PREFIXES = VISION_KEY_PREFIXES
 _VERBOSE = False
 
 
@@ -245,6 +248,46 @@ def resolve_fetches(fetches, source: TensorSource) -> tuple[dict[str, tuple[list
         else:
             errors.append(f"no source tensor for {n}: missing {[p for p in parts if not source.has(p)]}")
     return resolved, errors
+
+
+# ------------------------------------------------------------------ vision encoder
+_TOWER_SEGMENTS = ("multi_modal_projector", "patch_merge_mlp", "aligner")
+
+
+def is_vision(name: str) -> bool:
+    return name.startswith(VISION_KEY_PREFIXES)
+
+
+def is_checkpoint_tower_name(name: str) -> bool:
+    """A checkpoint tensor of the vision encoder: its first path segment under the wrapper root names the tower, its embedder or its projector."""
+    head = name.split(".")
+    if head[0] == "model" and len(head) > 1:
+        head = head[1:]
+    return "vision" in head[0] or "visual" in head[0] or head[0] in _TOWER_SEGMENTS
+
+
+def read_tower(source: TensorSource, ftw_dir: str, checkpoint_names: list[str]) -> dict[str, torch.Tensor]:
+    """The encoder tensors as the family's encoder-only reader emits them: the tower's checkpoint tensors go into a scratch checkpoint dir next to the FTW's config files, and the reader renames and fuses them the way the converter did."""
+    from safetensors.torch import save_file
+
+    from freetoken.models.weight import load_vision_weight
+
+    tmp = tempfile.mkdtemp(prefix="ftw-hotfix-tower-")
+    try:
+        copy_side_files(ftw_dir, tmp, lambda f: f.endswith(".safetensors") or f == "model.safetensors.index.json")
+        b = bar(sum(source.nbytes(n) for n in checkpoint_names), "Fetching the vision encoder")
+        tensors: dict[str, torch.Tensor] = {}
+        for n in checkpoint_names:
+            tensors[n] = source.get(n).contiguous()
+            tick(b, tensors[n].numel() * tensors[n].element_size())
+        done(b)
+        save_file(tensors, os.path.join(tmp, "tower.safetensors"))
+        with open(os.path.join(tmp, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": {}, "weight_map": {n: "tower.safetensors" for n in checkpoint_names}}, f)
+        del tensors
+        return {n: t for n, t in load_vision_weight(tmp, torch.device("cpu")) if is_vision(n)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def dequantize_rows(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -764,6 +807,9 @@ def main(argv: list[str] | None = None) -> int:
     log(f"{arch}: model declares {len(expected)} dense tensors")
     source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
     renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map, quant)
+    # the encoder comes from the family reader, not from by-name fetches
+    vision_missing = sorted(n for n, *_ in fetches if is_vision(n))
+    fetches = [f for f in fetches if not is_vision(f[0])]
     dequant_names = {n for n, _, _ in dequants}
     ple = PleSpec(ns.ftw) if arch.startswith("Qwen4Exp") else None
     chk = check_ftw(ns.ftw, index, expected, renames, dequant_names, ple)
@@ -774,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"{arch}: {len(expected)} expected dense tensors, FTW has {sum(e['kind'] == 'weight' for e in index['tensors'])}")
     print(f"  renames {len(renames)}  dequantize {len(dequants)}  fetch {len(fetches)}  drop {len(drops)}  leftover {len(leftovers)}"
+          + (f"  vision encoder: {len(vision_missing)} tensors" if vision_missing else "")
           + (f"  PLE table: {ple_status}" + (f" ({ple_detail})" if ple_detail else "") if need_ple else "")
           + (f"  dead bytes in {len(dirty)} shard(s)" if dirty else ""))
     for n, parts, _ in fetches[:8]:
@@ -799,9 +846,16 @@ def main(argv: list[str] | None = None) -> int:
         bad = True
     if len(problems) > 10:
         print(f"ERROR: ... {len(problems) - 10} more", file=sys.stderr)
-    if (fetches or need_ple) and source is None:
+    if (fetches or need_ple or vision_missing) and source is None:
         print("ERROR: tensors must be fetched but neither --repo nor --source was given", file=sys.stderr)
         return 2
+    tower_names = [n for n in source.weight_map if is_checkpoint_tower_name(n)] if vision_missing else []
+    if vision_missing and not tower_names:
+        print("ERROR: the source checkpoint has no vision encoder tensors", file=sys.stderr)
+        bad = True
+    elif vision_missing:
+        print(f"  vision encoder: {len(vision_missing)} tensors from the family reader over {len(tower_names)} checkpoint tensors "
+              f"({sum(source.nbytes(n) for n in tower_names) / 2**30:.2f} GiB)")
     fetch_srcs: dict[str, tuple[list[str], bool]] = {}
     if fetches:
         fetch_srcs, errors = resolve_fetches(fetches, source)
@@ -833,7 +887,19 @@ def main(argv: list[str] | None = None) -> int:
     if bad:
         return 2
 
-    replaced = dequant_names | set(fetch_srcs)
+    tower: dict[str, torch.Tensor] = {}
+    if vision_missing and not ns.dry_run:
+        tower = read_tower(source, ns.ftw, tower_names)
+        unproduced = [n for n in vision_missing if n not in tower]
+        wrong = [n for n in vision_missing if n in tower and tuple(tower[n].shape) != expected[n][0]]
+        if unproduced or wrong:
+            for n in unproduced[:5]:
+                print(f"ERROR: the family reader did not produce {n} from the source's encoder tensors", file=sys.stderr)
+            for n in wrong[:5]:
+                print(f"ERROR: {n}: reader shape {list(tower[n].shape)} != model shape {list(expected[n][0])}", file=sys.stderr)
+            return 2
+
+    replaced = dequant_names | set(fetch_srcs) | set(vision_missing)
     keep: list[tuple[dict, str]] = []
     for e in index["tensors"]:
         name = renames.get(e["name"], e["name"]) if e["kind"] == "weight" else e["name"]
@@ -845,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # disk: the new entries and the PLE table, plus either one compacted shard next to its original
     # (in place) or the whole compact copy (--out)
-    new_bytes = sum(_align_up(tensor_bytes(*expected[n])) for n in replaced)
+    new_bytes = sum(_align_up(tensor_bytes(tower[n].shape, tower[n].dtype) if n in tower else tensor_bytes(*expected[n])) for n in replaced)
     table_bytes = sum(source.nbytes(n) for n in source.weight_map if _PLE_INFIX in n) if need_ple else 0
     work = ns.out or ns.ftw
     if ns.out:
@@ -860,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  disk: about {need / 2**30:.1f} GiB needed under {work} ({free / 2**30:.1f} GiB free)")
     if ns.dry_run:
         return 0
-    if not (renames or dequants or fetch_srcs or drops or need_ple or dirty or ns.out):
+    if not (renames or dequants or fetch_srcs or vision_missing or drops or need_ple or dirty or ns.out):
         print("nothing to do; the FTW loads as is")
         return 0
     if free < need + (1 << 30):
@@ -875,6 +941,9 @@ def main(argv: list[str] | None = None) -> int:
             tick(b, e["nbytes"])
         done(b)
         items = list(fetch_srcs.items())
+        for n in (vision_missing if _VERBOSE or not vision_missing else count_bar(vision_missing, "Writing the vision encoder")):
+            log(f"  encoder {n} {list(tower[n].shape)}")
+            w.add_tensor(n, tower[n])
         for n, (srcs, reciprocal) in (items if _VERBOSE or not items else count_bar(items, "Fetching tensors")):
             log(f"  fetch {n} <- {', '.join(srcs)}" + (" (reciprocal)" if reciprocal else ""))
             vals = [source.get(c).reshape(()).float() for c in srcs]
@@ -885,7 +954,7 @@ def main(argv: list[str] | None = None) -> int:
             w.add_tensor(n, torch.stack(vals).max().reshape(()))
 
     hotfix = {"from": os.path.abspath(ns.ftw), "renamed": len(renames), "dequantized": len(dequants),
-              "fetched": len(fetch_srcs), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}
+              "fetched": len(fetch_srcs) + len(vision_missing), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}
     compacted = 0
     if ns.out:
         log(f"--out: writing a fresh FTW -> {work}")
@@ -919,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(os.path.join(work, f))
         new_entries: list[dict] = []
         new_shards: list[dict] = []
-        if dequants or fetch_srcs:
+        if dequants or fetch_srcs or vision_missing:
             log(f"in place: appending shard {_SHARD_FMT.format(next_num)} -> {work}")
             w = ShardWriter(work, index["shard_limit"], first_shard=next_num, global_off=index["total_bytes"])
             try:

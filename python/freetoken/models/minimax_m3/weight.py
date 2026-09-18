@@ -260,6 +260,21 @@ def iter_weights(
         reader.close()
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    config = parse_config(cached_load_hf_config(model_path))
+    if config.vision_config is None:
+        return
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
+    finally:
+        reader.close()
+
+
 def nvfp4_expert_spec(model_path: str, config):
     return _NVFP4_SOURCE_SPEC
 

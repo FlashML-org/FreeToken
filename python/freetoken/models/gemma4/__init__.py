@@ -11,6 +11,7 @@ from .moe import Gemma4Router
 from .vision import Gemma4MultimodalEmbedder, Gemma4UnifiedVisionEmbedder, Gemma4VisionModel
 from .weight import (
     nvfp4_expert_spec,
+    iter_vision_weights,
     iter_weights,
     iter_weights_parallel,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "Gemma4Router",
     "Gemma4VisionModel",
     "parse_config",
+    "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",
     "parse_gguf_config",

@@ -115,6 +115,18 @@ def iter_weights(
     assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    vision_buf: dict = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                vision = _vision_name(raw_name)
+                if vision is not None:
+                    yield from _vision_tensors(vision, f.get_tensor(raw_name), vision_buf)
+    assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
+
+
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, include_vision: bool
 ) -> Iterator[tuple[str, torch.Tensor]]:

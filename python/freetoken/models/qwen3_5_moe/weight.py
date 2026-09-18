@@ -286,6 +286,16 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                name = _rename(raw_name)
+                if name is not None and name.startswith(VISION_KEY_PREFIXES):
+                    yield name, f.get_tensor(raw_name)
+
+
 def iter_weights_parallel(
     model_path: str,
     device: torch.device,
