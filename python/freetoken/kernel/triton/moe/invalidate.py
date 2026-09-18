@@ -54,6 +54,21 @@ def invalidate_prefill_slots(
     (``layer * num_experts + expert``) and the tensor is contiguous, so the kernel's
     flat addressing matches the ``view(-1)`` the eager path used.
     """
+    # The raw-pointer kernel cannot clamp like the eager slices did; refuse a buffer
+    # that does not fit instead of reading past the cache.
+    if slot_start + num_experts > id_of_slot.numel():
+        raise ValueError(
+            f"prefill buffer [{slot_start}, {slot_start + num_experts}) exceeds "
+            f"id_of_slot size {id_of_slot.numel()}"
+        )
+    # The kernel needs a CUDA context; CPU test caches keep the old eager path, where
+    # the hidden sync is harmless (no enqueued GPU work to drain).
+    if id_of_slot.device.type != "cuda":
+        old_ids = id_of_slot[slot_start : slot_start + num_experts]
+        slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+        old_ids.fill_(-1)
+        usage[slot_start : slot_start + num_experts].zero_()
+        return
     grid = ((num_experts + 255) // 256,)
     _invalidate_slots_kernel[grid](
         id_of_slot, slot_for_id, usage, slot_start, num_experts, BLOCK=256
