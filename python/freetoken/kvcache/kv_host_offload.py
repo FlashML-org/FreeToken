@@ -59,6 +59,21 @@ class KVHostOffloader:
         self.mirror.tensor.zero_()  # fresh/dummy pages read back as zeros, never stale bytes
         self.mirror.pin()
 
+        # fp8 pool (kv_quant="fp8", PR#354): the pool stores e4m3 CODES + fp32 per-token
+        # scales. The mirror must carry BOTH or rehydrated pages decode garbage (the read
+        # path below restores codes+scales into the pool; a bf16-era mirror of raw k/v
+        # would silently corrupt). The raw-k/v Triton mirror_store only runs on bf16 pools.
+        self._scale_buf = getattr(pool, "_scale_buffer", None)  # [2, L, P*page, H] | None
+        self.mirror_scales: HostBank | None = None
+        if self._scale_buf is not None:
+            scale_heads = self._scale_buf.shape[-1]
+            self.mirror_scales = HostBank(
+                (2, num_layers, (num_logical_pages + 1) * page_size, scale_heads),
+                self._scale_buf.dtype,
+            )
+            self.mirror_scales.tensor.zero_()
+            self.mirror_scales.pin()
+
         # LRU slot maps (lru_ensure's id space is logical pages, slot space is buffer pages).
         self.phys_of = torch.full((num_logical_pages + 1,), -1, dtype=torch.int32, device=device)
         self.logical_of = torch.full((num_slots,), -1, dtype=torch.int32, device=device)
@@ -79,10 +94,6 @@ class KVHostOffloader:
         self._query_buf: torch.Tensor | None = None
         self._eff_buf: torch.Tensor | None = None
         self._trunc_eager = torch.zeros(1, dtype=torch.int32, device=device)
-        # Prefill write-page scratch (grow-only) + counter for the run-aware sampler.
-        self.max_bs = 1
-        self._wp_buf: torch.Tensor | None = None
-        self._wp_count = torch.zeros((), dtype=torch.int32, device=device)
 
         from freetoken.kernel.pinned import device_ptr
 
@@ -103,7 +114,42 @@ class KVHostOffloader:
         self._src_ptrs = torch.tensor(src_ptrs, dtype=torch.int64, device=device)
         self._feats = torch.full((2 * num_layers,), row_bytes, dtype=torch.int64, device=device)
         self._host_ptrs = torch.tensor(host_ptrs, dtype=torch.int64, device=device)
-        self.mirror_bytes = self.mirror.nbytes
+        # fp8: estende o descritor com os bancos de scales (mesma lista de páginas —
+        # o fused copy roda uma linha por banco por página; feats heterogêneos ok).
+        # E prepara os ponteiros do mirror_store quantizado (graph-safe, UVA).
+        self._quant_src_ptrs = None
+        self._quant_host_ptrs = None
+        if self.mirror_scales is not None:
+            sc = self._scale_buf  # [2, L, P*page, H] -> por página: [page, H]
+            scale_row = page_size * sc.shape[-1] * sc.element_size()
+            assert scale_row % 16 == 0
+            qsrc, qhost = [], []
+            for kv in range(2):
+                for layer in range(num_layers):
+                    pool_v = sc[kv, layer].view(-1, page_size, sc.shape[-1])
+                    mir_v = self.mirror_scales.tensor[kv, layer].view(
+                        -1, page_size, sc.shape[-1])
+                    assert pool_v.is_contiguous() and mir_v.is_contiguous()
+                    dst_ptrs.append(pool_v.data_ptr())
+                    src_ptrs.append(device_ptr(mir_v))
+            for layer in range(num_layers):
+                # ordem por camada: (kcode, kscale, vcode, vscale) — casa com o kernel
+                qsrc += [buf[0, layer].data_ptr(), sc[0, layer].data_ptr(),
+                         buf[1, layer].data_ptr(), sc[1, layer].data_ptr()]
+                qhost += [device_ptr(mirror[0, layer]),
+                          device_ptr(self.mirror_scales.tensor[0, layer]),
+                          device_ptr(mirror[1, layer]),
+                          device_ptr(self.mirror_scales.tensor[1, layer])]
+            self._quant_src_ptrs = torch.tensor(qsrc, dtype=torch.int64, device=device)
+            self._quant_host_ptrs = torch.tensor(qhost, dtype=torch.int64, device=device)
+            self._dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=device)
+            self._src_ptrs = torch.tensor(src_ptrs, dtype=torch.int64, device=device)
+            self._feats = torch.cat([
+                self._feats,
+                torch.full((2 * num_layers,), scale_row, dtype=torch.int64, device=device),
+            ])
+        self.mirror_bytes = self.mirror.nbytes + (
+            self.mirror_scales.nbytes if self.mirror_scales is not None else 0)
 
     # ----- geometry ---------------------------------------------------------
     def set_select_width(self, select_width: int, block_topk: int = 0,
@@ -111,14 +157,11 @@ class KVHostOffloader:
         # The sparse selection is block_topk short runs of consecutive tokens SCATTERED
         # across the sequence -- each run can touch its own page (two if it straddles a
         # boundary). Contiguity (select_width // page_size) badly underestimates this.
-        # Hard cap: the decode query is `max_bs * (1 + max_sel_pages)` wide and must fit
-        # the physical pool (lru_ensure requires |distinct| <= num_cached), so the
-        # per-row width is the pool split across the concurrent requests, not the whole
-        # pool. Concurrency and per-row selection width trade off here by construction;
-        # exceeding the resulting width now fails loudly (see `trunc_count`).
+        # Hard cap: the WHOLE decode batch's query (max_bs x (1 + sel)) must fit the pool,
+        # or mid-ensure evictions corrupt the attend. Divide by the batch, not the row.
         worst = 2 * (block_topk or (select_width // 4)) + 8
-        per_row = max(16, (self.num_slots - 73) // max(1, max_bs))
-        self.max_sel_pages = min(worst, per_row)
+        per_batch = max(16, (self.num_slots - 73) // max(1, max_bs))
+        self.max_sel_pages = min(worst, per_batch)
 
     def prefill_fetch_rows(self, n_write_pages: int) -> int:
         """Query rows per prefill attend sub-chunk: the write pages plus this many rows' worth
@@ -135,7 +178,6 @@ class KVHostOffloader:
     # ----- graph buffers ------------------------------------------------------
     def init_graph_buffers(self, max_bs: int, width_pages: int, select_width: int | None = None) -> None:
         """Static decode buffers (capture-safe addresses); sliced to the live bs per step."""
-        self.max_bs = max(1, max_bs)
         if select_width is not None:
             self.set_select_width(select_width, max_bs=max_bs)
         assert self.max_sel_pages > 0, "set_select_width must run before init_graph_buffers"
@@ -151,6 +193,22 @@ class KVHostOffloader:
             "eff_table": torch.zeros((max_bs, width_pages), dtype=torch.int32, device=d),
             "trunc": torch.zeros(1, dtype=torch.int32, device=d),
         }
+
+    def invalidate_pages(self, logical_pages: torch.Tensor) -> None:
+        """Marca páginas lógicas como frias (phys_of=-1), desfazendo bindings defasados.
+        Necessário quando o espelho foi reescrito por fora (reidratação host->espelho):
+        sem isso, um binding antigo apontaria pra um slot físico com conteúdo de outro
+        inquilino e o fetch seria pulado. Só desfaz se o slot ainda aponta pra esta página."""
+        lp = logical_pages.long().to(self.device)
+        old = self.phys_of[lp]
+        mask = old >= 0
+        if not bool(mask.any()):
+            return
+        old_slots = old[mask].long()
+        cur = self.logical_of[old_slots]
+        still = cur == lp[mask].long()
+        self.logical_of[old_slots[still]] = -1
+        self.phys_of[lp[mask]] = -1
 
     def trunc_count(self) -> int:
         """Dropped selection pages accumulated since the last read (0 = no truncation)."""
@@ -209,11 +267,10 @@ class KVHostOffloader:
             )
 
     # ----- write path ---------------------------------------------------------
-    def ensure_write_pages(self, out_loc: torch.Tensor, is_decode: bool,
-                           token_to_req: torch.Tensor | None = None) -> torch.Tensor:
+    def ensure_write_pages(self, out_loc: torch.Tensor, is_decode: bool) -> torch.Tensor:
         """Make every page ``out_loc`` writes to resident; returns the write-page query
         (the fetch path re-includes it so a write page can never be evicted mid-forward)."""
-        from freetoken.kernel.triton.qsa.offload import write_pages, write_pages_prefill
+        from freetoken.kernel.triton.qsa.offload import write_pages
 
         if is_decode:
             n = out_loc.numel()
@@ -221,23 +278,9 @@ class KVHostOffloader:
             write_pages(out_loc, wp, self.page_size)
             self._ensure(wp)
             return wp
-        # A prefill batch concatenates several requests, and a plain every-page_size-th
-        # stride lands at an arbitrary offset inside each later request: its LAST page is
-        # skipped whenever `len % page_size <= offset`, and store_kv would then write to a
-        # physical slot that was never ensured. The stride provably covers every page but
-        # the last of each run, so add the final token of each run (one page per
-        # concurrent request). All device-side: no host sync.
-        n = out_loc.numel()
-        if not n:
-            return out_loc
-        nstride = (n + self.page_size - 1) // self.page_size
-        extra = max(1, self.max_bs)
-        if self._wp_buf is None or self._wp_buf.numel() < nstride + extra:
-            self._wp_buf = torch.empty(max(nstride + extra, 1024), dtype=torch.int32,
-                                       device=self.device)
-        pages = self._wp_buf[: nstride + extra]
-        write_pages_prefill(out_loc, token_to_req, pages, self._wp_count,
-                            nstride, extra, self.page_size)
+        # The chunk's tokens are position-contiguous, so every 64th slot names a written
+        # page exactly once -- no torch.unique (a GPU sync) needed.
+        pages = (out_loc[:: self.page_size] // self.page_size).contiguous()
         self._ensure(pages)
         return pages
 
@@ -253,10 +296,34 @@ class KVHostOffloader:
         translate_slots(out_loc, self.phys_of, out, self.page_size)
         return out
 
-    def mirror_store(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
-        from freetoken.kernel.triton.qsa.offload import mirror_store
+    def mirror_store(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor,
+                     layer_id: int, out_loc_gpu: torch.Tensor | None = None) -> None:
+        if self.mirror_scales is None:
+            from freetoken.kernel.triton.qsa.offload import mirror_store
 
-        mirror_store(k, v, out_loc, self._host_ptrs, self.pool._dense(layer_id))
+            mirror_store(k, v, out_loc, self._host_ptrs, self.pool._dense(layer_id))
+            return
+        # fp8 pool: o pool JÁ quantizou (store_kv rodou antes). Espelhamos codes+scales
+        # LIDOS DO POOL (a única fonte da verdade pós-quantização) — nunca re-quantizar.
+        assert out_loc_gpu is not None, "fp8 mirror_store precisa dos slots físicos"
+        self._mirror_store_fp8(out_loc, out_loc_gpu, self.pool._dense(layer_id))
+
+    def _mirror_store_fp8(self, out_loc_logical: torch.Tensor, out_loc_phys: torch.Tensor,
+                          dense_layer: int) -> None:
+        """codes+scales do pool (slots físicos, pós-quantização) -> espelho (slots lógicos).
+        Graph-safe: kernel Triton com stores UVA, nada de .cpu() no caminho."""
+        from freetoken.kernel.triton.qsa.offload import mirror_store_quant
+
+        H, D = self.mirror.tensor.shape[4], self.mirror.tensor.shape[5]
+        scH = self._scale_buf.shape[-1]
+        mirror_store_quant(
+            self.pool._kv_buffer[0, dense_layer].view(-1, H * D),
+            self._scale_buf[0, dense_layer],
+            self.pool._kv_buffer[1, dense_layer].view(-1, H * D),
+            self._scale_buf[1, dense_layer],
+            out_loc_phys, out_loc_logical,
+            self._quant_src_ptrs, self._quant_host_ptrs, dense_layer,
+        )
 
     # ----- read path ------------------------------------------------------------
     def compact_all(self, indices: torch.Tensor, token_to_req: torch.Tensor,

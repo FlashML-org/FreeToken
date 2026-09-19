@@ -67,7 +67,7 @@ def _compact_sel_kernel(
     row = tl.where(lanes < count, seen, first)
     tl.store(out + r * maxp + lanes, row, mask=lanes < maxp)
     tl.store(counts + r, count)
-    tl.atomic_add(trunc, ndrop)
+    tl.atomic_max(trunc, ndrop)
 
 
 def compact_selected_pages(
@@ -84,8 +84,8 @@ def compact_selected_pages(
 
     ``out`` is ``[rows, maxp]`` int32; rows with fewer hits are padded with the row's first
     page (duplicates collapse in lru_ensure), or ``dummy_page`` when the row selected nothing.
-    ``trunc`` (optional [1] int32, device) accumulates the TOTAL number of pages dropped
-    across all rows because they exceeded ``maxp`` -- 0 means no truncation happened. ``counts`` (optional
+    ``trunc`` (optional [1] int32, device) accumulates how many pages were dropped per row
+    because they exceeded ``maxp`` -- 0 means no truncation happened. ``counts`` (optional
     [rows] int32, device) receives each row's stored distinct-page count.
     """
     rows, sel = indices.shape
@@ -185,51 +185,60 @@ def mirror_store(
         )
 
 
-
-
 @triton.jit
-def _write_pages_stride_kernel(out_loc, out, page_size: tl.constexpr):
-    """One page per page_size tokens: covers every page of a run but (possibly) its last."""
-    i = tl.program_id(0)
-    tl.store(out + i, tl.load(out_loc + i * page_size) // page_size)
+def _mirror_store_quant_kernel(
+    src_ptrs,     # [4L] int64 GPU: por camada, bases pool (kcode, kscale, vcode, vscale)
+    host_ptrs,    # [4L] int64 GPU: por camada, bases host UVA (kcode, kscale, vcode, vscale)
+    out_phys,     # [T] int32: slots físicos (pool) de cada token
+    out_log,      # [T] int32: slots lógicos (espelho) de cada token
+    layer,
+    code_bytes: tl.constexpr, scale_bytes: tl.constexpr,
+    BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+):
+    """fp8 write-through: lê códigos+scales do pool (pós-quantização) e espelha no host."""
+    t = tl.program_id(0)
+    phys = tl.load(out_phys + t).to(tl.int64)
+    logi = tl.load(out_log + t).to(tl.int64)
+    oc = tl.arange(0, BLOCK_C)
+    mc = oc < code_bytes
+    os_ = tl.arange(0, BLOCK_S)
+    ms = os_ < scale_bytes
+    kc_h = tl.load(host_ptrs + 4 * layer).to(tl.pointer_type(tl.uint8))
+    ks_h = tl.load(host_ptrs + 4 * layer + 1).to(tl.pointer_type(tl.uint8))
+    vc_h = tl.load(host_ptrs + 4 * layer + 2).to(tl.pointer_type(tl.uint8))
+    vs_h = tl.load(host_ptrs + 4 * layer + 3).to(tl.pointer_type(tl.uint8))
+    kc_s = tl.load(src_ptrs + 4 * layer).to(tl.pointer_type(tl.uint8))
+    ks_s = tl.load(src_ptrs + 4 * layer + 1).to(tl.pointer_type(tl.uint8))
+    vc_s = tl.load(src_ptrs + 4 * layer + 2).to(tl.pointer_type(tl.uint8))
+    vs_s = tl.load(src_ptrs + 4 * layer + 3).to(tl.pointer_type(tl.uint8))
+    tl.store(kc_h + logi * code_bytes + oc, tl.load(kc_s + phys * code_bytes + oc, mask=mc), mask=mc)
+    tl.store(vc_h + logi * code_bytes + oc, tl.load(vc_s + phys * code_bytes + oc, mask=mc), mask=mc)
+    tl.store(ks_h + logi * scale_bytes + os_, tl.load(ks_s + phys * scale_bytes + os_, mask=ms), mask=ms)
+    tl.store(vs_h + logi * scale_bytes + os_, tl.load(vs_s + phys * scale_bytes + os_, mask=ms), mask=ms)
 
 
-@triton.jit
-def _write_pages_pad_kernel(out, nstride):
-    """Pad the boundary slots with out[0]: a real logical page, so a run with fewer
-    boundaries than `extra` leaves duplicates behind instead of garbage. Duplicates
-    collapse inside lru_ensure."""
-    i = tl.program_id(0)
-    tl.store(out + nstride + i, tl.load(out + 0))
-
-
-@triton.jit
-def _write_pages_runs_kernel(out_loc, token_to_req, out, counter, n, nstride, extra):
-    """The last token of every request run (a prefill batch concatenates runs): its page is
-    the one the stride can miss. Bounded by `extra`, so the buffer stays fixed-shape."""
-    i = tl.program_id(0)
-    cur = tl.load(token_to_req + i)
-    nxt = tl.load(token_to_req + i + 1, mask=(i + 1 < n), other=-1)
-    if (i + 1 >= n) or (nxt != cur):
-        slot = tl.atomic_add(counter, 1)
-        if slot < extra:
-            tl.store(out + nstride + slot, tl.load(out_loc + i) // page_size)
-
-
-def write_pages_prefill(out_loc, token_to_req, out, counter, nstride, extra, page_size):
-    """Prefill write-page set: stride samples + the last token of each request run.
-
-    Fully device-side (no host sync): a sync here stalls the MoE prefetch pipeline that
-    `--moe-prefill-overlap` depends on, which costs more than the sampling itself.
-    """
-    n = out_loc.numel()
-    if not n:
+def mirror_store_quant(
+    kc_pool: torch.Tensor,   # [P*page, H*D] e4m3 (view)
+    ks_pool: torch.Tensor,   # [P*page, H] fp32
+    vc_pool: torch.Tensor,
+    vs_pool: torch.Tensor,
+    out_phys: torch.Tensor,  # [T] int32 slots físicos
+    out_log: torch.Tensor,   # [T] int32 slots lógicos
+    src_ptrs: torch.Tensor,  # [4L] int64 GPU
+    host_ptrs: torch.Tensor, # [4L] int64 GPU
+    dense_layer: int,
+) -> None:
+    """Espelha códigos+scales de uma camada fp8 pro host (graph-safe: UVA stores)."""
+    t = out_phys.numel()
+    if not t:
         return
-    _write_pages_stride_kernel[(nstride,)](out_loc, out, page_size)
-    if extra:
-        _write_pages_pad_kernel[(extra,)](out, nstride)
-        counter.zero_()
-        _write_pages_runs_kernel[(n,)](out_loc, token_to_req, out, counter, n, nstride, extra)
+    code_bytes = kc_pool.shape[1] * kc_pool.element_size()
+    scale_bytes = ks_pool.shape[1] * ks_pool.element_size()
+    _mirror_store_quant_kernel[(t,)](
+        src_ptrs, host_ptrs, out_phys, out_log, dense_layer,
+        code_bytes, scale_bytes,
+        triton.next_power_of_2(code_bytes), triton.next_power_of_2(scale_bytes),
+    )
 
 
-__all__ = ["write_pages", "compact_selected_pages", "translate_table", "translate_slots", "mirror_store"]
+__all__ = ["write_pages", "compact_selected_pages", "translate_table", "translate_slots", "mirror_store", "mirror_store_quant"]

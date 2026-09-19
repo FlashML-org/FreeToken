@@ -318,7 +318,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._update_index_cache(index, md, slot)
         if off is not None:
             # Write-through: the pinned host mirror (the backing store) sees every token.
-            off.mirror_store(k, v, batch.out_loc, layer_id)
+            off.mirror_store(k, v, batch.out_loc, layer_id, getattr(md, "out_loc_gpu", None))
         indices = self._select(index, md, slot)
         if off is not None:
             return self._attend_offloaded(qsa_sparse_paged_attention, q, indices, md, layer_id)
