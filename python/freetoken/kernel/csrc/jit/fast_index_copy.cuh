@@ -557,20 +557,21 @@ struct MultiIndexCopyKernel {
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
+        device.set_options<kDLCUDA, kDLROCM>();
         auto B = SymbolicSize{"num_banks"};
         auto L = SymbolicSize{"indices length"};
         auto ptr_dtype = SymbolicDType{};
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device(device)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device(device)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
