@@ -116,7 +116,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
+        # The pool's COMPUTE dtype, never its store dtype (the contract lives in
+        # kvcache/base.py). These buffers feed the indexer -- qsa_index_norm_rope and
+        # qsa_mqa_paged -- whose tl.dot has no fp8 path, so an e4m3 q_index does not
+        # fail here, it fails at CUDA-graph capture with "Unsupported rhs dtype
+        # fp8e4nv". --kv-cache-dtype fp8 quantizes only the KV tiers; the index tiers
+        # stay 16-bit by design (kvcache/qsa_pool.py).
         self.dtype = self.kvcache.dtype
+        assert self.dtype.itemsize == 2, (
+            f"QSA block selection needs a 16-bit compute dtype, got {self.dtype} -- "
+            "the KV pool must report its compute dtype, not e4m3 codes"
+        )
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -303,8 +313,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # Bind this forward's write pages before the first store; they ride every fetch
             # query below, so no mid-forward eviction can take them (and the write-through
             # mirror makes any other eviction lossless).
-            md.write_pages = off.ensure_write_pages(batch.out_loc, md.is_decode,
-                                                    md.token_to_req)
+            md.write_pages = off.ensure_write_pages(batch.out_loc, md.is_decode)
             md.out_loc_gpu = off.translate_slots(batch.out_loc, md.is_decode)
         self.kvcache.store_kv(k, v, batch.out_loc if off is None else md.out_loc_gpu, layer_id)
         if md.block_table is None:
@@ -320,6 +329,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # Write-through: the pinned host mirror (the backing store) sees every token.
             off.mirror_store(k, v, batch.out_loc, layer_id, getattr(md, "out_loc_gpu", None))
         indices = self._select(index, md, slot)
+        # Scale tensors only exist on an fp8 pool (k_scale returns None otherwise); the
+        # index tier stays bf16 either way, so _select above is quantization-agnostic.
         if off is not None:
             return self._attend_offloaded(qsa_sparse_paged_attention, q, indices, md, layer_id)
         return qsa_sparse_paged_attention(
@@ -330,6 +341,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
 
     def _attend_offloaded(self, attend, q, indices, md, layer_id) -> torch.Tensor:
@@ -341,28 +354,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
         k_cache = self.kvcache.k_cache(layer_id)
         v_cache = self.kvcache.v_cache(layer_id)
         # fp8 pool (PR #354): the attend kernel dequantizes with these; None on a bf16 pool.
-        # Scale accessors only exist on a quantized KV pool (fp8, e.g. PR #354); the
-        # plain bf16 pool on main has none. Probe instead of assuming, so the offload
-        # composes with either.
-        _k_scale = getattr(self.kvcache, "k_scale", None)
-        _v_scale = getattr(self.kvcache, "v_scale", None)
-        ks = _k_scale(layer_id) if _k_scale is not None else None
-        vs = _v_scale(layer_id) if _v_scale is not None else None
-        # The attend kernel on an unquantized pool takes NO scale arguments at all, so the
-        # kwargs must be omitted entirely (passing k_scale=None is still unexpected).
-        scales: dict = {}
-        if ks is not None:
-            scales["k_scale"] = ks
-        if vs is not None:
-            scales["v_scale"] = vs
+        ks = self.kvcache.k_scale(layer_id)
+        vs = self.kvcache.v_scale(layer_id)
         if md.is_decode:
             eff = off.fetch_for_attend(indices, md)
             return attend(q, k_cache, v_cache, indices, eff, md.token_to_req,
-                          torch.empty_like(q), **scales)
+                          torch.empty_like(q), k_scale=ks, v_scale=vs)
         rows = q.shape[0]
         if rows == 0:
             return attend(q, k_cache, v_cache, indices, md.block_table, md.token_to_req,
-                          torch.empty_like(q), **scales)
+                          torch.empty_like(q), k_scale=ks, v_scale=vs)
         # Row-group loop: one compact for the whole layer (grid = rows, no sync), then the
         # offloader packs rows into residency-feasible groups CPU-side with REAL page unions
         # (one D2H per layer) -- consecutive rows select mostly the same pages, so groups
@@ -371,20 +372,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         out = torch.empty_like(q)
         for (start, end), eff in off.iter_prefill_groups(sel_all, md.write_pages, md.block_table):
             attend(q[start:end], k_cache, v_cache, indices[start:end], eff,
-                   md.token_to_req[start:end], out[start:end], **scales)
+                   md.token_to_req[start:end], out[start:end], k_scale=ks, v_scale=vs)
         dropped = off.trunc_count()  # one sync per layer
         if dropped:
-            msg = (
-                f"KV host offload: {dropped} selected page(s) dropped this layer because a "
-                f"query row spans more than {off.max_sel_pages} distinct pages; those rows "
-                "would attend over unrelated physical slots. Raise --kv-host-pages or "
-                "--memory-ratio, or run with --max-running-requests 1."
+            logger.warning(
+                f"KV host offload: {dropped} selected pages dropped this layer "
+                f"(selection spans > {off.max_sel_pages} pages); the affected rows attended "
+                "over fallback slots"
             )
-            if md.is_decode:
-                # Inside a CUDA graph we cannot raise without tearing down the capture.
-                logger.warning(msg)
-            else:
-                raise RuntimeError(msg)
         return out
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
