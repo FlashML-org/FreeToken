@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -66,11 +67,17 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
+    # KV-cache storage quantization: "none" stores the compute dtype, "fp8" stores e4m3
+    # codes plus one fp32 scale per (token, slab, layer, kv head) -- about 2x the tokens
+    # per GiB, at a small accuracy cost. --kv-cache-dtype; resolved from "auto" by
+    # _adjust_config, which also refuses it on a pool family or attention backend that
+    # cannot read the scales.
+    kv_quant: str = "none"
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
-    linear_state_cache_ratio: float = 2.0
+    linear_state_cache_ratio: float = float(os.environ.get("FT_LINEAR_STATE_CACHE_RATIO", "2.0"))
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

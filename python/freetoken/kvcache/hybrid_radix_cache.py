@@ -71,6 +71,16 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
+        # Host tier (FT_GDN_HOST_TIER): wired by CacheManager. ``on_evict_node`` fires with
+        # the node IMMEDIATELY before its snapshot is freed (the slot is still valid --
+        # enqueue the D2H before returning). ``on_match_dead_snapshot`` may rehydrate a
+        # tombstone during match: return a fresh GPU slot to attach, None to keep walking.
+        self.on_evict_node = None
+        self.on_match_dead_snapshot = None
+        # KV host tier (FT_PREFIX_HOST): fires for every node whose KV pages LEAVE the tree
+        # (evict_full's leaf + cascade-exposed tombstone parents) -- BEFORE the free, while
+        # the bytes are still valid in the GPU buffer (the D2H must happen inside the call).
+        self.on_evict_kv = None
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -83,6 +93,14 @@ class HybridRadixCache:
         while not cur.is_root():
             if cur.mamba_value is not None:
                 return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur)
+            if self.on_match_dead_snapshot is not None:
+                slot = self.on_match_dead_snapshot(cur)
+                if slot is not None:
+                    # revive the tombstone: the rehydrated snapshot rides the tree again
+                    cur.mamba_value = slot
+                    if cur.mamba_ref_count == 0:
+                        self.mamba_evictable += 1
+                    return HybridMatch(self._collect_kv(cur), end_len, slot, cur)
             end_len -= cur.length
             cur = cur.parent
         return HybridMatch(self.empty, 0, None, self.root)
@@ -156,8 +174,12 @@ class HybridRadixCache:
             if node.ref_count != 0 or not node.is_leaf() or node.is_root():
                 continue
             freed += node.length
+            if self.on_evict_kv is not None:
+                self.on_evict_kv(node)
             kv.append(node.value)
             self.full_evictable -= node.length
+            if node.mamba_value is not None and self.on_evict_node is not None:
+                self.on_evict_node(node)
             self._free_node_mamba(node, mamba)
             parent, casc = self._cascade_tombstone_leaves(self._unlink(node), kv)
             freed += casc
@@ -177,14 +199,19 @@ class HybridRadixCache:
             node = heapq.heappop(cands)
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
-            if node.is_leaf() and node.ref_count == 0:
+            if self.on_evict_node is not None:
+                self.on_evict_node(node)
+            if node.is_leaf() and node.ref_count == 0 and self.on_evict_node is None:
                 kv.append(node.value)
                 self.full_evictable -= node.length
                 self._free_node_mamba(node, mamba)
                 freed += 1
                 self._cascade_tombstone_leaves(self._unlink(node), kv)
             else:
-                self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
+                # internal (or locked-KV) node -> tombstone; with a host tier wired, LEAF too:
+                # the snapshot is safely on the host, and keeping the leaf's KV in the tree
+                # is what lets a later match rehydrate the boundary instead of re-prefilling.
+                self._free_node_mamba(node, mamba)
                 freed += 1
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
@@ -230,6 +257,8 @@ class HybridRadixCache:
         freed = 0
         while (parent.mamba_value is None and parent.is_leaf()
                and parent.ref_count == 0 and not parent.is_root()):
+            if self.on_evict_kv is not None:
+                self.on_evict_kv(parent)
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length
@@ -251,6 +280,16 @@ class HybridRadixCache:
             n = n.parent
         vals.reverse()
         return torch.cat(vals) if vals else self.empty
+
+    def _collect_key(self, node: RadixTreeNode) -> torch.Tensor:
+        """The full token prefix ending at ``node`` (segment keys concatenated root->node)."""
+        keys: List[torch.Tensor] = []
+        n = node
+        while not n.is_root():
+            keys.append(n._key)
+            n = n.parent
+        keys.reverse()
+        return torch.cat(keys) if keys else torch.empty(0, dtype=torch.int32)
 
     def _leaves(self) -> List[RadixTreeNode]:
         out, stack = [], [self.root]
