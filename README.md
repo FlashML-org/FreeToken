@@ -35,7 +35,9 @@ Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/)
 
 ### CLI
 
-Install FreeToken with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
+#### CUDA (NVIDIA)
+
+Install the CUDA path with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
 
 ```bash
 uv pip install "freetoken[accel]"
@@ -49,6 +51,9 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+`accel` is the legacy CUDA compatibility extra; it is equivalent to the
+explicit `cuda` selection. It does not select AMD ROCm wheels.
+
 For More details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
@@ -56,6 +61,15 @@ For More details:
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 - [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
+
+### AMD ROCm/HIP port
+
+The `amd-rocm-gfx1151` branch contains the native AMD ROCm/HIP port and
+`gfx1151` validation work. Read [AMD ROCm on Radeon 8060S](docs/amd-rocm-gfx1151.md)
+for scope, platform boundaries, and the source-build sequence. The ROCm guide
+selects matched HIP Torch/TorchVision wheels before the no-build-isolation
+build; do not use a generic `pip install "freetoken[rocm]"` command to choose
+an AMD wheel index.
 
 ## Citation
 

@@ -55,14 +55,10 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
-    # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
-    # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
-    # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.14",
-    "torchvision>=0.26,<0.27",
+    # Torch and Triton are accelerator ABI dependencies. They intentionally
+    # live in the mutually exclusive CUDA and ROCm extras below.
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
-    "triton==3.6.0; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 
@@ -75,33 +71,93 @@ Issues = "https://github.com/FlashML-org/FreeToken/issues"
 ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=6.0"]
+dev = ["pytest>=6.0", "tomli>=2.0,<3; python_version < '3.11'"]
+# Select exactly one accelerator ABI. PyTorch's wheel backend is not part of
+# standard package metadata, so ``cuda`` and ``rocm`` deliberately make the
+# choice explicit for uv. The documented pip flow provisions the same matched
+# wheels from the chosen PyTorch index before the editable source build.
+cuda = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "triton==3.6.0; platform_system == 'Linux'",
+    "flashinfer-python[cu13]>=0.6,<0.7",
+    "sglang-kernel==0.4.5",
+]
+rocm = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "pytorch-triton-rocm>=3.5.1; sys_platform == 'linux'",
+    "triton-rocm>=3.6.0; sys_platform == 'linux'",
+]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
-# `freetoken[accel]` for the full native fast path.
+# `freetoken[cuda]` (or legacy `freetoken[accel]`) for the CUDA native fast path.
 fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
-accel = ["freetoken[fi,sgl]"]
+# Legacy spelling for the CUDA selection. Keep its dependencies explicit rather
+# than recursively referencing this package so resolver-only checks never need
+# to execute setup.py before the selected Torch runtime is installed.
+accel = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "triton==3.6.0; platform_system == 'Linux'",
+    "flashinfer-python[cu13]>=0.6,<0.7",
+    "sglang-kernel==0.4.5",
+]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
 # core transformers>=5.5 requirement. It is therefore not a lockable extra and is left
 # out of the default resolution — install it separately (`pip install 'vllm>=0.14,<0.15'`)
 # in a dedicated environment when you specifically need the Marlin path.
 
-# uv-only provenance pins — pip ignores this section and resolves from PyPI, which
-# works: PyPI's torch 2.11.0 is the same cu130 build this index serves.
-# `explicit = true` scopes the index to the one package that needs it
-# (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
-# which would otherwise shadow PyPI under uv's first-index strategy).
+# uv-only provenance pins. pip ignores this section, so a ROCm source build must
+# provision its matched Torch pair from the ROCm index before its editable build.
+# `explicit = true` scopes each index to packages named below; without it a
+# PyTorch index could shadow ordinary PyPI dependencies under uv's first-index
+# strategy.
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = [
+    { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-cu130", extra = "accel" },
+    { index = "pytorch-rocm72", extra = "rocm" },
+]
+torchvision = [
+    { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-cu130", extra = "accel" },
+    { index = "pytorch-rocm72", extra = "rocm" },
+]
+pytorch-triton-rocm = [{ index = "pytorch-rocm72", extra = "rocm" }]
+triton-rocm = [{ index = "pytorch-rocm72", extra = "rocm" }]
+sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-rocm72"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "sglang-cu130"
+url = "https://docs.sglang.io/whl/cu130"
+explicit = true
+
+[tool.uv]
+# setup.py imports Torch to build the native extensions. With a selected
+# accelerator extra, uv installs that runtime Torch first, then builds this
+# project in the same environment so PEP 517 cannot replace HIP Torch with a
+# PyPI CUDA build in an isolated build environment.
+no-build-isolation-package = ["freetoken"]
+conflicts = [
+    [{ extra = "cuda" }, { extra = "rocm" }],
+    [{ extra = "accel" }, { extra = "rocm" }],
+    [{ extra = "fi" }, { extra = "rocm" }],
+    [{ extra = "sgl" }, { extra = "rocm" }],
+]
 [tool.setuptools]
 include-package-data = true
 package-dir = {"" = "python"}

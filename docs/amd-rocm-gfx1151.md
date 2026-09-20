@@ -60,20 +60,49 @@ existing vLLM environment.  The reference layout is intentionally isolated:
   models/       optional links to read-only local model storage
 ```
 
-The exact PyTorch ROCm wheel must be selected after validating its compatible
-Triton build on LAN-223.  FreeToken's upstream CUDA package set must not be
-installed on AMD: `flashinfer`, `sglang-kernel`, CUDA-indexed Torch wheels, and
-the CUDA kernel-cache wheel are NVIDIA binaries.
+The supported PyTorch pair is `torch==2.11.0` and `torchvision==0.26.0` from
+PyTorch's ROCm 7.2 wheel index. That wheel index is an ABI selection, not the
+toolkit-root path: set all three root variables to the same complete ROCm
+toolkit installation before building. `/opt/rocm-10.0` is an example only;
+replace it only with the matching complete root on the target host.
+
+```bash
+export ROCM_HOME=/opt/rocm-10.0
+export ROCM_PATH="$ROCM_HOME"
+export HIP_PATH="$ROCM_HOME"
+
+python -m pip install \
+  --index-url https://download.pytorch.org/whl/rocm7.2 \
+  "torch==2.11.0" "torchvision==0.26.0"
+python -c "import torch; assert torch.version.hip, torch.version.hip"
+```
+
+FreeToken's upstream CUDA package set must not be installed on AMD:
+`flashinfer`, `sglang-kernel`, CUDA-indexed Torch wheels, and the CUDA
+kernel-cache wheel are NVIDIA binaries. Standard pip does not read uv's source
+mapping, so do not expect `pip install "freetoken[rocm]"` to select the ROCm
+index automatically.
 
 The initial build command is run from `source` only after the isolated Python
 environment has a working HIP PyTorch import:
 
 ```bash
-python -m pip install -e . --no-build-isolation --no-deps
+python -m pip install -e . --no-build-isolation
 ```
 
+`--no-build-isolation` is intentional: the validated HIP Torch ABI already
+exists in this isolated environment and must be the ABI used for the native
+extensions. FreeToken's ordinary runtime dependencies still install, but Torch
+is not a base dependency and is therefore not re-resolved. Do not substitute
+the CUDA `accel` extra for this sequence.
+
+Maintainers can verify the metadata selection independently with
+`bash scripts/verify-accel-resolver.sh`. It creates a disposable directory,
+performs resolver dry-runs only, and rejects the invalid ROCm-plus-CUDA-extra
+selection; it neither installs packages nor changes a service.
+
 Use `hipcc --version`, `rocminfo`, and a small PyTorch HIP allocation before
-the FreeToken build.  Record outputs in `artifacts/environment/`, with secrets
+the FreeToken build. Record outputs in `artifacts/environment/`, with secrets
 and access tokens removed.
 
 ## Persistent GGUF HIP JIT cache

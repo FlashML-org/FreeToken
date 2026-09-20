@@ -34,6 +34,12 @@ def _check_toolchain() -> None:
 def _gpu_runtime_paths() -> tuple[list[str], list[str], list[str], list[str]]:
     """Returns (include_dirs, library_dirs, libraries, extra_link_args)."""
     if IS_ROCM:
+        if not ROCM_HOME:
+            raise RuntimeError(
+                "A HIP PyTorch build requires one complete ROCm toolkit root before "
+                "building FreeToken. Set ROCM_HOME, ROCM_PATH, and HIP_PATH to the "
+                "same directory (for example, /opt/rocm-10.0)."
+            )
         rocm_home = Path(ROCM_HOME)
         library_dirs = [d for d in (rocm_home / "lib64", rocm_home / "lib") if d.exists()]
         # The pip-vendored rocm-sdk-core ships versioned sonames (libamdhip64.so.7)

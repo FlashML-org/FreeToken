@@ -1,10 +1,23 @@
 # Install
 
-## Requirements
+## CUDA (NVIDIA) requirements
 
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
 - Python >= 3.10, with [uv](https://docs.astral.sh/uv/) recommended (plain
   `pip` + `venv` works too)
+
+`accel` is the legacy name for the explicit `cuda` extra. The commands below,
+including the nightly kernel-cache wheel, are CUDA-only.
+
+## AMD ROCm/HIP from source
+
+The ROCm path is a separate, explicit Linux x86_64 source-build procedure. It
+requires Python >=3.10 and a complete ROCm toolkit. It provisions a matched HIP
+Torch/TorchVision pair from PyTorch's ROCm index before building FreeToken
+without build isolation. Follow [AMD ROCm on Radeon
+8060S](amd-rocm-gfx1151.md#clean-installation) rather than using the CUDA
+commands below. Standard pip does not read uv's source mapping, so `pip install
+"freetoken[rocm]"` cannot by itself choose the ROCm wheel index.
 
 ## Method 1: Install from PyPI
 

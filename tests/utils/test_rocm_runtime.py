@@ -6,8 +6,9 @@ for a newer NVIDIA SM capability, nor select optional CUDA binaries merely
 because a stale package happens to be installed in the environment.
 """
 
-import torch
 from pathlib import Path
+
+import torch
 
 from freetoken.kernel import backend
 from freetoken.utils import arch
