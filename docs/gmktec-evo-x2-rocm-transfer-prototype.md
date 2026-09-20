@@ -52,4 +52,3 @@ many small, non-contiguous blocks with the same sizes and batching as the
 runtime's miss path. It should report throughput, launch overhead, and p95/p99
 copy latency. A full checkpoint download remains gated on that result and on a
 resident-memory budget that preserves the protected service.
-

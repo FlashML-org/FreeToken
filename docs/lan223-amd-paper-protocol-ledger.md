@@ -24,4 +24,3 @@ project root. The upstream summary is `docs/upstream-qwen-paper-protocol.md`.
 
 Until every missing row is resolved from released artifacts or the authors,
 call the result `LAN-223 paper-inspired`, never `paper replication`.
-

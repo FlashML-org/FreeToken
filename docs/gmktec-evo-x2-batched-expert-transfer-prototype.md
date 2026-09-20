@@ -52,4 +52,3 @@ approximately 18 GiB live available-memory constraint.
 The next optimization experiment should overlap grouped staging and device
 copies with a synthetic compute kernel. It should report whether overlap hides
 the approximately 0.17 to 0.32 ms staging cost without increasing tail latency.
-

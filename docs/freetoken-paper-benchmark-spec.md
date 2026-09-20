@@ -97,4 +97,3 @@ agent-workload measurements.
    recovery gates before it can be compared on TPS.
 4. Report AMD results beside, not as replacements for, the paper's discrete-GPU
    results unless the model, workload, and measurement protocol are identical.
-

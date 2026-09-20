@@ -38,4 +38,3 @@ The candidate is rejected for promotion because it regressed end-to-end wall
 time in both measured cases. Future overlap work must use persistent streams,
 event pools, larger fused batches, and scheduler-level pipelining, then pass
 the same quality and tail-latency gates as the current validated path.
-

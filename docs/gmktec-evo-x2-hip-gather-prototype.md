@@ -46,4 +46,3 @@ The next prototype should use mapped or pinned host memory and a HIP kernel
 that consumes a descriptor list, then compare one descriptor submission for 64
 blocks against the serialized Python path. That will measure how much host
 intervention can be removed while retaining the real host-to-device boundary.
-

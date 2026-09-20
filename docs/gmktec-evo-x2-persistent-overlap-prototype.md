@@ -40,4 +40,3 @@ Future work should move batching into the runtime or a compiled HIP kernel,
 where expert indexing, gather, transfer scheduling, and compute can be fused or
 queued with substantially fewer host interventions. Any such implementation
 must still pass deterministic quality, tail-latency, recovery, and API gates.
-

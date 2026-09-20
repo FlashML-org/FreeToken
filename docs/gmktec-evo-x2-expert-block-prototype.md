@@ -51,4 +51,3 @@ count using one grouped operation per layer, then compares it with the
 serialized result above. This will quantify how much batching the runtime must
 provide before a large-model offload attempt can be considered technically
 credible.
-

@@ -77,4 +77,3 @@ matched Q5 control.
    the current functional or bounded-performance release gates.
 5. Keep strict NVIDIA comparison and 284B capacity as separate unresolved
    work items because their required external evidence is still missing.
-

@@ -84,4 +84,3 @@ cat >"${ARTIFACT_DIR}/manifest.json" <<EOF
 EOF
 
 printf '%s\n' "${ARTIFACT_DIR}"
-

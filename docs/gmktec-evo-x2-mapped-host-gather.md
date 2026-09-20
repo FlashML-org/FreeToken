@@ -45,4 +45,3 @@ Integrate a descriptor-list gather into a small synthetic MoE layer with the
 actual expert tensor shapes and FP4 or FP8 conversion path. Measure quality,
 per-token latency, and p95/p99 miss behavior before considering any full
 DeepSeek checkpoint download.
-

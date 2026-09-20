@@ -89,4 +89,3 @@ within an explicitly interactive latency budget.
    headroom.
 4. A predicted per-token miss volume and worst-case transfer latency.
 5. A stop condition that prevents uncontrolled swap growth or system thrash.
-
