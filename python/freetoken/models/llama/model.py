@@ -21,8 +21,9 @@ if TYPE_CHECKING:
 
 
 class LlamaDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = LlamaAttn(config, layer_id)       
+
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.self_attn = LlamaAttn(config, layer_id, prefix=f"{prefix}.self_attn")       
         # build the router and the smaller experts
         if config.num_experts > 1:
             # router
@@ -30,6 +31,8 @@ class LlamaDecoderLayer(BaseOP):
             # Smaller experts 
             self.mlp = make_moe_layer(
                 config, 
+                quant_config=config.quant,
+                prefix=f"{prefix}.mlp",
                 layer_id=layer_id, 
                 weight_format= getattr(config,"moe_weight_format","bf16")
                 )           
@@ -79,13 +82,16 @@ class LlamaDecoderLayer(BaseOP):
 
 
 class LlamaModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [LlamaDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                LlamaDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = RMSNormFused(
             size=config.hidden_size,
@@ -108,6 +114,8 @@ class LlamaForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         super().__init__()
         if is_gguf_model(config):

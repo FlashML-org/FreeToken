@@ -27,13 +27,15 @@ from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+from freetoken.models.blocks import embed_input_ids
+from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
 
 
-def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
+def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
     from .gdn import Qwen4ExpGatedDeltaNet
 
@@ -48,28 +50,26 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         rms_norm_eps=config.rms_norm_eps,
         layer_id=layer_id,
         output_gate=g.output_gate,
-        # Qwen3.8's block-fp8 checkpoint keeps the GDN projections bf16 (only the routed
-        # experts are quantized), so do not let expert_quant flip them to Fp8Block.
-        expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
-        attn_quant=config.attn_quant,
+        quant_config=config.quant,
+        prefix=prefix,
     )
 
 
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
-            self.linear_attn = build_linear_mixer(config, layer_id)
+            self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
-            self.self_attn = Qwen4ExpAttention(config, layer_id)
-        self.mlp = Qwen4ExpMoE(config, layer_id)
-        self.attn_hyper_connection = GatedResidual(config)
-        self.mlp_hyper_connection = GatedResidual(config)
+            self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
+        self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
+        self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
+        self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (
-            PLELayer(config, layer_id) if layer_id in config.qwen4_args.ple_layer_ids else None
+            PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -87,16 +87,19 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
 
 class Qwen4ExpModel(BaseOP):
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [Qwen4ExpDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                Qwen4ExpDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
@@ -106,7 +109,8 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -127,20 +131,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        if getattr(config, "lm_head_quant", "none") == "nvfp4":
-            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
-
-            assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
-            self.lm_head = Nvfp4LMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
-        else:
-            self.lm_head = ParallelLMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                tie_word_embeddings=config.tie_word_embeddings,
-                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            )
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
+        )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -169,6 +167,37 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        if engine_config.ple_backend == "disk":
+            from freetoken.utils import download_hf_weight
+
+            from .ple_disk import DiskRowTable, resolve_row_source
+
+            folder = download_hf_weight(engine_config.model_path)
+            # one WAIT node per captured graph: the flag protocol supports a single consume
+            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
+            emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
+            # hash with the state-dict-loaded constants, the same source the pinned path reads
+            constants = {
+                "num_ngram_heads": args.num_ngram_heads,
+                "layer_multipliers": emb.layer_multipliers.tolist(),
+                "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
+                "per_head_offsets": emb.ngram_heads_offsets.tolist(),
+                "eos_token_id": args.ngram_boundary_token_id,
+                "image_token_id": args.image_token_id,
+            }
+            disk_table = DiskRowTable(
+                resolve_row_source(folder),
+                constants,
+                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                max_extend_tokens=engine_config.max_extend_tokens,
+            )
+            self._ple_table = disk_table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(disk_table)
+            # engine enters this around every dispatch; the graph itself never waits on the disk
+            self.forward_host_ctx = disk_table.forward_host_ctx
+            return 0
+
         from .weight import load_ple_table
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
@@ -184,4 +213,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
 
-__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        if config.is_multimodal:
+            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
+            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+
+
+__all__ = [
+    "Qwen4ExpDecoderLayer",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpModel",
+    "build_linear_mixer",
+]

@@ -3,25 +3,18 @@
 The checkpoint is the multimodal wrapper layout: every text-tower tensor carries a
 ``language_model.`` prefix (``language_model.model.layers.N...``,
 ``language_model.lm_head.weight``); the ViT stack (``vision_tower.`` /
-``multi_modal_projector.`` / ``patch_merge_mlp.``) is never read (text-only serving).
+``multi_modal_projector.`` / ``patch_merge_mlp.``) is read by ``_iter_vision`` only when
+the engine builds the vision encoder (``include_vision``).
 
 Resident (non routed-expert) dense projections are MXFP8 in the checkpoint
-(fp8-e4m3 ``weight`` + uint8 e8m0 block-32 ``weight_scale_inv``). What this loader
-yields follows the quant modes RESOLVED IN ``parse_config`` (``ModelConfig.attn_quant``
-/ ``dense_quant``, from the FREETOKEN_M3_*_MXFP8 switches, default on): in the default
-mode the fp8 weight and its scale codes stream through verbatim (merged output-wise for
-the fused qkv / index-qk / gate-up projections -- the scales are per-output-row, so
-fusion is exact); with a switch off the projections are dequantized to bf16 at load.
+(fp8-e4m3 ``weight`` + uint8 e8m0 block-32 ``weight_scale_inv``): the fp8 weight and
+its scale codes stream through verbatim (merged output-wise for the fused qkv /
+index-qk / gate-up projections -- the scales are per-output-row, so fusion is exact).
 Norms, the router gate, ``e_score_correction_bias`` (kept fp32), embeddings and
 lm_head are unquantized and stream through verbatim. Routed experts are NVFP4
 (``w1/w3/w2`` = gate/up/down, same ModelOpt layout as MiniMax-M2) and go to the
-offload cache via ``load_nvfp4_expert_sources``; expert ``input_scale`` calibration
+offload cache from their NVFP4 pieces; expert ``input_scale`` calibration
 tensors are unused (W4A16) and never match the bank spec.
-
-FTW caveat: an FTW checkpoint stores whatever iter_weights yielded at CONVERSION time,
-and the model is built from the env at SERVE time -- the two must agree (a mismatch
-fails loudly in load_state_dict on the ``*.weight_scale_inv`` keys). The active modes
-are logged at load so conversion logs record the choice.
 """
 
 from __future__ import annotations
@@ -37,7 +30,6 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
@@ -144,16 +136,35 @@ def _emit_fused(
     )
 
 
+_VISION_ATTN = "vision_tower.vision_model.encoder.layers.{}.self_attn"
+
+
+def _iter_vision(reader: _ShardReader, weight_map: dict, num_layers: int) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower under its checkpoint names with q/k/v fused, the projector and patch-merge MLP under the tower prefix; all bf16 (the patch embedding is stored fp32)."""
+    for name in weight_map:
+        if name.startswith(("multi_modal_projector.", "patch_merge_mlp.")):
+            yield "vision_tower." + name, reader.get(name).to(torch.bfloat16)
+        elif name.startswith("vision_tower.") and ".self_attn." not in name:
+            yield name, reader.get(name).to(torch.bfloat16)
+    for layer in range(num_layers):
+        attn = _VISION_ATTN.format(layer)
+        for kind in ("weight", "bias"):
+            parts = [reader.get(f"{attn}.{proj}.{kind}") for proj in ("q_proj", "k_proj", "v_proj")]
+            yield f"{attn}.qkv.{kind}", torch.cat(parts, dim=0).to(torch.bfloat16)
+            yield f"{attn}.out_proj.{kind}", reader.get(f"{attn}.out_proj.{kind}").to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "MiniMax-M3 stores routed experts as NVFP4 and only supports the offload MoE "
-        "backend; experts are loaded into the offload cache via load_nvfp4_expert_sources()."
+        "backend; experts are loaded into the offload cache from their NVFP4 pieces."
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
@@ -170,8 +181,7 @@ def iter_weights(
 
         init_logger(__name__).info(
             f"MiniMax-M3 resident quant: attn={config.attn_quant} dense={config.dense_quant} "
-            f"lm_head={config.lm_head_quant} (FREETOKEN_M3_ATTN_MXFP8/FREETOKEN_M3_MLP_MXFP8; "
-            "an FTW conversion records these choices implicitly -- serve with the same flags)"
+            f"lm_head={config.lm_head_quant}"
         )
     try:
         for layer in tqdm(
@@ -244,40 +254,29 @@ def iter_weights(
         yield "model.embed_tokens.weight", reader.get("language_model.model.embed_tokens.weight")
         yield "model.norm.weight", reader.get("language_model.model.norm.weight")
         yield "lm_head.weight", reader.get("language_model.lm_head.weight")
+        if include_vision and config.vision_config is not None:
+            yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
     finally:
         reader.close()
 
 
-def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    config = parse_config(cached_load_hf_config(model_path))
+    if config.vision_config is None:
+        return
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
+    finally:
+        reader.close()
 
 
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
-__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
+__all__ = ["iter_weights", "nvfp4_expert_spec"]

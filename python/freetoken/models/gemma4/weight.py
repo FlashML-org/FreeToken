@@ -9,12 +9,12 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.models.loader import (
     MergeRule,
+    ShardReader,
     drop_page_cache,
     iter_weight_files,
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
@@ -60,50 +60,74 @@ _FEED_FORWARD_PREFIXES = (
 
 # modelopt-NVFP4 dense MLP (nvidia/Gemma-4-31B-IT-NVFP4): mlp.{gate,up,down}_proj are W4A16
 # FP4 -- uint8 weight + fp8-e4m3 block weight_scale + per-tensor weight_scale_2 + input_scale.
-# The scales are consumed with their .weight; input_scale is unused (W4A16). Mirrors the
-# qwen3_5_moe native-NVFP4 dense loader.
+# The scales are consumed with their .weight.
 _NVFP4_DENSE_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
-def _nvfp4_dense_parts(f, raw_base: str):
-    """Load an NVFP4 dense weight as the W4A16 kernel's buffers: (weight uint8 [O, IN//2],
-    weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] from the per-tensor
-    weight_scale_2 broadcast per output row)."""
-    w = f.get_tensor(raw_base + ".weight")
-    s = f.get_tensor(raw_base + ".weight_scale")
-    g = f.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
+def _nvfp4_dense_parts(reader: ShardReader, raw_base: str):
+    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
+    w = reader.get_tensor(raw_base + ".weight")
+    s = reader.get_tensor(raw_base + ".weight_scale")
+    g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
     g = g.expand(w.shape[0]).contiguous()
     assert (
         w.dtype is torch.uint8
         and s.dtype is torch.float8_e4m3fn
         and g.dtype is torch.float16
     ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
-    return w, s, g
+    a = reader.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32) if reader.has(raw_base + ".input_scale") else None
+    return w, s, g, a
 
 
-def _emit_nvfp4_dense_mlp(f, base: str, raw_base: str, buf: dict):
-    """(key, tensor) triples for an NVFP4 dense MLP projection: down_proj standalone;
+def _emit_nvfp4_dense_mlp(reader: ShardReader, base: str, raw_base: str, buf: dict):
+    """(key, tensor) pairs for an NVFP4 dense MLP projection: down_proj standalone;
     gate_proj/up_proj merged output-wise into gate_up_proj (each keeps its own scales, so the
     fused weight is exact). Returns [] while a gate/up merge is still buffered."""
-    w, s, g = _nvfp4_dense_parts(f, raw_base)
+    w, s, g, a = _nvfp4_dense_parts(reader, raw_base)
     if base.endswith(".down_proj"):
-        return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+        out = [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+        return out + ([(base + ".input_scale", a)] if a is not None else [])
     is_gate = base.endswith(".gate_proj")
     prefix = base[: -len(".gate_proj")] if is_gate else base[: -len(".up_proj")]
     slots = buf.setdefault(prefix, {})
-    slots["gate" if is_gate else "up"] = (w, s, g)
+    slots["gate" if is_gate else "up"] = (w, s, g, a)
     if "gate" not in slots or "up" not in slots:
         return []
-    gw, gs, gg = slots["gate"]
-    uw, us, ug = slots["up"]
+    gw, gs, gg, ga = slots["gate"]
+    uw, us, ug, ua = slots["up"]
     del buf[prefix]
     pre = prefix + ".gate_up_proj"
-    return [
+    out = [
         (pre + ".weight", torch.cat([gw, uw], dim=0)),
         (pre + ".weight_scale", torch.cat([gs, us], dim=0)),
         (pre + ".weight_global", torch.cat([gg, ug], dim=0)),
     ]
+    if ga is not None and ua is not None:
+        # both parts read the same activation; the larger range covers both
+        out.append((pre + ".input_scale", torch.maximum(ga, ua)))
+    return out
+
+
+def _rename_vision_key(raw_name: str) -> str | None:
+    """Encoder checkpoint key -> state-dict key, or None for anything else; the tower's clipped-linear wrapper is dropped."""
+    if raw_name.startswith("model.vision_tower."):
+        return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(".linear.", ".")
+    if raw_name.startswith("model.embed_vision."):
+        return "embed_vision." + raw_name[len("model.embed_vision.") :]
+    if raw_name.startswith("model.vision_embedder."):
+        return "vision_embedder." + raw_name[len("model.vision_embedder.") :]
+    return None
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision encoder alone, named as iter_weights names it."""
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                name = _rename_vision_key(raw_name)
+                if name is not None:
+                    yield name, f.get_tensor(raw_name)
 
 
 def _rename_language_key(raw_name: str) -> str:
@@ -129,22 +153,15 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    def rename_key(raw_name: str, *, include_vision: bool) -> str | None:
+    def rename_key(raw_name: str) -> str | None:
         prefix = "model.language_model."
         if raw_name.startswith(prefix):
             return _rename_language_key(raw_name)
         if raw_name.startswith("language_model."):
             return _rename_language_key(raw_name)
-        if include_vision:
-            if raw_name.startswith("model.vision_tower."):
-                return ("vision_tower." + raw_name[len("model.vision_tower.") :]).replace(
-                    ".linear.",
-                    ".",
-                )
-            if raw_name.startswith("model.embed_vision."):
-                return "embed_vision." + raw_name[len("model.embed_vision.") :]
-        return None
+        return _rename_vision_key(raw_name)
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
         for suffix, rule in _MERGE_RULES.items():
@@ -157,7 +174,6 @@ def iter_weights(
     if tp_info.size > 1:
         raise NotImplementedError("Gemma 4 weight loading currently supports TP=1 only")
 
-    include_vision = config.is_multimodal
     k_eq_v_layers = {
         layer_id
         for layer_id in range(config.num_layers)
@@ -166,77 +182,81 @@ def iter_weights(
     }
     merge_buf: dict[str, dict[str, torch.Tensor]] = {}
     gateup_buf: dict[str, dict[str, tuple]] = {}
-    for file in tqdm(
-        iter_weight_files(model_path),
-        desc="Loading weights",
-        disable=not tp_info.is_primary(),
-    ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            keyset = set(f.keys())
-            for raw_name in f.keys():
-                name = rename_key(raw_name, include_vision=include_vision)
-                if name is None:
-                    continue
+    reader = ShardReader(model_path, device)
+    try:
+        for file in tqdm(
+            iter_weight_files(model_path),
+            desc="Loading weights",
+            disable=not tp_info.is_primary(),
+        ):
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                for raw_name in f.keys():
+                    name = rename_key(raw_name)
+                    if name is None:
+                        continue
 
-                # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
-                # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
-                if _NVFP4_EXPERT_RE.search(raw_name):
-                    continue
+                    # Per-expert NVFP4 tensors go to the offload cache (expert pieces),
+                    # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
+                    if _NVFP4_EXPERT_RE.search(raw_name):
+                        continue
 
-                # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
-                if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
-                    continue
+                    # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
+                    if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
+                        continue
 
-                is_vision = name.startswith(("vision_tower.", "embed_vision."))
-                is_expert = (
-                    not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
-                )
-                if is_expert and not include_moe_experts:
-                    continue
-                if not is_expert and not include_non_moe:
-                    continue
-
-                # Native W4A16 NVFP4 dense MLP: the .weight is FP4-packed and carries block +
-                # per-tensor scales. The keyset guard (weight_scale_2 sibling present) is
-                # defense-in-depth beyond config.dense_quant -- the sibling MoE checkpoint's
-                # bf16 shared_mlp has no such sibling, so it falls through to the bf16 path.
-                if (
-                    config.dense_quant == "nvfp4"
-                    and not is_vision
-                    and not is_expert
-                    and _NVFP4_DENSE_MLP_RE.search(raw_name)
-                    and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset
-                ):
-                    yield from _emit_nvfp4_dense_mlp(
-                        f, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf
+                    is_vision = name.startswith(("vision_tower.", "embed_vision.", "vision_embedder."))
+                    if is_vision and not include_vision:
+                        continue
+                    is_expert = (
+                        not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
                     )
-                    continue
+                    if is_expert and not include_moe_experts:
+                        continue
+                    if not is_expert and not include_non_moe:
+                        continue
 
-                tensor = f.get_tensor(raw_name)
-                if is_vision or is_expert:
-                    yield name, tensor
-                    continue
-
-                info = merge_info(name)
-                if info is None:
-                    yield name, tensor
-                    continue
-
-                merged_key, rule = info
-                slots = merge_buf.setdefault(merged_key, {})
-                slots[rule.slot] = tensor
-                if rule.slot == "k" and k_eq_v_layers:
-                    layer_match = _LAYER_INDEX_PATTERN.search(name)
+                    # Native W4A16 NVFP4 dense MLP: the .weight is FP4-packed and carries block + per-tensor scales.
+                    # The weight_scale_2 sibling guard is defense-in-depth beyond config.dense_quant -- the sibling MoE checkpoint's bf16 shared_mlp has no such sibling, so it falls through to the bf16 path.
                     if (
-                        layer_match is not None
-                        and int(layer_match.group(1)) in k_eq_v_layers
+                        config.dense_quant == "nvfp4"
+                        and not is_vision
+                        and not is_expert
+                        and _NVFP4_DENSE_MLP_RE.search(raw_name)
+                        and reader.has(raw_name[: -len(".weight")] + ".weight_scale_2")
                     ):
-                        slots["v"] = tensor
-                if not all(slot in slots for slot in rule.slots):
-                    continue
-                parts = [slots[slot] for slot in rule.slots]
-                del merge_buf[merged_key]
-                yield merged_key, torch.cat(parts, dim=0)
+                        yield from _emit_nvfp4_dense_mlp(
+                            reader, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf
+                        )
+                        continue
+
+                    tensor = f.get_tensor(raw_name)
+                    if is_vision or is_expert:
+                        yield name, tensor
+                        continue
+
+                    info = merge_info(name)
+                    if info is None:
+                        yield name, tensor
+                        continue
+
+                    merged_key, rule = info
+                    slots = merge_buf.setdefault(merged_key, {})
+                    slots[rule.slot] = tensor
+                    if rule.slot == "k" and k_eq_v_layers:
+                        layer_match = _LAYER_INDEX_PATTERN.search(name)
+                        if (
+                            layer_match is not None
+                            and int(layer_match.group(1)) in k_eq_v_layers
+                        ):
+                            slots["v"] = tensor
+                    if not all(slot in slots for slot in rule.slots):
+                        continue
+                    parts = [slots[slot] for slot in rule.slots]
+                    del merge_buf[merged_key]
+                    yield merged_key, torch.cat(parts, dim=0)
+
+    finally:
+        reader.close()
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
@@ -255,7 +275,7 @@ def iter_weights_parallel(
     (``feed_forward.experts.{gate_up_proj,down_proj}``), so no merge needed; same key
     rename as iter_weights, read via the common chunked O_DIRECT reader."""
     assert include_moe_experts and not include_non_moe, (
-        "gemma4 parallel reader is experts-only (used by load_moe_expert_sources)"
+        "gemma4 parallel reader is experts-only (used by the expert piece reader)"
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
@@ -275,41 +295,12 @@ def iter_weights_parallel(
         yield _expert_name(raw_name), tensor
 
 
-def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-):
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
 __all__ = [
+    "nvfp4_expert_spec",
     "iter_weights",
     "iter_weights_parallel",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
 ]

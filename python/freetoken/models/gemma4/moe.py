@@ -39,12 +39,14 @@ class Gemma4Router(BaseOP):
 class Gemma4MLP(BaseOP):
     """Gemma 4 feed-forward sandwich: shared MLP plus routed MoE branch."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.shared_mlp = GatedMLP(config)
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.shared_mlp = GatedMLP(config, quant_config=config.quant, prefix=f"{prefix}.shared_mlp")
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
             activation="gelu_tanh",
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
         self.router = Gemma4Router(config)
 
@@ -80,29 +82,6 @@ class Gemma4MLP(BaseOP):
         )
 
 
-class _Nvfp4GatedMLP(BaseOP):
-    """W4A16 NVFP4 gated MLP (fused gate_up + down, gelu-tanh gated). Drop-in for the bf16
-    GatedMLP inside Gemma4DenseMLP on modelopt-NVFP4 dense checkpoints; same attribute names
-    (gate_up_proj / down_proj) so the loader targets it identically."""
-
-    def __init__(self, config: ModelConfig):
-        from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
-        from freetoken.layers import gelu_tanh_and_mul
-
-        self.gate_up_proj = Nvfp4DenseColMerged(
-            config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
-            has_bias=False,
-        )
-        self.down_proj = Nvfp4DenseLinear(
-            config.intermediate_size, config.hidden_size, has_bias=False
-        )
-        self._act = gelu_tanh_and_mul
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(self._act(self.gate_up_proj.forward(x)))
-
-
 class Gemma4DenseMLP(BaseOP):
     """Gemma 4 dense feed-forward: a single gated MLP branch (no routed experts),
     RMS-normed then residual-added, scaled by the per-layer ``layer_scalar``.
@@ -111,15 +90,10 @@ class Gemma4DenseMLP(BaseOP):
     ``out = (x + post_feedforward_layernorm(shared_mlp(pre_ff))) * layer_scalar``.
     Attribute names match the MoE Gemma4MLP so weight.py's rename machinery
     (``mlp.* -> feed_forward.shared_mlp.*``, bare ``layer_scalar`` /
-    ``post_feedforward_layernorm.``) resolves the dense checkpoint unchanged. The gated
-    MLP is bf16, or W4A16 NVFP4 when the checkpoint quantizes the dense MLP."""
+    ``post_feedforward_layernorm.``) resolves the dense checkpoint unchanged."""
 
-    def __init__(self, config: ModelConfig):
-        self.shared_mlp = (
-            _Nvfp4GatedMLP(config)
-            if getattr(config, "dense_quant", "none") == "nvfp4"
-            else GatedMLP(config)
-        )
+    def __init__(self, config: ModelConfig, *, prefix: str = ""):
+        self.shared_mlp = GatedMLP(config, quant_config=config.quant, prefix=f"{prefix}.shared_mlp")
         self.post_feedforward_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )

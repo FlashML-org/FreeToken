@@ -11,7 +11,7 @@ from .config import (
     SWAAttentionGroupConfig,
 )
 from .register import get_model_class
-from .weight import load_moe_expert_sources, load_weight
+from .weight import load_weight
 
 
 def create_model(model_config: ModelConfig) -> BaseLLMModel:
@@ -22,7 +22,6 @@ __all__ = [
     "BaseLLMModel",
     "create_model",
     "load_weight",
-    "load_moe_expert_sources",
     "AttentionGroupConfig",
     "BaseAttentionGroupConfig",
     "DSV4AttentionGroupConfig",

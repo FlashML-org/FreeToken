@@ -19,7 +19,7 @@ import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import expert_bank_row_bytes
-from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks
+from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.weight import (
     _NVFP4_SOURCE_SPEC,
@@ -27,8 +27,11 @@ from freetoken.models.qwen4_exp.weight import (
     iter_weights,
     load_ple_table,
 )
+from freetoken.moe.expert_banks import build_expert_banks
 from freetoken.moe.host_banks import HostResidency
 from freetoken.utils import cached_load_hf_config
+
+from .common import install_quant_config, meta_state_dict
 
 MODEL_PATH = os.environ.get("FREETOKEN_QWEN4EXP_MODEL")
 pytestmark = [
@@ -165,6 +168,7 @@ def dense_pass() -> tuple[list[str], dict[str, torch.Tensor]]:
     wanted = {name for name, _raw, _mode in SAMPLES}
     names: list[str] = []
     sampled: dict[str, torch.Tensor] = {}
+    install_quant_config(MODEL_PATH)
     for name, tensor in iter_weights(
         MODEL_PATH, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
     ):
@@ -189,27 +193,12 @@ def test_emitted_names_are_unique_and_complete(dense_pass):
 @pytest.fixture(scope="module")
 def model_state_dict_keys() -> set[str]:
     """Keys ``Qwen4ExpForCausalLM`` declares -- the authoritative target the loader must fill."""
-    from freetoken.layers import rotary
-    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
-
-    config = parse_config(cached_load_hf_config(MODEL_PATH))
-    saved = rotary._ROPE_DEVICE
-    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
-    rotary.get_rope.cache_clear()
-    try:
-        with torch.device("meta"):
-            return set(Qwen4ExpForCausalLM(config).state_dict())
-    finally:
-        rotary.set_rope_device(saved)
-        rotary.get_rope.cache_clear()
+    return set(meta_state_dict(MODEL_PATH))
 
 
 def test_emitted_names_are_the_model_state_dict(dense_pass, model_state_dict_keys):
     names, _sampled = dense_pass
-    # The routed NVFP4 experts come from the offload source banks, never from the dense pass.
-    expected = {k for k in model_state_dict_keys
-                if not k.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))}
-    assert set(names) == expected
+    assert set(names) == model_state_dict_keys
 
 
 def test_every_zero_centered_norm_is_present_and_raw(dense_pass, reader):
@@ -287,9 +276,23 @@ def layer0_expert_banks():
     )
     config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
                              num_moe_layers=1)
-    return load_nvfp4_expert_source_banks(
+    layer = _triton_layer()
+    pieces = iter_nvfp4_expert_pieces(
         MODEL_PATH, config, spec, drop_page_cache=lambda path: None, primary=False
     )
+    return build_expert_banks(layer.quant_method, 1, pieces, device=torch.device("cuda")).sources
+
+
+def _triton_layer():
+    """An offload NVFP4 layer bound to the Triton kernel, whose banks are the native rows."""
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    return OffloadMoELayer(0, E, 10, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
 
 
 @pytest.mark.slow
@@ -297,11 +300,11 @@ def test_sampled_experts_match_the_checkpoint(layer0_expert_banks, reader):
     banks = layer0_expert_banks
     for expert in random.Random(1).sample(range(E), 8):
         base = f"{LM}.layers.0.mlp.experts.{expert}"
-        assert torch.equal(banks["gate_up_packed"][0][expert, :I],
+        assert torch.equal(banks["gate_up"][0][expert, :I],
                            reader.get(f"{base}.gate_proj.weight"))
-        assert torch.equal(banks["gate_up_packed"][0][expert, I:],
+        assert torch.equal(banks["gate_up"][0][expert, I:],
                            reader.get(f"{base}.up_proj.weight"))
-        assert torch.equal(banks["down_packed"][0][expert],
+        assert torch.equal(banks["down"][0][expert],
                            reader.get(f"{base}.down_proj.weight"))
         for proj, bank, rows in (("gate_proj", "gate_up_scale", slice(0, I)),
                                  ("up_proj", "gate_up_scale", slice(I, 2 * I)),
@@ -320,18 +323,9 @@ def test_expert_bank_bytes_match_the_aot_row_table(layer0_expert_banks):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dummy banks are pinned")
-def test_dummy_expert_sources_have_the_real_bank_shapes(layer0_expert_banks):
-    from freetoken.models.weight import _model_override, dummy_nvfp4_expert_sources
-    from freetoken.models.register import get_model_spec
-
-    spec = get_model_spec("Qwen4ExpForConditionalGeneration")
-    # No dummy_* override, so --use-dummy-weight goes through the generic builders.
-    for hook in ("dummy_nvfp4_expert_sources", "dummy_moe_expert_sources", "dummy_q4_0_expert_sources"):
-        assert _model_override(spec, hook) is None
-
-    config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
-                             num_moe_layers=1)
-    dummy = dummy_nvfp4_expert_sources(config)
+def test_dummy_expert_banks_have_the_real_bank_shapes(layer0_expert_banks):
+    layer = _triton_layer()
+    dummy = build_expert_banks(layer.quant_method, 1, None, device=torch.device("cuda"), dummy=True).sources
     assert set(dummy) == set(layer0_expert_banks)
     for name, banks in dummy.items():
         assert banks[0].shape == layer0_expert_banks[name][0].shape

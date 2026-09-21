@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -12,13 +13,76 @@ from freetoken.models.config import (
 
 _SWA_TYPE = "sliding_attention"
 _FULL_TYPE = "full_attention"
+_VISION_LAYER_TYPES = {"window_attention", "full_attention"}
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    hidden_size: int
+    intermediate_size: int
+    num_layers: int
+    num_heads: int
+    layer_types: tuple[str, ...]
+    patch_size: int
+    temporal_patch_size: int
+    merge_size: int
+    pos_emb_side: int
+    layer_norm_eps: float
+    rope_theta: float
+    projector_hidden_size: int
+    text_hidden_size: int
+    text_rms_norm_eps: float
+
+    @property
+    def patch_dim(self) -> int:
+        return self.temporal_patch_size * 3 * self.patch_size**2
+
+    @property
+    def out_hidden_size(self) -> int:
+        return self.hidden_size * self.merge_size**2
+
+
+def parse_vision_config(hf_config: Any) -> VisionConfig | None:
+    """None when the config carries no vision section, which is how a text-only engine asks for no tower."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    if vc.hidden_act != "gelu" or hf_config.projector_hidden_act != "gelu":
+        raise NotImplementedError(
+            f"muse_glimmer vision activations {vc.hidden_act!r} / {hf_config.projector_hidden_act!r}; only gelu is implemented"
+        )
+    if vc.pos_emb_height != vc.pos_emb_width:
+        raise NotImplementedError("muse_glimmer vision tower: the position table must be square")
+    layer_types = tuple(vc.layer_types)
+    assert set(layer_types) <= _VISION_LAYER_TYPES, f"unknown vision layer types in {set(layer_types)}"
+    rope_params = getattr(vc, "rope_parameters", None) or {}
+    text = _text_config(hf_config)
+    config = VisionConfig(
+        hidden_size=vc.hidden_size,
+        intermediate_size=vc.intermediate_size,
+        num_layers=vc.num_hidden_layers,
+        num_heads=vc.num_attention_heads,
+        layer_types=layer_types,
+        patch_size=vc.patch_size,
+        temporal_patch_size=vc.patch_temporal,
+        merge_size=vc.merge_size,
+        pos_emb_side=vc.pos_emb_height,
+        layer_norm_eps=vc.layer_norm_eps,
+        rope_theta=float(rope_params.get("rope_theta", 10000.0)),
+        projector_hidden_size=hf_config.projector_hidden_size,
+        text_hidden_size=text.hidden_size,
+        text_rms_norm_eps=text.rms_norm_eps,
+    )
+    assert hf_config.out_hidden_size == config.out_hidden_size, (
+        f"adapter input {hf_config.out_hidden_size} != pixel-shuffled tower width {config.out_hidden_size}"
+    )
+    return config
 
 
 def _text_config(hf_config: Any) -> Any:
     """Muse Glimmer ships as a multimodal wrapper (MuseGlimmerForConditionalGeneration):
     the text tower lives in ``text_config`` and the weights carry a ``language_model.``
-    prefix. Served text-only -- the ~1.8B ViT perception encoder is never built, so
-    ``ModelConfig.vision_config`` stays None and the loader drops the vision tensors."""
+    prefix."""
     text = getattr(hf_config, "text_config", None)
     return text if text is not None else hf_config
 
@@ -108,7 +172,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=attn_sm_scale,
         final_logit_softcapping=getattr(text, "final_logit_softcapping", None),
         output_multiplier=getattr(text, "output_multiplier", None),
-        vision_config=None,  # served text-only
+        vision_config=parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attn_quant=quant,
         dense_quant=quant,
@@ -133,4 +197,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["VisionConfig", "parse_config", "parse_vision_config"]

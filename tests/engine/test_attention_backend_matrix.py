@@ -259,13 +259,15 @@ def test_legal_explicit_combinations_pass(monkeypatch, kind, backend):
 
 
 @pytest.mark.parametrize("kind", ["mla", "dsa"])
-def test_mla_requires_page_size_one(monkeypatch, kind):
+def test_mla_auto_adjusts_page_size(monkeypatch, kind):
+    """Any --page-size is auto-adjusted (with a warning) to the layout's
+    required size: 1 for plain latent-KV, 64 for the kpool variant."""
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch)
     config = _config(kind, attention_backend="auto", page_size=16)
-    with pytest.raises(ValueError, match="page-size 1"):
-        _adjust_config(config)
+    _adjust_config(config)
+    assert config.page_size == 1
 
 
 def test_trtllm_page_size_coercion_is_part_aware(monkeypatch):

@@ -11,14 +11,16 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import MiniMaxM3Attention
 from .mlp import MiniMaxM3MLP
 from .moe import MiniMaxM3SparseMoeBlock
+from .vision import MiniMaxM3VisionModel
 
 if TYPE_CHECKING:
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
 
@@ -27,19 +29,22 @@ class MiniMaxM3DecoderLayer(BaseOP):
     ``block_sparse_moe`` -- matching the checkpoint's naming. All layernorms are
     Gemma-style (1+w) RMSNorm (``use_gemma_norm``)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.m3_args
-        self.self_attn = MiniMaxM3Attention(config, layer_id)
+        self.self_attn = MiniMaxM3Attention(config, layer_id, prefix=f"{prefix}.self_attn")
         self.is_moe_layer = layer_id in args.moe_layer_ids
         if self.is_moe_layer:
-            self.block_sparse_moe: BaseOP = MiniMaxM3SparseMoeBlock(config, layer_id)
+            self.block_sparse_moe: BaseOP = MiniMaxM3SparseMoeBlock(
+                config, layer_id, prefix=f"{prefix}.block_sparse_moe"
+            )
         else:
             self.mlp = MiniMaxM3MLP(
                 config.hidden_size,
                 args.dense_intermediate_size,
-                quant=config.dense_quant,
                 alpha=args.swiglu_alpha,
                 limit=args.swiglu_limit,
+                quant_config=config.quant,
+                prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = GemmaPlusOneRMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps
@@ -62,18 +67,21 @@ class MiniMaxM3DecoderLayer(BaseOP):
 
 
 class MiniMaxM3Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [MiniMaxM3DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                MiniMaxM3DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = GemmaPlusOneRMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -89,6 +97,8 @@ class MiniMaxM3ForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         super().__init__()
 
@@ -97,4 +107,17 @@ class MiniMaxM3ForCausalLM(BaseLLMModel):
         return self.lm_head.forward(output)
 
 
-__all__ = ["MiniMaxM3ForCausalLM"]
+class MiniMaxM3ForConditionalGeneration(MiniMaxM3ForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.vision_tower = MiniMaxM3VisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.vision_tower.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.vision_tower.forward(item.feature, item.grid_thw)
+
+
+__all__ = ["MiniMaxM3ForCausalLM", "MiniMaxM3ForConditionalGeneration"]

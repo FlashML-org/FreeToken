@@ -1,10 +1,9 @@
 """Engine-facing config for MiniMax-M3 (``minimax_m3``).
 
 The checkpoint is a multimodal wrapper (``model_type=minimax_m3_vl``): the text tower
-lives in ``text_config`` and the weights carry a ``language_model.`` prefix. FreeToken
-serves the text tower; the ViT vision stack (``vision_tower.`` / projector) is skipped
-at load like the other VL checkpoints' (``VISION_KEY_PREFIXES``) -- multimodal input
-is future work, so ``ModelConfig.vision_config`` stays None here.
+lives in ``text_config`` and the weights carry a ``language_model.`` prefix. Its vision
+section becomes ``ModelConfig.vision_config`` for the tower in vision.py; an engine that
+builds no vision encoder hands parse_config a config without that section.
 
 Attention is GQA with block-sparse selection on the trailing layers: parse_config
 declares ONE full-attention group over all layers carrying ``mla=False`` plus the
@@ -16,19 +15,18 @@ ablation: plain MHAKVCache, every layer attends its whole history through a gene
 FULL backend). ``page_size`` is pinned to the 128-token sparse block by the backend's
 ``page_sizes`` declaration, so one KV page == one sparse block.
 
-Resident-weight quantization is resolved HERE (from the FREETOKEN_M3_*_MXFP8 env
-switches, default on) into the standard ``ModelConfig`` fields -- ``attn_quant`` /
-``dense_quant`` = ``"mxfp8"`` or ``"none"`` -- and every consumer (the module
-constructors and the weight loader) reads those fields, so the resolved config is the
-single record of what the served weights actually are. The routed experts are NVFP4
+The resident projections are served in the precision the checkpoint stores (MXFP8 for the
+official export); ``attn_quant`` / ``dense_quant`` record what was detected for the weight
+loader. The routed experts are NVFP4
 (same ModelOpt layout as MiniMax-M2 / GLM) and always live in the offload cache;
 their swigluoai activation restricts the NVFP4 GEMM backend to the Triton kernels
-(``select_nvfp4_backend``). lm_head / embeddings are BF16 in the checkpoint.
+(the NVFP4 MoE kernel objects). lm_head / embeddings are BF16 in the checkpoint.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -41,6 +39,54 @@ from .args import load_args
 
 def _text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    intermediate_size: int
+    num_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    layer_norm_eps: float
+    rope_theta: float
+    projector_hidden_size: int
+    text_hidden_size: int
+
+
+def _compression(vc: Any, key: str) -> int:
+    """The native vision config carries the merge sizes flat; the checkpoint's own config nests them under img_token_compression_config."""
+    value = getattr(vc, key, None)
+    return int(vc.img_token_compression_config[key] if value is None else value)
+
+
+def parse_vision_config(hf_config: Any) -> VisionConfig | None:
+    """None when the config carries no vision section, which is how a text-only engine asks for no tower."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    if vc.hidden_act != "gelu":
+        raise NotImplementedError(f"minimax_m3 vision tower activation {vc.hidden_act!r}; only gelu is implemented")
+    # the native config moves rope_theta into rope_parameters; the checkpoint's own config keeps it flat
+    rope_params = getattr(vc, "rope_parameters", None) or {}
+    text_hidden_size = _text_config(hf_config).hidden_size
+    return VisionConfig(
+        hidden_size=vc.hidden_size,
+        num_layers=vc.num_hidden_layers,
+        num_heads=vc.num_attention_heads,
+        intermediate_size=vc.intermediate_size,
+        num_channels=vc.num_channels,
+        patch_size=vc.patch_size,
+        temporal_patch_size=_compression(vc, "temporal_patch_size"),
+        spatial_merge_size=_compression(vc, "spatial_merge_size"),
+        layer_norm_eps=vc.layer_norm_eps,
+        rope_theta=float(rope_params["rope_theta"] if "rope_theta" in rope_params else vc.rope_theta),
+        projector_hidden_size=getattr(hf_config, "projector_hidden_size", None) or text_hidden_size,
+        text_hidden_size=text_hidden_size,
+    )
 
 
 # House rule: an env switch that changes WHAT IS SERVED must leave a server-log
@@ -85,22 +131,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         )
     args = load_args(text, num_layers, sparse_enabled=sparse_enabled)
 
-    # W8A16 MXFP8 (the checkpoint's native dense quantization) for the resident
-    # weights; decode is weight-bandwidth bound and the freed VRAM densifies the
-    # expert cache. =0 dequantizes to bf16 at load (bring-up / ablation). Read at
-    # PARSE time so the resolved config is the single record of the served weights
-    # -- an FTW checkpoint converted under one setting must be served under the
-    # same one (see weight.py) -- and logged HERE so the FTW serve path (which
-    # never runs iter_weights) still leaves a serve-time record of the modes.
-    attn_mxfp8 = os.getenv("FREETOKEN_M3_ATTN_MXFP8", "1") != "0"
-    mlp_mxfp8 = os.getenv("FREETOKEN_M3_MLP_MXFP8", "1") != "0"
-    _log_mode_once(
-        f"quant={attn_mxfp8}/{mlp_mxfp8}",
-        f"MiniMax-M3 resident quant: attn={'mxfp8' if attn_mxfp8 else 'none'} "
-        f"dense={'mxfp8' if mlp_mxfp8 else 'none'} lm_head=none "
-        "(FREETOKEN_M3_ATTN_MXFP8/FREETOKEN_M3_MLP_MXFP8; an FTW checkpoint "
-        "converted under one setting must be served under the same one).",
-    )
+    # the quantized release stores the dense projections MXFP8; the reader keeps them native and the layers take their scheme from the QuantConfig
+    dense_mxfp8 = getattr(hf_config, "quantization_config", None) is not None
 
     # Leading dense-FFN layers: M3's moe_layer_freq is a contiguous 0-prefix; the
     # offload cache and the generic num_moe_layers arithmetic rely on that shape.
@@ -191,11 +223,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # resolved config describes the served weights; the constructors and
         # iter_weights read these fields, never the env directly. lm_head stays bf16
         # (the checkpoint excludes it from quantization).
-        attn_quant="mxfp8" if attn_mxfp8 else "none",
-        dense_quant="mxfp8" if mlp_mxfp8 else "none",
+        attn_quant="mxfp8" if dense_mxfp8 else "none",
+        dense_quant="mxfp8" if dense_mxfp8 else "none",
         lm_head_quant="none",
         m3_args=args,
+        vision_config=parse_vision_config(hf_config),
+        # the native config maps image_token_id onto the checkpoint's image_token_index
+        image_token_id=getattr(hf_config, "image_token_id", getattr(hf_config, "image_token_index", None)),
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["VisionConfig", "parse_config", "parse_vision_config"]

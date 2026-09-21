@@ -119,9 +119,11 @@ class _ConvertSink:
     under one lock (disk-bound anyway).
     """
 
-    def __init__(self, writer: FTWWriter, desc: str = "Converting expert banks") -> None:
+    def __init__(self, writer: FTWWriter, desc: str = "Converting expert banks", *, names: dict[str, str] | None = None) -> None:
         self._writer = writer
         self._desc = desc
+        # canonical role -> the bank name the file stores
+        self._names = names or {}
         self._bar = None
         self._lock = threading.Lock()
         self._seen: set[int] = set()
@@ -139,7 +141,7 @@ class _ConvertSink:
             nbytes = 0
             for bank_name, bank in banks.items():
                 self._writer.add_tensor(
-                    layer_bank_entry_name(bank_name, layer_id), bank.tensor, kind="experts_bank"
+                    layer_bank_entry_name(self._names.get(bank_name, bank_name), layer_id), bank.tensor, kind="experts_bank"
                 )
                 nbytes += bank.nbytes
                 bank.release()
@@ -166,6 +168,7 @@ def convert_checkpoint(
     *,
     dtype: torch.dtype = torch.bfloat16,
     moe_backend: str = "offload",
+    quant_backend: str | None = None,
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
 ) -> dict:
@@ -195,10 +198,17 @@ def convert_checkpoint(
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
+                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
     mc = cfg.model_config
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
+    method = None
+    if offload:
+        from freetoken.engine.engine import offload_expert_method
+        from freetoken.layers import set_rope_device
+
+        set_rope_device(dev)
+        method = offload_expert_method(cfg)
 
     from freetoken.utils.progress import byte_bar, count_bar
 
@@ -216,18 +226,27 @@ def convert_checkpoint(
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
+    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
+    except (AttributeError, KeyError, ValueError):
+        side_hook = None
+    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
+
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
     num_layers = None
     if offload:
-        # Streamable formats (bf16, ds_fp4, nvfp4 on the triton backend, gpt-oss mxfp4, q4_0,
-        # qwen3_5 fp8/bf16-dequant) write each layer to its own FTW entry as it completes (via
-        # the sink) instead of materializing the whole bank set first; the non-streamable ones
-        # (nvfp4 marlin/b12x -- repack mutates the whole bank set in place after load) ignore
-        # the sink. Which happened is per-provider (e.g. nvfp4's backend pick), so it's read
-        # back from ExpertBanks.streamed, not guessed here.
-        sink = _ConvertSink(writer)
-        banks = load_expert_banks(model_path, mc, device=dev, dtype=dtype, layer_sink=sink)
+        # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
+        from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
+
+        names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
+        sink = _ConvertSink(writer, names=names)
+        banks = load_expert_banks(
+            model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
+        )
         quant_format = banks.quant_format
         if banks.streamed:
             sink.close()
@@ -251,12 +270,13 @@ def convert_checkpoint(
             # has whole-tensor add_tensor, so the per-layer sources reassemble into one
             # flat tensor (a per-bank host RAM spike during conversion).
             items = []
+            names = legacy_bank_names(quant_format)
             for name, per_layer in banks.sources.items():
                 if num_layers is None:
                     num_layers = len(per_layer)
                 else:
                     assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
-                items.append((name, torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
+                items.append((names.get(name, name), torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
             for an in ("gate_up_alpha", "down_alpha"):
                 if getattr(banks, an, None) is not None:
                     items.append((an, getattr(banks, an)))
@@ -297,6 +317,7 @@ def convert_checkpoint(
         "expert_bank_num_layers": num_layers,
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
+        "side_files": side_files,
     })
     return index
 

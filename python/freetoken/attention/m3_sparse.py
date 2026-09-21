@@ -100,7 +100,7 @@ def _pick_inner_backend(block_size: int) -> str:
 
     from freetoken.engine.engine import _resolve_auto_attention_backend
 
-    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}), False)
+    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}))
     if not _page_ok(name):
         # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
         # of the SAME tree (same arch gates, same requirement probes) with the

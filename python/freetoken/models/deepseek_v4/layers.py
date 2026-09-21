@@ -1,59 +1,9 @@
-"""Shared DSV4 primitives: weight-only linears, RMSNorm, and the static window /
-compressed top-k index builders."""
+"""Static window / compressed top-k index builders."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
-from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
-from freetoken.kernel.triton.dsv4.norm import rms_norm
-
-FP8 = torch.float8_e4m3fn
-
-
-class Linear(nn.Module):
-    """BF16 / FP32 / block-scaled-FP8 linear (weight-only).
-
-    ``kind="fp8"``: weight float8_e4m3fn + 128x128 e8m0 ``scale`` (dequant in the
-    Triton GEMM). ``kind="fp32"``/``"bf16"``: plain ``F.linear``.
-    """
-
-    def __init__(self, in_features, out_features, bias=False, kind="fp8"):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.kind = kind
-        if kind == "fp8":
-            self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=FP8), requires_grad=False)
-            self.scale = nn.Parameter(
-                torch.empty(out_features // 128, in_features // 128, dtype=torch.float8_e8m0fnu),
-                requires_grad=False,
-            )
-        else:
-            dtype = torch.float32 if kind == "fp32" else torch.bfloat16
-            self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype), requires_grad=False)
-            self.register_parameter("scale", None)
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features), requires_grad=False)
-        else:
-            self.register_parameter("bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.kind == "fp8":
-            return block_fp8_linear(x, self.weight, self.scale, self.bias)
-        return F.linear(x, self.weight.to(x.dtype), self.bias)
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32), requires_grad=False)
-
-    def forward(self, x: torch.Tensor):
-        return rms_norm(x, self.weight, self.eps)
 
 
 def get_window_topk_idxs(window_size, bsz, seqlen, start_pos):

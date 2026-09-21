@@ -9,34 +9,39 @@ from freetoken.layers import (
     GemmaPlusOneRMSNorm,
     GemmaPlusOneRMSNormFused,
     GemmaRMSNorm,
+    LinearColParallelMerged,
+    LinearReplicated,
     OPList,
     ParallelLMHead,
     RMSNorm,
     VocabParallelEmbedding,
     silu_and_mul,
 )
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import MuseGlimmerAttention
-from freetoken.models.quant_linear import make_col_merged, make_replicated
+from .vision import MuseGlimmerVisionModel
 
 if TYPE_CHECKING:
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
 
 class MuseGlimmerMLP(BaseOP):
-    """SwiGLU MLP (gate|up fused), NVFP4 (W4A16) on the quantized checkpoint else bf16."""
+    """SwiGLU MLP (gate|up fused); the projections take the checkpoint's scheme for their prefix."""
 
-    def __init__(self, config: ModelConfig):
-        self.gate_up_proj = make_col_merged(
-            config,
+    def __init__(self, config: ModelConfig, *, prefix: str = ""):
+        self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
             has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.gate_up_proj",
         )
-        self.down_proj = make_replicated(
-            config, config.intermediate_size, config.hidden_size, has_bias=False
+        self.down_proj = LinearReplicated(
+            config.intermediate_size, config.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.down_proj",
         )
 
     @nvtx_annotate("MLP")
@@ -56,10 +61,10 @@ class MuseGlimmerDecoderLayer(BaseOP):
     exists to keep.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self._layer_id = layer_id
-        self.self_attn = MuseGlimmerAttention(config, layer_id)
-        self.mlp = MuseGlimmerMLP(config)
+        self.self_attn = MuseGlimmerAttention(config, layer_id, prefix=f"{prefix}.self_attn")
+        self.mlp = MuseGlimmerMLP(config, prefix=f"{prefix}.mlp")
         H = config.hidden_size
         post_eps = config.post_norm_eps if config.post_norm_eps is not None else config.rms_norm_eps
         self.input_layernorm = GemmaPlusOneRMSNorm(H, eps=config.rms_norm_eps)
@@ -80,8 +85,23 @@ class MuseGlimmerDecoderLayer(BaseOP):
         return residual + h
 
 
+class _NormedEmbedding:
+    """embed_tokens followed by the weightless norm as one lookup for embed_input_ids, so image rows (already normed by the tower) scatter in after it like in the reference."""
+
+    def __init__(self, embed_tokens: VocabParallelEmbedding, embed_norm: GemmaRMSNorm):
+        self.embed_tokens = embed_tokens
+        self.embed_norm = embed_norm
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.embed_tokens.num_embeddings
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_norm.forward(self.embed_tokens.forward(input_ids))
+
+
 class MuseGlimmerModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -92,15 +112,19 @@ class MuseGlimmerModel(BaseOP):
         self.embed_norm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
+        self._normed_embedding = _NormedEmbedding(self.embed_tokens, self.embed_norm)
         self.layers = OPList(
-            [MuseGlimmerDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                MuseGlimmerDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         # Final norm scales by the raw checkpoint weight (plain RMSNorm, not the
         # centered (1+w) form the decoder norms use).
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_norm.forward(self.embed_tokens.forward(input_ids))
+        x = embed_input_ids(self._normed_embedding, input_ids, get_global_ctx().batch)
         for layer in self.layers.op_list:
             x = layer.forward(x)
         return self.norm.forward(x)
@@ -114,6 +138,8 @@ class MuseGlimmerForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         self._output_multiplier = config.output_multiplier
         self._final_logit_softcapping = config.final_logit_softcapping
@@ -131,4 +157,17 @@ class MuseGlimmerForCausalLM(BaseLLMModel):
         return logits
 
 
-__all__ = ["MuseGlimmerForCausalLM"]
+class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.vision_tower = MuseGlimmerVisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.vision_tower.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.vision_tower.forward(item.feature, [item.grid_thw])
+
+
+__all__ = ["MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"]

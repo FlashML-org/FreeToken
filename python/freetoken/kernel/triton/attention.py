@@ -476,6 +476,7 @@ def _extend_attention_kernel(
     kv_indptr_ptr,
     kv_indices_ptr,
     prefix_lens_ptr,
+    block_ends_ptr,
     sm_scale,
     sinks_ptr,
     stride_qt,
@@ -494,6 +495,7 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_BLOCKS: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -517,6 +519,12 @@ def _extend_attention_kernel(
     q_abs_pos = prefix_len + offs_m
     block_q_end = tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
     kv_loop_end = tl.minimum(kv_len, prefix_len + block_q_end)
+    if HAS_BLOCKS:
+        # rows inside a multimodal span also attend forward to the span's later keys: the tile loop must reach them
+        block_end = tl.load(block_ends_ptr + q_start + offs_m, mask=mask_m, other=0)
+        kv_loop_end = tl.minimum(kv_len, tl.maximum(kv_loop_end, tl.max(block_end, axis=0)))
+    else:
+        block_end = tl.zeros((BLOCK_M,), dtype=tl.int32)
 
     q = tl.load(
         q_ptr + (q_start + offs_m[:, None]) * stride_qt + q_head * stride_qh + offs_d[None, :],
@@ -538,6 +546,8 @@ def _extend_attention_kernel(
         mask_n = kv_offsets < kv_len
         key_pos = kv_offsets
         causal_mask = key_pos[None, :] <= q_abs_pos[:, None]
+        if HAS_BLOCKS:
+            causal_mask = causal_mask | (key_pos[None, :] < block_end[:, None])
         if SLIDING_WINDOW > 0:
             causal_mask = causal_mask & ((key_pos[None, :] + SLIDING_WINDOW) > q_abs_pos[:, None])
         final_mask = mask_m[:, None] & mask_n[None, :] & causal_mask
@@ -597,6 +607,7 @@ def _extend_attention_split_kernel(
     kv_indptr_ptr,
     kv_indices_ptr,
     prefix_lens_ptr,
+    block_ends_ptr,
     sm_scale,
     sinks_ptr,
     stride_qt,
@@ -619,6 +630,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_BLOCKS: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -702,11 +714,19 @@ def _extend_attention_split_kernel(
             m_i = m_new
 
     current_end = tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
+    if HAS_BLOCKS:
+        # rows inside a multimodal span also attend forward to the span's later keys: the tile loop must reach them
+        block_end = tl.load(block_ends_ptr + q_start + offs_m, mask=mask_m, other=0) - prefix_len
+        current_end = tl.minimum(q_len, tl.maximum(current_end, tl.max(block_end, axis=0)))
+    else:
+        block_end = tl.zeros((BLOCK_M,), dtype=tl.int32)
     for start_n in tl.range(0, current_end, BLOCK_N):
         local_kv_offsets = start_n + offs_n
         mask_n = local_kv_offsets < current_end
         local_q_pos = offs_m
         causal_mask = local_kv_offsets[None, :] <= local_q_pos[:, None]
+        if HAS_BLOCKS:
+            causal_mask = causal_mask | (local_kv_offsets[None, :] < block_end[:, None])
         if SLIDING_WINDOW > 0:
             causal_mask = causal_mask & (
                 (local_kv_offsets[None, :] + SLIDING_WINDOW) > local_q_pos[:, None]
@@ -773,8 +793,9 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    block_ends: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-tiled causal prefill/extend attention over paged KV cache."""
+    """Block-tiled causal prefill/extend attention over paged KV cache; block_ends holds per query token the end of the multimodal span it sits in (0 for none), whose later keys the row also attends."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -791,8 +812,11 @@ def extend_paged_attention(
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
 
+    if block_ends is not None:
+        assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    block_ends_arg = block_ends if block_ends is not None else qo_indptr
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
@@ -820,6 +844,7 @@ def extend_paged_attention(
             kv_indptr,
             kv_indices,
             prefix_lens,
+            block_ends_arg,
             sm_scale,
             sinks_arg,
             q.stride(0),
@@ -842,6 +867,7 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            HAS_BLOCKS=block_ends is not None,
             num_warps=8,
             num_stages=1,
         )
@@ -856,6 +882,7 @@ def extend_paged_attention(
         kv_indptr,
         kv_indices,
         prefix_lens,
+        block_ends_arg,
         sm_scale,
         sinks_arg,
         q.stride(0),
@@ -874,6 +901,7 @@ def extend_paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        HAS_BLOCKS=block_ends is not None,
         num_warps=8,
         num_stages=1,
     )

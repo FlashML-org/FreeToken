@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 
 
 class GptOssDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = GptOssAttention(config, layer_id)
-        self.mlp = GptOssMLP(config, layer_id)
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.self_attn = GptOssAttention(config, layer_id, prefix=f"{prefix}.self_attn")
+        self.mlp = GptOssMLP(config, layer_id, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -47,13 +47,16 @@ class GptOssDecoderLayer(BaseOP):
 
 
 class GptOssModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [GptOssDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                GptOssDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = RMSNormFused(
             size=config.hidden_size,
@@ -80,6 +83,8 @@ class GptOssForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         self.config = config
         super().__init__()

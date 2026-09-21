@@ -19,8 +19,8 @@
 #                      (default: cp312 -- the nightly/Desktop channel is cp312-only;
 #                      the release lane passes "cp310 cp311 cp312 cp313")
 #   FT_MANYLINUX_RETAG retag runtime wheels linux_x86_64 -> detected manylinux (default: 0).
-#                      Release/PyPI lane only: shipped Desktops resolve the nightly
-#                      release's assets by name and expect linux_x86_64.
+#                      Release/PyPI lane only: shipped Desktops resolve the beta
+#                      release's assets (copied from nightly) by name and expect linux_x86_64.
 #   FREETOKEN_BUILD_NO_STAMP / _RELEASE / _DEV_STAMP / _STRIP and
 #   FREETOKEN_KERNEL_CACHE_* are forwarded into the container. Other
 #   FREETOKEN_BUILD_* vars are NOT: _CLEAN is set by this script per matrix

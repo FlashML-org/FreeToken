@@ -4,8 +4,8 @@
 #
 # Installs the `freetoken` runtime (the `ft` CLI) and its prebuilt kernel-cache
 # wheel into a managed venv, then wires it up so FreeToken Desktop can find it.
-# Dependencies come from PyPI via uv, except torch and sglang-kernel whose cu130
-# wheels live on dedicated indexes (see CU_INDEX_ARGS below).
+# Dependencies come from PyPI via uv, except torch whose cu130
+# wheels live on a dedicated index (see CU_INDEX_ARGS below).
 #
 # Typical use (once a release exists):
 #   curl -fsSL https://<host>/install.sh | bash
@@ -201,12 +201,12 @@ mkdir -p "$FT_HOME"
 # re-install can't inherit a stale/mismatched torch (e.g. an old cu128 venv after a cu130 bump).
 "$UV" venv "$VENV" --python "$PY_VERSION" --clear
 
-# PyPI's torch 2.11.0 and sglang-kernel 0.4.5 are the same cu130 builds these indexes
-# serve; the explicit indexes pin provenance to the cu130 channels. `unsafe-best-match`
+# PyPI's torch 2.11.0 is the same cu130 build the pytorch index
+# serves; the explicit index pins provenance to the cu130 channel. `unsafe-best-match`
 # is needed because the pytorch index also mirrors stale copies of common deps (e.g.
 # packaging<=24.1) that would shadow PyPI under uv's first-index strategy; all indexes
 # here are trusted. [tool.uv.sources] does not survive into a built wheel, so the
-# indexes it names must be repeated below.
+# index it names must be repeated below.
 # flashinfer JIT-compiles its kernels on first use (e.g. sampling softmax), which needs nvcc --
 # breaking driver-only on a box with no CUDA toolkit. flashinfer-cubin + flashinfer-jit-cache ship
 # those kernels PREBUILT (multi-arch), so nothing compiles at runtime. They live on flashinfer's
@@ -220,7 +220,6 @@ INSTALL_WHEELS=(
 CU_INDEX_ARGS=(
   --index-strategy unsafe-best-match
   --extra-index-url https://download.pytorch.org/whl/cu130
-  --extra-index-url https://docs.sglang.io/whl/cu130
   --extra-index-url https://flashinfer.ai/whl
   --extra-index-url https://flashinfer.ai/whl/cu130
 )

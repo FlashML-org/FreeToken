@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next (model_type qwen4_exp), served text-only.
+"""Qwen3.8-Flash-Next (model_type qwen4_exp); image input rides on the shared Qwen VL tower.
 
 48 decoder layers on hc_count=4 hyper-connection residual streams R [T, 4*hidden]:
 embed -> repeat(1, 4) -> [PLE at zero-based layer 1] -> per layer attn_hc.mix -> (GDN | QSA) -> attn_hc.combine -> mlp_hc.mix -> MoE -> mlp_hc.combine -> top-level mixer.mix -> lm_head.
@@ -10,26 +10,27 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
-from .model import Qwen4ExpForCausalLM
+from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
+    ftw_side_files,
+    nvfp4_expert_spec,
+    iter_vision_weights,
     iter_weights,
-    load_nvfp4_expert_sources,
-    load_nvfp4_expert_sources_parallel,
     load_ple_table,
 )
 
 # Official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout (same
-# model.language_model.layers.* keys), so reuse its bank hook; for every other
-# expert_quant it defers to the per-quant providers, which resolve this module's
-# load_nvfp4_expert_sources via the model spec.
-from freetoken.models.qwen3_5_moe.weight import setup_offload_expert_banks
+# model.language_model.layers.* keys), so reuse its expert reader.
+from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces
 
 __all__ = [
+    "ftw_side_files",
+    "nvfp4_expert_spec",
     "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+    "iter_vision_weights",
     "iter_weights",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
     "load_ple_table",
     "parse_config",
-    "setup_offload_expert_banks",
+    "iter_expert_pieces",
 ]

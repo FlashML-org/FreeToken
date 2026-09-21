@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class GptOssAttention(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         import torch
 
         self.layer_id = layer_id
@@ -42,12 +42,16 @@ class GptOssAttention(BaseOP):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=config.has_attn_bias,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.sinks = torch.empty(self.num_qo_heads)
         self.o_proj = LinearOProj(
             input_size=config.num_qo_heads * self.head_dim,
             output_size=config.hidden_size,
             has_bias=config.has_attn_bias,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
 
         rotary_config = group.rotary_config

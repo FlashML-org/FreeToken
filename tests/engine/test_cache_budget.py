@@ -100,24 +100,24 @@ def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     assert expert_bytes_per_slot(sources) == 512 + 256
 
 
-def test_resolve_auto_applies_ratio_once_and_marlin_cap():
+def test_resolve_auto_applies_ratio_once():
     # baseline 1000, weights 100, ratio 0.9 -> budget = 900 - 100 - 0(fixed) = 800
     size, pages, overlap = resolve_moe_cache_auto(
         baseline_free=1000, weights_bytes=100, memory_ratio=0.9,
         cache_per_page=10, fixed_cache_size=0, per_expert_bytes=50,
         num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=1, quant_format="bf16",
+        kv_reserve_tokens=0, page_size=1,
     )
     # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
     assert size == 8 and pages == 40 and overlap is True
 
 
-def test_resolve_auto_marlin_caps_slots():
+def test_resolve_auto_caps_slots_at_the_kernel_limit():
     size, _, _ = resolve_moe_cache_auto(
         baseline_free=10_000_000, weights_bytes=0, memory_ratio=1.0,
         cache_per_page=10, fixed_cache_size=0, per_expert_bytes=100,
         num_experts=128, total_experts=4000, prefill_overlap=False,
-        kv_reserve_tokens=0, page_size=1, quant_format="nvfp4_marlin",
+        kv_reserve_tokens=0, page_size=1, max_slots=992,
     )
     assert size == 992
 
@@ -136,7 +136,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cache_auto = True
         moe_cache_size = 0
         moe_cache_rate = None
-        moe_backend = "offload"
+        moe_strategy = "offload"
         max_running_req = 1
         cuda_graph_max_bs = 1
         cuda_graph_bs = [1]
@@ -145,7 +145,6 @@ def _dsv4_adjust_cfg(**over):
         page_size = 1
         attention_backend = "dsv4_sparse"
         moe_cpu_layers = None
-        nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = None
 
@@ -166,7 +165,7 @@ def test_adjust_config_allows_auto_for_dsv4():
 
     cfg = _dsv4_adjust_cfg()
     _adjust_config(cfg)  # must not raise
-    assert cfg.moe_backend == "offload"
+    assert cfg.moe_strategy == "offload"
     assert cfg.moe_cache_auto is True  # resolved later at engine init, not here
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
 
@@ -212,14 +211,13 @@ def test_adjust_config_resolves_num_tokens_generic():
         moe_cache_auto = False
         moe_cache_size = 0
         moe_cache_rate = None
-        moe_backend = "auto"
+        moe_strategy = "auto"
         max_running_req = 4
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
         attention_backend = "fi"
-        nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = 5000
 
@@ -303,7 +301,6 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
             size = 1
 
     class StubBanks:
-        quant_format = "bf16"
         # 2 layers (num_moe_layers above) x 4 experts each -- per-layer host bank contract.
         sources = {
             "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,  # row = 32*8*2 = 512
@@ -329,9 +326,16 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         cache_per_page=cache_per_page, fixed_cache_size=fixed,
         per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
         num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=16, quant_format="bf16",
+        kv_reserve_tokens=0, page_size=16,
     )
     assert (size, pages, overlap) == expected
+
+    class StubMethod:
+        def slot_limit(self):
+            return 5
+
+    size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
+    assert size == 5
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +346,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
 def _offload_engine_config(**overrides):
     """A frozen EngineConfig for a quantized-experts MoE checkpoint in the bare-invocation state
-    (moe_backend="auto") unless overridden — the shared fixture for the _adjust_config tests."""
+    (moe_strategy="auto") unless overridden — the shared fixture for the _adjust_config tests."""
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
@@ -364,7 +368,7 @@ def _offload_engine_config(**overrides):
             num_moe_layers=10,
             num_experts=8,
             expert_quant="nvfp4",  # quantized experts -> must resolve to an offload backend
-            moe_backend="auto",
+            moe_strategy="auto",
         ),
     )
     return config
@@ -389,7 +393,7 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
     args.py's parse-time default only fires when the backend is *already*
-    offload-family at parse time -- but a bare invocation leaves moe_backend="auto" at parse
+    offload-family at parse time -- but a bare invocation leaves moe_strategy="auto" at parse
     time, and the "auto" -> offload/cpu/hybrid resolution only happens later, in _adjust_config,
     once the model_config (and its expert_quant) is known. This proves the engine-level
     resolution: a quantized-experts model auto-resolving to an offload-family backend also gets
@@ -397,7 +401,7 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     reached with moe_cache_size still 0.
     """
     from freetoken.engine.engine import _adjust_config
-    from freetoken.moe import is_offload_moe_backend
+    from freetoken.moe import is_offload_moe_strategy
 
     config = _offload_engine_config()
     _adjust_config(config)
@@ -405,7 +409,7 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     # Which member of the family gets picked is not this test's claim, and is not ours to
     # decide: a bare "auto" consults ~/.cache/freetoken/benchbw.json, so a box that has run
     # `ft bench bw` resolves nvfp4 experts to hybrid instead. Assert the family, not the member.
-    assert is_offload_moe_backend(config.moe_backend)
+    assert is_offload_moe_strategy(config.moe_strategy)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
@@ -439,14 +443,13 @@ def _generic_rotary_cfg(max_position, override):
         moe_cache_auto = False
         moe_cache_size = 0
         moe_cache_rate = None
-        moe_backend = "auto"
+        moe_strategy = "auto"
         max_running_req = 4
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
         attention_backend = "triton"
-        nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = None
         max_seq_len_override = None

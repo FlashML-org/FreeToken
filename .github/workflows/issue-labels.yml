@@ -1,0 +1,30 @@
+name: Label issues
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: github/issue-labeler@v3.4
+        with:
+          configuration-path: .github/issue-labeler.yml
+          enable-versioned-regex: 0
+          include-title: 0
+          repo-token: ${{ github.token }}
+      - if: github.event.action == 'opened'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            if (!/### Is the quantization already supported\s+GGUF/.test(body)) return;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: 'Thanks for the request. General GGUF support is tracked on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) and is not taken as a separate issue yet. Please follow the Roadmap for progress, or comment there with the checkpoint you need. Note that FreeToken loads Hugging Face safetensors checkpoints directly, so an FP8 / NVFP4 / BF16 version of the same model may already work; see [supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md).',
+            });

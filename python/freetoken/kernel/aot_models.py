@@ -79,10 +79,10 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     """
     H, I = hidden_size, moe_intermediate_size
     if fmt == "bf16":
-        # models/loader.py stream_moe_expert_sources: gate_up [E, 2I, H], down [E, H, I], bf16
+        # bf16 expert banks: gate_up [E, 2I, H], down [E, H, I]
         return {"gate_up": 2 * I * H * 2, "down": H * I * 2}
     if fmt == "fp8_block":
-        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block
+        # block-fp8 expert banks: fp8 weights + bf16 128x128 block
         # scales, trailing scale dim 16B-padded (same helper as the loader)
         B = 128
         return {
@@ -97,7 +97,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
-        # folded into GPU-resident alphas (moe/nvfp4_backends.py), so no global banks.
+        # folded into GPU-resident alphas (layers/quantization/moe/nvfp4.py), so no global banks.
         banks = {
             "gate_up_packed": 2 * I * (H // 2),
             "gate_up_scale": 2 * I * (H // 16),
@@ -109,7 +109,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             banks["down_global"] = H * 2
         return banks
     if fmt == "mxfp4_triton":
-        # gpt_oss/weight.py _empty_mxfp4_triton_banks: transposed split-K blocks/scales + bf16 bias
+        # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias
         return {
             "gate_up_blocks": (H // 2) * (2 * I),
             "gate_up_scales": (H // 32) * (2 * I),
@@ -145,6 +145,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration",),  # Qwen3-VL-30B-A3B: same text tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -154,6 +155,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
+        arch_aliases=("Qwen3_5MoeForCausalLM",),  # text-only release of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -275,6 +277,20 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # GLM-5.3-Flash: hybrid KDA + NoPE-MLA/DSA (kpool indexer). Latent writes
+        # go through torch scatter like GLM-5.2 (no paged-KV store groups); the
+        # KDA conv/recurrent state lives in the LinearStatePool, not paged KV.
+        name="RedHatAI/GLM-5.3-Flash-NVFP4",
+        architecture="Glm5NextForCausalLM",
+        arch_aliases=("Glm5NextForConditionalGeneration",),
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+        aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.
@@ -323,6 +339,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
+        arch_aliases=("Qwen3_5ForCausalLM",),  # text-only release of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
@@ -361,6 +378,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        arch_aliases=("Qwen3VLForConditionalGeneration",),  # Qwen3-VL-8B: same text tower
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",

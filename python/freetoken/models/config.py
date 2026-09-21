@@ -1,37 +1,44 @@
 from __future__ import annotations
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
-# State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
-# config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
-_VISION_TRUE = {"1", "true", "yes", "on"}
-
-
-def vision_load_enabled() -> bool:
-    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
-    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
-    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+# State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
 
 
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
-    a ModelOpt FP4 build, else the lowercased algo string (``"none"`` when unquantized). Models
-    with mixed-precision configs (e.g. qwen3_5_moe) need their own detector."""
+    a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
+    (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, or
+    ``format: mixed-precision`` with an nvfp4 config group, e.g.
+    RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
+    unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
+    own detector."""
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return "none"
-    if isinstance(quant, dict):
-        algo = quant.get("quant_algo") or quant.get("quant_method")
-    else:
-        algo = getattr(quant, "quant_algo", None) or getattr(quant, "quant_method", None)
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    algo = get("quant_algo") or get("quant_method")
     if algo is None:
         return "none"
-    return "nvfp4" if "fp4" in str(algo).lower() else str(algo).lower()
+    if "fp4" in str(algo).lower():
+        return "nvfp4"
+    fmt = str(get("format") or "").lower()
+    # exact "nvfp4" (not the "fp4" substring) so MXFP4 exports don't misroute
+    if "nvfp4" in fmt:
+        return "nvfp4"
+    # llm-compressor writes "mixed-precision" at the top when the groups differ (GLM-5.3-Flash: nvfp4 routed experts, fp8 MTP experts); the real format then sits in each group
+    if fmt == "mixed-precision":
+        groups = get("config_groups") or {}
+        groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
+        # groups that target the experts decide; only a generic ["Linear"] group falls back to all of them
+        expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
+        for g in expert_groups or groups:
+            if "nvfp4" in str(g.get("format") or "").lower():
+                return "nvfp4"
+    return str(algo).lower()
 
 
 def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
@@ -81,6 +88,18 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves vision
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
+
+
+def mrope_layout_from_rope_params(rope_params: Any) -> str:
+    """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved, else contiguous."""
+    if rope_params.get("mrope_interleaved_glm"):
+        return "interleaved_glm"
+    if rope_params.get("mrope_interleaved"):
+        return "interleaved"
+    return "contiguous"
 
 
 @dataclass(frozen=True)
@@ -97,8 +116,9 @@ class KVCacheGroupSpec:
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
-    # QSA compression: one index-key row per index_ratio tokens (1 keeps the BSA/DSA
-    # per-token slab). The pool factory and the cost model divide by the same value.
+    # Grouped index-key compression: one index-key row per ``index_ratio`` tokens
+    # (QSA groups, glm5_next kpool pools; 1 keeps the per-token BSA/DSA slab). The
+    # pool factory and the KV cost model divide by the same value.
     index_ratio: int = 1
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
@@ -137,8 +157,9 @@ class FullAttentionGroupConfig(BaseAttentionGroupConfig):
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
-    # QSA compression ratio (> 1 -> AttnType.QSA): index-key rows are per token group,
-    # so the index slab costs index_head_dim * num_index_layers * 2 // index_ratio per token.
+    # Grouped index-key compression ratio (see KVCacheGroupSpec.index_ratio).
+    # GQA + ratio > 1 -> AttnType.QSA (Qwen3.8); MLA + ratio > 1 -> the glm5_next
+    # kpool DSA layout (attn type stays DSA; the pool factory branches on mla).
     index_ratio: int = 1
 
 
@@ -151,6 +172,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    # image token spans attend to each other in both directions on these layers
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +188,9 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     conv_kernel_dim: int
     # Output-gate activation name ("silu", "sigmoid"), forwarded to rms_norm_gated.
     output_gate: str
+    # "gdn" and "kda" share the same state geometry (one LinearStatePool serves
+    # both); the variant selects the kernels.
+    variant: Literal["gdn", "kda"] = "gdn"
 
 
 @dataclass(frozen=True)
@@ -238,7 +264,11 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    moe_backend: str = "fused"
+    moe_strategy: str = "fused"
+    # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
+    decode_target: str = "gpu"
+    # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
+    quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
     moe_enabled: bool = False
     # Weight quantization of the MoE experts only. "none" keeps the default BF16
@@ -246,26 +276,13 @@ class ModelConfig:
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
-    nvfp4_backend: str = "triton"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
-    # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate
-    # from the routed experts above). "fp8_pertensor" keeps them fp8-e4m3 + a per-output-row
-    # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
-    # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
+    # the checkpoint's quant kind for the dense attention / GatedDeltaNet projections, detected by the family's parse_config for its reader
     attn_quant: str = "none"
-    # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
-    # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
-    # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their
-    # decode weight traffic); "none" dequantizes them to bf16 at load. Set independently of the
-    # routed experts and lm_head: e.g. pure-NVFP4 Qwen3.5 has bf16 attn + bf16 lm_head but FP4
-    # shared experts, so this is "nvfp4" while attn_quant / lm_head_quant are "none".
+    # the checkpoint's quant kind for the dense MLP projections (shared expert, dense layers), detected the same way
     dense_quant: str = "none"
-    # Weight quantization of the lm_head. "nvfp4" keeps the (untied) FP4 head native (W4A16) --
-    # the bf16 dequant of this ~1 GB matrix was the single largest decode kernel; "none" leaves
-    # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
-    # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
+    # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
@@ -307,6 +324,10 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): NoPE-MLA dims, the kpool indexer
+    # geometry, the KDA head config, and the mHC knobs. Opaque to model-agnostic engine
+    # code; None for every other model.
+    glm5_args: Any | None = None
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
@@ -339,6 +360,14 @@ class ModelConfig:
     @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """True when any full-attention layer uses 3-axis (t/h/w) rope positions."""
+        return any(
+            getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None
+            for g in self.attention_groups
+        )
 
     @property
     def has_hybrid_attention(self) -> bool:

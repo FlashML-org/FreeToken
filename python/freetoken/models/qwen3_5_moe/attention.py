@@ -4,11 +4,9 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaRMSNorm
+from freetoken.layers import BaseOP, GemmaRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
-
-from .quant_linear import make_col_merged, make_replicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -27,7 +25,7 @@ class Qwen3_5Attention(BaseOP):
     column/row-parallel for tensor parallelism later.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_q = config.num_qo_heads
@@ -39,10 +37,10 @@ class Qwen3_5Attention(BaseOP):
         # Fused q/k/v projection (one GEMM instead of three); q half is 2x for the
         # output gate. Split sizes: [num_q*head_dim*2, num_kv*head_dim, num_kv*head_dim].
         self._qkv_split = [self.num_q * head_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        # Block-fp8 (Fp8BlockColMerged) when the checkpoint is quantized, else bf16
-        # LinearColParallelMerged. q/k/v out dims are all /128, so the merged fp8 weight +
-        # weight_scale_inv concatenate cleanly along the output dim.
-        self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
+        self.qkv_proj = LinearColParallelMerged(
+            config.hidden_size, self._qkv_split, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+        )
         # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
         # into the stored weight (GemmaRMSNorm scales by the raw weight).
         self.q_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -57,13 +55,22 @@ class Qwen3_5Attention(BaseOP):
                 if config.rotary_config.scaling
                 else None
             ),
+            mrope_section=(
+                tuple(config.rotary_config.mrope_section)
+                if config.rotary_config.mrope_section is not None
+                else None
+            ),
+            mrope_layout=config.rotary_config.mrope_layout,
         )
-        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearReplicated(
+            self.qo_attn_dim, config.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
 
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        positions = get_global_ctx().batch.get_attn_positions()
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)

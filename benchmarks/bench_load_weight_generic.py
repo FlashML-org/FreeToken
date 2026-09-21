@@ -145,7 +145,7 @@ def _model_config(model_path: str):
     dev = bind_assigned_gpu()
     torch.zeros(1, device=dev)  # init CUDA context (pinning / nvfp4 backend pick)
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(0, 1),
-                       dtype=torch.bfloat16, moe_backend="offload")
+                       dtype=torch.bfloat16, moe_strategy="offload")
     return cfg.model_config
 
 

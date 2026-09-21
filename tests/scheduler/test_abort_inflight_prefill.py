@@ -79,7 +79,7 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
     """A launched (forward in flight) hybrid req: handle locked, pages allocated,
     GDN slots held, cached_len advanced -- the state _process_last_data will drain."""
     mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt),
-                                      mm_embeds=None))
+                                      ))
     req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=4,
               uid=UID, sampling_params=SamplingParams(max_tokens=4),
               cache_handle=mr.cuda_handle)

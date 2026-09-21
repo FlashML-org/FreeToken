@@ -49,6 +49,7 @@ def _glm_dsa_sparse_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -57,11 +58,14 @@ def _glm_dsa_sparse_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
 
     q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
     q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-    q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+    if HAS_ROPE:
+        # NoPE checkpoints (glm5_next) have D_R == 0: tl.arange needs a non-empty
+        # span, so the whole rope half is compiled out on the constexpr.
+        offs_r = tl.arange(0, D_R)
+        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -79,9 +83,12 @@ def _glm_dsa_sparse_kernel(
         valid = idxs >= 0
         kv_base = pool_ptr + idxs[:, None] * stride_pn
         kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-        kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-        scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+        scores = tl.dot(q_v, tl.trans(kv_v))
+        if HAS_ROPE:
+            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            scores += tl.dot(q_r, tl.trans(kv_r))
+        scores = scores * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -207,6 +214,7 @@ def _glm_dsa_splitk_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
@@ -221,7 +229,6 @@ def _glm_dsa_splitk_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
 
     n_active = TOPK
     if HAS_COUNTS:
@@ -238,7 +245,9 @@ def _glm_dsa_splitk_kernel(
     if split_end > split_start:
         q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
         q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+        if HAS_ROPE:
+            offs_r = tl.arange(0, D_R)
+            q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
 
         for start in range(split_start, split_end, BLOCK_T):
@@ -248,9 +257,12 @@ def _glm_dsa_splitk_kernel(
             valid = idxs >= 0
             kv_base = pool_ptr + idxs[:, None] * stride_pn
             kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-            scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
+            scores = scores * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -384,7 +396,7 @@ def glm_dsa_sparse_attn(
             stride_nb, stride_nm,
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
-            HAS_COUNTS=has_counts, NUM_SPLITS=n_splits,
+            HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits,
             num_warps=4, num_stages=2,
         )
         grid2 = (m, b, h)
@@ -410,7 +422,7 @@ def glm_dsa_sparse_attn(
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
-        HAS_COUNTS=has_counts,
+        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0,
         num_warps=4, num_stages=2,
     )
     return o

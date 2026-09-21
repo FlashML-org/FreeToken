@@ -22,10 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator, Tuple
 
 import torch
-from freetoken.distributed import get_tp_info
-from freetoken.kernel.pinned import alloc_pinned_tensor, copy_to_pinned_tensor
-from freetoken.models.loader import stream_moe_expert_sources
-from freetoken.utils import cached_load_hf_config, div_even
+from freetoken.utils import cached_load_hf_config
 
 from .register import _load_attr, get_model_spec
 
@@ -90,22 +87,11 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
+    from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)
-    index = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index) as f:
-            weight_map = json.load(f)["weight_map"]
-    else:  # single-file / no-index checkpoint: map name -> shard from each shard's header
-        weight_map = {}
-        for shard in sorted(os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))):
-            with open(os.path.join(model_path, shard), "rb") as fh:
-                n = struct.unpack("<Q", fh.read(8))[0]
-                hdr = json.loads(fh.read(n))
-            for nm in hdr:
-                if nm != "__metadata__":
-                    weight_map[nm] = shard
+    weight_map = safetensors_weight_map(model_path)
     shards: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         if is_expert(name):
@@ -225,6 +211,7 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_vision: bool = True,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -232,96 +219,47 @@ def load_weight(
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
-    from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+    from freetoken.models.config import VISION_KEY_PREFIXES
 
+    # a text-only engine never built the tower, so its tensors are not even read
+    keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
-        # The FTW dense shard stores whatever existed at conversion, including the vision
-        # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
-        # model never builds the tower, so replaying those tensors would trip load_state_dict's
-        # strict unexpected-key check. Skip them here to match the model the engine built.
-        skip_vision = not vision_load_enabled()
-        for name, tensor in iter_ftw_weights(model_path):
-            if skip_vision and name.startswith(VISION_KEY_PREFIXES):
-                continue
-            yield name, tensor
-        return
-
-    _config, spec = _spec_for_model_path(model_path)
-    iter_weights = _load_attr(spec.module, spec.iter_weights)
-    yield from iter_weights(
-        model_path,
-        device,
-        include_moe_experts=include_moe_experts,
-        include_non_moe=True,
-    )
-
-
-def load_moe_expert_sources(
-    model_path: str,
-    *,
-    dtype: torch.dtype,
-    dummy: bool = False,
-    parallel: bool = False,
-    workers: int = 8,
-    chunk: int = 8 << 20,
-    layer_sink=None,
-) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
-    config, spec = _spec_for_model_path(model_path)
-    if not config.is_moe:
-        raise ValueError(
-            f"{config.architectures[0]} does not provide MoE expert source loading"
-        )
-    if dummy:
-        builder = _model_override(spec, "dummy_moe_expert_sources") or dummy_moe_expert_sources
-        return builder(config, dtype=dtype)
-    if parallel:  # parallel: experts read via the common chunked multi-threaded O_DIRECT reader
-        iter_weights = _model_override(spec, "iter_weights_parallel")
-        if iter_weights is None:  # model has no parallel reader -> let the caller fall back to serial
-            raise NotImplementedError(
-                f"{spec.module} provides no iter_weights_parallel")
-        src = iter_weights(model_path, torch.device("cpu"), include_moe_experts=True,
-                           include_non_moe=False, workers=workers, chunk=chunk)
+        weights = iter_ftw_weights(model_path, keep=keep)
     else:
+        _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
-        src = iter_weights(model_path, torch.device("cpu"), include_moe_experts=True,
-                           include_non_moe=False)
-    return stream_moe_expert_sources(
-        src,
-        config,
-        dtype=dtype,
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_moe_expert_sources(
-    model_path: str,
-    model_config,
-    *,
-    dummy: bool = False,
-    parallel: bool = False,
-    workers: int = 8,
-    chunk: int = 8 << 20,
-    layer_sink=None,
-) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed NVFP4 expert source banks.
-    ``parallel=True`` uses the model's ``load_nvfp4_expert_sources_parallel`` (common
-    chunked multi-threaded O_DIRECT reader). ``layer_sink``: see
-    ``models.nvfp4_banks.load_nvfp4_expert_source_banks``; forwarded to the per-model
-    loader, which forwards it on."""
-    _config, spec = _spec_for_model_path(model_path)
-    if dummy:
-        builder = (
-            _model_override(spec, "dummy_nvfp4_expert_sources") or dummy_nvfp4_expert_sources
+        # only a family that registers an encoder is asked about the tower; the others never load one
+        kwargs = {"include_vision": include_vision} if spec.encoders else {}
+        weights = iter_weights(
+            model_path,
+            device,
+            include_moe_experts=include_moe_experts,
+            include_non_moe=True,
+            **kwargs,
         )
-        return builder(model_config)
-    if parallel:
-        loader = _model_override(spec, "load_nvfp4_expert_sources_parallel")
-        if loader is None:  # no parallel reader -> let the caller fall back to serial
-            raise NotImplementedError(
-                f"{spec.module} provides no load_nvfp4_expert_sources_parallel")
-        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink)
-    loader = _load_attr(spec.module, "load_nvfp4_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
+    for name, tensor in weights:
+        if keep is not None and not keep(name):
+            continue
+        yield name, tensor
+
+
+def load_vision_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+    """The vision encoder tensors alone, named as load_weight names them, read by the family's encoder-only reader."""
+    _config, spec = _spec_for_model_path(model_path)
+    reader = _model_override(spec, "iter_vision_weights")
+    if reader is None:
+        raise ValueError(f"{spec.module} has no encoder-only weight reader")
+    return reader(model_path, device)
+
+
+def ftw_lacks_vision(model_path: str) -> bool:
+    """True for an FTW that holds no vision encoder tensors: converted by a build before the family served images."""
+    from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
+    from freetoken.models.config import VISION_KEY_PREFIXES
+
+    if not is_ftw_checkpoint(model_path):
+        return False
+    return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
 
 
 def load_q4_0_moe_expert_sources(
@@ -342,72 +280,10 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
-def _num_moe_layers(config) -> int:
-    value = getattr(config, "num_moe_layers", None)
-    if value is not None:
-        return int(value)
-    return int(config.num_layers) - int(getattr(config, "first_k_dense_replace", 0))
-
-
-def dummy_moe_expert_sources(
-    config, *, dtype: torch.dtype
-) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Random BF16 expert banks shaped like ``stream_moe_expert_sources`` output:
-    one independently allocated ``[num_experts, ...]`` tensor per layer."""
-    num_layers = _num_moe_layers(config)
-    intermediate_size = div_even(config.moe_intermediate_size, get_tp_info().size)
-    gate_up = [
-        torch.randn(config.num_experts, 2 * intermediate_size, config.hidden_size, dtype=dtype)
-        for _ in range(num_layers)
-    ]
-    down = [
-        torch.randn(config.num_experts, config.hidden_size, intermediate_size, dtype=dtype)
-        for _ in range(num_layers)
-    ]
-    if torch.cuda.is_available():
-        gate_up = [copy_to_pinned_tensor(t) for t in gate_up]
-        down = [copy_to_pinned_tensor(t) for t in down]
-    return gate_up, down
-
-
-def dummy_nvfp4_expert_sources(config) -> dict[str, list[torch.Tensor]]:
-    """Random NVFP4 (ModelOpt-layout) expert banks shaped like the real loader's.
-
-    Same pinned allocation and per-layer bank shapes as ``load_nvfp4_expert_sources``,
-    so the repack/offload path downstream is exercised unchanged. Packed codes are
-    random nibbles; block scales are 1.0 and globals small because random e4m3 bytes
-    reach 448 (and include NaN encodings), which would blow up the dummy activations.
-    """
-    num_layers = _num_moe_layers(config)
-    E = config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    fp8 = torch.float8_e4m3fn
-
-    def bank(*shape: int, dtype: torch.dtype) -> list[torch.Tensor]:
-        return [alloc_pinned_tensor(*shape, dtype=dtype) for _ in range(num_layers)]
-
-    sources = {
-        "gate_up_packed": bank(E, 2 * I, H // 2, dtype=torch.uint8),
-        "gate_up_scale": bank(E, 2 * I, H // 16, dtype=fp8),
-        "gate_up_global": bank(E, 2 * I, dtype=torch.float16),
-        "down_packed": bank(E, H, I // 2, dtype=torch.uint8),
-        "down_scale": bank(E, H, I // 16, dtype=fp8),
-        "down_global": bank(E, H, dtype=torch.float16),
-    }
-    for t in sources["gate_up_packed"] + sources["down_packed"]:
-        t.random_(0, 256)
-    for t in sources["gate_up_scale"] + sources["down_scale"]:
-        t.fill_(1.0)
-    for t in sources["gate_up_global"] + sources["down_global"]:
-        t.fill_(0.01)
-    return sources
-
-
 __all__ = [
     "load_weight",
-    "load_moe_expert_sources",
-    "load_nvfp4_moe_expert_sources",
-    "dummy_moe_expert_sources",
-    "dummy_nvfp4_expert_sources",
+    "load_vision_weight",
+    "ftw_lacks_vision",
+    "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

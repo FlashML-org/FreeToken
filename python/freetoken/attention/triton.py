@@ -157,6 +157,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         v_cache = v_raw.view(-1, kv_heads, head_dim)
 
         spec = attn_spec or AttentionSpec()
+        block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
@@ -201,7 +202,10 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                block_ends=block_ends,
             )
+        if block_ends is not None:
+            raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
         return paged_attention(
             q=q,
             k_cache=k_cache,

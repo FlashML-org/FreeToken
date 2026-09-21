@@ -4,10 +4,11 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
-from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, OPList
+from freetoken.layers import BaseOP, GemmaRMSNorm, LayerNorm, LinearReplicated, OPList
+from freetoken.models.weight_stream import BlockWeightStreamer
 
 if TYPE_CHECKING:
-    from freetoken.models.gemma4.config import VisionConfig
+    from freetoken.models.gemma4.config import UnifiedVisionConfig, VisionConfig
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -108,7 +109,7 @@ class Gemma4VisionAttention(BaseOP):
         k = _apply_multidim_rope(k, cos, sin).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0, enable_gqa=self.num_kv_heads != self.num_heads)
         o = o.transpose(1, 2).reshape(B, P, self.num_heads * self.head_dim)
         return self.o_proj.forward(o)
 
@@ -189,14 +190,32 @@ class Gemma4VisionModel(BaseOP):
     """Pixels -> soft tokens. Output is ``[num_valid_soft_tokens, hidden]`` (padding stripped)."""
 
     def __init__(self, vc: VisionConfig):
+        if vc.use_clipped_linears:
+            raise NotImplementedError("the gemma4 vision tower does not apply clipped linears")
         self.patch_embedder = Gemma4VisionPatchEmbedder(vc)
         self.encoder = Gemma4VisionEncoder(vc)
         self._standardize = vc.standardize
         self._pooling_kernel_size = vc.pooling_kernel_size
         self._root_hidden = vc.hidden_size**0.5
+        self._streamer: BlockWeightStreamer | None = None
         if vc.standardize:
             self.std_bias = torch.empty(vc.hidden_size)
             self.std_scale = torch.empty(vc.hidden_size)
+
+    def place_weights(self, mode: str) -> None:
+        """gpu: every tensor resident; host: encoder layer tensors in pinned banks streamed two layers at a time (patch embedder and pooling stay resident)."""
+        if mode == "host" and self._streamer is None:
+            self._streamer = BlockWeightStreamer(self.encoder.layers.op_list, self.patch_embedder.input_proj.weight.device)
+        elif mode == "gpu" and self._streamer is not None:
+            self._streamer.unstream()
+            self._streamer = None
+        elif mode not in ("gpu", "host"):
+            raise ValueError(f"unknown vision weight placement {mode!r}")
+
+    def _layers(self):
+        if self._streamer is None:
+            return enumerate(self.encoder.layers.op_list)
+        return self._streamer.blocks(self.encoder.layers.op_list)
 
     def forward(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         k = self._pooling_kernel_size
@@ -206,7 +225,7 @@ class Gemma4VisionModel(BaseOP):
         h = self.patch_embedder.forward(pixel_values, position_ids, padding)
         cos, sin = self.encoder._rotary.cos_sin(position_ids, h.dtype)
         attn_mask = (~padding)[:, None, None, :]  # [B, 1, 1, P] True = attend
-        for layer in self.encoder.layers.op_list:
+        for _, layer in self._layers():
             h = layer.forward(h, cos, sin, attn_mask)
 
         h = h.masked_fill(padding.unsqueeze(-1), 0.0)
@@ -233,4 +252,22 @@ class Gemma4MultimodalEmbedder(BaseOP):
         return self.embedding_projection.forward(self.embedding_pre_projection_norm.forward(x))
 
 
-__all__ = ["Gemma4VisionModel", "Gemma4MultimodalEmbedder"]
+class Gemma4UnifiedVisionEmbedder(BaseOP):
+    """The gemma4_unified release's stand-in for the tower: LayerNorm, dense projection, LayerNorm, factorized 2-D position embedding, LayerNorm; one 48x48 super-patch per soft token."""
+
+    def __init__(self, vc: UnifiedVisionConfig):
+        self.patch_ln1 = LayerNorm(vc.patch_dim, vc.layer_norm_eps)
+        self.patch_dense = LinearReplicated(vc.patch_dim, vc.hidden_size, has_bias=True)
+        self.patch_ln2 = LayerNorm(vc.hidden_size, vc.layer_norm_eps)
+        self.pos_embedding = torch.empty(vc.posemb_size, 2, vc.hidden_size)
+        self.pos_norm = LayerNorm(vc.hidden_size, vc.layer_norm_eps)
+
+    def forward(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        h = self.patch_ln1.forward(pixel_values.to(self.patch_dense.weight.dtype))
+        h = self.patch_ln2.forward(self.patch_dense.forward(h))
+        clamped = position_ids.clamp(min=0)
+        pos = self.pos_embedding[clamped[..., 0], 0] + self.pos_embedding[clamped[..., 1], 1]
+        return self.pos_norm.forward(h + pos)
+
+
+__all__ = ["Gemma4MultimodalEmbedder", "Gemma4UnifiedVisionEmbedder", "Gemma4VisionModel"]

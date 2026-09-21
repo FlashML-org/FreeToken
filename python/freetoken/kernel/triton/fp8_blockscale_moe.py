@@ -98,14 +98,13 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
 
 def fused_experts_decode_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, activation="silu",
+    topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
     banks (resident: expert id; offload: cache slot)."""
     from freetoken.kernel import moe_sum_reduce_triton
-    from freetoken.layers import silu_and_mul
+    from freetoken.layers import gated_act_and_mul
 
-    assert activation == "silu"
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up.shape[1]
@@ -115,7 +114,7 @@ def fused_experts_decode_fp8_blockscale(
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     _decode_gemm(hidden_states, gate_up, gate_up_scale, ic1, topk_weights, topk_ids, False, False)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    silu_and_mul(ic1.view(-1, two_i), ic2)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True)
     out = torch.empty_like(hidden_states)
@@ -217,16 +216,15 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
 
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, num_experts, activation="silu",
+    topk_weights, topk_ids, num_experts, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
     from freetoken.kernel import moe_sum_reduce_triton
-    from freetoken.layers import silu_and_mul
+    from freetoken.layers import gated_act_and_mul
     from freetoken.kernel.triton.fp8_block_linear import per_token_group_quant_fp8
     from freetoken.moe.fused import moe_align_block_size
 
-    assert activation == "silu"
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up.shape[1]
@@ -246,7 +244,7 @@ def fused_experts_fp8_blockscale(
     _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
                   num_valid, top_k, False, cfg)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    silu_and_mul(ic1.view(-1, two_i), ic2)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,

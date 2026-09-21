@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import pathlib
 import re
-from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, Iterator, List, NamedTuple, Tuple, TypeAlias, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -22,16 +23,38 @@ DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
 
 
-def _cuda_cflags(extra: List[str]) -> List[str]:
-    """CUDA nvcc flags for a kernel build. During the multi-arch AOT cache build,
-    `TVM_FFI_CUDA_ARCH_LIST` (e.g. "8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
-    (`-gencode ...code=sm_XX`) for each listed arch — but NO PTX. We add the PTX of the HIGHEST
-    listed arch so a GPU newer than any listed one (no matching SASS) still runs via the driver's
-    PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
-    JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
-    no-op and tvm-ffi targets only the local GPU."""
+ARCH_LIST_ENV = "TVM_FFI_CUDA_ARCH_LIST"
+
+
+def _cuda_arch_list() -> List[str]:
+    """Archs a CUDA build targets: the AOT build's TVM_FFI_CUDA_ARCH_LIST, else the GPU this process is bound to."""
+    arch_list = os.getenv(ARCH_LIST_ENV, "").split()
+    if arch_list:
+        return arch_list
+    import torch
+
+    if not torch.cuda.is_available():
+        return []
+    major, minor = torch.cuda.get_device_capability()
+    return [f"{major}.{minor}"]
+
+
+@contextlib.contextmanager
+def _pin_tvm_ffi_arch_ctx(arch_list: List[str]) -> Iterator[None]:
+    """Hand tvm-ffi the arch list through its env var for one build. Left unset, tvm-ffi asks nvidia-smi and takes the first GPU listed, which under --gpu or CUDA_VISIBLE_DEVICES on a mixed box is not the bound one."""
+    if os.getenv(ARCH_LIST_ENV) or not arch_list:
+        yield
+        return
+    os.environ[ARCH_LIST_ENV] = " ".join(arch_list)
+    try:
+        yield
+    finally:
+        os.environ.pop(ARCH_LIST_ENV, None)
+
+
+def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
+    """CUDA nvcc flags for a kernel build. tvm-ffi emits one SASS cubin per arch in ``arch_list`` and no PTX, so add the PTX of the highest arch: a GPU newer than every listed arch still runs through the driver's PTX JIT. This flag also carries the arch into tvm-ffi's build hash, which skips tvm-ffi's own -gencode, so GPUs of different archs never share a cached .so."""
     flags = DEFAULT_CUDA_CFLAGS + extra
-    arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")
@@ -200,10 +223,12 @@ def load_aot(
     if prebuilt is not None:
         return prebuilt
 
+    arch_list: List[str] = []
     if cuda_files:
         from freetoken.kernel._toolchain import check_nvcc_matches_torch
 
         check_nvcc_matches_torch()
+        arch_list = _cuda_arch_list()
 
     from tvm_ffi.cpp import load
 
@@ -217,16 +242,17 @@ def load_aot(
     cpp_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cpp_files]
     cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
 
-    return load(
-        name,
-        cpp_files=cpp_files,
-        cuda_files=cuda_files,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
+    with _pin_tvm_ffi_arch_ctx(arch_list):
+        return load(
+            name,
+            cpp_files=cpp_files,
+            cuda_files=cuda_files,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags, arch_list),
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )
 
 
 def load_jit(
@@ -246,10 +272,12 @@ def load_jit(
     if prebuilt is not None:
         return prebuilt
 
+    arch_list: List[str] = []
     if cuda_files or cuda_wrappers:
         from freetoken.kernel._toolchain import check_nvcc_matches_torch
 
         check_nvcc_matches_torch()
+        arch_list = _cuda_arch_list()
 
     from tvm_ffi.cpp import load_inline
 
@@ -272,13 +300,14 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    return load_inline(
-        name,
-        cpp_sources=cpp_sources,
-        cuda_sources=cuda_sources,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags),
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
+    with _pin_tvm_ffi_arch_ctx(arch_list):
+        return load_inline(
+            name,
+            cpp_sources=cpp_sources,
+            cuda_sources=cuda_sources,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=_cuda_cflags(extra_cuda_cflags, arch_list),
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )

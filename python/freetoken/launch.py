@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -60,6 +61,7 @@ class ServedModel:
     # The model's own limit, not the KV budget in force: a rebuild moves that, and agents read
     # their config only at startup. None when the server does not report one.
     context_length: int | None = None
+    input_modalities: tuple[str, ...] = ("text",)
 
 
 @dataclass(frozen=True)
@@ -175,23 +177,27 @@ def _positive_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _stats_context_length(server: ServerURL) -> int | None:
-    """Fallback for servers whose /v1/models predates the context fields."""
+def _stats_model(server: ServerURL) -> dict[str, object]:
+    """The /v1/stats model card; empty when the server predates it."""
     try:
         payload = _get_json(f"{server.origin}/v1/stats")
-    except (HTTPError, URLError, OSError, TimeoutError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    model = payload.get("model")
-    return _positive_int(model.get("ctx")) if isinstance(model, dict) else None
+    except (HTTPError, URLError, HTTPException, OSError, TimeoutError, ValueError):
+        return {}
+    model = payload.get("model") if isinstance(payload, dict) else None
+    return model if isinstance(model, dict) else {}
+
+
+def _input_modalities(stats_model: dict[str, object]) -> tuple[str, ...]:
+    raw = stats_model.get("input_modalities")
+    extra = [m for m in raw if isinstance(m, str) and m != "text"] if isinstance(raw, list) else []
+    return ("text", *extra)
 
 
 def discover_server_model(server: ServerURL) -> ServedModel:
     try:
         _get_json(server.openai_base_url)
         payload = _get_json(f"{server.openai_base_url}/models")
-    except (HTTPError, URLError, OSError, TimeoutError) as exc:
+    except (HTTPError, URLError, HTTPException, OSError, TimeoutError) as exc:
         raise RuntimeError(f"Cannot connect to FreeToken server at {server.origin}: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -214,10 +220,16 @@ def discover_server_model(server: ServerURL) -> ServedModel:
     if not models:
         raise RuntimeError(f"FreeToken server at {server.origin} reported no models")
 
+    stats_model = _stats_model(server)
     if context_length is None:
-        context_length = _stats_context_length(server)
+        context_length = _positive_int(stats_model.get("ctx"))
 
-    return ServedModel(model_id=models[0], models=models, context_length=context_length)
+    return ServedModel(
+        model_id=models[0],
+        models=models,
+        context_length=context_length,
+        input_modalities=_input_modalities(stats_model),
+    )
 
 
 def _backup_path(path: Path) -> Path:
@@ -277,7 +289,11 @@ def _max_output_tokens(ctx: LaunchContext) -> int:
     return max(1, min(_context_window(ctx) // 4, MAX_OUTPUT_TOKENS_CAP))
 
 
-def _codex_catalog_entry(model_id: str, window: int) -> dict[str, object]:
+def _accepts_images(ctx: LaunchContext) -> bool:
+    return "image" in ctx.model.input_modalities
+
+
+def _codex_catalog_entry(model_id: str, window: int, images: bool) -> dict[str, object]:
     return {
         "slug": model_id,
         "display_name": model_id,
@@ -292,7 +308,7 @@ def _codex_catalog_entry(model_id: str, window: int) -> dict[str, object]:
         "additional_speed_tiers": [],
         "service_tiers": [],
         "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "input_modalities": ["text"],
+        "input_modalities": ["text", "image"] if images else ["text"],
         "base_instructions": "",
         "default_reasoning_summary": "none",
         "supported_reasoning_levels": [],
@@ -367,7 +383,8 @@ def prepare_codex(ctx: LaunchContext) -> CommandSpec:
         window = _context_window(ctx)
         catalog = {
             "models": [
-                _codex_catalog_entry(model_id, window) for model_id in _ordered_model_ids(ctx)
+                _codex_catalog_entry(model_id, window, _accepts_images(ctx))
+                for model_id in _ordered_model_ids(ctx)
             ],
         }
         _write_json_with_backup(catalog_path, catalog)
@@ -422,13 +439,19 @@ def _opencode_state_path() -> Path:
 
 
 def _opencode_model_entries(
-    model_ids: list[str], window: int, output: int
+    model_ids: list[str], window: int, output: int, images: bool
 ) -> dict[str, dict[str, object]]:
     # Without `limit.context` OpenCode reads the window as 0 and stops auto-compacting.
-    return {
-        model_id: {"name": model_id, "limit": {"context": window, "output": output}}
-        for model_id in model_ids
-    }
+    entries: dict[str, dict[str, object]] = {}
+    for model_id in model_ids:
+        entry: dict[str, object] = {
+            "name": model_id,
+            "limit": {"context": window, "output": output},
+        }
+        if images:
+            entry["modalities"] = {"input": ["text", "image"], "output": ["text"]}
+        entries[model_id] = entry
+    return entries
 
 
 def _opencode_config(ctx: LaunchContext) -> str:
@@ -441,7 +464,7 @@ def _opencode_config(ctx: LaunchContext) -> str:
                 "name": OPENCODE_PROVIDER_NAME,
                 "options": {"baseURL": ctx.server.openai_base_url},
                 "models": _opencode_model_entries(
-                    model_ids, _context_window(ctx), _max_output_tokens(ctx)
+                    model_ids, _context_window(ctx), _max_output_tokens(ctx), _accepts_images(ctx)
                 ),
             },
         },
@@ -514,11 +537,13 @@ def _dict_child(parent: dict[str, object], key: str) -> dict[str, object]:
     return child
 
 
-def _openclaw_model_entry(model_id: str, window: int, output: int) -> dict[str, object]:
+def _openclaw_model_entry(
+    model_id: str, window: int, output: int, images: bool
+) -> dict[str, object]:
     return {
         "id": model_id,
         "name": model_id,
-        "input": ["text"],
+        "input": ["text", "image"] if images else ["text"],
         "cost": {
             "input": 0,
             "output": 0,
@@ -583,7 +608,7 @@ def _patch_openclaw_config(
     window, output = _context_window(ctx), _max_output_tokens(ctx)
     new_models: list[dict[str, object]] = []
     for model_id in _ordered_model_ids(ctx):
-        entry = _openclaw_model_entry(model_id, window, output)
+        entry = _openclaw_model_entry(model_id, window, output, _accepts_images(ctx))
         for key, value in existing_by_id.get(model_id, {}).items():
             entry.setdefault(key, value)
         new_models.append(entry)
@@ -748,12 +773,14 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
                 config = loaded
 
         window, output = _context_window(ctx), _max_output_tokens(ctx)
+        modalities = ["text", "image"] if _accepts_images(ctx) else ["text"]
         config["llm-deepseek"] = {
             "baseURL": ctx.server.openai_base_url,
             "models": [
                 {
                     "id": model_id,
                     "name": f"{model_id} (FreeToken)",
+                    "inputModalities": modalities,
                     "contextWindow": window,
                     "maxTokens": output,
                 }
@@ -851,6 +878,7 @@ def print_dry_run(ctx: LaunchContext, spec: CommandSpec) -> None:
     print(f"OpenAI base URL: {ctx.server.openai_base_url}")
     print(f"Model: {ctx.model.model_id}")
     print(f"Context window: {_context_window(ctx)}")
+    print(f"Input modalities: {', '.join(ctx.model.input_modalities)}")
     print(f"Command: {shlex.join(spec.argv)}")
     if spec.env:
         print("Environment:")

@@ -16,7 +16,7 @@ addressed by page tables, and sparse attention is a physical-slot gather (see
 from .args import DeepseekV4Args, load_args
 from .config import parse_config
 from .model import DeepseekV4ForCausalLM
-from .weight import iter_weights, load_dsfp4_expert_sources
+from .weight import iter_expert_pieces, iter_weights
 
 __all__ = [
     "DeepseekV4Args",
@@ -24,5 +24,5 @@ __all__ = [
     "parse_config",
     "DeepseekV4ForCausalLM",
     "iter_weights",
-    "load_dsfp4_expert_sources",
+    "iter_expert_pieces",
 ]

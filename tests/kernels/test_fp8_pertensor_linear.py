@@ -105,32 +105,6 @@ def test_batch_size_does_not_change_the_numeric_scheme():
     assert torch.equal(alone, batched[:1])
 
 
-def test_layer_load_marks_uniform_scale_and_optional_input_scale():
-    from freetoken.kernel.triton.fp8_pertensor_linear import (
-        Fp8PerTensorColMerged,
-        Fp8PerTensorLinear,
-    )
-
-    K = 512
-    w8, scale = _quant_parts([256, 64, 64], K)
-    merged = Fp8PerTensorColMerged(K, [256, 64, 64])
-    merged.load_state_dict({
-        "weight": w8, "weight_scale": scale, "input_scale": torch.tensor(0.01, device=DEV),
-    })
-    assert merged._uniform_scale is False
-    assert merged.input_scale is not None
-
-    single = Fp8PerTensorLinear(K, 384)
-    flat = scale[:1].expand(384).contiguous()
-    single.load_state_dict({"weight": w8, "weight_scale": flat})  # no input_scale
-    assert single._uniform_scale is True
-    assert single.input_scale is None
-
-    # a reload must not trip over the input_scale it kept from the first load
-    single.load_state_dict({"weight": w8, "weight_scale": flat})
-    assert single.input_scale is None
-
-
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
 @pytest.mark.parametrize("M", [1, 4, 64, 300])
 def test_per_part_path_matches_rowwise(M: int, monkeypatch):
@@ -160,16 +134,19 @@ def test_fused_layer_forward_on_a_side_stream_completes():
     stall fails the test instead of hanging the session."""
     script = textwrap.dedent("""
         import os, time, torch
-        from freetoken.kernel.triton.fp8_pertensor_linear import FP8, Fp8PerTensorColMerged
+        from freetoken.kernel.triton.fp8_pertensor_linear import (
+            FP8, fp8_pertensor_linear, rowwise_scaled_mm_ok, weight_scale_segments,
+        )
 
         torch.manual_seed(0)
         K, parts = 2048, [8192, 512, 512]  # a prefill-sized fused qkv
         w8 = (torch.randn(sum(parts), K, device="cuda") * 8).clamp(-448, 448).to(FP8)
         scale = torch.cat([torch.full((p,), 0.01 * (i + 1), device="cuda")
                            for i, p in enumerate(parts)])
-        layer = Fp8PerTensorColMerged(K, parts)
-        layer.load_state_dict({"weight": w8, "weight_scale": scale,
-                               "input_scale": torch.tensor(0.02, device="cuda")})
+        input_scale = torch.tensor(0.02, device="cuda")
+        # same load-time decisions the torch fp8_tensor kernel makes in finalize
+        segments = weight_scale_segments(scale)
+        rowwise_scaled_mm_ok()
         x = torch.randn(2010, K, device="cuda", dtype=torch.bfloat16)  # #182 shape
         torch.cuda.synchronize()
 
@@ -177,7 +154,7 @@ def test_fused_layer_forward_on_a_side_stream_completes():
         events = []
         with torch.cuda.stream(stream):
             for _ in range(128):
-                layer.forward(x)
+                fp8_pertensor_linear(x, w8, scale, None, input_scale, False, scale_segments=segments)
                 ev = torch.cuda.Event()
                 ev.record(stream)
                 events.append(ev)

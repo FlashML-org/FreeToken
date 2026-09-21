@@ -6,6 +6,7 @@ from typing import Any
 from typing import FrozenSet
 
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.utils import EntryNotFoundError
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoConfig,
@@ -14,6 +15,12 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
+from freetoken.utils.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
@@ -164,6 +171,17 @@ class RawConfigShim:
         return json.loads(json.dumps(self._data))  # deep copy, callers may mutate
 
 
+def optional_hf_file(model_path: str, filename: str) -> str | None:
+    """Local path of ``filename`` in a checkpoint dir or Hub repo; None when the checkpoint has no such file."""
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, filename)
+        return path if os.path.isfile(path) else None
+    try:
+        return hf_hub_download(repo_id=model_path, filename=filename)
+    except EntryNotFoundError:
+        return None
+
+
 def _raw_config_json(model_path: str) -> dict:
     if os.path.isdir(model_path):
         path = os.path.join(model_path, "config.json")
@@ -173,19 +191,48 @@ def _raw_config_json(model_path: str) -> dict:
         return json.load(f)
 
 
+def sidecar_quantization_config(model_path: str) -> dict | None:
+    """The ``quantization_config`` an old ModelOpt export keeps only in ``hf_quant_config.json``, or None."""
+    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
+    if sidecar is None:
+        return None
+    with open(sidecar, encoding="utf-8") as f:
+        quant = json.load(f).get("quantization")
+    if not isinstance(quant, dict):
+        return None
+    return {"quant_method": "modelopt", **quant}
+
+
+def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
+    # config.json wins when it has one; the sidecar is only read for exports that never wrote it there
+    if getattr(config, "quantization_config", None) is not None:
+        return
+    if getattr(getattr(config, "text_config", None), "quantization_config", None) is not None:
+        return
+    quant = sidecar_quantization_config(model_path)
+    if quant is None:
+        return
+    if isinstance(config, RawConfigShim):
+        config._data["quantization_config"] = quant
+    else:
+        config.quantization_config = quant
+
+
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.
     try:
-        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except ValueError as exc:
         # Unknown model_type on this transformers version: serve off the raw JSON.
         # Anything else (bad path, malformed JSON) stays fatal.
         if "model type" not in str(exc):
             raise
-        return RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+        config = RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+    _merge_sidecar_quantization_config(config, model_path)
+    return config
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
@@ -204,13 +251,27 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     return type(config)(**config.to_dict())
 
 
+def _weight_allow_patterns(repo_id: str) -> list[str]:
+    try:
+        index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
+        with open(index, encoding="utf-8") as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    except Exception as e:
+        logger.warning(
+            "no usable %s for %s (%s); falling back to *.safetensors",
+            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
+        )
+        return ["*.safetensors"]
+    return shards or ["*.safetensors"]
+
+
 def download_hf_weight(model_path: str) -> str:
     if os.path.isdir(model_path):
         return model_path
     try:
         return snapshot_download(
             model_path,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=_weight_allow_patterns(model_path),
             tqdm_class=DisabledTqdm,
         )
     except Exception as e:

@@ -102,7 +102,7 @@ class StatsTracker:
 
 
 def derive_model_card(config: Any) -> dict:
-    """attn enum + moe bool + ctx from the model config."""
+    """attn enum + moe bool + ctx from the model config; input_modalities is what the API accepts right now."""
     mc = config.model_config
     if getattr(mc, "has_linear_attention", False):
         attn = "hybrid_linear"
@@ -115,6 +115,7 @@ def derive_model_card(config: Any) -> dict:
         "ctx": config.max_seq_len,
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
+        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 
