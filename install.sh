@@ -24,6 +24,8 @@
 #   FREETOKEN_PY_VERSION          python for the venv (default: 3.12 — must match the wheel tag)
 #   FREETOKEN_BIN_DIR             where to symlink `ft` (default: ~/.local/bin)
 #   FREETOKEN_ENV_DIR             environment.d dir (default: ~/.config/environment.d)
+#   FREETOKEN_FLASHINFER_VERSION  one version for flashinfer-python/-cubin/-jit-cache
+#                                 (default: $DEFAULT_FLASHINFER_VERSION)
 #
 # NOTE: common TVM FFI kernels come from the kernel-cache wheel. A working CUDA
 # toolkit (nvcc) is still needed when falling back to JIT for an uncovered kernel
@@ -32,6 +34,7 @@ set -euo pipefail
 
 DEFAULT_WHEEL_URL=""   # filled in once GitHub Releases are live
 DEFAULT_KERNEL_CACHE_WHEEL_URL=""   # filled in once GitHub Releases are live
+DEFAULT_FLASHINFER_VERSION="0.6.18.post1"
 
 FT_HOME="${FREETOKEN_HOME:-$HOME/.freetoken}"
 VENV="$FT_HOME/venv"
@@ -40,6 +43,7 @@ BIN_DIR="${FREETOKEN_BIN_DIR:-$HOME/.local/bin}"
 ENV_DIR="${FREETOKEN_ENV_DIR:-$HOME/.config/environment.d}"
 WHEEL="${FREETOKEN_WHEEL:-$DEFAULT_WHEEL_URL}"
 KERNEL_CACHE_WHEEL="${FREETOKEN_KERNEL_CACHE_WHEEL:-$DEFAULT_KERNEL_CACHE_WHEEL_URL}"
+FLASHINFER_VERSION="${FREETOKEN_FLASHINFER_VERSION:-$DEFAULT_FLASHINFER_VERSION}"
 
 # --yes / -y (or FREETOKEN_ASSUME_YES=1): run non-interactively — in particular, bootstrap uv
 # without asking. FreeToken Desktop's in-app installer passes --yes (its stdout is piped into a
@@ -211,10 +215,12 @@ mkdir -p "$FT_HOME"
 # breaking driver-only on a box with no CUDA toolkit. flashinfer-cubin + flashinfer-jit-cache ship
 # those kernels PREBUILT (multi-arch), so nothing compiles at runtime. They live on flashinfer's
 # own index (cubin arch-agnostic; jit-cache per-cuNNN). Large (~2 GiB) but downloaded once.
+# flashinfer refuses to import unless all three share one version, so pin them together.
 INSTALL_WHEELS=(
   "${WHEEL}[accel]"
-  flashinfer-cubin
-  flashinfer-jit-cache
+  "flashinfer-python==$FLASHINFER_VERSION"
+  "flashinfer-cubin==$FLASHINFER_VERSION"
+  "flashinfer-jit-cache==$FLASHINFER_VERSION"
   "$KERNEL_CACHE_WHEEL"
 )
 CU_INDEX_ARGS=(

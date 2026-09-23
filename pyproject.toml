@@ -76,7 +76,7 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+fi = ["flashinfer-python[cu13]==0.6.18.post1"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
