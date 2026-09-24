@@ -5,16 +5,18 @@ from typing import Any, ClassVar
 from ..names import is_routed_expert, name_set, substr_set
 from ..registry import register_dialect
 from ..scheme import QuantKind, QuantScheme
-from ..scheme import FP8_BLOCK, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
+from ..scheme import FP8_BLOCK_SIZES, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
 from .base import QuantConfig, Stored, cfg_get
 
 
 @register_dialect
 class Fp8BlockConfig(QuantConfig):
-    """HF ``quant_method: fp8`` (DeepSeek-V3 style 128x128 block scales) plus the DeepSeek-V4 e8m0 / fp4-expert variant."""
+    """HF ``quant_method: fp8`` (DeepSeek-V3 style 128x128 block scales) plus the DeepSeek-V4 e8m0 / fp4-expert
+    variant; DeepSeek-V4.1 keeps that dialect with 32x32 blocks (``weight_block_size: [32, 32]``)."""
 
     dialect = "fp8"
 
+    # the 128-block schemes every dialect table names; ``block_scheme`` carries the checkpoint's actual block edge
     SCHEMES: ClassVar[dict[str, QuantScheme]] = {
         "BLOCK": fp8_block_scheme("float"),
         "BLOCK_E8M0": fp8_block_scheme("e8m0"),
@@ -32,15 +34,25 @@ class Fp8BlockConfig(QuantConfig):
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)
         block = tuple(int(x) for x in (q.get("weight_block_size") or ()))
-        if q.get("weight_per_tensor") or block != (FP8_BLOCK, FP8_BLOCK):
-            raise NotImplementedError(f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} is not supported; only 128x128 blocks are")
+        square = len(block) == 2 and block[0] == block[1] and block[0] in FP8_BLOCK_SIZES
+        if q.get("weight_per_tensor") or not square:
+            raise NotImplementedError(
+                f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} is not supported; "
+                f"only square blocks of {FP8_BLOCK_SIZES} are"
+            )
+        self.block = block[0]
         # transformers skips lm_head when the checkpoint gives no list
         not_convert = tuple(q.get("modules_to_not_convert") or ("lm_head",))
         self.not_convert = name_set(not_convert)
         self.not_convert_substr = substr_set(not_convert)
         self.convert_tables = name_set(tuple(q.get("modules_to_convert") or ()))
         self.e8m0 = str(q.get("scale_fmt") or "").lower() == "ue8m0"
-        self.expert_fp4 = str(cfg_get(hf_config, "expert_dtype") or "").lower() == "fp4"
+        # ``expert_dtype`` sits at the config top level (V4) or inside quantization_config (V4.1)
+        expert_dtype = q.get("expert_dtype") or cfg_get(hf_config, "expert_dtype")
+        self.expert_fp4 = str(expert_dtype or "").lower() == "fp4"
+        self.block_scheme = fp8_block_scheme("e8m0" if self.e8m0 else "float", self.block)
+        # the fp4 experts quantize their activations at the same block as the dense linears
+        self.expert_scheme = mxfp4_scheme(act_block=self.block)
 
     def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
         names = super().storage(scheme)
@@ -54,5 +66,5 @@ class Fp8BlockConfig(QuantConfig):
         if self.not_convert(name) or self.not_convert_substr(name):
             return None
         if self.expert_fp4 and is_routed_expert(name):
-            return self.SCHEMES["EXPERT_MXFP4"]
-        return self.SCHEMES["BLOCK_E8M0" if self.e8m0 else "BLOCK"]
+            return self.expert_scheme
+        return self.block_scheme

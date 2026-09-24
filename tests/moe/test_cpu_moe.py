@@ -499,8 +499,8 @@ def test_cpu_moe_decode_cuda_graph_replay():
     # must actually have exercised it -- guard against a silent fallback to the
     # host-func path making this test vacuous for the capture-embedded memops.
     if ex._flag_sync:
-        assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
-        slot = ex._flag_slots[(layer, bs)]
+        assert (layer, bs, False) in ex._flag_slots, "flag slot expected for the decode task"
+        slot = ex._flag_slots[(layer, bs, False)]
         assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
         assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
         assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"

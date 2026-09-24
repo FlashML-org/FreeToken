@@ -12,10 +12,16 @@ E8M0 = torch.float8_e8m0fnu
 
 
 class TritonMxfp4MoEKernel(MoEKernel):
-    """Standard OCP MXFP4 experts (DeepSeek-V4 ds_fp4): e2m1 pairs + e8m0 scales, no bias."""
+    """Standard OCP MXFP4 experts (DeepSeek-V4 / V4.1 ds_fp4): e2m1 pairs + e8m0 scales, no bias.
+    W4A8 numerics of the reference ``Expert.forward``: fp8 activation round-trips at the
+    checkpoint's block, the routing weight multiplied into the fp32 intermediate (both the GPU
+    kernels and the ``ds_fp4`` CPU executor implement this placement)."""
 
     name = "triton"
     cpu_format = "ds_fp4"
+    supports_fp32_routed_sum = True
+    supports_batch_invariant_prefill = True
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.interleaved:
@@ -40,17 +46,23 @@ class TritonMxfp4MoEKernel(MoEKernel):
         out["down_scale"].copy_(pieces["down_scale"].view(E8M0))
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool, out_dtype: torch.dtype | None = None):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
+        # the W4A8 activation quant follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
+        act_block = layer.quant_method.scheme.act_block(128)
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 
-            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n)
+            return routed_experts_fp4_prefill(
+                x, topk_ids, topk_weights, *banks, limit, view.n,
+                act_block=act_block, out_dtype=out_dtype,
+                batch_invariant=layer.quant_method.cfg.batch_invariant_prefill,
+            )
         from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
-        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit)
+        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block, out_dtype=out_dtype)
 
 
 class TritonGptossMxfp4MoEKernel(MoEKernel):

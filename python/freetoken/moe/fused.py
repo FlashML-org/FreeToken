@@ -199,11 +199,15 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    *,
+    out_dtype: torch.dtype | None = None,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
-    """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
+    """At the input dtype, returns ``hidden_states`` overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
-    not shared; the resident bf16 path routes decode through here too."""
+    not shared; the resident bf16 path routes decode through here too. A different ``out_dtype``
+    allocates the destination and preserves the route sum until that final store."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
 
@@ -223,7 +227,8 @@ def fused_experts_impl(
         (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
         topk_ids.shape[1],
     )
-    config = get_config_func(M)
+    config = (get_default_config(1, E, w2.shape[1], w1.shape[2], topk_ids.shape[1])
+              if batch_invariant else get_config_func(M))
 
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
@@ -243,7 +248,8 @@ def fused_experts_impl(
     )
     compute_type = hidden_states.dtype
 
-    out_hidden_states = hidden_states
+    out_hidden_states = (hidden_states if out_dtype is None or out_dtype == hidden_states.dtype
+                         else torch.empty_like(hidden_states, dtype=out_dtype))
     curr_hidden_states = hidden_states
     tokens_num, _ = curr_hidden_states.shape
     begin_token_idx, end_token_idx = 0, num_tokens
@@ -251,7 +257,6 @@ def fused_experts_impl(
     intermediate_cache1 = intermediate_cache1[:tokens_num]
     intermediate_cache2 = intermediate_cache2[: tokens_num * topk_ids.shape[1]]
     intermediate_cache3 = intermediate_cache3[:tokens_num]
-    config = get_config_func(tokens_num)
 
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
@@ -307,6 +312,8 @@ def fused_experts_decode_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    *,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
@@ -376,6 +383,6 @@ def fused_experts_decode_impl(
         compute_type=hidden_states.dtype,
     )
 
-    out_hidden_states = torch.empty_like(hidden_states)
+    out_hidden_states = torch.empty_like(hidden_states, dtype=out_dtype or hidden_states.dtype)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
     return out_hidden_states

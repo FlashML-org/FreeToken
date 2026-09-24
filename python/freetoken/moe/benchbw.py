@@ -121,6 +121,7 @@ WORKLOADS: dict[str, Workload] = {
     "gpt-oss-20b": Workload("gpt-oss-20b", 2880, 2880, 32, 4, ("mxfp4_triton",),
                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "dsv4.1-flash": Workload("dsv4.1-flash", 5120, 2304, 384, 6, ("ds_fp4",), swiglu_limit=10.0),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "glm5.3-flash-nvfp4": Workload(
         "glm5.3-flash-nvfp4", 4096, 2048, 288, 8, ("nvfp4",),

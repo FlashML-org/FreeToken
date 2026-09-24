@@ -12,6 +12,8 @@ from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, is_r
 class FusedMoEKernel(MoEKernel):
     name = "fused"
     cpu_format = "bf16"
+    supports_fp32_routed_sum = True
+    supports_batch_invariant_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = gated_epilogue_reason(cfg)
@@ -28,12 +30,15 @@ class FusedMoEKernel(MoEKernel):
         out["down"].copy_(pieces["down"])
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool, out_dtype: torch.dtype | None = None):
         from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 
         # the resident layer runs the in-place prefill kernel for both phases
         impl = fused_experts_impl if is_prefill or is_resident(layer) else fused_experts_decode_impl
-        return impl(x, view.tensors["gate_up"], view.tensors["down"], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer))
+        kwargs = {} if out_dtype is None else {"out_dtype": out_dtype}
+        if impl is fused_experts_impl and is_prefill and layer.quant_method.cfg.batch_invariant_prefill:
+            kwargs["batch_invariant"] = True
+        return impl(x, view.tensors["gate_up"], view.tensors["down"], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer), **kwargs)
 
 
 @register_method(QuantKind.NONE, LayerKind.MOE)

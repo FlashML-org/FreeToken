@@ -2,6 +2,33 @@ import pytest
 import torch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("prefill", [False, True])
+def test_bf16_routed_sum_preserves_fp32_precision(prefill):
+    from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
+
+    torch.manual_seed(17)
+    x = torch.randn(9, 32, device="cuda", dtype=torch.bfloat16) * 0.25
+    gu = torch.randn(4, 64, 32, device="cuda", dtype=torch.bfloat16) * 0.25
+    down = torch.randn(4, 32, 32, device="cuda", dtype=torch.bfloat16) * 0.25
+    ids = torch.tensor([[0, 2]], device="cuda", dtype=torch.int32).repeat(9, 1)
+    weights = torch.rand(9, 2, device="cuda")
+    impl = fused_experts_impl if prefill else fused_experts_decode_impl
+    kwargs = {"batch_invariant": True} if prefill else {}
+    got = impl(x.clone(), gu, down, weights, ids, out_dtype=torch.float32, **kwargs)
+    parts = [
+        impl(x.clone(), gu, down, weights[:, r:r+1].contiguous(), ids[:, r:r+1].contiguous(),
+             out_dtype=torch.float32, **kwargs)
+        for r in range(2)
+    ]
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got, parts[0] + parts[1], atol=0, rtol=0)
+    assert torch.any(got != got.bfloat16().float())
+    if prefill:
+        one = impl(x[:1].clone(), gu, down, weights[:1], ids[:1], out_dtype=torch.float32, **kwargs)
+        assert torch.equal(one, got[:1])
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":

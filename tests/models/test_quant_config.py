@@ -52,6 +52,43 @@ HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
 BF16, FP8B, FP8T, MXFP8, NVFP4 = UnquantizedLinearMethod, Fp8BlockLinearMethod, Fp8TensorLinearMethod, Mxfp8LinearMethod, Nvfp4LinearMethod
 
 
+def test_linear_rejects_unsupported_batch_invariance(monkeypatch):
+    from freetoken.layers.quantization.linear.base import LinearConfig
+    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+    monkeypatch.setattr(TorchLinearKernel, "supports_batch_invariant", False)
+    method = UnquantizedLinearMethod(LinearConfig(32, 32))
+    with pytest.raises(KernelSelectionError, match="batch-invariant"):
+        method.require_batch_invariant()
+
+
+def test_moe_rejects_unsupported_precision_contract(monkeypatch):
+    from freetoken.layers.quantization.moe.base import ExpertView, MoEConfig
+    from freetoken.layers.quantization.moe.unquantized import FusedMoEKernel
+
+    monkeypatch.setattr(FusedMoEKernel, "supports_fp32_routed_sum", False)
+    cfg = dict(num_experts=4, hidden=32, intermediate=32, top_k=2)
+    with pytest.raises(KernelSelectionError, match="FP32"):
+        UnquantizedMoEMethod(MoEConfig(**cfg, require_fp32_routed_sum=True))
+    method = UnquantizedMoEMethod(MoEConfig(**cfg))
+    with pytest.raises(NotImplementedError, match="unrounded"):
+        method.apply(torch.empty(1, 32, dtype=torch.bfloat16), None, None, ExpertView({}),
+                     layer=None, is_prefill=True, out_dtype=torch.float32)
+    monkeypatch.setattr(FusedMoEKernel, "supports_batch_invariant_prefill", False)
+    with pytest.raises(KernelSelectionError, match="batch-invariant"):
+        UnquantizedMoEMethod(MoEConfig(**cfg, batch_invariant_prefill=True))
+
+
+@pytest.mark.parametrize("requirement", ["batch_invariant_prefill", "require_fp32_routed_sum"])
+def test_legacy_offload_banks_reject_unsupported_contract(requirement):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    with pytest.raises(KernelSelectionError, match="q4_0"):
+        OffloadMoELayer(0, 4, 2, 32, 32, **{requirement: True})
+
+
 def model_dir(name: str) -> str | None:
     path = os.path.join(MODELS, name.split("/")[-1])
     if os.path.isfile(os.path.join(path, "config.json")):  # a download in progress has the dir but no config yet
@@ -433,6 +470,25 @@ def test_modelopt_nvfp4_reads_the_activation_quantizer_from_config_groups(extra,
     q = {"quant_method": "modelopt", "quant_algo": "NVFP4", **extra}
     scheme = QuantConfig.from_hf(SimpleNamespace(quantization_config=q)).scheme_for("model.layers.0.mlp.down_proj")
     assert scheme.kind is QuantKind.NVFP4 and scheme.has("input_scale") is has_input_scale
+
+
+def test_fp8_dialect_reads_the_block_size_and_the_nested_expert_dtype():
+    """DeepSeek-V4.1 keeps the ``fp8`` dialect with 32x32 blocks and puts ``expert_dtype`` inside quantization_config."""
+    from freetoken.layers.quantization.scheme import fp8_block_size
+
+    q = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"}
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert type(quant) is Fp8BlockConfig and quant.block == 32
+    dense = quant.scheme_for("layers.3.attn.wq_a")
+    assert dense.kind is QuantKind.FP8_BLOCK and fp8_block_size(dense) == 32 and dense.weight.scale == "e8m0"
+    assert quant.storage(dense)["weight_scale_inv"].name == "scale"
+    assert quant.scheme_for("layers.3.ffn.experts.7.w1").kind is QuantKind.MXFP4
+    # the V4 128-block export still resolves to the 128 scheme
+    q128 = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128], "scale_fmt": "ue8m0"}
+    assert fp8_block_size(QuantConfig.from_hf(SimpleNamespace(quantization_config=q128)).scheme_for("layers.3.attn.wq_a")) == 128
+    for bad in ([64, 64], [32, 128], [128]):
+        with pytest.raises(NotImplementedError):
+            QuantConfig.from_hf(SimpleNamespace(quantization_config={**q, "weight_block_size": bad}))
 
 
 def test_every_dialect_names_the_tensors_behind_its_schemes():

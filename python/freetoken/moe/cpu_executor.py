@@ -158,6 +158,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        act_block: int = 128,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -271,7 +272,7 @@ class CpuMoeExecutor:
         # self so the coordinator's pinned pointers stay valid for the executor's
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
-        self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
+        self._flag_slots: dict[tuple[int, int, bool], int] = {}  # (layer_id, bs, fp32_out) -> slot
         self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
         if self._flag_sync:
             self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
@@ -308,6 +309,10 @@ class CpuMoeExecutor:
         # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
         self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
+        # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
+        self._act_block = int(act_block)
+        if fmt == "ds_fp4":
+            self._ext.set_act_block(self._act_block)
         if self._gpu_prequant:
             self._ext.set_input_prequant(True)
             logger.info_rank0(
@@ -466,7 +471,7 @@ class CpuMoeExecutor:
         """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
-        activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
+        activations (the checkpoint's fp8 block) to match the DeepSeek W4A8 reference."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
@@ -474,7 +479,7 @@ class CpuMoeExecutor:
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        assert H % 32 == 0 and I % 32 == 0, (H, I)  # e8m0 scales per 32 along K
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
@@ -498,12 +503,13 @@ class CpuMoeExecutor:
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
                 "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "y32": alloc_pinned_tensor(bs, self.H, dtype=torch.float32),  # the fp32 routed-sum contract
             }
             self._io[bs] = io
         return io
 
-    def _task_for(self, layer_id: int, bs: int) -> int:
-        key = (layer_id, bs)
+    def _task_for(self, layer_id: int, bs: int, fp32_out: bool = False) -> int:
+        key = (layer_id, bs, fp32_out)
         task = self._tasks.get(key)
         if task is None:
             io = self._io_for(bs)
@@ -514,6 +520,7 @@ class CpuMoeExecutor:
                 io["ids"].data_ptr(),
                 io["w"].data_ptr(),
                 io["y"].data_ptr(),
+                io["y32"].data_ptr() if fp32_out else 0,
             )
             self._tasks[key] = task
             # Allocate this (layer, bs) combo a flag slot and register its task with the
@@ -531,13 +538,16 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        """One MoE layer of decode on the CPU. Returns a GPU [bs, H] tensor.
+        """One MoE layer of decode on the CPU. Returns a GPU [bs, H] tensor in ``out_dtype``
+        (the input dtype by default; ``torch.float32`` keeps the sum over routes in fp32 for
+        the caller's merge instead of rounding it here).
 
         All ops go on the current CUDA stream so the whole thing is captured into
         the active CUDA graph (the two host nodes carry the data dependency on the
         pinned buffers, which hold this step's real routing on replay)."""
-        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
+        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids, out_dtype)
         return self.decode_sync(pending)
 
     def decode_submit(
@@ -546,6 +556,7 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node, then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -564,16 +575,18 @@ class CpuMoeExecutor:
             # pre-quantized activations and skips its serial scalar pass.
             from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 
-            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
+            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
 
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        task = self._task_for(layer_id, bs)
-        out = torch.empty_like(hidden_states)
-        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        fp32_out = out_dtype == torch.float32
+        assert out_dtype in (None, hidden_states.dtype, torch.float32), out_dtype
+        task = self._task_for(layer_id, bs, fp32_out)
+        out = torch.empty_like(hidden_states, dtype=torch.float32 if fp32_out else hidden_states.dtype)
+        slot = self._flag_slots.get((layer_id, bs, fp32_out)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
@@ -601,7 +614,7 @@ class CpuMoeExecutor:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
         io = self._io[bs]
-        out.copy_(io["y"], non_blocking=True)
+        out.copy_(io["y32" if out.dtype == torch.float32 else "y"], non_blocking=True)
         return out
 
     def _watchdog_tick(self, suspects: dict) -> None:

@@ -91,6 +91,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         # Whole-layer streaming moves all num_experts rows per layer; a small
         # chunk touches at most T*top_k of them, so below that crossover the
@@ -105,7 +106,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_states.shape[0] * self.top_k >= self.num_experts
             or cache.is_unpinned_layer(self.layer_id)
         ):
-            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids, out_dtype)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:
@@ -119,6 +120,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,
+            out_dtype=out_dtype,
         )
 
 
