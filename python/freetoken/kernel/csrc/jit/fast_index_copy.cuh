@@ -20,6 +20,13 @@ struct device_vec {
 
 namespace details {
 
+#if FREETOKEN_USE_ROCM
+// Use native Clang vector types so each __builtin_nontemporal_load/store
+// maps to one vectorized 8B/16B global memory instruction.
+using native_uint2 = uint32_t __attribute__((ext_vector_type(2)));
+using native_uint4 = uint32_t __attribute__((ext_vector_type(4)));
+#endif
+
 template <std::size_t kUnit>
 inline constexpr auto get_mem_package() {
     if constexpr (kUnit == 16) {
@@ -35,7 +42,7 @@ inline constexpr auto get_mem_package() {
 
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
 #if FREETOKEN_USE_ROCM
-    return *src;
+    return uint1{__builtin_nontemporal_load(&src->x)};
 #else
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
@@ -45,7 +52,8 @@ __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 
 
 __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
 #if FREETOKEN_USE_ROCM
-    return *src;
+    const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint2*>(src));
+    return __builtin_bit_cast(uint2, value);
 #else
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
@@ -55,7 +63,8 @@ __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 
 
 __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
 #if FREETOKEN_USE_ROCM
-    return *src;
+    const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint4*>(src));
+    return __builtin_bit_cast(uint4, value);
 #else
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
@@ -65,7 +74,7 @@ __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 
 
 __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
 #if FREETOKEN_USE_ROCM
-    *dst = value;
+    __builtin_nontemporal_store(value.x, &dst->x);
 #else
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
@@ -74,7 +83,8 @@ __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& v
 
 __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
 #if FREETOKEN_USE_ROCM
-    *dst = value;
+    __builtin_nontemporal_store(
+        __builtin_bit_cast(native_uint2, value), reinterpret_cast<native_uint2*>(dst));
 #else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
@@ -84,7 +94,8 @@ __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& v
 
 __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
 #if FREETOKEN_USE_ROCM
-    *dst = value;
+    __builtin_nontemporal_store(
+        __builtin_bit_cast(native_uint4, value), reinterpret_cast<native_uint4*>(dst));
 #else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
