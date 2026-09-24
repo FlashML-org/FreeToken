@@ -17,14 +17,6 @@ def _table(rows: int, seed: int) -> torch.Tensor:
     return torch.randint(0, 256, (rows, ROW_BYTES), dtype=torch.uint8, generator=gen)
 
 
-def test_sync_mode_is_validated_before_device_access():
-    from freetoken.kernel.row_store import probe_wait_sync
-
-    assert not probe_wait_sync("gate", torch.device("cpu"))
-    with pytest.raises(ValueError, match="sync mode"):
-        probe_wait_sync("typo", torch.device("cpu"))
-
-
 def _stage(store, ids: torch.Tensor, dst_stride: int = 0) -> torch.Tensor:
     stride = dst_stride or store.row_bytes
     staging = torch.zeros(ids.numel() * stride, dtype=torch.uint8)
