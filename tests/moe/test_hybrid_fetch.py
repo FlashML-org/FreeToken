@@ -86,9 +86,13 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_hybrid_fraction_gpu_matches_cpu_reference():
+@pytest.mark.parametrize("frac", [0.1, 0.415, 1.0])
+@pytest.mark.parametrize("by_recency", [True, False])
+def test_hybrid_fraction_gpu_matches_cpu_reference(frac, by_recency, monkeypatch):
+    import freetoken.moe.offload_kernels as kernels
+    monkeypatch.setattr(kernels, "_HYBRID_FETCH_BY_RECENCY", by_recency)
     torch.manual_seed(0)
-    num_experts, cache_size, top_k, frac = 32, 40, 8, 0.415
+    num_experts, cache_size, top_k = 32, 40, 8
 
     def make():
         return OffloadMoeCache(
@@ -107,7 +111,10 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
         missing = int(gpu.num_missing_full.item())
         fetched = int(gpu.num_indices.item())
         assert missing == int(ref.num_missing_full.item())
-        assert fetched == int(ref.num_indices.item()) == _balanced_fetch(missing, frac_q16)
+        assert fetched == int(ref.num_indices.item())
+        assert _balanced_fetch(missing, frac_q16) <= fetched <= missing
+        if step == 0 or not by_recency:
+            assert fetched == _balanced_fetch(missing, frac_q16)
         # slot rewrites (hit/fetched -> slot, overflow -> -1) and LRU state stay identical
         assert torch.equal(g.cpu(), c)
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
@@ -116,13 +123,74 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_hybrid_fixed_cap_unchanged():
+@pytest.mark.parametrize("cap", [0, 1, 32])
+def test_hybrid_fixed_cap_unchanged(cap):
     # fraction 0 (no profile / explicit --moe-hybrid-max-fetch) keeps the fixed cap.
     cache = OffloadMoeCache(
         num_layers=1, num_experts=32, cache_size=40, device=torch.device("cuda"),
-        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1,
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=cap,
     )
-    ids = torch.arange(8, dtype=torch.int32).cuda()
-    cache.ensure_experts_hybrid(0, ids)
-    assert int(cache.num_missing_full.item()) == 8
-    assert int(cache.num_indices.item()) == 1
+    for _ in range(3):
+        ids = torch.arange(8, dtype=torch.int32).cuda()
+        cache.ensure_experts_hybrid(0, ids)
+        assert int(cache.num_indices.item()) == min(cap, int(cache.num_missing_full.item()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_auto_split_admits_reuse_within_resident_lru_window():
+    def make():
+        return OffloadMoeCache(
+            num_layers=2, num_experts=8, cache_size=8, device=torch.device("cuda"),
+            quant_format="bf16", decode_target="hybrid",
+            hybrid_fetch_fraction=0.1,
+        )
+    gpu, ref = make(), make()
+    def step(layer, experts, fetched):
+        ids = torch.tensor([experts], device="cuda", dtype=torch.int32)
+        expected = ids.cpu()
+        gpu.ensure_experts_hybrid(layer, ids)
+        ref.ensure_experts_hybrid(layer, expected)
+        assert int(gpu.num_indices.item()) == int(ref.num_indices.item()) == fetched
+        assert torch.equal(ids.cpu(), expected)
+        assert torch.equal(gpu.slot_for_id, ref.slot_for_id)
+    step(0, [0, 1], 0)
+    step(0, [0, 1], 2)
+    step(0, [0, 1], 0)  # Hits, even though the bandwidth split prefers CPU for two misses.
+    for experts in ([0, 1], [2, 3], [4, 5], [6, 7]):
+        step(1, experts, 0)
+        step(1, experts, 2)
+    assert (gpu.slot_for_id[0, :2] == -1).all()
+    step(0, [0, 1], 0)  # Old reuse falls outside the current residency window.
+    step(0, [0, 1], 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_reuse_admission_compares_each_victim_during_graph_replay():
+    def make():
+        return OffloadMoeCache(
+            num_layers=2, num_experts=8, cache_size=8, device=torch.device("cuda"),
+            quant_format="bf16", decode_target="hybrid",
+            hybrid_fetch_fraction=0.1,
+        )
+    gpu, ref = make(), make()
+    raw = torch.tensor([[6, 7]], device="cuda", dtype=torch.int32)
+    gpu.ensure_experts_hybrid(1, raw.clone())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        slots = raw.clone()
+        gpu.ensure_experts_hybrid(1, slots)
+    for cache in (gpu, ref):
+        cache.reset()
+        cache.id_of_slot.copy_(torch.arange(8, device="cuda"))
+        cache.slot_for_id[0].copy_(torch.arange(8, device="cuda"))
+        cache.usage.fill_(8)
+        cache.usage[0] = 2
+        cache.step.fill_(10)
+        cache.expert_recency[1, 6:8] = torch.tensor([7, 6], device="cuda")
+    expected = raw.cpu()
+    ref.ensure_experts_hybrid(1, expected)
+    graph.replay()
+    assert gpu.num_indices.item() == ref.num_indices.item() == 1
+    assert slots[0, 0].item() == 0 and slots[0, 1].item() == -1
+    assert torch.equal(slots.cpu(), expected)
+    assert torch.equal(gpu.slot_for_id, ref.slot_for_id)

@@ -52,7 +52,9 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats). With automatic recency-based fetching, recurring misses
+    also enter the cache when their previous use is at least as recent as the actual LRU
+    victim. This prevents the per-step split from keeping hot experts on the CPU forever."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
@@ -129,10 +131,10 @@ def _ensure_experts_hybrid_cpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
-    the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
-    the bandwidth-matched ``~frac_q16/2^16 * misses`` when ``frac_q16`` > 0) of the missing
-    experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
-    most-recently-active misses (ties -> lower id); else the lowest ids."""
+    the GPU path; see tests/moe/test_hybrid_fetch.py). Uses the fixed cap or automatic
+    bandwidth budget plus reuse admission. Overflow misses are rewritten to -1. With
+    ``BY_RECENCY`` the fetch set is the most-recently-active misses (ties -> lower id);
+    else the lowest ids."""
     seen = []
     for expert in expert_ids.view(-1).tolist():
         if expert not in seen:
@@ -160,14 +162,15 @@ def _ensure_experts_hybrid_cpu(
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
-    num_fetch = min(len(missing), int(max_fetch))
+    admit_reuse = frac_q16 > 0 and _HYBRID_FETCH_BY_RECENCY
+    fetch_budget = min(len(missing), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
-    cache.num_indices.fill_(num_fetch)
-
     usage = cache.usage.tolist()
-    for idx in range(num_fetch):
-        expert = missing[idx]
+    fetched = 0
+    for expert in missing if admit_reuse else missing[:fetch_budget]:
         victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        if admit_reuse and fetched >= fetch_budget and (rec[expert] < 0 or rec[expert] < usage[victim]):
+            break
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -175,8 +178,10 @@ def _ensure_experts_hybrid_cpu(
         cache.slot_for_id[layer_id, expert] = victim
         cache.usage[victim] = step
         usage[victim] = step
-        cache.evict_slots[idx] = victim
-        cache.src_indices[idx] = expert  # layer-local row
+        cache.evict_slots[fetched] = victim
+        cache.src_indices[fetched] = expert
+        fetched += 1
+    cache.num_indices.fill_(fetched)
 
     if _HYBRID_FETCH_BY_RECENCY:
         for expert in seen:
@@ -318,8 +323,9 @@ def _ensure_experts_hybrid_kernel(
     the CPU). ``fetch_frac_q16`` > 0 (Q16 fixed point) replaces the fixed cap with the
     bandwidth-matched split ``~frac * num_missing`` (see the Phase-1 comment), computed
     in-kernel because ``num_missing`` only exists device-side (CUDA graph). ``num_indices``
-    = the capped fetch count (copy_missing), ``num_missing_full`` = the pre-cap miss count
-    (stats).
+    = the fetch count (copy_missing), ``num_missing_full`` = the pre-cap miss count
+    (stats). Automatic recency-based fetching also admits recurring misses that outrank
+    the actual LRU victim, even if the bandwidth budget alone would keep them on the CPU.
 
     Which misses to fetch is the cap policy. ``BY_RECENCY`` (default) fetches the experts
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
@@ -354,7 +360,6 @@ def _ensure_experts_hybrid_kernel(
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
@@ -369,8 +374,9 @@ def _ensure_experts_hybrid_kernel(
     else:
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
 
-    # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
-    if num_fetch > 0:
+    # ---- Phase 2: bandwidth budget plus reuse admission against each LRU victim ----
+    admit_reuse = (fetch_frac_q16 > 0) & BY_RECENCY
+    if admit_reuse or num_fetch > 0:
         off_c = tl.arange(0, BLOCK_C)
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
@@ -380,22 +386,35 @@ def _ensure_experts_hybrid_kernel(
             ei = tl.load(expert_ids_ptr + i)
             owner_active = owner_active | (oid == base + ei)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
-        for i in tl.range(num_fetch):
+        fetch_budget = num_fetch
+        limit = tl.where(admit_reuse, num_missing, num_fetch)
+        num_fetch = 0
+        admit = True
+        while (num_fetch < limit) & admit:
             victim = tl.argmin(u, axis=0).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
-            if old_id >= 0:
-                tl.store(slot_for_id_ptr + old_id, -1)
             if BY_RECENCY:
                 e = tl.argmax(score, axis=0).to(tl.int32)
-                score = tl.where(off_e == e, -1152921504606846976, score)
+                previous_use = tl.sum(tl.where(off_e == e, rec, 0))
+                # Recurring misses must outrank the actual victim, not just the oldest
+                # initial resident. Cold or stale misses retain the bandwidth budget.
+                admit = (num_fetch < fetch_budget) | ((previous_use >= 0) & (previous_use >= tl.min(u)))
             else:
-                e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
-            tl.store(id_of_slot_ptr + victim, base + e)
-            tl.store(slot_for_id_ptr + base + e, victim)
-            tl.store(usage_ptr + victim, step)
-            tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
-            u = tl.where(off_c == victim, 9223372036854775807, u)
+                e = tl.sum(tl.where((missing_rank == num_fetch) & is_missing, off_e, 0))
+            if admit:
+                if old_id >= 0:
+                    tl.store(slot_for_id_ptr + old_id, -1)
+                tl.store(id_of_slot_ptr + victim, base + e)
+                tl.store(slot_for_id_ptr + base + e, victim)
+                tl.store(usage_ptr + victim, step)
+                tl.store(evict_slots_ptr + num_fetch, victim)
+                tl.store(src_indices_ptr + num_fetch, e)  # layer-local row
+                u = tl.where(off_c == victim, 9223372036854775807, u)
+                if BY_RECENCY:
+                    score = tl.where(off_e == e, -1152921504606846976, score)
+                num_fetch += 1
+
+    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     for i in tl.range(num_active):

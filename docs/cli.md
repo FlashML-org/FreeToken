@@ -91,6 +91,15 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+With hybrid auto fetch (`--moe-hybrid-max-fetch -1`), the `ft bench bw` profile
+sets the CPU/PCIe split for cold misses. With the default recency policy, repeated misses
+are also cached if their previous use is at least as recent as the actual LRU entry
+they would replace. This prevents a zero-fetch split from keeping frequently used
+experts on the CPU indefinitely. Both decisions run on the GPU during CUDA graph replay;
+there is no model-specific miss threshold or additional startup calibration. An explicit
+nonnegative fetch cap retains its existing meaning; without a profile, auto keeps the
+existing fetch cap of 1.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
