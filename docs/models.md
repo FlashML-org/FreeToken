@@ -5,6 +5,7 @@ for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
+| DeepSeek-V4.1-Flash | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) |
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
 | GLM-5.3-Flash | [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
@@ -27,6 +28,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 | Family | Image tokens | `--image-min-tokens` / `--image-max-tokens` | `--mm-processor-kwargs` example |
 | --- | --- | --- | --- |
+| DeepSeek-V4.1-Flash (ViT tower, streamed under `--mm-encoder-weights host`) | one feature per 42x42 pixels, plus a learned row break per row and two delimiters; checkpoint cap 1024 total span tokens | maximum caps the entire span; minimum maps to a pixel-area floor before the cap; checkpoint minimum area is 544x544 | `{"max_image_tokens": 512, "min_pixels": 295936}` |
 | Qwen3.6 (both variants, every listed weight format), Qwen3.8-Flash-Next, Qwen3-VL | one token per 32x32 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 64 to 16384 tokens | `{"size": {"longest_edge": 1048576}}` |
 | Gemma-4 26B-A4B, 31B (`gemma4`: ViT tower, streamed under `--mm-encoder-weights host`) | one of the soft-token budgets 70 / 140 / 280 / 560 / 1120, every image scaled to its budget as far as the aspect ratio allows | the maximum picks the largest budget within it, below 70 is refused at start-up; the minimum has no effect | `{"max_soft_tokens": 1120}` |
 | Gemma-4 12B (`gemma4_unified`: linear patch embedder, resident under either placement) | same budgets, one 48x48 super-patch per soft token | same as the tower releases | same |
@@ -72,4 +74,29 @@ warning; pass `--moe-strategy offload` to use them.
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
+- DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
+  dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
+  fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
+  demand (keep them on a fast NVMe; the 6 GiB of table scales stay in host RAM), using
+  bounded pinned staging buffers; an FTW conversion copies them next
+  to the checkpoint as `engram-table-NN.safetensors`. `--decoder-replay bounded`
+  (default) runs the 20 decoder layers on each prompt's last 128 tokens, as DeepSeek deploys
+  it. That decoder KV is request-private (per-request rings, never in radix-shared pages, so
+  prefix reuse and commit-time page dedup only ever share encoder / compressed KV), and a
+  prefix hit keeps two live windows of history behind it so the encoder can recompute the
+  replayed tokens' hidden states. `--decoder-replay exact` runs the decoder on every prompt
+  token and caches its window KV like any other layer. Run
+  `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
+  choosing a MoE strategy. `--moe-strategy hybrid` splits expert misses using those
+  measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` controls the token
+  capacity reserved before allocating the expert cache, subject to the attention
+  pool's structural minimum. Size this reserve for the intended context and concurrency.
+  `--max-extend-length` controls prefill chunk size and its workspace requirement.
+  Image input uses the shared
+  multimodal processor and encoder cache, including chunked prefill and prefix replay;
+  `--text-model-only` skips the vision weights. DSpark speculative decoding is not served.
+  Reasoning effort accepts `low`, `high`,
+  `max`, or an integer from 1 to 100 through `reasoning_effort` or
+  `chat_template_kwargs.reasoning_effort`; integers are passed to the checkpoint's
+  encoder unchanged. Runtime window-cache controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.

@@ -64,27 +64,29 @@ def plan_mm_chunk(
     return jobs, plan
 
 
-def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem], List[Tuple[int, int, int, int, int, int]], List[int], List[int]]:
-    """Jobs, plan, the batch rows of every gathered embedding row and, per batch token, the end of the image span holding it (0 for text), over the reqs in batch order (each spans [cached_len, device_len))."""
+def plan_mm_batch(reqs, encoder_cache: EncoderCache | None, *, starts: List[int] | None = None) -> tuple[List[MMItem], List[Tuple[int, int, int, int, int, int]], List[int], List[int]]:
+    """Jobs, gather plan, embedding rows and image-span ends over each [start, device_len); starts default to cached_len."""
     jobs: List[MMItem] = []
     plan: List[Tuple[int, int, int, int, int, int]] = []
     rows: List[int] = []
     block_ends: List[int] = []
     offset = 0
-    for req in reqs:
+    starts = starts if starts is not None else [r.cached_len for r in reqs]
+    assert len(starts) == len(reqs)
+    for req, start in zip(reqs, starts):
         if req.mm_items:
-            req_jobs, req_plan = plan_mm_chunk(req.uid, req.mm_items, req.cached_len, req.device_len, encoder_cache)
+            req_jobs, req_plan = plan_mm_chunk(req.uid, req.mm_items, start, req.device_len, encoder_cache)
             jobs.extend(req_jobs)
             plan.extend(req_plan)
             for _, _, row_lo, row_hi, _, pos in req_plan:
                 rows.extend(range(offset + pos, offset + pos + row_hi - row_lo))
             if not block_ends:
-                block_ends = [0] * sum(r.extend_len for r in reqs)
+                block_ends = [0] * sum(r.device_len - s for r, s in zip(reqs, starts))
             for item in req.mm_items:
                 for span_lo, span_hi in item.offsets:
-                    for i in range(max(span_lo, req.cached_len), min(span_hi, req.device_len)):
-                        block_ends[offset + i - req.cached_len] = span_hi
-        offset += req.extend_len
+                    for i in range(max(span_lo, start), min(span_hi, req.device_len)):
+                        block_ends[offset + i - start] = span_hi
+        offset += req.device_len - start
     return jobs, plan, rows, block_ends
 
 

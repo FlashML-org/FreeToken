@@ -159,6 +159,19 @@ def test_empty_effort_is_treated_as_absent():
     assert state.sent.chat_template_kwargs == {}
 
 
+def test_numeric_effort_reaches_shared_tokenizer_validation():
+    from freetoken.server.openai_api import chat_request_to_genspec
+    from pydantic import ValidationError
+    import pytest
+
+    for effort in (0, 1, 25, 75, 100, 101):
+        spec = chat_request_to_genspec(chat_request(reasoning_effort=effort), {})
+        assert spec.chat_template_kwargs == {**ON, "reasoning_effort": effort}
+    for effort in (True, 25.5):
+        with pytest.raises(ValidationError):
+            chat_request(reasoning_effort=effort)
+
+
 def test_foreign_thinking_shapes_stay_ignored():
     # extra="allow" swallowed any thinking shape before the field existed;
     # a bare string, a bool, or a typeless dict must keep working unchanged.

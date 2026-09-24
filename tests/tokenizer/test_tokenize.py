@@ -89,6 +89,36 @@ class FakeDsv4Tokenizer:
         return torch.tensor([[4, 5, 6]], dtype=torch.long)
 
 
+def test_dsv41_encoder_gets_image_sources_before_and_after_fetch(tmp_path):
+    import copy
+    from freetoken.mm.media import collect_image_refs
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding_dsv4.py").write_text('''
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    parts = messages[0]["content"]
+    assert parts[1] == {"type": "text", "text": "compare"}
+    assert parts[0].get("url") == "https://example.com/image.png" or parts[0].get("data") == b"first image bytes"
+    assert parts[2].get("data") in ("aW1hZ2U=", b"second image bytes")
+    return "two images"
+''')
+    messages = [{"role": "user", "content": [
+        {"type": "image", "freetoken_ref": {"kind": "url", "data": "https://example.com/image.png"}},
+        {"type": "text", "text": "compare"},
+        {"type": "image", "freetoken_ref": {"kind": "b64", "data": "aW1hZ2U="}},
+    ]}]
+    manager = TokenizeManager(FakeDsv4Tokenizer(tmp_path))
+    msg = TokenizeMsg(uid=1, text=messages, sampling_params=SamplingParams())
+    original = copy.deepcopy(messages)
+    assert manager.render_prompt(msg) == "two images"
+    assert messages == original
+    assert len(collect_image_refs(messages)) == 2
+    msg.images = [b"first image bytes", b"second image bytes"]
+    stripped = copy.deepcopy(messages)
+    assert manager.render_prompt(msg) == "two images"
+    assert messages == stripped
+
+
 def test_tokenize_manager_uses_dsv4_encoder_when_chat_template_is_missing(tmp_path):
     encoding_dir = tmp_path / "encoding"
     encoding_dir.mkdir()
@@ -285,3 +315,28 @@ def test_tokenize_survives_an_unhashable_effort():
     manager.tokenize([msg])
 
     assert "reasoning_effort" not in tokenizer.chat_template_kwargs
+
+
+@pytest.mark.parametrize("budget", [1, 25, 50, 75, 100])
+def test_numeric_encoder_effort_survives_prompt_rendering(tmp_path, budget):
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding.py").write_text('''
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    if thinking_mode != "thinking":
+        return "chat"
+    effort = "high" if reasoning_effort is None else reasoning_effort
+    if isinstance(effort, str):
+        effort = {"low": 50, "high": 75, "max": 100}[effort]
+    if type(effort) is not int or not 1 <= effort <= 100:
+        raise ValueError("invalid budget")
+    return f"Reasoning Effort: {effort}"
+''')
+    manager = TokenizeManager(FakeDsv4Tokenizer(tmp_path))
+    msg = TokenizeMsg(
+        uid=1, text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"enable_thinking": True, "reasoning_effort": budget},
+    )
+    assert manager.render_prompt(msg) == f"Reasoning Effort: {budget}"
+    assert msg.chat_template_kwargs["reasoning_effort"] == budget

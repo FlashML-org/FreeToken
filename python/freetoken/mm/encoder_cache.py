@@ -1,4 +1,4 @@
-"""Encoder embedding cache keyed by content hash; an entry lives while any request still has rows of it to gather."""
+"""Encoder embeddings keyed by content hash, retained through their consumers' prefill when replay is enabled."""
 
 from __future__ import annotations
 
@@ -20,13 +20,16 @@ class _Entry:
 
 
 class EncoderCache:
-    def __init__(self, storage: str = "cpu") -> None:
+    def __init__(self, storage: str = "cpu", *, retain_until_prefill_end: bool = False) -> None:
         assert storage in ("cpu", "cuda")
         self._storage = storage
+        self.retain_until_prefill_end = retain_until_prefill_end
         self._entries: Dict[int, _Entry] = {}
 
     def register(self, item_hash: int, uid: int, rows: int) -> None:
         """Claim rows of the image for uid before any of its chunks run; a repeated image adds up."""
+        if self.retain_until_prefill_end:
+            rows = max(rows, 1)  # a prefix hit may still replay rows of an otherwise consumed image
         if rows <= 0:
             return
         entry = self._entries.setdefault(item_hash, _Entry())
@@ -59,6 +62,8 @@ class EncoderCache:
 
     def consume(self, item_hash: int, uid: int, rows: int) -> None:
         """Account rows uid gathered; the last row of the last holder frees the entry."""
+        if self.retain_until_prefill_end:
+            return
         entry = self._entries[item_hash]
         left = entry.remaining[uid] - rows
         assert left >= 0, f"request {uid} gathered more rows of image {item_hash} than it registered"
@@ -70,7 +75,7 @@ class EncoderCache:
             del self._entries[item_hash]
 
     def release(self, uid: int, hashes: list[int]) -> None:
-        """Drop uid's claims whatever it gathered (abort); entries nobody else holds are freed."""
+        """Drop uid's claims on completion or abort; entries nobody else holds are freed."""
         for h in hashes:
             entry = self._entries.get(h)
             if entry is None:

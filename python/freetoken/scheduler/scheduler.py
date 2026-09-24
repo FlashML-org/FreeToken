@@ -85,8 +85,10 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
+            # the history the cache keeps behind a reusable position: the window, or more when the
+            # model's resume recomputes into it (KVCacheGroupSpec.swa_resume_history)
             sliding_window_size=next(
-                (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
+                (g.resume_history for g in config.model_config.kv_cache_group_specs() if g.resume_history is not None),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
@@ -329,6 +331,9 @@ class Scheduler(SchedulerIOMixin):
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
                     continue
+                if batch.is_prefill and req.mm_items and self.engine.encoder_cache is not None:
+                    # Only a final prefill chunk reaches this branch; replay no longer needs its images.
+                    self.engine.encoder_cache.release(req.uid, [item.hash for item in req.mm_items])
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
@@ -349,7 +354,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                # Overlap can advance device_len ahead of the token delivered to the host.
+                # Overlap can advance device_len one token ahead of this host reply.
                 hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
@@ -737,17 +742,10 @@ class Scheduler(SchedulerIOMixin):
         the CONCRETE current window (usable pages) so a rollback restores it byte-for-byte,
         whether it was pinned or ratio-derived."""
         eng = self.engine
-        config = self.config
-        mc = config.model_config
-        num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
-            sizes = getattr(eng.kv_cache, "sizes", None)
-            if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
-                num_swa_pages = max(0, sizes.n_win_pages - 1)
-        elif getattr(mc, "has_swa_attention", False) and (
-            getattr(config, "cache_type", None) == "swa_radix"
-        ):  # usable window tokens = pool tokens minus the slot-0 sentinel
-            num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import window_pool_spec
+
+        spec = window_pool_spec(self.config)
+        num_swa_pages = eng.kv_cache.window_pages if spec is not None else None
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
@@ -853,7 +851,8 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
-        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        starts = [self.engine.model.prefill_start(r) for r in batch.padded_reqs]
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache, starts=starts)
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan

@@ -57,7 +57,7 @@ class TokenizeManager:
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
-        self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        self._logged_effort_maps: set[tuple[Any, str | int | None]] = set()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
         results: List[UserMsg] = []
@@ -104,7 +104,7 @@ class TokenizeManager:
         if not isinstance(msg.text, list):
             return msg.text
         return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {}), images=msg.images
         )
 
     def _render(
@@ -112,12 +112,13 @@ class TokenizeManager:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
+        *, images: list[bytes] | None = None,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
-                self._dsv4_encoder, messages, tools, chat_template_kwargs
+                self._dsv4_encoder, messages, tools, chat_template_kwargs, images=images
             )
         # Broadcast the effort in every spelling the ecosystem's templates read
         # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
@@ -197,8 +198,12 @@ def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleTy
     model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
     if not model_path:
         return None
-    encoder_path = os.path.join(str(model_path), "encoding", "encoding_dsv4.py")
-    if not os.path.isfile(encoder_path):
+    # DeepSeek-V4 ships encoding/encoding_dsv4.py, V4.1 encoding/encoding.py; same encode_messages contract
+    encoder_path = next(
+        (p for p in (os.path.join(str(model_path), "encoding", name) for name in ("encoding_dsv4.py", "encoding.py")) if os.path.isfile(p)),
+        None,
+    )
+    if encoder_path is None:
         return None
     spec = importlib.util.spec_from_file_location("encoding_dsv4", encoder_path)
     if spec is None or spec.loader is None:
@@ -215,9 +220,28 @@ def _apply_dsv4_chat_encoder(
     messages: list[dict],
     tools: list[dict] | None,
     chat_template_kwargs: dict,
+    *, images: list[bytes] | None = None,
 ) -> str:
     rendered_messages = [dict(message) for message in messages]
+    image_data = iter(images) if images is not None else None
     for message in rendered_messages:
+        if isinstance(message.get("content"), list):
+            content = []
+            for part in message["content"]:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    # Prerender still has refs; the tokenizer worker receives fetched bytes.
+                    # The checkpoint encoder validates sources even when rendering only text.
+                    ref = part.get("freetoken_ref")
+                    if image_data is not None:
+                        try:
+                            part = {"type": "image", "data": next(image_data)}
+                        except StopIteration:
+                            raise ValueError("image blocks outnumber fetched images") from None
+                    elif ref is not None:
+                        key = "data" if ref["kind"] == "b64" else "url"
+                        part = {"type": "image", key: ref["data"]}
+                content.append(part)
+            message["content"] = content
         if message.get("tool_calls"):
             message["tool_calls"] = _dsv4_tool_calls(message["tool_calls"])
     if tools:

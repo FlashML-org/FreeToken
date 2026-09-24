@@ -26,6 +26,12 @@ if TYPE_CHECKING:
 
 
 class BaseLLMModel(ABC, BaseOP):
+    replays_prefill = False
+
+    def prefill_start(self, req) -> int:
+        """First token the model recomputes; multimodal gathering uses the same interval."""
+        return req.cached_len
+
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 

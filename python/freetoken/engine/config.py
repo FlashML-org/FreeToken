@@ -34,6 +34,9 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # DeepSeek-V4.1 decoder prefill: "bounded" (default) runs the decoder layers on each prompt's last
+    # window (Decoder SWA Bounded Replay, DeepSeek's deployment); "exact" runs them on every token.
+    decoder_replay: str = "bounded"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

@@ -637,6 +637,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--decoder-replay",
+        default=ServerArgs.decoder_replay,
+        choices=["bounded", "exact"],
+        help=(
+            "DeepSeek-V4.1 decoder prefill. 'bounded' (default) runs the 20 decoder layers on each "
+            "prompt's last 128 tokens with the sliding window truncated there (DeepSeek's Decoder SWA "
+            "Bounded Replay); 'exact' runs them on every prompt token (the reference numerics)."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",

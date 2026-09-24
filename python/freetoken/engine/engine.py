@@ -129,6 +129,8 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
+    if AttnType.CSA2 in required:
+        candidates.append(("csa2_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
@@ -397,7 +399,7 @@ class Engine:
             from freetoken.mm.processor import get_mm_processor
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
-            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device, retain_until_prefill_end=self.model.replays_prefill)
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
                 f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
@@ -812,6 +814,8 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        method = sample.quant_method
+        scheme = method.scheme if method is not None else None
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -823,7 +827,9 @@ class Engine:
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
+            fmt=method.cpu_format if method is not None else None,
+            # the W4A8 activation block rides the expert scheme (DeepSeek-V4: 128, V4.1: 32)
+            act_block=scheme.act_block(128) if scheme is not None else 128,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1200,6 +1206,49 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     return requested
 
 
+def _adjust_csa2_config(config: EngineConfig, override) -> None:
+    """DeepSeek-V4.1 (CSA2) config reconciliation, the DSV4 policy with the replay knob: sync the
+    runtime into ``dsv41_args``, page_size = the window page P, radix -> swa_radix, decode graph
+    batches <= max_running_req. Unlike DSV4 the prefill chunk keeps ``max_extend_tokens`` (whole
+    window pages): at a 1M ceiling the window pool alone would admit ~40K-token chunks whose
+    activations (64 x 512 latent queries per token) do not fit next to the expert cache."""
+    import dataclasses
+
+    from freetoken.models.deepseek_v41.config import csa2_geometry
+
+    model_config = config.model_config
+    args = model_config.dsv41_args
+    args.max_seq_len = config.max_seq_len
+    args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    args.decoder_replay = config.decoder_replay
+    # the replay mode decides how much live window history a prefix hit needs (geometry.resume_windows):
+    # rebuild the attention group's geometry so the cache manager, the pool and its cost model agree
+    object.__setattr__(  # ModelConfig is frozen; this is the config-resolution step that owns it
+        model_config, "attention_groups",
+        tuple(dataclasses.replace(g, geometry=csa2_geometry(args)) if getattr(g, "kind", None) == "csa2" else g for g in model_config.attention_groups),
+    )
+    P = args.window_size
+    override("page_size", P)
+    logger.info_rank0(
+        f"CSA2 KV pages are {P}-token window pages; page_size set to {P}; decoder replay: {args.decoder_replay} "
+        f"(prefix hits keep {csa2_geometry(args).resume_history} tokens of window history)"
+    )
+    if getattr(config, "cache_type", "radix") != "naive":
+        override("cache_type", "swa_radix")
+    current = getattr(config, "max_extend_tokens", None)  # a SchedulerConfig field
+    if current is not None and (extend := max(P, current // P * P)) != current:
+        override("max_extend_tokens", extend)
+    mr = config.max_running_req
+    if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > mr:
+        logger.warning_rank0(f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds max_running_req {mr}; clamping (larger decode batches never occur).")
+        override("cuda_graph_max_bs", mr)
+    if config.cuda_graph_bs is not None:
+        kept = [bs for bs in config.cuda_graph_bs if bs <= mr]
+        if kept != list(config.cuda_graph_bs):
+            logger.warning_rank0(f"dropping cuda_graph_bs entries above max_running_req {mr}: {[bs for bs in config.cuda_graph_bs if bs > mr]}")
+            override("cuda_graph_bs", kept)
+
+
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
@@ -1477,6 +1526,7 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    is_csa2 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
@@ -1520,6 +1570,8 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+    if is_csa2:
+        _adjust_csa2_config(config, override)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
@@ -1806,7 +1858,7 @@ def _adjust_config(config: EngineConfig):
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
-    if seq_override is not None and rotary is not None and not is_dsv4:
+    if seq_override is not None and rotary is not None and not (is_dsv4 or is_csa2):
         if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "

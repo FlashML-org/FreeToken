@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 
 class MessageContent(BaseModel):
@@ -77,7 +77,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
-    reasoning_effort: str | None = None
+    reasoning_effort: str | StrictInt | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
     # foreign shape stays ignored (extra="allow" swallowed it before this field
     # existed) instead of becoming a bare 422 at the route boundary; the handler
