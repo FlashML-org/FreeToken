@@ -64,12 +64,12 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
-        # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([
             CppExtension(
-                name="freetoken.kernel._ple_store",
+                name="freetoken.kernel._row_store",
                 sources=[
-                    "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                    "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
                 ],
                 extra_compile_args=["-O3", "-std=c++17"],
             )
