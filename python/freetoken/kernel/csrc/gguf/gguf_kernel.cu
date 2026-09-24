@@ -83,8 +83,14 @@ torch::Tensor ggml_dequantize(
   at::Tensor DW = torch::empty({m, n}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+  // These kernels are vendored from sgl-kernel/llama.cpp; the guards below are a FreeToken addition
+  // to prevent silent data corruption from unsupported quant types.
   DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+    TORCH_CHECK(to_cuda != nullptr,
+                "ggml_dequantize: unsupported GGUF quant type ", type,
+                " (dequant kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/"
+                "IQ2_XS/IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
 
@@ -184,6 +190,10 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_mul_mat_vec_a8: unsupported GGUF quant type ", type,
+                    " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
+                    "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
   });
   return Y;
@@ -327,6 +337,10 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_mul_mat_a8: unsupported GGUF quant type ", type,
+                    " (MMQ kernels exist only for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K; "
+                    "I-quants must route through ggml_dequantize)");
     }
   });
   return Y;
@@ -533,6 +547,10 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_moe_a8: unsupported GGUF quant type ", type,
+                    " (MMQ kernels exist only for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K; "
+                    "I-quants must route through ggml_dequantize)");
     }
   });
   return Y;
@@ -804,6 +822,10 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_moe_a8_vec: unsupported GGUF quant type ", type,
+                    " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
+                    "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
   });
   return Y;
@@ -831,8 +853,12 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_K;
     case 14:
       return MOE_X_Q6_K;
+    default:
+      TORCH_CHECK(false, "ggml_moe_get_block_size: unsupported GGUF quant type ", type,
+                  " (MMQ kernels exist only for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K; "
+                  "I-quants must route through ggml_dequantize)");
+      return 0;  // unreachable but silences compiler warning
   }
-  return 0;
 }
 
 // ---- FreeToken pybind bindings (donor registers these via TORCH_LIBRARY; we
