@@ -245,3 +245,31 @@ def test_triton_pre_only_matches_torch():
     assert (got_post.float() - ref_post.float()).abs().max().item() < 2e-3
     assert (got_comb.float() - ref_comb.float()).abs().max().item() < 2e-3
     assert (got_li.float() - ref_li.float()).abs().max().item() < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_tuned_mhc_preserves_chunked_results_and_graph_replay():
+    from freetoken.kernel.triton.mhc import mhc_fused_post_pre_single_pass_triton as fused
+
+    torch.manual_seed(26)
+    hidden, tokens = 5120, 7
+    res = torch.randn(tokens, N, hidden, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    post = torch.rand(tokens, N, 1, device="cuda")
+    comb = torch.softmax(torch.randn(tokens, N, N, device="cuda"), -1)
+    pre = torch.rand(tokens, N, device="cuda")
+    fn = torch.randn(2 * N + N * N, N * hidden, device="cuda") * 0.05
+    scale, base = torch.ones(3, device="cuda"), torch.zeros(2 * N + N * N, device="cuda")
+    def run(lo, hi):
+        return fused(x[lo:hi], res[lo:hi], post[lo:hi], comb[lo:hi], pre[lo:hi], fn, scale, base,
+                     RMS_EPS, EPS, POST_MULT, SINKHORN)
+    whole = run(0, tokens)
+    chunks = [run(0, 2), run(2, tokens)]
+    for i, expected in enumerate(whole):
+        assert torch.equal(expected, torch.cat([chunk[i] for chunk in chunks]))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(0, tokens)
+    graph.replay()
+    for got, expected in zip(captured, whole):
+        assert torch.equal(got, expected)
