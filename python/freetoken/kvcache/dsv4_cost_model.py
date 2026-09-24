@@ -28,14 +28,12 @@ _FP32_BYTES = 4
 
 
 def dsv4_reserved_window_pages(max_running_req: int, radix: bool) -> int:
-    """Window pages the sliding pool must always keep for the concurrent working set: each
-    running request's decode transients (2 per req + dummy) plus, in radix mode, PER concurrent
-    request one locked live-tail page AND a retained (soft-pinned) prompt-end window -- the
-    window is 2 pages here because the retention gap page-aligns to a whole extra page at
-    P==window==128, so a distinct follow-up per running request can re-lock 2 pages each.
-    Shared by the engine's window-floor and the manager's prefill_chunk_budget so both
-    reserve the same set."""
-    return 2 * (max_running_req + 1) + (3 * max_running_req if radix else 0) + 1
+    """Window pages the sliding pool must always keep for the concurrent working set; the
+    formula is shared with every sliding-window paged pool (``window_tier.reserved_window_pages``)
+    and by the engine's window-floor and the manager's prefill_chunk_budget."""
+    from .window_tier import reserved_window_pages
+
+    return reserved_window_pages(max_running_req, radix)
 
 
 def ring_size_for_ratio(ratio: int) -> int:

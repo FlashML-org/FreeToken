@@ -120,12 +120,10 @@ def derive_model_card(config: Any) -> dict:
 
 
 def _swa_page_size(config: Any) -> int:
-    """The window pool's own page unit: P (window_size) for DSV4, 1 token for radix-SWA.
-    Mirrors compute_cache_pools' swa_page_size."""
-    dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None)
-    if dsv4 is not None:
-        return int(getattr(dsv4, "window_size", 0) or 1)
-    return 1
+    from freetoken.kvcache.cache_status import window_pool_spec
+
+    spec = window_pool_spec(config)
+    return spec.page_size if spec is not None else 1
 
 
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:

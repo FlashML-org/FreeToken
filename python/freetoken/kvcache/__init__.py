@@ -46,6 +46,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
+    if AttnType.CSA2 in types:
+        from .csa2_paged_pool import CSA2PagedKVCache
+
+        return CSA2PagedKVCache
     if AttnType.SWA in types:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -95,6 +99,22 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
+            n_scratch=config.max_running_req + 1,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
+    from .csa2_paged_pool import CSA2PagedKVCache
+
+    if resolve_pool_class(model_config) is CSA2PagedKVCache:
+        from .csa2_cost_model import _csa2_pool_sizes, csa2_geometry
+
+        # Same route as DSV4: the generic CacheManager over the shared page table; the pool is the
+        # swa_pool plug-in (window tier + per-source packed main / index pools + state rings).
+        pool = CSA2PagedKVCache(
+            sizes=_csa2_pool_sizes(config, num_pages + 1),  # +1 for dummy page
+            geom=csa2_geometry(config),
+            device=device,
+            dtype=dtype,
             n_scratch=config.max_running_req + 1,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")

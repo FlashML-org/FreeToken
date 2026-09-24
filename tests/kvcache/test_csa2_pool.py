@@ -1,0 +1,202 @@
+"""CSA2 paged KV pool + cost model (CPU, no model): geometry validation, per-source tiers, sizing /
+byte accounting, the window free-list duck-type, full-loc translation; packed writes on CUDA."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from freetoken.kvcache.csa2_cost_model import (
+    csa2_cache_per_page,
+    csa2_kv_unit_bytes,
+    csa2_pool_bytes,
+    csa2_pool_sizes,
+    csa2_solve_num_pages,
+    csa2_window_unit_bytes,
+)
+from freetoken.kvcache.csa2_geometry import CSA2Geometry
+from freetoken.kvcache.csa2_paged_pool import CSA2PagedKVCache
+from freetoken.kvcache.row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
+
+DEVICE = torch.device("cpu")
+P = 128
+# a 10-layer miniature of V4.1's layout: 2 window-only, ratio-2 encoder (source 2, source 5), ratio-1 decoder (source 7)
+RATIOS = (0, 0, 2, 2, 2, 2, 2, 1, 1, 1)
+SOURCES = (2, 5, 7)
+
+
+def _geom(**over) -> CSA2Geometry:
+    base = dict(n_layers=10, head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES)
+    base.update(over)
+    return CSA2Geometry(**base)
+
+
+def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
+    geom = _geom()
+    sizes = csa2_pool_sizes(num_pages, geom, swa_ratio, P)
+    return CSA2PagedKVCache(sizes, geom, DEVICE, n_scratch=n_scratch), sizes, geom
+
+
+def test_window_control_uses_pool_units_and_restores_concrete_capacity():
+    from types import SimpleNamespace
+
+    from freetoken.attention import AttnType
+    from freetoken.kvcache.cache_status import (
+        _supports_swa_ratio, compute_cache_floors, compute_cache_pools,
+    )
+    from freetoken.kvcache.csa2_cost_model import _csa2_pool_sizes
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.server.api_server import CacheRebuildRequest, _resolve_num_swa_pages, cache_geometry
+    from freetoken.server.stats import _swa_page_size
+
+    pool, _, geom = _pool(num_pages=64)
+    config = SimpleNamespace(
+        page_size=P, max_running_req=1, max_seq_len=1024, cache_type="swa_radix",
+        swa_full_tokens_ratio=0.5, swa_num_pages_override=None,
+        model_config=SimpleNamespace(
+            dsv4_args=None, has_swa_attention=False,
+            attention_groups=[SimpleNamespace(geometry=geom)],
+            kv_cache_group_specs=lambda: [SimpleNamespace(attn_type=AttnType.CSA2)],
+        ),
+    )
+    engine = SimpleNamespace(
+        config=config, kv_cache=pool, num_pages=63,
+        moe_offload_cache=None, linear_state_pool=None,
+    )
+    assert _supports_swa_ratio(config)
+    assert compute_cache_pools(engine)["swa_page_size"] == P
+    assert compute_cache_pools(engine)["num_swa_pages"] == 31
+    floor = _csa2_pool_sizes(config, 64, num_swa_pages=1).n_win_pages - 1
+    assert compute_cache_floors(engine)["swa_tokens"] == floor * P
+    prior = Scheduler._current_cache_geometry(SimpleNamespace(engine=engine, config=config))
+    assert prior["num_swa_pages"] == 31
+    state = SimpleNamespace(config=config, cache_pools=compute_cache_pools(engine))
+    req = CacheRebuildRequest(num_pages=64, swa_full_tokens_ratio=0.5)
+    assert _resolve_num_swa_pages(state, req) == 32
+    assert _swa_page_size(config) == P
+    state.stats = SimpleNamespace(kv_total_pages=63, mamba_total_slots=0)
+    state.last_rebuild = {"num_pages": 64, "num_swa_pages": 32}
+    assert cache_geometry(state)["swa_full_tokens_ratio"] == 0.5
+    pool._init_paged_state(1, True)
+    pool.rebuild_from_config(config, 63, num_swa_pages=24)
+    assert pool.window_pages == 24
+    pool.rebuild_from_config(config, prior["num_pages"], num_swa_pages=prior["num_swa_pages"])
+    assert pool.window_pages == 31
+
+
+def test_geometry_derives_sources_and_rings():
+    g = _geom()
+    assert [g.kv_source_of(l) for l in range(10)] == [None, None, 2, 2, 2, 5, 5, 7, 7, 7]
+    assert g.ring_sources == (2, 5) and g.ring_size(2) == 2
+    assert g.win_row_bytes == 528 and g.main_row_bytes == 288 and g.idx_row_bytes == 68 and g.state_bytes == 4096
+    with pytest.raises(ValueError):  # a compressing layer before its first source
+        _geom(kv_source_layer_ids=(5, 7))
+    with pytest.raises(ValueError):  # a consumer whose source has another ratio
+        _geom(compress_ratios=(0, 0, 2, 2, 1, 2, 2, 1, 1, 1))
+    with pytest.raises(ValueError):  # a window-only "source"
+        _geom(kv_source_layer_ids=(0, 2, 5, 7))
+
+
+def test_v41_global_kv_is_890_bytes_per_token():
+    """The tech report's headline: 3 ratio-2 encoder sources + 1 ratio-1 decoder source = 890 B/token."""
+    ratios = (0, 0) + (2,) * 18 + (1,) * 20
+    g = CSA2Geometry(n_layers=40, head_dim=512, index_head_dim=128, window=128, compress_ratios=ratios, kv_source_layer_ids=(2, 8, 14, 20))
+    per_token_global = sum((g.main_row_bytes + g.idx_row_bytes) // g.ratio_of(s) for s in g.kv_source_layer_ids)
+    assert per_token_global == 890
+    assert csa2_kv_unit_bytes(g, 128) == 890 + 8  # + the int64 full->window map slot
+
+
+def test_pool_tiers_per_source_and_aliasing():
+    pool, sizes, geom = _pool()
+    assert len(pool.window_pool) == 10 and pool.window_pool[0].shape == (sizes.n_win_slots, 528)
+    assert set(pool.main_pool) == set(SOURCES) == set(pool.idx_pool)
+    assert set(pool.state_ring) == {2, 5}  # the ratio-1 decoder source carries no partial group
+    assert pool.main_pool[2].shape == (sizes.full_token // 2 + 1, 288)
+    assert pool.main_pool[7].shape == (sizes.full_token + 1, 288)
+    assert pool.idx_pool[5].shape == (sizes.full_token // 2 + 1, 68)
+    assert pool.main_pool_of(4) is pool.main_pool[2] and pool.idx_pool_of(9) is pool.idx_pool[7]
+    assert pool.scratch_base[2] == sizes.full_token // 2
+    with pytest.raises(AssertionError):
+        pool.main_pool_of(0)
+    ring = pool.state_ring[2]
+    assert ring.ring_size == 2 and ring.item_size == 512 and ring.buffer.shape == (sizes.state_slots[2] + 1, 1024)
+    assert torch.all(ring.buffer[-1, :512] == 0) and torch.all(torch.isneginf(ring.buffer[-1, 512:]))
+
+
+def test_pool_bytes_match_allocation_and_solver_respects_budget():
+    pool, sizes, geom = _pool(num_pages=16, swa_ratio=0.25)
+    assert pool.total_bytes() == csa2_pool_bytes(sizes, geom, n_scratch=1)
+    assert csa2_cache_per_page(geom, 0.25, P) > 0
+    assert csa2_window_unit_bytes(geom, P) == -(-(10 * P * 528 + 2 * 2 * 4096) // P)
+    budget = 64 << 20
+    solved = csa2_solve_num_pages(budget, geom, 0.25, floor_win_pages=4, P=P, n_scratch=3)
+    assert csa2_pool_bytes(solved, geom, 3) <= budget
+    # one more page, sized the way the solver sizes (window = max(floor, ceil(ratio * pages))), overflows
+    more = solved.full_token // P + 1
+    bigger = csa2_pool_sizes(more, geom, 0.25, P, n_win_pages=max(4, (round(0.25 * more * P) + P - 1) // P))
+    assert csa2_pool_bytes(bigger, geom, 3) > budget
+    assert solved.n_win_pages >= 4
+    with pytest.raises(ValueError):
+        csa2_solve_num_pages(1 << 10, geom, 0.25, floor_win_pages=4, P=P)
+
+
+def test_translation_state_loc_and_cmp_rows():
+    pool, sizes, geom = _pool(num_pages=16)
+    pool.bind_window_pages(full_page_base=0, window_page_base=2 * P)
+    pool.bind_window_pages(full_page_base=3 * P, window_page_base=0)
+    assert pool.translate_full_to_window(torch.tensor([0, 1, 127])).tolist() == [2 * P, 2 * P + 1, 2 * P + 127]
+    assert pool.translate_full_to_window(torch.tensor([3 * P + 5])).item() == 5
+    assert pool.translate_full_to_window(torch.tensor([P + 7, -1])).tolist() == [-1, -1]
+    full = torch.tensor([0, 1, 2, 127, 128, 4 * P - 1])
+    assert pool.cmp_rows(full, 2).tolist() == [0, 0, 1, 63, 64, 2 * P - 1]
+    assert pool.cmp_rows(full, 1).tolist() == full.tolist()
+    assert pool.cmp_rows(torch.tensor([-1]), 2).item() < 0
+    top = pool.cmp_rows(torch.tensor([sizes.full_token - 1]), 2).item()
+    assert top < pool.scratch_base[2]
+    ws = pool.translate_full_to_window(torch.tensor([127, 3 * P]))
+    assert CSA2PagedKVCache.state_loc(ws, 2, P).tolist() == [2 * 2 + 1, 0]
+    assert CSA2PagedKVCache.state_loc(torch.tensor([-1]), 2, P).item() == -1
+
+
+def _expand(bases):
+    return (torch.tensor(bases, dtype=torch.int64)[:, None] + torch.arange(P)).flatten()
+
+
+def test_swa_duck_type_alloc_free_and_dummy():
+    pool, sizes, _ = _pool(num_pages=8)
+    pool._init_paged_state(max_running_req=2, radix=True)
+    cap = sizes.n_win_slots - P
+    assert pool.swa_available_size() == cap and pool.swa_num_tokens - 1 == cap
+    assert pool.sliding_window_size == P and pool.prefill_chunk_budget >= P
+    pool.alloc_swa(_expand([0, 2 * P]))
+    assert pool.swa_available_size() == cap - 2 * P
+    ws = pool.translate_loc_from_full_to_swa(torch.arange(2 * P, 3 * P))
+    assert (ws >= 0).all() and int(ws[0]) % P == 0 and torch.equal(ws - ws[0], torch.arange(P))
+    pool.free_swa(_expand([0]))
+    pool.free_swa(_expand([0]))  # idempotent
+    assert pool.swa_available_size() == cap - P
+    with pytest.raises(AssertionError):
+        pool.free_swa(torch.arange(2 * P, 2 * P + 5))
+    dummy = pool.translate_loc_from_full_to_swa(torch.arange(sizes.full_token - P, sizes.full_token))
+    assert int(dummy[0]) == sizes.n_win_slots - P
+    assert pool.k_cache(3) is pool.window_pool[3] and pool.num_layers == 10 and pool.unit_bytes()[0] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="packed writes run through triton")
+def test_packed_writes_round_trip_on_cuda():
+    from kernels.test_csa2_pack import reference_roundtrip  # tests/ is on sys.path under pytest
+
+    geom = _geom()
+    sizes = csa2_pool_sizes(4, geom, 0.5, P)
+    pool = CSA2PagedKVCache(sizes, geom, torch.device("cuda"), n_scratch=2)
+    kv = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([0, 130, 5], device="cuda")
+    pool.store_window(kv, 4, slots)
+    assert torch.equal(pool.read_window(4, slots), reference_roundtrip(kv, FP8_E8M0_B32))
+    pool.store_main(kv, 2, slots)
+    assert torch.equal(pool.read_main(2, slots), reference_roundtrip(kv, FP4_E4M3_B16))
+    k = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    pool.store_index(k, 7, slots)
+    assert torch.equal(pool.read_index(7, slots), reference_roundtrip(k, FP4_E8M0_B32))
+    pool.store_kv(kv, kv, slots, 0)
+    assert torch.equal(pool.read_window(0, slots), reference_roundtrip(kv, FP8_E8M0_B32))

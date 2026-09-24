@@ -8,7 +8,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.config import KVCacheGroupSpec
 from freetoken.utils import align_ceil, div_even
 
-from .base import BaseKVCachePool
+from .base import BaseKVCachePool, WindowPoolSpec
 
 
 @dataclass(frozen=True)
@@ -294,6 +294,16 @@ class HybridSWAKVCache(BaseKVCachePool):
             # geometry, atomic with the buffer realloc. The fresh empty SWA radix tree built
             # by CacheManager.rebuild is then consistent by construction (idle-only).
             self._init_swa_paged_state()
+
+    @classmethod
+    def window_spec(cls, config) -> WindowPoolSpec | None:
+        if config.cache_type != "swa_radix":
+            return None
+        return WindowPoolSpec(1, _swa_pool_floor(config))
+
+    @property
+    def window_pages(self) -> int:
+        return self.swa_num_tokens - 1
 
     @classmethod
     def kv_cost(cls, config, *, num_swa_pages: int | None = None) -> tuple[int, int, int, int]:

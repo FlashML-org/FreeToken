@@ -127,6 +127,15 @@ class KVCacheGroupSpec:
     # (QSA groups, glm5_next kpool pools; 1 keeps the per-token BSA/DSA slab). The
     # pool factory and the KV cost model divide by the same value.
     index_ratio: int = 1
+    # Live window-tier history (tokens) the cache manager must keep behind a reusable
+    # position -- what prefix matching demands, locking pins and the eviction frontiers
+    # retain. None = ``sliding_window`` (a resume needs exactly its window); CSA2 under
+    # bounded replay needs two windows (the recompute of the window before the hit).
+    swa_resume_history: int | None = None
+
+    @property
+    def resume_history(self) -> int | None:
+        return self.swa_resume_history if self.swa_resume_history is not None else self.sliding_window
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
@@ -215,11 +224,32 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     sliding_window: int  # the P-token window page
 
 
+@dataclass(frozen=True)
+class CSA2AttentionGroupConfig(BaseAttentionGroupConfig):
+    """CSA2 sparse attention (DeepSeek-V4.1: window + cross-layer-shared compressed KV in
+    packed rows + hierarchical indexer). Standalone like DSV4's group so no SWA/MLA gate
+    reroutes it. ``geometry`` is the kvcache-side description the pool and its cost model
+    price themselves from."""
+
+    kind: ClassVar[Literal["csa2"]] = "csa2"
+    cache_kind: ClassVar[Literal["csa2_paged"]] = "csa2_paged"
+
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int  # the P-token window page
+    geometry: Any  # freetoken.kvcache.csa2_geometry.CSA2Geometry
+
+    @property
+    def resume_history(self) -> int:
+        return self.geometry.resume_history
+
+
 AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
+    | CSA2AttentionGroupConfig
 )
 
 
@@ -327,6 +357,9 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    # DeepSeek-V4.1 payload (DeepseekV41Args): CSA2 layer roles, Engram, replay policy. Opaque
+    # to model-agnostic engine code; None for every other model.
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
@@ -503,6 +536,19 @@ class ModelConfig:
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
                         attn_type=AttnType.DSV4,
+                    )
+                )
+            elif isinstance(group, CSA2AttentionGroupConfig):
+                # Taxonomy entry only, like DSV4: the pool prices itself from group.geometry.
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=group.sliding_window,
+                        attn_type=AttnType.CSA2,
+                        swa_resume_history=group.resume_history,
                     )
                 )
         return tuple(specs)
