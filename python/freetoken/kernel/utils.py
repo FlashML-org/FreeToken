@@ -23,10 +23,10 @@ DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
-DEFAULT_ROCM_ARCHES = ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1200", "gfx1201")
 
 
-ARCH_LIST_ENV = "TVM_FFI_CUDA_ARCH_LIST"
+CUDA_ARCH_LIST_ENV = "TVM_FFI_CUDA_ARCH_LIST"
+ROCM_ARCH_LIST_ENV = "TVM_FFI_ROCM_ARCH_LIST"
 
 
 def _is_rocm() -> bool:
@@ -37,7 +37,7 @@ def _is_rocm() -> bool:
 
 def _cuda_arch_list() -> List[str]:
     """Archs a CUDA build targets: the AOT build's TVM_FFI_CUDA_ARCH_LIST, else the GPU this process is bound to."""
-    arch_list = os.getenv(ARCH_LIST_ENV, "").split()
+    arch_list = os.getenv(CUDA_ARCH_LIST_ENV, "").split()
     if arch_list:
         return arch_list
     import torch
@@ -48,17 +48,34 @@ def _cuda_arch_list() -> List[str]:
     return [f"{major}.{minor}"]
 
 
+def _rocm_arch_list() -> List[str]:
+    """The single ROCm GPU this process is bound to, or an explicit cross-compile target."""
+    from freetoken.utils.arch import get_rocm_gfx_arch
+
+    arch = get_rocm_gfx_arch()
+    if arch is None:
+        raise RuntimeError(
+            "Could not determine the bound ROCm GPU architecture; select a visible GPU "
+            "or set FREETOKEN_ROCM_ARCH for cross-compilation"
+        )
+    return [arch]
+
+
 @contextlib.contextmanager
-def _pin_tvm_ffi_arch_ctx(arch_list: List[str]) -> Iterator[None]:
-    """Hand tvm-ffi the arch list through its env var for one build. Left unset, tvm-ffi asks nvidia-smi and takes the first GPU listed, which under --gpu or CUDA_VISIBLE_DEVICES on a mixed box is not the bound one."""
-    if os.getenv(ARCH_LIST_ENV) or not arch_list:
+def _pin_tvm_ffi_arch_ctx(arch_list: List[str], env_var: str) -> Iterator[None]:
+    """Pin tvm-ffi to the resolved targets for one build, then restore the caller's environment."""
+    if not arch_list:
         yield
         return
-    os.environ[ARCH_LIST_ENV] = " ".join(arch_list)
+    old_arch_list = os.environ.get(env_var)
+    os.environ[env_var] = " ".join(arch_list)
     try:
         yield
     finally:
-        os.environ.pop(ARCH_LIST_ENV, None)
+        if old_arch_list is None:
+            os.environ.pop(env_var, None)
+        else:
+            os.environ[env_var] = old_arch_list
 
 
 def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
@@ -74,18 +91,10 @@ def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
     return flags
 
 
-def _hip_cflags(extra: List[str]) -> List[str]:
+def _hip_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
     """HIP flags for a kernel build on ROCm."""
     # TODO(ROCm): Triton autotune configs need RDNA-specific tuning (wave count, LDS size).
-    flags = DEFAULT_HIP_CFLAGS + extra
-    raw_arches = os.getenv("FREETOKEN_ROCM_ARCH") or os.getenv("PYTORCH_ROCM_ARCH", "")
-    arches = list(dict.fromkeys(re.findall(r"gfx\d+[a-z]?", raw_arches.lower())))
-    if not arches:
-        from freetoken.utils.arch import get_rocm_gfx_arch
-
-        detected = get_rocm_gfx_arch()
-        arches = [detected] if detected else list(DEFAULT_ROCM_ARCHES)
-    return flags + [f"--offload-arch={arch}" for arch in arches]
+    return DEFAULT_HIP_CFLAGS + extra + [f"--offload-arch={arch}" for arch in arch_list]
 
 
 @cache
@@ -297,11 +306,14 @@ def load_aot(
 
     is_rocm = _is_rocm()
     arch_list: List[str] = []
-    if cuda_files and not is_rocm:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+    if cuda_files:
+        if is_rocm:
+            arch_list = _rocm_arch_list()
+        else:
+            from freetoken.kernel._toolchain import check_nvcc_matches_torch
 
-        check_nvcc_matches_torch()
-        arch_list = _cuda_arch_list()
+            check_nvcc_matches_torch()
+            arch_list = _cuda_arch_list()
 
     from tvm_ffi.cpp import load
 
@@ -316,13 +328,15 @@ def load_aot(
     cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
 
     if is_rocm:
-        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        cuda_cflags = _hip_cflags(extra_cuda_cflags, arch_list)
         runtime_ldflags = _rocm_link_flags()
+        arch_list_env = ROCM_ARCH_LIST_ENV
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags, arch_list)
         runtime_ldflags = []
+        arch_list_env = CUDA_ARCH_LIST_ENV
 
-    with _pin_tvm_ffi_arch_ctx(arch_list):
+    with _pin_tvm_ffi_arch_ctx(arch_list, arch_list_env):
         return load(
             name,
             cpp_files=cpp_files,
@@ -354,11 +368,14 @@ def load_jit(
 
     is_rocm = _is_rocm()
     arch_list: List[str] = []
-    if (cuda_files or cuda_wrappers) and not is_rocm:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+    if cuda_files or cuda_wrappers:
+        if is_rocm:
+            arch_list = _rocm_arch_list()
+        else:
+            from freetoken.kernel._toolchain import check_nvcc_matches_torch
 
-        check_nvcc_matches_torch()
-        arch_list = _cuda_arch_list()
+            check_nvcc_matches_torch()
+            arch_list = _cuda_arch_list()
 
     from tvm_ffi.cpp import load_inline
 
@@ -382,13 +399,15 @@ def load_jit(
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
     if is_rocm:
-        cuda_cflags = _hip_cflags(extra_cuda_cflags)
+        cuda_cflags = _hip_cflags(extra_cuda_cflags, arch_list)
         runtime_ldflags = _rocm_link_flags()
+        arch_list_env = ROCM_ARCH_LIST_ENV
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags, arch_list)
         runtime_ldflags = []
+        arch_list_env = CUDA_ARCH_LIST_ENV
 
-    with _pin_tvm_ffi_arch_ctx(arch_list):
+    with _pin_tvm_ffi_arch_ctx(arch_list, arch_list_env):
         return load_inline(
             name,
             cpp_sources=cpp_sources,

@@ -1,5 +1,8 @@
 import importlib
+import os
 import pathlib
+import sys
+import types
 from types import SimpleNamespace
 
 import torch
@@ -39,16 +42,55 @@ def test_rocm_arch_falls_back_to_cross_compile_env(monkeypatch):
     _clear_arch_caches()
 
 
-def test_hip_cflags_emit_one_offload_flag_per_arch(monkeypatch):
-    from freetoken.kernel.utils import _hip_cflags
+def test_hip_cflags_target_only_resolved_arch(monkeypatch):
+    from freetoken.kernel import utils
 
     monkeypatch.setenv("FREETOKEN_ROCM_ARCH", "gfx1200;gfx1201")
+    monkeypatch.setattr(arch, "get_rocm_gfx_arch", lambda: "gfx1201")
 
-    flags = _hip_cflags(["-Wno-unused-command-line-argument"])
+    arch_list = utils._rocm_arch_list()
+    flags = utils._hip_cflags(["-Wno-unused-command-line-argument"], arch_list)
 
-    assert "--offload-arch=gfx1200" in flags
+    assert arch_list == ["gfx1201"]
     assert "--offload-arch=gfx1201" in flags
-    assert not any(";" in flag for flag in flags)
+    assert "--offload-arch=gfx1200" not in flags
+
+
+def test_rocm_loaders_pin_tvm_ffi_to_resolved_arch(monkeypatch):
+    from freetoken.kernel import utils
+
+    builds = []
+
+    def record_build(*_args, **kwargs):
+        builds.append(
+            (
+                os.environ[utils.ROCM_ARCH_LIST_ENV],
+                kwargs["extra_cuda_cflags"],
+            )
+        )
+        return object()
+
+    tvm_ffi = types.ModuleType("tvm_ffi")
+    tvm_ffi.__path__ = []
+    tvm_ffi_cpp = types.ModuleType("tvm_ffi.cpp")
+    tvm_ffi_cpp.load = record_build
+    tvm_ffi_cpp.load_inline = record_build
+    monkeypatch.setitem(sys.modules, "tvm_ffi", tvm_ffi)
+    monkeypatch.setitem(sys.modules, "tvm_ffi.cpp", tvm_ffi_cpp)
+    monkeypatch.setenv(utils.DISABLE_KERNEL_CACHE_ENV, "1")
+    monkeypatch.setenv(utils.ROCM_ARCH_LIST_ENV, "gfx1100 gfx1200")
+    monkeypatch.setattr(utils, "_is_rocm", lambda: True)
+    monkeypatch.setattr(utils, "_rocm_arch_list", lambda: ["gfx1201"])
+    monkeypatch.setattr(utils, "_rocm_link_flags", lambda: [])
+
+    utils.load_aot("test_rocm_aot_arch", cuda_files=["unused.cu"])
+    utils.load_jit("test_rocm_jit_arch", cuda_files=["unused.cu"])
+
+    assert builds == [
+        ("gfx1201", [*utils.DEFAULT_HIP_CFLAGS, "--offload-arch=gfx1201"]),
+        ("gfx1201", [*utils.DEFAULT_HIP_CFLAGS, "--offload-arch=gfx1201"]),
+    ]
+    assert os.environ[utils.ROCM_ARCH_LIST_ENV] == "gfx1100 gfx1200"
 
 
 def test_rocm_link_flags_support_versioned_modular_sdk(monkeypatch, tmp_path):
