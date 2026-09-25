@@ -26,6 +26,7 @@ class BackendInfo:
     supported_types: frozenset[AttnType]
     requires_flashinfer: bool = False
     requires_sgl_kernel: bool = False
+    requires_sm90: bool = False
     requires_sm100: bool = False
     # Allowed page sizes (None -> any). Config-time resolution coerces to the last
     # entry when the resolved page_size is not in the list.
@@ -71,6 +72,7 @@ def create_fi_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_sgl_kernel=True,
+        requires_sm90=True,
     ),
 )
 def create_fa_backend(config: ModelConfig):
