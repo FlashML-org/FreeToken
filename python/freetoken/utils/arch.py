@@ -1,7 +1,57 @@
 from __future__ import annotations
 
 import functools
+import os
+import re
 from typing import Tuple
+
+
+_GFX_ARCH_RE = re.compile(r"gfx\d+[a-z]?")
+
+
+def _gfx_arch_from(value: object) -> str | None:
+    match = _GFX_ARCH_RE.search(str(value).lower())
+    return match.group(0) if match else None
+
+
+@functools.cache
+def is_rocm() -> bool:
+    """True when torch is built for ROCm (AMD GPU) instead of CUDA."""
+    import torch
+    return getattr(torch.version, "hip", None) is not None
+
+
+@functools.cache
+def get_rocm_gfx_arch() -> str | None:
+    """Return the current AMD GPU target (for example ``gfx1201``).
+
+    Prefer the runtime device because build variables may contain multiple
+    semicolon-separated targets. Environment variables remain useful for
+    cross-compilation and systems where no GPU is currently visible; in that
+    fallback mode the first target is returned. The result is process-cached
+    for FreeToken's one-process-per-GPU execution model, so callers must select
+    the intended device before the first call.
+    """
+    if not is_rocm():
+        return None
+
+    import torch
+
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            for attr in ("gcnArchName", "arch"):
+                arch = _gfx_arch_from(getattr(props, attr, ""))
+                if arch:
+                    return arch
+        except (AttributeError, RuntimeError):
+            pass
+
+    for env_var in ("FREETOKEN_ROCM_ARCH", "PYTORCH_ROCM_ARCH", "HCC_AMDGPU_TARGET"):
+        arch = _gfx_arch_from(os.getenv(env_var, ""))
+        if arch:
+            return arch
+    return None
 
 
 @functools.cache
@@ -9,6 +59,8 @@ def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
+    if is_rocm():
+        return None
     if not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
