@@ -28,6 +28,17 @@ throttling.  NVIDIA GPU tokens per second are context, not an AMD acceptance
 threshold: LAN-223 uses a shared-memory APU rather than discrete VRAM and
 PCIe.
 
+### Known scope boundary
+
+This validation targets `gfx1151`; it is not a claim of generic AMD
+architecture support. A separate public [gfx1011/ROCm 10.2 report](https://github.com/FlashML-org/flashlib/issues/24)
+describes clean prefill followed by corrupted decode in a routed-expert
+offload path and suspects `flashlib.kernels.slot_cache.lru_ensure`. That
+report has not been reproduced on `gfx1151`, and its author did not establish
+the kernel root cause. Until revision-scoped target tests exercise both
+cache hits and misses, this branch does not claim general AMD cache-admission
+correctness.
+
 ## What this branch changes
 
 The code is deliberately gated at the narrowest possible boundary so CUDA
@@ -49,6 +60,24 @@ behavior stays unchanged.
 
 ## Clean LAN-223 installation
 
+**Qualification status: partial; gfx1151 runtime remains unqualified.** On
+2026-09-25, the current candidate dependency set installed in a disposable
+Linux/x86_64 Python 3.14 environment on LAN-215 using AMD's ROCm 7.14.0 index
+and `gfx1151` device extras. `rocm-sdk init` exposed HIP 7.14.60850, and
+`pip install --no-build-isolation -e '.[rocm]'` built the pinned-tensor,
+CPU-MoE, and row-store native extensions. `pip check`, native-extension
+imports, the `flashlib` slot-cache import, and nine no-hardware install/setup
+contract tests passed. The GPU was hidden during the build and test/import
+checks; LAN-215 is a `gfx1150` host, and setup builds only host C++ extensions.
+After making HIP capability-query failure handling explicit and checking stream
+callback-enqueue errors, the three native extensions rebuilt with zero compiler
+warnings. `fast_index_copy.cuh` also compiled through ROCm 7.14 `hipcc` for the
+`gfx1151` target as a temporary host object; no FreeToken device kernel was
+emitted or run. This validates the candidate package/install and host-extension
+path, not FreeToken HIP JIT/device-kernel execution on `gfx1151` or end-to-end
+parity. The commands below remain experimental until those target-runtime
+gates pass.
+
 Do not install into system Python, an existing llama.cpp environment, or the
 existing vLLM environment.  The reference layout is intentionally isolated:
 
@@ -60,20 +89,26 @@ existing vLLM environment.  The reference layout is intentionally isolated:
   models/       optional links to read-only local model storage
 ```
 
-The supported PyTorch pair is `torch==2.11.0` and `torchvision==0.26.0` from
-PyTorch's ROCm 7.2 wheel index. That wheel index is an ABI selection, not the
-toolkit-root path: set all three root variables to the same complete ROCm
-toolkit installation before building. `/opt/rocm-10.0` is an example only;
-replace it only with the matching complete root on the target host.
+The candidate PyTorch pair is `torch==2.11.0+rocm7.14.0` and
+`torchvision==0.26.0+rocm7.14.0` from AMD's multi-architecture wheel index.
+The explicit `device-gfx1151` extras select AMD's matching device packages.
+The matching SDK, including its development tools and headers, must also be
+installed in this same isolated environment. Do not point the build at a
+different system ROCm installation: LAN-223 currently has ROCm 10.0 and
+7.2.4 trees, which are not the candidate 7.14 SDK.
 
 ```bash
-export ROCM_HOME=/opt/rocm-10.0
+python -m pip install \
+  --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+  "torch[device-gfx1151]==2.11.0+rocm7.14.0" \
+  "torchvision[device-gfx1151]==0.26.0+rocm7.14.0" \
+  "rocm[libraries,devel,device-gfx1151]==7.14.0"
+rocm-sdk init
+export ROCM_HOME="$(rocm-sdk path --root)"
+export PATH="$(rocm-sdk path --bin):$PATH"
 export ROCM_PATH="$ROCM_HOME"
 export HIP_PATH="$ROCM_HOME"
-
-python -m pip install \
-  --index-url https://download.pytorch.org/whl/rocm7.2 \
-  "torch==2.11.0" "torchvision==0.26.0"
+hipcc --version
 python -c "import torch; assert torch.version.hip, torch.version.hip"
 ```
 

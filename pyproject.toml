@@ -80,14 +80,22 @@ cuda = [
     "torch==2.11.0",
     "torchvision==0.26.0",
     "triton==3.6.0; platform_system == 'Linux'",
-    "flashinfer-python[cu13]>=0.6,<0.7",
+    "flashinfer-python[cu13]==0.6.18.post1",
     "sglang-kernel==0.4.5",
 ]
 rocm = [
-    "torch==2.11.0",
-    "torchvision==0.26.0",
-    "pytorch-triton-rocm>=3.5.1; sys_platform == 'linux'",
-    "triton-rocm>=3.6.0; sys_platform == 'linux'",
+    "torch[device-gfx1151]==2.11.0+rocm7.14.0",
+    "torchvision[device-gfx1151]==0.26.0+rocm7.14.0",
+    "triton==3.7.1+git0263a6a6.rocm7.14.0; sys_platform == 'linux'",
+    "rocm[libraries]==7.14.0; sys_platform == 'linux'",
+    "rocm[devel]==7.14.0; sys_platform == 'linux'",
+    "rocm-sdk-core==7.14.0; sys_platform == 'linux'",
+    "rocm-sdk-libraries==7.14.0; sys_platform == 'linux'",
+    "rocm-sdk-devel==7.14.0; sys_platform == 'linux'",
+    "rocm-sdk-device-gfx1151==7.14.0; sys_platform == 'linux'",
+    "amd-torch-device-gfx1151==2.11.0+rocm7.14.0; sys_platform == 'linux'",
+    "amd-torch-device-gfx115x==2.11.0+rocm7.14.0; sys_platform == 'linux'",
+    "amd-torchvision-device-gfx1151==0.26.0+rocm7.14.0; sys_platform == 'linux'",
 ]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
@@ -102,7 +110,7 @@ accel = [
     "torch==2.11.0",
     "torchvision==0.26.0",
     "triton==3.6.0; platform_system == 'Linux'",
-    "flashinfer-python[cu13]>=0.6,<0.7",
+    "flashinfer-python[cu13]==0.6.18.post1",
     "sglang-kernel==0.4.5",
 ]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
@@ -112,7 +120,9 @@ accel = [
 # in a dedicated environment when you specifically need the Marlin path.
 
 # uv-only provenance pins. pip ignores this section, so a ROCm source build must
-# provision its matched Torch pair from the ROCm index before its editable build.
+# provision its matched PyTorch/AMD Triton stack from the AMD index before its
+# editable build. The gfx1151 extras select AMD's architecture-specific device
+# packages; PyTorch pins its matching generic `triton` distribution.
 # `explicit = true` scopes each index to packages named below; without it a
 # PyTorch index could shadow ordinary PyPI dependencies under uv's first-index
 # strategy.
@@ -120,15 +130,22 @@ accel = [
 torch = [
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cu130", extra = "accel" },
-    { index = "pytorch-rocm72", extra = "rocm" },
+    { index = "amd-rocm714", extra = "rocm" },
 ]
 torchvision = [
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cu130", extra = "accel" },
-    { index = "pytorch-rocm72", extra = "rocm" },
+    { index = "amd-rocm714", extra = "rocm" },
 ]
-pytorch-triton-rocm = [{ index = "pytorch-rocm72", extra = "rocm" }]
-triton-rocm = [{ index = "pytorch-rocm72", extra = "rocm" }]
+triton = [{ index = "amd-rocm714", extra = "rocm" }]
+rocm = [{ index = "amd-rocm714", extra = "rocm" }]
+rocm-sdk-core = [{ index = "amd-rocm714", extra = "rocm" }]
+rocm-sdk-libraries = [{ index = "amd-rocm714", extra = "rocm" }]
+rocm-sdk-devel = [{ index = "amd-rocm714", extra = "rocm" }]
+rocm-sdk-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
+amd-torch-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
+amd-torch-device-gfx115x = [{ index = "amd-rocm714", extra = "rocm" }]
+amd-torchvision-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
@@ -137,8 +154,8 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-rocm72"
-url = "https://download.pytorch.org/whl/rocm7.2"
+name = "amd-rocm714"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
 explicit = true
 
 [[tool.uv.index]]

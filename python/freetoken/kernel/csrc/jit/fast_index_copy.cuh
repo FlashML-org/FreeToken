@@ -173,8 +173,12 @@ inline bool host_ptr_identity() {
             return false;  // fail closed: translate (and surface errors), don't assume identity
         }
         int uva = 0, reg = 0;
-        cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-        cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+        const auto uva_err = cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
+        const auto reg_err =
+            cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+        if (uva_err != cudaSuccess || reg_err != cudaSuccess) {
+            return false;
+        }
         return uva == 1 && reg == 1;
     }();
     return identity;
