@@ -235,7 +235,7 @@ say "installing $WHEEL + accel (flashinfer prebuilt + sglang-kernel) + $KERNEL_C
 # box that cached a wheel before a republish silently reinstalls the stale copy forever
 # (the venv is fresh each time, the cache is not). Force revalidation of just our two
 # packages; every other dependency keeps hitting the cache.
-"$UV" pip install --python "$VENV" \
+UV_HTTP_TIMEOUT=600 UV_HTTP_RETRIES=10 "$UV" pip install --python "$VENV" \
   --refresh-package freetoken --refresh-package freetoken-kernel-cache \
   "${CU_INDEX_ARGS[@]}" "${INSTALL_WHEELS[@]}"
 
