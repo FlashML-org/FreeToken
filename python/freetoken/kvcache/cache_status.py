@@ -120,21 +120,18 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
         return int(_linear_pool_min_slots(config) - 1)
 
     def _swa() -> int:
-        # Window-pool floor in tokens (matches the pool's own page unit x count):
-        #   DSV4      -- the working-set floor pages _dsv4_pool_sizes clamps n_win_pages to, x P.
-        #   radix-SWA -- the concurrent working set (+1 slot-0 sentinel) _swa_paged_num_tokens
-        #                floors to.
-        # 0 for models without a window pool.
+        # Report usable tokens, matching num_swa_pages in rebuild requests.
+        # DSV4's physical floor includes a dummy page; the SWA floor already excludes slot 0.
         from .dsv4_cost_model import _dsv4_window_floor_pages
         from .hybrid_swa_pool import _swa_pool_floor
 
         mc = config.model_config
         if mc.dsv4_args is not None:
             P = mc.dsv4_args.window_size
-            return int(_dsv4_window_floor_pages(config, P) * P)
+            return int((_dsv4_window_floor_pages(config, P) - 1) * P)
         if not (mc.has_swa_attention and config.cache_type == "swa_radix"):
             return 0
-        return int(_swa_pool_floor(config) + 1)
+        return int(_swa_pool_floor(config))
 
     for key, fn in (("kv_tokens", _kv), ("moe_experts", _moe), ("mamba_slots", _mamba),
                     ("swa_tokens", _swa)):

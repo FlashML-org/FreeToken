@@ -213,7 +213,7 @@ def test_floors_dsv4_reports_real_window_floor():
     assert floors["kv_tokens"] > 0
     # The window (swa) floor is reported too, in tokens (window pages x P) -- not the bogus 0 the
     # radix-only branch used to give for DSV4.
-    assert floors["swa_tokens"] == _dsv4_window_floor_pages(cfg, P) * P
+    assert floors["swa_tokens"] == (_dsv4_window_floor_pages(cfg, P) - 1) * P
 
 
 def test_floors_missing_config_all_zero():
