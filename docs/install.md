@@ -13,7 +13,12 @@ uv venv && source .venv/bin/activate
 uv pip install "freetoken[accel]"
 ```
 
-CUDA kernels are JIT-compiled on first use, need a CUDA 13 toolkit with `nvcc` on PATH.
+CUDA kernels are JIT-compiled on first use. An explicit absolute `CUDA_HOME`
+must contain an `nvcc` matching PyTorch's exact CUDA release; otherwise
+FreeToken checks the matching `/usr/local/cuda-X.Y` toolkit and then `PATH`.
+JIT and kernel-cache builds fail if no exact compiler is available. Toolkit
+selection does not change the supported PyTorch, driver, or GPU matrix. A
+complete prebuilt kernel cache does not require a compiler at server startup.
 
 ## Method 2: Install from source
 
