@@ -33,6 +33,38 @@ inline constexpr auto get_mem_package() {
     }
 }
 
+// The ld.global.L1::no_allocate / st.global.wt PTX below are cache-policy hints
+// (skip L1 allocate on read, write-through on store) with no HIP equivalent -- AMD
+// ROCm builds fall back to plain loads/stores. Correctness is unchanged; only the
+// cache-policy hint is lost.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+    return *src;
+}
+
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+    return *src;
+}
+
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+    return *src;
+}
+
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+    *dst = value;
+}
+
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+    *dst = value;
+}
+
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+    *dst = value;
+}
+
+#else
+
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
@@ -69,6 +101,8 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
+
+#endif
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.

@@ -396,6 +396,13 @@ def decode_paged_attention(
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
     block_h = triton.next_power_of_2(valid_block_h)
+    if torch.version.hip is not None:
+        # RDNA WMMA has no matrix-core instruction below a 16x16 tile, so a decode
+        # GQA group smaller than 16 (e.g. 4 here) leaves tl.dot's M dim too small to
+        # lower on this backend. The kernel already masks lanes >= VALID_BLOCK_H
+        # (it does this for non-power-of-two groups too), so padding BLOCK_H up to
+        # 16 is safe -- it only adds masked-out, discarded head lanes.
+        block_h = max(block_h, 16)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
 
