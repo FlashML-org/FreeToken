@@ -60,7 +60,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
     num_qo_heads = int(g("attention.head_count"))
-    kv_per_layer = g("attention.head_count_kv")  # per-layer list
+    # llama.cpp writes head_count_kv as a SCALAR when every layer shares a KV head
+    # count, and only as a per-layer array when they differ (e.g. gemma-4-E2B: 1).
+    _kv = g("attention.head_count_kv")
+    kv_per_layer = [int(x) for x in _kv] if hasattr(_kv, "__len__") else [int(_kv)] * num_layers
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
