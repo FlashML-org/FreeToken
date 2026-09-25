@@ -48,6 +48,19 @@ These families accept image input by default; pass `--text-model-only` to skip t
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it.
 
+### CPU/Hybrid MoE graph compatibility
+
+CPU and hybrid MoE have the same execution semantics on CUDA and ROCm, but use
+backend-specific GPU/CPU synchronization. CUDA retains its mapped-pinned,
+per-slot flag handshake. ROCm 7.14 uses HIP signal memory and explicit Graph
+batch-memory-op nodes whose storage follows the CPU executor's lifetime.
+
+At startup, FreeToken verifies the ROCm path with a real graph capture,
+instantiate, and replay probe. If that probe fails, FreeToken disables CUDA
+Graph for CPU/hybrid MoE and continues on the correct eager path. Set
+`FREETOKEN_CPU_MOE_FLAG_SYNC=0` to explicitly disable the native flag handshake;
+on ROCm this also selects the graph-off eager path.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
