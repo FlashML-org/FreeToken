@@ -154,6 +154,11 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Temporary first-stage ownership: Hybrid orchestration has moved out of
+        # the model layer, while OffloadMoeRuntime will take ownership in the next
+        # migration step.  Keeping it beside the existing cpu_executor preserves
+        # current Engine construction order and both CUDA/ROCm synchronization paths.
+        self.hybrid_decode_executor = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
@@ -563,6 +568,10 @@ class OffloadMoeCache:
             "set_cpu_executor requires decode_target in {'cpu','hybrid'}"
         )
         self.cpu_executor = executor
+        if self.decode_target == "hybrid":
+            from freetoken.moe.hybrid_decode import HybridDecodeExecutor
+
+            self.hybrid_decode_executor = HybridDecodeExecutor(self, executor)
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
