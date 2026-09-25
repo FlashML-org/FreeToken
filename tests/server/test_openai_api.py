@@ -687,3 +687,65 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+# ----------------------------------------------------- per-request metrics
+def _metrics_replies() -> list[UserReply]:
+    return [
+        UserReply(uid=42, incremental_output="", finished=False, prompt_tokens_delta=10, cached_tokens=4),
+        UserReply(uid=42, incremental_output="hi", finished=True, completion_tokens_delta=2, prefill_ms=8.0),
+    ]
+
+
+def test_non_stream_chat_metrics_only_with_flag():
+    state = FakeState(_metrics_replies())
+    state.config.enable_metrics_report = True
+    response = run(handle_chat_completion(chat_request(tools=None), request=None, state=state, model_sampling={}))
+    metrics = response["metrics"]
+    assert metrics["prefill_time_ms"] == 8.0
+    assert metrics["prefill_tokens"] == 6 and metrics["cached_prompt_tokens"] == 4
+    assert metrics["decode_tokens"] == 2
+    assert metrics["total_time_ms"] > 0
+
+    off = run(handle_chat_completion(chat_request(tools=None), request=None, state=FakeState(_metrics_replies()), model_sampling={}))
+    assert "metrics" not in off
+
+
+def test_non_stream_chat_metrics_report_the_cache_hit_without_enable_cache_report():
+    """--enable-cache-report governs the billing fields in `usage`. Gating the hit inside
+    `metrics` on it too would leave prefill_tokens_per_second computed over tokens that were
+    never forwarded."""
+    state = FakeState(_metrics_replies())
+    state.config.enable_metrics_report = True
+    response = run(handle_chat_completion(chat_request(tools=None), request=None, state=state, model_sampling={}))
+    assert "prompt_tokens_details" not in response["usage"]
+    assert response["metrics"]["cached_prompt_tokens"] == 4
+
+
+def test_stream_chat_metrics_ride_the_usage_chunk():
+    state = FakeState(_metrics_replies())
+    state.config.enable_metrics_report = True
+    req = chat_request(tools=None, stream_options={"include_usage": True})
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = parse_sse(run(collect()))
+    final = next(e for e in reversed(events) if isinstance(e, dict) and e.get("usage"))
+    assert final["metrics"]["prefill_time_ms"] == 8.0
+    assert final["metrics"]["decode_tokens"] == 2
+    # No metrics on the content chunks -- exactly one carries them.
+    assert sum(1 for e in events if isinstance(e, dict) and "metrics" in e) == 1
+
+
+def test_stream_chat_without_include_usage_has_no_metrics_chunk():
+    """Metrics ride the usage chunk, so a client that opted out of usage keeps the plain
+    OpenAI stream rather than getting an extra trailing chunk it never asked for."""
+    state = FakeState(_metrics_replies())
+    state.config.enable_metrics_report = True
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, chat_request(tools=None), state)]
+
+    events = parse_sse(run(collect()))
+    assert not any(isinstance(e, dict) and "metrics" in e for e in events)

@@ -44,9 +44,11 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     count_prompt_tokens,
     generate_events,
     generate_full,
+    metrics_enabled,
     render_messages,
     resolve_sampling,
     split_tool_lists,
@@ -126,10 +128,11 @@ async def handle_anthropic_messages(
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
+    metrics = metrics_enabled(state)
     if req.stream:
         events = anthropic_event_stream(
             generate_events(uid, spec, state, source="/v1/messages"),
-            req.model, uid, cache_report=cache_report,
+            req.model, uid, cache_report=cache_report, metrics=metrics,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -139,7 +142,9 @@ async def handle_anthropic_messages(
         result = await generate_full(uid, spec, state, source="/v1/messages")
     except GenerationError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
-    response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
+    response = anthropic_full_response(
+        result, req.model, uid, cache_report=cache_report, metrics=metrics
+    )
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
@@ -375,7 +380,7 @@ def _tool_result_parts(content) -> tuple[str, list[dict[str, Any]]]:
 # Output formatting: GenResult / GenEvent -> Anthropic response / events
 # --------------------------------------------------------------------------- #
 def anthropic_full_response(
-    result: GenResult, model: str, uid: int, cache_report: bool = False
+    result: GenResult, model: str, uid: int, cache_report: bool = False, metrics: bool = False
 ) -> AnthropicMessagesResponse:
     content: list[AnthropicContentBlock] = []
     if result.reasoning:
@@ -402,6 +407,12 @@ def anthropic_full_response(
         usage=_anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cached_tokens, cache_report
         ),
+        metrics=build_metrics(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            cached_tokens=result.cached_tokens,
+            timings=result.timings,
+        ) if metrics else None,
     )
 
 
@@ -420,7 +431,8 @@ def _anthropic_usage(
 
 
 async def anthropic_event_stream(
-    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False
+    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False,
+    metrics: bool = False,
 ) -> AsyncIterator[str]:
     """Format the protocol-neutral GenEvent stream into Anthropic SSE events.
 
@@ -576,6 +588,12 @@ async def anthropic_event_stream(
                     usage=_anthropic_usage(
                         ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report
                     ),
+                    metrics=build_metrics(
+                        prompt_tokens=ev.prompt_tokens,
+                        completion_tokens=ev.completion_tokens,
+                        cached_tokens=ev.cached_tokens,
+                        timings=ev.timings,
+                    ) if metrics else None,
                 ))
                 yield _event(AnthropicStreamEvent(type="message_stop"))
                 # Anthropic streams terminate on message_stop — no OpenAI-style

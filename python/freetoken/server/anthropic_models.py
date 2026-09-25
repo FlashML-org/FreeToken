@@ -153,6 +153,10 @@ class AnthropicMessagesResponse(BaseModel):
     ) = None
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
+    # FreeToken extension, served only under --enable-metrics-report: per-request inference
+    # timings. Anthropic's wire has no such field, so it stays absent by default rather than
+    # being emitted as null -- both response paths dump with exclude_none.
+    metrics: dict[str, Any] | None = None
 
     def model_post_init(self, __context):
         if not self.id:
@@ -176,3 +180,5 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # Rides message_delta next to usage, under --enable-metrics-report only.
+    metrics: dict[str, Any] | None = None

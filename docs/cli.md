@@ -98,6 +98,62 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-metrics-report` | off | Serve a per-request `metrics` object next to usage ([below](#per-request-performance-metrics)) |
+
+### Per-request performance metrics
+
+`--enable-metrics-report` adds a `metrics` object to each response on `/v1/chat/completions`,
+`/v1/messages` and `/v1/responses`. It is not part of any of those protocols, which is why it is
+off by default; clients that do not read it are unaffected.
+
+```json
+{
+  "usage": { "prompt_tokens": 8192, "completion_tokens": 256, "total_tokens": 8448 },
+  "metrics": {
+    "ttft_ms": 320.5,
+    "prefill_tokens": 2048,
+    "cached_prompt_tokens": 6144,
+    "prefill_time_ms": 410.0,
+    "prefill_tokens_per_second": 4995.12,
+    "decode_tokens": 256,
+    "decode_time_ms": 5120.8,
+    "decode_tokens_per_second": 49.8,
+    "total_time_ms": 5480.2
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `ttft_ms` | Time to the first generated token, from the point the request entered the generation path |
+| `prefill_tokens` | Prompt tokens actually forwarded: `prompt_tokens - cached_prompt_tokens` |
+| `cached_prompt_tokens` | Prompt tokens served from the prefix cache instead of recomputed |
+| `prefill_time_ms` | The scheduler's own prefill span: admission to the token sampled off the last prefill chunk |
+| `prefill_tokens_per_second` | `prefill_tokens / prefill_time_ms` |
+| `decode_tokens` | Generated tokens (same as `usage.completion_tokens`) |
+| `decode_time_ms` | First generated token to the last |
+| `decode_tokens_per_second` | `(decode_tokens - 1) / decode_time_ms`; the first token comes out of prefill, so it spans no decode interval |
+| `total_time_ms` | Request latency up to the terminal engine reply, excluding HTTP framing |
+
+Reading the numbers:
+
+- `prefill_time_ms` is measured inside the scheduler, which is the point of the flag: a client
+  timing SSE frames cannot see when prefill starts or ends. The others are measured at the API
+  layer and carry the same IPC hops a client's own timestamps would.
+- `ttft_ms` is larger than `prefill_time_ms` by the time the request spent queued before
+  admission. Under load that gap is the queue, not the model.
+- Every span is **this request's share of shared work**. Its prefill chunk is co-scheduled with
+  other prompts and its decode steps are batched with other requests, so the throughputs
+  describe this request under that load, not isolated engine benchmarks. For those,
+  send one request at a time.
+- `cached_prompt_tokens` here always reports the real prefix-cache hit, whether or not
+  `--enable-cache-report` is set; that flag governs the billing fields in `usage`. Without it
+  `prefill_tokens_per_second` would be computed over tokens that were never forwarded.
+
+Streaming responses carry `metrics` on the same final message as usage, so the request has to ask
+for usage too: `stream_options: {"include_usage": true}` on `/v1/chat/completions`. On
+`/v1/messages` it rides `message_delta`; on `/v1/responses`, `response.completed`.
+`/v1/completions` does not serve `metrics`: it does not go through the shared generation core.
 
 ### Image input
 
