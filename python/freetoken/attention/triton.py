@@ -259,7 +259,6 @@ class TritonAttentionBackend(BaseAttnBackend):
         q_positions = getattr(batch, "positions", None)
         if q_positions is None:
             q_positions = torch.zeros(num_query_tokens, dtype=torch.int64, device=device)
-
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
             indptr=indptr,

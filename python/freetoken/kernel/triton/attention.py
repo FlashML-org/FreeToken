@@ -364,8 +364,17 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    rocm_block_h_probe: int | None = None,
+    rocm_block_n_probe: int | None = None,
+    rocm_num_warps_probe: int | None = None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    The ``rocm_*_probe`` arguments are benchmark-only HIP controls. They let
+    LAN-223 measure a query-head tile, KV block length, or launch warp count
+    without changing the serving defaults. Normal callers leave every probe
+    argument ``None`` and preserve the established ROCm configuration.
+    """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -396,8 +405,35 @@ def decode_paged_attention(
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
     block_h = triton.next_power_of_2(valid_block_h)
+    if rocm_block_h_probe is not None:
+        if torch.version.hip is None:
+            raise ValueError("rocm_block_h_probe is only valid for HIP builds")
+        if rocm_block_h_probe < valid_block_h or rocm_block_h_probe & (rocm_block_h_probe - 1):
+            raise ValueError("rocm_block_h_probe must be a power of two at least valid_block_h")
+        block_h = rocm_block_h_probe
+    elif torch.version.hip is not None:
+        # RDNA WMMA has no matrix-core instruction below a 16x16 tile, so a decode
+        # GQA group smaller than 16 (e.g. 4 here) leaves tl.dot's M dim too small to
+        # lower on this backend. The kernel already masks lanes >= VALID_BLOCK_H
+        # (it does this for non-power-of-two groups too), so padding BLOCK_H up to
+        # 16 is safe -- it only adds masked-out, discarded head lanes.
+        block_h = max(block_h, 16)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
+    block_n = 32
+    num_warps = 4
+    if rocm_block_n_probe is not None:
+        if torch.version.hip is None:
+            raise ValueError("rocm_block_n_probe is only valid for HIP builds")
+        if rocm_block_n_probe < 16 or rocm_block_n_probe & (rocm_block_n_probe - 1):
+            raise ValueError("rocm_block_n_probe must be a power of two at least 16")
+        block_n = rocm_block_n_probe
+    if rocm_num_warps_probe is not None:
+        if torch.version.hip is None:
+            raise ValueError("rocm_num_warps_probe is only valid for HIP builds")
+        if rocm_num_warps_probe not in (1, 2, 4, 8):
+            raise ValueError("rocm_num_warps_probe must be one of 1, 2, 4, or 8")
+        num_warps = rocm_num_warps_probe
 
     _decode_grouped_stage1_kernel[
         (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
@@ -428,14 +464,14 @@ def decode_paged_attention(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        BLOCK_N=32,
+        BLOCK_N=block_n,
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     _decode_stage2_kernel[(batch, num_q_heads)](

@@ -188,6 +188,12 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # Qwen Q4_K_M has a tiny set of Q6_K down-projection layers.  They keep
+        # their byte-exact rows in a separate cache because Q5_K and Q6_K have
+        # incompatible packed row sizes.  The engine wires these only when the
+        # loaded checkpoint declares exceptional Q6_K layers.
+        self.auxiliary_offload_cache: OffloadMoeCache | None = None
+        self.auxiliary_layer_id: int | None = None
 
     def forward(
         self,
@@ -276,6 +282,10 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if self.auxiliary_offload_cache is not None:
+            return self._decode_q6_down_routed(
+                cache, self.auxiliary_offload_cache, hidden_states, topk_weights, topk_ids
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -293,6 +303,34 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+        )
+
+    def _decode_q6_down_routed(
+        self,
+        cache: OffloadMoeCache,
+        auxiliary: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode an exceptional Q6_K down layer through two independent caches."""
+        if cache.decode_target != "gpu":
+            raise NotImplementedError(
+                "Qwen GGUF Q6_K down layers currently require the GPU offload backend"
+            )
+        auxiliary_layer_id = self.auxiliary_layer_id
+        assert auxiliary_layer_id is not None
+        raw_ids = topk_ids.clone()
+        cache.ensure_experts(self.layer_id, topk_ids)
+        auxiliary.ensure_experts(auxiliary_layer_id, raw_ids)
+        cache.copy_missing()
+        auxiliary.copy_missing()
+        from freetoken.moe.fused_q4_k_q6_k import fused_experts_gguf_q4_k_q6_k
+
+        gate_up, _unused_down = cache.bank_views()
+        (down,) = auxiliary.bank_views()
+        return fused_experts_gguf_q4_k_q6_k(
+            hidden_states, gate_up, down, topk_weights, topk_ids, raw_ids, self.activation
         )
 
     def _decode_hybrid(
@@ -356,6 +394,10 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if self.auxiliary_offload_cache is not None:
+            return self._prefill_q6_down_routed(
+                cache, self.auxiliary_offload_cache, hidden_states, topk_weights, topk_ids
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -381,6 +423,33 @@ class OffloadMoELayer(MoELayer):
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
+        )
+
+    def _prefill_q6_down_routed(
+        self,
+        cache: OffloadMoeCache,
+        auxiliary: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill exceptional Q6_K layers without mixed-cache overlap choreography."""
+        if cache.prefill_overlap or auxiliary.prefill_overlap:
+            raise NotImplementedError(
+                "Qwen GGUF Q6_K down layers require --disable-moe-prefill-overlap"
+            )
+        auxiliary_layer_id = self.auxiliary_layer_id
+        assert auxiliary_layer_id is not None
+        cache.materialize_layer(self.layer_id)
+        auxiliary.materialize_layer(auxiliary_layer_id)
+        cache.copy_missing()
+        auxiliary.copy_missing()
+        from freetoken.moe.fused_q4_k_q6_k import fused_experts_gguf_q4_k_q6_k
+
+        gate_up, _unused_down = cache.bank_views(self.num_experts)
+        (down,) = auxiliary.bank_views(self.num_experts)
+        return fused_experts_gguf_q4_k_q6_k(
+            hidden_states, gate_up, down, topk_weights, topk_ids, topk_ids, self.activation
         )
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
@@ -432,7 +501,67 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "q4_k_q5_k":
+            # Qwen Q4_K_M is a mixed GGUF recipe: routed gate/up rows are Q4_K
+            # while down rows are Q5_K.  The kernel reads both packed layouts
+            # directly and applies the two quant dispatches in sequence.
+            from freetoken.moe.fused_q4_k_q5_k import fused_experts_gguf_q4_k_q5_k
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_k_q5_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "mxfp4_triton":
+            # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
+            # decode + grouped `_t` prefill. The swiglu scalars live on the layer
+            # (set at construction), not in the base signature.
+            from freetoken.moe.fused_mxfp4 import (
+                run_mxfp4_prefill_experts_t,
+                run_mxfp4_splitk_decode_experts,
+            )
+
+            gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
+            run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
+            return run(
+                hidden_states, topk_weights, topk_ids,
+                gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias,
+                top_k=self.top_k,
+                hidden_act_alpha=self.hidden_act_alpha,
+                swiglu_limit=self.swiglu_limit,
+            )
+        if fmt == "ds_fp4":
+            # DeepSeek-V4 FP4 experts: grouped inline-dequant GEMM for streaming
+            # prefill chunks (n = bank rows to sort over); per-route dequant GEMV
+            # for decode and the sparse small-chunk slot path (n is None there,
+            # and sorting over the full slot cache would drown in padding).
+            gate_up_packed, gate_up_scale, down_packed, down_scale = views
+            if is_prefill and n is not None:
+                from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
+
+                return routed_experts_fp4_prefill(
+                    hidden_states, topk_ids, topk_weights,
+                    gate_up_packed, gate_up_scale, down_packed, down_scale,
+                    self.swiglu_limit, n,
+                )
+            from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+            return routed_experts_fp4(
+                hidden_states, topk_ids, topk_weights,
+                gate_up_packed, gate_up_scale, down_packed, down_scale,
+                self.swiglu_limit,
+            )
+        assert fmt == "bf16", f"unknown quant_format {fmt!r}"
+        gate_up, down = views
+        impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
+        return impl(
+            hidden_states,
+            gate_up,
+            down,
+            topk_weights,
+            topk_ids,
+            self.activation,
+            self.apply_router_weight_on_input,
+        )
 
 
 def make_moe_layer(

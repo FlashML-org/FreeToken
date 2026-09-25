@@ -23,6 +23,8 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +35,12 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    # Q4_K is the common ``Q4_K_M`` tensor encoding. The ``M`` label describes
+    # a model-wide mixed quantization recipe, while individual GGUF tensors carry
+    # the base GGML type Q4_K. Each super-block holds two fp16 scales, twelve packed
+    # six-bit sub-scales, and 128 packed four-bit values.
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +50,8 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -77,6 +87,14 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-element block = fp16 scale followed by 32 signed int8 values."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)
+    q = raw[:, 2:34].view(torch.int8).to(torch.float32)
+    return (q * d).reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -115,8 +133,62 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K reference decoder matching llama.cpp's ``dequantize_row_q4_K``.
+
+    A Q4_K super-block covers 256 values as eight 32-value groups.  ``scales``
+    packs the eight positive scales followed by the eight minimum coefficients as
+    six-bit little-endian integers.  For each group the decoded value is
+    ``d * scale * q - dmin * minimum``.  This runs only in tests and non-hot
+    load-time conversions; GPU execution stays packed in the GGUF kernels.
+    """
+    raw = raw.reshape(-1, 144)
+    block_count = raw.shape[0]
+    scale_bytes = raw[:, 4:16].to(torch.int32)
+    # Direct vector form of ggml's get_scale_min_k4. Entries 0..3 store a
+    # six-bit scale and minimum directly. Entries 4..7 split each high two
+    # bits across the first four bytes and the upper nibble of bytes 8..11.
+    scales = torch.empty((block_count, 8), dtype=torch.float32, device=raw.device)
+    minimums = torch.empty_like(scales)
+    scales[:, :4] = (scale_bytes[:, :4] & 0x3F).to(torch.float32)
+    minimums[:, :4] = (scale_bytes[:, 4:8] & 0x3F).to(torch.float32)
+    scales[:, 4:] = (
+        (scale_bytes[:, 8:12] & 0x0F) | ((scale_bytes[:, :4] >> 6) << 4)
+    ).to(torch.float32)
+    minimums[:, 4:] = (
+        (scale_bytes[:, 8:12] >> 4) | ((scale_bytes[:, 4:8] >> 6) << 4)
+    ).to(torch.float32)
+    d = _f16_scales(raw, 0, 2)
+    dmin = _f16_scales(raw, 2, 4)
+    quantized = raw[:, 16:144]
+    values = torch.empty((block_count, 256), dtype=torch.float32, device=raw.device)
+    # GGML stores each pair of 32-value groups in the same 32-byte region:
+    # the low nibbles are group ``2 * pair`` and the high nibbles are group
+    # ``2 * pair + 1``.  They are therefore not eight consecutive 16-byte
+    # groups.  Keeping this order identical to ``dequantize_block_q4_K`` is
+    # essential because this decoder is the independent correctness oracle for
+    # the packed HIP kernels.
+    for pair in range(4):
+        pair_bytes = quantized[:, pair * 32:(pair + 1) * 32]
+        low = (pair_bytes & 0x0F).to(torch.float32)
+        high = (pair_bytes >> 4).to(torch.float32)
+        low_group = 2 * pair
+        high_group = low_group + 1
+        values[:, low_group * 32:(low_group + 1) * 32] = (
+            d * scales[:, low_group:low_group + 1] * low
+            - dmin * minimums[:, low_group:low_group + 1]
+        )
+        values[:, high_group * 32:(high_group + 1) * 32] = (
+            d * scales[:, high_group:high_group + 1] * high
+            - dmin * minimums[:, high_group:high_group + 1]
+        )
+    return values.reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_Q4_K: dequant_q4_k,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -142,12 +214,16 @@ __all__ = [
     "GGML_F16",
     "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
+    "dequant_q4_k",
     "dequant_q6_k",
     "dequantize",
 ]

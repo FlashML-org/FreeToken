@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "Small deterministic Qwen API quality suite for LAN-223. This is a local control, not the FreeToken paper workload.",
+  "cases": [
+    {
+      "id": "canary_exact",
+      "prompt": "Return exactly the word LAN223 and nothing else. Do not add punctuation.",
+      "check": {"kind": "exact", "value": "LAN223"}
+    },
+    {
+      "id": "arithmetic_exact",
+      "prompt": "What is 17 times 19? Reply with only the decimal number.",
+      "check": {"kind": "exact", "value": "323"}
+    },
+    {
+      "id": "json_schema",
+      "prompt": "Reply with exactly this JSON object and no other text: {\"status\":\"ok\",\"value\":7}",
+      "check": {
+        "kind": "json_fields",
+        "fields": {"status": "ok", "value": 7}
+      }
+    }
+  ]
+}

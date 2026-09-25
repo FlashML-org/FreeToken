@@ -33,7 +33,7 @@ def _cuda_arch_list() -> List[str]:
         return arch_list
     import torch
 
-    if not torch.cuda.is_available():
+    if torch.version.hip is not None or not torch.cuda.is_available():
         return []
     major, minor = torch.cuda.get_device_capability()
     return [f"{major}.{minor}"]
@@ -54,7 +54,13 @@ def _pin_tvm_ffi_arch_ctx(arch_list: List[str]) -> Iterator[None]:
 
 def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
     """CUDA nvcc flags for a kernel build. tvm-ffi emits one SASS cubin per arch in ``arch_list`` and no PTX, so add the PTX of the highest arch: a GPU newer than every listed arch still runs through the driver's PTX JIT. This flag also carries the arch into tvm-ffi's build hash, which skips tvm-ffi's own -gencode, so GPUs of different archs never share a cached .so."""
-    flags = DEFAULT_CUDA_CFLAGS + extra
+    import torch
+
+    flags = list(DEFAULT_CUDA_CFLAGS)
+    if torch.version.hip is not None:
+        # nvcc-only: hipcc/clang rejects it outright.
+        flags = [f for f in flags if f != "--expt-relaxed-constexpr"]
+    flags = flags + extra
     if arch_list:
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")

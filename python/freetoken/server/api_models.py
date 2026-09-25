@@ -120,6 +120,10 @@ class CompletionRequest(BaseModel):
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # Nonstandard but deliberately explicit: false tells FreeToken that this
+    # raw prompt already includes every required special token.  The default
+    # remains true for OpenAI-style raw completion compatibility.
+    add_special_tokens: bool = True
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "CompletionRequest":

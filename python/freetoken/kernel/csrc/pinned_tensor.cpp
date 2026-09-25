@@ -1,12 +1,12 @@
 #include <cstdint>
-#include <cuda_runtime_api.h>
+#include "hip_compat.h"
 #include <torch/extension.h>
 
 namespace {
 
 void free_pinned(void *ptr) {
   if (ptr != nullptr) {
-    cudaFreeHost(ptr);
+    (void)cudaFreeHost(ptr);  // best-effort cleanup; destructors cannot report errors
   }
 }
 
@@ -79,8 +79,12 @@ bool host_ptr_identity() {
   const cudaError_t err = cudaGetDevice(&device);
   TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
   int uva = 0, reg = 0;
-  cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-  cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+  const auto uva_err = cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
+  const auto reg_err =
+      cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+  if (uva_err != cudaSuccess || reg_err != cudaSuccess) {
+    return false;  // fail closed and use the explicit host-to-device pointer mapping
+  }
   return uva == 1 && reg == 1;
 }
 
