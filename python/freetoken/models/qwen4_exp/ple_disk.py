@@ -112,7 +112,7 @@ class DiskRowTable:
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        from freetoken.kernel import _ple_store
+        from freetoken.kernel.row_store import PleStore
 
         self.num_rows = source.total_rows
         self.head_dim = source.row_bytes  # fp8: one byte per element
@@ -128,7 +128,7 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        self._store = _ple_store.PleStore(
+        self._store = PleStore(
             paths=list(source.paths),
             extent_file=list(source.extent_file),
             extent_base=list(source.extent_base),
@@ -155,7 +155,9 @@ class DiskRowTable:
         self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
-        self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"))
+        from freetoken.kernel.row_store import probe_wait_sync
+
+        self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
@@ -163,25 +165,6 @@ class DiskRowTable:
         self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
-
-    def _probe_wait_sync(self, mode: str) -> bool:
-        from freetoken.kernel import _ple_store
-
-        if mode == "gate":
-            return False
-        scratch = alloc_pinned_tensor(1, dtype=torch.int64)
-        scratch.zero_()
-        stream = torch.cuda.current_stream(self._device)
-        ok = (
-            _ple_store.memop_write(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-            and _ple_store.memop_wait_geq(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-        )
-        if ok:
-            stream.synchronize()
-            ok = int(scratch[0]) == 7
-        if mode == "wait" and not ok:
-            raise RuntimeError("FREETOKEN_PLE_SYNC=wait but stream memops are unavailable")
-        return ok
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
@@ -222,10 +205,10 @@ class DiskRowTable:
                                 for r, t in zip(reqs, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
-                        from freetoken.kernel import _ple_store
+                        from freetoken.kernel.row_store import signal
 
                         # unblock the stream before surfacing; the step's output is discarded
-                        _ple_store.signal_flag(self._flag.data_ptr())
+                        signal(self._flag)
                         raise
 
                 return _complete
@@ -260,11 +243,9 @@ class DiskRowTable:
         rows = row_ids.shape[0]
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync:
-            from freetoken.kernel import _ple_store
+            from freetoken.kernel.row_store import wait_reset
 
-            _ple_store.memop_wait_reset(
-                torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
-            )
+            wait_reset(torch.cuda.current_stream(self._device), self._flag)
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
         )
