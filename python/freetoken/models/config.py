@@ -5,7 +5,8 @@ from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
+# ``image_*`` covers deepseek_v4's sentinel vectors, which carry no tower prefix of their own.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.", "vision.", "aligner.", "image_")
 
 
 def detect_expert_quant(hf_config: Any) -> str:

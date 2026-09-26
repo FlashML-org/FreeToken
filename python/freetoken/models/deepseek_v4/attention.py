@@ -38,6 +38,7 @@ class Attention(BaseOP):
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
+        self.max_image_tokens = args.vision_max_n_token
 
         self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
         # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
@@ -104,7 +105,53 @@ class Attention(BaseOP):
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         return self.wo_b.forward(o)
 
-    def _prefill_segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int):
+    @staticmethod
+    def visible_window_cols(
+        spans, start_pos: int, n: int, win: int, max_img: int, device: torch.device,
+        addr_lo: int = 0, width: int | None = None,
+    ) -> torch.Tensor:
+        """Window candidate columns (``-1`` padded) for a segment containing image spans.
+
+        Port of the reference ``get_image_visible`` + ``get_window_topk_idxs_visible``
+        pair: span tokens see their whole span bidirectionally (capped at ``max_img``)
+        instead of the 128-window, while text tokens -- and span tokens near the span
+        start -- keep the ordinary window into history. Returns ``[n, width]`` in
+        request-absolute coordinates with live entries in ``[addr_lo, span_end)``; the
+        caller translates to slot-lut indices (cold: as-is; extend: minus ``w_lo``).
+        """
+        if width is None:
+            width = win + max_img
+        left, right = Attention._span_left_right(spans, start_pos, n, max_img, device)
+        idx = start_pos + torch.arange(n, device=device)
+        left_add = (left - (win - 1)).clamp(min=0)
+        starts = (idx - (win - 1) - left_add).clamp(min=addr_lo)
+        cols = starts.unsqueeze(1) + torch.arange(width, device=device)
+        return torch.where(cols > (idx + right).unsqueeze(1), -1, cols)
+
+    @staticmethod
+    def _span_left_right(
+        spans, start_pos: int, n: int, max_img: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token visible counts to the left/right within each image span.
+
+        Metadata twin of the reference ``get_image_visible`` (which derives spans from
+        virtual token ids): ``left[q] = q - span_start`` clamped to ``max_img - 1``,
+        ``right[q] = span_end - q`` clamped to ``max_img``, zero outside spans. ``spans``
+        are request-absolute positions inside ``[start_pos, start_pos + n)``.
+        """
+        left = torch.zeros(n, dtype=torch.int64, device=device)
+        right = torch.zeros(n, dtype=torch.int64, device=device)
+        for s, e in spans:
+            lo, hi = s - start_pos, e - start_pos
+            idx = torch.arange(lo, hi, device=device)
+            left[lo:hi] = (idx - lo).clamp(max=max_img - 1)
+            # the END sentinel sits at e-1: visibility reaches the END TOKEN, not past it
+            right[lo:hi] = ((hi - 1) - idx).clamp(max=max_img)
+        return left, right
+
+    def _prefill_segment(
+        self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int, spans=None
+    ):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
         advance its compressor/indexer carry, and return its per-query candidate lists.
 
@@ -113,6 +160,14 @@ class Attention(BaseOP):
         ``(win_global [1, n, w], cmp_global [1, n, c] | None)`` at natural widths (cold: w =
         min(n, win); extend: w = win); the caller pads BOTH halves to the batch-uniform widths
         and concatenates.
+
+        ``spans`` (VL requests) are the request's image-block ranges ``[(start, end)]`` inside
+        ``[start_pos, start_pos + n)`` -- chunking never splits one. Inside a span, every token
+        sees the whole span (bidirectional, capped at ``vision_max_n_token``) instead of only its
+        128-window, matching the reference's ``get_window_topk_idxs_visible``. All span-visible
+        candidates are intra-segment, so the live full-page map covers them (the 128-slot ring
+        never needs to serve >128-back reads). ``spans=None`` keeps the historical path
+        bit-identical.
         """
         win, ratio, device = self.window_size, self.compress_ratio, x_seg.device
         end = start_pos + n
@@ -120,23 +175,38 @@ class Attention(BaseOP):
         self.attn.store_window(kv_seg, self.layer_id, slots)
 
         if start_pos == 0:
-            win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
-            # natural width min(n, win); the caller pads to the batch-uniform width
+            if spans:
+                max_img = self.max_image_tokens
+                cols = Attention.visible_window_cols(
+                    spans, 0, n, win, max_img, device, addr_lo=0,
+                    width=min(n, win + max_img),
+                )
+                win_cols = cols.unsqueeze(0)
+            else:
+                win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
+            # natural width min(n, win) -- win+max_img for span segments; the caller pads
             win_global = self.attn.win_cols_to_global(win_cols, slots)
         else:
             # Candidates span [w_lo, end): each new query's 128-sliding window over the retained
             # prefix plus the new tokens, causal-masked to -1 past its own position.
             w_lo = max(0, start_pos - win + 1)
             ws_pool = self.attn.window_slots_of(ti, w_lo, end)
-            abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
-            cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
-            win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
+            if spans:
+                max_img = self.max_image_tokens
+                cols = Attention.visible_window_cols(
+                    spans, start_pos, n, win, max_img, device, addr_lo=w_lo,
+                )
+                win_cols = torch.where(cols < 0, cols, cols - w_lo).unsqueeze(0)
+            else:
+                abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
+                cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
+                win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
             win_global = self.attn.win_cols_to_global(win_cols, ws_pool)
 
         if not ratio:
             return win_global, None
-        # Only the compressor/indexer read the matched tail page's slot; resolving it costs a
-        # host sync (.item()), so do it after the ratio-0 early-out.
+        # Only the compressor/indexer read the matched tail page's slot; resolving it costs
+        # a host sync (.item()), so do it after the ratio-0 early-out.
         tail_ws = (
             int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
             if start_pos > 0 else None
@@ -157,7 +227,7 @@ class Attention(BaseOP):
             self.compressor.forward(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
         return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
 
-    def forward_ragged(self, x, segments, flat_positions):
+    def forward_ragged(self, x, segments, flat_positions, spans_by_ti=None):
         """Ragged batched prefill (cu_seqlens). ``x`` is [1, T, dim] -- the requests' NEW token
         streams concatenated (NO padding); ``segments`` is [(offset, n, table_idx, start_pos)]
         tiling [0, T); ``flat_positions`` [T] is each token's ABSOLUTE position, so a radix-hit
@@ -197,9 +267,18 @@ class Attention(BaseOP):
         win_parts: list[torch.Tensor] = []
         cmp_parts: list[torch.Tensor | None] = []
         max_c = 0
+        any_spans = False
         for off, n, ti, start_pos in segments:
+            spans = None
+            if spans_by_ti is not None:
+                req_spans = spans_by_ti.get(ti)
+                if req_spans:
+                    end = start_pos + n
+                    spans = [(s, e) for (s, e) in req_spans if s >= start_pos and e <= end]
+                    any_spans = any_spans or bool(spans)
             win_global, cmp_global = self._prefill_segment(
-                x[:, off:off + n], qr[:, off:off + n], kv[0, off:off + n], ti, start_pos, n
+                x[:, off:off + n], qr[:, off:off + n], kv[0, off:off + n], ti, start_pos, n,
+                spans=spans,
             )
             win_parts.append(win_global)
             cmp_parts.append(cmp_global)
@@ -213,6 +292,11 @@ class Attention(BaseOP):
         # is enough to flip a greedy near-tie. bs>1 pads every part to win (the historical
         # batched behavior).
         n_window = win if len(segments) > 1 else win_parts[0].shape[-1]
+        if any_spans:
+            # Span segments carry win+max_img-wide candidates; pad every part to the widest
+            # so the single flat launch stays rectangular. Text-only batches (any_spans
+            # False) keep the historical widths bit-identically.
+            n_window = max(n_window, *(w.shape[-1] for w in win_parts))
         flat = []
         for i, (off, n, ti, _start) in enumerate(segments):
             wg = win_parts[i]

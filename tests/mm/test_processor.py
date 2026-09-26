@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from freetoken.message import MMItem
-from freetoken.mm import MM_PAD_SHIFT_VALUE
+from freetoken.mm import MM_PAD_SHIFT_VALUE, mm_pad_value
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, image_positions
 from freetoken.mm.processors.gemma4 import Gemma4MMProcessor, Gemma4UnifiedMMProcessor
@@ -17,6 +17,7 @@ from freetoken.mm.processors.glm5_next import Glm5NextMMProcessor
 from freetoken.mm.processors.muse_glimmer import MuseGlimmerMMProcessor
 from freetoken.mm.processors.minimax_m3 import IMAGE_END_ID, IMAGE_START_ID, MiniMaxM3MMProcessor
 from freetoken.mm.processors.qwen_vl import QwenVLMMProcessor
+from freetoken.mm.processors.deepseek_v4 import DSV4MMProcessor
 
 PLACEHOLDER = 7
 BOI, SOFT, EOI = 90, 91, 92
@@ -46,7 +47,7 @@ class _Family(MMProcessor):
             for i, _ in enumerate(images)
         ]
 
-    def prompt_replacement(self, item):
+    def prompt_replacement(self, item, start=0):
         return PromptReplacement.select_token_id([BOI] + [SOFT] * self.n_soft + [EOI], SOFT)
 
     def dummy_items(self, dtype, device):
@@ -56,7 +57,7 @@ class _Family(MMProcessor):
 class _Tiled(_Family):
     """Rows of soft tokens separated by a break token, like a tiled image."""
 
-    def prompt_replacement(self, item):
+    def prompt_replacement(self, item, start=0):
         full = ([SOFT] * 2 + [BOI]) * 3
         return PromptReplacement.select_token_id(full, SOFT)
 
@@ -415,3 +416,110 @@ def test_registry_resolves_by_architecture(monkeypatch):
     assert get_mm_processor("/text-only") is None
     assert get_mm_processor("/unknown-vlm") is None
     assert get_mm_processor("/missing") is None  # a config that fails to load means no vision
+
+
+def _dsv4_config(**over):
+    """The vision dims sit at the top level of a deepseek_v4 checkpoint config."""
+    base = dict(
+        vision_n_layers=32,
+        vision_dim=1024,
+        vision_n_heads=16,
+        vision_inter_dim=2816,
+        vision_patch_size=14,
+        vision_rope_theta=10000.0,
+        vision_downsample_ratio=3,
+        vision_max_n_token=384,
+        vision_min_pixels=147456,
+        vision_max_wh_ratio=8,
+        hidden_size=4096,
+    )
+    return SimpleNamespace(**{**base, **over})
+
+
+def _dsv4_image(width, height):
+    from PIL import Image
+
+    return Image.new("RGB", (width, height))
+
+
+def test_dsv4_block_length_and_hash_follow_the_insertion_offset():
+    from freetoken.models.deepseek_v4.config import IMAGE_TOKEN_ID
+    from freetoken.models.deepseek_v4.vision import build_image_block
+
+    proc = DSV4MMProcessor(_dsv4_config(), "/nonexistent", MultimodalConfig())
+    assert proc.placeholder == [IMAGE_TOKEN_ID]
+    (item,) = proc.process([_dsv4_image(640, 480)])
+    assert (item.n_vit_h, item.n_vit_w, item.n_llm_h, item.n_llm_w) == (35, 46, 12, 16)
+
+    repl = proc.prompt_replacement(item, 0)
+    at_zero, hash_zero = len(repl.full), item.hash
+    assert at_zero == len(build_image_block(12, 16, 0)[0]) == 209
+    assert repl.full == [IMAGE_TOKEN_ID] * at_zero
+    # the block's sentinels are embeddings too, so the whole span takes image rows
+    assert repl.embed_spans() == [[0, at_zero]]
+    assert item.pad_value == mm_pad_value(item.hash) and item.pad_value >= MM_PAD_SHIFT_VALUE
+
+    # the lead pads align the block to a compression stride, so a later offset is a shorter
+    # block AND a different content hash: one alignment's rows must never serve another's
+    repl = proc.prompt_replacement(item, 2)
+    assert len(repl.full) == at_zero - 2 and item.hash != hash_zero
+    assert item.pad_value == mm_pad_value(item.hash) >= MM_PAD_SHIFT_VALUE
+
+
+def test_dsv4_dummy_item_is_the_smallest_encodable_block():
+    from freetoken.models.deepseek_v4.vision import build_image_block
+
+    proc = DSV4MMProcessor(_dsv4_config(), "/nonexistent", MultimodalConfig())
+    (dummy,) = proc.dummy_items(torch.bfloat16, torch.device("cpu"))
+    dummy.validate()
+    assert dummy.feature.shape == (36, 3, 14, 14)  # a 6x6 patch grid, one 2x2 merge grid
+    assert dummy.num_tokens == len(build_image_block(2, 2, 0)[0]) == 13
+
+
+def test_a_text_only_checkpoint_config_has_no_dsv4_processor():
+    proc = DSV4MMProcessor
+    with pytest.raises(ValueError):
+        proc(_dsv4_config(vision_n_layers=0), "/nonexistent", MultimodalConfig())
+
+
+def test_prompt_replacement_sees_the_offset_it_lands_at():
+    class _Offset(MMProcessor):
+        placeholder = [PLACEHOLDER]
+
+        def process(self, images):
+            return [
+                MMItem(
+                    modality="image",
+                    hash=200 + i,
+                    pad_value=MM_PAD_SHIFT_VALUE + 200 + i,
+                    offsets=[],
+                    feature=torch.zeros(1),
+                )
+                for i in range(len(images))
+            ]
+
+        def prompt_replacement(self, item, start=0):
+            return PromptReplacement([PLACEHOLDER] * (1 + start % 2))
+
+        def dummy_items(self, dtype, device):
+            return []
+
+    proc = _Offset("/fake", MultimodalConfig())
+    ids = torch.tensor([1, PLACEHOLDER, 2, PLACEHOLDER, 3], dtype=torch.int32)
+    out = proc.apply(ids, [_png(), _png()])
+    # the first placeholder sits at offset 1 (odd: two tokens), the second at offset 4;
+    # apply fills the embedding slots with each item's content pad id, not the placeholder
+    pads = [item.pad_value for item in out.mm_items]
+    assert out.input_ids.tolist() == [1, pads[0], pads[0], 2, pads[1], 3]
+    assert [item.offsets for item in out.mm_items] == [[[1, 3]], [[4, 5]]]
+
+
+def test_dsv4_image_max_tokens_lowers_the_checkpoints_block_cap():
+    from freetoken.models.deepseek_v4.vision import build_image_block
+
+    big = DSV4MMProcessor(_dsv4_config(), "/nonexistent", MultimodalConfig())
+    capped = DSV4MMProcessor(_dsv4_config(), "/nonexistent", MultimodalConfig(image_max_tokens=64))
+    (a,) = big.process([_dsv4_image(1600, 1200)])
+    (b,) = capped.process([_dsv4_image(1600, 1200)])
+    assert b.n_llm_h * b.n_llm_w < a.n_llm_h * a.n_llm_w
+    assert len(build_image_block(b.n_llm_h, b.n_llm_w, 0)[0]) <= 64

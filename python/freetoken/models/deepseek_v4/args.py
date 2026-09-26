@@ -69,6 +69,18 @@ class DeepseekV4Args:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
+    # ----- vision tower (DeepSeek-V4-Flash-Vision-Exp; 0 on the text-only releases) -----
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 384
+    vision_min_pixels: int = 147456
+    vision_max_wh_ratio: int = 8
+
     def __post_init__(self) -> None:
         # JSON lists -> tuple so the dataclass stays hashable / immutable-ish.
         if isinstance(self.compress_ratios, list):

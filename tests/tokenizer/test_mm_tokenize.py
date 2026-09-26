@@ -1,4 +1,4 @@
-"""Image tokenization against real Qwen VL, Gemma-4, GLM-5.3, Muse-Glimmer and MiniMax-M3 checkpoints (skipped when absent)."""
+"""Image tokenization against real Qwen VL, Gemma-4, GLM-5.3, Muse-Glimmer, MiniMax-M3 and DeepSeek-V4-Vision checkpoints (skipped when absent)."""
 
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ GEMMA = os.environ.get("FREETOKEN_GEMMA4_MODEL", "")
 GLM = os.environ.get("FREETOKEN_GLM53_MODEL", "")
 MUSE = os.environ.get("FREETOKEN_MUSE_MODEL", "")
 MINIMAX = os.environ.get("FREETOKEN_MINIMAX_M3_MODEL", "")
+DSV4 = os.environ.get("FREETOKEN_DSV4_VL_MODEL", "")
 
 pytestmark = [
     pytest.mark.needs_weights,
     pytest.mark.skipif(
-        not MODELS and not any(os.path.exists(os.path.join(p, "config.json")) for p in (GEMMA, GLM, MUSE, MINIMAX)),
-        reason="no FREETOKEN_QWEN36_MODEL / FREETOKEN_QWEN3VL_MODEL / FREETOKEN_GEMMA4_MODEL / FREETOKEN_GLM53_MODEL / FREETOKEN_MUSE_MODEL / FREETOKEN_MINIMAX_M3_MODEL checkpoint",
+        not MODELS and not any(os.path.exists(os.path.join(p, "config.json")) for p in (GEMMA, GLM, MUSE, MINIMAX, DSV4)),
+        reason="no FREETOKEN_QWEN36_MODEL / FREETOKEN_QWEN3VL_MODEL / FREETOKEN_GEMMA4_MODEL / FREETOKEN_GLM53_MODEL / FREETOKEN_MUSE_MODEL / FREETOKEN_MINIMAX_M3_MODEL / FREETOKEN_DSV4_VL_MODEL checkpoint",
     ),
 ]
 
@@ -214,3 +215,51 @@ def test_minimax_wraps_the_pad_span_in_start_end_tokens():
     assert bool((ids[start:end] == item.pad_value).all())
     budgeted = TokenizeManager(tokenizer, get_mm_processor(MINIMAX, MultimodalConfig(image_max_tokens=64))).tokenize([_msg([_png(640, 400)])])[0]
     assert budgeted.mm_items[0].num_tokens <= 64
+
+
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(DSV4, "config.json")),
+    reason="no FREETOKEN_DSV4_VL_MODEL checkpoint",
+)
+def test_dsv4_expands_the_placeholder_into_the_reference_block():
+    """The block carries one content pad id, and its length follows the reference's grid."""
+    from freetoken.mm.processor import get_mm_processor
+    from freetoken.tokenizer.tokenize import TokenizeManager
+    from freetoken.utils.hf import load_tokenizer
+
+    manager = TokenizeManager(load_tokenizer(DSV4), get_mm_processor(DSV4))
+    # 640x480 through the reference: a 12x16 merge grid, so 206 tokens of rows and markers
+    # plus the 3 lead pads that align the block at this offset
+    out = manager.tokenize([_msg([_png(640, 480)])])[0]
+    ids = out.input_ids.tolist()
+    (item,) = out.mm_items
+    assert (item.n_llm_h, item.n_llm_w) == (12, 16)
+    assert item.num_tokens == 209
+    lo, hi = item.offsets[0]
+    assert (lo, hi) == (item.start, item.start + 209)
+    assert set(ids[lo:hi]) == {item.pad_value}
+    assert item.pad_value >= MM_PAD_SHIFT_VALUE and item.pad_value == mm_pad_value(item.hash)
+    assert 129264 not in ids  # the raw <|deepseek_image|> placeholder is gone
+    assert item.feature.shape == (35 * 46, 3, 14, 14) and item.feature.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(DSV4, "config.json")),
+    reason="no FREETOKEN_DSV4_VL_MODEL checkpoint",
+)
+def test_dsv4_two_images_take_two_blocks_and_the_second_is_shorter():
+    """The second image sits at a different offset, so its block is a different length."""
+    from freetoken.mm.processor import get_mm_processor
+    from freetoken.tokenizer.tokenize import TokenizeManager
+    from freetoken.utils.hf import load_tokenizer
+
+    manager = TokenizeManager(load_tokenizer(DSV4), get_mm_processor(DSV4))
+    raw = _png(320, 240)
+    out = manager.tokenize([_msg([raw, raw], n_parts=2)])[0]
+    first, second = out.mm_items
+    assert (first.start, second.start) == (first.offsets[0][0], second.offsets[0][0])
+    # the lead pads take up to three tokens of slack, so the blocks nearly match
+    assert abs(second.num_tokens - first.num_tokens) <= 3
+    # two images share a pad id only when their blocks are laid out identically, which is
+    # exactly when their offsets are congruent: otherwise one must not serve the other's key
+    assert (first.pad_value == second.pad_value) == ((second.start - first.start) % 4 == 0)

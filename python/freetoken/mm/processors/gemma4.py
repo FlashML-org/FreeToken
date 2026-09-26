@@ -65,7 +65,7 @@ class Gemma4MMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
         full = [self.boi_token_id] + [self.image_token_id] * item.num_soft_tokens + [self.eoi_token_id]
         return PromptReplacement.select_token_id(full, self.image_token_id)
 

@@ -25,6 +25,9 @@ from .effort import (
 
 logger = init_logger(__name__)
 
+# Stands in for an image the render path never decodes (validation, count_tokens).
+_NO_IMAGE_DATA = b"\x00"
+
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
@@ -63,7 +66,7 @@ class TokenizeManager:
         results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
-            prompt = self.render_prompt(msg)
+            prompt = self._render_msg(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
@@ -101,10 +104,18 @@ class TokenizeManager:
         validate a request before committing an SSE stream. Sanitizes
         ``reasoning_effort`` first: every render path (worker, frontend
         validation, count_tokens) must quantize identically."""
+        return self._render_msg(msg)
+
+    def _render_msg(self, msg: TokenizeMsg) -> str:
+        """``render_prompt``; the single render path, so validation and tokenization
+        cannot drift. Only the dsv4 encoder needs the request's image bytes on the part."""
         if not isinstance(msg.text, list):
             return msg.text
+        messages = msg.text
+        if self._dsv4_encoder is not None:
+            messages = _reinject_dsv4_image_data(messages, getattr(msg, "images", None))
         return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+            messages, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
 
     def _render(
@@ -208,6 +219,38 @@ def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleTy
     if not hasattr(module, "encode_messages"):
         return None
     return module
+
+
+def _reinject_dsv4_image_data(messages: list[dict], images: list[bytes] | None) -> list[dict]:
+    """Put the request's image bytes back on the image parts the dsv4 encoder reads.
+
+    The frontend moves fetched media onto TokenizeMsg.images and pops the refs off the
+    parts (mm.media.collect_image_refs), but encoding_dsv4._extract_image wants the source
+    on the part itself. Render-only callers (frontend validation, count_tokens) carry no
+    bytes: a sentinel keeps the part non-empty so the placeholder still lands in the
+    prompt, and nothing on the render path decodes it.
+    """
+    if not isinstance(messages, list):
+        return messages
+    img_iter = iter(images or ())
+    out: list[dict] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        parts = []
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "image"
+                and not any(key in part for key in ("source", "url", "data"))
+            ):
+                parts.append({**part, "data": next(img_iter, None) or _NO_IMAGE_DATA})
+            else:
+                parts.append(part)
+        out.append({**message, "content": parts})
+    return out
 
 
 def _apply_dsv4_chat_encoder(
