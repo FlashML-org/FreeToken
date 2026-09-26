@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
+    from freetoken.kvcache.kv_host_offload import KVHostOffloader
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -183,6 +184,9 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
+    # KV host offload (--kv-host-pages): the QSA backend's logical->physical page bridge.
+    # Set by the engine before create_attention_backend; None when disabled.
+    kv_offloader: KVHostOffloader | None = None
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None

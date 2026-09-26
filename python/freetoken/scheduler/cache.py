@@ -56,6 +56,31 @@ class CacheManager:
         if swa_pool is not None:
             self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
+        # Host prefix tier: FT_GDN_HOST_TIER=1 guarda snapshots GDN na RAM (Degrau 2);
+        # FT_PREFIX_HOST=1 + FT_PREFIX_HOST_GB adiciona o KV de prefixo num slot space host
+        # separado (Degrau 3 — o radix nunca perde o mapeamento). Hybrid path only.
+        self.host_tier = None
+        gdn_on = os.environ.get("FT_GDN_HOST_TIER", "0") == "1"
+        kv_gb = (float(os.environ.get("FT_PREFIX_HOST_GB", "16"))
+                 if os.environ.get("FT_PREFIX_HOST", "0") == "1" else 0)
+        if self.is_hybrid and (gdn_on or kv_gb > 0):
+            from freetoken.core import get_global_ctx
+            from freetoken.kvcache.host_prefix_tier import HostPrefixTier
+            from freetoken.utils import init_logger
+
+            slots = int(os.environ.get("FT_GDN_HOST_SLOTS", "32"))
+            kv_pool = get_global_ctx().kv_cache if kv_gb > 0 else None
+            self.host_tier = HostPrefixTier(
+                linear_state_pool, kv_pool, gdn_slots_host=slots,
+                kv_budget_bytes=int(kv_gb * (1 << 30)), device=device)
+            self.prefix_cache.on_evict_node = self._on_evict_node_to_host
+            self.prefix_cache.on_match_dead_snapshot = self._rehydrate_snapshot
+            if kv_pool is not None:
+                self.prefix_cache.on_evict_kv = self._on_evict_kv_to_host
+            init_logger(__name__).info(
+                f"host prefix tier ON: {slots} GDN slots"
+                + (f" + {kv_gb:.0f} GiB KV store" if kv_pool is not None else "")
+            )
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -101,6 +126,16 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            # Host prefix tier (FT_PREFIX_HOST): a prefix evicted from the tree lives in RAM
+            # (KV bytes + GDN snapshot). If the tree match fell short, rehydrate the deeper
+            # host entry into fresh pages, re-insert it into the tree and re-match.
+            tier = self.host_tier
+            if tier is not None and tier.has_kv:
+                hit = tier.lookup(ids, self.page_size)
+                if (hit is not None and hit.kv_pages is not None and hit.gdn_slot is not None
+                        and hit.host_len > m.cached_len):
+                    self._rehydrate_host_prefix(ids, hit)
+                    m = self.prefix_cache.match_prefix(ids)
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
@@ -548,6 +583,96 @@ class CacheManager:
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 
+    # ----- host GDN-snapshot tier (FT_GDN_HOST_TIER) -------------------------------
+    def _on_evict_node_to_host(self, node) -> None:
+        """Tree hook: the node's GDN snapshot is about to be freed. Copy it to the host tier
+        and index the node's prefix (the GPU slot is freed only after we return)."""
+        tier = self.host_tier
+        prefix = self.prefix_cache._collect_key(node)
+        try:
+            hs = tier.write_gdn(node.mamba_value)
+        except RuntimeError:
+            # host tier full: drop the OLDEST indexed prefix and retry once
+            if not tier._index:
+                return
+            oldest = next(iter(tier._index))
+            tier.evict_host(tier._index[oldest].key_tokens)
+            try:
+                hs = tier.write_gdn(node.mamba_value)
+            except RuntimeError:
+                return
+        tier.put_prefix(prefix, None, hs)
+
+    def _on_evict_kv_to_host(self, node) -> None:
+        """Tree hook (FT_PREFIX_HOST): the node's KV pages are about to be freed. Copy the
+        WHOLE prefix's pages to the host store while the bytes are still valid (eviction is
+        bottom-up, so the ancestors' pages are still live), and index the prefix."""
+        tier = self.host_tier
+        prefix = self.prefix_cache._collect_key(node)
+        kv = self.prefix_cache._collect_kv(node)
+        slots = tier.write_kv(kv)
+        if slots is not None:
+            tier.put_prefix(prefix, slots, None)
+
+    def _rehydrate_snapshot(self, node) -> int | None:
+        """Tree hook (match path): the node is a snapshot tombstone. If the host tier has its
+        prefix, copy the snapshot back into a fresh pool slot and return the slot; None =
+        keep walking (the match truncates as before)."""
+        tier = self.host_tier
+        hit = tier.lookup(self.prefix_cache._collect_key(node), self.page_size)
+        if hit is None or hit.gdn_slot is None:
+            return None
+        pool = self.linear_state_pool
+        if pool.num_free_slots < 1:
+            # make room: evicting another snapshot writes IT to the host tier first
+            self.ensure_mamba_slots(1)
+            if pool.num_free_slots < 1:
+                return None
+        slot = pool.alloc(1)[0]
+        tier.read_gdn(hit.gdn_slot, slot)
+        return slot
+
+    def _rehydrate_host_prefix(self, ids: torch.Tensor, hit) -> None:
+        """FT_PREFIX_HOST: sobe um prefixo frio do tier pro tree+GPU -- aloca páginas novas
+        (pode evictar: a vítima é escrita no host primeiro), copia os bytes KV H2D, restaura
+        o snapshot GDN num slot novo e re-insere o prefixo no tree (o match seguinte acha).
+        """
+        tier = self.host_tier
+        n_pages = hit.host_len // self.page_size
+        kv_new = self._page_to_token(self._allocate(n_pages))
+        pool = self.linear_state_pool
+        if hit.gdn_slot is not None:
+            self.ensure_mamba_slots(1)
+            if pool.num_free_slots < 1:
+                self._free(kv_new)  # sem slot GDN não dá pra reidratar; devolve as páginas
+                return
+            slot = pool.alloc(1)[0]
+            tier.read_gdn(hit.gdn_slot, slot)
+        else:
+            self._free(kv_new)
+            return  # o modelo híbrido não resume sem snapshot GDN
+        # Com o KVHostOffloader ativo, as páginas recém-alocadas são LÓGICAS: subir bytes
+        # pra GPU em bulk estoura o pool físico quando o prefixo > pool (o fetch lazy já
+        # resolve residência na atenção). Copiamos host->host pro espelho e invalidamos
+        # bindings defasados, em vez de H2D.
+        from freetoken.core import get_global_ctx
+        off = getattr(get_global_ctx(), "kv_offloader", None)
+        new_pages = kv_new[:: self.page_size] // self.page_size
+        if off is not None:
+            tier.read_kv_to_mirror(hit.kv_pages, off.mirror.tensor,
+                                   off.mirror_scales.tensor if off.mirror_scales is not None else None,
+                                   new_pages)
+            off.invalidate_pages(new_pages)
+        else:
+            tier.read_kv(hit.kv_pages, new_pages)
+        prefix_len, mamba_exist = self.prefix_cache.insert(ids[: hit.host_len], kv_new, slot)
+        if prefix_len > 0:
+            # o tree já tinha [0, prefix_len) com as páginas antigas (dedup do insert) --
+            # as páginas frescas que aloquei pra essa parte voltam pro free list
+            self._free(kv_new[:prefix_len])
+        if mamba_exist:
+            pool.free([slot])  # o boundary já tinha snapshot vivo (dedup do insert)
+
     def rebuild(self, num_pages: int, page_table: torch.Tensor) -> None:
         """Re-point the page table and reset page accounting + prefix cache IN PLACE.
 
@@ -561,6 +686,12 @@ class CacheManager:
         self.page_table = page_table
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
+        if self.host_tier is not None:
+            # the rebuilt tree gets the same hooks (the host index survives a rebuild)
+            self.prefix_cache.on_evict_node = self._on_evict_node_to_host
+            self.prefix_cache.on_match_dead_snapshot = self._rehydrate_snapshot
+            if self.host_tier.has_kv:
+                self.prefix_cache.on_evict_kv = self._on_evict_kv_to_host
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
