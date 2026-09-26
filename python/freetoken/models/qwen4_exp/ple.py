@@ -135,6 +135,7 @@ class PinnedUVATable:
         weight: torch.Tensor,
         scale: float = 1.0,
         *,
+        scale_rows: torch.Tensor | None = None,
         device: torch.device | None = None,
         prefetch: bool = True,
     ) -> None:
@@ -150,6 +151,12 @@ class PinnedUVATable:
         self._device = device or torch.device("cuda", torch.cuda.current_device())
         # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
         self._table_ptr = device_ptr(weight)
+        # per-row fp32 scales (community per_row_e4m3 exports); pinned host memory like the codes
+        if scale_rows is not None:
+            assert scale_rows.dtype == torch.float32 and scale_rows.device.type == "cpu"
+            assert scale_rows.is_contiguous() and scale_rows.shape == (self.num_rows,)
+        self.scale_rows = scale_rows  # keep the bank alive
+        self._scale_ptr = device_ptr(scale_rows) if scale_rows is not None else 0
         self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
@@ -181,6 +188,7 @@ class PinnedUVATable:
             dst,
             self.scale,
             self._is_fp8,
+            scale_ptr=self._scale_ptr,
         )
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
