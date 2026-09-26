@@ -1,0 +1,45 @@
+FROM rocm/dev-ubuntu-24.04:10.0.0-full@sha256:a90cf047f615abe70fbef83c64def0a2d549ef37a39c8ea545430aba4981b374
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      cmake git pkg-config python3.12-venv xxd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/opt/rocm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib
+
+RUN python -m pip install --no-cache-dir --upgrade \
+      pip "setuptools>=77,<82" wheel ninja "numpy>=2.0,<2.5" \
+    && python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/whl-next \
+      "torch[device-all]==2.11.0+rocm10.0.0" \
+      "torchvision[device-all]==0.26.0+rocm10.0.0" \
+      "torchaudio==2.11.0+rocm10.0.0" \
+      "triton==3.8.0+git4cff872c.rocm10.0.0"
+
+RUN python -m pip install --no-cache-dir \
+      "apache-tvm-ffi==0.1.13.post3" \
+      "einops>=0.8,<1" \
+      "fastapi>=0.115,<1" \
+      "flashlib==0.3.0" \
+      "gguf>=0.19,<1" \
+      "huggingface_hub>=1.5,<2" \
+      "msgpack>=1.1,<2" \
+      "modelscope>=1.37,<2" \
+      "numpy>=2.0,<2.5" \
+      "openai>=2.0,<3" \
+      "partial-json-parser>=0.2,<1" \
+      "pillow>=10,<13" \
+      "prompt_toolkit>=3.0,<4" \
+      "pydantic>=2.9,<3" \
+      "pytest>=6.0" \
+      "pyzmq>=27,<28" \
+      "safetensors>=0.6,<1" \
+      "tqdm>=4.66,<5" \
+      "transformers==5.16.1" \
+      "uvicorn>=0.30,<1" \
+    && python -m pip check \
+    && python -c "import torch, triton; assert torch.__version__ == '2.11.0+rocm10.0.0'; assert torch.version.hip == '7.15.26333'; assert torch.version.cuda is None; assert triton.__version__ == '3.8.0'"

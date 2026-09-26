@@ -1,0 +1,213 @@
+name: ROCm CI
+run-name: ROCm CI / ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-ci-w7900d
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: ROCm tests
+    runs-on: [self-hosted, linux, x64, rocm-ci, gfx1100, w7900d]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.0.0-ci-gh-proxy@sha256:23b9290860e56b03d18ae1d35dfadb1e2cf0de3f998f2cbb649e5992666f849e
+      volumes:
+        - /nvme0/data/FreeToken/models:/opt/freetoken-ci/models:ro
+        - /nvme0/data/FreeToken/datasets:/opt/freetoken-ci/datasets:ro
+      options: >-
+        --device=/dev/kfd
+        --device=/dev/dri
+        --shm-size=128g
+    env:
+      CI: "true"
+      CI_ASSET_ROOT: /opt/freetoken-ci
+      FREETOKEN_ROCM_ARCH: gfx1100
+      MAX_JOBS: "64"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_INDEX_URL: ${{ vars.ROCM_CI_PIP_INDEX_URL || 'https://mirrors.aliyun.com/pypi/simple' }}
+      PYTHONUNBUFFERED: "1"
+      PYTORCH_ROCM_ARCH: gfx1100
+      ROCR_VISIBLE_DEVICES: "4,5"
+      TORCH_EXTENSIONS_DIR: /tmp/freetoken-ci/torch-extensions
+      TRITON_CACHE_DIR: /tmp/freetoken-ci/triton
+      XDG_CACHE_HOME: /tmp/freetoken-ci/xdg
+
+    steps:
+      - name: Prepare diagnostics
+        run: |
+          rm -rf "$RUNNER_TEMP/rocm-ci"
+          mkdir -p "$RUNNER_TEMP/rocm-ci"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Configure test assets
+        run: |
+          set_asset() {
+            local kind="$1" name="$2" path="$3"
+            if [[ "$kind" == file && -f "$path" ]] || [[ "$kind" == directory && -d "$path" ]]; then
+              printf '%s=%s\n' "$name" "$path" >> "$GITHUB_ENV"
+            else
+              printf '::notice::%s is unavailable at %s; its tests may skip\n' "$name" "$path"
+            fi
+          }
+
+          set_asset file FREETOKEN_AIME25_JSONL "$CI_ASSET_ROOT/datasets/aime25/test-freetoken.jsonl"
+          set_asset file FREETOKEN_GEMMA4_GGUF_GLOB "$CI_ASSET_ROOT/models/gemma-4-26B-A4B-GGUF/gemma-4-26B-A4B-Q8_0.gguf"
+          set_asset directory FREETOKEN_QWEN4EXP_MODEL "$CI_ASSET_ROOT/models/Qwen3.8-Flash-Next-NVFP4"
+          set_asset directory FREETOKEN_REBUILD_TEST_MODEL "$CI_ASSET_ROOT/models/Qwen3.5-0.8B"
+          set_asset directory FREETOKEN_TEST_MODEL "$CI_ASSET_ROOT/models/Qwen3.5-35B-A3B-FP8"
+
+      - name: Validate ROCm environment
+        run: |
+          mkdir -p "$TORCH_EXTENSIONS_DIR" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+          python - <<'PY' | tee "$RUNNER_TEMP/rocm-ci/runtime-before-install.txt"
+          import sys
+
+          import torch
+          import triton
+
+          if torch.version.hip is None or torch.version.cuda is not None:
+              raise SystemExit(
+                  f"expected ROCm PyTorch, got hip={torch.version.hip!r}, "
+                  f"cuda={torch.version.cuda!r}"
+              )
+          if not torch.cuda.is_available() or torch.cuda.device_count() != 2:
+              raise SystemExit(f"expected two ROCm GPUs, found {torch.cuda.device_count()}")
+
+          print(f"python={sys.version.split()[0]}")
+          print(f"torch={torch.__version__}")
+          print(f"torch_hip={torch.version.hip}")
+          print(f"triton={triton.__version__}")
+          for index in range(torch.cuda.device_count()):
+              props = torch.cuda.get_device_properties(index)
+              arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
+              if arch != "gfx1100":
+                  raise SystemExit(f"GPU {index}: expected gfx1100, got {arch!r}")
+              print(f"gpu[{index}]={props.name} arch={arch}")
+          PY
+
+      - name: Install FreeToken
+        run: |
+          { time python -m pip install --no-build-isolation -e .; } \
+            2>&1 | tee "$RUNNER_TEMP/rocm-ci/install.log"
+          python -m pip check 2>&1 | tee "$RUNNER_TEMP/rocm-ci/pip-check.log"
+
+      - name: Validate installed environment
+        run: |
+          python - <<'PY' | tee "$RUNNER_TEMP/rocm-ci/runtime-after-install.txt"
+          import torch
+          import triton
+          import transformers
+
+          if torch.version.hip is None or torch.version.cuda is not None:
+              raise SystemExit(
+                  f"installation replaced ROCm PyTorch: hip={torch.version.hip!r}, "
+                  f"cuda={torch.version.cuda!r}"
+              )
+          print(f"torch={torch.__version__}")
+          print(f"torch_hip={torch.version.hip}")
+          print(f"triton={triton.__version__}")
+          print(f"transformers={transformers.__version__}")
+          PY
+          printf 'FREETOKEN_QWEN4_HF_PYTHON=%s\n' "$(command -v python)" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        id: tests
+        env:
+          # W7900D has 48 GiB VRAM; FreeToken's 70 GiB default would skip AIME.
+          FREETOKEN_AIME_MIN_FREE_GIB: "40"
+        run: |
+          set +e
+          { time python -m pytest tests --ignore=tests/e2e/test_aime.py \
+              -ra --durations=50 \
+              --junitxml="$RUNNER_TEMP/rocm-ci/pytest-rocm-base.xml"; } \
+            2>&1 | tee "$RUNNER_TEMP/rocm-ci/pytest.log"
+          base_status=${PIPESTATUS[0]}
+          { time python -m pytest tests/e2e/test_aime.py -ra --durations=10 \
+              --junitxml="$RUNNER_TEMP/rocm-ci/pytest-rocm-aime.xml"; } \
+            2>&1 | tee -a "$RUNNER_TEMP/rocm-ci/pytest.log"
+          aime_status=${PIPESTATUS[0]}
+          set -e
+          printf 'base=%s\naime=%s\n' "$base_status" "$aime_status" \
+            > "$RUNNER_TEMP/rocm-ci/pytest-status.txt"
+          ((base_status == 0 && aime_status == 0))
+
+      - name: Write test summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rocm-ci"
+          python - <<'PY'
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          result_dir = Path(os.environ["RUNNER_TEMP"]) / "rocm-ci"
+
+          def counts(xml_paths, log_path):
+              test_suites = []
+              try:
+                  for xml_path in xml_paths:
+                      if xml_path.is_file():
+                          root = ET.parse(xml_path).getroot()
+                          test_suites.extend([root] if "tests" in root.attrib else list(root))
+                  if not test_suites:
+                      return ["-"] * 6
+                  tests = sum(int(suite.attrib.get("tests", 0)) for suite in test_suites)
+                  failed = sum(int(suite.attrib.get("failures", 0)) for suite in test_suites)
+                  errors = sum(int(suite.attrib.get("errors", 0)) for suite in test_suites)
+                  skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in test_suites)
+                  passed = tests - failed - errors - skipped
+                  log = log_path.read_text(errors="replace") if log_path.is_file() else ""
+                  matches = re.findall(r"(\d+) deselected", log)
+                  deselected = sum(int(value) for value in matches)
+                  duration = f'{sum(float(suite.attrib.get("time", 0)) for suite in test_suites):.2f}s'
+                  return [passed, failed, errors, skipped, deselected, duration]
+              except (ET.ParseError, TypeError, ValueError):
+                  return ["-"] * 6
+
+          passed, failed, errors, skipped, deselected, duration = counts(
+              [result_dir / "pytest-rocm-base.xml", result_dir / "pytest-rocm-aime.xml"],
+              result_dir / "pytest.log",
+          )
+          outcome = os.environ.get("TEST_OUTCOME", "not run")
+
+          lines = [
+              "# ROCm CI summary",
+              "",
+              f"- Trigger: `{os.environ['GITHUB_EVENT_NAME']}`",
+              f"- Commit: `{os.environ['GITHUB_SHA']}`",
+              "- GPU target: `2 x gfx1100`",
+              "",
+              "| Test scope | Step outcome | Passed | Failed | Errors | Skipped | Deselected | Duration |",
+              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+              f"| `tests/` | {outcome} | {passed} | {failed} | {errors} | {skipped} | {deselected} | {duration} |",
+          ]
+          summary = "\n".join(lines) + "\n"
+          (result_dir / "summary.md").write_text(summary)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write(summary)
+          PY
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rocm-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rocm-ci/
+          if-no-files-found: warn
+          retention-days: 14
