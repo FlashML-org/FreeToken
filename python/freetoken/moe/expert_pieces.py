@@ -37,8 +37,21 @@ def _model_hook(spec, name: str):
         return None
 
 
+def nvfp4_expert_spec_of(model_path: str, config):
+    """The family's ``Nvfp4ExpertSourceSpec`` (its ``nvfp4_expert_spec`` hook), or None.
+
+    The disk tier resolves the spec through this same hook the reader uses, so the
+    index and the loader read the same rows (see ``moe.disk_tier.Nvfp4DiskIndex``)."""
+    spec = get_model_spec(config.architectures[0])
+    hook = _model_hook(spec, "nvfp4_expert_spec")
+    if hook is None:
+        return None
+    return hook(model_path, config)
+
+
 def iter_expert_pieces(
-    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20
+    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8,
+    chunk: int = 8 << 20, skip_experts_from: int | None = None,
 ) -> Iterator[Piece]:
     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
 
@@ -47,12 +60,19 @@ def iter_expert_pieces(
     experts come from the family's stacked ``iter_weights`` and NVFP4 experts from its
     ``nvfp4_expert_spec``. The reader is resolved here, before any bank is allocated, so a
     missing parallel reader raises ``NotImplementedError`` while a serial fallback is still cheap.
-    """
+
+    ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are
+    disk-resident -- the NVFP4 reader never reads their tensors and yields an empty
+    piece for each so the bank fill still completes the layer."""
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:
         pieces = hook(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
         if pieces is not None:
+            if skip_experts_from is not None:
+                raise NotImplementedError(
+                    f"{spec.module} owns its expert reader; the disk-tier row skip is only "
+                    "implemented in the shared NVFP4 reader")
             return pieces
     if kind is QuantKind.NONE:
         return _bf16_pieces(model_path, config, spec, parallel=parallel, workers=workers, chunk=chunk)
@@ -63,7 +83,8 @@ def iter_expert_pieces(
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
         return iter_nvfp4_expert_pieces(
-            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers, chunk=chunk
+            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers,
+            chunk=chunk, skip_experts_from=skip_experts_from,
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 
