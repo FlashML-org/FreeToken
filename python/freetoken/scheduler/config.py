@@ -14,6 +14,9 @@ def _get_pid_suffix() -> str:
 @dataclass(frozen=True)
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
+    # True when --max-prefill-length was given on the CLI. Models that widen the chunk for
+    # single-pass prefill (DSV4) must not clobber an explicit user value.
+    max_extend_tokens_explicit: bool = False
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40
