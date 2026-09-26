@@ -6,8 +6,8 @@ final-logit softcap), so this produces the *same* ``ModelConfig`` as
 ``gemma4.config.parse_config`` -- only the source is GGUF KV metadata instead of a
 HF config object. transformers' own GGUF->config conversion is rejected by the
 gemma4 strict dataclass (per-layer ``num_key_value_heads`` array), so we read the
-metadata directly. ``expert_quant`` is set to ``"q4_0"`` to route the routed experts
-through the native-Q4_0 offload-cache path.
+metadata directly. ``expert_quant`` keeps the legacy ``"q4_0"`` provider tag, while
+the tensor table records the actual dense and per-layer routed-expert GGML types.
 """
 
 from __future__ import annotations
@@ -48,6 +48,72 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     return full_head_dim // 4
 
 
+def _gguf_quant_layout(model_path: str, num_layers: int, num_experts: int) -> dict | None:
+    """Discover native tensor types without touching the tensor payloads.
+
+    A metadata-only FTW source has no tensor table, in which case ``None`` keeps
+    the historical Q4_0/Q6_K defaults recorded by the converted checkpoint.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    fields = {
+        "qkv": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
+        "attn_output": ("attn_output.weight",),
+        "shared_gate_up": ("ffn_gate.weight", "ffn_up.weight"),
+        "shared_down": ("ffn_down.weight",),
+    }
+    per_layer = {name: [set() for _ in range(num_layers)] for name in fields}
+    expert_gate_up = [None] * num_layers
+    expert_down = [None] * num_layers
+    expert_gate_up_bytes = [None] * num_layers
+    expert_down_bytes = [None] * num_layers
+    embedding = None
+    saw_tensor = False
+
+    for tensor in iter_gguf_tensors(model_path):
+        saw_tensor = True
+        if tensor.name == "token_embd.weight":
+            embedding = tensor.ggml_type
+            continue
+        if not tensor.name.startswith("blk."):
+            continue
+        layer = int(tensor.name.split(".")[1])
+        suffix = tensor.name.split(".", 2)[2]
+        if suffix == "ffn_gate_up_exps.weight":
+            expert_gate_up[layer] = tensor.ggml_type
+            expert_gate_up_bytes[layer] = tensor.packed().numel()
+        elif suffix == "ffn_down_exps.weight":
+            expert_down[layer] = tensor.ggml_type
+            expert_down_bytes[layer] = tensor.packed().numel()
+        else:
+            for role, suffixes in fields.items():
+                if suffix in suffixes:
+                    per_layer[role][layer].add(tensor.ggml_type)
+                    break
+
+    if not saw_tensor:
+        return None
+    if embedding is None:
+        raise ValueError("gemma4 GGUF has no token_embd.weight")
+
+    layout: dict[str, object] = {"embedding": embedding}
+    for role, values in per_layer.items():
+        bad = [i for i, types in enumerate(values) if len(types) != 1]
+        if bad:
+            raise ValueError(f"gemma4 GGUF {role} tensors disagree or are missing in layers {bad}")
+        layout[role] = tuple(next(iter(types)) for types in values)
+    for role, values in (("expert_gate_up", expert_gate_up), ("expert_down", expert_down)):
+        missing = [i for i, value in enumerate(values) if value is None]
+        if missing:
+            raise ValueError(f"gemma4 GGUF {role} tensors are missing in layers {missing}")
+        layout[role] = tuple(values)
+    # Total packed bytes per expert. The loader stores each expert contiguously in
+    # a fixed-width cache slot and passes the slot stride to the CUDA kernel.
+    layout["expert_gate_up_bytes"] = tuple(int(n) // num_experts for n in expert_gate_up_bytes)
+    layout["expert_down_bytes"] = tuple(int(n) // num_experts for n in expert_down_bytes)
+    return layout
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     m = shim.metadata
 
@@ -59,6 +125,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
+    num_experts = int(g("expert_count"))
     num_qo_heads = int(g("attention.head_count"))
     kv_per_layer = g("attention.head_count_kv")  # per-layer list
     # True -> sliding-window (SWA) layer, False -> full attention.
@@ -105,7 +172,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
         rotary_config=full_rotary,
-        num_experts=int(g("expert_count")),
+        num_experts=num_experts,
         num_experts_per_tok=int(g("expert_used_count")),
         moe_intermediate_size=int(g("expert_feed_forward_length")),
         norm_topk_prob=True,
@@ -114,6 +181,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_enabled=True,
         expert_quant="q4_0",
         moe_weight_format="q4_0",
+        gguf_quant_types=_gguf_quant_layout(shim.model_path, num_layers, num_experts),
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -341,7 +409,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     """In place: replace gemma4's dense projections + embedding with native GGUF ops.
 
     Quantized in the checkpoint -> swapped: attention qkv/o, shared-MLP gate_up/down
-    (all Q4_0) and the token embedding (Q6_K, also the tied LM head). Left as dense
+    and the token embedding (also the tied LM head). Left as dense
     bf16 (F32 in the GGUF): the router gate, all RMSNorms, the per-layer scalars, and
     the routed experts (served from the offload cache).
     """
@@ -356,23 +424,33 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
             GGUFLinear(in_features, out_features, quant_type, has_bias=lin.bias is not None),
         )
 
+    layout = config.gguf_quant_types
+    embedding_type = layout["embedding"] if layout is not None else GGML_Q6_K
     inner = model.model
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
+        quant_type=embedding_type,
         embed_scale=config.embedding_scale,
     )
     inner.embed_tokens = embed
 
-    for layer in inner.layers.op_list:
-        swap_linear(layer.self_attn, "qkv_proj")
-        swap_linear(layer.self_attn, "o_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "gate_up_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "down_proj")
+    for layer_id, layer in enumerate(inner.layers.op_list):
+        swap_linear(layer.self_attn, "qkv_proj", layout["qkv"][layer_id] if layout else GGML_Q4_0)
+        swap_linear(layer.self_attn, "o_proj", layout["attn_output"][layer_id] if layout else GGML_Q4_0)
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "gate_up_proj",
+            layout["shared_gate_up"][layer_id] if layout else GGML_Q4_0,
+        )
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "down_proj",
+            layout["shared_down"][layer_id] if layout else GGML_Q4_0,
+        )
 
     if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, embedding_type)
 
 
 # --------------------------------------------------------------------------------------
@@ -385,6 +463,28 @@ def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], 
     return {
         "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
         "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
+    }
+
+
+def _uses_mixed_gguf_experts(config: ModelConfig) -> bool:
+    layout = getattr(config, "gguf_quant_types", None)
+    if layout is None:
+        return False
+    return any(
+        quant_type != GGML_Q4_0
+        for role in ("expert_gate_up", "expert_down")
+        for quant_type in layout[role]
+    )
+
+
+def _gguf_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    if not _uses_mixed_gguf_experts(config):
+        return _q4_0_expert_specs(config)
+    layout = config.gguf_quant_types
+    E = config.num_experts
+    return {
+        "gate_up": ((E, max(layout["expert_gate_up_bytes"])), torch.uint8),
+        "down": ((E, max(layout["expert_down_bytes"])), torch.uint8),
     }
 
 
@@ -413,7 +513,13 @@ def load_q4_0_expert_sources(
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
+    mixed = _uses_mixed_gguf_experts(config)
+    if mixed and layer_sink is not None:
+        raise NotImplementedError(
+            "converting mixed-type GGUF expert banks to FTW is not supported yet; "
+            "serve the source GGUF directly"
+        )
+    hb = alloc_layer_banks(_gguf_expert_specs(config), L)  # lazy anon mmaps (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
 
@@ -424,10 +530,18 @@ def load_q4_0_expert_sources(
                 continue
             layer = int(t.name.split(".")[1])
             if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, h_bytes))
+                packed = t.packed().reshape(E, -1)
+                if mixed:
+                    banks["gate_up"][layer][:, : packed.shape[1]].copy_(packed)
+                else:
+                    banks["gate_up"][layer].copy_(packed.reshape(E, 2 * I, h_bytes))
                 seen_gu.add(layer)
             elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
+                packed = t.packed().reshape(E, -1)
+                if mixed:
+                    banks["down"][layer][:, : packed.shape[1]].copy_(packed)
+                else:
+                    banks["down"][layer].copy_(packed.reshape(E, H, i_bytes))
                 seen_dn.add(layer)
             else:
                 continue
@@ -455,7 +569,7 @@ def dummy_q4_0_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tenso
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
     L = config.num_layers
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)
+    hb = alloc_layer_banks(_gguf_expert_specs(config), L)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     for t in banks["gate_up"] + banks["down"]:
         t.random_(0, 256)

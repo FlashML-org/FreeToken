@@ -1,5 +1,4 @@
-"""GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+"""GGML block-quant metadata and reference dequantization for native GGUF weights.
 
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
@@ -8,13 +7,16 @@ dense F32/F16 tensors at load (norms, scales, router) via :func:`dequantize`, an
 (b) cross-check the CUDA kernels in tests. The ``BLOCK_SHAPE`` table and
 :func:`row_bytes` are the type metadata the packed (kernel) path also relies on.
 
-Each ``dequant_*`` takes the raw little-endian bytes as a ``uint8`` tensor whose
+Each dequantizer takes the raw little-endian bytes as a ``uint8`` tensor whose
 final axis spans whole blocks, and returns the values in *storage order* (ggml's
 fastest axis first); the caller reshapes to the torch shape (``dims[::-1]``). The
-math mirrors ``ggml-quants.c``.
+hot Q4_0/Q6_K references mirror ``ggml-quants.c`` directly; other block types
+delegate their reference path to gguf-py.
 """
 
 from __future__ import annotations
+
+from functools import partial
 
 import torch
 
@@ -22,8 +24,24 @@ import torch
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q4_1 = 3
+GGML_Q5_0 = 6
+GGML_Q5_1 = 7
 GGML_Q8_0 = 8
+GGML_Q2_K = 10
+GGML_Q3_K = 11
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ4_NL = 20
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -32,8 +50,24 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_F16: (1, 2),
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
+    GGML_Q4_1: (32, 20),
+    GGML_Q5_0: (32, 22),
+    GGML_Q5_1: (32, 24),
     GGML_Q8_0: (32, 34),
+    GGML_Q2_K: (256, 84),
+    GGML_Q3_K: (256, 110),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ3_S: (256, 110),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
+    GGML_IQ1_M: (256, 56),
 }
 
 GGML_NAME = {
@@ -41,8 +75,24 @@ GGML_NAME = {
     GGML_F16: "F16",
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
+    GGML_Q4_1: "Q4_1",
+    GGML_Q5_0: "Q5_0",
+    GGML_Q5_1: "Q5_1",
     GGML_Q8_0: "Q8_0",
+    GGML_Q2_K: "Q2_K",
+    GGML_Q3_K: "Q3_K",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ3_S: "IQ3_S",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
+    GGML_IQ1_M: "IQ1_M",
 }
 
 
@@ -115,10 +165,41 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def _dequant_gguf_py(raw: torch.Tensor, out_dtype: torch.dtype, ggml_type: int) -> torch.Tensor:
+    """Reference dequant for additional block types, delegated to gguf-py."""
+    import gguf
+    import numpy as np
+
+    out = gguf.quants.dequantize(
+        raw.detach().cpu().contiguous().numpy(), gguf.GGMLQuantizationType(ggml_type)
+    )
+    return torch.from_numpy(np.asarray(out)).to(raw.device, out_dtype).reshape(-1)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
 }
+for _ggml_type in (
+    GGML_Q4_1,
+    GGML_Q5_0,
+    GGML_Q5_1,
+    GGML_Q8_0,
+    GGML_Q2_K,
+    GGML_Q3_K,
+    GGML_Q4_K,
+    GGML_Q5_K,
+    GGML_IQ2_XXS,
+    GGML_IQ2_XS,
+    GGML_IQ3_XXS,
+    GGML_IQ1_S,
+    GGML_IQ4_NL,
+    GGML_IQ3_S,
+    GGML_IQ2_S,
+    GGML_IQ4_XS,
+    GGML_IQ1_M,
+):
+    _DEQUANT[_ggml_type] = partial(_dequant_gguf_py, ggml_type=_ggml_type)
 
 
 def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> torch.Tensor:
@@ -142,8 +223,24 @@ __all__ = [
     "GGML_F16",
     "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q4_1",
+    "GGML_Q5_0",
+    "GGML_Q5_1",
     "GGML_Q8_0",
+    "GGML_Q2_K",
+    "GGML_Q3_K",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
+    "GGML_IQ2_XXS",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
+    "GGML_IQ1_S",
+    "GGML_IQ4_NL",
+    "GGML_IQ3_S",
+    "GGML_IQ2_S",
+    "GGML_IQ4_XS",
+    "GGML_IQ1_M",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",

@@ -48,6 +48,8 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # Per layer (gate_up ggml type, down ggml type) for native mixed GGUF banks.
+    gguf_quant_types: tuple[tuple[int, int], ...] | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -159,7 +161,20 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
             "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
             "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
         )
+    from freetoken.models.gguf.dequant import GGML_Q4_0
     from freetoken.models.weight import load_q4_0_moe_expert_sources
+
+    layout = getattr(model_config, "gguf_quant_types", None)
+    quant_types = None
+    quant_format = "q4_0"
+    if layout is not None:
+        quant_types = tuple(zip(layout["expert_gate_up"], layout["expert_down"]))
+        if any(pair != (GGML_Q4_0, GGML_Q4_0) for pair in quant_types):
+            quant_format = "gguf"
+            if decode_target != "gpu":
+                raise NotImplementedError(
+                    "mixed-type GGUF experts currently support GPU offload only"
+                )
 
     # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
     # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
@@ -168,7 +183,10 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     sink = None if dummy else layer_sink
     sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        quant_format,
+        {name: sources[name] for name in _BANK_SCHEMAS[quant_format]},
+        streamed=sink is not None,
+        gguf_quant_types=quant_types,
     )
 
 
