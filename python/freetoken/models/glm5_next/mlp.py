@@ -12,7 +12,7 @@ import torch
 from freetoken.layers import BaseOP, swiglu_clamp_and_mul
 from freetoken.utils import nvtx_annotate
 
-from freetoken.layers import LinearReplicated
+from freetoken.layers import LinearColParallelMerged, LinearReplicated, LinearRowParallel
 
 
 class Glm5NextGatedMLP(BaseOP):
@@ -23,12 +23,21 @@ class Glm5NextGatedMLP(BaseOP):
         swiglu_limit: float | None = None,
         *,
         has_bias: bool = False,
+        tensor_parallel: bool = False,
         quant_config=None,
         prefix: str = "",
     ):
-        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        # The decoder MLPs split their intermediate dim under TP (down all-reduces); the vision
+        # tower runs whole on every rank, so its projections stay replicated.
+        kw = dict(has_bias=has_bias, quant_config=quant_config)
+        if tensor_parallel:
+            self.gate_proj = LinearColParallelMerged(hidden_size, [intermediate_size], prefix=f"{prefix}.gate_proj", **kw)
+            self.up_proj = LinearColParallelMerged(hidden_size, [intermediate_size], prefix=f"{prefix}.up_proj", **kw)
+            self.down_proj = LinearRowParallel(intermediate_size, hidden_size, prefix=f"{prefix}.down_proj", **kw)
+        else:
+            self.gate_proj = LinearReplicated(hidden_size, intermediate_size, prefix=f"{prefix}.gate_proj", **kw)
+            self.up_proj = LinearReplicated(hidden_size, intermediate_size, prefix=f"{prefix}.up_proj", **kw)
+            self.down_proj = LinearReplicated(intermediate_size, hidden_size, prefix=f"{prefix}.down_proj", **kw)
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")

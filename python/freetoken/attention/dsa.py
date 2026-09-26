@@ -106,7 +106,10 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
         args = self._model_args(config)
         self.config = config
-        self.num_heads = config.num_qo_heads
+        from freetoken.distributed import get_tp_info
+        from freetoken.utils import div_even
+
+        self.num_heads = div_even(config.num_qo_heads, get_tp_info().size)  # this rank's heads
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.latent_dim = self.kv_lora_rank + self.qk_rope_head_dim

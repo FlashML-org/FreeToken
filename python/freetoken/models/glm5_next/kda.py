@@ -28,8 +28,9 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
-from freetoken.utils import nvtx_annotate
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated, LinearRowParallel
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -46,37 +47,44 @@ class _DepthwiseConv1d(BaseOP):
 class Glm5NextKDA(BaseOP):
     """KDA op; state is held in ``ctx.linear_state_pool`` keyed by the request's
     linear slot (``FLAMetadata.cache_indices``). Parameter names follow the
-    checkpoint modulo two load-time fusions (see weight.py): ``in_proj`` is
-    q|k|v|b|f_a|g_a concatenated, ``conv1d`` is q|k|v conv concatenated."""
+    checkpoint modulo load-time fusions (see weight.py): ``in_proj`` is q|k|v|b
+    concatenated, ``in_proj_fg`` is f_a|g_a, ``conv1d`` is q|k|v conv concatenated.
+
+    Under TP a rank owns whole heads: q|k|v|b, the f_b/g_b up-projections, the conv
+    channels, A_log and dt_bias split per head, o_proj is row-parallel. The rank-128
+    f_a/g_a bottleneck and the per-head-dim o_norm stay replicated."""
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.layer_id = layer_id
-        self.num_heads = args.linear_num_heads
+        self.num_heads = div_even(args.linear_num_heads, get_tp_info().size)  # this rank's heads
         self.head_dim = args.linear_head_dim
         self.proj_size = self.num_heads * self.head_dim  # H * D
+        full_p = args.linear_num_heads * self.head_dim
         self.conv_dim = 3 * self.proj_size  # merged q|k|v stream
         self.conv_kernel_size = args.linear_conv_kernel_dim
         self.lower_bound = args.linear_lower_bound
         self.scale = self.head_dim**-0.5
 
         p, h, d = self.proj_size, self.num_heads, self.head_dim
-        # one fused input GEMM over q|k|v|b|f_a|g_a
-        self._in_proj_split = [p, p, p, h, d, d]
+        # q|k|v|b split by head; the f_a|g_a bottleneck is not per-head, so it is a replicated GEMM
         self.in_proj = LinearColParallelMerged(
-            args.hidden_size, self._in_proj_split, has_bias=False,
+            args.hidden_size, [full_p, full_p, full_p, args.linear_num_heads], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.in_proj",
         )
+        self.in_proj_fg = LinearReplicated(
+            args.hidden_size, 2 * d, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.in_proj_fg",
+        )
         # Low-rank gate up-projections (128 -> 8192): forget gate and output gate.
-        self.f_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.f_b_proj")
-        self.g_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.g_b_proj")
+        self.f_b_proj = LinearColParallelMerged(d, [full_p], has_bias=False, quant_config=config.quant, prefix=f"{prefix}.f_b_proj")
+        self.g_b_proj = LinearColParallelMerged(d, [full_p], has_bias=False, quant_config=config.quant, prefix=f"{prefix}.g_b_proj")
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
         # Gate params stay fp32 (exp/sigmoid precision; the kernels read fp32).
         # models/weight.py exempts *.A_log / *.dt_bias from the model-dtype downcast.
         self.A_log = torch.empty(h, dtype=torch.float32)
         self.dt_bias = torch.empty(p, dtype=torch.float32)
         self.o_norm = GatedRMSNorm(d, eps=args.norm_eps, activation="sigmoid")
-        self.o_proj = LinearReplicated(p, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj")
+        self.o_proj = LinearRowParallel(full_p, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj")
 
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
@@ -108,10 +116,8 @@ class Glm5NextKDA(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        proj = self.in_proj.forward(hidden_states)
-        conv_in, b, f_a, g_a = torch.split(
-            proj, [self.conv_dim, h, d, d], dim=-1
-        )
+        conv_in, b = torch.split(self.in_proj.forward(hidden_states), [self.conv_dim, h], dim=-1)
+        f_a, g_a = torch.split(self.in_proj_fg.forward(hidden_states), [d, d], dim=-1)
         g1 = self.f_b_proj.forward(f_a)  # raw forget-gate logits [T, H*D]
         g2 = self.g_b_proj.forward(g_a)  # output-gate logits [T, H*D]
         li = pool.local_index(self.layer_id)
