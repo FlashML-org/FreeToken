@@ -701,10 +701,31 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
+    """The usable context: ``min(model ceiling, allocated KV tokens)``.
+
+    This is the clamp the engine already applies to its own ``max_seq_len`` (Engine.__init__,
+    and again in _refresh_seq_state after a rebuild), and therefore the limit the scheduler
+    admits against. The frontend process holds an unclamped ServerArgs copy, so publishing
+    ``config.max_seq_len`` here advertised the model's positional ceiling instead -- e.g. 262144
+    against a 178176-token pool, so the engine and this route disagreed about one quantity.
+
+    `ft launch` reads this to size each agent's context window (opencode's ``limit.context``,
+    codex's ``context_window``, ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``), so overstating it stops
+    those agents compacting before the KV pool runs out.
+    """
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
-    return value if value > 0 else None
+    if value <= 0:
+        return None
+    try:
+        # Local import: api_server imports this module, so a module-level one would cycle.
+        from .api_server import kv_pool_geometry
+
+        num_pages, page_size = kv_pool_geometry(state)
+        kv_tokens = num_pages * page_size
+    except Exception:  # noqa: BLE001
+        kv_tokens = 0
+    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
+    return min(value, kv_tokens) if kv_tokens > 0 else value
