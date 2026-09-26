@@ -327,3 +327,18 @@ def test_cache_rebuild_request_rejects_unknown_mode():
     assert CacheRebuildRequest(mode="if_idle").mode == "if_idle"
     with pytest.raises(ValidationError):
         CacheRebuildRequest(mode="drain")
+
+
+from pydantic import ValidationError  # noqa: E402
+
+from freetoken.server.api_server import CacheRebuildRequest  # noqa: E402
+
+
+def test_rebuild_timeout_bounds():
+    import pytest
+
+    for bad in (0, -5, 3601, float("nan")):
+        with pytest.raises(ValidationError):
+            CacheRebuildRequest(timeout=bad)
+    assert CacheRebuildRequest(timeout=3600).timeout == 3600
+    assert CacheRebuildRequest().timeout == 300.0
