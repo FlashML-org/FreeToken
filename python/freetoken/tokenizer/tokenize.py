@@ -36,8 +36,14 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
     one implementation prevents the two sides from disagreeing. Thinking is on
     when tools are offered (dsv4 only emits well-formed tool calls in thinking
     mode) or when the caller requests it via ``chat_template_kwargs``.
+    An explicit ``enable_thinking=False`` (or ``thinking=False``) from the
+    caller always wins, even when tools are present — the caller knows their
+    intent better than the heuristic.
     """
     ctk = chat_template_kwargs or {}
+    # Explicit disable takes precedence over the tools-presumed-thinking heuristic.
+    if ctk.get("enable_thinking") is False or ctk.get("thinking") is False:
+        return "chat"
     mode = str(ctk.get("thinking_mode") or "chat")
     if tools or ctk.get("enable_thinking") or ctk.get("thinking"):
         mode = "thinking"
