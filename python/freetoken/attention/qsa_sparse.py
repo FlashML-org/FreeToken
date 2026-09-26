@@ -92,6 +92,10 @@ class QSASparseMetadata(BaseAttnMetadata):
     rope_rows:        torch.Tensor | None = None  # [T] int32 arange
     q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    # KV host offload (--kv-host-pages): this forward's write pages (re-included in every
+    # fetch query so no mid-forward eviction can take them) and the physical out_loc.
+    write_pages:      torch.Tensor | None = None
+    out_loc_gpu:      torch.Tensor | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -112,7 +116,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
+        # The pool's COMPUTE dtype, never its store dtype (the contract lives in
+        # kvcache/base.py). These buffers feed the indexer -- qsa_index_norm_rope and
+        # qsa_mqa_paged -- whose tl.dot has no fp8 path, so an e4m3 q_index does not
+        # fail here, it fails at CUDA-graph capture with "Unsupported rhs dtype
+        # fp8e4nv". --kv-cache-dtype fp8 quantizes only the KV tiers; the index tiers
+        # stay 16-bit by design (kvcache/qsa_pool.py).
         self.dtype = self.kvcache.dtype
+        assert self.dtype.itemsize == 2, (
+            f"QSA block selection needs a 16-bit compute dtype, got {self.dtype} -- "
+            "the KV pool must report its compute dtype, not e4m3 codes"
+        )
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -142,6 +156,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             ).to(self.device)
 
         self._block_topk_kernel = _resolve_block_topk()
+        # KV host offload (None unless --kv-host-pages > 0): the GPU K/V pool is an LRU cache
+        # over the pinned host mirror; reads/writes translate logical -> physical pages.
+        self.kv_offloader = getattr(get_global_ctx(), "kv_offloader", None)
+        if self.kv_offloader is not None:
+            assert self.kv_offloader.pool is self.kvcache
+            self.kv_offloader.set_select_width(self.select_width, self.block_topk)
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
@@ -288,7 +308,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        off = self.kv_offloader
+        if off is not None and slot == 0:
+            # Bind this forward's write pages before the first store; they ride every fetch
+            # query below, so no mid-forward eviction can take them (and the write-through
+            # mirror makes any other eviction lossless).
+            md.write_pages = off.ensure_write_pages(batch.out_loc, md.is_decode)
+            md.out_loc_gpu = off.translate_slots(batch.out_loc, md.is_decode)
+        self.kvcache.store_kv(k, v, batch.out_loc if off is None else md.out_loc_gpu, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
         if slot == 0 or md.cmp_rows is None:
@@ -298,7 +325,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._plan_index_writes(md, batch)
 
         self._update_index_cache(index, md, slot)
+        if off is not None:
+            # Write-through: the pinned host mirror (the backing store) sees every token.
+            off.mirror_store(k, v, batch.out_loc, layer_id, getattr(md, "out_loc_gpu", None))
         indices = self._select(index, md, slot)
+        # Scale tensors only exist on an fp8 pool (k_scale returns None otherwise); the
+        # index tier stays bf16 either way, so _select above is quantization-agnostic.
+        if off is not None:
+            return self._attend_offloaded(qsa_sparse_paged_attention, q, indices, md, layer_id)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -307,7 +341,46 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
+
+    def _attend_offloaded(self, attend, q, indices, md, layer_id) -> torch.Tensor:
+        """Attend through the host-mirrored page space: fetch the selected pages into
+        physical slots, translate the block table, call the attend kernel unmodified.
+        Prefill attends one row at a time (a row's scattered selection nearly fills the
+        physical pool) over a once-per-layer compacted page list -- no host syncs."""
+        off = self.kv_offloader
+        k_cache = self.kvcache.k_cache(layer_id)
+        v_cache = self.kvcache.v_cache(layer_id)
+        # fp8 pool (PR #354): the attend kernel dequantizes with these; None on a bf16 pool.
+        ks = self.kvcache.k_scale(layer_id)
+        vs = self.kvcache.v_scale(layer_id)
+        if md.is_decode:
+            eff = off.fetch_for_attend(indices, md)
+            return attend(q, k_cache, v_cache, indices, eff, md.token_to_req,
+                          torch.empty_like(q), k_scale=ks, v_scale=vs)
+        rows = q.shape[0]
+        if rows == 0:
+            return attend(q, k_cache, v_cache, indices, md.block_table, md.token_to_req,
+                          torch.empty_like(q), k_scale=ks, v_scale=vs)
+        # Row-group loop: one compact for the whole layer (grid = rows, no sync), then the
+        # offloader packs rows into residency-feasible groups CPU-side with REAL page unions
+        # (one D2H per layer) -- consecutive rows select mostly the same pages, so groups
+        # pack several rows. Per group: one tight ensure + one translate + one attend.
+        sel_all = off.compact_all(indices, md.token_to_req, md.block_table)
+        out = torch.empty_like(q)
+        for (start, end), eff in off.iter_prefill_groups(sel_all, md.write_pages, md.block_table):
+            attend(q[start:end], k_cache, v_cache, indices[start:end], eff,
+                   md.token_to_req[start:end], out[start:end], k_scale=ks, v_scale=vs)
+        dropped = off.trunc_count()  # one sync per layer
+        if dropped:
+            logger.warning(
+                f"KV host offload: {dropped} selected pages dropped this layer "
+                f"(selection spans > {off.max_sel_pages} pages); the affected rows attended "
+                "over fallback slots"
+            )
+        return out
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -518,6 +591,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+        if self.kv_offloader is not None:
+            self.kv_offloader.init_graph_buffers(max_bs, pages, self.select_width)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)

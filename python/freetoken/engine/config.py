@@ -89,6 +89,11 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Extra KV pages mirrored to pinned host RAM (QSA paged pools, e.g. Qwen3.8-Flash-Next):
+    # the GPU pool becomes an LRU cache over the logical page space (scheduler, page table and
+    # radix tree all see num_pages + kv_host_pages pages), extending context past VRAM
+    # capacity. 0 (default) = off.
+    kv_host_pages: int = 0
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
