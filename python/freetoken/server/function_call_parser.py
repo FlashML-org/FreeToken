@@ -259,6 +259,17 @@ class BaseFormatDetector(ABC):
     # bot_token is a parse trigger, not a uniqueness claim.
     toolcall_opener: str | None = None
 
+    def scrub_markup(self, text: str) -> str:
+        """Remove this format's markup from text about to be surfaced as content.
+
+        Called on the one-shot parse paths and the end-of-stream drain, so a marker the
+        parser could not turn into a call cannot ride along. NOT called per streaming
+        chunk: parse_streaming_increment still releases a partial opener mid-stream.
+        The default keeps the text untouched, so a detector that does not override this
+        surfaces raw text as it always has.
+        """
+        return text
+
     def __init__(self):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
@@ -2060,12 +2071,24 @@ class Gemma4Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
+    # The opener's stable prefix. A block that never completed leaves only part of the
+    # opener behind, which the exact-match bot_token check cannot catch. The closer
+    # ("<tool_call|>") does not share this prefix; finish_streaming replaces it
+    # separately, and the one-shot path does not scrub it at all.
+    _marker_prefix = "<|tool_call"
+
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
+    def scrub_markup(self, text: str) -> str:
+        """Content ends where tool markup begins: an opener the parser could not turn
+        into a call is still protocol framing, not assistant-visible text."""
+        idx = text.find(self._marker_prefix)
+        return text if idx == -1 else text[:idx]
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        normal_text = text[:idx].strip() if idx != -1 else self.scrub_markup(text)
         if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -2331,6 +2354,9 @@ class Gemma4Detector(BaseFormatDetector):
         self._g4_reset()
         if mode != "idle" or self.bot_token in residual:
             return ""
+        # A stream that ends mid-marker leaves an opener prefix the bot_token check
+        # above cannot see; the closer never starts with it, so both scrubs apply.
+        residual = self.scrub_markup(residual)
         if self.eot_token in residual:
             residual = residual.replace(self.eot_token, "")
         if self.prev_tool_call_arr and residual.strip() == "":
@@ -3591,7 +3617,9 @@ class FunctionCallParser:
                 if pos != -1:
                     tail_start = max(tail_start, pos + len(tok))
             if tail_start != -1:
-                tail = full_text[tail_start:]
+                # has_tool_call() only recognises a COMPLETE opener, so a truncated one
+                # trailing the last call would ride into content; scrub before appending.
+                tail = self.detector.scrub_markup(full_text[tail_start:])
                 normal = parsed_result.normal_text or ""
                 # Only plain text: an unterminated final block would make the
                 # "last closer" precede it and leak markup into content.
@@ -3599,7 +3627,10 @@ class FunctionCallParser:
                     parsed_result.normal_text = normal + tail
             return parsed_result
         else:
-            return StreamingParseResult(normal_text=full_text, calls=[])
+            # Re-surfacing full_text would undo the detector's own scrub and leak the
+            # markup. Detectors that do not scrub return it unchanged, so an
+            # unparseable block never blanks their response.
+            return StreamingParseResult(normal_text=self.detector.scrub_markup(full_text), calls=[])
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
