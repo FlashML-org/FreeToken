@@ -326,3 +326,46 @@ def test_save_pinned_field_and_select_compat(tmp_path):
     hot3.save()
     assert not (tmp_path / "hotstats.json").exists()
 
+
+
+class _DeadCudaCounts:
+    """模拟退出阶段 CUDA 上下文已失效：任何 .cpu() 读取都抛运行时错误。"""
+
+    def cpu(self):
+        raise RuntimeError("CUDA error: context is destroyed")
+
+
+def test_save_survives_dead_cuda_drain(monkeypatch, tmp_path):
+    """退出阶段 device 排空失败（CUDA 上下文已失效）时 save 仍用宿主累计落盘，
+    已排空间隔的统计数据不丢；失败只告警不外抛。"""
+    hot = _make_hotness(tmp_path)
+    hot.record(0, torch.tensor([[0, 1], [1, 3]], dtype=torch.int32))
+    hot._host_counts += hot.counts.numpy()  # 模拟退出前最后一次成功的周期排空
+    hot.counts = _DeadCudaCounts()  # 此刻 CUDA 已不可用
+    hot.save()  # 不得外抛
+
+    payload = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))
+    assert np.array_equal(
+        np.asarray(payload["counts"], dtype=np.int64),
+        np.array([[1, 2, 0, 1], [0, 0, 0, 0]]),
+    )
+
+
+def test_maybe_flush_writes_json_periodically(monkeypatch, tmp_path):
+    """周期排空顺带原子写 JSON：崩溃/SIGKILL 最多丢一个间隔的统计。"""
+    hot = _make_hotness(tmp_path, flush_interval_s=60.0)
+    clock = {"t": hot._last_flush}
+    monkeypatch.setattr("freetoken.moe.hotness.time.monotonic", lambda: clock["t"])
+
+    hot.record(0, torch.tensor([[0, 1], [1, 3]], dtype=torch.int32))
+    clock["t"] += 61.0
+    assert hot.maybe_flush() is True
+    payload = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))
+    assert payload["counts"] == [[1, 2, 0, 1], [0, 0, 0, 0]]
+
+    hot.record(1, torch.tensor([[2, 2]], dtype=torch.int32))
+    clock["t"] += 61.0
+    assert hot.maybe_flush() is True
+    payload = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))
+    assert payload["counts"] == [[1, 2, 0, 1], [0, 0, 2, 0]]
+    assert not (tmp_path / "hotstats.json.tmp").exists()  # 原子替换无残留

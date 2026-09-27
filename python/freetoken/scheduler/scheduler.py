@@ -317,6 +317,15 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        # 退出落盘要在 CUDA 仍健康时做：atexit 阶段再做 D2H 可能因上下文失效丢掉
+        # 最后一个间隔的统计（周期排空已保底，此处只是收口）。
+        engine = getattr(self, "engine", None)
+        cache = getattr(engine, "moe_offload_cache", None)
+        if cache is not None and getattr(cache, "hotness", None) is not None:
+            try:
+                cache.hotness.save()
+            except Exception as exc:  # noqa: BLE001 -- 统计收口失败不阻断关停
+                logger.warning("expert hotness final save failed: %s", exc)
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()

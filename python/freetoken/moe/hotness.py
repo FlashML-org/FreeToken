@@ -125,7 +125,8 @@ class ExpertHotness:
             距上次排空未满间隔（窗口模式 = min(flush_interval_s, window_interval_s)，
             否则 flush_interval_s）直接返回 False；否则把 device 计数器 D2H 为增量
             delta 并清零 device 侧，累加进宿主累计，窗口模式再交给 _feed_window，
-            刷新墙钟后返回 True。
+            最后原子写一次 JSON（调度循环内 CUDA 健康，落盘不必等退出；崩溃或
+            SIGKILL 最多丢一个间隔的统计），刷新墙钟后返回 True。
         """
         now = time.monotonic()
         interval = self.flush_interval_s
@@ -150,6 +151,11 @@ class ExpertHotness:
             )
         if self.window_interval_s is not None:
             self._feed_window(delta, now)
+        if self.out_path:
+            try:
+                self._write_json()
+            except Exception as exc:  # noqa: BLE001 -- 周期落盘失败不能打断调度循环
+                logger.warning("periodic expert-hotness write failed: %s", exc)
         return True
     def _feed_window(self, delta: np.ndarray, now: float) -> bool:
         """
@@ -232,16 +238,39 @@ class ExpertHotness:
             1，pinned 为可选键，选点工具只读已知键、向后兼容）。
 
         Code Logic（这个函数做什么）:
-            out_path 为 None（纯窗口模式）时直接返回；否则先强制排空一次 device
-            计数器（不落未排空数据），组装 schema_version=1 的 payload（meta 附
-            num_layers/num_experts/total_tokens/duration_s/created_at，counts 为嵌套
-            list[int]，pinned_provider 给定时附 pin-list 风格的 pinned 条目），写
-            out_path + ".tmp" 后 os.replace 原子替换。
+            out_path 为 None（纯窗口模式）时直接返回；否则先 best-effort 排空一次
+            device 计数器（退出阶段 CUDA 上下文可能已失效：排空失败只告警并继续，
+            宿主累计保有此前每个间隔的数据），组装 schema_version=1 的 payload
+            （meta 附 num_layers/num_experts/total_tokens/duration_s/created_at，
+            counts 为嵌套 list[int]，pinned_provider 给定时附 pin-list 风格的
+            pinned 条目），写 out_path + ".tmp" 后 os.replace 原子替换。
         """
         if not self.out_path:
             return
-        self._host_counts += self.counts.cpu().numpy()
-        self.counts.zero_()
+        try:
+            self._host_counts += self.counts.cpu().numpy()
+            self.counts.zero_()
+        except Exception as exc:  # noqa: BLE001 -- atexit 阶段 CUDA 不可用属预期
+            logger.warning(
+                "device hotness drain failed at save; host accumulator keeps "
+                "drained intervals: %s",
+                exc,
+            )
+        self._write_json()
+
+    def _write_json(self) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            选点工具消费的是落盘 JSON（统计 → 选点的契约文件）；周期排空与退出
+            落盘共用同一写出逻辑，保证两种时机产出的文件 schema 与原子性一致。
+
+        Code Logic（这个函数做什么）:
+            组装 schema_version=1 的 payload（meta 附 num_layers/num_experts/
+            total_tokens/duration_s/created_at，counts 为嵌套 list[int]，
+            pinned_provider 给定时附当前钉住集），写 out_path + ".tmp" 后
+            os.replace 原子替换（父目录按需创建）。
+        """
+        assert self.out_path
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "meta": {
@@ -306,8 +335,9 @@ class ExpertHotness:
     def install_exit_flush(self) -> None:
         """
         Business Logic（为什么需要这个函数）:
-            采集结束依赖进程退出落盘；若不在退出钩子里兜底，一次 SIGTERM 就丢掉全部
-            统计。注册动作可能被调用多次（幂等），落盘也必须只发生一次。
+            采集结束依赖进程退出落盘；周期排空已每间隔写一次 JSON（崩溃最多丢一个
+            间隔），退出钩子负责最后一次完整落盘。注册动作可能被调用多次（幂等），
+            落盘也必须只发生一次。
 
         Code Logic（这个函数做什么）:
             首次调用时用 atexit.register 注册 _exit_flush；重复调用直接返回。
@@ -321,16 +351,19 @@ class ExpertHotness:
         """
         Business Logic（为什么需要这个函数）:
             atexit 回调在解释器关闭阶段执行，任何异常都不能向外抛；且 save 可能已被
-            显式调用过，重复写文件没有意义。
+            显式调用过，重复写文件没有意义。save 内部的 device 排空是 best-effort
+            （CUDA 已失效时退回宿主累计），本钩子只兜底写出路径的意外失败。
 
         Code Logic（这个函数做什么）:
-            防重入标志保证只执行一次；调用 save 把统计原子落盘，失败时记录 warning
-            并吞掉异常（退出路径不能因统计文件失败而报错）。
+            防重入标志保证只执行一次；调用 save 把统计原子落盘，失败时记录含异常
+            详情的 warning 并吞掉（退出路径不能因统计文件失败而报错）。
         """
         if self._exit_done:
             return
         self._exit_done = True
         try:
             self.save()
-        except Exception:
-            logger.warning("failed to flush expert hotness stats to %s", self.out_path, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 -- 退出路径不能因统计失败而报错
+            logger.warning(
+                "failed to flush expert hotness stats to %s: %r", self.out_path, exc
+            )
