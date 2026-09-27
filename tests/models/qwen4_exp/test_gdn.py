@@ -173,3 +173,41 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+def _split_layer(fused, ratio: int):
+    """The op-swap layout: packed/dense ``in_proj_qkvz`` + dense ``in_proj_ba`` instead of the
+    fused ``in_proj``. Built from the fused op's own weights so the two must agree."""
+    from freetoken.layers import LinearColParallelMerged
+    from freetoken.utils import torch_dtype
+
+    num_k, num_v = HEADS[ratio]
+    conv_dim = 2 * num_k * HEAD_DIM + num_v * HEAD_DIM
+    value_dim = num_v * HEAD_DIM
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        op = Qwen4ExpGatedDeltaNet(
+            hidden_size=HIDDEN, num_k_heads=num_k, num_v_heads=num_v, head_k_dim=HEAD_DIM,
+            head_v_dim=HEAD_DIM, conv_kernel_size=CONV_K, rms_norm_eps=EPS, layer_id=0,
+            output_gate="sigmoid",
+        )
+        op.in_proj_qkvz = LinearColParallelMerged(HIDDEN, [conv_dim, value_dim], has_bias=False, quant_config=None, prefix="")
+        op.in_proj_ba = LinearColParallelMerged(HIDDEN, [num_v, num_v], has_bias=False, quant_config=None, prefix="")
+    op._split_in_proj = True
+    if hasattr(op, "in_proj"):
+        del op.in_proj
+    sd = dict(fused.state_dict())
+    fused_w = sd.pop("in_proj.weight")
+    sd["in_proj_qkvz.weight"] = fused_w[: conv_dim + value_dim]
+    sd["in_proj_ba.weight"] = fused_w[conv_dim + value_dim :]
+    op.load_state_dict(sd)
+    return op
+
+
+@pytest.mark.parametrize("ratio", (2, 3))
+def test_split_in_proj_matches_fused(ratio):
+    """The loader builds GDN split (in_proj_qkvz + in_proj_ba); it must equal the fused op."""
+    fused, _ref = _make_layer(ratio, seed=ratio)
+    split = _split_layer(fused, ratio)
+    _, _, out_f = _prefill(fused, _ctx(ratio), [128], seed=5)
+    _, _, out_s = _prefill(split, _ctx(ratio), [128], seed=5)
+    torch.testing.assert_close(out_s.float(), out_f.float(), rtol=RTOL, atol=ATOL)
