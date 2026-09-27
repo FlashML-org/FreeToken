@@ -231,3 +231,19 @@ def test_resolve_ple_source_uses_ftw_side_files(tmp_path) -> None:
     (empty / INDEX_NAME).write_text("{}")
     with pytest.raises(ValueError, match="ple-source"):
         resolve_ple_source(SimpleNamespace(model_path=str(empty), ple_source=None))
+
+
+def test_compress_ratios_absent_or_zero_defaults_to_four(monkeypatch) -> None:
+    """A converter that drops/zeroes compress_ratios must not flip the full layers to BSA."""
+    from freetoken.models.qwen4_exp import gguf as qgguf
+
+    monkeypatch.setattr(qgguf, "_expert_format", lambda path: "iq4_xs")
+    for value in ([0] * 48, None):
+        metadata = dict(_METADATA)
+        if value is None:
+            metadata.pop("qwen4exp.attention.compress_ratios")
+        else:
+            metadata["qwen4exp.attention.compress_ratios"] = value
+        shim = _shim()
+        shim.metadata = metadata
+        assert qgguf.parse_gguf_config(shim).qwen4_args.index_ratio == 4

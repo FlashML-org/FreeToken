@@ -89,24 +89,33 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     index_n_heads = int(g("attention.indexer.head_count"))
     index_head_dim = int(g("attention.indexer.key_length"))
     index_budget = int(g("attention.indexer.top_k"))
-    ratios = [int(x) for x in g("attention.compress_ratios")]
+    ratios = [int(x) for x in (m.get("qwen4exp.attention.compress_ratios") or ())]
     nonzero = {r for r in ratios if r}
-    if len(nonzero) != 1:
+    if len(nonzero) > 1:
         raise ValueError(f"qwen4exp: non-uniform attention.compress_ratios {sorted(nonzero)}")
-    index_ratio = nonzero.pop()
+    # Some converters omit or zero this (a finetune whose HF config sets indexer_compress_ratio
+    # 4 shipped all-zero); default to 4 so the full layers stay QSA, not MiniMax block-sparse.
+    index_ratio = nonzero.pop() if nonzero else 4
 
     hc_count = int(g("hyper_connection.count"))
     hc_lowrank = int(g("hyper_connection.low_rank"))
 
     hidden_act = "silu"
+    # Text tokens go through mRoPE too (llama.cpp uses ggml_rope_multi with these sections),
+    # so the sections must reach the rope rather than being dropped. GGUF stores 4 slots with
+    # a trailing zero; the model uses a 3-section table.
+    mrope_section = [int(x) for x in (m.get("qwen4exp.rope.dimension_sections") or ())]
+    while mrope_section and mrope_section[-1] == 0:
+        mrope_section.pop()
+    mrope_section = tuple(mrope_section) if len(mrope_section) == 3 else None
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=max_pos,
         base=rope_base,
         scaling=None,
-        mrope_section=None,  # text-only: the mRoPE sections reduce to standard partial rope
-        mrope_layout="contiguous",
+        mrope_section=mrope_section,
+        mrope_layout="interleaved" if mrope_section is not None else "contiguous",
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -146,8 +155,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         ngram_vocab_size_base = int(g("ple.head_vocab_sizes")[0])
         eos = g("ple.eos_token_id")
     else:
-        ple_embed_dim, ple_conv_kernel_size = 0, 1
-        ngram_size, heads_per_ngram, ngram_vocab_size_base = 1, 1, 1
+        # no PLE layers: keep the args non-degenerate (num_ngram_heads >= 1) so nothing
+        # divides by zero; the module is inert because ple_layer_ids is empty.
+        ple_embed_dim, ple_conv_kernel_size = 1, 1
+        ngram_size, heads_per_ngram, ngram_vocab_size_base = 2, 1, 1
         eos = m.get("tokenizer.ggml.eos_token_id", 0)
     if isinstance(eos, (list, tuple)):
         eos = eos[0]
@@ -180,6 +191,21 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     # GGUF op-swap cannot run; direct .gguf loading is the supported path for now.
     gguf_types = _quant_plan(shim.model_path) if os.path.isfile(shim.model_path) else None
 
+    # Some releases omit expert_shared_feed_forward_length; fall back to the routed width
+    # when the checkpoint actually ships a shared expert, else 0.
+    shexp_kv = m.get("qwen4exp.expert_shared_feed_forward_length")
+    if shexp_kv is not None:
+        shared_inter = int(shexp_kv)
+    elif os.path.isfile(shim.model_path):
+        from freetoken.models.gguf.reader import gguf_tensor_names
+
+        has_shexp = any(
+            n.endswith("ffn_gate_shexp.weight") for n in gguf_tensor_names(shim.model_path)
+        )
+        shared_inter = int(g("expert_feed_forward_length")) if has_shexp else 0
+    else:
+        shared_inter = int(g("expert_feed_forward_length"))  # metadata-only: assume present
+
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -195,7 +221,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         num_experts=int(g("expert_count")),
         num_experts_per_tok=int(g("expert_used_count")),
         moe_intermediate_size=int(g("expert_feed_forward_length")),
-        shared_expert_intermediate_size=int(g("expert_shared_feed_forward_length")),
+        shared_expert_intermediate_size=shared_inter,
         norm_topk_prob=True,
         moe_enabled=True,
         use_qk_norm=True,
@@ -238,6 +264,12 @@ def _to_bf16(t):  # GgufTensor -> bf16 dense of its torch shape
     return dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16).reshape(t.shape)
 
 
+def _to_fp32(t):  # GgufTensor -> fp32 dense of its torch shape
+    from freetoken.models.gguf.dequant import dequantize
+
+    return dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32).reshape(t.shape)
+
+
 def _require_tp1(what: str) -> None:
     from freetoken.distributed import get_tp_info
 
@@ -254,8 +286,6 @@ _LAYER_SCALAR_MAP = {
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     "indexer.q_norm.weight": "self_attn.indexer.q_layernorm.weight",
     "indexer.k_norm.weight": "self_attn.indexer.k_layernorm.weight",
-    "ssm_a": "linear_attn.A_log",
-    "ssm_dt.bias": "linear_attn.dt_bias",
     "ssm_norm.weight": "linear_attn.norm.weight",
     "hc_attn_norm.weight": "attn_hyper_connection.hc_norm.weight",
     "hc_ffn_norm.weight": "mlp_hyper_connection.hc_norm.weight",
@@ -271,13 +301,45 @@ _TOP_SCALAR_MAP = {
 _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
 _UNQUANTIZED_GGML = frozenset({GGML_F32, GGML_F16, GGML_BF16})
 
+
+def _gdn_head_perm(num_key_heads: int, num_value_heads: int) -> torch.Tensor:
+    """Index that reorders converter-ordered GDN value heads back to HF order.
+
+    The GGUF converter writes per-value-head tensors in ``[num_v_per_k, num_k]`` order
+    (``gguf[j] = hf[i]`` with ``j = i // R + K * (i % R)``); gathering with this perm
+    turns GGUF rows back into ``hf[i]``.
+    """
+    per_k = num_value_heads // num_key_heads
+    return torch.tensor([i // per_k + num_key_heads * (i % per_k) for i in range(num_value_heads)])
+
+
+def _permute_head_blocks(x: torch.Tensor, perm: torch.Tensor, head_dim: int, dim: int) -> torch.Tensor:
+    """Reorder ``dim`` of ``x`` (size ``len(perm)*head_dim``) by head, in place-free."""
+    shape = list(x.shape)
+    shape[dim : dim + 1] = [len(perm), head_dim]
+    return x.reshape(shape).index_select(dim, perm).reshape(x.shape)
+
+
+# Norms the model applies as (1+w) -- the converter folded the +1 into the stored weight.
+_ZERO_CENTERED_NORMS = frozenset({
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "indexer.q_norm.weight",
+    "indexer.k_norm.weight",
+    "hc_attn_norm.weight",
+    "hc_ffn_norm.weight",
+    "output_hc_norm.weight",
+    "ple_norm_key.weight",
+    "ple_norm_query.weight",
+    "ple_norm_conv.weight",
+})
+
 # (plan key, gguf suffix tuple) for each fused/single projection the op-swap can pack.
 _PLAN_GROUPS = {
     "qkv": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
     "o": ("attn_output.weight",),
     "indexer": ("indexer.q_proj.weight", "indexer.k_proj.weight"),
     "inproj_qkvz": ("attn_qkv.weight", "attn_gate.weight"),
-    "ssm_out": ("ssm_out.weight",),
     "shexp_up": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
     "shexp_down": ("ffn_down_shexp.weight",),
     "ple_key": ("ple_key.weight",),
@@ -313,14 +375,27 @@ def _quant_plan(model_path: str) -> dict[str, int]:
     return plan
 
 
+def _as_part(t) -> tuple[int, torch.Tensor]:
+    return t.ggml_type, t.packed()
+
+
+def _dequant_part(part: tuple[int, torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE, dequantize
+
+    ggml_type, data = part
+    block, size = BLOCK_SHAPE[ggml_type]
+    out = dequantize(data.reshape(-1), ggml_type, dtype)
+    return out.reshape(data.shape[0], data.shape[1] // size * block)
+
+
 def _emit_group(base: str, rel: str, parts) -> tuple[str, torch.Tensor]:
     """Fuse projection parts along the output dim: packed ``.qweight`` only when every part
     shares one quant type, else a dense bf16 ``.weight`` (mixed checkpoints, e.g. QSA
     q=Q6_K with k/v=Q8_0, cannot share a packed row layout)."""
-    types = {p.ggml_type for p in parts}
+    types = {p[0] for p in parts}
     if len(types) == 1 and next(iter(types)) not in _UNQUANTIZED_GGML:
-        return f"{base}.{rel}.qweight", torch.cat([p.packed() for p in parts], dim=0)
-    return f"{base}.{rel}.weight", torch.cat([_to_bf16(p) for p in parts], dim=0)
+        return f"{base}.{rel}.qweight", torch.cat([p[1] for p in parts], dim=0)
+    return f"{base}.{rel}.weight", torch.cat([_dequant_part(p, torch.bfloat16) for p in parts], dim=0)
 
 
 def _emit_single(base: str, rel: str, t) -> tuple[str, torch.Tensor]:
@@ -361,6 +436,13 @@ def iter_gguf_weights(
     hc = args.hc_count
     lowrank = args.hc_lowrank
     pad = (-(lowrank + hc)) % 16
+    # llama.cpp-style GDN conversion stores the value heads grouped by key head
+    # ("[R, K]" order) and folds zero-centred norms as (1+w); the model wants HF order
+    # and raw weights. See _gdn_head_perm / _ZERO_CENTERED_NORMS.
+    linear = config.linear_attention_group()
+    gdn_perm = _gdn_head_perm(linear.num_key_heads, linear.num_value_heads)
+    gdn_head_dim = linear.value_head_dim
+    key_dim = linear.num_key_heads * linear.key_head_dim
 
     qkv_buf: dict[int, dict[str, object]] = {}
     idx_buf: dict[int, dict[str, object]] = {}
@@ -382,7 +464,8 @@ def iter_gguf_weights(
         if name == "per_layer_token_embd.weight":
             continue  # PLE n-gram table: attached separately (load_host_tables)
         if name in _TOP_SCALAR_MAP:
-            yield _TOP_SCALAR_MAP[name], _to_bf16(t)
+            value = _to_fp32(t) - 1.0 if name in _ZERO_CENTERED_NORMS else _to_bf16(t)
+            yield _TOP_SCALAR_MAP[name], value
             continue
         if name == "output_hc_down.weight":
             yield "model.hyper_connection_mixer.input_mix_weight_down.weight", _to_bf16(t)
@@ -400,44 +483,69 @@ def iter_gguf_weights(
         base = f"model.layers.{layer}"
 
         if suffix in _LAYER_SCALAR_MAP:
-            yield f"{base}.{_LAYER_SCALAR_MAP[suffix]}", _to_bf16(t)
+            value = _to_fp32(t) - 1.0 if suffix in _ZERO_CENTERED_NORMS else _to_bf16(t)
+            yield f"{base}.{_LAYER_SCALAR_MAP[suffix]}", value
+            continue
+        if suffix == "ssm_dt.bias":
+            yield f"{base}.linear_attn.dt_bias", _to_fp32(t)[gdn_perm]  # model keeps dt_bias fp32
+            continue
+        if suffix == "ssm_a":
+            # llama.cpp stores A = -exp(A_log) (gate = softplus(alpha+dt) * ssm_a); the
+            # model keeps A_log and computes -exp(A_log), so invert back in fp32.
+            a = _to_fp32(t)[gdn_perm]
+            yield f"{base}.linear_attn.A_log", torch.log(-a)
             continue
         if suffix == "ffn_gate_inp_shexp.weight":
             # ggml ships it 1-D; the model's LinearReplicated(hidden, 1) weight is [1, hidden]
             yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
             continue
 
-        # GDN (linear_attention) layer tensors.
+        # GDN (linear_attention) layer tensors. Value-head-indexed tensors come back in
+        # converter order, so reorder them to HF order before fusing (packed rows reorder
+        # fine because each row is a full-width packed row).
         if suffix == "attn_qkv.weight":
-            inproj_buf.setdefault(layer, {})["qkv"] = t
+            packed = t.packed()
+            inproj_buf.setdefault(layer, {})["qkv"] = (t.ggml_type, torch.cat([
+                packed[: 2 * key_dim],
+                _permute_head_blocks(packed[2 * key_dim :], gdn_perm, gdn_head_dim, 0),
+            ], dim=0))
         elif suffix == "attn_gate.weight":
-            inproj_buf.setdefault(layer, {})["z"] = t
+            inproj_buf.setdefault(layer, {})["z"] = (
+                t.ggml_type, _permute_head_blocks(t.packed(), gdn_perm, gdn_head_dim, 0),
+            )
         elif suffix == "ssm_alpha.weight":
-            inproj_buf.setdefault(layer, {})["alpha"] = t
+            inproj_buf.setdefault(layer, {})["alpha"] = (t.ggml_type, t.packed()[gdn_perm])
         elif suffix == "ssm_beta.weight":
-            inproj_buf.setdefault(layer, {})["beta"] = t
+            inproj_buf.setdefault(layer, {})["beta"] = (t.ggml_type, t.packed()[gdn_perm])
         elif suffix == "ssm_out.weight":
-            yield _emit_single(f"{base}.linear_attn", "out_proj", t)
+            # input axis is the value dim, which packs across 128-wide heads, so dense
+            yield f"{base}.linear_attn.out_proj.weight", _permute_head_blocks(
+                _to_bf16(t), gdn_perm, gdn_head_dim, 1
+            )
         elif suffix == "ssm_conv1d.weight":
-            yield f"{base}.linear_attn.conv1d.weight", _to_bf16(t).reshape(t.shape[0], 1, t.shape[1])
+            conv = _to_bf16(t).reshape(t.shape[0], 1, t.shape[1])
+            yield f"{base}.linear_attn.conv1d.weight", torch.cat([
+                conv[: 2 * key_dim],
+                _permute_head_blocks(conv[2 * key_dim :], gdn_perm, gdn_head_dim, 0),
+            ], dim=0)
         # QSA (full_attention) layer tensors.
         elif suffix == "attn_q.weight":
-            qkv_buf.setdefault(layer, {})["q"] = t
+            qkv_buf.setdefault(layer, {})["q"] = _as_part(t)
         elif suffix == "attn_k.weight":
-            qkv_buf.setdefault(layer, {})["k"] = t
+            qkv_buf.setdefault(layer, {})["k"] = _as_part(t)
         elif suffix == "attn_v.weight":
-            qkv_buf.setdefault(layer, {})["v"] = t
+            qkv_buf.setdefault(layer, {})["v"] = _as_part(t)
         elif suffix == "attn_output.weight":
             yield _emit_single(f"{base}.self_attn", "o_proj", t)
         elif suffix == "indexer.q_proj.weight":
-            idx_buf.setdefault(layer, {})["q"] = t
+            idx_buf.setdefault(layer, {})["q"] = _as_part(t)
         elif suffix == "indexer.k_proj.weight":
-            idx_buf.setdefault(layer, {})["k"] = t
+            idx_buf.setdefault(layer, {})["k"] = _as_part(t)
         # Shared expert and PLE projections.
         elif suffix == "ffn_gate_shexp.weight":
-            shexp_buf.setdefault(layer, {})["gate"] = t
+            shexp_buf.setdefault(layer, {})["gate"] = _as_part(t)
         elif suffix == "ffn_up_shexp.weight":
-            shexp_buf.setdefault(layer, {})["up"] = t
+            shexp_buf.setdefault(layer, {})["up"] = _as_part(t)
         elif suffix == "ffn_down_shexp.weight":
             yield _emit_single(f"{base}.mlp.shared_expert", "down_proj", t)
         elif suffix in ("ple_key.weight", "ple_value.weight"):
@@ -469,7 +577,7 @@ def iter_gguf_weights(
             # convert() always builds in_proj_ba dense (the b/a tensors are F32 in practice),
             # so emit it dense regardless of their type
             yield f"{base}.linear_attn.in_proj_ba.weight", torch.cat(
-                [_to_bf16(ip["beta"]), _to_bf16(ip["alpha"])], dim=0
+                [_dequant_part(ip["beta"], torch.bfloat16), _dequant_part(ip["alpha"], torch.bfloat16)], dim=0
             )
             del inproj_buf[layer]
         sh = shexp_buf.get(layer)

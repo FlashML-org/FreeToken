@@ -61,6 +61,17 @@ stops with a clear error instead of OOM-crashing the host.
   safetensors with `--ple-source <repo-or-dir>` (`--ple-backend disk|pinned`); the source's
   own `ngram_embedding.shard_<i>.weight` count defines the table. `ple.layer_multipliers` and
   the n-gram head sizes/offsets are derived and reproduce the GGUF's own values.
+- How many IQ4_XS experts fit (52 GiB available):
+  Base geometry (H=2560, I=640; gate/up IQ4_XS + down IQ4_NL) = 2.54 MiB/expert, 48 layers, so banks scale as:
+  N experts   banks
+   128        15.2 GiB
+   256        30.5 GiB
+   288        34.3 GiB
+   320        38.1 GiB
+   352        41.9 GiB
+   384        45.7 GiB
+   512        60.9 GiB   <- current, won't fit
+  With ~56 GiB MemAvailable and ~4–6 GiB for the process/dense/KV, the practical ceiling is ~352–384 experts; 320 is comfortable. expert_used_count (top-k=10) must stay ≤ N.
 
 ## Verification
 
