@@ -59,6 +59,8 @@ checkpoint is set:
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
+| `FREETOKEN_GGUF_QUANTS_MODEL` | `models/test_gguf_dequant.py` — local GGUF carrying Q5_K/IQ4_NL/IQ4_XS tensors |
+| `FREETOKEN_QWEN4EXP_GGUF` | `models/test_gguf_qwen4exp_config.py` — local qwen4exp GGUF (any shard) |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
 `generation_config.json` (pass@N at the recommended temperature, or a single greedy

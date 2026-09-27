@@ -315,7 +315,24 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     return written
 
 
-def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
+def ple_shard_count(folder: str) -> int:
+    """Number of ``ngram_embedding.shard_<i>.weight`` tensors in a PLE table folder.
+
+    The GGUF config has no ``split_ngram_parts`` (it carries a single table tensor), so the
+    source's own shard set defines the table when ``--ple-source`` points at an fp8 export.
+    """
+    indices = []
+    for path in _ple_table_files(folder):
+        header, _ = _safetensors_header(path)
+        indices += [int(m.group("shard")) for key in header if (m := _PLE_SHARD_RE.search(key))]
+    if not indices:
+        raise ValueError(f"{folder}: no {_PLE_TABLE_INFIX}shard_<i>.weight tensors found")
+    if sorted(indices) != list(range(len(indices))):
+        raise ValueError(f"{folder}: PLE shards are not contiguous 0..{len(indices) - 1}: {sorted(indices)}")
+    return len(indices)
+
+
+def load_ple_table(model_path: str, qwen4_args, *, num_parts: int | None = None, pin: bool = True,
                    workers: int = 8, chunk: int = 8 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
 
@@ -349,7 +366,7 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             begin, end = meta["data_offsets"]
             parts[int(match.group("shard"))] = (path, base + begin, end - begin)
 
-    expected = int(qwen4_args.split_ngram_parts)
+    expected = int(qwen4_args.split_ngram_parts) if num_parts is None else num_parts
     if sorted(parts) != list(range(expected)):
         raise ValueError(
             f"PLE table needs shards 0..{expected - 1}, found {len(parts)}: {sorted(parts)[:8]}"

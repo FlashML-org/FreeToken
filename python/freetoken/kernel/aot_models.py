@@ -207,6 +207,18 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
     ),
     AotModel(
+        # GGUF release: native block-quant routed experts (IQ4_XS/Q5_K/IQ4_NL) served from the
+        # offload cache; same text tower / graph, so the same AOT kernel set.
+        name="bartowski/Qwen3.8-Flash-Next-IQ4_XS",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=("iq4_xs", "q5_K", "iq4_nl"),
+        arch_aliases=("Qwen4ExpGGUFForCausalLM",),
+    ),
+    AotModel(
         name="google/gemma-4-26B-A4B-it",
         architecture="Gemma4ForConditionalGeneration",
         hidden_size=2816,

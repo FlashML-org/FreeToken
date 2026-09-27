@@ -328,6 +328,10 @@ class ModelConfig:
     # geometry, the KDA head config, and the mHC knobs. Opaque to model-agnostic engine
     # code; None for every other model.
     glm5_args: Any | None = None
+    # GGUF (native block-quant) hint: the packed quant type per projection, read from the
+    # checkpoint's tensor table, so a GGUF model swaps the matching dense ops for GGUF ops
+    # at build. None for non-GGUF checkpoints and metadata-only FTW ggufs (no tensor table).
+    gguf_quant_types: dict[str, int] | None = None
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine

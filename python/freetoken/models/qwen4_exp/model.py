@@ -141,6 +141,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+        # GGUF checkpoints carry native block-quantized weights: swap the packed projections
+        # for GGUF ops (routed experts stay on the offload cache).
+        from .gguf import convert_qwen4_exp_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen4_exp_to_gguf(self, config)
+
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
         ple_layers = self.model.ple_layers
@@ -167,12 +174,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        # The fp8 n-gram table is not part of the model weights: HF checkpoints ship it as
+        # separate model-plefp8-* shards resolved from model_path, and a GGUF/FTW checkpoint
+        # carries none, so it must be told where the original fp8 source is.
+        from .gguf import resolve_ple_source
+
+        source = resolve_ple_source(engine_config)
+
         if engine_config.ple_backend == "disk":
             from freetoken.utils import download_hf_weight
 
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
+            folder = download_hf_weight(source)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
@@ -198,9 +212,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
-        from .weight import load_ple_table
+        from freetoken.utils import download_hf_weight
 
-        table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
+        from .weight import load_ple_table, ple_shard_count
+
+        # An explicit --ple-source (GGUF/FTW) carries no split_ngram_parts in its config, so
+        # the source's own shard count defines the table.
+        parts = (
+            ple_shard_count(download_hf_weight(source))
+            if getattr(engine_config, "ple_source", None)
+            else None
+        )
+        table = load_ple_table(source, self._config.qwen4_args, num_parts=parts)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(

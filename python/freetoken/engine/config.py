@@ -32,6 +32,10 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # PLE n-gram table source: a HF repo id or a local folder holding the model-plefp8-* shards.
+    # None resolves it from model_path (HF checkpoints). A GGUF/FTW checkpoint carries no fp8
+    # table of its own, so it must point this at the original fp8 source.
+    ple_source: str | None = None
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -131,7 +135,8 @@ class EngineConfig:
         built = {e.config_key for e in self.active_encoders}
         for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
             if key not in built:
-                setattr(hf_config, key, None)
+                # object.__setattr__: the GGUF config shim is a frozen dataclass
+                object.__setattr__(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)

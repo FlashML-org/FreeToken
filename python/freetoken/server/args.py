@@ -626,6 +626,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-source",
+        default=ServerArgs.ple_source,
+        help=(
+            "HF repo id or local folder holding a PLE n-gram table's model-plefp8-* shards. "
+            "Required for GGUF/FTW checkpoints (they carry no fp8 table); HF checkpoints "
+            "resolve it from the model path."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
