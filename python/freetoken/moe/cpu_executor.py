@@ -68,8 +68,20 @@ _ACT_IDS = {
     "swiglu_clamp": 4,
 }
 
+# Native-GGUF W4A8 formats: packed expert banks dequantized inside the C++ int8 GEMV.
+_GGUF_W4A8_FORMATS = ("q4_0", "iq4_nl", "iq4_xs", "q5_K")
+
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {
+    "bf16": 0,
+    "nvfp4": 1,
+    "mxfp4_triton": 2,
+    "ds_fp4": 3,
+    "q4_0": 4,
+    "iq4_nl": 5,
+    "iq4_xs": 6,
+    "q5_K": 7,
+}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -369,8 +381,8 @@ class CpuMoeExecutor:
             )
             return ptrs, (H, I)
 
-        if fmt == "q4_0":
-            return self._resolve_q4_0_banks(banks)
+        if fmt in _GGUF_W4A8_FORMATS:
+            return self._resolve_gguf_banks(banks, fmt)
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
@@ -404,11 +416,14 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+    def _resolve_gguf_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
+        """Native-GGUF W4A8 schema: packed block bytes per output row, row-major over K --
+        the *same* packed banks the GPU offload path streams. gate_up is
+        [S, 2I, row_bytes(H)], down is [S, H, row_bytes(I)]; the C++ int8 GEMV reads a row
+        in place and dequantizes weights inside the K-loop."""
+        from freetoken.models.gguf.dequant import row_bytes
+        from freetoken.moe.gguf_experts import gguf_expert_role_types
+
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
             gate_up[0].dtype, down[0].dtype,
@@ -416,9 +431,9 @@ class CpuMoeExecutor:
         I = int(gate_up[0].shape[1] // 2)
         H = int(down[0].shape[1])
         assert gate_up[0].shape[1] == 2 * I
-        assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        gate_up_type, down_type = gguf_expert_role_types(fmt)
+        assert int(gate_up[0].shape[2]) == row_bytes(H, gate_up_type), (gate_up[0].shape, H)
+        assert int(down[0].shape[2]) == row_bytes(I, down_type), (down[0].shape, I)
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),

@@ -20,8 +20,11 @@ from freetoken.models.gguf.dequant import (
     GGML_BF16,
     GGML_F16,
     GGML_F32,
+    GGML_IQ4_NL,
+    GGML_IQ4_XS,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -31,10 +34,13 @@ from .base import BaseOP
 
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
-# standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+# standard + k-quants + non-linear: an MMVQ (small-batch GEMV) kernel exists for all.
+_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q5_K, GGML_Q6_K, GGML_IQ4_NL, GGML_IQ4_XS}
+# large-batch MMQ kernels exist only for the standard/K-quants (IQ4_NL/IQ4_XS have no
+# MMQ case -- they fall through to dequant-then-matmul below).
+_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q5_K, GGML_Q6_K}
+# dequant-to-dense + normal GEMM fallback; covers every type the dequant path knows.
+_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q5_K, GGML_Q6_K, GGML_IQ4_NL, GGML_IQ4_XS}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6

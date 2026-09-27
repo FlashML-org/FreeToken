@@ -2,8 +2,8 @@
 
 The expert kernel (``QuantMethod.kernel``) owns the bank layout and the pack step; the
 checkpoint side delivers pieces (``moe.expert_pieces``) and this module fills the pinned host
-banks from them (``build_expert_banks``). The GGUF q4_0 experts still
-use their own providers until they get a method.
+banks from them (``build_expert_banks``). The native-GGUF experts (q4_0/q5_K/iq4_nl/
+iq4_xs) still use their own providers until they get a method.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+import functools
 from dataclasses import dataclass, field
 
 import torch
@@ -152,40 +153,68 @@ def build_expert_banks(
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, *, quant_format) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
-            "parallel reader not implemented for q4_0: GGUF is a single packed file "
+            "parallel reader not implemented for GGUF experts: GGUF is a single packed file "
             "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
             "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
         )
-    from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.moe.gguf_experts import (
+        dummy_gguf_expert_sources,
+        gguf_expert_role_types,
+        load_gguf_expert_sources,
+    )
 
-    # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
-    # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
-    # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
-    # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
-    sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    gate_up_type, down_type = gguf_expert_role_types(quant_format)
+    E, L = model_config.num_experts, model_config.num_layers
+    H, I = model_config.hidden_size, model_config.moe_intermediate_size
+    if dummy:
+        sources = dummy_gguf_expert_sources(
+            num_layers=L, num_experts=E, hidden_size=H, intermediate_size=I,
+            gate_up_type=gate_up_type, down_type=down_type,
+        )
+        return ExpertBanks(quant_format, {name: sources[name] for name in _BANK_SCHEMAS[quant_format]})
+
+    # Native GGUF routed experts: packed block bytes streamed to the GPU and dequantized
+    # inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are per-layer
+    # HostBanks (pin-after-fill), so conversion streams each completed layer's gate_up +
+    # down straight through the sink.
+    sources = load_gguf_expert_sources(
+        model_path, num_layers=L, num_experts=E, hidden_size=H, intermediate_size=I,
+        gate_up_type=gate_up_type, down_type=down_type, layer_sink=None if dummy else layer_sink,
+    )
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        quant_format, {name: sources[name] for name in _BANK_SCHEMAS[quant_format]},
+        streamed=layer_sink is not None,
     )
 
 
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
-    "q4_0": _q4_0_banks,
+    "q4_0": functools.partial(_gguf_banks, quant_format="q4_0"),
+    "q5_K": functools.partial(_gguf_banks, quant_format="q5_K"),
+    "iq4_nl": functools.partial(_gguf_banks, quant_format="iq4_nl"),
+    "iq4_xs": functools.partial(_gguf_banks, quant_format="iq4_xs"),
 }
 
 
 def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     expert_quant = model_config.expert_quant
-    if expert_quant not in _PROVIDERS:
+    from freetoken.moe.gguf_experts import GGUF_EXPERT_QUANTS
+
+    # a plain tag loads through its provider; a '<gate_up>+<down>' tag (per-role expert
+    # quants, e.g. IQ4_XS gate/up with IQ4_NL down) loads through the generic GGUF provider
+    if expert_quant in _PROVIDERS:
+        provider = _PROVIDERS[expert_quant]
+    elif expert_quant.split("+", 1)[0] in GGUF_EXPERT_QUANTS:
+        provider = functools.partial(_gguf_banks, quant_format=expert_quant)
+    else:
         raise ValueError(
             f"{expert_quant!r} experts load through their MoE quant method; "
             f"only {sorted(_PROVIDERS)} still have a format provider"
         )
-    return _PROVIDERS[expert_quant](
+    return provider(
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
         layer_sink=layer_sink,
@@ -306,7 +335,7 @@ def load_expert_banks(
 
     ``method`` (the bound expert quant method of the model's offload layers) selects
     the generic path: the family's pieces packed by the method's kernel. Without it only the
-    GGUF q4_0 format loads, through its own provider.
+    native-GGUF formats load, through their own provider.
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).

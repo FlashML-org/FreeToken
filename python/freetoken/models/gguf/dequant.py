@@ -1,5 +1,5 @@
 """GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+checkpoints use: Q4_0, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, plus trivial F32/F16/BF16).
 
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
@@ -23,7 +23,10 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ4_NL = 20
+GGML_IQ4_XS = 23
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -33,7 +36,10 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ4_XS: (256, 136),
 }
 
 GGML_NAME = {
@@ -42,8 +48,14 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ4_XS: "IQ4_XS",
 }
+
+# ggml's 16-entry int8 codebook for the non-linear 4-bit quants (IQ4_NL/IQ4_XS).
+IQ4NL_KVALUES = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
 
 
 def row_bytes(numel: int, ggml_type: int) -> int:
@@ -77,6 +89,14 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 values; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -115,9 +135,81 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_iq4_nl(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """IQ4_NL: per 32-elem block = fp16 scale ``d`` + 16 packed nibbles; each nibble
+    indexes a 16-entry int8 codebook, so ``w = d * kvalues_iq4nl[q]``.
+
+    Same byte/nibble packing as Q4_0 (element ``j`` low, ``j+16`` high), only the
+    lookup replaces the linear ``q - 8``.
+    """
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    qs = raw[:, 2:18]  # [N,16] uint8
+    values = torch.tensor(IQ4NL_KVALUES, dtype=torch.float32, device=raw.device)
+    q = torch.cat([values[(qs & 0x0F).long()], values[(qs >> 4).long()]], dim=1)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
+def dequant_iq4_xs(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """IQ4_XS: 256-elem super-block = fp16 ``d`` + 16-bit high scale bits + 4B low
+    scale nibbles + 128B packed nibbles. The 6-bit ``ls`` per 32-elem sub-block gives
+    ``dl = d*(ls-32)``, then the same codebook lookup as IQ4_NL.
+    """
+    raw = raw.reshape(-1, 136)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    scales_h = raw[:, 2:4].contiguous().view(torch.uint16).to(torch.int64)  # [n,1]
+    scales_l = raw[:, 4:8].to(torch.int64)  # [n,4]
+    qs = raw[:, 8:136]  # [n,128]
+    ib = torch.arange(8, device=raw.device)  # [8], one per 32-elem sub-block
+    low = (scales_l[:, ib // 2] >> (4 * (ib % 2))) & 0x0F  # [n,8]
+    high = (scales_h >> (2 * ib)) & 3  # [n,8]
+    dl = d * ((low | (high << 4)) - 32).to(torch.float32)  # [n,8]
+    q = qs.reshape(n, 8, 16)  # [n,8 sub-blocks,16 bytes]
+    values = torch.tensor(IQ4NL_KVALUES, dtype=torch.float32, device=raw.device)
+    y = torch.cat([values[(q & 0x0F).long()], values[(q >> 4).long()]], dim=2)  # [n,8,32]
+    return (y * dl.unsqueeze(2)).reshape(-1).to(out_dtype)
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q5_K: 256-elem super-block = fp16 ``d`` + fp16 ``dmin`` + 12B packed 6-bit
+    sub-block scales/mins + 32B 5th bits + 128B low nibbles.
+
+    ``w = d*sc*q - dmin*m`` with the 5-bit ``q`` per element; 8 sub-blocks of 32, each
+    with a 6-bit scale and min (ggml's ``get_scale_min_k4`` packing).
+    """
+    raw = raw.reshape(-1, 176)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    dmin = _f16_scales(raw, 2, 4)  # [n,1]
+    scales = raw[:, 4:16].to(torch.int64)  # [n,12]
+    qh = raw[:, 16:48].to(torch.int64)  # [n,32]
+    qs = raw[:, 48:176].to(torch.int64)  # [n,128]
+
+    sc = torch.empty((n, 8), dtype=torch.int64, device=raw.device)
+    mn = torch.empty((n, 8), dtype=torch.int64, device=raw.device)
+    sc[:, 0:4] = scales[:, 0:4] & 0x3F
+    sc[:, 4:8] = (scales[:, 8:12] & 0x0F) | ((scales[:, 0:4] >> 6) << 4)
+    mn[:, 0:4] = scales[:, 4:8] & 0x3F
+    mn[:, 4:8] = (scales[:, 8:12] >> 4) | ((scales[:, 4:8] >> 6) << 4)
+    d1 = d * sc.to(torch.float32)  # [n,8]
+    m1 = dmin * mn.to(torch.float32)  # [n,8]
+
+    ql = qs.reshape(n, 4, 32)  # 4 groups of 64 elements
+    q = torch.stack([ql & 0x0F, (ql >> 4) & 0x0F], dim=2).reshape(n, 8, 32)  # [n,8,32]
+    ib = torch.arange(8, device=raw.device).view(1, 8, 1)
+    q = q + (((qh.view(n, 1, 32) >> ib) & 1) << 4)  # 5th bit per sub-block
+    y = d1.unsqueeze(2) * q - m1.unsqueeze(2)
+    return y.reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_Q5_K: dequant_q5_k,
     GGML_Q6_K: dequant_q6_k,
+    GGML_IQ4_NL: dequant_iq4_nl,
+    GGML_IQ4_XS: dequant_iq4_xs,
 }
 
 
@@ -143,11 +235,19 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q5_K",
     "GGML_Q6_K",
+    "GGML_IQ4_NL",
+    "GGML_IQ4_XS",
     "GGML_NAME",
     "BLOCK_SHAPE",
+    "IQ4NL_KVALUES",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
+    "dequant_q5_k",
     "dequant_q6_k",
+    "dequant_iq4_nl",
+    "dequant_iq4_xs",
     "dequantize",
 ]

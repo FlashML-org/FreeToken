@@ -10,8 +10,9 @@
 // sync() blocks the host-func thread until the pool drains. The heavy GEMV runs
 // on the persistent worker threads, not the host-func thread.
 //
-// Weight formats: bf16, NVFP4, MXFP4, ds_fp4 and Q4_0 expert banks (see WFmt and
-// the per-format bank schemas). Compute is FP32-accumulate; the intermediate is
+// Weight formats: bf16, NVFP4, MXFP4, ds_fp4 and the native-GGUF W4A8 formats
+// (Q4_0, IQ4_NL, IQ4_XS, Q5_K) expert banks (see WFmt and the per-format bank
+// schemas). Compute is FP32-accumulate; the intermediate is
 // stored bf16 to match the GPU decode path. ISA is chosen once at construction
 // (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
@@ -1207,20 +1208,367 @@ float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
 }
 #endif  // CPU_MOE_X86
 
-// All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI is orthogonal to
-// the ISA tier (gated by cpu_has_avxvnni() / FREETOKEN_CPU_MOE_NO_VNNI), so it wins when
-// present; otherwise the 256-bit VPMADDUBSW kernel covers both the avx2 and avx512 tiers.
-q4dot_fn select_q4dot() {
-  const IsaTier t = pick_isa();
-#if CPU_MOE_X86
-  if (cpu_has_avxvnni()) return q4_0_dot_i8_vnni;
-  if (t >= ISA_AVX2) return q4_0_dot_i8_avx2;
-#endif
-  (void)t;
-  return q4_0_dot_i8_scalar;
+// All tiers are W4A8 (int8 activations pre-quantized to Q8_0); the per-format dot is
+// picked by select_gguf_dot(). AVX-VNNI is orthogonal to the ISA tier (gated by
+// cpu_has_avxvnni() / FREETOKEN_CPU_MOE_NO_VNNI), so it wins when present; otherwise the
+// 256-bit VPMADDUBSW kernel covers both the avx2 and avx512 tiers.
+
+// ------------- IQ4_NL / IQ4_XS / Q5_K (GGUF non-linear + K-quant, W4A8) -------------
+// Same W4A8 contract as Q4_0 (int8 Q8_0 activations), selected by the packed format:
+//  * IQ4_NL: 18-byte block, the nibble indexes a fixed 16-entry int8 LUT (kIq4nl)
+//    instead of the linear (nibble-8).
+//  * IQ4_XS: 136-byte super-block; 8 sub-blocks of 32 with a 6-bit scale ls (dl=d*(ls-32)),
+//    the same 16-byte LUT packing per sub-block.
+//  * Q5_K: 176-byte super-block; affine w = d*sc*q - dmin*m with 5-bit q, so the int8
+//    dot gives sum(q*a) and a per-32 activation sum corrects the min term.
+// All three keep the q4dot_fn signature; the caller passes the matching activation block
+// size (asb has one fp32 scale per 32 activation elements).
+
+// ggml's IQ4_NL codebook (ggml-quants.c kvalues_iq4nl).
+alignas(16) static const int8_t kIq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// ggml get_scale_min_k4: 6-bit scale/min of Q5_K sub-block j in [0,8).
+inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& sc, uint8_t& mn) {
+  if (j < 4) {
+    sc = q[j] & 63;
+    mn = q[j + 4] & 63;
+  } else {
+    sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+inline float load_fp16_scale(const uint8_t* p) {
+  uint16_t h;
+  std::memcpy(&h, p, sizeof(h));
+  return fp16_to_f32(h);
+}
+
+float iq4_nl_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    const uint8_t* q = blk + 2;
+    const int8_t* a = aq + (size_t)b * 32;
+    int isum = 0;
+    for (int j = 0; j < 16; ++j) {
+      isum += (int)kIq4nl[q[j] & 0x0F] * (int)a[j];
+      isum += (int)kIq4nl[q[j] >> 4] * (int)a[16 + j];
+    }
+    acc += load_fp16_scale(blk) * asb[b] * (float)isum;
+  }
+  return acc;
+}
+
+float iq4_xs_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 136;
+    const float d = load_fp16_scale(blk);
+    uint16_t scales_h;
+    std::memcpy(&scales_h, blk + 2, sizeof(scales_h));
+    const uint8_t* scales_l = blk + 4;
+    const uint8_t* qs = blk + 8;
+    for (int s = 0; s < 8; ++s) {
+      const int ls = ((scales_l[s >> 1] >> (4 * (s & 1))) & 0xF) |
+                     (((scales_h >> (2 * s)) & 3) << 4);
+      const float dl = d * (float)(ls - 32) * asb[b * 8 + s];
+      const uint8_t* q = qs + (size_t)s * 16;
+      const int8_t* a = aq + (size_t)(b * 8 + s) * 32;
+      int isum = 0;
+      for (int j = 0; j < 16; ++j) {
+        isum += (int)kIq4nl[q[j] & 0x0F] * (int)a[j];
+        isum += (int)kIq4nl[q[j] >> 4] * (int)a[16 + j];
+      }
+      acc += dl * (float)isum;
+    }
+  }
+  return acc;
+}
+
+float q5_k_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 176;
+    const float d = load_fp16_scale(blk);
+    const float dmin = load_fp16_scale(blk + 2);
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    for (int s = 0; s < 8; ++s) {
+      uint8_t sc, mn;
+      get_scale_min_k4(s, scales, sc, mn);
+      const uint8_t* q = qs + (size_t)(s >> 1) * 32;
+      const int8_t* a = aq + (size_t)(b * 8 + s) * 32;
+      int qsum = 0, asum = 0;
+      for (int l = 0; l < 32; ++l) {
+        const int nib = (s & 1) ? (q[l] >> 4) : (q[l] & 0x0F);
+        const int qq = nib | (((qh[l] >> s) & 1) << 4);
+        qsum += qq * (int)a[l];
+        asum += (int)a[l];
+      }
+      acc += asb[b * 8 + s] * (d * (float)sc * (float)qsum - dmin * (float)mn * (float)asum);
+    }
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86
+// sum over the 8 int32 lanes.
+__attribute__((target("avx2")))
+static inline int hsum256_epi32(__m256i v) {
+  __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+  s = _mm_hadd_epi32(s, s);
+  s = _mm_hadd_epi32(s, s);
+  return _mm_cvtsi128_si32(s);
+}
+
+// 32 signed int8 weights dotted with 32 signed int8 activations -> 8 int32 partials
+// (ggml sign trick: |w| * (sign(w)*a) = w*a). No int16 saturation: |w|,|a| <= 127.
+__attribute__((target("avx2")))
+static inline __m256i gguf_s8s8_dot32(__m256i wq, __m256i a) {
+  __m256i aw = _mm256_sign_epi8(wq, wq);
+  __m256i sa = _mm256_sign_epi8(a, wq);
+  return _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sa), _mm256_set1_epi16(1));
+}
+
+// Q5_K signed-u8 (q in 0..31) x s8 activations -> 8 int32 partials.
+__attribute__((target("avx2")))
+static inline __m256i gguf_u8s8_dot32(__m256i qv, __m256i a) {
+  return _mm256_madd_epi16(_mm256_maddubs_epi16(qv, a), _mm256_set1_epi16(1));
+}
+
+// sum of 32 int8 activations as int32.
+__attribute__((target("avx2")))
+static inline int gguf_asum32(__m256i a) {
+  return hsum256_epi32(gguf_u8s8_dot32(_mm256_set1_epi8(1), a));
+}
+
+// One 16-byte nibble block -> 32 int8 codebook weights (low nibbles = elems 0..15).
+__attribute__((target("avx2")))
+static inline __m256i iq4_unpack_lut(const uint8_t* q, __m256i lut2) {
+  const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+  const __m128i m0f = _mm_set1_epi8(0x0F);
+  const __m128i lo = _mm_and_si128(qb, m0f);
+  const __m128i hi = _mm_and_si128(_mm_srli_epi16(qb, 4), m0f);
+  const __m128i lut = _mm256_castsi256_si128(lut2);
+  return _mm256_set_m128i(_mm_shuffle_epi8(lut, hi), _mm_shuffle_epi8(lut, lo));
+}
+
+__attribute__((target("avx2,fma,f16c")))
+float iq4_nl_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m256i lut2 = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nl)));
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const __m256i wq = iq4_unpack_lut(blk + 2, lut2);
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    const __m256i d32 = gguf_s8s8_dot32(wq, a);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), _mm256_set1_ps(q4_scale(dh) * asb[b]), accF);
+  }
+  return hsum256(accF);
+}
+
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float iq4_nl_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m256i lut2 = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nl)));
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const __m256i wq = iq4_unpack_lut(blk + 2, lut2);
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    const __m256i aw = _mm256_sign_epi8(wq, wq);
+    const __m256i sa = _mm256_sign_epi8(a, wq);
+    const __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);
+    uint16_t h;
+    std::memcpy(&h, blk, sizeof(h));
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), _mm256_set1_ps(q4_scale(h) * asb[b]), accF);
+  }
+  return hsum256(accF);
+}
+
+__attribute__((target("avx2,fma,f16c")))
+float iq4_xs_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m256i lut2 = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nl)));
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 136;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const float d = load_fp16_scale(blk);
+    uint16_t scales_h;
+    std::memcpy(&scales_h, blk + 2, sizeof(scales_h));
+    const uint8_t* scales_l = blk + 4;
+    const uint8_t* qs = blk + 8;
+    for (int s = 0; s < 8; ++s) {
+      const int ls = ((scales_l[s >> 1] >> (4 * (s & 1))) & 0xF) |
+                     (((scales_h >> (2 * s)) & 3) << 4);
+      const __m256i wq = iq4_unpack_lut(qs + (size_t)s * 16, lut2);
+      const __m256i a = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(aq + (size_t)(b * 8 + s) * 32));
+      const __m256i d32 = gguf_s8s8_dot32(wq, a);
+      accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32),
+                             _mm256_set1_ps(d * (float)(ls - 32) * asb[b * 8 + s]), accF);
+    }
+  }
+  return hsum256(accF);
+}
+
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float iq4_xs_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m256i lut2 = _mm256_broadcastsi128_si256(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nl)));
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 136;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const float d = load_fp16_scale(blk);
+    uint16_t scales_h;
+    std::memcpy(&scales_h, blk + 2, sizeof(scales_h));
+    const uint8_t* scales_l = blk + 4;
+    const uint8_t* qs = blk + 8;
+    for (int s = 0; s < 8; ++s) {
+      const int ls = ((scales_l[s >> 1] >> (4 * (s & 1))) & 0xF) |
+                     (((scales_h >> (2 * s)) & 3) << 4);
+      const __m256i wq = iq4_unpack_lut(qs + (size_t)s * 16, lut2);
+      const __m256i a = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(aq + (size_t)(b * 8 + s) * 32));
+      const __m256i aw = _mm256_sign_epi8(wq, wq);
+      const __m256i sa = _mm256_sign_epi8(a, wq);
+      const __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);
+      accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di),
+                             _mm256_set1_ps(d * (float)(ls - 32) * asb[b * 8 + s]), accF);
+    }
+  }
+  return hsum256(accF);
+}
+
+// Q5_K sub-block q vector: nib = (s even ? low : high) nibbles of qs group (s>>1);
+// 5th bit = (qh[l] >> s) & 1, added as 16. Vectorized without variable shifts: the bit
+// test is (qh & (1<<s)) == (1<<s) -> 0xFF, ANDed with 16.
+__attribute__((target("avx2")))
+static inline __m256i q5k_unpack32(const uint8_t* qs_group, const uint8_t* qh, int s) {
+  const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs_group));
+  const __m256i qhb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+  const __m256i m0f = _mm256_set1_epi8(0x0F);
+  const __m256i nib = (s & 1) ? _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f)
+                              : _mm256_and_si256(q, m0f);
+  const __m256i bit = _mm256_set1_epi8((char)(1 << s));
+  const __m256i hi = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qhb, bit), bit),
+                                      _mm256_set1_epi8(16));
+  return _mm256_or_si256(nib, hi);
+}
+
+__attribute__((target("avx2,fma,f16c")))
+float q5_k_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 176;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const float d = load_fp16_scale(blk);
+    const float dmin = load_fp16_scale(blk + 2);
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    for (int s = 0; s < 8; ++s) {
+      uint8_t sc, mn;
+      get_scale_min_k4(s, scales, sc, mn);
+      const __m256i qv = q5k_unpack32(qs + (size_t)(s >> 1) * 32, qh, s);
+      const __m256i a = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(aq + (size_t)(b * 8 + s) * 32));
+      const float qsum = (float)hsum256_epi32(gguf_u8s8_dot32(qv, a));
+      const float asum = (float)gguf_asum32(a);
+      acc += asb[b * 8 + s] * (d * (float)sc * qsum - dmin * (float)mn * asum);
+    }
+  }
+  return acc;
+}
+
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float q5_k_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 176;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    const float d = load_fp16_scale(blk);
+    const float dmin = load_fp16_scale(blk + 2);
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    for (int s = 0; s < 8; ++s) {
+      uint8_t sc, mn;
+      get_scale_min_k4(s, scales, sc, mn);
+      const __m256i qv = q5k_unpack32(qs + (size_t)(s >> 1) * 32, qh, s);
+      const __m256i a = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(aq + (size_t)(b * 8 + s) * 32));
+      const __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), qv, a);
+      const float qsum = (float)hsum256_epi32(di);
+      const float asum = (float)gguf_asum32(a);
+      acc += asb[b * 8 + s] * (d * (float)sc * qsum - dmin * (float)mn * asum);
+    }
+  }
+  return acc;
+}
+#endif  // CPU_MOE_X86
+
+enum WFmt {
+  WF_BF16 = 0,
+  WF_NVFP4 = 1,
+  WF_MXFP4 = 2,
+  WF_DSFP4 = 3,
+  WF_Q4_0 = 4,
+  WF_IQ4_NL = 5,
+  WF_IQ4_XS = 6,
+  WF_Q5_K = 7
+};
+
+// Native-GGUF packed-row byte stride over K for a format (0 = not a GGUF format).
+inline int gguf_row_bytes(int fmt, int K) {
+  if (fmt == WF_Q4_0 || fmt == WF_IQ4_NL) return (K / 32) * 18;
+  if (fmt == WF_IQ4_XS) return (K / 256) * 136;
+  if (fmt == WF_Q5_K) return (K / 256) * 176;
+  return 0;
+}
+
+inline bool is_gguf_w4a8(int fmt) {
+  return fmt == WF_Q4_0 || fmt == WF_IQ4_NL || fmt == WF_IQ4_XS || fmt == WF_Q5_K;
+}
+
+// Per-format W4A8 dot, picking the best tier the CPU+build supports.
+q4dot_fn select_gguf_dot(int fmt) {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  const bool vnni = cpu_has_avxvnni();
+  if (t >= ISA_AVX2) {
+    if (fmt == WF_IQ4_NL) return vnni ? iq4_nl_dot_i8_vnni : iq4_nl_dot_i8_avx2;
+    if (fmt == WF_IQ4_XS) return vnni ? iq4_xs_dot_i8_vnni : iq4_xs_dot_i8_avx2;
+    if (fmt == WF_Q5_K) return vnni ? q5_k_dot_i8_vnni : q5_k_dot_i8_avx2;
+    if (vnni) return q4_0_dot_i8_vnni;
+    return q4_0_dot_i8_avx2;
+  }
+#endif
+  (void)t;
+  if (fmt == WF_IQ4_NL) return iq4_nl_dot_i8_scalar;
+  if (fmt == WF_IQ4_XS) return iq4_xs_dot_i8_scalar;
+  if (fmt == WF_Q5_K) return q5_k_dot_i8_scalar;
+  return q4_0_dot_i8_scalar;
+}
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1256,7 +1604,7 @@ struct CpuMoeExecutor {
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
-  bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  bool use_q4a8 = false;       // native GGUF W4A8 (Q4_0/IQ4_NL/IQ4_XS/Q5_K): int8 pre-quant
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
@@ -1267,7 +1615,7 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
-  // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
+  // Native-GGUF packed-row byte strides (gguf_row_bytes over K=H for gate_up, K=I for down).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
   float e4m3_lut[256];
@@ -1382,21 +1730,33 @@ struct CpuMoeExecutor {
     nvdot = select_nvdot();
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
-    q4dot = select_q4dot();
-    if (weight_format == WF_Q4_0) {
-      if (H % 32 != 0 || I % 32 != 0)
-        throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
-      q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
-      q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+    q4dot = select_gguf_dot(weight_format);
+    if (is_gguf_w4a8(weight_format)) {
+      const int blk = (weight_format == WF_Q4_0 || weight_format == WF_IQ4_NL) ? 32 : 256;
+      if (H % blk != 0 || I % blk != 0)
+        throw std::runtime_error(
+            "GGUF 4-bit CPU MoE requires H and I to be multiples of the block size");
+      q4_gu_row_bytes = gguf_row_bytes(weight_format, H);  // K = H (gate_up rows)
+      q4_dn_row_bytes = gguf_row_bytes(weight_format, I);  // K = I (down rows)
     }
     isa = c.name;
-    // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
-    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
-    // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
+    // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. The native-GGUF
+    // formats are always W4A8 (activations pre-quantized to Q8_0); select_gguf_dot picks
+    // the per-format VPDPBUSD / VPMADDUBSW / scalar kernel for the tier.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
-    use_q4a8 = (weight_format == WF_Q4_0);
-    const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
+    use_q4a8 = is_gguf_w4a8(weight_format);
+    const char* q4tag = "";
+    if (use_q4a8) {
+      const char* fmtname = weight_format == WF_IQ4_NL ? "iq4_nl"
+                            : weight_format == WF_IQ4_XS ? "iq4_xs"
+                            : weight_format == WF_Q5_K ? "q5_k"
+                                                       : "q4_0";
+      const char* tier = cpu_has_avxvnni() ? "vnni" : "tier";
+      static thread_local char q4buf[64];
+      std::snprintf(q4buf, sizeof(q4buf), "+%s(%s-w4a8)", tier, fmtname);
+      q4tag = q4buf;
+    }
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
@@ -1489,7 +1849,7 @@ struct CpuMoeExecutor {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
     }
-    if (fmt == WF_Q4_0) {
+    if (is_gguf_w4a8(fmt)) {
       const uint8_t* w =
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
@@ -1512,7 +1872,7 @@ struct CpuMoeExecutor {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
     }
-    if (fmt == WF_Q4_0) {
+    if (is_gguf_w4a8(fmt)) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
     }

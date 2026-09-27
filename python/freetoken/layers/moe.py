@@ -397,7 +397,7 @@ class OffloadMoELayer(MoELayer):
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
-    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
+    # Native-GGUF experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -423,16 +423,22 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
-            # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+        from freetoken.moe.gguf_experts import (
+            GGUF_EXPERT_QUANTS,
+            fused_experts_gguf,
+            gguf_expert_role_types,
+        )
 
+        if fmt.split("+", 1)[0] in GGUF_EXPERT_QUANTS:
+            # Native GGUF experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+            # streamed packed banks; topk_ids already index the cache slots / layer.
             gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            gate_up_type, down_type = gguf_expert_role_types(fmt)
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                gate_up_type, down_type,
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        raise AssertionError(f"offload experts without a quant method only serve GGUF banks, got {fmt!r}")
 
 
 def make_moe_layer(

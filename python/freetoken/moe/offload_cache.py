@@ -45,6 +45,11 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF K-quant / non-linear experts: same packed-row layout, other block
+    # sizes (see BLOCK_SHAPE). gate_up [L*E, 2I, row_bytes(H)], down [L*E, H, row_bytes(I)].
+    "q5_K": ("gate_up", "down"),
+    "iq4_nl": ("gate_up", "down"),
+    "iq4_xs": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -90,10 +95,62 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "q5_K": lambda H, I: 2 * I * (H // 256) * 176 + H * (I // 256) * 176,
+    "iq4_nl": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "iq4_xs": lambda H, I: 2 * I * (H // 256) * 136 + H * (I // 256) * 136,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
+
+# GGUF expert format tags -> the ggml type, for sizing per-role bank bytes. A composite
+# "<gate_up>+<down>" tag (e.g. IQ4_XS gate/up with IQ4_NL down when the intermediate width
+# is not 256-aligned) sizes each role with its own block. The block table is duplicated here
+# (BLOCK_SHAPE) to avoid importing freetoken.models from this early module (circular import).
+_GGUF_BANK_TYPES = {"q4_0": (32, 18), "q5_K": (256, 176), "iq4_nl": (32, 18), "iq4_xs": (256, 136)}
+
+
+def _gguf_role_bytes(tag: str, role: str, H: int, I: int) -> int:
+    block, size = _GGUF_BANK_TYPES[tag]
+    k = H if role == "gate_up" else I
+    rows = 2 * I if role == "gate_up" else H
+    return rows * (k // block) * size
+
+
+class _CompositeSchemas(dict):
+    def __missing__(self, key):
+        if isinstance(key, str) and "+" in key:
+            gate_up, down = key.split("+", 1)
+            if gate_up in self and down in self:
+                return ("gate_up", "down")
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+class _CompositeBytes(dict):
+    def __missing__(self, key):
+        if isinstance(key, str) and "+" in key:
+            gate_up, down = key.split("+", 1)
+            if gate_up in _GGUF_BANK_TYPES and down in _GGUF_BANK_TYPES:
+                return lambda H, I: (
+                    _gguf_role_bytes(gate_up, "gate_up", H, I) + _gguf_role_bytes(down, "down", H, I)
+                )
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+_BANK_SCHEMAS = _CompositeSchemas(_BANK_SCHEMAS)
+_BANK_BYTES_PER_EXPERT = _CompositeBytes(_BANK_BYTES_PER_EXPERT)
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
