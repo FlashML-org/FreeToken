@@ -212,12 +212,12 @@ ft serve ... --hot-expert-list pins.json
 **目标**：运行期按滑动窗口热度自动调整热集成员，域漂移（代码 ↔ 长上下文 agent）时热集不失效。
 
 **机制**：
-- **窗口统计**：钉住模式下 `ExpertHotness` 常开（不再仅 `--hot-stats-out` 时）。双缓冲计数：周期 T 到达时把 device `counts` 清零前先 D2H 到"当前窗口"，上一窗口保留为参照；EMA（半衰期=窗口长）作为平滑热度。
-- **重钉决策**（宿主侧纯计算，T 默认 600s，`--hot-expert-repin-interval-s`，0=关闭）：每层比较 EMA top-K 与当前钉住集；仅当候选专家的 EMA 计数 ≥ 被替换者 × `--hot-expert-repin-gain`（默认 1.5，迟滞防抖）才交换；每周期每层最多换 `--hot-expert-repin-max-swaps`（默认 8）个。
-- **迁移执行**（行级交换，每对 ≤ 4.69 MiB）：
+- **窗口统计**：钉住模式下 `ExpertHotness` 常开（不再仅 `--hot-stats-out` 时）。双缓冲计数：每次墙钟排空（间隔 = min(落盘间隔, T)）把 device `counts` 增量 D2H 后清零，增量先并入"当前窗口"宿主累计器（device 部分 + 已排空部分合起来才是完整窗口，排空可横跨窗口边界）；窗口边界到达即封口出"完整窗口"，上一窗口保留为参照；EMA（半衰期=窗口长，每窗衰减 0.5，首窗直取）作为平滑热度，提供 `window_topk` 与 `ema_kth`（第 K 名计数）查询。`--hot-stats-out` 的全量累计仍吃同一份增量，语义不变。
+- **重钉决策**（宿主侧纯计算，`--hot-expert-repin-interval-s` 默认 0=关闭，>0 时钉住模式下计数器自动常开）：每层比较 EMA top-K 与当前钉住集；仅当"候选 ∈ 当前冷集 且 EMA(候选) ≥ EMA(被替换者) × `--hot-expert-repin-gain`"（默认 1.5，迟滞防抖；EMA=0 的候选不换）才交换；每周期每层最多换 `--hot-expert-repin-max-swaps`（默认 8）个；候选/受害排序平局取小 id。
+- **迁移执行**（行级交换，每对 ≤ 4.69 MiB，`OffloadMoeCache.swap_pinned_experts`）：
   1. 新热冷专家 c（bank 行 r_c）、被替换钉住专家 h（槽 s_h）；
-  2. `s_h --D2H--> host scratch`；`scratch --> bank[r_c]`（h 回填 host）；`bank[r_c] --H2D--> s_h`（c 上位）；
-  3. 更新映射：`pin_ids/cold_row/slot_for_id/id_of_slot`（全部为既有张量的值改写，shape 不变 → **与 CUDA 图兼容**，flashlib 合并查询读的 `pin_ids` 缓冲同理）。
+  2. `s_h --D2H--> host scratch`；`bank[r_c] --H2D--> s_h`（c 上位——必须先于写回，写回会覆盖 c 的原始字节）；`scratch --> bank[r_c]`（h 回填 host，全库唯一运行期 bank 写者）；
+  3. 更新映射：`pin_ids/cold_row/slot_for_id/id_of_slot`（usage 刷成当前 step 衔接 flashlib 不可驱逐语义），并刷新三源组装的预建 gather 索引与 cold_row 宿主镜像；全部为既有张量的值改写，shape 不变 → **与 CUDA 图兼容**，flashlib 合并查询读的 `pin_ids` 缓冲同理。
 - **执行点**：`Scheduler` 的 idle 安全点（`_execute_pending_rebuild` 先例，scheduler.py:230-233）——所有流同步、无在途 GEMM/CPU GEMV 时做交换；由此 **host bank 从"加载后只读"变为"仅在重钉安全点可写"**，需在 `host_banks.py`/注释与并发假设中显式记录该约定。
 - **与 §8/§9 的交互**：重钉只交换行身份，不改任何 shape/指针基址；CPU executor 的 data_ptr 表不变（bank 首址与行宽不动，变的只是行内容与 cold_row 值）——这是冷行号间接层带来的额外红利。
 - **可观测**：每次重钉打印迁移对（layer, 换入, 换出, 计数比）汇总行；`--hot-stats-out` 落盘时附当前钉住集。

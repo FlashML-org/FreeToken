@@ -622,6 +622,13 @@ class Engine:
         # 显存钉住（--hot-expert-list[/--hot-expert-slots]）：读取并校验钉住计划，
         # 剥离 CPU 解码层的钉住项；未配置时为 None，一切行为与现状一致。
         pin_plan = _resolve_hot_pin_plan(config, num_moe_layers, num_experts, cpu_layer_ids)
+        # 动态重钉（设计 §10）只能在钉住模式下开启：提前到 bank 加载前拒绝，避免
+        # 装载一半才失败。
+        if config.hot_expert_repin_interval_s > 0 and pin_plan is None:
+            raise ValueError(
+                "--hot-expert-repin-interval-s 需要显存钉住模式：请同时配置 "
+                "--hot-expert-list[/--hot-expert-slots]（0 = 关闭动态重钉）"
+            )
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -789,7 +796,10 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
-        if config.hot_stats_out is not None:
+        # 热度计数器：--hot-stats-out 显式开启（全量累计落盘），或钉住模式下开了
+        # 动态重钉时自动常开（out_path=None 只喂滑动窗口，不落盘）。
+        repin_on = pin_plan is not None and config.hot_expert_repin_interval_s > 0
+        if config.hot_stats_out is not None or repin_on:
             from freetoken.moe.hotness import ExpertHotness
 
             # Attached before capture for the same reason as collect_stats: record()'s
@@ -806,12 +816,32 @@ class Engine:
                     "quant_format": cache.quant_format,
                     "top_k": config.model_config.num_experts_per_tok,
                 },
+                window_interval_s=config.hot_expert_repin_interval_s if repin_on else None,
             )
-            cache.hotness.install_exit_flush()
-            logger.info_rank0(
-                f"expert hotness stats: collecting every MoE layer into {config.hot_stats_out} "
-                f"(flush every {config.hot_stats_interval_s:.0f}s + at exit)"
-            )
+            if config.hot_stats_out is not None:
+                cache.hotness.install_exit_flush()
+                logger.info_rank0(
+                    f"expert hotness stats: collecting every MoE layer into {config.hot_stats_out} "
+                    f"(flush every {config.hot_stats_interval_s:.0f}s + at exit)"
+                )
+            if pin_plan is not None:
+                # stats 落盘附带当前钉住集（pinned 可选键，重钉漂移的事后分析用）
+                cache.hotness.pinned_provider = cache.pinned_id_lists
+            if repin_on:
+                from freetoken.moe.hot_pin import HotExpertRepinManager
+
+                cache.repin_manager = HotExpertRepinManager(
+                    cache,
+                    cache.hotness,
+                    interval_s=config.hot_expert_repin_interval_s,
+                    gain=config.hot_expert_repin_gain,
+                    max_swaps=config.hot_expert_repin_max_swaps,
+                )
+                logger.info_rank0(
+                    f"dynamic repin: hotness window {config.hot_expert_repin_interval_s:.0f}s, "
+                    f"hysteresis gain {config.hot_expert_repin_gain:g}, at most "
+                    f"{config.hot_expert_repin_max_swaps} swaps per layer per cycle"
+                )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):

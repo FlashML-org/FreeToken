@@ -9,6 +9,7 @@ import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
 if TYPE_CHECKING:
+    from freetoken.moe.hot_pin import HotExpertRepinManager
     from freetoken.moe.hotness import ExpertHotness
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
@@ -326,6 +327,13 @@ class OffloadMoeCache:
         self._pin_gather_src: list[torch.Tensor] = []
         self._pin_gather_num: list[torch.Tensor] = []
         self._cold_row_np = None
+        # 动态重钉管理器（HotExpertRepinManager）：engine 在钉住且
+        # --hot-expert-repin-interval-s > 0 时装配；scheduler 的 idle 安全点经
+        # getattr 触发。None = 动态重钉关闭。
+        self.repin_manager: HotExpertRepinManager | None = None
+        # 重钉行级交换的宿主暂存（每 bank 一个 [rows, *row] pinned 张量，
+        # _repin_scratch 惰性分配、跨调用复用；None = 尚未重钉过）。
+        self._repin_scratch_bufs: list[torch.Tensor] | None = None
 
     def init_hot_pins(self, pin_ids: torch.Tensor, pin_counts: list[int], cold_row: torch.Tensor) -> None:
         """装配显存钉住：校验几何、占用 slot 顶部区并预填钉住映射。
@@ -439,26 +447,48 @@ class OffloadMoeCache:
             前提。
 
         Code Logic（这个函数做什么）:
-            逐层取 cold_row >= 0 的冷专家 id（int32，冷行序）作组合填充的 dst 行、
-            恒等 arange 作 src 行；取 pin_ids/pin_slots 前缀作钉住行 gather 的
-            dst/src；行数为 [1] int64 device 标量。另把 cold_row 复制成宿主 numpy
-            镜像（miss remap 的查表源，顶部槽恒命中故 pinned -> -1 不会进 miss）。
-            rebuild 重解算钉住几何（pin_slots 变化）后必须重跑；未来的动态重钉改写
-            pin_ids/cold_row 值（shape 不变）时也必须同步刷新。
+            逐层调 _refresh_pin_gather_layer 取 cold_row >= 0 的冷专家 id（int32，
+            冷行序）作组合填充的 dst 行、恒等 arange 作 src 行；取 pin_ids/pin_slots
+            前缀作钉住行 gather 的 dst/src；行数为 [1] int64 device 标量。另把
+            cold_row 复制成宿主 numpy 镜像（miss remap 的查表源，顶部槽恒命中故
+            pinned -> -1 不会进 miss）。rebuild 重解算钉住几何（pin_slots 变化）后
+            必须重跑；动态重钉改写 pin_ids/cold_row 值（shape 不变）后按层刷新。
         """
         assert self.pin_ids is not None and self.pin_slots is not None and self.cold_row is not None
-        self._pin_cold_dst, self._pin_cold_src, self._pin_cold_num = [], [], []
-        self._pin_gather_dst, self._pin_gather_src, self._pin_gather_num = [], [], []
-        for layer_id, count in enumerate(self.pin_counts):
-            cold_ids = torch.nonzero(self.cold_row[layer_id] >= 0).flatten().to(torch.int32)
-            c = int(cold_ids.numel())
-            self._pin_cold_dst.append(cold_ids)
-            self._pin_cold_src.append(torch.arange(c, dtype=torch.int32, device=self.device))
-            self._pin_cold_num.append(torch.tensor([c], dtype=torch.int64, device=self.device))
-            self._pin_gather_dst.append(self.pin_ids[layer_id, :count].clone())
-            self._pin_gather_src.append(self.pin_slots[layer_id, :count].clone())
-            self._pin_gather_num.append(torch.tensor([count], dtype=torch.int64, device=self.device))
+        # 预定长度后逐层刷新（_refresh_pin_gather_layer 按索引赋值，与重钉路径共用）
+        self._pin_cold_dst = [None] * self.num_layers
+        self._pin_cold_src = [None] * self.num_layers
+        self._pin_cold_num = [None] * self.num_layers
+        self._pin_gather_dst = [None] * self.num_layers
+        self._pin_gather_src = [None] * self.num_layers
+        self._pin_gather_num = [None] * self.num_layers
+        for layer_id in range(self.num_layers):
+            self._refresh_pin_gather_layer(layer_id)
         self._cold_row_np = self.cold_row.detach().cpu().numpy()
+
+    def _refresh_pin_gather_layer(self, layer_id: int) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            三源组装的固定 shape gather 索引描述"当前钉住集/冷集"的布局，动态重钉
+            交换行身份后（shape 全部不变）必须按层重建，且与加载期全量构建共享
+            同一份逻辑，否则两处演化会漂移。
+
+        Code Logic（这个函数做什么）:
+            重建 layer_id 的六项：_pin_cold_dst = cold_row >= 0 的冷专家 id（升序，
+            即冷行序）、_pin_cold_src = 恒等 arange、两者行数 [1] 标量；
+            _pin_gather_dst/src = pin_ids/pin_slots 前缀 clone、行数标量。全量重建
+            （_build_pin_gather_buffers）与单次重钉交换（swap_pinned_experts）共用。
+        """
+        assert self.pin_ids is not None and self.pin_slots is not None and self.cold_row is not None
+        count = self.pin_counts[layer_id]
+        cold_ids = torch.nonzero(self.cold_row[layer_id] >= 0).flatten().to(torch.int32)
+        c = int(cold_ids.numel())
+        self._pin_cold_dst[layer_id] = cold_ids
+        self._pin_cold_src[layer_id] = torch.arange(c, dtype=torch.int32, device=self.device)
+        self._pin_cold_num[layer_id] = torch.tensor([c], dtype=torch.int64, device=self.device)
+        self._pin_gather_dst[layer_id] = self.pin_ids[layer_id, :count].clone()
+        self._pin_gather_src[layer_id] = self.pin_slots[layer_id, :count].clone()
+        self._pin_gather_num[layer_id] = torch.tensor([count], dtype=torch.int64, device=self.device)
 
     def pin_query_buffer(self, num_route_ids: int) -> torch.Tensor:
         """
@@ -516,6 +546,149 @@ class OffloadMoeCache:
             for role, tensor in stage.items():
                 cache = self.bank_caches[role]
                 cache[slots] = tensor[:count].to(device=cache.device, dtype=cache.dtype)
+
+    def pinned_id_lists(self) -> list[list[int]]:
+        """每层当前钉住专家 id 的 host 快照（pin list 序 == 槽位序；未钉住为全空）。
+
+        动态重钉决策与 ``--hot-stats-out`` 落盘 pinned 字段的数据源：只在 idle 安全点
+        或退出落盘时调用，一次 pin_ids 的 D2H 可接受。
+        """
+        if self.pin_ids is None or self.pin_counts is None:
+            return [[] for _ in range(self.num_layers)]
+        host = self.pin_ids.detach().cpu()
+        return [host[layer_id, :count].tolist() for layer_id, count in enumerate(self.pin_counts)]
+
+    def _repin_scratch(self, rows: int) -> list[torch.Tensor]:
+        """行级交换的宿主暂存（每 bank 一个 [rows, *row] 张量），惰性分配、跨调用复用。
+
+        Business Logic（为什么需要这个函数）:
+            重钉把被替换钉住行 D2H 到宿主再写回 bank，必须先落在可写的 host 缓冲；
+            重钉低频但每周期 ≤ max_swaps × L 对，按需分配一次并复用即可，避免每次
+            交换都向分配器要 pinned 内存。
+
+        Code Logic（这个函数做什么）:
+            首次调用（或现有缓冲行数不足）时按各 bank 行形状分配 rows 行（CUDA 设备
+            用 pin_memory 加速 D2H）；返回每 bank 的暂存张量列表。
+        """
+        bufs = self._repin_scratch_bufs
+        if bufs is None or bufs[0].shape[0] < rows:
+            bufs = [
+                torch.empty(
+                    (rows, *cache.shape[1:]),
+                    dtype=cache.dtype,
+                    pin_memory=(self.device.type == "cuda"),
+                )
+                for _per_layer, cache in self.banks
+            ]
+            self._repin_scratch_bufs = bufs
+        return bufs
+
+    def swap_pinned_experts(self, layer_id: int, swaps: list[tuple[int, int]]) -> None:
+        """动态重钉的行级交换：候选冷专家 c 上位到被替换钉住专家 h 的顶部槽。
+
+        Business Logic（为什么需要这个函数）:
+            域漂移后冷专家可能比旧钉住专家更热，把两者的权威驻留对调（c 的字节上
+            显存、h 的字节回宿主 bank），热集就能跟随负载演进；交换必须同时搬字节
+            与改映射，且对 decode/prefill 全部读者表现为"原子"——这要求它在 idle
+            安全点（所有流同步、无在途 GEMM/CPU GEMV/未完成 prefill chunk）执行，
+            本方法内不再处理并发。
+
+        Code Logic（这个函数做什么）:
+            对每对 (c, h)：host 解析 c 的冷行 r_c 与 h 的钉住槽 s_h（校验 c ∈ 冷集、
+            s_h ∈ 顶部区、swaps 无重复专家）后，a) s_h 行 D2H 进复用的宿主暂存；
+            c) bank[r_c] H2D 进 s_h（c 上位——必须先于写回，写回会覆盖 c 的原始字
+            节）；b) 暂存 host-to-host 写回 bank[r_c]（h 回填宿主，bank 的唯一运行期
+            写者，见 host_banks 的并发约定）；d) 原子化改写映射值：pin_ids[l, j_h] =
+            c、cold_row[l, c] = -1、cold_row[l, h] = r_c、slot_for_id[l, c] = s_h、
+            slot_for_id[l, h] = -1、id_of_slot[s_h] = l*E+c（usage 刷成当前 step，
+            衔接 flashlib 不可驱逐语义的自我续期）；e) 刷新该层三源组装的 gather
+            索引与 cold_row 宿主镜像。全部为既有张量的值改写（shape 不变 ⇒ CUDA
+            graph 兼容），flashlib 合并查询/hybrid 范围保护天然读新值。
+        """
+        assert self.pin_ids is not None and self.pin_counts is not None, "init_hot_pins first"
+        assert self.pin_slots is not None and self.cold_row is not None, "init_hot_pins first"
+        assert self.banks and self._cold_row_np is not None, "swap needs pinning + banks"
+        assert 0 <= layer_id < self.num_layers, layer_id
+        if not swaps:
+            return
+        count = self.pin_counts[layer_id]
+        assert count > 0, f"layer {layer_id} has no pinned experts"
+        E = self.num_experts
+        # host 侧解析当前映射（idle 安全点，同步读取）
+        pin_host = self.pin_ids[layer_id, :count].cpu().tolist()
+        slot_host = self.slot_for_id[layer_id].cpu().tolist()
+        cold_host = self.cold_row[layer_id].cpu().tolist()
+        pin_pos = {e: j for j, e in enumerate(pin_host)}
+        cs: list[int] = []
+        hs: list[int] = []
+        js: list[int] = []
+        s_list: list[int] = []
+        r_list: list[int] = []
+        seen_c: set[int] = set()
+        seen_h: set[int] = set()
+        for cand, replaced in swaps:
+            r = cold_host[cand]
+            if r < 0:
+                raise ValueError(f"layer {layer_id}: 候选专家 {cand} 不在冷集（cold_row={r}），拒绝交换")
+            s = slot_host[replaced]
+            if s < self.pin_base:
+                raise ValueError(
+                    f"layer {layer_id}: 被替换专家 {replaced} 的槽 {s} 不在钉住区 "
+                    f"[{self.pin_base}, {self.cache_size})，拒绝交换"
+                )
+            pair = (cand, replaced)
+            if cand in seen_c or replaced in seen_h:
+                raise ValueError(f"layer {layer_id}: 交换对 {pair} 与前面的交换重复使用同一专家")
+            seen_c.add(cand)
+            seen_h.add(replaced)
+            cs.append(cand)
+            hs.append(replaced)
+            js.append(pin_pos[replaced])
+            s_list.append(s)
+            r_list.append(r)
+        n = len(cs)
+        c_t = torch.tensor(cs, dtype=torch.long, device=self.device)
+        h_t = torch.tensor(hs, dtype=torch.long, device=self.device)
+        j_t = torch.tensor(js, dtype=torch.long, device=self.device)
+        s_t = torch.tensor(s_list, dtype=torch.long, device=self.device)
+        import os as _os
+
+        if not _os.getenv("FREETOKEN_REPIN_SKIP_BYTES"):
+            scratch = self._repin_scratch(n)
+            for i, (per_layer, cache) in enumerate(self.banks):
+                # a. 被替换钉住行 -> 宿主暂存（同步 D2H；idle 点无并发读者）。
+                # 逐行 slice copy_：fp8 等 bank dtype 的 index 系内核（index_copy_ /
+                # 花式索引 gather）在 CPU 与 CUDA 上均未实现，copy_ 则是纯字节搬运，
+                # 对任意 dtype 都可用——真实 NVFP4 演示验证过这一点。
+                for k in range(n):
+                    scratch[i][k].copy_(cache[s_list[k]])
+            for i, (per_layer, cache) in enumerate(self.banks):
+                # c. 候选冷行 -> 顶部槽（H2D）：c 的权重上显存，c 从此由钉住槽权威驻留。
+                # 必须先于 b：b 会把 c 的原始字节覆盖掉。
+                for k in range(n):
+                    cache[s_list[k]].copy_(per_layer[layer_id][r_list[k]])
+            for i, (per_layer, cache) in enumerate(self.banks):
+                # b. 暂存 -> 候选旧冷行（host-to-host）：h 的权重回填 bank，h 从此由 bank 权威驻留
+                for k in range(n):
+                    per_layer[layer_id][r_list[k]] = scratch[i][k]
+        # d. 映射原子化更新（值改写，shape 不变 -> CUDA graph 兼容；int32/int64 映射
+        # 张量的 index 内核不受 bank dtype 限制）
+        flat_c = torch.tensor([layer_id * E + c for c in cs], dtype=torch.int32, device=self.device)
+        self.pin_ids[layer_id].index_copy_(0, j_t, c_t.to(torch.int32))
+        self.cold_row[layer_id, c_t] = -1
+        self.cold_row[layer_id, h_t] = torch.tensor(r_list, dtype=torch.int32, device=self.device)
+        self.slot_for_id[layer_id, c_t] = s_t.to(torch.int32)
+        self.slot_for_id[layer_id, h_t] = -1
+        self.id_of_slot[s_t] = flat_c
+        # usage 刷成当前 step：flashlib 路径的钉住槽靠"usage == step 不可驱逐"自我
+        # 续期，交换后到该层下一次合并查询之间有其他层 ensure 的窗口，旧 usage 的
+        # 钉住槽理论上可能成为全局 argmin 受害者；刷成当前 step 后它是最年轻的
+        # stale 槽（平局时 argmin 取最小槽位号，顶部区槽号最大，永不胜出）。
+        self.usage[s_t] = int(self.step.item())
+        self._cold_row_np[layer_id, cs] = -1
+        self._cold_row_np[layer_id, hs] = r_list
+        # e. 该层三源组装的 gather 索引随新钉住集/冷集重建
+        self._refresh_pin_gather_layer(layer_id)
 
     def set_bank_sources(
         self,

@@ -116,13 +116,14 @@ def test_maybe_flush_is_time_gated(monkeypatch, tmp_path):
     assert hot.maybe_flush() is False
 
 
-def test_ones_buffer_grows_and_reuses(tmp_path):
-    """_ones 按需扩展缓存 buffer，同长度请求复用同一存储。"""
+def test_record_uses_fresh_ones_no_shared_buffer(tmp_path):
+    """record 的增量不再共享可扩容缓存（多 batch-size graph 捕获下的 UAF 根因）：
+    counts 上不暴露 _ones_buf，重复 record 的累加语义不变。"""
     hot = _make_hotness(tmp_path)
-    ones = hot._ones(4)
-    assert hot._ones(4).data_ptr() == ones.data_ptr() and hot._ones(2).numel() == 2
-    grown = hot._ones(9)
-    assert grown.numel() == 9 and bool(torch.all(grown == 1))
+    assert not hasattr(hot, "_ones_buf")
+    for _ in range(3):
+        hot.record(0, torch.tensor([[0, 1]], dtype=torch.int32))
+    assert int(hot.counts[0]) == 3 and int(hot.counts[1]) == 3
 
 
 def test_offload_cache_hotness_defaults_none_and_record_path(tmp_path):
@@ -206,3 +207,122 @@ def test_record_inside_cuda_graph_accumulates_per_replay(tmp_path):
     delta = hot.counts - baseline
     assert int(delta.sum()) == 40  # 5 次 replay × 8 个路由
     assert int(delta[3]) == 40  # 全部落在专家 3（第 0 层平坦 id 空间）
+
+
+# ---------------------------------------------------------------------------
+# 动态重钉：滑动窗口 + EMA（设计 §10）
+# ---------------------------------------------------------------------------
+
+
+def _make_window_hotness(num_layers=1, num_experts=4, window_interval_s=10.0, flush_interval_s=3600.0):
+    from freetoken.moe.hotness import ExpertHotness
+
+    return ExpertHotness(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        device=torch.device("cpu"),
+        out_path=None,
+        flush_interval_s=flush_interval_s,
+        window_interval_s=window_interval_s,
+    )
+
+
+def test_window_ema_semantics_and_full_count_coexistence(monkeypatch, tmp_path):
+    """窗口封口：完整窗口 = 各次排空增量的并集（排空间隔 < 窗口间隔时跨多次排空）；
+    EMA 首窗直取、其后 0.5*ema + 0.5*窗口；全量累计（_host_counts/save）语义不受
+    窗口消费影响。"""
+    from freetoken.moe.hotness import ExpertHotness
+
+    # 排空每 5s 一次、窗口 10s：一个窗口横跨 ≥2 次排空
+    hot = _make_window_hotness(window_interval_s=10.0, flush_interval_s=5.0)
+    hot.out_path = str(tmp_path / "stats.json")  # 同时验证与 --hot-stats-out 共存
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("freetoken.moe.hotness.time.monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]  # __init__ 取真实时钟，构造后对齐到受控时钟
+
+    # 窗口 #1：三次排空的增量并集
+    hot.record(0, torch.tensor([[0, 1], [0, 2]], dtype=torch.int32))  # 0:2, 1:1, 2:1
+    clock["t"] = 1006.0
+    assert hot.maybe_flush() is True  # 首次排空：开窗（started=1006），不封口
+    assert hot.has_window is False
+    assert hot._host_counts.tolist() == [2, 1, 1, 0]  # 全量累计照常
+
+    hot.record(0, torch.tensor([[1, 1]], dtype=torch.int32))  # 1:+2
+    clock["t"] = 1011.0
+    assert hot.maybe_flush() is True  # 排空但窗口未满（5s < 10s）
+
+    clock["t"] = 1017.0  # 无新记录的排空：封口窗口 #1 = 前两次增量并集
+    assert hot.maybe_flush() is True
+    assert hot.has_window
+    np.testing.assert_array_equal(hot.ema_counts()[0], np.array([2.0, 3.0, 1.0, 0.0]))
+    np.testing.assert_array_equal(hot._window.reshape(1, 4)[0], np.array([2, 3, 1, 0]))
+    assert hot._window_acc.tolist() == [0, 0, 0, 0]
+
+    # 窗口 #2：单次排空即封口；EMA = 0.5*W1 + 0.5*W2
+    hot.record(0, torch.tensor([[3, 3]], dtype=torch.int32))  # 3:2
+    clock["t"] = 1028.0
+    assert hot.maybe_flush() is True
+    np.testing.assert_array_equal(hot._window.reshape(1, 4)[0], np.array([0, 0, 0, 2]))
+    np.testing.assert_array_equal(hot.ema_counts()[0], np.array([1.0, 1.5, 0.5, 1.0]))
+    # 全量累计 = 两窗之和，save 落盘与窗口/EMA 完全解耦
+    assert hot._host_counts.tolist() == [2, 3, 1, 2]
+    hot.save()
+    payload = ExpertHotness.load(str(tmp_path / "stats.json"))
+    assert payload["counts"] == [[2, 3, 1, 2]]
+
+
+def test_window_topk_and_ema_kth(monkeypatch):
+    """window_topk：EMA 降序、平局取小 id；ema_kth：按名次取值、越界抛错；
+    无完整窗口时查询拒绝。"""
+    hot = _make_window_hotness(num_experts=4)
+    assert hot.has_window is False
+    with pytest.raises(RuntimeError, match="窗口"):
+        hot.ema_counts()
+    with pytest.raises(RuntimeError, match="窗口"):
+        hot.window_topk(0, 2)
+
+    hot._ema = np.array([5.0, 7.0, 5.0, 1.0])  # 直接注入：降序 1,0/2(平局),3
+    assert hot.window_topk(0, 2) == [1, 0]  # 平局 5.0 取小 id 0
+    assert hot.window_topk(0, 99) == [1, 0, 2, 3]  # k 截断到专家数
+    assert hot.ema_kth(0, 1) == 7.0
+    assert hot.ema_kth(0, 2) == 5.0
+    assert hot.ema_kth(0, 4) == 1.0
+    with pytest.raises(ValueError, match="名次"):
+        hot.ema_kth(0, 0)
+    with pytest.raises(ValueError, match="名次"):
+        hot.ema_kth(0, 5)
+
+
+def test_save_pinned_field_and_select_compat(tmp_path):
+    """pinned_provider 给定时 save 附带 pin-list 风格 pinned 键（schema_version 仍 1），
+    选点工具 load_stats 照常读取；out_path=None 时 save 是 no-op。"""
+    import json
+
+    from freetoken.hotness.select import load_stats
+    from freetoken.moe.hotness import ExpertHotness
+
+    hot = _make_hotness(tmp_path)
+    hot.pinned_provider = lambda: [[3, 0], [1]]
+    hot.record(0, torch.tensor([[0, 3]], dtype=torch.int32))
+    hot._host_counts += hot.counts.numpy()
+    hot.save()
+    payload = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["pinned"] == [{"layer": 0, "experts": [3, 0]}, {"layer": 1, "experts": [1]}]
+    # 选点工具读取兼容：可选键不破坏既有校验
+    stats = load_stats(str(tmp_path / "hotstats.json"))
+    assert stats["meta"]["num_layers"] == 2
+
+    # 无 provider：不写 pinned 键
+    hot2 = _make_hotness(tmp_path)
+    hot2.save()
+    payload2 = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))
+    assert "pinned" not in payload2
+
+    # out_path=None（纯窗口模式）：save no-op，不建文件
+    hot3 = _make_window_hotness()
+    hot3.record(0, torch.tensor([[0, 1]], dtype=torch.int32))
+    (tmp_path / "hotstats.json").unlink()  # 清掉上一子用例的产物
+    hot3.save()
+    assert not (tmp_path / "hotstats.json").exists()
+

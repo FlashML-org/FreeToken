@@ -80,6 +80,15 @@ class EngineConfig:
     # （复用 hotness/select.py 的 select_pins）；未设置时 hot_expert_list 必须已是
     # pin list JSON。
     hot_expert_slots: int | None = None
+    # 动态重钉（设计 §10）：滑动窗口热度驱动的运行期重钉，钉住模式下按墙钟间隔
+    # （秒）把 device 热度计数 D2H 成"当前窗口"，经 EMA（半衰期 = 窗口时长）平滑后
+    # 与当前钉住集比较，仅在 idle 安全点做行级交换。0 = 关闭（默认）；>0 时钉住
+    # 模式下的热度计数器自动常开（即使未设 hot_stats_out）。
+    hot_expert_repin_interval_s: float = 0.0
+    # 重钉迟滞：候选专家的 EMA 计数 ≥ 被替换钉住专家 × gain 才交换（防抖，>1）。
+    hot_expert_repin_gain: float = 1.5
+    # 每周期每层最多交换的专家对数。
+    hot_expert_repin_max_swaps: int = 8
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

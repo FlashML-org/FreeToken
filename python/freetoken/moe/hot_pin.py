@@ -1,4 +1,5 @@
-"""显存钉住热点专家的加载期装配：pin list/stats 读取、校验与 cold_row 构建。
+"""显存钉住热点专家的加载期装配与运行期动态重钉：pin list/stats 读取、校验、
+cold_row 构建、重钉决策与 idle 安全点迁移管理。
 
 本模块是选点工具（``freetoken.hotness.select``，纯 Python）与运行期
 ``OffloadMoeCache`` 之间的契约层：
@@ -8,26 +9,45 @@
   ``cold_row [L, E] int32`` 冷行映射；
 * CPU 解码层（``--moe-cpu-layers`` 命中的层）的钉住项在此剥离并告警——这些层的
   host bank 保持全量 ``[E]``（CPU executor 按原始专家 id 取行），只有 GPU 层参与
-  冷压缩。
+  冷压缩；
+* ``plan_repin_swaps``（纯宿主计算）比较滑动窗口 EMA 热度与当前钉住集，产出
+  迟滞过滤后的交换对；
+* ``HotExpertRepinManager`` 在 idle 安全点（scheduler 的 ``_execute_pending_rebuild``
+  同位置）周期性触发决策并经 ``OffloadMoeCache.swap_pinned_experts`` 执行行级迁移
+  （设计文档 §10）。
 
-纯几何/纯 Python（torch 仅用于 cold_row 张量），可在无 GPU 环境单测。
+纯几何/纯 Python（torch 仅用于 cold_row 张量与管理器的同步栅栏），可在无 GPU 环境单测。
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from freetoken.utils import init_logger
+
+if TYPE_CHECKING:
+    from freetoken.moe.hotness import ExpertHotness
+    from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
 
 # pin list 文件 schema 与选点工具共用一个版本常量（单一事实来源）
 from freetoken.hotness.select import SCHEMA_VERSION  # noqa: E402,F401
 
-__all__ = ["SCHEMA_VERSION", "HotPinPlan", "resolve_hot_pin_plan", "cold_row_from_pins"]
+__all__ = [
+    "SCHEMA_VERSION",
+    "HotPinPlan",
+    "HotExpertRepinManager",
+    "cold_row_from_pins",
+    "plan_repin_swaps",
+    "resolve_hot_pin_plan",
+]
 
 
 @dataclass(frozen=True)
@@ -194,3 +214,156 @@ def resolve_hot_pin_plan(
         logger.warning_rank0("--hot-expert-list: 没有任何可钉住的层，本次启动不钉住")
         return None
     return HotPinPlan(pins=pins, num_experts=num_experts, skipped=skipped)
+
+
+def plan_repin_swaps(
+    ema: np.ndarray,
+    pinned: list[list[int]],
+    *,
+    gain: float,
+    max_swaps: int,
+) -> dict[int, list[tuple[int, int]]]:
+    """
+    Business Logic（为什么需要这个函数）:
+        动态重钉的核心判断必须与执行解耦：决策是纯宿主计算（可单测、可解释），
+        才能把"何时换、换谁"的迟滞规则与"如何搬字节"的迁移细节分开演进，也才能
+        在不触碰任何张量的情况下验证防抖语义。
+
+    Code Logic（这个函数做什么）:
+        逐层比较 EMA 热度 top-K 与当前钉住集：候选 = EMA 前 K 名中不在钉住集的
+        冷专家（按 EMA 降序、平局小 id）；受害 = 钉住集中 EMA 计数最低者（升序、
+        平局小 id）。仅当 EMA(候选) >= EMA(受害) × gain 才交换（迟滞防抖）——候选
+        与受害各自按序推进，首个不满足即终止（后续候选更冷、受害不会更冷，必然
+        全不满足）；EMA 为 0 的候选不参与（零热度不构成"更热"证据）。每层最多
+        max_swaps 对。返回 {layer_id: [(候选, 被替换), ...]}，无迁移的层不出现。
+    """
+    if gain < 1.0:
+        raise ValueError(f"gain 必须 >= 1.0（迟滞下限），实际为 {gain}")
+    if max_swaps < 1:
+        raise ValueError(f"max_swaps 必须 >= 1，实际为 {max_swaps}")
+    if ema.ndim != 2 or ema.shape[0] != len(pinned):
+        raise ValueError(f"ema 形状 {ema.shape} 与钉住层数 {len(pinned)} 不一致")
+    plan: dict[int, list[tuple[int, int]]] = {}
+    for layer_id, pins in enumerate(pinned):
+        count = len(pins)
+        if count == 0:
+            continue
+        row = ema[layer_id]
+        num_experts = row.shape[0]
+        # 全序：EMA 降序、平局取小 id（与选点工具 select_pins 同一规则）
+        order = sorted(range(num_experts), key=lambda e: (-row[e], e))
+        # 候选：EMA 前 K 名中的当前冷专家（不在钉住集 ⟺ 在冷集）
+        candidates = [e for e in order[:count] if e not in set(pins)]
+        # 受害排序：钉住专家按 EMA 升序、平局小 id（最冷者优先被替换）
+        victims = sorted(pins, key=lambda e: (row[e], e))
+        swaps: list[tuple[int, int]] = []
+        vi = 0
+        for cand in candidates:
+            if len(swaps) >= max_swaps or vi >= len(victims):
+                break
+            cand_ema = float(row[cand])
+            if cand_ema <= 0.0:
+                break  # 候选按 EMA 降序，其后必然同样为零热度
+            victim = victims[vi]
+            if cand_ema < float(row[victim]) * gain:
+                break  # 迟滞未过线：后续候选更冷、受害不变，必然同样不过线
+            swaps.append((cand, victim))
+            vi += 1
+        if swaps:
+            plan[layer_id] = swaps
+    return plan
+
+
+class HotExpertRepinManager:
+    """动态重钉管理器：周期触发窗口决策并在 idle 安全点执行行级迁移（设计 §10）。
+
+    由 engine 在钉住装配完成时挂到 ``OffloadMoeCache.repin_manager``；scheduler 在
+    ``_execute_pending_rebuild`` 同一个 idle 安全点调用 :meth:`maybe_repin`。
+    """
+
+    def __init__(
+        self,
+        cache: OffloadMoeCache,
+        hotness: ExpertHotness,
+        *,
+        interval_s: float,
+        gain: float,
+        max_swaps: int,
+    ) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            重钉的触发节奏、迟滞与上限是用户可调的三个独立旋钮；把它们与 cache/
+            hotness 的绑定收敛到一个管理器对象，scheduler 只需要一次 getattr 触发，
+            不感知决策与迁移细节。
+
+        Code Logic（这个函数做什么）:
+            校验参数（interval_s > 0、gain >= 1.0、max_swaps >= 1）后保存 cache、
+            窗口计数器与三旋钮；初始化上次触发墙钟（首个窗口需 interval_s 填充，
+            之前的触发会被 has_window 门挡住）。
+        """
+        if interval_s <= 0:
+            raise ValueError(f"--hot-expert-repin-interval-s 必须 > 0，实际为 {interval_s}")
+        if gain < 1.0:
+            raise ValueError(f"--hot-expert-repin-gain 必须 >= 1.0（迟滞下限），实际为 {gain}")
+        if max_swaps < 1:
+            raise ValueError(f"--hot-expert-repin-max-swaps 必须 >= 1，实际为 {max_swaps}")
+        self._cache = cache
+        self._hotness = hotness
+        self._interval_s = float(interval_s)
+        self._gain = float(gain)
+        self._max_swaps = int(max_swaps)
+        self._last = time.monotonic()
+
+    def maybe_repin(self, now: float | None = None) -> bool:
+        """
+        Business Logic（为什么需要这个函数）:
+            scheduler 的 idle 安全点每迭代都会到达，但重钉只能在"墙钟到点 && 已有
+            完整热度窗口 && 确有迁移"三者同时成立时执行；执行前必须同步全部流，
+            保证没有在途 GEMM/CPU GEMV/未完成 prefill chunk 读着即将改写的字节。
+
+        Code Logic（这个函数做什么）:
+            墙钟未到 interval_s 直接返回 False；到点即刷新（失败也不立刻重试，
+            下一个窗口再看）。无完整窗口/无钉住时返回 False。否则取 EMA 与当前
+            钉住集（GPU → host 一次拷贝）跑 plan_repin_swaps；有迁移先在 CUDA 设备
+            上 torch.cuda.synchronize 做安全栅栏，再逐层 swap_pinned_experts 执行，
+            最后打一条汇总日志（层、换入/换出对、计数比、耗时）并返回 True。
+            now 参数仅供测试注入时钟。
+        """
+        now = time.monotonic() if now is None else now
+        if now - self._last < self._interval_s:
+            return False
+        self._last = now
+        if not self._hotness.has_window or self._cache.pin_ids is None:
+            return False
+        ema = self._hotness.ema_counts()
+        plan = plan_repin_swaps(ema, self._cache.pinned_id_lists(), gain=self._gain, max_swaps=self._max_swaps)
+        if not plan:
+            return False
+        t0 = time.perf_counter()
+        if self._cache.device.type == "cuda":
+            # idle 安全点栅栏：所有流同步后无在途 GEMM/CPU GEMV/prefill chunk，
+            # 行级交换的 D2H/H2D 与 host-to-host 写回才不会与读者竞争。
+            torch.cuda.synchronize(self._cache.device)
+        total = 0
+        for layer_id in sorted(plan):
+            swaps = plan[layer_id]
+            self._cache.swap_pinned_experts(layer_id, swaps)
+            total += len(swaps)
+        if self._cache.device.type == "cuda":
+            # 交换后再次同步：行级拷贝是异步的，这里把任何交换期错误就地暴露，
+            # 不让它以异步非法访问的形式归因到后续 forward。
+            torch.cuda.synchronize(self._cache.device)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        detail = "; ".join(
+            "L{}: {} -> {} (ema {:.1f} vs {:.1f}, x{:.2f})".format(
+                layer_id, replaced, cand, ema[layer_id, cand], ema[layer_id, replaced],
+                ema[layer_id, cand] / max(ema[layer_id, replaced], 1e-9),
+            )
+            for layer_id in sorted(plan)
+            for cand, replaced in plan[layer_id]
+        )
+        logger.info_rank0(
+            "dynamic repin: %d expert(s) swapped across %d layer(s) in %.1f ms: %s",
+            total, len(plan), elapsed_ms, detail,
+        )
+        return True

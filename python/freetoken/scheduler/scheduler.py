@@ -155,6 +155,11 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        # 动态重钉（设计文档 §10）：此处是调度器真正泊入空闲的位置（阻塞等待下一条
+        # 消息之前）。重钉由墙钟触发而非消息触发，loop 内的消息驱动 idle 点（下方
+        # _maybe_repin）在纯空闲时不可达——只有这里能保证"无人请求也会按窗口周期
+        # 重钉"。调度器此时无在途 batch，管理器执行前还会做全设备同步栅栏。
+        self._maybe_repin(None)
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -232,6 +237,10 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
+        # 动态重钉：同一个 idle 安全点按滑动窗口热度调整钉住热集（设计文档 §10）。
+        # 管理器内部自判墙钟/窗口就绪，未到点是纯日期比较，热路径开销可忽略。
+        self._maybe_repin(last_data)
+
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
         # engine stream in ``_forward``). Without this, a request that reuses a just-freed
@@ -276,6 +285,9 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+
+        # 动态重钉：同一个 idle 安全点（normal_loop 无未排空 batch，恒传 None）。
+        self._maybe_repin(None)
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -666,6 +678,32 @@ class Scheduler(SchedulerIOMixin):
                 )
             ]
         )
+
+    def _maybe_repin(self, last_data: ForwardData | None) -> None:
+        """idle 安全点的动态重钉触发（设计文档 §10）：与 ``_execute_pending_rebuild``
+        同一位置、同一门控（无待排空 batch、无 pending prefill / running decode）。
+
+        Business Logic（为什么需要这个函数）:
+            重钉要改写钉住槽的字节与映射，必须发生在没有任何 MoE 读者的时刻；
+            rebuild 的执行点正是这样的安全点，重钉搭同一班车，不另设调度约定。
+
+        Code Logic（这个函数做什么）:
+            门控不过直接返回；否则经三层 getattr 取引擎 cache 上的 repin 管理器
+            （与 _process_last_data 的排空钩子同款防御：轻量测试桩可能没有 engine /
+            moe_offload_cache），管理器内部自判墙钟、窗口就绪与迁移必要性。
+        """
+        if last_data is not None or self.prefill_manager.runnable or self.decode_manager.runnable:
+            return
+        repin = getattr(
+            getattr(getattr(self, "engine", None), "moe_offload_cache", None),
+            "repin_manager",
+            None,
+        )
+        if repin is not None:
+            try:
+                repin.maybe_repin()
+            except Exception:  # noqa: BLE001 — 重钉失败不能拖垮调度循环；记录后保当前钉住集继续服务
+                logger.exception("dynamic repin failed; keeping the current pin set")
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

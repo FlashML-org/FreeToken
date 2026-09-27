@@ -50,7 +50,10 @@ class ExpertBanks:
     layout: dict | None = None
     # 冷压缩行映射 [num_layers, num_experts] int32（CPU 张量）：pinned 专家 -> -1，
     # 冷专家 -> 其冷行号（该层冷专家按 id 升序的序号）。未启用钉住时为 None。
-    # 每层 bank 行数为 [num_experts - K_l, *row]，行号 == cold_row 值。
+    # 每层 bank 行数为 [num_experts - K_l, *row]，行号 == cold_row 值。行身份在
+    # 动态重钉（设计 §10）时经 OffloadMoeCache.swap_pinned_experts 原地翻转
+    # （被替换钉住行写回候选的旧冷行，cold_row 对应项随映射同步更新）；除该 idle
+    # 安全点外 bank 行内容加载后只读（并发约定见 host_banks 模块 docstring）。
     cold_row: torch.Tensor | None = field(default=None)
 
 

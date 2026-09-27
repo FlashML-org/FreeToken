@@ -778,6 +778,44 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hot-expert-repin-interval-s",
+        type=float,
+        metavar="T",
+        default=ServerArgs.hot_expert_repin_interval_s,
+        help=(
+            "Dynamic repinning (requires --hot-expert-list): every T seconds of "
+            "wall-clock, drain the expert-hotness counters into a sliding window, "
+            "smooth it with an EMA (half-life = window length) and swap pinned experts "
+            "whose EMA count no longer justifies their slot. Swaps run only at fully "
+            "idle safe points (no in-flight prefill/decode), move at most one bank row "
+            "per expert and are CUDA-graph safe (tensor values only, shapes fixed). "
+            "0 (default) disables repinning; with T > 0 the hotness counters turn on "
+            "automatically even without --hot-stats-out."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-repin-gain",
+        type=float,
+        default=ServerArgs.hot_expert_repin_gain,
+        help=(
+            "Dynamic repinning hysteresis: a cold candidate replaces a pinned expert "
+            "only when its EMA count is >= gain times the incumbent's (default 1.5); "
+            "higher values make the hot set stickier."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-repin-max-swaps",
+        type=int,
+        default=ServerArgs.hot_expert_repin_max_swaps,
+        help=(
+            "Dynamic repinning cap: at most this many expert swaps per layer per "
+            "window (default 8), bounding the PCIe traffic of one repin cycle."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",
