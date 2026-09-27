@@ -53,7 +53,7 @@ NVMe checkpoint（真源，只读）
   `counts.index_add_(0, topk_ids.flatten() + layer_id * num_experts, ones_like)`。
   - 固定 shape、无同步 → **CUDA graph 可捕获**（whole-graph replay 时同一 op 重复累加，语义正确）。
   - 仅当 `hot_stats_out` 配置时启用；未配置时零开销（不进入前向路径）。
-- **排空与落盘**：无每步同步。宿主侧周期钩子放在 `Scheduler._process_last_data`（每 loop 迭代调用，`scheduler.py:419-428`）：按墙钟时间间隔（默认 60s，`--hot-stats-interval-s`）做一次 `counts.cpu()` 累加到宿主数组（98 KB D2H，可忽略）。`atexit` + 信号安全起见在最终 flush 时写 JSON。
+- **排空与落盘**：无每步同步。宿主侧周期钩子放在 `Scheduler._process_last_data`（每 loop 迭代调用，`scheduler.py:419-428`）：按墙钟时间间隔（默认 60s，`--hot-stats-interval-s`）做一次 `counts.cpu()` 累加到宿主数组（98 KB D2H，可忽略），**每次排空顺带原子写一次 JSON**（tmp + `os.replace`）——崩溃/SIGKILL 最多丢一个间隔的统计。`Scheduler.shutdown()` 在 CUDA 仍健康时显式 `save()` 收口（此时设备排空保证成功）；`atexit` 兜底时 device 排空是 best-effort（解释器退出阶段 CUDA 上下文可能已失效，失败则退回宿主累计照常写盘，实测该路径曾因强制 `counts.cpu()` 丢掉整场统计，见 6fb25ee）。
 - **文件 schema**（统计 → 选点的契约）：
   ```json
   {"schema_version": 1,
