@@ -106,6 +106,9 @@ def test_attention_groups(monkeypatch) -> None:
     assert linear.num_key_heads == 16 and linear.num_value_heads == 48
     assert linear.key_head_dim == 128 and linear.value_head_dim == 128
     assert linear.conv_kernel_dim == 4
+    # The GDN output gate is the architecture's sigmoid, not hidden_act (silu, which is only
+    # the MoE activation); the GGUF carries no KV for it.
+    assert linear.output_gate == "sigmoid"
 
 
 def test_qwen4_args(monkeypatch) -> None:

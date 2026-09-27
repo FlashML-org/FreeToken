@@ -101,6 +101,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     hc_lowrank = int(g("hyper_connection.low_rank"))
 
     hidden_act = "silu"
+    # The GDN output gate is sigmoid for qwen4exp (HF `output_gate_type`, and llama.cpp's
+    # qwen4exp graph passes GGML_UNARY_OP_SIGMOID). The GGUF has no KV for it, and hidden_act
+    # is the MoE activation, so default to the architecture's gate rather than hidden_act.
+    output_gate = "sigmoid"
     # Text tokens go through mRoPE too (llama.cpp uses ggml_rope_multi with these sections),
     # so the sections must reach the rope rather than being dropped. GGUF stores 4 slots with
     # a trailing zero; the model uses a 3-section table.
@@ -135,7 +139,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         key_head_dim=key_head_dim,
         value_head_dim=value_head_dim,
         conv_kernel_dim=conv_kernel_dim,
-        output_gate=hidden_act,
+        output_gate=output_gate,
     )
     groups = tuple(sorted((full_group, linear_group), key=lambda gp: gp.layer_ids[0]))
 
@@ -683,7 +687,7 @@ def convert_qwen4_exp_to_gguf(model, config: ModelConfig) -> None:
     GDN is built split (``in_proj_qkvz`` packed + ``in_proj_ba`` dense): the checkpoint
     quantizes qkv|z but ships b/a as F32, so they cannot share a packed buffer.
     """
-    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear, GGUFUntiedLMHead
     from freetoken.layers import LinearColParallelMerged
 
     plan = config.gguf_quant_types or {}
@@ -698,7 +702,9 @@ def convert_qwen4_exp_to_gguf(model, config: ModelConfig) -> None:
         )
     lm_head_type = plan.get("lm_head")
     if lm_head_type is not None:
-        model.lm_head = GGUFLinear(config.hidden_size, config.vocab_size, int(lm_head_type), has_bias=False)
+        model.lm_head = GGUFUntiedLMHead(
+            config.hidden_size, config.vocab_size, int(lm_head_type), has_bias=False
+        )
 
     for layer in inner.layers.op_list:
         layer_id = layer._layer_id

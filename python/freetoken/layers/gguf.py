@@ -94,6 +94,24 @@ class GGUFLinear(BaseOP):
         return out
 
 
+class GGUFUntiedLMHead(GGUFLinear):
+    """Packed GGUF LM head for an untied ``output.weight``.
+
+    Owns the prefill last-token gather (the engine reads ``logits[:batch.size]``), which
+    ``ParallelLMHead`` does and a bare ``GGUFLinear`` would drop -- otherwise a prefill
+    samples the first prompt token's distribution instead of the last token's.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return super().forward(x)
+
+
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.
 
@@ -131,4 +149,4 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+__all__ = ["GGUFLinear", "GGUFUntiedLMHead", "GGUFEmbedding", "fused_mul_mat_gguf"]
