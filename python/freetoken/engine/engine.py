@@ -802,7 +802,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
+            # FIXME: the None branch serves the native-GGUF packed banks (q4_0/iq4_nl/iq4_xs/q5_K), which have no quant method yet; drop it once GGUF joins the quant path
             fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
         )
         cache.set_cpu_executor(executor)
@@ -1311,16 +1311,36 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
-def _pin_budget_bytes(reserved: int = 0) -> int | None:
-    """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+def _mem_available_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo (bytes), or None if unreadable."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+
+def _pin_budget_bytes(reserved: int = 0) -> int | None:
+    """Bytes this process can still safely cudaHostRegister, or None when pinning is unbounded.
+
+    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%.
+    Plain Linux has no hard cap, but page-locked banks cannot be reclaimed, so a bank set larger
+    than available RAM takes the host down (OOM); budget 90% of ``MemAvailable`` there so an
+    oversized offload fails with a clear message instead. FREETOKEN_PIN_BUDGET_GB overrides
+    anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks
+    (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
-    else:
+    elif hasattr(os, "uname") and "microsoft" in os.uname().release.lower():  # WSL kernel tag
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+    else:
+        available = _mem_available_bytes()
+        if available is None:
+            return None
+        cap = int(available * 0.9)
     return max(0, cap - reserved)
 
 
@@ -1348,7 +1368,7 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
-            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
+            f"{budget / 2**30:.1f} GiB (FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
         )
 
 
