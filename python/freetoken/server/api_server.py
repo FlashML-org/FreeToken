@@ -446,6 +446,11 @@ def _served_model_name() -> str | None:
     return getattr(cfg, "served_model_name", None)
 
 
+# Bearer token gating the HTTP API; None = auth off (upstream default). Set from
+# ServerArgs.api_key in run_api_server before uvicorn takes over.
+_API_KEY: str | None = None
+
+
 @app.middleware("http")
 async def _record_request_middleware(request: Request, call_next):
     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
@@ -478,6 +483,33 @@ async def _record_request_middleware(request: Request, call_next):
         )
     )
     return response
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """Reject non-health requests unless they carry Authorization: Bearer <api_key> when a
+    key is configured. Registered after _record_request_middleware, so LIFO order runs this
+    gate first and unauthorized probes never reach the request ring. /health stays open so
+    orchestrators can poll readiness without the token."""
+    if _API_KEY is None or request.url.path == "/health":
+        return await call_next(request)
+    import hmac
+
+    from fastapi.responses import JSONResponse
+
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, _API_KEY):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "Invalid or missing API key. Pass Authorization: Bearer <key>.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+    return await call_next(request)
 
 
 class CacheRebuildRequest(BaseModel):
@@ -931,7 +963,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         run_shell: If True, also attach the interactive terminal shell to the served API.
     """
 
-    global _GLOBAL_STATE, _MODEL_SAMPLING
+    global _GLOBAL_STATE, _MODEL_SAMPLING, _API_KEY
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
@@ -950,6 +982,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     host = config.server_host
     port = config.server_port
+    _API_KEY = config.api_key
 
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
