@@ -84,3 +84,7 @@ stops with a clear error instead of OOM-crashing the host.
 - CPU/hybrid MoE only supports single-type (non-composite) expert formats.
 - `moe/bench_profile.py` / `benchbw.py` have no entries for the new formats, so
   `--moe-strategy auto` stays on GPU offload unless overridden.
+- CPU Q5_K GEMV recomputes the per-32 activation sum inside every output-row dot
+  (`cpu_moe_ext.cpp: gguf_asum32`), so it does ~`2I + H` redundant sums per token/route.
+  Precomputing the sums in the activation-quantization pass would remove it; left undone
+  because it changes the W4A8 dot signature and needs A/B numbers.
