@@ -192,6 +192,10 @@ class CpuMoeExecutor:
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        # 显存钉住的冷行映射（--hot-expert-list；None = 不钉住）：CPU GEMV 按专家 id
+        # 直读 bank 行，而冷压缩 bank 的行号是冷行号，所以发往 CPU 的专家 id 要先经
+        # cold_row 重映射（钉住层恒命中、不会发往 CPU；CPU 解码层无钉住、映射恒等）。
+        self.cold_row = getattr(cache, "cold_row", None)
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
@@ -567,8 +571,15 @@ class CpuMoeExecutor:
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
         # D2H: ship this step's activations + routing to pinned host memory.
+        # 显存钉住：先把专家 id 经 cold_row 重映射为冷压缩 bank 的行号（C++ GEMV 按
+        # id × 行宽直读行）。-1（GPU 负责的路由）原样保留；固定 shape、无 host 同步，
+        # CUDA graph 可捕获。CPU 解码层的 cold_row 行是恒等映射，此处无代价直通。
+        if self.cold_row is not None:
+            cold = self.cold_row[layer_id]
+            safe = topk_ids.clamp(min=0).long()
+            topk_ids = torch.where(topk_ids >= 0, cold[safe], topk_ids).to(torch.int32)
         io["x"].copy_(hidden_states, non_blocking=True)
-        io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
+        io["ids"].copy_(topk_ids, non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         task = self._task_for(layer_id, bs)

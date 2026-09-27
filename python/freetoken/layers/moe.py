@@ -235,6 +235,9 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        cache = self.offload_cache
+        if cache is not None and cache.hotness is not None:
+            cache.hotness.record(self.layer_id, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -248,6 +251,9 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        cache = self.offload_cache
+        if cache is not None and cache.hotness is not None:
+            cache.hotness.record(self.layer_id, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -372,6 +378,8 @@ class OffloadMoELayer(MoELayer):
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
+        # 显存钉住：materialize_layer 已把钉住权重 D2D 安装进 [0, E) 暂存位，prefill
+        # GEMM 保持原始形态（position == 专家 id、views 取前 E 行、n=E）。
         return self._expert_gemm(
             cache,
             hidden_states,

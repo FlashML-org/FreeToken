@@ -310,6 +310,15 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        # Periodic drain of the expert-hotness collector, gated by wall time inside
+        # maybe_flush (cheap no-op between intervals). Runs before the early return so
+        # idle loops still flush; this stream is ordered after the engine stream here,
+        # so the D2H read never races the in-flight decode graph's index_add_.
+        # 双层 getattr：真实 Scheduler 恒有 engine；轻量测试桩可能两者皆无
+        engine = getattr(self, "engine", None)
+        cache = getattr(engine, "moe_offload_cache", None)
+        if cache is not None and cache.hotness is not None:
+            cache.hotness.maybe_flush()
         if last_data is None:
             return
 

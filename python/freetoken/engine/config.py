@@ -63,6 +63,23 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Expert-routing hotness collection (offload family): when set, every MoE layer
+    # accumulates its raw routing ids into a device-side counter and the scheduler
+    # drains it to the host every hot_stats_interval_s (+ at exit), writing the
+    # per-(layer, expert) histogram JSON consumed by the pin-selection tool.
+    hot_stats_out: str | None = None
+    # Wall-clock seconds between host-side drains of the hotness counters.
+    hot_stats_interval_s: float = 60.0
+    # 显存钉住热点专家：--hot-expert-list 指向 pin list JSON（选点工具
+    # `python -m freetoken.hotness select -o` 的输出）；或配合 hot_expert_slots 指向
+    # --hot-stats-out 格式的热度统计 JSON，由引擎在加载期内部选每层 top-K。设置后每层
+    # top-K 专家在加载期单副本常驻显存 slot cache 顶部区（不参与 LRU 驱逐），host bank
+    # 只装其余冷专家。两者都未设置时行为与不钉住完全一致。
+    hot_expert_list: str | None = None
+    # 每层钉住槽位数 K：设置后 hot_expert_list 按 stats 文件解读并内部选点
+    # （复用 hotness/select.py 的 select_pins）；未设置时 hot_expert_list 必须已是
+    # pin list JSON。
+    hot_expert_slots: int | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

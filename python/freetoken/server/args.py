@@ -725,6 +725,59 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hot-stats-out",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.hot_stats_out,
+        help=(
+            "Collect per-(MoE layer, expert) routing-hotness counts into this JSON file "
+            "(offload family only). Counters accumulate on-device (CUDA-graph safe); the "
+            "scheduler drains them to the host every --hot-stats-interval-s and at exit. "
+            "The file feeds the hot-expert pin-selection tool."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-stats-interval-s",
+        type=float,
+        default=ServerArgs.hot_stats_interval_s,
+        help=(
+            "Wall-clock seconds between host-side drains of the --hot-stats-out hotness "
+            "counters."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-list",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.hot_expert_list,
+        help=(
+            "Pin each MoE layer's top-K hot experts into the GPU slot cache (offload "
+            "family only). FILE is either a pin list JSON written by "
+            "`python -m freetoken.hotness select -o`, or -- with --hot-expert-slots -- "
+            "a hotness stats JSON (--hot-stats-out format) to pick from internally at "
+            "load time. Pinned experts stay single-copy resident in VRAM (never "
+            "LRU-evicted, never swapped over PCIe) and the host banks hold only the "
+            "remaining cold experts. Requires --disable-moe-prefill-overlap in v1 "
+            "(prefill overlap is rejected at startup when pinning is on)."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-slots",
+        type=int,
+        metavar="K",
+        default=ServerArgs.hot_expert_slots,
+        help=(
+            "With --hot-expert-list pointing at a hotness stats JSON: pin K experts per "
+            "layer, selected internally at load time with the selection tool's rule "
+            "(count descending, ties to the lower id). Without it, --hot-expert-list "
+            "must already be a pin list JSON and this flag must stay unset."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

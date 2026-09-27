@@ -24,7 +24,15 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
+
+    显存钉住（cache.pin_ids 非空）时改走合并查询：钉住 id 拼进同一次 query 尾部，
+    phase1 命中把钉住槽 usage 刷成当前 step，flashlib 的 "usage == step 不可驱逐"
+    语义逐调用自我续期，钉住专家因此永驻显存（flashlib 零改动）。钉住是命中，不产生
+    copy 计划项；与冷专家重复时 phase1 去重折叠到同一槽。
     """
+    if cache.pin_ids is not None:
+        _ensure_experts_pinned(cache, layer_id, expert_ids)
+        return
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
@@ -38,6 +46,62 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
     )
+
+
+def _ensure_experts_pinned(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """钉住模式下的 flashlib 合并查询（零 flashlib 改动）。
+
+    Business Logic（为什么需要这个函数）:
+        bank 冷压缩后 host 只装冷专家，钉住专家的行无处可取；必须让钉住槽对
+        flashlib 永远表现为"刚命中"，唯一手段是把钉住 id 附加进每次 lru_ensure
+        的 query——这是 offload 路径钉住的全部机制。
+
+    Code Logic（这个函数做什么）:
+        取 (num_route_ids) 键的固定合并缓冲 comb，comb[:n] = 路由专家 id、
+        comb[n:] = 本层钉住 id（层内钉住数为 0 时无附加段），以 comb 为 query 调
+        lru_ensure（out 别名 comb 原地），再把前 n 个 slot id 写回 expert_ids；
+        最后把 src_indices 经 cold_row 重映射为冷行号（copy_missing 的取行索引，
+        num_indices 之外的垃圾项 remap 无害——fused copy 按设备侧长度读取）。
+        全程固定 shape、无 host 同步，CUDA graph 可捕获。
+    """
+    n = expert_ids.numel()
+    comb = cache.pin_query_buffer(n)
+    k = int(cache.pin_counts[layer_id])
+    comb[:n].copy_(expert_ids.view(-1))
+    if k:
+        comb[n : n + k].copy_(cache.pin_ids[layer_id, :k])
+    lru_ensure(
+        comb,
+        cache.slot_for_id.view(-1),
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        comb,
+        cache.src_indices,
+        cache.evict_slots,
+        cache.num_indices,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        id_base=layer_id * cache.num_experts,
+    )
+    expert_ids.copy_(comb[:n].view_as(expert_ids))
+    if cache.cold_row is not None:
+        remap_src_indices_to_cold_rows(cache, layer_id)
+
+
+def remap_src_indices_to_cold_rows(cache, layer_id: int) -> None:
+    """
+    Business Logic（为什么需要这个函数）:
+        lru_ensure 产出的 src_indices 是层内专家 id，而冷压缩 bank 的行号是冷行号；
+        copy_missing 取行前必须经 cold_row 重映射，否则会从错行拷贝权重。
+
+    Code Logic（这个函数做什么）:
+        固定 shape 设备侧 gather：src = cold_row[layer][clamp(src, 0, E-1)]。
+        num_indices 之外的垃圾项被夹进合法范围后重映射为何值都无影响（fused copy
+        只读前 num_indices 项）；CUDA graph 可捕获。hybrid/materialize 路径的
+        kernel 直接写冷行号，不经过本函数（避免双重映射）。
+    """
+    row = cache.cold_row[layer_id]
+    cache.src_indices.copy_(row[cache.src_indices.clamp(0, cache.num_experts - 1).long()])
 
 
 def ensure_experts_hybrid(
@@ -56,7 +120,12 @@ def ensure_experts_hybrid(
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        has_pins = cache.pin_ids is not None
+        return _ensure_experts_hybrid_cpu(
+            cache, layer_id, expert_ids, max_fetch, frac_q16,
+            pin_base=cache.pin_base if has_pins else None,
+            cold_row=None if cache.cold_row is None else cache.cold_row[layer_id],
+        )
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
@@ -100,6 +169,7 @@ def _ensure_experts_hybrid_gpu(
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
+    has_pins = cache.pin_ids is not None
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -112,6 +182,10 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        # 钉住：冷行映射（HAS_PINS=False 时不解引用，传任意 int32 张量占位）+
+        # 受害槽排除区起点（无钉住时 = cache_size，排除为空）
+        cache.cold_row if has_pins else expert_ids,
+        cache.pin_base if has_pins else cache.cache_size,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -121,18 +195,25 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        HAS_PINS=has_pins,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    pin_base: int | None = None, cold_row: torch.Tensor | None = None,
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
     the bandwidth-matched ``~frac_q16/2^16 * misses`` when ``frac_q16`` > 0) of the missing
     experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
-    most-recently-active misses (ties -> lower id); else the lowest ids."""
+    most-recently-active misses (ties -> lower id); else the lowest ids.
+
+    显存钉住镜像参数：``pin_base`` 给定时受害槽扫描只考虑 ``[0, pin_base)``（顶部钉住区
+    不可驱逐，对应 GPU kernel 的 ``off_c >= pin_base`` 排除）；``cold_row`` 给定时
+    ``src_indices`` 写冷行号（对应 GPU kernel 的 cold_map load）。二者缺省 None 时
+    行为与不钉住完全一致。"""
     seen = []
     for expert in expert_ids.view(-1).tolist():
         if expert not in seen:
@@ -165,9 +246,10 @@ def _ensure_experts_hybrid_cpu(
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
+    victim_limit = cache.cache_size if pin_base is None else pin_base
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        victim = min(range(victim_limit), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -176,7 +258,10 @@ def _ensure_experts_hybrid_cpu(
         cache.usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
-        cache.src_indices[idx] = expert  # layer-local row
+        if cold_row is not None:
+            cache.src_indices[idx] = int(cold_row[expert].item())  # 冷压缩 bank 行
+        else:
+            cache.src_indices[idx] = expert  # layer-local row
 
     if _HYBRID_FETCH_BY_RECENCY:
         for expert in seen:
@@ -190,6 +275,7 @@ def _ensure_experts_hybrid_cpu(
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
+    has_pins = cache.pin_ids is not None
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
         cache.id_of_slot,
@@ -198,10 +284,14 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         cache.evict_slots,
         cache.src_indices,
         cache.num_indices,
+        # 钉住：槽位排除区起点与冷行映射（HAS_PINS=False 时不解引用 cold_map）
+        cache.pin_base if has_pins else cache.cache_size,
+        cache.cold_row if has_pins else cache.slot_for_id,
         layer_id,
         cache.num_experts,
         cache.cache_size,
         BLOCK=block,
+        HAS_PINS=has_pins,
     )
 
 
@@ -246,7 +336,7 @@ def _reset_cache_kernel(
         tl.store(num_indices_ptr, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["pin_base"])
 def _materialize_layer_kernel(
     slot_for_id_ptr,
     id_of_slot_ptr,
@@ -255,11 +345,23 @@ def _materialize_layer_kernel(
     evict_slots_ptr,
     src_indices_ptr,
     num_indices_ptr,
+    pin_base,
+    cold_map_ptr,
     layer_id: tl.constexpr,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_PINS: tl.constexpr,
 ):
+    """整层物化进 slots [0, num_experts)（非 overlap prefill），position == 专家 id。
+
+    显存钉住（HAS_PINS）：冷专家照旧（计划项按冷行号压缩：第 r 个冷专家的计划写在
+    第 r 项，src 即 r，``num_indices = 冷专家数``）；钉住专家不写计划项、不写
+    slot_for_id（其权威槽位在顶部区），其 [0, E) 暂存位的字节由
+    ``OffloadMoeCache.materialize_layer`` 在 kernel 之后 D2D 安装，同时这里把暂存位
+    的 id_of_slot 显式清成 -1、usage 清 0——暂存位必须是"空槽"（陈旧映射会在后续
+    flashlib 驱逐里错误清除别的专家的映射）。清槽阶段只清 ``slot < pin_base`` 的
+    本层槽——顶部钉住槽的映射永不失效。"""
     off = tl.arange(0, BLOCK)
     expert_mask = off < num_experts
     slot_mask = off < cache_size
@@ -268,7 +370,8 @@ def _materialize_layer_kernel(
     base = layer_id * num_experts
     old_id = tl.load(id_of_slot_ptr + slot, mask=slot_mask, other=-1)
     # Flat ids make "belongs to this layer" a range check instead of a field compare.
-    same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
+    # 钉住槽（slot >= pin_base）保持既有映射，不参与本层的清槽。
+    same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts) & (slot < pin_base)
     tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
     tl.store(usage_ptr + slot, 0, mask=same_layer)
 
@@ -277,17 +380,28 @@ def _materialize_layer_kernel(
 
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
-    tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
-    tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
-    tl.store(usage_ptr + slot, step, mask=expert_mask)
-    tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
-    tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
-    tl.store(num_indices_ptr, num_experts)
+    if HAS_PINS:
+        # 冷行号（pinned -> -1）；冷行号同时是 copy 计划的压缩位置
+        cold_rank = tl.load(cold_map_ptr + base + off, mask=expert_mask, other=-1)
+    else:
+        cold_rank = off
+    cold = expert_mask & (cold_rank >= 0)
+    num_cold = tl.sum(cold.to(tl.int32))
+    # 钉住专家的 [0, E) 暂存位交给 D2D 安装字节，映射上必须是空槽
+    pin_pos = expert_mask & (cold_rank < 0)
+    tl.store(id_of_slot_ptr + slot, -1, mask=pin_pos)
+    tl.store(usage_ptr + slot, 0, mask=pin_pos)
+    tl.store(id_of_slot_ptr + slot, base + off, mask=cold)
+    tl.store(slot_for_id_ptr + base + off, slot, mask=cold)
+    tl.store(usage_ptr + slot, step, mask=cold)
+    tl.store(evict_slots_ptr + cold_rank, slot, mask=cold)
+    tl.store(src_indices_ptr + cold_rank, cold_rank, mask=cold)  # 层内冷行
+    tl.store(num_indices_ptr, num_cold)
 
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "pin_base"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -300,6 +414,8 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    cold_map_ptr,
+    pin_base,
     layer_id,
     num_active,
     max_fetch,
@@ -309,6 +425,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    HAS_PINS: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -325,7 +442,12 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    显存钉住（HAS_PINS）：Phase 2 的受害槽扫描排除顶部钉住区（``off_c >= pin_base``，
+    对应 CPU 镜像的 victim_limit）；``src_indices`` 经 ``cold_map_ptr``（cold_row 表）
+    改写为冷压缩 bank 的行号。钉住专家 ``slot_for_id`` 已预填，Phase 1 恒命中——
+    永不进入 miss 集合，也永不被驱逐。"""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -379,7 +501,9 @@ def _ensure_experts_hybrid_kernel(
         for i in tl.range(num_active):
             ei = tl.load(expert_ids_ptr + i)
             owner_active = owner_active | (oid == base + ei)
-        u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
+        # 顶部钉住区（off_c >= pin_base）不在受害候选之列；无钉住时 pin_base ==
+        # cache_size，该排除为空。
+        u = tl.where(owner_active | (~c_mask) | (off_c >= pin_base), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
@@ -394,7 +518,11 @@ def _ensure_experts_hybrid_kernel(
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
+            if HAS_PINS:
+                # 冷压缩 bank 的行号（miss 不含钉住专家，cold_row 必 >= 0）
+                tl.store(src_indices_ptr + i, tl.load(cold_map_ptr + base + e))
+            else:
+                tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----

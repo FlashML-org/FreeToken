@@ -18,7 +18,7 @@ import torch
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
-from .host_banks import alloc_layer_banks
+from .host_banks import alloc_layer_banks  # noqa: F401  (converter tooling allocates uniform banks through it)
 from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
@@ -48,6 +48,10 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # 冷压缩行映射 [num_layers, num_experts] int32（CPU 张量）：pinned 专家 -> -1，
+    # 冷专家 -> 其冷行号（该层冷专家按 id 升序的序号）。未启用钉住时为 None。
+    # 每层 bank 行数为 [num_experts - K_l, *row]，行号 == cold_row 值。
+    cold_row: torch.Tensor | None = field(default=None)
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -75,6 +79,8 @@ def build_expert_banks(
     device: torch.device,
     layer_sink=None,
     dummy: bool = False,
+    pin_sets: dict[int, list[int]] | None = None,
+    pin_sink=None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -83,20 +89,73 @@ def build_expert_banks(
     complete once its ``num_experts`` rows have arrived: with ``layer_sink=None`` its banks
     are pinned in the background, otherwise the sink receives them (converter). ``dummy``
     skips the pieces and fills the banks with finite random contents.
+
+    ``pin_sets``（显存钉住，v1）: ``{layer_id -> 按热度序的钉住专家 id 列表}``。命中的层
+    冷压缩：bank 只有 ``[E - K_l, *row]`` 行，行号 = 冷行号（冷专家按 id 升序压缩）；钉住
+    专家的权重改为 pack 进 ``[K_l, *row]`` 的 per-layer host 暂存。该层全部行读完后以
+    ``pin_sink(layer_id, {role: 暂存})`` 一次性移交（sink 必须在返回前完成 H2D 或持有一份
+    拷贝——暂存随调用结束释放，host 峰值占用 ≤ 单层钉住字节）。钉住 piece 仍会被读盘
+    （reader 按范围整段吐出），这是 v1 接受的 IO 浪费，v2 可在读取层过滤。返回的
+    ``ExpertBanks.cold_row`` 为 ``[L, E] int32``（pinned -> -1）。``layer_sink`` 与
+    ``pin_sets`` 互斥（converter 不参与钉住）。
     """
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
+    from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
+
+    if layer_sink is not None and pin_sets:
+        raise ValueError("expert bank converter (layer_sink) 与显存钉住 (pin_sets) 互斥")
 
     kernel = method.kernel
     layout = method.layout()
     E = method.cfg.num_experts
+    pin_counts = [len((pin_sets or {}).get(l, ())) for l in range(num_layers)]
+    for layer_id, experts in (pin_sets or {}).items():
+        if not 0 <= layer_id < num_layers:
+            raise ValueError(f"pin 层号越界: {layer_id} (num_layers={num_layers})")
+        if len(set(experts)) != len(experts) or any(not 0 <= e < E for e in experts):
+            raise ValueError(f"layer {layer_id} 的钉住专家 id 非法/重复: {experts}")
+        if len(experts) >= E:
+            raise ValueError(
+                f"layer {layer_id} 的钉住数 {len(experts)} 必须小于专家数 {E}（冷 bank 至少 1 行）"
+            )
+    # 冷行映射只建一次，两条路径（dummy / pieces）共用
+    cold_row = _cold_row_from_pin_sets(pin_sets, num_layers, E)
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
-    hb = alloc_layer_banks(specs, num_layers)
+    hb = {
+        role: [
+            # 冷压缩：钉住层的 bank 只有 E-K 行（行号 = cold_row），其余层保持全量 E 行
+            HostBank((E - pin_counts[l], *shape[1:]), dtype)
+            for l in range(num_layers)
+        ]
+        for role, (shape, dtype) in specs.items()
+    }
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
     }
+    # per-layer 钉住暂存：host 峰值 ≤ 单层钉住字节（每层移交 pin_sink 后即释放）
+    pin_stage: dict[int, dict[str, torch.Tensor]] = {}
+    pin_read: dict[int, int] = {}
+
+    def _pin_stage_for(layer_id: int) -> dict[str, torch.Tensor]:
+        """取（惰性建）该层的钉住暂存 {role: [K_l, *row]}，并清零其已读行计数。"""
+        stage = pin_stage.get(layer_id)
+        if stage is None:
+            k = pin_counts[layer_id]
+            stage = {
+                role: torch.empty((k, *shape[1:]), dtype=dtype)
+                for role, (shape, dtype) in specs.items()
+            }
+            pin_stage[layer_id] = stage
+            pin_read[layer_id] = 0
+        return stage
+
+    def _release_pin_stage(layer_id: int) -> None:
+        """该层全部行读毕：把钉住暂存一次性移交 pin_sink 后丢弃（host 峰值 ≤ 单层钉住字节）。"""
+        stage = pin_stage.pop(layer_id)
+        if pin_sink is not None:
+            pin_sink(layer_id, stage)
 
     if dummy:
         for role, per_layer in banks.items():
@@ -104,12 +163,18 @@ def build_expert_banks(
                 _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
+        for layer_id in range(num_layers):
+            if pin_counts[layer_id]:
+                stage = _pin_stage_for(layer_id)
+                for role, tensor in stage.items():
+                    _dummy_fill(role, tensor)
+                _release_pin_stage(layer_id)
         if torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), banks,
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-            kind=method.kind, kernel=kernel.name, layout=layout,
+            kind=method.kind, kernel=kernel.name, layout=layout, cold_row=cold_row,
         )
 
     def _fill(sink) -> None:
@@ -123,16 +188,30 @@ def build_expert_banks(
             if written[layer_id, e0:e1].any():
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
             written[layer_id, e0:e1] = 1
-            out = {role: banks[role][layer_id][e0:e1] for role in specs}
-            got = method.pack(piece, out)
-            for role, values in got.items():
-                alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
+            layer_pins = set((pin_sets or {}).get(layer_id, ()))
+            pin_list = (pin_sets or {}).get(layer_id) or []
+            # 冷压缩 pack：把 [e0, e1) 切成极大冷专家连续段，逐段 pack 进对应冷行区间；
+            # 钉住专家单独成段 pack 进 per-layer 暂存（cold_row 对钉住专家为 -1，不占冷行）。
+            # 暂存行序 == pin list 顺序（slot 分配按同一序号）。
+            runs = _split_cold_runs(e0, e1, layer_pins)
+            for a, b in runs:
+                out, src_piece = _run_views(a, b, e0, piece, banks, layer_id, pin_list, _pin_stage_for)
+                got = method.pack(src_piece, out)
+                for role, values in got.items():
+                    alphas[role][layer_id * E + a : layer_id * E + b] = values.to(alphas[role].dtype)
             if tracker is not None:
                 for _ in range(e1 - e0):
                     tracker.note(layer_id)
+            if pin_counts[layer_id]:
+                pin_read[layer_id] = pin_read.get(layer_id, 0) + (e1 - e0)
+                if pin_read[layer_id] == E:
+                    _release_pin_stage(layer_id)
         missing = (written == 0).nonzero().tolist()
         if missing:
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
+        # 暂存未移交 = 该层行没读全却提前结束（上面 missing 已兜底）或 sink 缺失
+        if pin_stage and pin_sink is None:
+            raise ValueError("pin_sets 给定但 pin_sink 缺失：钉住权重无处移交")
 
     if layer_sink is not None:
         _fill(layer_sink)
@@ -146,7 +225,81 @@ def build_expert_banks(
         legacy_format_for(method.kind, kernel.name), banks,
         gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
         streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
+        cold_row=cold_row,
     )
+
+
+def _cold_row_from_pin_sets(pin_sets: dict[int, list[int]] | None, num_layers: int, num_experts: int) -> torch.Tensor:
+    """
+    Business Logic（为什么需要这个函数）:
+        build_expert_banks 的冷压缩行号与 OffloadMoeCache 的 remap/materialize 语义
+        必须同源；hot_pin.cold_row_from_pins 是该语义的唯一实现，这里只做薄封装，
+        避免两套手写映射漂移。
+
+    Code Logic（这个函数做什么）:
+        把 {layer -> 钉住 id 列表} 还原成 [num_layers][K] 矩形输入（缺失层补空），
+        调用 freetoken.moe.hot_pin.cold_row_from_pins 得到 [L, E] int32（pinned -> -1）。
+        没有任何钉住项（pin_sets 为 None 或全空）时返回 None——ExpertBanks.cold_row
+        为 None 即"未启用钉住"的契约标记。
+    """
+    from freetoken.moe.hot_pin import cold_row_from_pins
+
+    pins = [list((pin_sets or {}).get(l, ())) for l in range(num_layers)]
+    if not any(pins):
+        return None
+    return cold_row_from_pins(pins, num_experts)
+
+
+def _split_cold_runs(e0: int, e1: int, layer_pins: set[int]) -> list[tuple[int, int]]:
+    """
+    Business Logic（为什么需要这个函数）:
+        pack 契约要求目标行区间连续；冷压缩后钉住专家在专家 id 轴上挖出空洞，
+        必须把 piece 切成极大冷专家连续段与单专家钉住段，段内 (源行, 目标行)
+        才能保持等宽直线拷贝。
+
+    Code Logic（这个函数做什么）:
+        扫描 [e0, e1)：冷专家归入极大连续段 (a, b)；钉住专家自成单元素段
+        (e, e+1)（pack 进钉住暂存）。无钉住时返回单一 (e0, e1)，与既有行为完全一致。
+    """
+    if not layer_pins:
+        return [(e0, e1)]
+    runs: list[tuple[int, int]] = []
+    a = None
+    for e in range(e0, e1):
+        if e in layer_pins:
+            if a is not None:
+                runs.append((a, e))
+                a = None
+            runs.append((e, e + 1))
+        elif a is None:
+            a = e
+    if a is not None:
+        runs.append((a, e1))
+    return runs
+
+
+def _run_views(a: int, b: int, e0: int, piece, banks, layer_id: int, pin_list: list[int], pin_stage_for) -> tuple[dict, dict]:
+    """
+    Business Logic（为什么需要这个函数）:
+        一段专家连续段的 pack 目标（bank 冷行区间或钉住暂存行）与源（piece 行区间）
+        必须逐 role 对齐；pack 契约要求目标行连续，所以段拆分（_split_cold_runs）
+        与这里的目标视图必须配套。
+
+    Code Logic（这个函数做什么）:
+        钉住段（a 为钉住专家，单元素段）：返回钉住暂存的第 j 行（j = a 在 pin list
+        中的序数——与 slot 顶部区的分配序号一致）。冷段 (a, b)：返回 ({role: bank 冷行
+        区间 [cold_before : cold_before + 段长]}, {role: piece 对应行区间})，
+        cold_before = a 之前冷专家个数（冷行号按 id 升序压缩，段内连续）。
+    """
+    if a in set(pin_list):
+        stage = pin_stage_for(layer_id)
+        # 段内只会有单个钉住专家（_split_cold_runs 的钉住段都是单元素）
+        j = pin_list.index(a)
+        return ({role: tensor[j : j + (b - a)] for role, tensor in stage.items()},
+                {role: values[a - e0 : b - e0] for role, values in piece.items()})
+    cold_before = a - sum(1 for e in pin_list if e < a)
+    return ({role: per_layer[layer_id][cold_before : cold_before + (b - a)] for role, per_layer in banks.items()},
+            {role: values[a - e0 : b - e0] for role, values in piece.items()})
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -192,16 +345,16 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, pin_sets=None, pin_sink=None) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
     if dummy:
-        return build_expert_banks(method, num_layers, None, device=device, dummy=True)
+        return build_expert_banks(method, num_layers, None, device=device, dummy=True, pin_sets=pin_sets, pin_sink=pin_sink)
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, pin_sets=pin_sets, pin_sink=pin_sink)
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -286,6 +439,8 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    pin_sets: dict[int, list[int]] | None = None,
+    pin_sink=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -310,10 +465,21 @@ def load_expert_banks(
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
+
+    ``pin_sets`` / ``pin_sink``（显存钉住，v1）: 冷压缩构建参数，原样转发给
+    ``build_expert_banks``（语义见其 docstring：钉住层 bank 冷压缩为 ``[E-K, *row]``，
+    钉住权重经 per-layer 暂存移交给 ``pin_sink``，返回 ``ExpertBanks.cold_row``）。
+    仅 method 慢路径支持：FTW 快路径遇到钉住时降级为慢路径并告警（否则 host 无法省下
+    钉住字节）；GGUF q4_0 提供方不支持，直接报错。
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
+    if pin_sets and model_path and is_ftw_checkpoint(model_path) and not dummy:
+        logger.warning_rank0(
+            "--hot-expert-list: FTW 快路径暂不支持冷压缩钉住，改走慢路径逐 piece 打包 "
+            "（加载更慢；host 省下钉住字节的目标不受影响）"
+        )
+    elif model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
@@ -354,7 +520,12 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
+            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, pin_sets, pin_sink)
+        if pin_sets:
+            raise ValueError(
+                "--hot-expert-list 需要走 quant method 的慢路径打包（当前 checkpoint 的专家"
+                "加载器不支持冷压缩钉住；GGUF q4_0 暂不兼容钉住）"
+            )
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 
     with requested_residency(layer_residency) as residency_plan:

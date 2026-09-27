@@ -616,8 +616,12 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
+        num_experts = config.model_config.num_experts
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
+        # 显存钉住（--hot-expert-list[/--hot-expert-slots]）：读取并校验钉住计划，
+        # 剥离 CPU 解码层的钉住项；未配置时为 None，一切行为与现状一致。
+        pin_plan = _resolve_hot_pin_plan(config, num_moe_layers, num_experts, cpu_layer_ids)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -666,6 +670,32 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+        # 钉住装配：loader 侧冷压缩 + per-layer 钉住暂存 sink。sink 只保住一个可复用的
+        # GPU 暂存（峰值 = 单层钉住字节），待 set_bank_sources 建好 slot cache 后一次性
+        # D2D 进顶部区（host 暂存每层移交后即释放，峰值 ≤ 单层钉住字节）。
+        pin_sets = pin_sink = None
+        pin_arena: dict[str, torch.Tensor] | None = None
+        if pin_plan is not None:
+            pin_sets = {
+                layer_id: experts
+                for layer_id, experts in enumerate(pin_plan.pins)
+                if experts
+            }
+            k_arena = max(len(experts) for experts in pin_sets.values())
+
+            def pin_sink(layer_id: int, stage: dict[str, torch.Tensor]) -> None:
+                """单层钉住权重移交点：H2D 进（惰性分配的）可复用 GPU 暂存后立即丢弃 host 暂存。"""
+                nonlocal pin_arena
+                if pin_arena is None:
+                    pin_arena = {
+                        role: torch.zeros(
+                            (k_arena, *tensor.shape[1:]), dtype=tensor.dtype, device=self.device
+                        )
+                        for role, tensor in stage.items()
+                    }
+                for role, tensor in stage.items():
+                    pin_arena[role][: tensor.shape[0]].copy_(tensor)
+
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -678,9 +708,21 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    pin_sets=pin_sets,
+                    pin_sink=pin_sink,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        if pin_plan is not None:
+            # v1 约束：overlap 双缓冲整层 bank 拷贝假设 bank 按专家 id 全量存放，与
+            # 冷压缩不兼容（将由 prefill 三源组装解除）；auto 解算出的 overlap 在此关闭。
+            if config.moe_prefill_overlap:
+                object.__setattr__(config, "moe_prefill_overlap", False)
+                logger.info_rank0(
+                    "--hot-expert-list: disabling MoE prefill overlap (v1 pinning is "
+                    "incompatible with the full-layer double buffer; the three-source "
+                    "prefill assembly will lift this)"
+                )
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)
@@ -726,13 +768,58 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        # 钉住时各层 bank 行数 = E - K_l（冷压缩），传给形状校验
+        per_layer_rows = (
+            [num_experts - len(experts) for experts in pin_plan.pins] if pin_plan is not None else None
+        )
+        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, per_layer_rows=per_layer_rows)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if pin_plan is not None:
+            if banks.cold_row is None:
+                raise RuntimeError(
+                    "--hot-expert-list: bank loader ignored the pin sets (no cold_row); "
+                    "cannot pin hot experts"
+                )
+            # 钉住映射预填 + 顶部区校验 + 记账日志（pinned bytes / host 节省 / LRU 槽数）
+            counts = [len(experts) for experts in pin_plan.pins]
+            k_max = max(counts, default=0)
+            pin_ids = torch.zeros((num_moe_layers, k_max), dtype=torch.int32)
+            for layer_id, experts in enumerate(pin_plan.pins):
+                if experts:
+                    pin_ids[layer_id, : len(experts)] = torch.tensor(experts, dtype=torch.int32)
+            cache.init_hot_pins(pin_ids, counts, banks.cold_row)
+            if pin_arena is not None:
+                # 钉住权重入显存：GPU 暂存 -> slot cache 顶部区（行序 == pin list 序 == 槽位分配序）
+                cache.load_pinned_rows(pin_arena)
+                pin_arena = None
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        if config.hot_stats_out is not None:
+            from freetoken.moe.hotness import ExpertHotness
+
+            # Attached before capture for the same reason as collect_stats: record()'s
+            # index_add_ must be inside the graph so replays accumulate real routing.
+            cache.hotness = ExpertHotness(
+                num_layers=config.model_config.num_moe_layers,
+                num_experts=config.model_config.num_experts,
+                device=self.device,
+                out_path=config.hot_stats_out,
+                flush_interval_s=config.hot_stats_interval_s,
+                meta={
+                    "model_path": config.model_path,
+                    "moe_strategy": config.moe_strategy,
+                    "quant_format": cache.quant_format,
+                    "top_k": config.model_config.num_experts_per_tok,
+                },
+            )
+            cache.hotness.install_exit_flush()
+            logger.info_rank0(
+                f"expert hotness stats: collecting every MoE layer into {config.hot_stats_out} "
+                f"(flush every {config.hot_stats_interval_s:.0f}s + at exit)"
+            )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -1256,6 +1343,39 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _resolve_hot_pin_plan(
+    config: EngineConfig, num_moe_layers: int, num_experts: int, cpu_layer_ids: frozenset[int]
+):
+    """把 --hot-expert-list[/--hot-expert-slots] 解析成已校验的钉住计划（无配置 -> None）。
+
+    Business Logic（为什么需要这个函数）:
+        钉住的入口校验（策略族、文件 schema、几何、CPU 解码层剥离）必须发生在任何
+        bank 读取之前，坏配置要在这时失败而不是加载一半后崩；engine 只消费计划。
+
+    Code Logic（这个函数做什么）:
+        两个 hot_expert_* 字段都未设置时直接返回 None（行为与现状逐字节一致）；
+        非 offload 家族配置钉住时报 ValueError；其余转交
+        freetoken.moe.hot_pin.resolve_hot_pin_plan（pin list / stats+slots 双入口、
+        CPU 层剥离与告警都在那一处）。
+    """
+    if config.hot_expert_list is None and config.hot_expert_slots is None:
+        return None
+    if not is_offload_moe_strategy(config.moe_strategy):
+        raise ValueError(
+            "--hot-expert-list 仅支持 offload 家族（offload / hybrid / --moe-cpu-layers），"
+            f"当前 moe_strategy={config.moe_strategy!r}"
+        )
+    from freetoken.moe.hot_pin import resolve_hot_pin_plan
+
+    return resolve_hot_pin_plan(
+        config.hot_expert_list,
+        config.hot_expert_slots,
+        num_layers=num_moe_layers,
+        num_experts=num_experts,
+        cpu_layer_ids=cpu_layer_ids,
+    )
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
