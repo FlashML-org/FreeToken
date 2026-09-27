@@ -98,7 +98,10 @@ class HybridRadixCache:
         node, prefix_len = self._walk(input_ids)
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
+            # A view would keep the request's full output-budget token buffer alive.
+            new_node.set_key_value(
+                input_ids[prefix_len:].clone(), kv_indices[prefix_len:].clone()
+            )
             new_node.set_parent(node)
             self.full_evictable += new_node.length
             node = new_node
