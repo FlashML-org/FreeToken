@@ -417,7 +417,7 @@ def iter_gguf_weights(
         elif suffix == "ssm_beta.weight":
             inproj_buf.setdefault(layer, {})["beta"] = t
         elif suffix == "ssm_out.weight":
-            yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+            yield _emit_single(f"{base}.linear_attn", "out_proj", t)
         elif suffix == "ssm_conv1d.weight":
             yield f"{base}.linear_attn.conv1d.weight", _to_bf16(t).reshape(t.shape[0], 1, t.shape[1])
         # QSA (full_attention) layer tensors.
@@ -428,7 +428,7 @@ def iter_gguf_weights(
         elif suffix == "attn_v.weight":
             qkv_buf.setdefault(layer, {})["v"] = t
         elif suffix == "attn_output.weight":
-            yield f"{base}.self_attn.o_proj.qweight", t.packed()
+            yield _emit_single(f"{base}.self_attn", "o_proj", t)
         elif suffix == "indexer.q_proj.weight":
             idx_buf.setdefault(layer, {})["q"] = t
         elif suffix == "indexer.k_proj.weight":
@@ -439,10 +439,10 @@ def iter_gguf_weights(
         elif suffix == "ffn_up_shexp.weight":
             shexp_buf.setdefault(layer, {})["up"] = t
         elif suffix == "ffn_down_shexp.weight":
-            yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
+            yield _emit_single(f"{base}.mlp.shared_expert", "down_proj", t)
         elif suffix in ("ple_key.weight", "ple_value.weight"):
             proj = "key_proj" if suffix.startswith("ple_key") else "value_proj"
-            yield f"{base}.ple.{proj}.qweight", t.packed()
+            yield _emit_single(f"{base}.ple", proj, t)
         elif suffix == "ple_conv1d.weight":
             yield f"{base}.ple.conv1d.weight", _to_bf16(t).reshape(t.shape[0], 1, t.shape[1])
         # Hyper-connection merged down + inject (bf16: the two parts may differ in GGUF type).
@@ -466,7 +466,11 @@ def iter_gguf_weights(
         ip = inproj_buf.get(layer)
         if ip and {"qkv", "z", "alpha", "beta"} <= ip.keys():
             yield _emit_group(f"{base}.linear_attn", "in_proj_qkvz", [ip["qkv"], ip["z"]])
-            yield _emit_group(f"{base}.linear_attn", "in_proj_ba", [ip["beta"], ip["alpha"]])
+            # convert() always builds in_proj_ba dense (the b/a tensors are F32 in practice),
+            # so emit it dense regardless of their type
+            yield f"{base}.linear_attn.in_proj_ba.weight", torch.cat(
+                [_to_bf16(ip["beta"]), _to_bf16(ip["alpha"])], dim=0
+            )
             del inproj_buf[layer]
         sh = shexp_buf.get(layer)
         if sh and {"gate", "up"} <= sh.keys():
@@ -521,21 +525,30 @@ def is_gguf_model(config: ModelConfig) -> bool:
 def resolve_ple_source(engine_config) -> str:
     """The fp8 PLE n-gram table source (a HF repo id or a folder with ``model-plefp8-*``).
 
-    HF checkpoints resolve it from ``model_path``; a GGUF/FTW checkpoint carries no fp8 table
-    (the GGUF's IQ4_NL ``per_layer_token_embd`` is ignored), so it must set ``--ple-source``.
+    HF checkpoints and FTW checkpoints with their own ``ple-table-*.safetensors`` resolve from
+    ``model_path``; a GGUF (or an FTW without the side files) carries no fp8 table, so it must
+    set ``--ple-source``.
     """
     source = getattr(engine_config, "ple_source", None)
     if source:
         return source
+    import glob
+    import os
+
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
     from freetoken.models.gguf.reader import is_gguf_path
 
-    if is_gguf_path(engine_config.model_path) or is_ftw_checkpoint(engine_config.model_path):
+    model_path = engine_config.model_path
+    if is_ftw_checkpoint(model_path) and glob.glob(
+        os.path.join(model_path, "ple-table-*.safetensors")
+    ):
+        return model_path
+    if is_gguf_path(model_path) or is_ftw_checkpoint(model_path):
         raise ValueError(
             "this checkpoint carries no fp8 PLE table; pass --ple-source <repo-or-dir> "
             "pointing at the original model-plefp8-* shards"
         )
-    return engine_config.model_path
+    return model_path
 
 
 def _swap(owner, attr: str, quant_type: int) -> None:

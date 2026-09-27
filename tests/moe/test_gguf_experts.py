@@ -189,3 +189,23 @@ def test_dummy_sources_shapes_match_the_loader(monkeypatch) -> None:
         )
         assert banks["gate_up"][0].shape == (E, 2 * I, row_bytes(H, quant_type))
         assert banks["down"][0].shape == (E, H, row_bytes(I, quant_type))
+
+
+def test_composite_format_resolves_in_and_getitem() -> None:
+    """A per-role tag must satisfy both `in` and `[]` (dict.__contains__ skips __missing__)."""
+    from freetoken.moe.offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
+
+    assert "iq4_xs+iq4_nl" in _BANK_SCHEMAS
+    assert _BANK_SCHEMAS["iq4_xs+iq4_nl"] == ("gate_up", "down")
+    assert _BANK_BYTES_PER_EXPERT.get("iq4_xs+iq4_nl") is not None
+    assert "bogus+nope" not in _BANK_SCHEMAS
+
+
+def test_expert_format_detects_a_fused_gate_up_tensor(monkeypatch) -> None:
+    from freetoken.models.gguf import reader
+    from freetoken.moe.gguf_experts import gguf_expert_format
+
+    fused = _FakeTensor("blk.0.ffn_gate_up_exps.weight", GGML_Q5_K, torch.zeros(0))
+    down = _FakeTensor("blk.0.ffn_down_exps.weight", GGML_IQ4_NL, torch.zeros(0))
+    monkeypatch.setattr(reader, "iter_gguf_tensors", lambda path: iter([fused, down]))
+    assert gguf_expert_format("x") == "q5_K+iq4_nl"

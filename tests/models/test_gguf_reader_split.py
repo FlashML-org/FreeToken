@@ -31,8 +31,8 @@ def _write_shard(folder: str, no: int, count: int, total: int, tensors) -> str:
 
     path = os.path.join(folder, f"m-{no + 1:05d}-of-{count:05d}.gguf")
     writer = gguf.GGUFWriter(path, ARCH)
-    writer.add_uint32("split.count", count)
-    writer.add_uint32("split.no", no)
+    writer.add_uint16("split.count", count)  # llama.cpp writes these as uint16
+    writer.add_uint16("split.no", no)
     writer.add_uint64("split.tensors.count", total)
     for name, array in tensors:
         writer.add_tensor(name, array)

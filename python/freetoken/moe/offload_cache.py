@@ -125,6 +125,15 @@ class _CompositeSchemas(dict):
                 return ("gate_up", "down")
         raise KeyError(key)
 
+    def __contains__(self, key):
+        # dict.__contains__ does not consult __missing__, so a composite tag must be
+        # resolved explicitly (callers use both `in` and `[]`).
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
     def get(self, key, default=None):
         try:
             return self[key]
@@ -141,6 +150,13 @@ class _CompositeBytes(dict):
                     _gguf_role_bytes(gate_up, "gate_up", H, I) + _gguf_role_bytes(down, "down", H, I)
                 )
         raise KeyError(key)
+
+    def __contains__(self, key):
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
 
     def get(self, key, default=None):
         try:

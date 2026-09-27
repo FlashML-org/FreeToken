@@ -628,13 +628,13 @@ class Engine:
         split_residency = (
             bool(cpu_layer_ids)
             and config.moe_strategy in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+            and _explicit_pin_budget_bytes(self._host_tables_bytes) is not None
         )
         if config.moe_strategy == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-            budget = _pin_budget_bytes(self._host_tables_bytes)
+            budget = _explicit_pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
@@ -1323,25 +1323,37 @@ def _mem_available_bytes() -> int | None:
     return None
 
 
-def _pin_budget_bytes(reserved: int = 0) -> int | None:
-    """Bytes this process can still safely cudaHostRegister, or None when pinning is unbounded.
+def _explicit_pin_budget_bytes(reserved: int = 0) -> int | None:
+    """The *explicit* pin cap (WSL 40% or FREETOKEN_PIN_BUDGET_GB), or None on plain Linux.
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%.
-    Plain Linux has no hard cap, but page-locked banks cannot be reclaimed, so a bank set larger
-    than available RAM takes the host down (OOM); budget 90% of ``MemAvailable`` there so an
-    oversized offload fails with a clear message instead. FREETOKEN_PIN_BUDGET_GB overrides
-    anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks
-    (qwen4_exp's PLE table)."""
+    Residency/pinning decisions use this so the implicit Linux guard below cannot silently
+    change them; only the pre-load safety check uses the MemAvailable fallback.
+    """
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
     elif hasattr(os, "uname") and "microsoft" in os.uname().release.lower():  # WSL kernel tag
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
     else:
-        available = _mem_available_bytes()
-        if available is None:
-            return None
-        cap = int(available * 0.9)
+        return None
     return max(0, cap - reserved)
+
+
+def _pin_budget_bytes(reserved: int = 0) -> int | None:
+    """Bytes this process can still safely cudaHostRegister (None = unbounded / not checked).
+
+    Explicit caps (WSL 40%, FREETOKEN_PIN_BUDGET_GB) come from ``_explicit_pin_budget_bytes``.
+    On plain Linux, where pinning is otherwise unbounded, fall back to 90% of ``MemAvailable``:
+    page-locked banks cannot be reclaimed, so a bank set larger than RAM crashes the host. This
+    fallback is only used by the pre-load safety check, never by residency decisions.
+    ``FREETOKEN_ALLOW_PIN_OVERCOMMIT=1`` disables the check entirely.
+    """
+    explicit = _explicit_pin_budget_bytes(reserved)
+    if explicit is not None:
+        return explicit
+    available = _mem_available_bytes()
+    if available is None:
+        return None
+    return max(0, int(available * 0.9) - reserved)
 
 
 def _bank_bytes(config: EngineConfig, method=None) -> int | None:
@@ -1361,6 +1373,8 @@ def _pin_hint(reserved: int) -> str:
 
 def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> None:
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
+    if os.environ.get("FREETOKEN_ALLOW_PIN_OVERCOMMIT"):
+        return
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
     budget = _pin_budget_bytes(reserved)

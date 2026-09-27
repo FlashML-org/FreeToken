@@ -214,3 +214,20 @@ def test_resolve_ple_source(tmp_path) -> None:
     hf_dir = tmp_path / "hf"
     hf_dir.mkdir()
     assert resolve_ple_source(SimpleNamespace(model_path=str(hf_dir), ple_source=None)) == str(hf_dir)
+
+
+def test_resolve_ple_source_uses_ftw_side_files(tmp_path) -> None:
+    from freetoken.checkpoint.ftw import INDEX_NAME
+    from freetoken.models.qwen4_exp.gguf import resolve_ple_source
+
+    ftw = tmp_path / "ftw"
+    ftw.mkdir()
+    (ftw / INDEX_NAME).write_text("{}")
+    (ftw / "ple-table-0.safetensors").write_text("")  # side file written by ftw_side_files
+    assert resolve_ple_source(SimpleNamespace(model_path=str(ftw), ple_source=None)) == str(ftw)
+
+    empty = tmp_path / "ftw-empty"
+    empty.mkdir()
+    (empty / INDEX_NAME).write_text("{}")
+    with pytest.raises(ValueError, match="ple-source"):
+        resolve_ple_source(SimpleNamespace(model_path=str(empty), ple_source=None))

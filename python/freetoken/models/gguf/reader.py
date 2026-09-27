@@ -140,8 +140,14 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     # Otherwise the reader would try to resolve siblings of the rewritten file name.
     if "split.count" in reader.fields:
         field = reader.fields["split.count"]
-        assert len(field.types) == 1 and field.types[0] == gguf.GGUFValueType.UINT32
-        struct.pack_into("<I", buf, int(field.offset) + 8 + len("split.count") + 4, 1)
+        # llama.cpp writes split.count as uint16; accept both widths and pack the same one
+        # (a 4-byte write into a 2-byte field would corrupt the following KV entry).
+        assert len(field.types) == 1 and field.types[0] in (
+            gguf.GGUFValueType.UINT16, gguf.GGUFValueType.UINT32
+        ), f"unexpected split.count type {field.types}"
+        width = 2 if field.types[0] == gguf.GGUFValueType.UINT16 else 4
+        struct.pack_into("<H" if width == 2 else "<I",
+                         buf, int(field.offset) + 8 + len("split.count") + 4, 1)
     # The tensor table is dropped, but config derivation needs one fact from it (an
     # untied output head shows up only as an "output.weight" tensor). Append it as an
     # extra KV and bump kv_count (u64 at byte 16). Little-endian only -- the re-parse

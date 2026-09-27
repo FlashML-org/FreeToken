@@ -94,6 +94,18 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
+    if "+" in fmt:
+        # native GGUF per-role experts: "<gate_up>+<down>" (e.g. iq4_xs+iq4_nl when the
+        # intermediate width is not 256-aligned), each role sized by its own block.
+        gate_up, down = fmt.split("+", 1)
+        if gate_up in _GGUF_ROLE_BLOCK and down in _GGUF_ROLE_BLOCK:
+            gb, gs = _GGUF_ROLE_BLOCK[gate_up]
+            db, ds = _GGUF_ROLE_BLOCK[down]
+            return {"gate_up": 2 * I * (H // gb) * gs, "down": H * (I // db) * ds}
+    if fmt in _GGUF_ROLE_BLOCK:
+        # one native GGUF type for both roles (moe/offload_cache._GGUF_BANK_TYPES)
+        block, size = _GGUF_ROLE_BLOCK[fmt]
+        return {"gate_up": 2 * I * (H // block) * size, "down": H * (I // block) * size}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
@@ -130,6 +142,15 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
 
 
 _NVFP4_FORMATS = ("nvfp4", "nvfp4_marlin", "nvfp4_b12x")
+
+# native GGUF expert types -> (block elems, bytes per block). Kept local so this module
+# stays importable in the torch-only kernel-cache build env (cf. moe/offload_cache.py).
+_GGUF_ROLE_BLOCK = {
+    "q4_0": (32, 18),
+    "q5_K": (256, 176),
+    "iq4_nl": (32, 18),
+    "iq4_xs": (256, 136),
+}
 
 # Config fields come from each checkpoint's config.json (text_config for the
 # multimodal wrappers); checkpoints without a local copy were recorded from

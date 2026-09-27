@@ -59,11 +59,18 @@ def gguf_expert_format(model_path: str) -> str:
 
     seen: dict[str, set[int]] = {"gate": set(), "up": set(), "down": set()}
     for t in iter_gguf_tensors(model_path):
+        if t.name.endswith("ffn_gate_up_exps.weight"):  # fused tensor covers both roles
+            seen["gate"].add(t.ggml_type)
+            seen["up"].add(t.ggml_type)
+            continue
         for role in seen:
             if t.name.endswith(f"ffn_{role}_exps.weight"):
                 seen[role].add(t.ggml_type)
     if not seen["gate"]:
-        raise ValueError(f"{model_path}: no ffn_gate_exps.weight to detect the expert quant")
+        raise ValueError(
+            f"{model_path}: no ffn_gate_exps.weight / ffn_gate_up_exps.weight "
+            "to detect the expert quant"
+        )
     for role, types in seen.items():
         if len(types) != 1:
             raise ValueError(
