@@ -99,3 +99,17 @@ stops with a clear error instead of OOM-crashing the host.
   (`cpu_moe_ext.cpp: gguf_asum32`), so it does ~`2I + H` redundant sums per token/route.
   Precomputing the sums in the activation-quantization pass would remove it; left undone
   because it changes the W4A8 dot signature and needs A/B numbers.
+- Two qwen4_exp tests assert exact equality where only closeness holds, so they fail
+  deterministically (measured; both are test-hygiene, not runtime bugs):
+  - `test_qsa_backend.py::test_chunked_prefill_matches_one_shot` compares a split prefill to
+    a one-shot with `torch.equal`; the dual-source compress reduces the pooled group in a
+    different order, giving max abs diff ~1.5e-3 at output scale ~0.1 (~1.5%), inside the
+    `rtol=2e-2` the same file uses against the fp32 oracle. Should be a closeness check.
+  - `test_ple.py::test_track_snapshot_equals_a_prefill_stopped_at_the_boundary` compares the
+    boundary snapshot to a truncated prefill with `torch.equal`, at ~1.3e-7 relative fp32
+    noise. Should be `allclose`.
+- The two `needs_weights` tests in `tests/models/test_gguf_qwen4exp_config.py` hardcode the
+  full Qwen3.8-Flash-Next checkpoint (512 experts, PLE on layer 1, layer-0 `in_proj_qkvz`
+  fused as `qweight`), so they fail when `FREETOKEN_QWEN4EXP_GGUF` points at a variant such as
+  the 160-expert no-PLE coder finetune (its layer-0 qkv/z types differ, so `in_proj_qkvz`
+  stays dense). Assert derived properties or gate the tests to the matching file.
