@@ -25,6 +25,9 @@ from freetoken.models.gguf.dequant import (
 )
 
 # ggml_type -> (block numel, bytes per block) as it must appear in BLOCK_SHAPE.
+# ggml's IQ4 codebook, spelled out so the reference does not share the production constant.
+_IQ4_KVALUES = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+
 EXPECTED_SHAPE = {
     GGML_Q5_K: (256, 176),
     GGML_IQ4_NL: (32, 18),
@@ -83,8 +86,8 @@ def _ref_iq4_nl(blocks: np.ndarray) -> np.ndarray:
         d = _from_f16(b[0:2].tobytes())
         qs = b[2:18]
         for j in range(16):
-            out[i, j] = d * IQ4NL_KVALUES[qs[j] & 0xF]
-            out[i, j + 16] = d * IQ4NL_KVALUES[qs[j] >> 4]
+            out[i, j] = d * _IQ4_KVALUES[qs[j] & 0xF]
+            out[i, j + 16] = d * _IQ4_KVALUES[qs[j] >> 4]
     return out
 
 
@@ -106,8 +109,8 @@ def _ref_iq4_xs(blocks: np.ndarray) -> np.ndarray:
             ls = ((int(scales_l[ib // 2]) >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4)
             dl = d * (ls - 32)
             for j in range(16):
-                out[i, 32 * ib + j] = dl * IQ4NL_KVALUES[qs[16 * ib + j] & 0xF]
-                out[i, 32 * ib + j + 16] = dl * IQ4NL_KVALUES[qs[16 * ib + j] >> 4]
+                out[i, 32 * ib + j] = dl * _IQ4_KVALUES[qs[16 * ib + j] & 0xF]
+                out[i, 32 * ib + j + 16] = dl * _IQ4_KVALUES[qs[16 * ib + j] >> 4]
     return out
 
 
@@ -160,3 +163,7 @@ def test_dequantize_matches_the_c_reference_on_a_real_checkpoint() -> None:
         expected = REFERENCE[ggml_type](blocks).reshape(-1)
         assert torch.equal(got, torch.from_numpy(expected)), GGML_NAME[ggml_type]
     assert seen == set(REFERENCE), sorted(GGML_NAME[t] for t in set(REFERENCE) - seen)
+
+
+def test_iq4_codebook_matches_the_reference_literal() -> None:
+    assert tuple(IQ4NL_KVALUES) == _IQ4_KVALUES

@@ -116,7 +116,8 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
     """Sanity: the CPU W4A16 GEMV lands close to the GPU ggml MMVQ (W4A8) kernel the
     offload path uses -- a looser tol since MMVQ quantizes activations to int8."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
-    from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+    from freetoken.moe.gguf_experts import fused_experts_gguf
+    from freetoken.models.gguf.dequant import GGML_Q4_0
 
     torch.manual_seed(77)
     L, E, H, I, top_k = 2, 16, 2816, 704, 8
@@ -139,8 +140,9 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
     b = cache.bank_sources
     gate_up_layer = b["gate_up"][layer].to(dev)
     down_layer = b["down"][layer].to(dev)
-    gpu_out = fused_experts_gguf_q4_0(
-        hidden, gate_up_layer, down_layer, w, ids.clone(), "gelu_tanh"
+    gpu_out = fused_experts_gguf(
+        hidden, gate_up_layer, down_layer, w, ids.clone(), "gelu_tanh",
+        int(GGML_Q4_0), int(GGML_Q4_0),
     ).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)

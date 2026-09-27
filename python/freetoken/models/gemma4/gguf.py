@@ -205,7 +205,7 @@ def iter_gguf_weights(
 
     assert not include_moe_experts, (
         "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
-        "experts are loaded into the offload cache via load_q4_0_expert_sources()."
+        "they are loaded into the offload cache by moe/gguf_experts.py."
     )
     assert include_non_moe
     _require_tp1("weight loading")
@@ -374,101 +374,9 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     if config.tie_word_embeddings:
         model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
 
-
-# --------------------------------------------------------------------------------------
-# Routed-expert host banks (native Q4_0) for the offload cache.
-# --------------------------------------------------------------------------------------
-
-def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    E = config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    return {
-        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
-    }
-
-
-def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """Per-layer host banks of the routed experts' native Q4_0 block bytes.
-
-    ``gate_up`` is one ``[E, 2I, H//32*18]`` tensor per layer and ``down`` one
-    ``[E, H, I//32*18]`` per layer (independent :class:`HostBank` allocations) -- each
-    expert's packed rows verbatim from the GGUF (no dequant), whole layers arriving in
-    one shot (gate_up + down = 2 writes/layer), so the offload cache streams whole
-    experts to the ggml MoE kernels.
-
-    ``layer_sink=None`` (serving): pin each layer's two banks as they complete via an
-    internally-owned :class:`PinPipeline` (or, on a CUDA-less host, allocate the mmap
-    banks but never pin -- the CPU executor reads them pageable). ``layer_sink`` given
-    (converter): the completion tracker fires into it instead -- nothing here is pinned,
-    and the sink may release banks it has written out, so the returned tensors are only
-    valid until then (the caller owns that tradeoff).
-    """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
-
-    _require_tp1("expert banks")
-    L, E = config.num_layers, config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
-    banks = {name: [b.tensor for b in hb[name]] for name in hb}
-    seen_gu, seen_dn = set(), set()
-
-    def _load(sink) -> None:
-        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
-        for t in iter_gguf_tensors(model_path):
-            if not t.name.startswith("blk."):
-                continue
-            layer = int(t.name.split(".")[1])
-            if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, h_bytes))
-                seen_gu.add(layer)
-            elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
-                seen_dn.add(layer)
-            else:
-                continue
-            if tracker is not None:
-                tracker.note(layer)
-
-    if layer_sink is not None:
-        _load(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _load(pins)
-    else:
-        _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
-
-    want = set(range(L))
-    assert seen_gu == want and seen_dn == want, (
-        f"missing Q4_0 expert layers: gate_up {sorted(want - seen_gu)}, "
-        f"down {sorted(want - seen_dn)}"
-    )
-    return banks
-
-
-def dummy_q4_0_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
-    """Random Q4_0 expert banks shaped like ``load_q4_0_expert_sources`` output."""
-    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
-
-    L = config.num_layers
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)
-    banks = {name: [b.tensor for b in hb[name]] for name in hb}
-    for t in banks["gate_up"] + banks["down"]:
-        t.random_(0, 256)
-    if torch.cuda.is_available():
-        pin_banks(hb)  # match the other dummies: pin-after-fill (no-op mmap fill on CPU-only)
-    return banks
-
-
 __all__ = [
     "parse_gguf_config",
     "iter_gguf_weights",
     "convert_gemma4_to_gguf",
     "is_gguf_model",
-    "load_q4_0_expert_sources",
-    "dummy_q4_0_expert_sources",
 ]

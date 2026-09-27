@@ -108,3 +108,20 @@ def test_metadata_gguf_copies_shard_zero_and_records_output(tmp_path) -> None:
     # the rewritten metadata file is a single GGUF (split.count pinned to 1)
     assert split_shard_count(dest) == 1
     assert metadata["split.count"] == 1
+
+
+def test_absurd_split_count_is_rejected(tmp_path) -> None:
+    import gguf
+
+    path = os.path.join(str(tmp_path), "m-00001-of-00002.gguf")
+    writer = gguf.GGUFWriter(path, ARCH)
+    writer.add_uint16("split.count", 5000)
+    writer.add_uint16("split.no", 0)
+    writer.add_uint64("split.tensors.count", 1)
+    writer.add_tensor("a", np.arange(4, dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    with pytest.raises(ValueError, match="exceeds"):
+        split_shard_count(path)

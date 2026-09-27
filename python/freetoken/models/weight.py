@@ -262,28 +262,9 @@ def ftw_lacks_vision(model_path: str) -> bool:
     return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
 
 
-def load_q4_0_moe_expert_sources(
-    model_path: str,
-    model_config,
-    *,
-    dummy: bool = False,
-    layer_sink=None,
-) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
-    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
-    _config, spec = _spec_for_model_path(model_path)
-    if dummy:
-        builder = _model_override(spec, "dummy_q4_0_expert_sources")
-        assert builder is not None, "model defines no dummy_q4_0_expert_sources"
-        return builder(model_config)
-    loader = _load_attr(spec.module, "load_q4_0_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
-
-
 __all__ = [
     "load_weight",
     "load_vision_weight",
     "ftw_lacks_vision",
-    "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

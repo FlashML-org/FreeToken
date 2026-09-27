@@ -65,19 +65,21 @@ def gguf_config_source(model_path: str) -> str | None:
     return None
 
 
-@functools.cache
-def _shard_paths(model_path: str) -> tuple[str, ...]:
-    """The shard files of a split GGUF in split.no order (a plain file resolves to itself)."""
-    import gguf
+# llama.cpp split GGUFs are a few shards; anything far larger is a malformed/untrusted file.
+_MAX_SHARDS = 1024
 
-    count = _field_value(gguf.GGUFReader(model_path), "split.count")
-    if not count or int(count) <= 1:
-        return (model_path,)
-    count = int(count)
+
+@functools.cache
+def _shard_paths(model_path: str, count: int) -> tuple[str, ...]:
+    """Shard files of a split GGUF whose KV already declared ``count`` (name math + isfile)."""
     match = _SPLIT_NAME_RE.match(os.path.basename(model_path))
     if match is None:
         raise ValueError(
             f"{model_path}: split.count={count} but the name is not '<name>-NNNNN-of-MMMMM.gguf'"
+        )
+    if int(match.group("count")) != count:
+        raise ValueError(
+            f"{model_path}: split.count={count} but the name declares {match.group('count')}"
         )
     stem, width = match.group("prefix"), len(match.group("no"))
     total = len(match.group("count"))
@@ -94,11 +96,23 @@ def _shard_paths(model_path: str) -> tuple[str, ...]:
 
 @functools.cache
 def _shard_readers(model_path: str) -> tuple[Any, ...]:
-    """One ``gguf.GGUFReader`` per shard, split.no order; verifies the declared tensor count."""
+    """One ``gguf.GGUFReader`` per shard, split.no order; the passed path is opened once."""
     import gguf
 
-    readers = tuple(gguf.GGUFReader(path) for path in _shard_paths(model_path))
-    total = _field_value(readers[0], "split.tensors.count")
+    head = gguf.GGUFReader(model_path)
+    count = _field_value(head, "split.count")
+    count = int(count) if count else 1
+    if count > _MAX_SHARDS:
+        raise ValueError(f"{model_path}: split.count={count} exceeds the {_MAX_SHARDS} shard limit")
+    if count <= 1:
+        readers = (head,)
+    else:
+        here = os.path.realpath(model_path)
+        readers = tuple(
+            head if os.path.realpath(path) == here else gguf.GGUFReader(path)
+            for path in _shard_paths(model_path, count)
+        )
+    total = _field_value(head, "split.tensors.count")
     if len(readers) > 1 and total is not None:
         seen = sum(len(r.tensors) for r in readers)
         if seen != int(total):
@@ -115,7 +129,7 @@ def _metadata_reader(model_path: str):
 
 def split_shard_count(model_path: str) -> int:
     """Number of shard files (1 for a plain GGUF)."""
-    return len(_shard_paths(model_path))
+    return len(_shard_readers(model_path))
 
 
 def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:

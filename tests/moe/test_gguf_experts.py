@@ -209,3 +209,33 @@ def test_expert_format_detects_a_fused_gate_up_tensor(monkeypatch) -> None:
     down = _FakeTensor("blk.0.ffn_down_exps.weight", GGML_IQ4_NL, torch.zeros(0))
     monkeypatch.setattr(reader, "iter_gguf_tensors", lambda path: iter([fused, down]))
     assert gguf_expert_format("x") == "q5_K+iq4_nl"
+
+
+def test_gguf_block_size_and_format_tables_agree() -> None:
+    """The GGUF block sizes and expert format tags are restated in several places (two of
+    them intentionally, to stay importable in narrow build envs); drift mis-sizes banks."""
+    from freetoken.kernel.aot_models import _GGUF_ROLE_BLOCK
+    from freetoken.models.gguf.dequant import (
+        BLOCK_SHAPE,
+        GGML_IQ4_NL,
+        GGML_IQ4_XS,
+        GGML_Q4_0,
+        GGML_Q5_K,
+    )
+    from freetoken.moe.cpu_executor import _GGUF_W4A8_FORMATS, _WFMT_IDS
+    from freetoken.moe.expert_banks import _PROVIDERS
+    from freetoken.moe.gguf_experts import GGUF_EXPERT_QUANTS, gguf_expert_role_types
+    from freetoken.moe.offload_cache import _GGUF_BANK_TYPES
+
+    expected = {
+        "q4_0": BLOCK_SHAPE[GGML_Q4_0],
+        "q5_K": BLOCK_SHAPE[GGML_Q5_K],
+        "iq4_nl": BLOCK_SHAPE[GGML_IQ4_NL],
+        "iq4_xs": BLOCK_SHAPE[GGML_IQ4_XS],
+    }
+    assert _GGUF_BANK_TYPES == expected
+    assert _GGUF_ROLE_BLOCK == expected
+    assert set(GGUF_EXPERT_QUANTS) == set(_GGUF_W4A8_FORMATS) == set(_PROVIDERS)
+    assert set(GGUF_EXPERT_QUANTS) <= set(_WFMT_IDS)
+    for tag, ggml_type in GGUF_EXPERT_QUANTS.items():
+        assert gguf_expert_role_types(tag) == (ggml_type, ggml_type)

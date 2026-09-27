@@ -76,6 +76,18 @@ def _f16_scales(raw: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
     return raw[:, lo:hi].contiguous().view(torch.float16).to(torch.float32)
 
 
+_IQ4NL_LUT: dict[torch.device, torch.Tensor] = {}
+
+
+def _iq4nl_lut(device: torch.device) -> torch.Tensor:
+    """The IQ4 codebook as an fp32 tensor on ``device`` (created once per device)."""
+    lut = _IQ4NL_LUT.get(device)
+    if lut is None:
+        lut = torch.tensor(IQ4NL_KVALUES, dtype=torch.float32, device=device)
+        _IQ4NL_LUT[device] = lut
+    return lut
+
+
 def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q4_0: per 32-elem block = fp16 scale ``d`` + 16 packed nibbles; ``w = d*(q-8)``.
 
@@ -145,7 +157,7 @@ def dequant_iq4_nl(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     raw = raw.reshape(-1, 18)
     d = _f16_scales(raw, 0, 2)  # [N,1]
     qs = raw[:, 2:18]  # [N,16] uint8
-    values = torch.tensor(IQ4NL_KVALUES, dtype=torch.float32, device=raw.device)
+    values = _iq4nl_lut(raw.device)
     q = torch.cat([values[(qs & 0x0F).long()], values[(qs >> 4).long()]], dim=1)  # [N,32]
     return (q * d).reshape(-1).to(out_dtype)
 
@@ -166,7 +178,7 @@ def dequant_iq4_xs(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     high = (scales_h >> (2 * ib)) & 3  # [n,8]
     dl = d * ((low | (high << 4)) - 32).to(torch.float32)  # [n,8]
     q = qs.reshape(n, 8, 16)  # [n,8 sub-blocks,16 bytes]
-    values = torch.tensor(IQ4NL_KVALUES, dtype=torch.float32, device=raw.device)
+    values = _iq4nl_lut(raw.device)
     y = torch.cat([values[(q & 0x0F).long()], values[(q >> 4).long()]], dim=2)  # [n,8,32]
     return (y * dl.unsqueeze(2)).reshape(-1).to(out_dtype)
 

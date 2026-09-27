@@ -1,9 +1,7 @@
 from .attention import Gemma4Attention
 from .config import parse_config
 from .gguf import (
-    dummy_q4_0_expert_sources,
     iter_gguf_weights,
-    load_q4_0_expert_sources,
     parse_gguf_config,
 )
 from .model import Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration
@@ -32,6 +30,4 @@ __all__ = [
     "iter_weights_parallel",
     "parse_gguf_config",
     "iter_gguf_weights",
-    "load_q4_0_expert_sources",
-    "dummy_q4_0_expert_sources",
 ]
