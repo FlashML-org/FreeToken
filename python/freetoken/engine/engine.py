@@ -713,16 +713,8 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        if pin_plan is not None:
-            # v1 约束：overlap 双缓冲整层 bank 拷贝假设 bank 按专家 id 全量存放，与
-            # 冷压缩不兼容（将由 prefill 三源组装解除）；auto 解算出的 overlap 在此关闭。
-            if config.moe_prefill_overlap:
-                object.__setattr__(config, "moe_prefill_overlap", False)
-                logger.info_rank0(
-                    "--hot-expert-list: disabling MoE prefill overlap (v1 pinning is "
-                    "incompatible with the full-layer double buffer; the three-source "
-                    "prefill assembly will lift this)"
-                )
+        # 钉住与 --moe-prefill-overlap 已由 prefill 三源组装（offload_cache 的
+        # miss 冷行 remap + 组合填充）解除互斥：overlap 在此保持用户/auto 解算值。
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)

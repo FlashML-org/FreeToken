@@ -339,11 +339,14 @@ def test_init_hot_pins_maps_accounting_and_floors(caplog):
     assert "pinned" in caplog.text and "LRU region" in caplog.text
     assert f"{cache.pinned_bytes() / 2**20:.1f} MiB" in caplog.text
 
-    # overlap 拒绝（错误信息说明将由三源组装解除）
+    # overlap 与钉住已由三源组装解除互斥：init 成功，映射与固定 shape gather 索引照常预建
     cache2 = _make_pinned_cache(num_layers=1, num_experts=16, pins=(3,))
     cache2.prefill_overlap = True
-    with pytest.raises(ValueError, match="overlap|三源"):
-        _init_pins(cache2, pins=(3,), k_per_layer=[1])
+    pins_matrix2 = _init_pins(cache2, pins=(3,), k_per_layer=[1])
+    assert int(cache2.slot_for_id[0, pins_matrix2[0][0]].item()) == cache2.pin_base
+    assert cache2._pin_gather_dst[0].tolist() == pins_matrix2[0]
+    assert cache2._pin_gather_src[0].tolist() == [cache2.pin_base]
+    assert cache2._pin_cold_dst[0].tolist() == [e for e in range(16) if e != pins_matrix2[0][0]]
     # LRU 地板拒绝：P + max(2E, 512) 放不下
     from freetoken.moe.hot_pin import cold_row_from_pins
 

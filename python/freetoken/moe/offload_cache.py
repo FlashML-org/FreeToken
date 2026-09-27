@@ -310,6 +310,22 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # prefill 三源组装（钉住 + overlap）状态：双缓冲首行指针与组合填充描述符
+        # （_init_prefill_overlap_buffers 建，CUDA only）、逐层 gather 索引与宿主
+        # 冷行镜像（_build_pin_gather_buffers 建，init_hot_pins/rebuild 时刷新）。
+        # 未钉住时全部保持空/None，prefill 行为与不钉住逐字节一致。
+        self._prefill_buffer_ptrs: list[torch.Tensor] = []
+        self._compose_cache_ptrs: torch.Tensor | None = None
+        self._compose_host_ptrs: list[torch.Tensor] | None = None
+        self._compose_feat_bytes: torch.Tensor | None = None
+        self._overlap_small_bank_ids: list[int] = []
+        self._pin_cold_dst: list[torch.Tensor] = []
+        self._pin_cold_src: list[torch.Tensor] = []
+        self._pin_cold_num: list[torch.Tensor] = []
+        self._pin_gather_dst: list[torch.Tensor] = []
+        self._pin_gather_src: list[torch.Tensor] = []
+        self._pin_gather_num: list[torch.Tensor] = []
+        self._cold_row_np = None
 
     def init_hot_pins(self, pin_ids: torch.Tensor, pin_counts: list[int], cold_row: torch.Tensor) -> None:
         """装配显存钉住：校验几何、占用 slot 顶部区并预填钉住映射。
@@ -321,23 +337,17 @@ class OffloadMoeCache:
 
         Code Logic（这个函数做什么）:
             校验 pin_ids [L, K_max] / pin_counts / cold_row [L, E] 的一致性（层内
-            不重复、K ≤ E、cold_row 与钉住集互逆）；断言 v1 约束——prefill_overlap
-            必须为 False（overlap 双缓冲整层 bank 拷贝与冷压缩 bank 不兼容，将由
-            三源组装解除）、LRU 区 cache_size - P ≥ max(2E, 512)。随后计算各层
-            钉住槽位（顶部区按层前缀偏移），预填 slot_for_id / id_of_slot（usage
-            保持 0），并打印钉住字节 / host 节省 / LRU 槽数。须在 set_bank_sources
-            之后调用（记账需要 bank 行宽）。
+            不重复、K ≤ E、cold_row 与钉住集互逆）与 LRU 区 cache_size - P ≥
+            max(2E, 512)（防 LRU 退化；prefill overlap 双缓冲与钉住的兼容由三源
+            组装保证，不再互斥）。随后计算各层钉住槽位（顶部区按层前缀偏移），预填
+            slot_for_id / id_of_slot（usage 保持 0），预建三源组装的固定 shape
+            gather 索引与宿主冷行镜像，并打印钉住字节 / host 节省 / LRU 槽数。
+            须在 set_bank_sources 之后调用（记账需要 bank 行宽）。
         """
         L, E = self.num_layers, self.num_experts
         k_max = max(pin_counts, default=0)
         if k_max > E:
             raise ValueError(f"每层钉住数 {k_max} 超过专家数 {E}")
-        if self.prefill_overlap:
-            raise ValueError(
-                "显存钉住 v1 与 MoE prefill overlap 双缓冲不兼容（overlap 假设 host bank "
-                "按专家 id 全量存放；钉住后的三源组装将解除该约束）——请加 "
-                "--disable-moe-prefill-overlap"
-            )
         assert pin_ids.shape == (L, max(pin_counts, default=0)), (pin_ids.shape, pin_counts)
         assert len(pin_counts) == L
         assert all(0 <= c <= E for c in pin_counts), pin_counts
@@ -362,6 +372,7 @@ class OffloadMoeCache:
         self._init_pin_geometry()
         self._pin_query_buffers = {}
         self._fill_pin_maps()
+        self._build_pin_gather_buffers()
         pinned_bytes = self.pinned_bytes()
         logger.info_rank0(
             f"hot expert pinning: {total_pins} experts pinned at slots "
@@ -417,6 +428,37 @@ class OffloadMoeCache:
             slots = self.pin_slots[layer_id, :count]
             self.slot_for_id.view(-1)[flat_ids] = slots
             self.id_of_slot[slots.long()] = flat_ids.to(torch.int32)
+
+    def _build_pin_gather_buffers(self) -> None:
+        """预建三源组装（钉住 + prefill overlap）的固定 shape gather 索引与宿主冷行镜像。
+
+        Business Logic（为什么需要这个函数）:
+            双缓冲的组合填充（冷行自 bank、钉住行自顶部槽）与 miss run-list 的冷行
+            remap 需要逐层冷专家 id 与钉住 id/槽位索引；热路径上现算会引入分配与
+            host 往返，加载期按固定 shape 预建是零热路径分配（CUDA graph 友好）的
+            前提。
+
+        Code Logic（这个函数做什么）:
+            逐层取 cold_row >= 0 的冷专家 id（int32，冷行序）作组合填充的 dst 行、
+            恒等 arange 作 src 行；取 pin_ids/pin_slots 前缀作钉住行 gather 的
+            dst/src；行数为 [1] int64 device 标量。另把 cold_row 复制成宿主 numpy
+            镜像（miss remap 的查表源，顶部槽恒命中故 pinned -> -1 不会进 miss）。
+            rebuild 重解算钉住几何（pin_slots 变化）后必须重跑；未来的动态重钉改写
+            pin_ids/cold_row 值（shape 不变）时也必须同步刷新。
+        """
+        assert self.pin_ids is not None and self.pin_slots is not None and self.cold_row is not None
+        self._pin_cold_dst, self._pin_cold_src, self._pin_cold_num = [], [], []
+        self._pin_gather_dst, self._pin_gather_src, self._pin_gather_num = [], [], []
+        for layer_id, count in enumerate(self.pin_counts):
+            cold_ids = torch.nonzero(self.cold_row[layer_id] >= 0).flatten().to(torch.int32)
+            c = int(cold_ids.numel())
+            self._pin_cold_dst.append(cold_ids)
+            self._pin_cold_src.append(torch.arange(c, dtype=torch.int32, device=self.device))
+            self._pin_cold_num.append(torch.tensor([c], dtype=torch.int64, device=self.device))
+            self._pin_gather_dst.append(self.pin_ids[layer_id, :count].clone())
+            self._pin_gather_src.append(self.pin_slots[layer_id, :count].clone())
+            self._pin_gather_num.append(torch.tensor([count], dtype=torch.int64, device=self.device))
+        self._cold_row_np = self.cold_row.detach().cpu().numpy()
 
     def pin_query_buffer(self, num_route_ids: int) -> torch.Tensor:
         """
@@ -679,6 +721,11 @@ class OffloadMoeCache:
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
+        self._prefill_buffer_ptrs = []
+        self._compose_cache_ptrs = None
+        self._compose_host_ptrs = None
+        self._compose_feat_bytes = None
+        self._overlap_small_bank_ids = []
         self.prefill_copy_stream = None
         self.prefill_begin_event = None
         self.prefill_ready_events = []
@@ -719,6 +766,8 @@ class OffloadMoeCache:
             self._pin_query_buffers = {}
             self._init_pin_geometry()
             self._fill_pin_maps()
+            # pin_slots 随 cache_size 变了，钉住行 gather 索引同步刷新
+            self._build_pin_gather_buffers()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -841,6 +890,40 @@ class OffloadMoeCache:
                 (self.num_experts,), dtype=torch.int32, device=self.device
             )
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # 三源组装（钉住 + overlap）的组合填充描述符：双缓冲首行指针、slot cache 与
+        # 宿主 bank 的 base 指针、行字节数、小 bank 集合。独立于 fused copy plan 的
+        # 启用状态（FREETOKEN_FUSED_COPY=0 等场景下 copy_missing 退化为 per-bank，
+        # 而组合填充仍可用自己的描述符）。unpinned 层与 overlap 互斥（见
+        # set_bank_sources），所以宿主指针永远可解析。
+        feats = [math.prod(cache.shape[1:]) * cache.element_size() for _, cache in self.banks]
+        self._overlap_small_bank_ids = [b for b, f in enumerate(feats) if f < _SMALL_BANK_FEAT_BYTES]
+        if self.device.type == "cuda":
+            from freetoken.kernel.pinned import device_ptr
+
+            self._prefill_buffer_ptrs = [
+                torch.tensor(
+                    [buf[b].data_ptr() for buf in self.prefill_bank_buffers],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                for b in range(2)
+            ]
+            self._compose_cache_ptrs = torch.tensor(
+                [cache.data_ptr() for _, cache in self.banks], dtype=torch.int64, device=self.device
+            )
+            self._compose_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+            for f in feats:
+                # fast_index_copy_multi 内核要求行字节 16 对齐（torch 分配天然满足；
+                # 显式断言以防未来引入奇异行宽）
+                assert f % 16 == 0, f
+            self._compose_host_ptrs = [
+                torch.tensor(
+                    [device_ptr(per_layer[layer_id]) for per_layer, _ in self.banks],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                for layer_id in range(self.num_layers)
+            ]
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
         slot_start = buffer_id * self.num_experts
@@ -871,6 +954,10 @@ class OffloadMoeCache:
             # The copy stream is fenced behind the previous decode, so the snapshot
             # observes its final slot map; one host sync per chunk, then per-layer
             # classification is pure host math.
+            # 快照一致性前提：钉住映射（顶部区 slot_for_id / cold_row）在 chunk 之间
+            # 不变——动态重钉只允许发生在 idle 安全点（chunk 边界，无在途 prefill），
+            # 因此 begin 时刻的快照对整个 chunk 的 hit/miss 分类与 miss 冷行 remap
+            # 都有效。
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
@@ -893,8 +980,13 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            if self.pin_ids is None:
+                for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                    buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                return
+            # 钉住：bank 行数 E-K != E，整层 copy_ 形状不符——三源组合填充
+            # （冷行自宿主冷压缩 bank + 钉住行自 slot 顶部区），position == id 不变。
+            self._compose_prefill_banks(layer_id, buffer_id, small_only=False)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -929,6 +1021,15 @@ class OffloadMoeCache:
             reason = (
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
+            )
+        elif self.pin_ids is not None and self.pin_base < 2 * self.num_experts:
+            # 钉住区必须整体落在 hit 阈值之上：顶部槽低于 2E 会被分类成 miss，而
+            # 钉住专家在宿主 bank 里没有行可拷。LRU 地板（pin_base >= max(2E,512)）
+            # 使其实际不可达，这里兜底并给出可读原因。
+            reason = (
+                f"the pinned top region starts at slot {self.pin_base}, inside the double "
+                f"buffers' borrow region [0, {2 * self.num_experts}): pinned rows would "
+                f"classify as misses and no host bank row exists for them"
             )
         elif not self._resolve_batch_memcpy():
             reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
@@ -970,6 +1071,14 @@ class OffloadMoeCache:
         -- the buffers own those slots, so their bytes are volatile within the
         chunk. Hit and miss row sets are disjoint, so the streams need no
         ordering against each other.
+
+        三源组装（钉住）：钉住槽位于顶部区（>= 2E）恒分类为 hit，由 D2D gather 从
+        权威槽取行；miss 侧的宿主 run-list 经 cold_row 宿主镜像把专家 id 重映射为
+        冷压缩 bank 行号（cold_row 保序压缩，连续专家 id 的 run 仍对应连续冷行，
+        coalescing 不变；钉住 -> -1 不可能出现在 miss 里，出现即映射损坏，防御性
+        拒绝）。小行宽 bank 不进 batch（子 256KB 条目会让 batch 退化同步拷贝）也
+        不进 gather，其整行集合（冷 + 钉住）由组合填充覆盖。未钉住时行为与原先
+        逐字节一致。
         """
         import numpy as np
 
@@ -981,6 +1090,8 @@ class OffloadMoeCache:
         hit_mask = snap >= 2 * E
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
+        pinned = self.pin_ids is not None
+        cold_np = self._cold_row_np[layer_id] if pinned else None
         if self._gather_dst_ptrs is not None:
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
@@ -995,17 +1106,36 @@ class OffloadMoeCache:
                 blocks_per_bank=64,
             )
         miss = np.nonzero(~hit_mask)[0]
+        if pinned and miss.size:
+            # 钉住槽恒命中（pin_base >= 2E ⇒ slot >= 2E ⇒ hit）；miss 中出现
+            # cold_row == -1 说明钉住映射已损坏，拒绝错拷贝胜过静默给错权重。
+            stale = cold_np[miss] < 0
+            if stale.any():
+                raise RuntimeError(
+                    f"layer {layer_id}: pinned expert(s) {miss[stale].tolist()} classified "
+                    f"as prefill miss (snapshot slots {snap[miss[stale]].tolist()}); "
+                    "the pinned slot map is corrupted"
+                )
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
             self._invalidate_prefill_buffer(buffer_id)
+            starts = lengths = cold_starts = None
             if miss.size:
                 run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
                 starts = miss[run_starts]
                 lengths = np.diff(np.concatenate((run_starts, [miss.size])))
+                if pinned:
+                    # cold_row 表是 int32；指针偏移乘法（rows * feat）会超 int32，
+                    # 与 np.nonzero 的 starts 一样统一升到 int64
+                    cold_starts = cold_np[starts].astype(np.int64)
             dst, src, nbytes = [], [], []
             for b, feat in enumerate(self._copy_feat_bytes_host):
                 if feat < _SMALL_BANK_FEAT_BYTES:
+                    if pinned:
+                        # 小 bank 不进 batch（batch 混入子 256KB 条目会整体退化为
+                        # 同步拷贝）：冷行与钉住行都交给组合填充（bank 字节即权威）。
+                        continue
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
                     # rows the gather skips for these banks.
@@ -1013,8 +1143,9 @@ class OffloadMoeCache:
                     src.append(self._copy_src_ptrs_host[layer_id][b])
                     nbytes.append(E * feat)
                 elif miss.size:
+                    rows = cold_starts if pinned else starts
                     dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
-                    src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
+                    src.extend(self._copy_src_ptrs_host[layer_id][b] + rows * feat)
                     nbytes.extend(lengths * feat)
             if dst:
                 self._batch_memcpy(
@@ -1023,7 +1154,75 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
+            if pinned and self._overlap_small_bank_ids:
+                self._compose_prefill_banks(layer_id, buffer_id, small_only=True)
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+    def _compose_prefill_banks(self, layer_id: int, buffer_id: int, small_only: bool) -> None:
+        """三源组合填充双缓冲的一层：冷行自宿主冷压缩 bank、钉住行自 slot 顶部区。
+
+        Business Logic（为什么需要这个函数）:
+            钉住后 host bank 只装冷专家（[E-K] 行），buffer [E, *row] 的每一行必须
+            由两个来源拼出：冷专家取 bank 冷行（无论运行期命中与否——bank 字节即冷
+            专家的权威驻留），钉住专家取顶部权威槽。hit-d2d 不可用时的整层拷贝回退
+            （全部 bank）与 hit-d2d 路径的小 bank 填充（小行宽 bank 既不进 batch
+            也不进命中 gather）共用本函数；buffer 的 position == 专家 id 契约不变，
+            GEMM 侧零感知。
+
+        Code Logic（这个函数做什么）:
+            CUDA 上对目标 bank 集合做两次 fast_index_copy_multi_jit：冷行 gather
+            （宿主 bank UVA 指针，src 行 = 恒等冷行序，dst 行 = 冷专家 id）、钉住
+            行 gather（slot cache 指针，src 行 = 钉住槽，dst 行 = 钉住 id）；索引
+            与行数缓冲由 _build_pin_gather_buffers 按固定 shape 预建，热路径零分配，
+            描述符不依赖 fused copy plan 的启用状态。small_only 时把描述符按预建的
+            小 bank 集合切片。CPU 设备（测试镜像）走等价的 torch index_copy_ 组合。
+            FREETOKEN_SKIP_FAST_INDEX_COPY=1 时与其他 fast_index_copy 消费方一样
+            整体跳过（消融旋钮的既定语义：输出仅在缓存已有内容时有意义）。
+        """
+        if self.device.type != "cuda":
+            bank_ids = range(len(self.banks))
+            if small_only:
+                bank_ids = self._overlap_small_bank_ids
+            for i in bank_ids:
+                per_layer, cache = self.banks[i]
+                target = self.prefill_bank_buffers[i][buffer_id]
+                target.index_copy_(0, self._pin_cold_dst[layer_id].long(), per_layer[layer_id])
+                if self.pin_counts[layer_id]:
+                    rows = cache[self._pin_gather_src[layer_id].long()]
+                    target.index_copy_(0, self._pin_gather_dst[layer_id].long(), rows)
+            return
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        buf_ptrs = self._prefill_buffer_ptrs[buffer_id]
+        host_ptrs = self._compose_host_ptrs[layer_id]
+        cache_ptrs, feats = self._compose_cache_ptrs, self._compose_feat_bytes
+        if small_only:
+            if not self._overlap_small_bank_ids:
+                return
+            sel = torch.tensor(self._overlap_small_bank_ids, dtype=torch.int64, device=self.device)
+            buf_ptrs = buf_ptrs.index_select(0, sel)
+            host_ptrs = host_ptrs.index_select(0, sel)
+            cache_ptrs = cache_ptrs.index_select(0, sel)
+            feats = feats.index_select(0, sel)
+        # 冷源：宿主冷压缩 bank，第 r 行 -> buffer 的第 cold_ids[r] 行（position==id）
+        fast_index_copy_multi_jit(
+            buf_ptrs,
+            host_ptrs,
+            feats,
+            self._pin_cold_dst[layer_id],
+            self._pin_cold_src[layer_id],
+            self._pin_cold_num[layer_id],
+        )
+        if self.pin_counts[layer_id]:
+            # 钉住源：slot cache 顶部权威槽，第 j 个钉住槽 -> buffer 的第 pin id 行
+            fast_index_copy_multi_jit(
+                buf_ptrs,
+                cache_ptrs,
+                feats,
+                self._pin_gather_dst[layer_id],
+                self._pin_gather_src[layer_id],
+                self._pin_gather_num[layer_id],
+            )
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
@@ -1089,11 +1288,15 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
-        # 显存钉住：把钉住权重从顶部权威槽 D2D 安装进 [0, E) 的 position==id 暂存位，
-        # prefill GEMM 因而保持原始形态（原始 id 直通、views 取前 E 行、n=E）。暂存位
-        # 在映射上是空槽（materialize kernel 清成 id=-1/usage=0），只服务本层本步的
-        # prefill GEMM，任何后续 ensure/materialize 都会按既有语义改写它们。
-        if self.pin_ids is not None:
+        # 显存钉住（仅非 overlap 的 materialize prefill 路径）：把钉住权重从顶部权威
+        # 槽 D2D 安装进 [0, E) 的 position==id 暂存位，prefill GEMM 因而保持原始形态
+        # （原始 id 直通、views 取前 E 行、n=E）。暂存位在映射上是空槽（materialize
+        # kernel 清成 id=-1/usage=0），只服务本层本步的 prefill GEMM，任何后续
+        # ensure/materialize 都会按既有语义改写它们。overlap 路径绝不走到这里
+        # （layers/moe.py 分支唯一），且 [0, E) 届时是双缓冲借用区，钉住行由
+        # _compose_prefill_banks/_prefetch_split 的顶部槽 gather 服务——此守卫
+        # 明确两套装配的互斥边界。
+        if self.pin_ids is not None and not self.prefill_overlap:
             k = self.pin_counts[layer_id]
             if k:
                 # [0, E) 是各层共享的层内 position==id 窗口，dst 即层内专家 id

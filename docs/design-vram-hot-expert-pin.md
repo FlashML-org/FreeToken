@@ -86,10 +86,10 @@ NVMe checkpoint（真源，只读）
 
 - 钉住区 = slot 顶部 `[cache_size - P, cache_size)`，`P = L × K`（每层 K 个，层 l 的第 j 个钉住专家 → slot `cache_size - P + l*K + j`）。
 - 选顶部原因：prefill 双缓冲借用底部 `[0, 2E)`（`prefill_hit_compact` 阈值、`_invalidate_prefill_buffer`）；`materialize_layer` 写 `[0,E)`。顶部互不干扰。
-- v1 约束（init 断言，错误信息明确）：
-  - `prefill_overlap` 必须为 False（overlap 双缓冲整层 bank 拷贝与冷压缩 bank 不兼容，v2 处理）；
+- 约束（init 校验，错误信息明确）：
   - LRU 区剩余 `cache_size - P ≥ max(2*E, 512)`，否则拒绝（防 LRU 退化）；
   - `hot_expert_list` 的 K 超预算时截断并告警。
+  - v1 曾要求 `prefill_overlap` 必须为 False；扩展二（§9）的三源组装已解除该互斥，钉住 + `--moe-prefill-overlap`/hit-d2d 为合法配置。
 
 #### 3.3.2 初始化（`engine.py::_init_offload_moe_cache` 扩展）
 
@@ -128,7 +128,7 @@ expert_ids.copy_(comb[:K_r])             # 写回 slot id
 
 | 机制 | 交互 | 处理 |
 |---|---|---|
-| prefill overlap 双缓冲 | 整层 bank 拷贝，与冷压缩不兼容 | v1 断言关闭；v2 三源组装（bank 冷行 + cache gather pinned + misses） |
+| prefill overlap 双缓冲 | 与冷压缩 bank 曾不兼容 | 扩展二三源组装已解除：miss 经 cold_row remap 进 batch、钉住行经顶部槽 D2D gather / 组合填充（bank 冷行 + cache 顶部槽 + misses 三源） |
 | `_invalidate_prefill_buffer` | 只写 `[0,2E)` | 顶部区无碰撞 |
 | `_reset_cache_kernel`（rebuild/reset） | 清空全部映射 | v1：带 pin 时 `rebuild`/reset 后重钉（调 init 的预填步骤）；至少断言并告警 |
 | `decode_log_interval`/`decode_miss_stats` | 统计语义 | miss 统计不含 pinned（它们恒命中），报告里注明 |
@@ -201,6 +201,7 @@ ft serve ... --hot-expert-list pins.json
 - `prefill_hit_compact` 语义已天然兼容：阈值 `slot >= 2*num_experts` 只排除双缓冲借用区，钉住槽（顶部）与 LRU 命中槽都会被收集为 hit → gather 进 buffer。无需改动或仅加注释。
 - `_prefetch_split` 的 **miss 侧**：宿主 run-list 从快照构建后，专家 id → `cold_row` remap（快照 host 数学内完成，miss 集合不含 pinned）。
 - **整层拷贝回退路径**（`copy()` 的 `buffer.copy_(per_layer[layer_id])`，hit-d2d 不可用时）：改为组合填充——冷行用 `index_select(bank, cold_row_table)`、钉住行用 fast_index_copy 从顶部槽 gather，两次固定 shape 拷贝；或统一走 gather 内核。实现者按最小 diff 选择，验收以数值一致为准。
+- **小行宽 bank**（< 256KB）在 hit-d2d 路径既不进 batch 也不进命中 gather：其整行集合（冷行自 bank + 钉住行自顶部槽）由同一组合填充覆盖，避免 batch 混入子 256KB 条目而整体退化为同步拷贝（实现时确定的关键细节：小 bank 的整层 batch 条目在冷压缩下行数不足 E，无法保留）。
 - 解除 §3.3.1 的 `prefill_overlap=False` 断言：钉住与 overlap 同时启用成为合法配置；`_hit_d2d_usable` 的各回退原因补一条钉住相关检查（顶部区必须存在）。
 - 快照一致性：`begin_prefill` 的 snapshot 已 fence 在前一次 decode 之后，钉住映射在 chunk 之间不变（动态重钉只在 idle 安全点发生，见 §10），无需额外同步，但需在注释中写明该前提。
 
