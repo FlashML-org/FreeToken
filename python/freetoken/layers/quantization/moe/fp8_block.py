@@ -19,9 +19,13 @@ def _pad_scale(rows: int, cols: int) -> int:
 
 class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
+    # 128x128 block-fp8 的 bank 同样可被 CPU executor 消费（#534）：C++ GEMV 原地读
+    # 同一份 e4m3 + padded bf16 scale 行，K 循环内解量化；声明 cpu_format 后，
+    # 策略解析在显存不足 -> offload/hybrid 时不再抛 KernelSelectionError。
+    cpu_format = "fp8_block"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
