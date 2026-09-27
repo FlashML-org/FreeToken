@@ -2,6 +2,9 @@
 
 AMD users: see the [AMD ROCm installation guide (WIP)](install_amd.md).
 
+If a build fails (CUDA major mismatch, gcc/clang host compiler, a Python whose sysconfig
+bakes in clang flags), see [build-troubleshooting.md](build-troubleshooting.md).
+
 ## Requirements
 
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
