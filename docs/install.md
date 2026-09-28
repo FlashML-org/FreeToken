@@ -1,5 +1,7 @@
 # Install
 
+AMD users: see the [AMD ROCm installation guide (WIP)](install_amd.md).
+
 ## Requirements
 
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
