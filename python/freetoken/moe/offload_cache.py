@@ -645,31 +645,121 @@ class OffloadMoeCache:
             total += sum(c * row_bytes for c in self.pin_counts)
         return total
 
-    def load_pinned_rows(self, stage: dict[str, torch.Tensor]) -> None:
-        """把钉住权重的 GPU 暂存拷进 slot cache 顶部区（钉住权重入显存的最后一步）。
+    def load_pinned_rows(self, stages: list[dict[str, torch.Tensor] | None]) -> None:
+        """把每一层自己的钉住权重拷进该层的 pin slots。
 
         Business Logic（为什么需要这个函数）:
-            钉住专家的权重在 bank 加载期经 per-layer host 暂存 + GPU arena 流转过来
-            （host 峰值 ≤ 单层钉住字节），但加载期 slot cache 尚未分配，只能在
-            set_bank_sources 之后由本方法一次性 D2D 就位。
+            钉住专家的权重在 bank 加载期以 per-layer host 暂存过来，slot cache
+            要等 set_bank_sources 之后才存在。每一层必须用自己的暂存：共用一块
+            缓冲再写进所有层，服务的就是最后一层的权重。
 
         Code Logic（这个函数做什么）:
-            逐层把 stage[role] 的前 pin_counts[l] 行按 pin_slots[l]（行序 == pin list
-            序 == 槽位分配序）写进对应 bank cache 的顶部槽；arena 行数是各层钉住数的
-            最大值，超出该层钉住数的残余行不会被映射、不被读取。init_hot_pins 之后、
-            首次 forward 之前调用一次。
+            stages 与层一一对应，None 表示该层没有钉住。有钉住数但 stage 缺失则
+            抛 RuntimeError。按 pin_slots[l]（行序 == pin list 序）把
+            stage[role] 的前 pin_counts[l] 行写入对应 bank cache。init_hot_pins
+            之后、首次 forward 之前调用一次。调用方随后丢掉 stages。
         """
         assert self.pin_counts is not None and self.pin_slots is not None, (
             "load_pinned_rows requires init_hot_pins first"
         )
         assert self.banks, "set_bank_sources must register the banks first"
+        if len(stages) != self.num_layers:
+            raise ValueError(
+                f"load_pinned_rows expected {self.num_layers} layers, got {len(stages)}"
+            )
         for layer_id, count in enumerate(self.pin_counts):
+            stage = stages[layer_id]
             if not count:
                 continue
+            if stage is None:
+                raise RuntimeError(
+                    f"layer {layer_id} has {count} pinned experts but no staged weights"
+                )
             slots = self.pin_slots[layer_id, :count].long()
             for role, tensor in stage.items():
+                if tensor.shape[0] < count:
+                    raise ValueError(
+                        f"layer {layer_id} role {role} stage has {tensor.shape[0]} rows, need {count}"
+                    )
                 cache = self.bank_caches[role]
                 cache[slots] = tensor[:count].to(device=cache.device, dtype=cache.dtype)
+
+    def _snapshot_pinned_rows(self) -> list[dict[str, torch.Tensor]] | None:
+        """
+        Business Logic（为什么需要这个函数）:
+            rebuild 会丢掉整块 slot cache。钉住专家的 host bank 没有这些行
+            （cold_row = -1），不先拷出来，重钉之后槽里是零，decode 仍当命中。
+
+        Code Logic（这个函数做什么）:
+            按 (layer, pin 序号) 把当前活跃 pin slots 的各 bank 行拷到 CPU。
+            没有钉住时返回 None。行序与 pin_ids 前缀一致，几何变了也能按新槽写回。
+        """
+        if self.pin_ids is None or self.pin_slots is None or self.pin_counts is None:
+            return None
+        if not any(self.pin_counts):
+            return None
+        layers: list[dict[str, torch.Tensor]] = []
+        for layer_id, count in enumerate(self.pin_counts):
+            if not count:
+                layers.append({})
+                continue
+            slots = [int(s) for s in self.pin_slots[layer_id, :count].tolist()]
+            copied: dict[str, torch.Tensor] = {}
+            for role, cache in self.bank_caches.items():
+                # 逐行 copy_：fp8 等 bank dtype 没有 index_select。
+                host = torch.empty(
+                    (count, *cache.shape[1:]),
+                    dtype=cache.dtype,
+                    pin_memory=(self.device.type == "cuda"),
+                )
+                for row, slot in enumerate(slots):
+                    host[row].copy_(cache[slot])
+                copied[role] = host
+            layers.append(copied)
+        return layers
+
+    def _restore_pinned_rows(self, layers: list[dict[str, torch.Tensor]] | None) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            snapshot 之后 pin 槽下标随 cache_size 重算过。字节要按 pin 序号写回
+            新槽，按旧 slot 下标写会落到别的专家上。
+
+        Code Logic（这个函数做什么）:
+            layers[layer][role] 的第 j 行写入 pin_slots[layer, j]。空 dict 跳过。
+            行数与当前活跃钉住数不一致时抛 RuntimeError。
+        """
+        if not layers or self.pin_slots is None or self.pin_counts is None:
+            return
+        for layer_id, rows in enumerate(layers):
+            if not rows:
+                continue
+            count = self.pin_counts[layer_id]
+            slots = self.pin_slots[layer_id, :count].long()
+            for role, src in rows.items():
+                if src.shape[0] != count:
+                    raise RuntimeError(
+                        f"layer {layer_id} role {role} pin snapshot has {src.shape[0]} rows, "
+                        f"active pins are {count}"
+                    )
+                cache = self.bank_caches[role]
+                cache[slots] = src.to(device=cache.device, dtype=cache.dtype)
+
+    def _clear_stale_slot_ids(self, stale_slots: list[int], keep_slots: list[int]) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            扩 K 或换血后，专家在 LRU 里的旧槽必须去掉 id 映射，否则下一次驱逐
+            会按旧 id 把刚钉上的 slot_for_id 清掉。空闲容量槽已经回到 LRU，这个
+            旧槽可能正好是本批要钉住的新槽，这种槽不能清。
+
+        Code Logic（这个函数做什么）:
+            从 stale_slots 去掉 keep_slots 后，把剩下的 id_of_slot 写成 -1。
+            没有可清的槽时不写映射。
+        """
+        keep = set(keep_slots)
+        drop = [slot for slot in stale_slots if slot not in keep]
+        if not drop:
+            return
+        self.id_of_slot[torch.tensor(drop, dtype=torch.long, device=self.device)] = -1
 
     def pinned_id_lists(self) -> list[list[int]]:
         """每层当前钉住专家 id 的 host 快照（pin list 序 == 槽位序；未钉住为全空）。
@@ -825,10 +915,9 @@ class OffloadMoeCache:
         self.cold_row[layer_id, h_t] = torch.tensor(r_list, dtype=torch.int32, device=self.device)
         self.slot_for_id[layer_id, c_t] = s_t.to(torch.int32)
         self.slot_for_id[layer_id, h_t] = -1
+        # 先清旧 LRU 槽再写新 id。旧槽若就是本批的新钉槽，helper 会把它留在 keep 里。
+        self._clear_stale_slot_ids(stale_slots, s_list)
         self.id_of_slot[s_t] = flat_c
-        if stale_slots:
-            # 候选旧 LRU 副本槽去映射（见上文 stale_slots 收集处的说明）
-            self.id_of_slot[torch.tensor(stale_slots, dtype=torch.long, device=self.device)] = -1
         # usage 刷成当前 step：flashlib 路径的钉住槽靠"usage == step 不可驱逐"自我
         # 续期，交换后到该层下一次合并查询之间有其他层 ensure 的窗口，旧 usage 的
         # 钉住槽理论上可能成为全局 argmin 受害者；刷成当前 step 后它是最年轻的
@@ -938,9 +1027,9 @@ class OffloadMoeCache:
         self.pin_ids[layer_id].index_copy_(0, j_t, e_t.to(torch.int32))
         self.cold_row[layer_id, e_t] = -1
         self.slot_for_id[layer_id, e_t] = s_t.to(torch.int32)
+        # 先清旧 LRU 槽再写新 id。专家可能正住在即将钉住的那个容量槽里。
+        self._clear_stale_slot_ids(stale_slots, s_list)
         self.id_of_slot[s_t] = flat_e
-        if stale_slots:
-            self.id_of_slot[torch.tensor(stale_slots, dtype=torch.long, device=self.device)] = -1
         # usage 刷成当前 step（理由同 swap_pinned_experts）；冷行让给空闲行池。
         # pin_held=1：这个槽离开 LRU，hybrid 不再把它当受害槽。
         self.usage[s_t] = step
@@ -1248,12 +1337,14 @@ class OffloadMoeCache:
 
         Keeps the CPU/pinned ``bank_sources`` and the GPU-resident alphas; never
         reloads banks. Tears down prefill-overlap buffers first (their views alias
-        the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
-        cold-start after rebuild. Object identity is preserved so attached layers and
-        ``ctx.moe_offload_cache`` stay valid.
+        the old ``bank_caches``), frees the old GPU tensors, then reallocates.
+        Unpinned slots cold-start. Pinned rows are restored from a host snapshot:
+        those experts have no host-bank row to reload. Object identity is preserved
+        so attached layers and ``ctx.moe_offload_cache`` stay valid.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
+        pinned_rows = self._snapshot_pinned_rows()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self._prefill_buffer_ptrs = []
@@ -1301,6 +1392,7 @@ class OffloadMoeCache:
             self._pin_query_buffers = {}
             self._init_pin_geometry()
             self._fill_pin_maps()
+            self._restore_pinned_rows(pinned_rows)
             # pin_slots 随 cache_size 变了，钉住行 gather 索引同步刷新
             self._build_pin_gather_buffers()
         self.stat_missing.zero_()

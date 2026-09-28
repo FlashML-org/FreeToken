@@ -173,6 +173,47 @@ def test_prefill_forward_records_hotness(monkeypatch, tmp_path):
     assert hot.total_tokens == 1
 
 
+def test_routed_forward_records_hotness_before_slot_rewrite(monkeypatch, tmp_path):
+    """外部路由只走 routed_forward。热度在 topk_ids 被改成槽位号之前记下。"""
+    _init_tp()
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    layer = OffloadMoELayer(
+        1, 4, 2, 8, 16, quant_config=NoQuantConfig(), prefix="model.layers.1.mlp.experts"
+    )
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+            "down": [torch.randn(4, 8, 16) for _ in range(2)],
+        }
+    )
+    layer.offload_cache = cache
+    hot = _make_hotness(tmp_path, num_layers=2, num_experts=4)
+    cache.hotness = hot
+
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    seen: dict[str, torch.Tensor] = {}
+
+    def _capture(_hidden, _weights, ids):
+        seen["ids"] = ids.detach().clone()
+        return _hidden
+
+    monkeypatch.setattr(layer, "_decode_routed", _capture)
+    monkeypatch.setattr(
+        "freetoken.layers.moe.get_global_ctx",
+        lambda: type("Ctx", (), {"batch": type("Batch", (), {"is_prefill": False})()})(),
+    )
+    out = layer.routed_forward(torch.randn(1, 8), topk_weights, topk_ids)
+    assert out is not None
+    assert int(hot.counts[1 * 4 + 1]) == 1 and int(hot.counts[1 * 4 + 2]) == 1
+    assert hot.total_tokens == 1
+    assert seen["ids"].tolist() == [[2, 1]]
+
+
 def test_exit_flush_is_reentrancy_safe(monkeypatch, tmp_path):
     """install_exit_flush 幂等注册；_exit_flush 只落盘一次，失败吞异常。"""
     hot = _make_hotness(tmp_path)

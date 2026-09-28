@@ -759,8 +759,7 @@ def parse_args(
             "a hotness stats JSON (--hot-stats-out format) to pick from internally at "
             "load time. Pinned experts stay single-copy resident in VRAM (never "
             "LRU-evicted, never swapped over PCIe) and the host banks hold only the "
-            "remaining cold experts. Requires --disable-moe-prefill-overlap in v1 "
-            "(prefill overlap is rejected at startup when pinning is on)."
+            "remaining cold experts."
         ),
     )
 

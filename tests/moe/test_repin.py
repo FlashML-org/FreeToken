@@ -642,6 +642,55 @@ def test_install_pinned_experts_truncates_at_capacity():
     assert fresh.cold_row[0, 2].item() >= 0 and fresh._pin_free_rows[0] == set()
 
 
+def test_install_keeps_mapping_when_lru_slot_is_the_new_pin():
+    """专家正住在即将钉住的容量槽里时，装入后 id_of_slot 仍指向它；别的旧槽要清掉。"""
+    _init_tp()
+    E = 16
+    cache = _make_pinned_cache(
+        num_layers=1, num_experts=E, pins=(0,), k_per_layer=[1],
+        cache_size=4 + max(2 * E, LRU_FLOOR) + 8,
+    )
+    _init_pins(cache, pins=(0,), k_per_layer=[1], pin_capacity=4)
+    _load_pinned_slot_contents(cache)
+    s5 = int(cache.pin_slots[0, 1].item())
+    s6 = int(cache.pin_slots[0, 2].item())
+    # 5 住在自己即将占用的钉槽里；6 住在 LRU 区的 0 号槽。同一批装入。
+    cache.id_of_slot[s5] = 5
+    cache.slot_for_id[0, 5] = s5
+    cache.id_of_slot[0] = 6
+    cache.slot_for_id[0, 6] = 0
+    assert cache.install_pinned_experts(0, [5, 6]) == [5, 6]
+    assert int(cache.id_of_slot[s5].item()) == 5
+    assert int(cache.id_of_slot[s6].item()) == 6
+    assert int(cache.id_of_slot[0].item()) == -1
+    assert int(cache.slot_for_id[0, 5].item()) == s5
+    assert int(cache.slot_for_id[0, 6].item()) == s6
+    assert int(cache.pin_held[s5].item()) == 1 and int(cache.pin_held[s6].item()) == 1
+    for slot, expert in ((s5, 5), (s6, 6)):
+        for _per_layer, bank_cache in cache.banks:
+            assert bank_cache[slot].mean().item() == float(expert)
+
+
+def test_idle_wait_s_is_the_remaining_window():
+    """换血唤醒时间是窗口剩余秒数；过点有下限；目录模式不醒。"""
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+
+    _init_tp()
+    cache = _make_pinned_cache(num_layers=1, num_experts=8, pins=(1,), k_per_layer=[1])
+    _init_pins(cache, pins=(1,), k_per_layer=[1])
+    hot = _make_hotness(num_layers=1, num_experts=8, window_interval_s=10.0)
+    manager = HotExpertRepinManager(cache, hot, interval_s=10.0, gain=1.5, max_swaps=1)
+    manager._last = 1000.0
+    assert manager.idle_wait_s(now=1000.0) == pytest.approx(10.0)
+    assert manager.idle_wait_s(now=1006.0) == pytest.approx(4.0)
+    assert manager.idle_wait_s(now=1010.0) == pytest.approx(0.05)
+    assert manager.idle_wait_s(now=1025.0) == pytest.approx(0.05)
+    catalog = HotExpertRepinManager(
+        cache, hot, interval_s=10.0, gain=1.5, max_swaps=1, catalog=[[1, 2]]
+    )
+    assert catalog.idle_wait_s(now=1000.0) is None
+
+
 # ---------------------------------------------------------------------------
 # GPU：动态 K 值更新对已捕获 decode 图立即生效（hybrid 内核）
 # ---------------------------------------------------------------------------

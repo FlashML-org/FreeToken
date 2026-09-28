@@ -155,11 +155,31 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
-        # 动态重钉（设计文档 §10）：此处是调度器真正泊入空闲的位置（阻塞等待下一条
-        # 消息之前）。重钉由墙钟触发而非消息触发，loop 内的消息驱动 idle 点（下方
-        # _maybe_repin）在纯空闲时不可达——只有这里能保证"无人请求也会按窗口周期
-        # 重钉"。调度器此时无在途 batch，管理器执行前还会做全设备同步栅栏。
+        # 动态重钉的一次检查。阻塞收包期间窗口仍可能封口，_recv_msg_* 会按
+        # _repin_wait_ms 醒过来再进这里。调度器此时无在途 batch。
         self._maybe_repin(None)
+
+    def _repin_wait_ms(self) -> int | None:
+        """
+        Business Logic（为什么需要这个函数）:
+            空闲收包默认一直阻塞。开了 EMA 换血时，窗口可能在阻塞期间封口，
+            必须有超时把调度器叫醒，否则要等下一条请求才换血。
+
+        Code Logic（这个函数做什么）:
+            没有 repin 管理器，或管理器表示不用醒（目录模式），返回 None。
+            否则把 idle_wait_s 换成毫秒，至少 1ms。
+        """
+        repin = getattr(
+            getattr(getattr(self, "engine", None), "moe_offload_cache", None),
+            "repin_manager",
+            None,
+        )
+        if repin is None:
+            return None
+        wait_s = repin.idle_wait_s()
+        if wait_s is None:
+            return None
+        return max(1, int(wait_s * 1000.0))
 
     @torch.inference_mode()
     def rebuild_cache(

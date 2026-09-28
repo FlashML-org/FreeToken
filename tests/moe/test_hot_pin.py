@@ -227,6 +227,18 @@ def test_load_pin_list_roundtrip_and_errors(tmp_path):
     with pytest.raises(ValueError, match="--hot-expert-slots"):
         _load_pin_list(str(tmp_path / "stats.json"), 2, 8)
 
+    # 文件顺序与 layer 字段不一致时按 layer 索引，不按出现顺序装到层上
+    swapped = json.loads(path.read_text(encoding="utf-8"))
+    swapped["pins"] = list(reversed(swapped["pins"]))
+    (tmp_path / "swapped.json").write_text(json.dumps(swapped), encoding="utf-8")
+    assert _load_pin_list(str(tmp_path / "swapped.json"), 2, 8) == [[7, 2], [0, 5]]
+    # 条目数够，但同一层写了两次、另一层缺失
+    dup_layer = json.loads(path.read_text(encoding="utf-8"))
+    dup_layer["pins"] = [dup_layer["pins"][0], dict(dup_layer["pins"][0])]
+    (tmp_path / "dup_layer.json").write_text(json.dumps(dup_layer), encoding="utf-8")
+    with pytest.raises(ValueError, match="重复出现"):
+        _load_pin_list(str(tmp_path / "dup_layer.json"), 2, 8)
+
 
 def test_cold_row_is_inverse_of_pins():
     """cold_row：pinned -> -1，冷专家 -> 按 id 升序的行号；无钉层为恒等。"""
@@ -437,6 +449,30 @@ def test_capacity_layout_geometry_guards_and_padding():
         small.init_hot_pins(*args, pin_capacity=2)
 
 
+def test_load_pinned_rows_keeps_each_layers_weights():
+    """每层钉住槽装的是自己的暂存，不是最后一层的那一份。"""
+    cache = _make_pinned_cache(num_layers=2, num_experts=16, pins=(3, 7))
+    _init_pins(cache, pins=(3, 7))
+    stages: list[dict[str, torch.Tensor] | None] = []
+    for layer_id, count in enumerate(cache.pin_counts):
+        stage = {}
+        for role, bank_cache in cache.bank_caches.items():
+            stage[role] = torch.full(
+                (count, *bank_cache.shape[1:]), float(layer_id * 100 + 3), dtype=bank_cache.dtype
+            )
+        stages.append(stage)
+    cache.load_pinned_rows(stages)
+    for layer_id, count in enumerate(cache.pin_counts):
+        for j in range(count):
+            slot = int(cache.pin_slots[layer_id, j].item())
+            for bank_cache in cache.bank_caches.values():
+                assert float(bank_cache[slot].mean().item()) == float(layer_id * 100 + 3)
+    missing = list(stages)
+    missing[0] = None
+    with pytest.raises(RuntimeError, match="layer 0"):
+        cache.load_pinned_rows(missing)
+
+
 def test_reset_and_rebuild_restore_pin_maps():
     """reset/rebuild 清空全部映射后必须立即重钉（钉住专家永远命中不变式）。"""
     from freetoken.moe import offload_kernels
@@ -461,12 +497,16 @@ def test_reset_and_rebuild_restore_pin_maps():
         for j, e in enumerate(pins_matrix[l]):
             assert int(cache.slot_for_id[l, e].item()) == cache.pin_base + l * 2 + j
 
-    # rebuild：cache_size 变化 -> 几何重解算 + 重钉
+    # rebuild：cache_size 变化 -> 几何重解算 + 重钉，钉住字节按 pin 序号写回新槽
+    _load_pinned_slot_contents(cache)
     cache.rebuild(cache.cache_size + 16)
     assert cache.pin_base == cache.cache_size - 4
     for l in range(2):
         for j, e in enumerate(pins_matrix[l]):
-            assert int(cache.slot_for_id[l, e].item()) == cache.pin_base + l * 2 + j
+            slot = int(cache.slot_for_id[l, e].item())
+            assert slot == cache.pin_base + l * 2 + j
+            for _, bank_cache in cache.banks:
+                assert float(bank_cache[slot].mean().item()) == float(l * 100 + e)
     # rebuild 地板：钉住区扣掉后 LRU 不足 -> 拒绝
     with pytest.raises(ValueError, match="LRU"):
         cache.validate_rebuild(4 + 100)

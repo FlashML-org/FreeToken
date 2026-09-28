@@ -209,16 +209,19 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Expert compute for an externally computed routing decision (``TopK``).
-
-        The entry point for models whose router does not fit ``fused_topk`` (sigmoid
-        scores, selection bias, group-limited top-k, ...); identical to ``forward``
-        past the router. ``topk_ids`` must be safe to mutate in place (decode
-        rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
-
-        ``hidden_states`` may also be overwritten by the expert kernel. Compute
-        shared branches that need the original input before calling this method.
         """
+        Business Logic（为什么需要这个函数）:
+            GLM、Gemma4、DeepSeek、gpt-oss、MiniMax 自己算完 top-k，只调用这里。
+            热度如果只记在 fused_topk 那条 forward 上，这些模型的换血窗口永远是空的。
+
+        Code Logic（这个函数做什么）:
+            cache.hotness 存在时，先用还没被改写成槽位号的 topk_ids 调 record。
+            再按 batch 阶段进入 _prefill_routed 或 _decode_routed，最后 all-reduce。
+            topk_ids 必须允许就地改写；hidden_states 也可能被专家内核覆盖。
+        """
+        cache = self.offload_cache
+        if cache is not None and cache.hotness is not None:
+            cache.hotness.record(self.layer_id, topk_ids)
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)

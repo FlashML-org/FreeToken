@@ -673,31 +673,27 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
-        # 钉住装配：loader 侧冷压缩 + per-layer 钉住暂存 sink。sink 只保住一个可复用的
-        # GPU 暂存（峰值 = 单层钉住字节），待 set_bank_sources 建好 slot cache 后一次性
-        # D2D 进顶部区（host 暂存每层移交后即释放，峰值 ≤ 单层钉住字节）。
+        # 钉住装配：loader 冷压缩后把每层钉住暂存交给 sink。每层必须单独保住。
+        # 复用一块 GPU arena 再广播，后一层会覆盖前一层，所有层都装上最后一层的权重。
+        # 暂存留在 host，等自动 cache 按空闲显存划完再逐层 H2D，避免提前占掉那块预算。
         pin_sets = pin_sink = None
-        pin_arena: dict[str, torch.Tensor] | None = None
+        pin_stages: list[dict[str, torch.Tensor] | None] | None = None
         if pin_plan is not None:
             pin_sets = {
                 layer_id: experts
                 for layer_id, experts in enumerate(pin_plan.pins)
                 if experts
             }
-            k_arena = max(len(experts) for experts in pin_sets.values())
+            pin_stages = [None] * num_moe_layers
 
             def pin_sink(layer_id: int, stage: dict[str, torch.Tensor]) -> None:
-                """单层钉住权重移交点：H2D 进（惰性分配的）可复用 GPU 暂存后立即丢弃 host 暂存。"""
-                nonlocal pin_arena
-                if pin_arena is None:
-                    pin_arena = {
-                        role: torch.zeros(
-                            (k_arena, *tensor.shape[1:]), dtype=tensor.dtype, device=self.device
-                        )
-                        for role, tensor in stage.items()
-                    }
-                for role, tensor in stage.items():
-                    pin_arena[role][: tensor.shape[0]].copy_(tensor)
+                """保住这一层 loader 已经物化的 host 暂存。调用方返回后会丢掉局部引用。"""
+                assert pin_stages is not None
+                if not 0 <= layer_id < len(pin_stages):
+                    raise RuntimeError(f"pin sink layer {layer_id} out of range")
+                if pin_stages[layer_id] is not None:
+                    raise RuntimeError(f"layer {layer_id} delivered a pin stage twice")
+                pin_stages[layer_id] = stage
 
         try:
             with _weight_load_context():
@@ -794,10 +790,14 @@ class Engine:
                 pin_ids, counts, banks.cold_row, pin_capacity=pin_capacity,
                 lru_min_slots=config.hot_expert_lru_floor or None,
             )
-            if pin_arena is not None:
-                # 钉住权重入显存：GPU 暂存 -> slot cache 顶部区（行序 == pin list 序 == 槽位分配序）
-                cache.load_pinned_rows(pin_arena)
-                pin_arena = None
+            if pin_stages is not None:
+                # 每层 host 暂存 H2D 进自己的 pin slots。清掉列表内容，sink 闭包
+                # 还指着这个 list 时字节也能马上放开。
+                cache.load_pinned_rows(pin_stages)
+                for index in range(len(pin_stages)):
+                    pin_stages[index] = None
+                pin_stages = None
+                pin_sink = None
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         if config.tune_file:

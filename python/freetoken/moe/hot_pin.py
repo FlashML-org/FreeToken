@@ -83,8 +83,9 @@ def _load_pin_list(path: str, num_layers: int, num_experts: int) -> list[list[in
     Code Logic（这个函数做什么）:
         读取并校验 pin list JSON：schema_version 必须为 1；num_layers/num_experts
         必须与当前模型一致；per_layer_slots 为正整数且每层 experts 长度与之相等、
-        专家 id 在 [0, num_experts) 内且层内不重复。校验失败抛 ValueError；成功
-        返回 [num_layers][K] 的专家 id 列表（保持 pin list 顺序）。
+        专家 id 在 [0, num_experts) 内且层内不重复。条目按 layer 字段放回下标，
+        文件顺序不作数；layer 必须恰好覆盖 0..num_layers-1 各一次。校验失败抛
+        ValueError；成功返回 [num_layers][K] 的专家 id 列表（层内保持文件顺序）。
     """
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
@@ -110,14 +111,16 @@ def _load_pin_list(path: str, num_layers: int, num_experts: int) -> list[list[in
     pins = payload.get("pins")
     if not isinstance(pins, list) or len(pins) != num_layers:
         raise ValueError(f"pin list pins 必须是 {num_layers} 个条目的 list: {path}")
-    result: list[list[int]] = []
+    by_layer: dict[int, list[int]] = {}
     for entry in pins:
         if not isinstance(entry, dict) or not {"layer", "experts"} <= set(entry):
             raise ValueError(f"pin list 每项须含 layer/experts 字段: {entry!r}")
         layer_id = entry["layer"]
         experts = entry["experts"]
-        if not isinstance(layer_id, int) or not 0 <= layer_id < num_layers:
+        if isinstance(layer_id, bool) or not isinstance(layer_id, int) or not 0 <= layer_id < num_layers:
             raise ValueError(f"pin list layer 越界: {layer_id!r}")
+        if layer_id in by_layer:
+            raise ValueError(f"pin list layer {layer_id} 重复出现")
         if not isinstance(experts, list) or len(experts) != slots:
             raise ValueError(
                 f"pin list layer {layer_id} 的 experts 长度必须为 per_layer_slots={slots}，"
@@ -127,8 +130,13 @@ def _load_pin_list(path: str, num_layers: int, num_experts: int) -> list[list[in
             raise ValueError(f"pin list layer {layer_id} 含越界/非法专家 id: {experts}")
         if len(set(experts)) != len(experts):
             raise ValueError(f"pin list layer {layer_id} 内专家 id 重复: {experts}")
-        result.append(list(experts))
-    return result
+        by_layer[layer_id] = list(experts)
+    missing = [i for i in range(num_layers) if i not in by_layer]
+    if missing:
+        raise ValueError(
+            f"pin list 必须恰好覆盖 layer 0..{num_layers - 1} 各一次，缺少 {missing}"
+        )
+    return [by_layer[i] for i in range(num_layers)]
 
 
 def cold_row_from_pins(pins: list[list[int]], num_experts: int) -> torch.Tensor:
@@ -620,6 +628,25 @@ class HotExpertRepinManager:
                     "(known interaction defect); prefill uses full-layer copies"
                 )
         return bool(unpinned_total or pinned_total)
+
+    def idle_wait_s(self, now: float | None = None) -> float | None:
+        """
+        Business Logic（为什么需要这个函数）:
+            调度器空闲时阻塞等下一条请求。EMA 窗口若在这次阻塞里封口，没有超时
+            就要等下一条请求才换血。这里告诉收包最多再等多久该醒一次。目录模式
+            只沿 pin list 调 K，不按窗口换血，继续一直阻塞。
+
+        Code Logic（这个函数做什么）:
+            目录模式返回 None。否则返回距离上次 maybe_repin 计时点的剩余秒数；
+            已经过点时返回 0.05，避免 _last 停在过去时忙等。now 只给测试注入。
+        """
+        if self._catalog is not None:
+            return None
+        now = time.monotonic() if now is None else now
+        remaining = self._interval_s - (now - self._last)
+        if remaining <= 0.0:
+            return 0.05
+        return remaining
 
     def maybe_repin(self, now: float | None = None) -> bool:
         """
