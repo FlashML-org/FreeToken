@@ -59,9 +59,9 @@ class EngineConfig:
     moe_cpu_layers: str | None = None
     # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
-    # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
-    # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
-    # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
+    # -1 (default) = auto: fetch 50% of each step's misses over PCIe and compute the
+    # rest on the CPU. That split is the measured decode optimum (K=32 hybrid FP8);
+    # a non-negative value is an explicit per-step fetch cap instead.
     moe_hybrid_max_fetch: int = -1
     # Expert-routing hotness collection (offload family): when set, every MoE layer
     # accumulates its raw routing ids into a device-side counter and the scheduler
@@ -85,14 +85,14 @@ class EngineConfig:
     # （宿主冷 bank 的下界），其余排名留在目录里供 pin_k 按原序扩容；EMA 换血关闭。
     # None = 整张 pin list 都是初始钉住集（原行为）。
     hot_expert_active_k: int | None = None
-    # LRU 区地板（槽数）：0 = 默认 max(2×专家数, 512)；放宽到 ≥1 可换取更大的
-    # 钉住容量上限（K_cap 上限 = (cache_size - floor) // 层数）
-    hot_expert_lru_floor: int = 0
+    # LRU 区地板（槽数）。1（默认）允许钉住容量把 LRU 收到 1 槽；空着的容量槽
+    # 仍算 LRU。0 = 内置地板 max(2×专家数, 512)。
+    hot_expert_lru_floor: int = 1
     # 动态重钉（设计 §10）：滑动窗口热度驱动的运行期重钉，钉住模式下按墙钟间隔
     # （秒）把 device 热度计数 D2H 成"当前窗口"，经 EMA（半衰期 = 窗口时长）平滑后
-    # 与当前钉住集比较，仅在 idle 安全点做行级交换。0 = 关闭（默认）；>0 时钉住
-    # 模式下的热度计数器自动常开（即使未设 hot_stats_out）。
-    hot_expert_repin_interval_s: float = 0.0
+    # 与当前钉住集比较，仅在 idle 安全点做行级交换。60（默认）= 钉住模式下每 60s
+    # 封一个热度窗口并允许 EMA 换血；0 = 关闭。未配置钉住表时此值不生效。
+    hot_expert_repin_interval_s: float = 60.0
     # 重钉迟滞：候选专家的 EMA 计数 ≥ 被替换钉住专家 × gain 才交换（防抖，>1）。
     hot_expert_repin_gain: float = 1.5
     # 每周期每层最多交换的专家对数。

@@ -624,13 +624,7 @@ class Engine:
         # 显存钉住（--hot-expert-list[/--hot-expert-slots]）：读取并校验钉住计划，
         # 剥离 CPU 解码层的钉住项；未配置时为 None，一切行为与现状一致。
         pin_plan = _resolve_hot_pin_plan(config, num_moe_layers, num_experts, cpu_layer_ids)
-        # 动态重钉（设计 §10）只能在钉住模式下开启：提前到 bank 加载前拒绝，避免
-        # 装载一半才失败。
-        if config.hot_expert_repin_interval_s > 0 and pin_plan is None:
-            raise ValueError(
-                "--hot-expert-repin-interval-s 需要显存钉住模式：请同时配置 "
-                "--hot-expert-list[/--hot-expert-slots]（0 = 关闭动态重钉）"
-            )
+        # 默认 60s 换血窗口。没配钉住表时 pin_plan 为 None，后面不会建管理器。
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -892,33 +886,21 @@ class Engine:
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
-        """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
+        """
+        Business Logic（为什么需要这个函数）:
+            hybrid decode 要把每步 miss 拆成 PCIe 换入和 CPU 计算。实测在 K=32 上
+            各取一半最快；带宽画像给出的比例没有这组负载准。
 
-        Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :
-        (cpu_bw - pcie_bw), i.e. fetching a pcie_bw / cpu_bw fraction of each decode
-        step's misses -- both sides then finish together instead of one idling. The
-        achieved bandwidths come from the cached `ft bench bw` profile (the same one the
-        auto backend pick reads); without a usable profile the old fixed cap of 1 applies.
+        Code Logic（这个函数做什么）:
+            moe_hybrid_max_fetch >= 0 时保持显式 cap，不改比例。默认 -1 时把
+            每步拉取上限设为全部专家数，fetch_fraction 设为 0.5。
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
-        from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
-
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
-        if fraction is None:
-            cache.set_fetch_params(1, 0.0)  # 无 profile 旧语义：固定 cap 1、无比例分流
-            logger.warning_rank0(
-                "--moe-hybrid-max-fetch auto: no usable `ft bench bw` profile for "
-                f"{cache.quant_format!r} experts; using a fixed fetch cap of 1"
-            )
-            return
-        cache.set_fetch_params(cache.num_experts, fraction)
+        cache.set_fetch_params(cache.num_experts, 0.5)
         logger.info_rank0(
-            f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
-            "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
+            "--moe-hybrid-max-fetch auto: fetching 50.0% of each decode step's "
+            "expert misses over PCIe, the rest on the CPU"
         )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:

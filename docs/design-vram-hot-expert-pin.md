@@ -213,7 +213,7 @@ ft serve ... --hot-expert-list pins.json
 
 **机制**：
 - **窗口统计**：钉住模式下 `ExpertHotness` 常开（不再仅 `--hot-stats-out` 时）。双缓冲计数：每次墙钟排空（间隔 = min(落盘间隔, T)）把 device `counts` 增量 D2H 后清零，增量先并入"当前窗口"宿主累计器（device 部分 + 已排空部分合起来才是完整窗口，排空可横跨窗口边界）；窗口边界到达即封口出"完整窗口"，上一窗口保留为参照；EMA（半衰期=窗口长，每窗衰减 0.5，首窗直取）作为平滑热度，提供 `window_topk` 与 `ema_kth`（第 K 名计数）查询。`--hot-stats-out` 的全量累计仍吃同一份增量，语义不变。
-- **重钉决策**（宿主侧纯计算，`--hot-expert-repin-interval-s` 默认 0=关闭，>0 时钉住模式下计数器自动常开）：每层比较 EMA top-K 与当前钉住集；仅当"候选 ∈ 当前冷集 且 EMA(候选) ≥ EMA(被替换者) × `--hot-expert-repin-gain`"（默认 1.5，迟滞防抖；EMA=0 的候选不换）才交换；每周期每层最多换 `--hot-expert-repin-max-swaps`（默认 8）个；候选/受害排序平局取小 id。
+- **重钉决策**（宿主侧纯计算，`--hot-expert-repin-interval-s` 默认 60 秒，0=关闭；钉住模式下计数器自动常开）：每层比较 EMA top-K 与当前钉住集；仅当"候选 ∈ 当前冷集 且 EMA(候选) ≥ EMA(被替换者) × `--hot-expert-repin-gain`"（默认 1.5，迟滞防抖；EMA=0 的候选不换）才交换；每周期每层最多换 `--hot-expert-repin-max-swaps`（默认 8）个；候选/受害排序平局取小 id。hybrid 每步 miss 的默认 PCIe 比例是 0.5。
 - **迁移执行**（行级交换，每对 ≤ 4.69 MiB，`OffloadMoeCache.swap_pinned_experts`）：
   1. 新热冷专家 c（bank 行 r_c）、被替换钉住专家 h（槽 s_h）；
   2. `s_h --D2H--> host scratch`；`bank[r_c] --H2D--> s_h`（c 上位——必须先于写回，写回会覆盖 c 的原始字节）；`scratch --> bank[r_c]`（h 回填 host，全库唯一运行期 bank 写者）；

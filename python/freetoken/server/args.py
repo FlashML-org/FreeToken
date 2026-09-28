@@ -718,9 +718,9 @@ def parse_args(
         help=(
             "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
-            "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
-            "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
-            "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+            "-1 (default) = auto: fetch 50% of each step's misses over PCIe and compute "
+            "the rest on the CPU. 0 = never fetch (all misses on CPU); a positive value "
+            "is a fixed per-step fetch cap."
         ),
     )
 
@@ -770,10 +770,9 @@ def parse_args(
         metavar="N",
         default=ServerArgs.hot_expert_lru_floor,
         help=(
-            "LRU region floor in slots for the pin capacity guard. 0 (default) = "
-            "max(2*experts, 512); relax down to 1 to raise the pin-capacity ceiling "
-            "(K_cap max = (moe_cache_size - N) / moe_layers) at the cost of LRU "
-            "locality -- decode single-stream may degrade as LRU shrinks."
+            "LRU region floor in slots for the pin capacity guard. 1 (default) lets "
+            "the pin capacity shrink the LRU down to one slot; spare capacity slots "
+            "stay in the LRU. 0 = the built-in floor max(2*experts, 512)."
         ),
     )
 
@@ -814,14 +813,14 @@ def parse_args(
         metavar="T",
         default=ServerArgs.hot_expert_repin_interval_s,
         help=(
-            "Dynamic repinning (requires --hot-expert-list): every T seconds of "
+            "Dynamic repinning, used when --hot-expert-list is set: every T seconds of "
             "wall-clock, drain the expert-hotness counters into a sliding window, "
             "smooth it with an EMA (half-life = window length) and swap pinned experts "
             "whose EMA count no longer justifies their slot. Swaps run only at fully "
             "idle safe points (no in-flight prefill/decode), move at most one bank row "
             "per expert and are CUDA-graph safe (tensor values only, shapes fixed). "
-            "0 (default) disables repinning; with T > 0 the hotness counters turn on "
-            "automatically even without --hot-stats-out."
+            "60 (default) enables that window; 0 disables it. Without a pin list the "
+            "value is unused."
         ),
     )
 
