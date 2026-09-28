@@ -796,7 +796,10 @@ class Engine:
             for layer_id, experts in enumerate(pin_plan.pins):
                 if experts:
                     pin_ids[layer_id, : len(experts)] = torch.tensor(experts, dtype=torch.int32)
-            cache.init_hot_pins(pin_ids, counts, banks.cold_row, pin_capacity=pin_capacity)
+            cache.init_hot_pins(
+                pin_ids, counts, banks.cold_row, pin_capacity=pin_capacity,
+                lru_min_slots=config.hot_expert_lru_floor or None,
+            )
             if pin_arena is not None:
                 # 钉住权重入显存：GPU 暂存 -> slot cache 顶部区（行序 == pin list 序 == 槽位分配序）
                 cache.load_pinned_rows(pin_arena)

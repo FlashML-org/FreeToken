@@ -81,6 +81,9 @@ class EngineConfig:
     # 时是钉住容量 K_cap（list 定初始 K，容量为运行中调 K 预留扩容空间）。
     # 未设置时 hot_expert_list 必须已是 pin list JSON，容量 = 初始 K。
     hot_expert_slots: int | None = None
+    # LRU 区地板（槽数）：0 = 默认 max(2×专家数, 512)；放宽到 ≥1 可换取更大的
+    # 钉住容量上限（K_cap 上限 = (cache_size - floor) // 层数）
+    hot_expert_lru_floor: int = 0
     # 动态重钉（设计 §10）：滑动窗口热度驱动的运行期重钉，钉住模式下按墙钟间隔
     # （秒）把 device 热度计数 D2H 成"当前窗口"，经 EMA（半衰期 = 窗口时长）平滑后
     # 与当前钉住集比较，仅在 idle 安全点做行级交换。0 = 关闭（默认）；>0 时钉住

@@ -373,6 +373,7 @@ class OffloadMoeCache:
         pin_counts: list[int],
         cold_row: torch.Tensor,
         pin_capacity: int | None = None,
+        lru_min_slots: int | None = None,
     ) -> None:
         """装配显存钉住：校验几何、占用 slot 顶部容量区并预填钉住映射。
 
@@ -418,11 +419,14 @@ class OffloadMoeCache:
             assert all(int(cold_row[layer_id, e].item()) == -1 for e in experts)
         capacity_slots = L * k_cap
         lru_slots = self.cache_size - capacity_slots
-        if lru_slots < max(2 * E, 512):
+        lru_floor = lru_min_slots if lru_min_slots is not None else max(2 * E, 512)
+        lru_floor = max(1, int(lru_floor))
+        if lru_slots < lru_floor:
             raise ValueError(
                 f"钉住容量区 L×K_cap={capacity_slots} 槽（K_cap={k_cap}）后 LRU 区只剩 "
-                f"{lru_slots} < max(2*E, 512) = {max(2 * E, 512)}（防 LRU 退化）："
-                f"moe_cache_size={self.cache_size} 需 ≥ L×K_cap + max(2E, 512)，"
+                f"{lru_slots} < 下限 {lru_floor}（防 LRU 退化；默认 max(2*E, 512)，"
+                f"--hot-expert-lru-floor 可放宽至 ≥1）："
+                f"moe_cache_size={self.cache_size} 需 ≥ L×K_cap + {lru_floor}，"
                 f"请调小每层钉住数/--hot-expert-slots 或提高 --moe-cache-size"
             )
         # pin_ids 按容量宽度存储（[L, K_cap]）：合并查询每次拷贝整条容量行，运行中
@@ -436,6 +440,8 @@ class OffloadMoeCache:
         # 钉住数：宿主冷压缩 bank 只有 E - floors[l] 行，缩 K 换出的行必须从
         # "曾钉住专家让出的行"池里取，池深 = K_active - floors[l]）与空闲行池。
         self.pin_capacity = k_cap
+        # LRU 地板的运行时记忆（rebuild 校验复用；None = 未钉住/默认地板）
+        self._lru_min_slots = lru_min_slots
         self.pin_floors = list(pin_counts)
         self._pin_free_rows = [set() for _ in range(L)]
         for layer_id in range(L):
@@ -1189,7 +1195,10 @@ class OffloadMoeCache:
             assert self.pin_capacity is not None
             capacity_slots = self.num_layers * self.pin_capacity
             lru_slots = cache_size - capacity_slots
-            if lru_slots < max(2 * self.num_experts, 512):
+            lru_floor = self._lru_min_slots if self._lru_min_slots is not None else max(
+                2 * self.num_experts, 512
+            )
+            if lru_slots < max(1, int(lru_floor)):
                 raise ValueError(
                     f"rebuild 目标 cache_size {cache_size} 扣除钉住容量区 "
                     f"L×K_cap={capacity_slots}（K_cap={self.pin_capacity}）后 LRU 区 "

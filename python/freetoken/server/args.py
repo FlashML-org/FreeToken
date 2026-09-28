@@ -765,6 +765,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hot-expert-lru-floor",
+        type=int,
+        metavar="N",
+        default=ServerArgs.hot_expert_lru_floor,
+        help=(
+            "LRU region floor in slots for the pin capacity guard. 0 (default) = "
+            "max(2*experts, 512); relax down to 1 to raise the pin-capacity ceiling "
+            "(K_cap max = (moe_cache_size - N) / moe_layers) at the cost of LRU "
+            "locality -- decode single-stream may degrade as LRU shrinks."
+        ),
+    )
+
+    parser.add_argument(
         "--hot-expert-slots",
         type=int,
         metavar="K",
