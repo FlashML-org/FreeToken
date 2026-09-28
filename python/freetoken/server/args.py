@@ -230,6 +230,11 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        # Qwen3 Instruct 2507 checkpoints do not emit thinking markers, although
+        # they share an architecture with the Thinking variant.
+        checkpoint_name = model_path.lower()
+        if "qwen3" in checkpoint_name and "instruct-2507" in checkpoint_name:
+            return None
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
