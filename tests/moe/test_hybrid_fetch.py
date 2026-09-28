@@ -242,3 +242,25 @@ def test_fetch_params_update_applies_to_captured_graph():
     assert overflow_b == missing - _balanced_fetch(missing, q16_b)
     assert fetched_b == _balanced_fetch(missing, q16_b)
     assert overflow_b != overflow_a
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_set_fetch_params_on_inference_mode_constructed_cache():
+    """launch.py 在 torch.inference_mode() 下构造 Scheduler：cache 缓冲因此是
+    inference tensor，运行中（模式外）的 set_fetch_params 就地写必须仍可用
+    （写路径显式进入该模式），否则 --tune-file 轮询每轮静默失败。"""
+    with torch.inference_mode():
+        cache = OffloadMoeCache(
+            num_layers=1, num_experts=32, cache_size=40, device=torch.device("cuda"),
+            quant_format="bf16", decode_target="hybrid",
+            hybrid_max_fetch=32, hybrid_fetch_fraction=0.375,
+        )
+    assert int(cache.fetch_params[1]) == round(0.375 * Q)
+    # 模式外（模拟轮询线程）更新：修复前在此抛 Inplace-update 运行时错误
+    cache.set_fetch_params(32, 0.5)
+    assert cache.hybrid_fetch_fraction == 0.5
+    assert int(cache.fetch_params[1]) == round(0.5 * Q)
+    # 新值对已捕获的图生效：fraction 0.5 下 8 个全 miss 应取平衡拉取数
+    ids = torch.arange(8, dtype=torch.int32).cuda()
+    cache.ensure_experts_hybrid(0, ids)
+    assert int(cache.num_indices.item()) == _balanced_fetch(8, round(0.5 * Q))

@@ -705,6 +705,20 @@ class OffloadMoeCache:
             索引与 cold_row 宿主镜像。全部为既有张量的值改写（shape 不变 ⇒ CUDA
             graph 兼容），flashlib 合并查询/hybrid 范围保护天然读新值。
         """
+        # 缓冲是 launch.py 的 torch.inference_mode() 下构造的 inference tensor：本原语
+        # 的宿主侧就地写（copy_/index_copy_/索引赋值）必须在模式内执行（idle 安全点
+        # 在调度线程、模式外），否则抛 Inplace-update 运行时错误。
+        with torch.inference_mode():
+            self._swap_pinned_experts_impl(layer_id, swaps)
+
+    def _swap_pinned_experts_impl(self, layer_id: int, swaps: list[tuple[int, int]]) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            swap_pinned_experts 的实现体（公开方法已进入 inference_mode 栅栏）。
+
+        Code Logic（这个函数做什么）:
+            见 swap_pinned_experts 的 docstring。
+        """
         assert self.pin_ids is not None and self.pin_counts is not None, "init_hot_pins first"
         assert self.pin_slots is not None and self.cold_row is not None, "init_hot_pins first"
         assert self.banks and self._cold_row_np is not None, "swap needs pinning + banks"
@@ -822,6 +836,18 @@ class OffloadMoeCache:
             组装 gather 索引与 cold_row 宿主镜像。全部为既有张量的值改写（shape 不变
             ⇒ CUDA graph 兼容），返回实际装入的专家列表。
         """
+        # inference tensor 栅栏：同 swap_pinned_experts 的说明。
+        with torch.inference_mode():
+            return self._install_pinned_experts_impl(layer_id, experts)
+
+    def _install_pinned_experts_impl(self, layer_id: int, experts: list[int]) -> list[int]:
+        """
+        Business Logic（为什么需要这个函数）:
+            install_pinned_experts 的实现体（公开方法已进入 inference_mode 栅栏）。
+
+        Code Logic（这个函数做什么）:
+            见 install_pinned_experts 的 docstring。
+        """
         self._require_dynamic_pin_state(layer_id)
         free = self._pin_free_rows
         assert free is not None and self.pin_slots is not None and self.pin_ids is not None
@@ -907,6 +933,18 @@ class OffloadMoeCache:
             flashlib argmin 隐形）；d) pin_counts[l] 递减。最后按首钉 dup 约定重垫
             填充行并刷新该层三源组装 gather 索引与 cold_row 宿主镜像。返回换出的
             专家列表（pin list 序）。
+        """
+        # inference tensor 栅栏：同 swap_pinned_experts 的说明。
+        with torch.inference_mode():
+            return self._unpin_tail_experts_impl(layer_id, new_count)
+
+    def _unpin_tail_experts_impl(self, layer_id: int, new_count: int) -> list[int]:
+        """
+        Business Logic（为什么需要这个函数）:
+            unpin_tail_experts 的实现体（公开方法已进入 inference_mode 栅栏）。
+
+        Code Logic（这个函数做什么）:
+            见 unpin_tail_experts 的 docstring。
         """
         self._require_dynamic_pin_state(layer_id)
         free = self._pin_free_rows
@@ -1742,13 +1780,17 @@ class OffloadMoeCache:
         if self.fetch_params is not None:
             from freetoken.moe.offload_kernels import fetch_fraction_q16
 
-            self.fetch_params.copy_(
-                torch.tensor(
-                    [self.hybrid_max_fetch, fetch_fraction_q16(fetch_fraction)],
-                    dtype=torch.int32,
-                    device=self.device,
+            # cache 缓冲在 launch.py 的 torch.inference_mode() 下构造（inference
+            # tensor）：模式外的宿主侧就地写会抛 Inplace-update 运行时错误
+            # （--tune-file 轮询线程不在该模式内），就地写必须显式进入该模式。
+            with torch.inference_mode():
+                self.fetch_params.copy_(
+                    torch.tensor(
+                        [self.hybrid_max_fetch, fetch_fraction_q16(fetch_fraction)],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 )
-            )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.

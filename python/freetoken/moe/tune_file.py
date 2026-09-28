@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 
 from typing import TYPE_CHECKING
 
@@ -118,12 +119,27 @@ class TuneFilePoller:
             self._thread = None
 
     def _run(self) -> None:
-        """线程主循环：周期等待 + 单次检查；任何意外异常只记日志，绝不离场。"""
+        """线程主循环：周期等待 + 单次检查；任何意外异常降级为告警日志，绝不离场。
+
+        Code Logic（这个函数做什么）:
+            首轮先打一条 alive 心跳（证明线程在跑、给出基线 mtime），意外异常以
+            warning 记录（60s 节流：持续失败不刷屏，但绝不在 INFO 级别下静默）。
+        """
+        first = True
+        last_error_log = 0.0
         while not self._stop.wait(self.interval_s):
             try:
                 self.poll_once()
+                if first:
+                    logger.info_rank0(
+                        "tune file poller alive (baseline mtime set on first poll)"
+                    )
+                    first = False
             except Exception as exc:  # noqa: BLE001 -- 轮询线程绝不能带崩引擎
-                logger.debug("tune file poll failed: %s", exc)
+                now = time.monotonic()
+                if now - last_error_log >= 60.0:
+                    last_error_log = now
+                    logger.warning("tune file poll failed: %s: %s", type(exc).__name__, exc)
 
     def poll_once(self) -> None:
         """单次 mtime 检查与应用（单测可直接调用；mtime 未变 / 解析失败静默跳过）。"""
