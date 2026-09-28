@@ -825,7 +825,10 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         # 热度计数器：--hot-stats-out 显式开启（全量累计落盘），或钉住模式下开了
         # 动态重钉时自动常开（out_path=None 只喂滑动窗口，不落盘）。
-        repin_on = pin_plan is not None and config.hot_expert_repin_interval_s > 0
+        catalog = pin_plan.catalog if pin_plan is not None else None
+        repin_on = pin_plan is not None and (
+            config.hot_expert_repin_interval_s > 0 or catalog is not None
+        )
         if config.hot_stats_out is not None or repin_on:
             from freetoken.moe.hotness import ExpertHotness
 
@@ -843,7 +846,11 @@ class Engine:
                     "quant_format": cache.quant_format,
                     "top_k": config.model_config.num_experts_per_tok,
                 },
-                window_interval_s=config.hot_expert_repin_interval_s if repin_on else None,
+                window_interval_s=(
+                    config.hot_expert_repin_interval_s
+                    if config.hot_expert_repin_interval_s > 0
+                    else None
+                ),
             )
             if config.hot_stats_out is not None:
                 cache.hotness.install_exit_flush()
@@ -857,18 +864,25 @@ class Engine:
             if repin_on:
                 from freetoken.moe.hot_pin import HotExpertRepinManager
 
+                interval_s = (
+                    config.hot_expert_repin_interval_s
+                    if config.hot_expert_repin_interval_s > 0
+                    else 86400.0
+                )
                 cache.repin_manager = HotExpertRepinManager(
                     cache,
                     cache.hotness,
-                    interval_s=config.hot_expert_repin_interval_s,
+                    interval_s=interval_s,
                     gain=config.hot_expert_repin_gain,
                     max_swaps=config.hot_expert_repin_max_swaps,
+                    catalog=catalog,
                 )
-                logger.info_rank0(
-                    f"dynamic repin: hotness window {config.hot_expert_repin_interval_s:.0f}s, "
-                    f"hysteresis gain {config.hot_expert_repin_gain:g}, at most "
-                    f"{config.hot_expert_repin_max_swaps} swaps per layer per cycle"
-                )
+                if catalog is None:
+                    logger.info_rank0(
+                        f"dynamic repin: hotness window {config.hot_expert_repin_interval_s:.0f}s, "
+                        f"hysteresis gain {config.hot_expert_repin_gain:g}, at most "
+                        f"{config.hot_expert_repin_max_swaps} swaps per layer per cycle"
+                    )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -1426,6 +1440,7 @@ def _resolve_hot_pin_plan(
         num_layers=num_moe_layers,
         num_experts=num_experts,
         cpu_layer_ids=cpu_layer_ids,
+        active_k=config.hot_expert_active_k,
     )
 
 

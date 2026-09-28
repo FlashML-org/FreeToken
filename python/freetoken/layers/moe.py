@@ -6,7 +6,8 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
-from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.moe.offload_cache import OffloadMoeCache, prefill_aliases_pin_region
+from freetoken.utils import init_logger
 
 
 from .base import BaseOP
@@ -24,6 +25,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+logger = init_logger(__name__)
 
 
 class MoELayer(BaseOP):
@@ -356,12 +358,21 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        """
+        Business Logic（为什么需要这个函数）:
+            prefill 要把本层专家权重摆成 position == 专家 id 再做整层 GEMM。默认借用
+            slot cache 前 2E 槽（双缓冲或一次性物化）。钉住区若落进这扇窗口，整层
+            拷贝会覆盖权威钉住槽，decode 随后非法访问。
+
+        Code Logic（这个函数做什么）:
+            重叠时按 CPU executor 的 max_tokens 把 token 切块，逐块走 decode 按需
+            装载（只写 [0, pin_base) 的 LRU 槽，钉住槽不动）。不重叠时保持原路径：
+            overlap 开着走双缓冲，否则 materialize_layer 后整层 GEMM。
+        """
         cache = self.offload_cache
         assert cache is not None
+        if prefill_aliases_pin_region(cache.pin_base, self.num_experts):
+            return self._prefill_routed_via_decode(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -390,6 +401,48 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_routed_via_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Business Logic（为什么需要这个函数）:
+            LRU 收到 1 槽时钉住区会盖住 prefill 借用的 [0, 2E)。整层拷贝不能再用。
+            decode 按需装载已经会避开钉住槽，prefill 复用它才能在这块几何上继续服务。
+
+        Code Logic（这个函数做什么）:
+            CPU executor 的 scratch 按 max_tokens 分配，块长取 min(本步 token 数,
+            max_tokens)；无 executor 时整步一次。每块调用 _decode_routed（hybrid
+            溢出走 CPU，命中与限量换入走 GPU 槽），再按 token 维拼回。
+        """
+        cache = self.offload_cache
+        assert cache is not None
+        if not getattr(cache, "_prefill_pin_overlap_logged", False):
+            cache._prefill_pin_overlap_logged = True
+            logger.warning(
+                "prefill aliases the pinned region (pin_base=%s < 2E=%d); "
+                "this step uses decode-style on-demand loads so pinned slots stay intact",
+                cache.pin_base, 2 * self.num_experts,
+            )
+        bs = hidden_states.shape[0]
+        executor = cache.cpu_executor
+        limit = bs if executor is None else max(1, int(executor.max_tokens))
+        if bs <= limit:
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        parts: list[torch.Tensor] = []
+        for start in range(0, bs, limit):
+            end = min(bs, start + limit)
+            parts.append(
+                self._decode_routed(
+                    hidden_states[start:end].contiguous(),
+                    topk_weights[start:end].contiguous(),
+                    topk_ids[start:end].contiguous(),
+                )
+            )
+        return torch.cat(parts, dim=0)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

@@ -359,7 +359,6 @@ def test_manager_target_k_grow_shrink(monkeypatch, caplog):
     import freetoken.moe.hotness as hotness_mod
     from freetoken.moe import offload_kernels
     from freetoken.moe.hot_pin import HotExpertRepinManager
-    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
 
     monkeypatch.setattr(offload_kernels, "lru_ensure", _lru_ensure_oracle)
     _init_tp()
@@ -454,7 +453,8 @@ def test_manager_target_k_grow_shrink(monkeypatch, caplog):
         assert cache.slot_for_id[l, 3].item() == -1
         s3 = int(cache.pin_slots[l, 3].item())
         assert int(cache.id_of_slot[s3].item()) == -1
-        assert int(cache.usage[s3].item()) == _PIN_USAGE_SENTINEL  # 空容量槽对 argmin 隐形
+        assert int(cache.usage[s3].item()) == 0  # 空容量槽回到 LRU
+        assert int(cache.pin_held[s3].item()) == 0
         assert cache.pin_ids[l].tolist() == [0, 1, 2, 0]
         # 换出字节回宿主 bank（D2H）：行 0 现在装专家 3
         for per_layer, _bank_cache in cache.banks:
@@ -655,7 +655,6 @@ def test_pin_k_dynamic_k_on_captured_hybrid_graph_gpu(monkeypatch):
     import freetoken.moe.hot_pin as hot_pin_mod
     import freetoken.moe.hotness as hotness_mod
     from freetoken.moe.hot_pin import HotExpertRepinManager
-    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
 
     L, E = 1, 16
     dev = torch.device("cuda")
@@ -728,7 +727,8 @@ def test_pin_k_dynamic_k_on_captured_hybrid_graph_gpu(monkeypatch):
     assert cache.pin_counts == [3]
     assert int(cache.slot_for_id[0, 3].item()) == -1
     assert int(cache.id_of_slot[pin_slots[3]].item()) == -1
-    assert int(cache.usage[pin_slots[3]].item()) == _PIN_USAGE_SENTINEL
+    assert int(cache.usage[pin_slots[3]].item()) == 0
+    assert int(cache.pin_held[pin_slots[3]].item()) == 0
     row3 = int(cache.cold_row[0, 3].item())
     assert row3 >= 0
     for per_layer, _bank_cache in cache.banks:
@@ -978,3 +978,37 @@ def test_target_k_grows_from_cumulative_hotness_without_window(monkeypatch):
         assert set(cache.pinned_id_lists()[l]) - set(range(K0)) <= {K0 + 2, K0 + 5, K0 + 9}
     # 全量累计路径消费目标后不再重触发
     assert manager.target_k is None
+
+
+def test_catalog_growth_follows_pin_list_and_skips_ema(monkeypatch):
+    """目录模式下扩容按 pin list 原序补前缀，热度更高的表外专家不入选，EMA 换血不跑。"""
+    import freetoken.moe.hot_pin as hot_pin_mod
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+
+    _init_tp()
+    cache = _make_pinned_cache(
+        num_layers=1, num_experts=8, pins=(0, 1), k_per_layer=[2],
+        cache_size=4 + max(2 * 8, LRU_FLOOR) + 8,
+    )
+    _init_pins(cache, pins=(0, 1), k_per_layer=[2], pin_capacity=4)
+    _load_pinned_slot_contents(cache)
+    hot = _make_hotness(num_layers=1, num_experts=8, window_interval_s=10.0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hot_pin_mod.time, "monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]
+    for _ in range(20):
+        hot.record(0, torch.tensor([[7, 7, 7]], dtype=torch.int32))
+    clock["t"] = 1030.0
+    assert hot.maybe_flush() is True
+
+    manager = HotExpertRepinManager(
+        cache, hot, interval_s=10.0, gain=1.5, max_swaps=8, catalog=[[0, 1, 2, 3]],
+    )
+    manager.set_target_k(4)
+    assert manager.apply_target_k() is True
+    assert cache.pinned_id_lists()[0] == [0, 1, 2, 3]
+    # 窗口已封口且 7 远热于表内专家，换血仍不改钉住集
+    assert manager.maybe_repin(now=clock["t"] + 100.0) is False
+    assert cache.pinned_id_lists()[0] == [0, 1, 2, 3]

@@ -227,6 +227,7 @@ def _ensure_experts_hybrid_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -
         # 传任意张量占位指针）
         cache.cold_row if has_pins else expert_ids,
         cache.pin_base_dev if has_pins else expert_ids,
+        cache.pin_held if has_pins else expert_ids,
         layer_id,
         expert_ids.numel(),
         # cap/比例设备张量：内核开头 tl.load 读取，值更新对已捕获图立即生效
@@ -287,10 +288,11 @@ def _ensure_experts_hybrid_cpu(
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
-    victim_limit = cache.cache_size if pin_base is None else pin_base
+    held = cache.pin_held.tolist() if pin_base is not None and cache.pin_held is not None else None
+    eligible = [s for s in range(cache.cache_size) if held is None or not held[s]]
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(victim_limit), key=lambda s: (usage[s], s))
+        victim = min(eligible, key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -457,6 +459,7 @@ def _ensure_experts_hybrid_kernel(
     expert_recency_ptr,
     cold_map_ptr,
     pin_base_ptr,
+    pin_held_ptr,
     layer_id,
     num_active,
     fetch_params_ptr,
@@ -499,11 +502,6 @@ def _ensure_experts_hybrid_kernel(
     # 运行时可变的 cap/比例（内核每次执行都重读；禁止 constexpr/特化以保持分支为运行时分支）
     max_fetch = tl.load(fetch_params_ptr)
     fetch_frac_q16 = tl.load(fetch_params_ptr + 1)
-    # 钉住排除边界（HAS_PINS=False 时占位指针不解引用，排除为空）
-    if HAS_PINS:
-        pin_base = tl.load(pin_base_ptr)
-    else:
-        pin_base = cache_size
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -557,9 +555,13 @@ def _ensure_experts_hybrid_kernel(
         for i in tl.range(num_active):
             ei = tl.load(expert_ids_ptr + i)
             owner_active = owner_active | (oid == base + ei)
-        # 顶部钉住区（off_c >= pin_base）不在受害候选之列；无钉住时 pin_base ==
-        # cache_size，该排除为空。
-        u = tl.where(owner_active | (~c_mask) | (off_c >= pin_base), 9223372036854775807, u)
+        # 只排除当前钉住的槽（pin_held=1）。空容量槽 pin_held=0，计入 LRU：
+        # 活跃 K 越大，可驱逐槽越少。无钉住时不读 pin_held。
+        if HAS_PINS:
+            held = tl.load(pin_held_ptr + off_c, mask=c_mask, other=1) != 0
+        else:
+            held = off_c < 0
+        u = tl.where(owner_active | (~c_mask) | held, 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))

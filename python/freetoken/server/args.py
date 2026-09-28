@@ -796,6 +796,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--hot-expert-active-k",
+        type=int,
+        metavar="N",
+        default=ServerArgs.hot_expert_active_k,
+        help=(
+            "With a pin list JSON: pin only the first N experts of each layer at load "
+            "(host-bank floor) and keep the list order up to --hot-expert-slots as the "
+            "catalog. Runtime pin_k then grows and shrinks along that fixed order. EMA "
+            "swaps are disabled. N must be <= the list length and <= --hot-expert-slots."
+        ),
+    )
+
+    parser.add_argument(
         "--hot-expert-repin-interval-s",
         type=float,
         metavar="T",

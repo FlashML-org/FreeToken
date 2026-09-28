@@ -81,6 +81,10 @@ class EngineConfig:
     # 时是钉住容量 K_cap（list 定初始 K，容量为运行中调 K 预留扩容空间）。
     # 未设置时 hot_expert_list 必须已是 pin list JSON，容量 = 初始 K。
     hot_expert_slots: int | None = None
+    # 加载期实际钉住的前缀长度。设置后 pin list 只取前 active_k 个作为初始钉住集
+    # （宿主冷 bank 的下界），其余排名留在目录里供 pin_k 按原序扩容；EMA 换血关闭。
+    # None = 整张 pin list 都是初始钉住集（原行为）。
+    hot_expert_active_k: int | None = None
     # LRU 区地板（槽数）：0 = 默认 max(2×专家数, 512)；放宽到 ≥1 可换取更大的
     # 钉住容量上限（K_cap 上限 = (cache_size - floor) // 层数）
     hot_expert_lru_floor: int = 0

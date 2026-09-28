@@ -64,6 +64,9 @@ class HotPinPlan:
     pins: list[list[int]]
     num_experts: int
     skipped: dict[int, list[int]] = field(default_factory=dict)  # layer -> 被剥离的钉住项
+    # 固定排名目录（pin list 原序，长度 = 容量）。非空时 pin_k 只沿这个前缀扩缩，
+    # 不按 EMA / 累计热度选点，也不做周期换血。None = 原热度选点。
+    catalog: list[list[int]] | None = None
 
     @property
     def k_max(self) -> int:
@@ -181,6 +184,7 @@ def resolve_hot_pin_plan(
     num_layers: int,
     num_experts: int,
     cpu_layer_ids: frozenset[int] = frozenset(),
+    active_k: int | None = None,
 ) -> HotPinPlan | None:
     """
     Business Logic（为什么需要这个函数）:
@@ -192,15 +196,41 @@ def resolve_hot_pin_plan(
         两者都未设置返回 None（不钉住）。hot_expert_slots 与 pin list 同传时 slots
         是钉住容量 K_cap（运行中调 K 的扩容上限，须 >= pin list 每层钉住数）；与
         热度统计 JSON 同传时 slots 是加载期选点数（复用 hotness.select.load_stats
-        校验 + select_pins 选每层 top-K，容量同值 = 静态）。随后剥离 cpu_layer_ids
-        命中层的钉住项（告警一次，列出层与专家数），全部层为空时也返回 None（无可
-        钉项）。文件校验失败抛 ValueError。
+        校验 + select_pins 选每层 top-K，容量同值 = 静态）。``active_k`` 只接受 pin
+        list：初始钉住集取每层前 active_k 个（宿主冷 bank 下界），目录取前
+        min(K_cap, 表长) 个原序，供运行中 pin_k 按表扩缩、不走 EMA。随后剥离
+        cpu_layer_ids 命中层的钉住项（告警一次，列出层与专家数），全部层为空时也
+        返回 None（无可钉项）。文件校验失败抛 ValueError。
     """
     if hot_expert_list is None and hot_expert_slots is None:
         return None
     pins: list[list[int]]
     pin_list_capacity: int | None = None
-    if (
+    catalog: list[list[int]] | None = None
+    if active_k is not None:
+        if hot_expert_list is None or not _looks_like_pin_list(hot_expert_list):
+            raise ValueError("--hot-expert-active-k 只能与 pin list JSON 一起使用")
+        if isinstance(active_k, bool) or not isinstance(active_k, int) or active_k < 1:
+            raise ValueError(f"--hot-expert-active-k 必须是正整数，实际为 {active_k!r}")
+        full = _load_pin_list(hot_expert_list, num_layers, num_experts)
+        width = len(full[0]) if full else 0
+        if active_k > width:
+            raise ValueError(
+                f"--hot-expert-active-k {active_k} 超过 pin list 每层长度 {width}"
+            )
+        cap = width if hot_expert_slots is None else hot_expert_slots
+        if cap < active_k:
+            raise ValueError(
+                f"--hot-expert-slots {cap} 小于 --hot-expert-active-k {active_k}"
+            )
+        if cap > width:
+            raise ValueError(
+                f"--hot-expert-slots {cap} 超过 pin list 每层长度 {width}，"
+                "目录里没有更多专家可按原序扩"
+            )
+        catalog = [row[:cap] for row in full]
+        pins = [row[:active_k] for row in full]
+    elif (
         hot_expert_list is not None
         and hot_expert_slots is not None
         and _looks_like_pin_list(hot_expert_list)
@@ -247,6 +277,8 @@ def resolve_hot_pin_plan(
             if pins[layer_id]:
                 skipped[layer_id] = pins[layer_id]
                 pins[layer_id] = []
+                if catalog is not None:
+                    catalog[layer_id] = []
         if skipped:
             logger.warning_rank0(
                 f"--hot-expert-list: CPU 解码层 {sorted(skipped)} 的 "
@@ -256,7 +288,7 @@ def resolve_hot_pin_plan(
     if all(not p for p in pins):
         logger.warning_rank0("--hot-expert-list: 没有任何可钉住的层，本次启动不钉住")
         return None
-    return HotPinPlan(pins=pins, num_experts=num_experts, skipped=skipped)
+    return HotPinPlan(pins=pins, num_experts=num_experts, skipped=skipped, catalog=catalog)
 
 
 def plan_repin_swaps(
@@ -334,6 +366,7 @@ class HotExpertRepinManager:
         interval_s: float,
         gain: float,
         max_swaps: int,
+        catalog: list[list[int]] | None = None,
     ) -> None:
         """
         Business Logic（为什么需要这个函数）:
@@ -345,6 +378,8 @@ class HotExpertRepinManager:
             校验参数（interval_s > 0、gain >= 1.0、max_swaps >= 1）后保存 cache、
             窗口计数器与三旋钮；初始化上次触发墙钟（首个窗口需 interval_s 填充，
             之前的触发会被 has_window 门挡住）；目标 K 置空（pin_k 未写入）。
+            catalog 给定时记下 pin list 原序，扩容只沿这张表取尚未钉住的下一批，
+            周期 EMA 换血不再执行。
         """
         if interval_s <= 0:
             raise ValueError(f"--hot-expert-repin-interval-s 必须 > 0，实际为 {interval_s}")
@@ -361,6 +396,15 @@ class HotExpertRepinManager:
         # 运行中调 K 的最新目标（set_target_k 写入，apply_target_k 消费后清空；
         # None = 无待落地目标，apply_target_k 在 idle 点的每次轮询直接快速返回）
         self._target_k: int | None = None
+        self._catalog: list[list[int]] | None = (
+            None if catalog is None else [list(row) for row in catalog]
+        )
+        if self._catalog is not None:
+            width = max((len(row) for row in self._catalog), default=0)
+            logger.info_rank0(
+                "pin catalog: EMA swaps disabled; pin_k follows the pin-list order "
+                f"(catalog width {width})"
+            )
         # 扩容等待原因（无窗口 / 零热度候选）的限流日志标记：同类原因只打一次，
         # 有实际进展后复位，避免每个 idle 安全点刷屏又保留"为什么还没扩"的可观测性
         self._defer_logged: bool = False
@@ -409,6 +453,24 @@ class HotExpertRepinManager:
             if e in pinned or float(row[e]) <= 0.0:
                 continue
             out.append(e)
+        return out
+
+    def _catalog_growth(self, layer_id: int, want: int, pinned: set[int]) -> list[int]:
+        """
+        Business Logic（为什么需要这个函数）:
+            纯净调 K 时每层活跃集必须是初始专家表的前缀，不能改用线上热度重排。
+
+        Code Logic（这个函数做什么）:
+            按目录原序跳过已经钉住的 id，取接下来 want 个。目录里没有的专家不会入选。
+        """
+        assert self._catalog is not None
+        out: list[int] = []
+        for expert in self._catalog[layer_id]:
+            if len(out) >= want:
+                break
+            if expert in pinned:
+                continue
+            out.append(expert)
         return out
 
     def apply_target_k(self) -> bool:
@@ -461,12 +523,10 @@ class HotExpertRepinManager:
             self._target_k = None
             self._defer_logged = False
             return False
-        # 扩容选点的热度源：窗口 EMA 已封口用 EMA（对近期负载敏感）；未封口时退回
-        # 全量累计热度（首批流量排空即有，无需等一个完整窗口）——扩容初始选点本就
-        # 没有"更近"的信号可用，服务启动以来的 top 热点即最合理起点，其后由常规
-        # EMA 换血继续修正。
+        # 扩容选点：有目录时只沿 pin list 原序补尚未钉住的下一批（不看热度）。
+        # 否则窗口 EMA 已封口用 EMA；未封口退回全量累计热度。
         ema = None
-        if grows:
+        if grows and self._catalog is None:
             if self._hotness.has_window:
                 ema = self._hotness.ema_counts()
             else:
@@ -482,9 +542,14 @@ class HotExpertRepinManager:
         grow_picks: dict[int, list[int]] = {}
         for layer_id in sorted(grows):
             pinned_set = set(cache.pinned_id_lists()[layer_id])
-            grow_picks[layer_id] = self._growth_candidates(
-                layer_id, grows[layer_id], pinned_set, ema
-            )
+            if self._catalog is not None:
+                grow_picks[layer_id] = self._catalog_growth(
+                    layer_id, grows[layer_id], pinned_set
+                )
+            else:
+                grow_picks[layer_id] = self._growth_candidates(
+                    layer_id, grows[layer_id], pinned_set, ema
+                )
         if not shrinks and all(not picks for picks in grow_picks.values()):
             if not self._defer_logged:
                 logger.info_rank0(
@@ -513,7 +578,12 @@ class HotExpertRepinManager:
                 pinned_total += len(put)
                 shortfall = grows[layer_id] - len(put)
                 shortfall_total += shortfall
-                note = f"，{shortfall} 个候选窗口热度不足未钉" if shortfall else ""
+                if not shortfall:
+                    note = ""
+                elif self._catalog is not None:
+                    note = f"，{shortfall} 个超出 pin list 目录未钉"
+                else:
+                    note = f"，{shortfall} 个候选窗口热度不足未钉"
                 details.append(
                     f"L{layer_id}: +{put} (K {counts[layer_id]}->{counts[layer_id] + len(put)}{note})"
                 )
@@ -530,8 +600,9 @@ class HotExpertRepinManager:
         if touched:
             logger.info_rank0(
                 "dynamic pin-k: target K=%d applied in %.1f ms -- %d pinned in, %d unpinned "
-                "across %d layer(s): %s",
-                target, elapsed_ms, pinned_total, unpinned_total, touched, "; ".join(details),
+                "across %d layer(s), LRU slots=%d: %s",
+                target, elapsed_ms, pinned_total, unpinned_total, touched,
+                cache.cache_size - sum(cache.pin_counts), "; ".join(details),
             )
             # 动态 K 与 prefill hit-D2D（cudaMemcpyBatchAsync 三源组装）目前存在
             # 未定位的交互缺陷：扩缩后该路径偶发驱动 invalid argument 并毒化上下文
@@ -568,6 +639,8 @@ class HotExpertRepinManager:
             换出对、计数比、耗时）并返回 True。now 参数仅供测试注入时钟。
         """
         applied = self.apply_target_k()
+        if self._catalog is not None:
+            return applied
         now = time.monotonic() if now is None else now
         if now - self._last < self._interval_s:
             return applied
@@ -605,4 +678,15 @@ class HotExpertRepinManager:
             "dynamic repin: %d expert(s) swapped across %d layer(s) in %.1f ms: %s",
             total, len(plan), elapsed_ms, detail,
         )
+        # 换血改写钉住槽，和动态 pin_k 一样会让 prefill hit-D2D 的三源批量拷贝
+        # 报 invalid argument 并拖垮 worker。换血落地后永久关掉这条 prefill 路径。
+        cache = self._cache
+        if getattr(cache, "_prefill_hit_d2d_active", False):
+            cache._prefill_hit_d2d_active = False
+            cache._batch_memcpy = False
+            cache._hit_d2d_runtime_disabled = True
+            logger.warning(
+                "MoE prefill hit-D2D disabled after an EMA repin "
+                "(known interaction defect); prefill uses full-layer copies"
+            )
         return True

@@ -103,14 +103,25 @@ _BANK_BYTES_PER_EXPERT = {
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
 
-# 未活跃容量槽的 usage 哨兵：钉住区按每层固定容量 K_cap 预留后，"缩 K"会让部分
-# 容量槽失去映射（id_of_slot == -1）。flashlib 合并查询路径没有 pin_base 排除，
-# 受害槽 = 全 cache argmin(usage)，陈旧低 usage 的空容量槽会被选中并把冷专家装进
-# 钉住区（后续扩 K 会覆盖活槽）。哨兵取 2^62：远大于任何 step 计数、远小于
-# flashlib 的 "usage == step 不可驱逐" 打包值 INT64_MAX，argmin 永不选它
-# （LRU 地板保证恒有 usage < step 的真 LRU 槽存在）。hybrid 内核按
-# off_c >= pin_base 整段排除容量区，不依赖该值；对它无害。
+# 仍保留给需要把某个槽暂时踢出 argmin 的路径。空容量槽不再盖这个值：那些槽就是
+# LRU 区的一部分（cache_size - 当前钉住槽数）。真正钉住的槽由 pin_held 标记，
+# hybrid 受害扫描跳过它们；缩 K 把标记清掉，槽回到 LRU。
 _PIN_USAGE_SENTINEL = 1 << 62
+
+
+def prefill_aliases_pin_region(pin_base: int | None, num_experts: int) -> bool:
+    """
+    Business Logic（为什么需要这个函数）:
+        prefill 双缓冲和整层物化都借用 slot cache 的前 2E 个槽（position == 专家
+        id）。钉住区起点落进这段时，整层拷贝会改写权威钉住槽；随后 decode 把已钉
+        专家当成 miss，按 cold_row=-1 取宿主行，表现为非法显存访问。LRU 地板允许
+        收到 1 槽后，这种重叠是合法几何，prefill 必须改道，不能再整层覆盖。
+
+    Code Logic（这个函数做什么）:
+        未钉住（pin_base is None）返回 False。否则当 pin_base < 2 * num_experts
+        时返回 True，表示钉住区与 prefill 借用窗口重叠。
+    """
+    return pin_base is not None and pin_base < 2 * num_experts
 
 
 @dataclass
@@ -196,6 +207,9 @@ class OffloadMoeCache:
         self.cold_row: torch.Tensor | None = None
         self.pin_base: int | None = None
         self.pin_base_dev: torch.Tensor | None = None
+        # [cache_size] int32。1 = 该槽当前钉着专家，hybrid 换入不得驱逐。0 = 普通
+        # LRU 槽（含尚未使用的容量槽）。指针在 init 后稳定，调 K 只改值。
+        self.pin_held: torch.Tensor | None = None
         self.pin_capacity: int | None = None
         self.pin_floors: list[int] | None = None
         self._pin_free_rows: list[set[int]] | None = None
@@ -513,30 +527,34 @@ class OffloadMoeCache:
         Business Logic（为什么需要这个函数）:
             钉住映射是"钉住专家永远命中"的前提：reset/rebuild 清空全部映射后必须
             立即重钉，否则钉住专家会被当成 miss 走一次冷行换入（host 已无其行），
-            产生永久错误。同时未活跃容量槽必须在每次映射重建时盖 usage 哨兵：
-            flashlib 合并查询路径按全 cache argmin(usage) 选受害槽，空容量槽的陈旧
-            低 usage 会让冷专家被装进钉住区、被后续扩 K 覆盖。
+            产生永久错误。未活跃容量槽不盖哨兵：它们计入 LRU（usage 0、pin_held 0），
+            换入可以占用；下次扩 K 再把占用者换走。真正钉住的槽 pin_held=1。
 
         Code Logic（这个函数做什么）:
-            逐层 scatter：slot_for_id[l, e] = 钉住槽位、id_of_slot[钉住槽位] =
-            l*E + e；未活跃容量槽（j ∈ [count, K_cap)）id_of_slot 保持 -1 且 usage
-            盖 _PIN_USAGE_SENTINEL。活跃槽 usage 保持 0（首次合并查询即命中并刷新为
-            当前 step）。仅在 init/rebuild/reset 时调用（host 侧循环 + 设备 scatter，
-            不在热路径）。
+            重建 pin_held 为全 0。逐层 scatter：slot_for_id[l, e] = 钉住槽位、
+            id_of_slot[钉住槽位] = l*E+e、pin_held[钉住槽位] = 1。未活跃容量槽
+            （j ∈ [count, K_cap)）id_of_slot = -1、usage = 0、pin_held = 0。
+            仅在 init/rebuild/reset 时调用。
         """
         assert self.pin_ids is not None and self.pin_slots is not None
         L, E = self.num_layers, self.num_experts
         k_cap = self.pin_capacity
+        if self.pin_held is None or self.pin_held.numel() != self.cache_size:
+            self.pin_held = torch.zeros(self.cache_size, dtype=torch.int32, device=self.device)
+        else:
+            self.pin_held.zero_()
         for layer_id, count in enumerate(self.pin_counts):
             if count:
                 flat_ids = layer_id * E + self.pin_ids[layer_id, :count].long()
                 slots = self.pin_slots[layer_id, :count]
                 self.slot_for_id.view(-1)[flat_ids] = slots
                 self.id_of_slot[slots.long()] = flat_ids.to(torch.int32)
+                self.pin_held[slots.long()] = 1
             if count < k_cap:
                 idle_slots = self.pin_slots[layer_id, count:]
                 self.id_of_slot[idle_slots.long()] = -1
-                self.usage[idle_slots.long()] = _PIN_USAGE_SENTINEL
+                self.usage[idle_slots.long()] = 0
+                self.pin_held[idle_slots.long()] = 0
 
     def _build_pin_gather_buffers(self) -> None:
         """预建三源组装（钉住 + prefill overlap）的固定 shape gather 索引与宿主冷行镜像。
@@ -888,6 +906,10 @@ class OffloadMoeCache:
                 # 两个容量槽、slot_for_id 互相覆盖、空闲行池少记一行
                 raise ValueError(f"layer {layer_id}: 专家 {e} 在本批重复出现，无法钉住")
             s = int(self.pin_slots[layer_id, self.pin_counts[layer_id] + len(installed)].item())
+            # 该容量槽若已被 LRU 换入占用，先解除占用者的映射，再把槽交给新钉。
+            occupant = int(self.id_of_slot[s].item())
+            if occupant >= 0:
+                self.slot_for_id.view(-1)[occupant] = -1
             prev = slot_host[e]
             if prev >= 0:
                 stale_slots.append(prev)
@@ -919,8 +941,11 @@ class OffloadMoeCache:
         self.id_of_slot[s_t] = flat_e
         if stale_slots:
             self.id_of_slot[torch.tensor(stale_slots, dtype=torch.long, device=self.device)] = -1
-        # usage 刷成当前 step（理由同 swap_pinned_experts）；冷行让给空闲行池
+        # usage 刷成当前 step（理由同 swap_pinned_experts）；冷行让给空闲行池。
+        # pin_held=1：这个槽离开 LRU，hybrid 不再把它当受害槽。
         self.usage[s_t] = step
+        if self.pin_held is not None:
+            self.pin_held[s_t] = 1
         for r in r_list:
             free[layer_id].add(r)
         self.pin_counts[layer_id] += n
@@ -934,8 +959,8 @@ class OffloadMoeCache:
 
         Business Logic（为什么需要这个函数）:
             负载漂移后每层钉住数 K 需要"缩"：尾部位（pin list 序末尾）的钉住专家让
-            出权威地位、字节回宿主 bank；容量槽留空（仍在排除区，不参与 LRU——固定
-            容量布局的已知取舍）。换出的宿主行必须来自空闲行池：bank 行数 = 加载期
+            出权威地位、字节回宿主 bank；空出来的容量槽回到 LRU（pin_held 清 0、
+            usage 清 0），下一次换入可以占用。换出的宿主行必须来自空闲行池：bank 行数 = 加载期
             E - floors[l] 固定，缩 K 释放的行恰好供扩 K 复用，池深 = K_active -
             floors[l] 保证缩到 floors[l] 之前永不行穷。
 
@@ -943,8 +968,8 @@ class OffloadMoeCache:
             校验 floors[l] <= new_count < pin_counts[l] 后，对尾部每个位置 j（从末
             尾向前）：a) 取空闲行 r = min(池)（确定性）；b) 钉住槽字节 D2H 写回
             bank[r]；c) 原子化改写映射值：cold_row[l, e] = r、slot_for_id[l, e] =
-            -1、id_of_slot[s] = -1、usage[s] 盖 _PIN_USAGE_SENTINEL（空容量槽对
-            flashlib argmin 隐形）；d) pin_counts[l] 递减。最后按首钉 dup 约定重垫
+            -1、id_of_slot[s] = -1、usage[s] = 0、pin_held[s] = 0（槽回到 LRU）；
+            d) pin_counts[l] 递减。最后按首钉 dup 约定重垫
             填充行并刷新该层三源组装 gather 索引与 cold_row 宿主镜像。返回换出的
             专家列表（pin list 序）。
         """
@@ -1002,8 +1027,10 @@ class OffloadMoeCache:
         self.cold_row[layer_id, e_t] = r_t.to(torch.int32)
         self.slot_for_id[layer_id, e_t] = -1
         self.id_of_slot[s_t] = -1
-        # 空容量槽盖哨兵：flashlib argmin 永不选中（hybrid 由 pin_base 排除，不受影响）
-        self.usage[s_t] = _PIN_USAGE_SENTINEL
+        # 槽回到 LRU：usage 0 让它成为下一批最老的受害候选，pin_held 0 允许 hybrid 选中。
+        self.usage[s_t] = 0
+        if self.pin_held is not None:
+            self.pin_held[s_t] = 0
         self.pin_counts[layer_id] = new_count
         self._cold_row_np[layer_id, unpinned] = r_list
         self._pad_pin_row(layer_id)

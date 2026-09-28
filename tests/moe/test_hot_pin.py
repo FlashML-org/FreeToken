@@ -22,6 +22,16 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 LRU_FLOOR = 512  # init_hot_pins 的 LRU 区绝对下限（max(2E, 512) 的 512 项）
 
 
+def test_prefill_aliases_pin_region_when_lru_shrinks_into_borrow_window():
+    """钉住区起点落入 [0, 2E) 时 prefill 必须改道；未钉住或整段落在窗口之上则不用。"""
+    from freetoken.moe.offload_cache import prefill_aliases_pin_region
+
+    assert prefill_aliases_pin_region(None, 512) is False
+    assert prefill_aliases_pin_region(1024, 512) is False
+    assert prefill_aliases_pin_region(12, 512) is True
+    assert prefill_aliases_pin_region(1, 512) is True
+
+
 def _init_tp():
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
@@ -262,6 +272,15 @@ def test_resolve_hot_pin_plan_entries_and_cpu_skip(tmp_path):
     # slots < 1
     with pytest.raises(ValueError, match="--hot-expert-slots"):
         resolve_hot_pin_plan(str(path), 0, 2, 8)
+    # active_k：初始钉住集是表的前缀，目录收到容量为止
+    ranked = _write_pin_list(
+        tmp_path / "ranked.json", [[0, 1, 2, 3, 4], [5, 4, 3, 2, 1]], 2, 8, slots=5
+    )
+    plan = resolve_hot_pin_plan(str(ranked), 4, 2, 8, active_k=2)
+    assert plan.pins == [[0, 1], [5, 4]]
+    assert plan.catalog == [[0, 1, 2, 3], [5, 4, 3, 2]]
+    with pytest.raises(ValueError, match="active-k"):
+        resolve_hot_pin_plan(str(ranked), 4, 2, 8, active_k=6)
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +388,8 @@ def test_init_hot_pins_maps_accounting_and_floors(caplog):
 
 
 def test_capacity_layout_geometry_guards_and_padding():
-    """固定容量布局：每层定宽槽位与静态 pin_base/pin_slots、未活跃槽哨兵与首钉
+    """固定容量布局：每层定宽槽位与静态 pin_base/pin_slots、空容量槽回到 LRU、首钉
     dup 填充行；容量显式值的三个守卫（< 初始钉住数 / > E / 容量下的 LRU 地板）。"""
-    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
-
     L, E, k_cap = 2, 16, 4
     cache = _make_pinned_cache(
         num_layers=L, num_experts=E, pins=(3, 7), k_per_layer=[1, 2],
@@ -391,12 +408,16 @@ def test_capacity_layout_geometry_guards_and_padding():
     assert int(cache.slot_for_id[0, pins_matrix[0][0]].item()) == cache.pin_base
     assert int(cache.slot_for_id[1, 3].item()) == cache.pin_base + k_cap
     assert int(cache.slot_for_id[1, 7].item()) == cache.pin_base + k_cap + 1
-    # 未活跃容量槽：无 id 映射 + usage 哨兵（flashlib argmin 永不选中）
+    # 未活跃容量槽回到 LRU：无 id 映射、usage 0、pin_held 0。活跃槽 pin_held 1。
     for l, count in enumerate([1, 2]):
+        for j in range(count):
+            s = int(cache.pin_slots[l, j].item())
+            assert int(cache.pin_held[s].item()) == 1
         for j in range(count, k_cap):
             s = int(cache.pin_slots[l, j].item())
             assert int(cache.id_of_slot[s].item()) == -1
-            assert int(cache.usage[s].item()) == _PIN_USAGE_SENTINEL
+            assert int(cache.usage[s].item()) == 0
+            assert int(cache.pin_held[s].item()) == 0
     # 填充行 = 首钉 dup（合并查询全容量行拷贝的无害命中约定）
     assert cache.pin_ids[0].tolist() == [3, 3, 3, 3]
     assert cache.pin_ids[1].tolist() == [3, 7, 3, 3]
