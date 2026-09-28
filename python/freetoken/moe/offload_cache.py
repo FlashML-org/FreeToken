@@ -1662,12 +1662,54 @@ class OffloadMoeCache:
                     src.extend(self._copy_src_ptrs_host[layer_id][b] + rows * feat)
                     nbytes.extend(lengths * feat)
             if dst:
-                self._batch_memcpy(
-                    torch.tensor(dst, dtype=torch.int64),
-                    torch.tensor(src, dtype=torch.int64),
-                    torch.tensor(nbytes, dtype=torch.int64),
-                    torch.cuda.current_stream(self.device).cuda_stream,
-                )
+                try:
+                    self._batch_memcpy(
+                        torch.tensor(dst, dtype=torch.int64),
+                        torch.tensor(src, dtype=torch.int64),
+                        torch.tensor(nbytes, dtype=torch.int64),
+                        torch.cuda.current_stream(self.device).cuda_stream,
+                    )
+                except RuntimeError as exc:
+                    # 驱动拒绝时的宿主侧上下文（与扩展内打印的描述符摘要互补）：
+                    # 层/buffer/miss 规模/钉住状态——现场一次给全，避免复现循环。
+                    # 实测（2026-09-28，FP8 真实服务）：描述符全部合法（无 NULL、
+                    # 行号在界内、尺寸正常）时 cudaMemcpyBatchAsync 仍会偶发返回
+                    # invalid argument，与动态钉住的扩容时间点弱相关——驱动侧
+                    # 问题无法在调用侧根治，这里就地降级：永久关闭 hit-D2D 并用
+                    # 既有整层/三源组合拷贝补齐本层本 buffer，服务不中断。
+                    logger.error(
+                        "batch memcpy rejected: layer=%d buffer=%d n_entries=%d "
+                        "miss=%d E=%d K_active=%s K_cap=%s floors=%s bank_feats=%s "
+                        "(%s)",
+                        layer_id, buffer_id, len(dst), int(miss.size), E,
+                        self.pin_counts[layer_id], self.pin_capacity,
+                        self.pin_floors[layer_id] if self.pin_floors else None,
+                        self._copy_feat_bytes_host, exc,
+                    )
+                    self._batch_memcpy = False
+                    self._prefill_hit_d2d_active = False
+                    if not self._hit_d2d_fallback_logged:
+                        self._hit_d2d_fallback_logged = True
+                        logger.warning(
+                            "MoE prefill hit-D2D disabled at runtime (driver rejected "
+                            "a live cudaMemcpyBatchAsync batch); falling back to "
+                            "full-layer copies"
+                        )
+                    with torch.cuda.stream(self.prefill_copy_stream):
+                        if self._prefill_buffer_has_release_event[buffer_id]:
+                            self.prefill_copy_stream.wait_event(
+                                self.prefill_release_events[buffer_id]
+                            )
+                        self._invalidate_prefill_buffer(buffer_id)
+                        if self.pin_ids is None:
+                            for (per_layer, _), buffer in zip(
+                                self.banks, self.prefill_bank_buffers
+                            ):
+                                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                        else:
+                            self._compose_prefill_banks(layer_id, buffer_id, small_only=False)
+                        self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+                    return
             if pinned and self._overlap_small_bank_ids:
                 self._compose_prefill_banks(layer_id, buffer_id, small_only=True)
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
