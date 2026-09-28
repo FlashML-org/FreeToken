@@ -89,6 +89,12 @@ class EngineConfig:
     hot_expert_repin_gain: float = 1.5
     # 每周期每层最多交换的专家对数。
     hot_expert_repin_max_swaps: int = 8
+    # 运行中调参文件（--tune-file）：指向 JSON 文件，引擎守护线程每 2s 检查 mtime，
+    # 变化则应用其中的键："fetch_fraction"（hybrid 每步 PCIe 拉取比例，[0,1]；经
+    # cache.set_fetch_params 写设备张量，对已捕获 decode 图立即生效，cap 不变）；
+    # "pin_k" 预留给 Phase C 动态重钉（本阶段只解析并日志）。非法 JSON / mtime 未变
+    # 静默跳过；越界值忽略并告警一次。None = 关闭。
+    tune_file: str | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

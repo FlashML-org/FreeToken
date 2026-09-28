@@ -222,6 +222,16 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        # hybrid only: [2] int32 运行时可变 fetch 参数，[0]=max_fetch、[1]=frac_q16
+        #（Q16 定点的 fetch_fraction）。hybrid ensure 内核按指针读取（捕获进 CUDA
+        # graph 的是指针而非值），set_fetch_params 只改值 -> 值更新对已捕获 decode
+        # 图立即生效（与动态重钉同款"值更新图安全"模式）。cache 持有、永不重分配
+        # （与 pin_slots 同约束），rebuild 不动它（调参值跨 rebuild 存续）。非 hybrid
+        # 模式为 None。
+        self.fetch_params: torch.Tensor | None = None
+        if self.decode_target == "hybrid":
+            self.fetch_params = torch.zeros(2, dtype=torch.int32, device=self.device)
+            self.set_fetch_params(self.hybrid_max_fetch, self.hybrid_fetch_fraction)
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
@@ -1433,6 +1443,37 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+
+    def set_fetch_params(self, max_fetch: int, fetch_fraction: float) -> None:
+        """运行中更新 hybrid 拉取参数（cap + 比例），对已捕获 decode 图立即生效。
+
+        Business Logic（为什么需要这个方法）:
+            hybrid 每步的 PCIe 拉取 cap/比例原先以内核标量实参传入，CUDA graph 捕获
+            时被冻结，运行中改 Python 属性无法影响已捕获的 decode 图；运行中调参
+            （--tune-file 轮询 fetch_fraction）因此必须改走"设备张量按指针读取"的
+            值更新路径——本方法是唯一的合法写入口（无 profile 旧语义 = 固定 cap 1、
+            无比例分流，仍以 set_fetch_params(1, 0.0) 表达）。
+
+        Code Logic（这个函数做什么）:
+            宿主侧用与 ensure_experts_hybrid 入口完全一致的公式（fetch_fraction_q16）
+            把比例换算成 Q16 定点；同步更新 Python 属性 hybrid_max_fetch /
+            hybrid_fetch_fraction（CPU 参考镜像与测试读属性），并把 [max_fetch,
+            frac_q16] copy_ 进设备张量 fetch_params（指针稳定，只改值，图安全）。
+            非 hybrid 模式 fetch_params 为 None，此时只更新属性（hybrid 内核不会
+            被调用）。
+        """
+        self.hybrid_max_fetch = int(max_fetch)
+        self.hybrid_fetch_fraction = float(fetch_fraction)
+        if self.fetch_params is not None:
+            from freetoken.moe.offload_kernels import fetch_fraction_q16
+
+            self.fetch_params.copy_(
+                torch.tensor(
+                    [self.hybrid_max_fetch, fetch_fraction_q16(fetch_fraction)],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.

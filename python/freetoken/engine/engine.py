@@ -378,6 +378,8 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # 运行中调参轮询（--tune-file，moe/tune_file.py）：cache 装配后启动；None = 未启用
+        self._tune_poller = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -793,6 +795,18 @@ class Engine:
                 pin_arena = None
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+        if config.tune_file:
+            # 运行中调参（最小可用）：daemon 线程每 2s 检查 JSON 文件 mtime，变化则
+            # 经 cache.set_fetch_params 改值（fetch_params 指针稳定，对已捕获 decode
+            # 图立即生效）。cache 对象身份跨 rebuild 不变，线程引用始终有效。
+            from freetoken.moe.tune_file import POLL_INTERVAL_S, TuneFilePoller
+
+            self._tune_poller = TuneFilePoller(cache, config.tune_file)
+            self._tune_poller.start()
+            logger.info_rank0(
+                f"tune file polling: {config.tune_file} every {POLL_INTERVAL_S:.0f}s "
+                "(fetch_fraction applies to captured decode graphs; pin_k reserved)"
+            )
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -868,14 +882,13 @@ class Engine:
             cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
         )
         if fraction is None:
-            cache.hybrid_max_fetch = 1
+            cache.set_fetch_params(1, 0.0)  # 无 profile 旧语义：固定 cap 1、无比例分流
             logger.warning_rank0(
                 "--moe-hybrid-max-fetch auto: no usable `ft bench bw` profile for "
                 f"{cache.quant_format!r} experts; using a fixed fetch cap of 1"
             )
             return
-        cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction is the cap
-        cache.hybrid_fetch_fraction = fraction
+        cache.set_fetch_params(cache.num_experts, fraction)
         logger.info_rank0(
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
@@ -1210,6 +1223,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if self._tune_poller is not None:
+            self._tune_poller.stop()
+            self._tune_poller = None
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

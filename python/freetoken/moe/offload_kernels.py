@@ -104,6 +104,21 @@ def remap_src_indices_to_cold_rows(cache, layer_id: int) -> None:
     cache.src_indices.copy_(row[cache.src_indices.clamp(0, cache.num_experts - 1).long()])
 
 
+def fetch_fraction_q16(fetch_fraction: float) -> int:
+    """host 侧统一的 fetch_fraction -> Q16 定点换算（GPU 内核与 CPU 镜像共用）。
+
+    Business Logic（为什么需要这个函数）:
+        fetch_fraction 同时喂给 GPU 内核（经 fetch_params 设备张量）与 CPU 参考镜像
+        （标量实参），两路必须对同一 fraction 算出完全相同的定点值，否则镜像测试与
+        运行中调参（--tune-file）的语义会分叉；收敛成单一纯函数消除双处公式漂移。
+
+    Code Logic（这个函数做什么）:
+        把 [0, 1] 的比例四舍五入到 1/65536 定点并夹到 [0, 1 << 16]；负值与 >1 值
+        分别夹为 0 与饱和值（与历史 ensure_experts_hybrid 入口公式逐位一致）。
+    """
+    return min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:
@@ -116,9 +131,13 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats).
+
+    GPU 路径的 cap/比例不再取自本函数标量实参（CUDA graph 捕获会冻结标量），而是经
+    ``cache.fetch_params`` 设备张量按指针读取——运行中 ``set_fetch_params`` 改值即可
+    对已捕获 decode 图立即生效。标量实参仅服务 CPU 参考镜像分支。"""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
-    frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+    frac_q16 = fetch_fraction_q16(fetch_fraction)
     if not expert_ids.is_cuda:
         has_pins = cache.pin_ids is not None
         return _ensure_experts_hybrid_cpu(
@@ -126,7 +145,7 @@ def ensure_experts_hybrid(
             pin_base=cache.pin_base if has_pins else None,
             cold_row=None if cache.cold_row is None else cache.cold_row[layer_id],
         )
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -163,13 +182,24 @@ def reset_cache(cache) -> None:
 
 
 
-def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
-) -> None:
+def _ensure_experts_hybrid_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """GPU hybrid ensure（CUDA graph 可捕获）：cap/比例经 fetch_params 指针读取。
+
+    Business Logic（为什么需要这个函数）:
+        运行中调参（--tune-file 改 fetch_fraction）要求已捕获的 decode 图立即按新
+        值分流；标量内核实参在捕获时被冻结，无法满足，因此 cap 与 Q16 比例必须
+        走"指针稳定、只改值"的设备张量（与动态重钉同款值更新图安全模式）。
+
+    Code Logic（这个函数做什么）:
+        以 cache.fetch_params（[2] int32：[0]=max_fetch、[1]=frac_q16，cache 持有
+        永不重分配）单指针启动 _ensure_experts_hybrid_kernel；其余缓冲与 constexpr
+        与原实现一致（指针稳定性约束同 pin_slots 等既有设备缓冲）。
+    """
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
     has_pins = cache.pin_ids is not None
+    assert cache.fetch_params is not None, "hybrid cache must own a fetch_params tensor"
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -188,8 +218,8 @@ def _ensure_experts_hybrid_gpu(
         cache.pin_base if has_pins else cache.cache_size,
         layer_id,
         expert_ids.numel(),
-        int(max_fetch),
-        int(frac_q16),
+        # cap/比例设备张量：内核开头 tl.load 读取，值更新对已捕获图立即生效
+        cache.fetch_params,
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
@@ -401,7 +431,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "pin_base"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "pin_base"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -418,8 +448,7 @@ def _ensure_experts_hybrid_kernel(
     pin_base,
     layer_id,
     num_active,
-    max_fetch,
-    fetch_frac_q16,
+    fetch_params_ptr,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
@@ -438,6 +467,13 @@ def _ensure_experts_hybrid_kernel(
     = the capped fetch count (copy_missing), ``num_missing_full`` = the pre-cap miss count
     (stats).
 
+    ``max_fetch`` / ``fetch_frac_q16`` are loaded from ``fetch_params_ptr`` ([2] int32:
+    [0] = cap, [1] = Q16 fraction) instead of frozen kernel scalars: the pointer is a
+    stable cache-owned buffer, so a runtime ``set_fetch_params`` value update applies to
+    already-captured decode graphs on the next replay. Both stay plain runtime values
+    (never constexpr / specialized), so the fraction branch below remains a runtime
+    branch.
+
     Which misses to fetch is the cap policy. ``BY_RECENCY`` (default) fetches the experts
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
@@ -448,6 +484,9 @@ def _ensure_experts_hybrid_kernel(
     对应 CPU 镜像的 victim_limit）；``src_indices`` 经 ``cold_map_ptr``（cold_row 表）
     改写为冷压缩 bank 的行号。钉住专家 ``slot_for_id`` 已预填，Phase 1 恒命中——
     永不进入 miss 集合，也永不被驱逐。"""
+    # 运行时可变的 cap/比例（内核每次执行都重读；禁止 constexpr/特化以保持分支为运行时分支）
+    max_fetch = tl.load(fetch_params_ptr)
+    fetch_frac_q16 = tl.load(fetch_params_ptr + 1)
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts

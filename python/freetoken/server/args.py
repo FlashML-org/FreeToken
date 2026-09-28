@@ -816,6 +816,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--tune-file",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.tune_file,
+        help=(
+            "Runtime tuning via a JSON file polled every 2 s (mtime-gated). Keys: "
+            "\"fetch_fraction\" (hybrid decode's PCIe fetch split, [0, 1]; applied "
+            "through cache.set_fetch_params with the fetch cap unchanged and takes "
+            "effect on already-captured decode graphs without recapture) and "
+            "\"pin_k\" (reserved for dynamic repin; currently parsed and logged "
+            "only). Invalid JSON is silently skipped; out-of-range values are "
+            "ignored with one warning. Unset (default) disables polling."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

@@ -100,11 +100,14 @@ def _lru_ensure_oracle(query, slot_of_id, id_of_slot, lru_usage, lru_step, out_i
 
 
 def _make_pinned_cache(num_layers=2, num_experts=16, pins=(3, 7), k_per_layer=None,
-                       cache_size=None, device="cpu", dims=(8, 4), dtype=torch.float32):
+                       cache_size=None, device="cpu", dims=(8, 4), dtype=torch.float32,
+                       decode_target="gpu"):
     """带冷压缩 bank（尚未装配钉住）的 bf16 cache。
 
     bank 内容按指纹填充：冷行 (layer, expert) 的两个 bank 行均为标量 l*100+e，
     行均值即来源指纹；未写行（不该存在）预填 1000+l 便于暴露取错行。
+    decode_target 默认 "gpu"；hybrid 内核对拍测试须传 "hybrid"（hybrid 模式下
+    cache 才持有 fetch_params 设备张量，GPU ensure 内核按指针读取 cap/比例）。
     """
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -116,6 +119,7 @@ def _make_pinned_cache(num_layers=2, num_experts=16, pins=(3, 7), k_per_layer=No
     dev = torch.device(device)
     cache = OffloadMoeCache(
         num_layers=num_layers, num_experts=num_experts, cache_size=cache_size, device=dev,
+        decode_target=decode_target,
     )
     gate_up, down = [], []
     for l in range(num_layers):
@@ -523,8 +527,10 @@ def test_hybrid_kernel_with_pins_matches_cpu_mirror_gpu():
     """真实 hybrid kernel（pin_base 排除 + cold_row src）与 CPU 镜像逐位对拍。"""
     L, E = 2, 16
     pins = (5, 9, 1)
-    gpu = _make_pinned_cache(num_layers=L, num_experts=E, pins=pins, device="cuda")
-    ref = _make_pinned_cache(num_layers=L, num_experts=E, pins=pins, device="cpu")
+    gpu = _make_pinned_cache(num_layers=L, num_experts=E, pins=pins, device="cuda",
+                             decode_target="hybrid")
+    ref = _make_pinned_cache(num_layers=L, num_experts=E, pins=pins, device="cpu",
+                             decode_target="hybrid")
     pins_matrix = _init_pins(gpu, pins=pins)
     _init_pins(ref, pins=pins)
     rng = np.random.default_rng(9)
