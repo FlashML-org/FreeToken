@@ -197,6 +197,22 @@ class ExpertHotness:
             raise RuntimeError("尚无封口的热度窗口：先让 maybe_flush 在窗口模式下跑满一个 window_interval_s")
         return self._ema.reshape(self.num_layers, self.num_experts)
 
+    def cumulative_counts(self) -> np.ndarray:
+        """全量累计热度的 [num_layers, num_experts] int64 视图（历次排空的累加）。
+
+        Business Logic（为什么需要这个方法）:
+            动态扩 K 的选点需要"哪些专家更热"；窗口 EMA 要等首个 window_interval_s
+            封口才存在，而服务启动以来一直维护的全量累计（每次排空累加进宿主数组）
+            在首批流量排空后就可用——扩容选点在窗口未就绪时退回用它，避免人为
+            等待一个完整窗口。
+
+        Code Logic（这个函数做什么）:
+            把宿主累计数组 _host_counts 以零拷贝 reshape 视图返回
+            [num_layers, num_experts]（int64；调用方只读，排序语义与 EMA 相同：
+            降序取热、零热度不选）。
+        """
+        return self._host_counts.reshape(self.num_layers, self.num_experts)
+
     def window_topk(self, layer_id: int, k: int) -> list[int]:
         """
         Business Logic（为什么需要这个函数）:

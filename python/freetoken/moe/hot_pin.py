@@ -425,9 +425,9 @@ class HotExpertRepinManager:
             扩容 want 必须是 min(目标差值, K_cap - counts)（"装入个数"语义——2026-09-28
             真实 FP8 服务事故：grows 误存绝对目标，K=32/K_cap=61 收 pin_k=40 时以
             want=40 选点，install 在 32+29>=61 处每次拒绝第 30 个候选，目标因异常
-            保留、每个 idle 原样重试，扩容永不收敛）。有扩容但尚无完整热度窗口时
-            整体等待（目标保留，缩容也等下一窗口——避免半应用状态）；窗口就绪但
-            扩容候选全无（窗口热度不足）时同样保留目标静默返回，等下一个 idle 安全点。
+            保留、每个 idle 原样重试，扩容永不收敛）。扩容选点热度源：窗口 EMA 已
+            封口用 EMA；未封口退回全量累计热度（首批流量排空即有，不等待窗口）。
+            扩容候选全无（热度全零）时目标保留、静默返回，等下一个 idle 安全点。
             否则 torch.cuda.synchronize 做安全栅栏，逐层先缩（尾部换出）后扩
             （install_pinned_experts 装入，选点见 _growth_candidates），再次
             synchronize 暴露异步错误。全部层落地（无 shortfall）才清空目标；窗口
@@ -461,15 +461,22 @@ class HotExpertRepinManager:
             self._target_k = None
             self._defer_logged = False
             return False
-        if grows and not self._hotness.has_window:
-            # 扩容选点需要窗口 EMA；窗口未就绪时目标保留，等首个完整窗口
-            if not self._defer_logged:
-                logger.info_rank0(
-                    "dynamic pin-k: target K=%d deferred -- no sealed hotness window yet", target
-                )
-                self._defer_logged = True
-            return False
-        ema = self._hotness.ema_counts() if grows else None
+        # 扩容选点的热度源：窗口 EMA 已封口用 EMA（对近期负载敏感）；未封口时退回
+        # 全量累计热度（首批流量排空即有，无需等一个完整窗口）——扩容初始选点本就
+        # 没有"更近"的信号可用，服务启动以来的 top 热点即最合理起点，其后由常规
+        # EMA 换血继续修正。
+        ema = None
+        if grows:
+            if self._hotness.has_window:
+                ema = self._hotness.ema_counts()
+            else:
+                ema = self._hotness.cumulative_counts()
+                if not self._defer_logged:
+                    logger.info_rank0(
+                        "dynamic pin-k: target K=%d growth picks from cumulative "
+                        "hotness (first window not sealed yet)", target
+                    )
+                    self._defer_logged = True
         # 选点先于栅栏（纯宿主计算）：扩容候选全无（窗口热度不足）时目标保留、
         # 静默返回，等下一个 idle 安全点再试，不用日志刷屏
         grow_picks: dict[int, list[int]] = {}

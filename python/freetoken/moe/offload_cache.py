@@ -1643,6 +1643,21 @@ class OffloadMoeCache:
                     nbytes.append(E * feat)
                 elif miss.size:
                     rows = cold_starts if pinned else starts
+                    if pinned:
+                        # 生产不变式：src 行号必须落在该层冷压缩 bank 的行数内
+                        #（E - pin_floors[l]）。越界（动态钉住的映射/行池不一致）会
+                        # 产生越界 H2D 源地址——memcpyBatchAsync 报 invalid argument
+                        # 或更糟：静默拷到错权重。就地拒绝并给出全部诊断值。
+                        bank_rows = int(self.banks[b][0][layer_id].shape[0])
+                        bad = (rows < 0) | (rows >= bank_rows)
+                        if bool(bad.any()):
+                            bad_rows = rows[bad.astype(bool)].tolist()
+                            raise RuntimeError(
+                                f"layer {layer_id} bank {b}: cold row(s) {bad_rows} out of "
+                                f"range [0, {bank_rows}) (E={E}, floors={self.pin_floors[layer_id]}, "
+                                f"K_active={self.pin_counts[layer_id]}) — dynamic-pin row "
+                                "accounting is corrupted"
+                            )
                     dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
                     src.extend(self._copy_src_ptrs_host[layer_id][b] + rows * feat)
                     nbytes.extend(lengths * feat)

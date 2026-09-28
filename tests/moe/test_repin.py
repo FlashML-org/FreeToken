@@ -937,3 +937,44 @@ def test_swap_then_captured_graph_replay_gpu():
                 assert slot == pin_slots0[e] and fingerprint == float(e), (step, e)
             else:
                 assert fingerprint == float(e), (step, e, slot)
+
+
+def test_target_k_grows_from_cumulative_hotness_without_window(monkeypatch):
+    """扩容选点在首个热度窗口封口前退回全量累计热度（首批流量排空即可扩），
+    不再等待 window_interval_s；选点与 EMA 同序（降序、零热度不选）。"""
+    import freetoken.moe.hot_pin as hot_pin_mod
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+
+    _init_tp()
+    L, E, K0, CAP = 2, 128, 32, 61
+    cache = _make_pinned_cache(
+        num_layers=L, num_experts=E, pins=tuple(range(K0)), k_per_layer=[K0, K0],
+        cache_size=L * CAP + max(2 * E, LRU_FLOOR) + 8,
+    )
+    _init_pins(cache, pins=tuple(range(K0)), k_per_layer=[K0, K0], pin_capacity=CAP)
+    _load_pinned_slot_contents(cache)
+    hot = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hot_pin_mod.time, "monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]
+    # 未封口窗口：record 一批流量（不封口）+ 一次排空 → 全量累计有值
+    row = torch.tensor([[K0 + 5, K0 + 9, K0 + 2]], dtype=torch.int32)
+    for l in range(L):
+        for _ in range(10):
+            hot.record(l, row)
+    clock["t"] += 61.0
+    assert hot.maybe_flush() is True
+    assert not hot.has_window
+
+    manager = HotExpertRepinManager(cache, hot, interval_s=3600.0, gain=1.5, max_swaps=8)
+    manager.set_target_k(K0 + 3)
+    assert manager.apply_target_k() is True  # 无窗口也直接扩容
+    assert all(c == K0 + 3 for c in cache.pin_counts)
+    # 装入的正是累计热度最高的未钉专家（K0+5 / K0+9 / K0+2 中按 EMA 排序取 3 个）
+    for l in range(L):
+        assert set(cache.pinned_id_lists()[l]) - set(range(K0)) <= {K0 + 2, K0 + 5, K0 + 9}
+    # 全量累计路径消费目标后不再重触发
+    assert manager.target_k is None
