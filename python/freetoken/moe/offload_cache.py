@@ -826,15 +826,18 @@ class OffloadMoeCache:
             prefill chunk）调用，本方法内不处理并发。
 
         Code Logic（这个函数做什么）:
-            对每个冷专家 e（校验 e ∈ 冷集、未越容量）：a) 取该层第 count 个容量槽
+            按序装入冷专家直到剩余容量用尽：超容量时截断（返回实际装入的前缀，
+            shortfall 由上层 manager 的日志与目标续传语义处理），只有非法输入——
+            越界 id、不在冷集、层内重复——才 raise（校验先于任何写入，raise 时
+            零副作用）。对每个装入的专家 e：a) 取该层第 count 个容量槽
             s = pin_slots[l, count]；若 e 恰有 LRU 残留副本槽则解除其 id 映射（防
             后续驱逐按旧 id 反清新钉映射，同 swap 的 stale_slots 处理）；b) bank 冷
             行 H2D 进 s（e 的字节上显存）；c) 原子化改写映射值：pin_ids[l, count] =
             e、cold_row[l, e] = -1、slot_for_id[l, e] = s、id_of_slot[s] = l*E+e、
             usage[s] = 当前 step（衔接 flashlib 不可驱逐语义的自我续期），冷行让给
-            空闲行池；d) pin_counts[l] += 1，按首钉 dup 约定重垫填充行，刷新该层三源
-            组装 gather 索引与 cold_row 宿主镜像。全部为既有张量的值改写（shape 不变
-            ⇒ CUDA graph 兼容），返回实际装入的专家列表。
+            空闲行池；d) pin_counts[l] += n，按首钉 dup 约定重垫填充行，刷新该层
+            三源组装 gather 索引与 cold_row 宿主镜像。全部为既有张量的值改写
+            （shape 不变 ⇒ CUDA graph 兼容），返回实际装入的专家列表。
         """
         # inference tensor 栅栏：同 swap_pinned_experts 的说明。
         with torch.inference_mode():
@@ -858,27 +861,32 @@ class OffloadMoeCache:
         slot_host = self.slot_for_id[layer_id].cpu().tolist()
         step = int(self.step.item())
         installed: list[int] = []
+        installed_set: set[int] = set()
         s_list: list[int] = []
         r_list: list[int] = []
         stale_slots: list[int] = []
         for e in experts:
+            if self.pin_counts[layer_id] + len(installed) >= self.pin_capacity:
+                # 超容量截断：装到剩余容量为止，返回实际装入前缀（调用方 manager
+                # 有 shortfall 日志与目标续传语义）；截断优先于后续条目的校验
+                break
             if not 0 <= e < E:
                 raise ValueError(f"layer {layer_id}: 专家 id {e} 越界（E={E}）")
-            if self.pin_counts[layer_id] + len(installed) >= self.pin_capacity:
-                raise ValueError(
-                    f"layer {layer_id}: 容量槽已满（K_cap={self.pin_capacity}），"
-                    f"无法再装入专家 {e}"
-                )
             r = cold_host[e]
             if r < 0:
                 raise ValueError(
                     f"layer {layer_id}: 专家 {e} 不在冷集（cold_row={r}），无法钉住"
                 )
+            if e in installed_set:
+                # 冷行快照不随装入更新，层内重复必须显式拒绝，否则同一专家占据
+                # 两个容量槽、slot_for_id 互相覆盖、空闲行池少记一行
+                raise ValueError(f"layer {layer_id}: 专家 {e} 在本批重复出现，无法钉住")
             s = int(self.pin_slots[layer_id, self.pin_counts[layer_id] + len(installed)].item())
             prev = slot_host[e]
             if prev >= 0:
                 stale_slots.append(prev)
             installed.append(e)
+            installed_set.add(e)
             s_list.append(s)
             r_list.append(r)
         if not installed:

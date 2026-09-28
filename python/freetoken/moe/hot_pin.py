@@ -361,6 +361,9 @@ class HotExpertRepinManager:
         # 运行中调 K 的最新目标（set_target_k 写入，apply_target_k 消费后清空；
         # None = 无待落地目标，apply_target_k 在 idle 点的每次轮询直接快速返回）
         self._target_k: int | None = None
+        # 扩容等待原因（无窗口 / 零热度候选）的限流日志标记：同类原因只打一次，
+        # 有实际进展后复位，避免每个 idle 安全点刷屏又保留"为什么还没扩"的可观测性
+        self._defer_logged: bool = False
 
     @property
     def target_k(self) -> int | None:
@@ -418,13 +421,18 @@ class HotExpertRepinManager:
         Code Logic（这个函数做什么）:
             无待落地目标或缺钉住状态直接返回 False。每层目标 = clamp(k, floors[l],
             K_cap)（floors = 加载期钉住数：宿主冷压缩 bank 行数决定缩 K 下界；CPU
-            解码层 floors = 0 自然保持不钉）。有扩容但尚无完整热度窗口时整体等待
-            （目标保留，缩容也等下一窗口——避免半应用状态）；窗口就绪但扩容候选
-            全无（窗口热度不足）时同样保留目标静默返回，等下一个 idle 安全点。
+            解码层 floors = 0 自然保持不钉）。缩容目标传绝对值给 unpin_tail_experts；
+            扩容 want 必须是 min(目标差值, K_cap - counts)（"装入个数"语义——2026-09-28
+            真实 FP8 服务事故：grows 误存绝对目标，K=32/K_cap=61 收 pin_k=40 时以
+            want=40 选点，install 在 32+29>=61 处每次拒绝第 30 个候选，目标因异常
+            保留、每个 idle 原样重试，扩容永不收敛）。有扩容但尚无完整热度窗口时
+            整体等待（目标保留，缩容也等下一窗口——避免半应用状态）；窗口就绪但
+            扩容候选全无（窗口热度不足）时同样保留目标静默返回，等下一个 idle 安全点。
             否则 torch.cuda.synchronize 做安全栅栏，逐层先缩（尾部换出）后扩
-            （install_pinned_experts 装入，选点见 _growth_candidates，热度不足时
-            扩多少算多少并在日志注明），再次 synchronize 暴露异步错误，打汇总日志
-            并清空目标。返回是否有变更。
+            （install_pinned_experts 装入，选点见 _growth_candidates），再次
+            synchronize 暴露异步错误。全部层落地（无 shortfall）才清空目标；窗口
+            热度不足的余量保留目标、下个 idle 续传（幂等：counts 已更新，重算 grows
+            只剩余量，不重复迁移已装入专家）。返回是否有变更。
         """
         if self._target_k is None or self._cache.pin_ids is None:
             return False
@@ -440,17 +448,26 @@ class HotExpertRepinManager:
             for layer_id in range(cache.num_layers)
             if targets[layer_id] < counts[layer_id]
         }
+        # 扩容量是"装入个数"（want 语义）：目标差值，且不超过剩余容量槽。shrinks
+        # 的值是绝对目标数（unpin_tail_experts 的 new_count 参数即绝对值），两者
+        # 语义不同，不能共用一种写法
         grows = {
-            layer_id: targets[layer_id]
+            layer_id: min(targets[layer_id] - counts[layer_id], cap - counts[layer_id])
             for layer_id in range(cache.num_layers)
             if targets[layer_id] > counts[layer_id]
         }
         if not shrinks and not grows:
             # 已在目标上：无待办，消费目标（写重复 pin_k 不产生任何迁移）
             self._target_k = None
+            self._defer_logged = False
             return False
         if grows and not self._hotness.has_window:
             # 扩容选点需要窗口 EMA；窗口未就绪时目标保留，等首个完整窗口
+            if not self._defer_logged:
+                logger.info_rank0(
+                    "dynamic pin-k: target K=%d deferred -- no sealed hotness window yet", target
+                )
+                self._defer_logged = True
             return False
         ema = self._hotness.ema_counts() if grows else None
         # 选点先于栅栏（纯宿主计算）：扩容候选全无（窗口热度不足）时目标保留、
@@ -462,6 +479,12 @@ class HotExpertRepinManager:
                 layer_id, grows[layer_id], pinned_set, ema
             )
         if not shrinks and all(not picks for picks in grow_picks.values()):
+            if not self._defer_logged:
+                logger.info_rank0(
+                    "dynamic pin-k: target K=%d deferred -- window EMA has no growth "
+                    "candidates (zero-traffic window?)", target
+                )
+                self._defer_logged = True
             return False
         t0 = time.perf_counter()
         if cache.device.type == "cuda":
@@ -469,6 +492,7 @@ class HotExpertRepinManager:
             torch.cuda.synchronize(cache.device)
         unpinned_total = 0
         pinned_total = 0
+        shortfall_total = 0
         touched = 0
         details: list[str] = []
         for layer_id in sorted(set(shrinks) | set(grow_picks)):
@@ -481,6 +505,7 @@ class HotExpertRepinManager:
                 put = cache.install_pinned_experts(layer_id, grow_picks[layer_id])
                 pinned_total += len(put)
                 shortfall = grows[layer_id] - len(put)
+                shortfall_total += shortfall
                 note = f"，{shortfall} 个候选窗口热度不足未钉" if shortfall else ""
                 details.append(
                     f"L{layer_id}: +{put} (K {counts[layer_id]}->{counts[layer_id] + len(put)}{note})"
@@ -489,7 +514,11 @@ class HotExpertRepinManager:
         if cache.device.type == "cuda":
             # 应用后再次同步：行级拷贝是异步的，任何错误就地暴露
             torch.cuda.synchronize(cache.device)
-        self._target_k = None
+        # 全部层落地才消费目标；窗口热度不足的余量保留目标，下个 idle 安全点续传
+        # （counts 已推进，重算 grows 只剩余量——半应用状态靠幂等可续而非回滚）
+        if shortfall_total == 0:
+            self._target_k = None
+            self._defer_logged = False
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if touched:
             logger.info_rank0(

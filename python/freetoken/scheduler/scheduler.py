@@ -711,8 +711,13 @@ class Scheduler(SchedulerIOMixin):
         if repin is not None:
             try:
                 repin.maybe_repin()
-            except Exception:  # noqa: BLE001 — 重钉失败不能拖垮调度循环；记录后保当前钉住集继续服务
-                logger.exception("dynamic repin failed; keeping the current pin set")
+            except Exception as exc:  # noqa: BLE001 — 重钉失败不能拖垮调度循环；记录后保当前钉住集继续服务
+                # 异常详情内联：logger.exception 的 traceback 在部分子进程日志管线下
+                # 不落盘，内联保证每次失败都可见
+                logger.error(
+                    "dynamic repin failed (%s: %s); keeping the current pin set",
+                    type(exc).__name__, exc,
+                )
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

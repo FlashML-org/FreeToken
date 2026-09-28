@@ -515,6 +515,133 @@ def test_target_k_grow_defers_until_window_ready(monkeypatch):
     assert manager.target_k is None
 
 
+def test_target_k_real_service_shape_converges(monkeypatch, caplog):
+    """真实服务形态回归（2026-09-28 FP8 服务扩容死循环）：K=32/K_cap=61。
+    修复前 apply_target_k 把绝对目标当 want 传给 _growth_candidates（pin_k=40 时
+    选 40 个候选），install 校验在 32+29>=61 处每次拒绝第 30 个候选且零副作用，
+    目标因异常保留、每个 idle 原样重试，永不收敛。修复后：按剩余容量截断 want，
+    窗口热度不足的余量保留目标跨 idle 续传，全部层落地才清空目标；缩容 61->32
+    同样收敛。"""
+    import freetoken.moe.hot_pin as hot_pin_mod
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+
+    _init_tp()
+    L, E, K0, CAP = 2, 128, 32, 61
+    cache = _make_pinned_cache(
+        num_layers=L, num_experts=E, pins=tuple(range(K0)), k_per_layer=[K0, K0],
+        cache_size=L * CAP + max(2 * E, LRU_FLOOR) + 8,
+    )
+    _init_pins(cache, pins=tuple(range(K0)), k_per_layer=[K0, K0], pin_capacity=CAP)
+    _load_pinned_slot_contents(cache)
+    hot = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hot_pin_mod.time, "monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]  # __init__ 取真实时钟，构造后对齐到受控时钟
+    manager = HotExpertRepinManager(cache, hot, interval_s=10.0, gain=1.5, max_swaps=8)
+    manager.set_target_k(CAP)
+    # 窗口未就绪：目标保留（真实服务首个热度窗口封口前的形态）
+    assert manager.apply_target_k() is False
+    assert manager.target_k == CAP
+
+    def seal_window(layer_experts: list[int], t: float) -> None:
+        """喂一个完整窗口的每层流量并封口（与既有 target_k 用例同一窗口节奏）。"""
+        row = torch.tensor([layer_experts], dtype=torch.int32)
+        for _ in range(50):
+            for l in range(L):
+                hot.record(l, row)
+        clock["t"] = t
+        assert hot.maybe_flush() is True  # 开窗
+        clock["t"] = t + 11.0
+        assert hot.maybe_flush() is True  # 封口
+
+    with caplog.at_level(logging.INFO, logger="freetoken.moe.hot_pin"):
+        # 第一窗只有 10 个非零热度候选：装 10 个、shortfall 19，目标保留待续传
+        seal_window(list(range(32, 42)), 1011.0)
+        assert manager.apply_target_k() is True
+        assert cache.pin_counts == [42, 42]
+        assert manager.target_k == CAP  # 幂等可续：半应用状态保留目标
+        # 第二窗补齐余下 19 个候选：一次 apply 收敛到 K_cap，目标清空
+        seal_window(list(range(42, 61)), 1033.0)
+        assert manager.apply_target_k() is True
+        assert cache.pin_counts == [CAP, CAP]
+        assert manager.target_k is None
+
+    pin_k_logs = [r.getMessage() for r in caplog.records if "dynamic pin-k" in r.getMessage()]
+    assert any("target K=61 applied" in m for m in pin_k_logs)
+    final_log = pin_k_logs[-1]
+    assert "target K=61 applied" in final_log and "热度不足" not in final_log
+
+    for l in range(L):
+        # 61 个钉住 id 唯一、映射互逆（钉住 <=> cold_row == -1 <=> 槽在容量区）
+        ids = cache.pin_ids[l].tolist()
+        assert len(set(ids)) == CAP and ids[:K0] == list(range(K0))
+        assert sorted(ids[K0:]) == list(range(K0, CAP))
+        cr = cache.cold_row[l].cpu().tolist()
+        sf = cache.slot_for_id[l].cpu().tolist()
+        for e in range(E):
+            if e < CAP:
+                assert cr[e] == -1 and cache.pin_base + l * CAP <= sf[e] < cache.pin_base + (l + 1) * CAP, (l, e)
+            else:
+                assert cr[e] >= 0 and sf[e] == -1, (l, e)
+        # 余下冷专家（CAP..E-1）保持原始冷行（e - K0）：装入释放的行进了空闲池
+        assert sorted(r for r in cr if r >= 0) == list(range(CAP - K0, E - K0))
+        # 缩 K 释放的 bank 行恰为装入专家让出的行（e - K0），空闲池记账一致
+        assert cache._pin_free_rows[l] == set(range(CAP - K0))
+        np.testing.assert_array_equal(cache._cold_row_np[l], np.array(cr, dtype=np.int32))
+
+    # 缩容回 K0（真实验证的 61 -> 32 方向）：免窗口、尾部换出、目标消费
+    manager.set_target_k(K0)
+    assert manager.apply_target_k() is True
+    assert cache.pin_counts == [K0, K0]
+    assert manager.target_k is None
+    for l in range(L):
+        assert cache.pin_ids[l, :K0].tolist() == list(range(K0))
+        cr = cache.cold_row[l].cpu().tolist()
+        assert all(cr[e] >= 0 for e in range(K0, E)) and all(cr[e] == -1 for e in range(K0))
+        assert cache._pin_free_rows[l] == set()
+
+
+def test_install_pinned_experts_truncates_at_capacity():
+    """install 契约（真实服务事故的第二道防线）：超容量截断到剩余容量并返回实际
+    装入（不 raise），越界/不在冷集/层内重复才 raise 且零副作用。"""
+    _init_tp()
+    L, E = 1, 16
+    cache = _make_pinned_cache(num_layers=L, num_experts=E, pins=(0,), k_per_layer=[1],
+                               cache_size=4 + max(2 * E, LRU_FLOOR) + 8)
+    _init_pins(cache, pins=(0,), k_per_layer=[1], pin_capacity=4)
+    _load_pinned_slot_contents(cache)
+    # 剩余容量 3、候选 5 个：截断装入前 3 个，恰好到满容量（含 >= 边界）
+    assert cache.install_pinned_experts(0, [2, 3, 4, 5, 6]) == [2, 3, 4]
+    assert cache.pin_counts == [4]
+    assert cache.pin_ids[0].tolist() == [0, 2, 3, 4]
+    assert cache._pin_free_rows[0] == {1, 2, 3}  # 装入专家让出的冷行（e - 1）
+    for j, e in enumerate([0, 2, 3, 4]):
+        s = int(cache.pin_slots[0, j].item())
+        assert int(cache.id_of_slot[s].item()) == e
+        for _per_layer, bank_cache in cache.banks:
+            assert bank_cache[s].mean().item() == float(e)
+    # 已满容量再装：返回空列表而非报错
+    assert cache.install_pinned_experts(0, [5]) == []
+    assert cache.pin_counts == [4]
+
+    # 非法输入在写入前整体拒绝（校验循环先于任何字节/映射改动）
+    fresh = _make_pinned_cache(num_layers=L, num_experts=E, pins=(0,), k_per_layer=[1],
+                               cache_size=4 + max(2 * E, LRU_FLOOR) + 8)
+    _init_pins(fresh, pins=(0,), k_per_layer=[1], pin_capacity=4)
+    with pytest.raises(ValueError, match="重复"):
+        fresh.install_pinned_experts(0, [2, 2, 3])  # 层内重复（冷行快照查不出，须显式拒绝）
+    with pytest.raises(ValueError, match="越界"):
+        fresh.install_pinned_experts(0, [16])
+    with pytest.raises(ValueError, match="不在冷集"):
+        fresh.install_pinned_experts(0, [0])  # 已是钉住专家
+    assert fresh.pin_counts == [1]
+    assert fresh.pin_ids[0, :1].tolist() == [0]
+    assert fresh.cold_row[0, 2].item() >= 0 and fresh._pin_free_rows[0] == set()
+
+
 # ---------------------------------------------------------------------------
 # GPU：动态 K 值更新对已捕获 decode 图立即生效（hybrid 内核）
 # ---------------------------------------------------------------------------
