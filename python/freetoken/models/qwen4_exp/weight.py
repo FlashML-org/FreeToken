@@ -11,6 +11,7 @@ Dropped: ``mtp.*`` (speculative head, read by :func:`iter_mtp_weights`); ``model
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -703,6 +704,31 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     return written
 
 
+_PLE_HEADROOM_PCT = 12  # of effective memory kept free of the pinned bank: Python heaps, reader bounces, page-alignment slack
+
+
+def effective_memory_available(meminfo: str = "/proc/meminfo", cgroup: str = "/sys/fs/cgroup") -> int | None:
+    """Host bytes a startup allocation may take: the tighter of ``MemAvailable`` and the cgroup v2 headroom (``memory.max - memory.current``, a known zero when over); ``None`` when neither is readable."""
+    bounds = []
+    try:
+        with open(meminfo, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    bounds.append(int(line.split()[1]) * 1024)
+                    break
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(os.path.join(cgroup, "memory.max"), encoding="utf-8") as fh:
+            limit = fh.read().strip()
+        if limit != "max":
+            with open(os.path.join(cgroup, "memory.current"), encoding="utf-8") as fh:
+                bounds.append(max(0, int(limit) - int(fh.read().strip())))
+    except (OSError, ValueError):
+        pass
+    return min(bounds) if bounds else None
+
+
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                    workers: int = 8, chunk: int = 8 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
@@ -712,15 +738,27 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
     table is ~47.7 GiB (fp8) and must not also sit in the page cache while the bank holds the same bytes.
     An fp8 table needs the checkpoint's scalar ``weight_scale``; a bf16 table without one is unscaled.
+
+    Schema, geometry and the effective-memory admission (12% headroom) all finish before the bank
+    exists; any failure after that (a read, a shard that changed, the pin) discards the bank and
+    publishes nothing.
     """
     folder = download_hf_weight(model_path)
     layout = ple_table_layout(folder)
     check_ple_geometry(layout, qwen4_args)
+    available = effective_memory_available()
+    if available is not None and layout.total_bytes > available * (100 - _PLE_HEADROOM_PCT) // 100:
+        raise ValueError(
+            f"PLE table needs {layout.total_bytes} bytes of host memory for the pinned bank; effective memory "
+            f"available is {available} bytes, {available * (100 - _PLE_HEADROOM_PCT) // 100} after the "
+            f"{_PLE_HEADROOM_PCT}% headroom"
+        )
 
     bank = HostBank((layout.total_rows, layout.cols), layout.dtype)
     part_bytes = layout.rows_per_part * layout.cols * layout.dtype.itemsize
     identity = {f.path: f for f in layout.files}
     bar = byte_bar(layout.total_bytes, "Loading PLE table")
+    buf: memoryview | None = None
     try:
         buf = bank.memoryview()
         verified: set[str] = set()
@@ -733,10 +771,18 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             bar.update(part.nbytes)
         for shard in layout.files:  # ... and still is once its bytes are in the bank
             _check_same_file(shard, os.stat(shard.path), "while reading")
-    finally:
+        buf.release()
+        buf = None
         bar.close()
-    if pin and torch.cuda.is_available():
-        bank.pin()
+        if pin and torch.cuda.is_available():
+            bank.pin()
+    except BaseException:
+        with contextlib.suppress(Exception):  # never mask the failure with its own cleanup
+            if buf is not None:
+                buf.release()
+            bar.close()
+            bank.discard()
+        raise
     return PleTable(bank=bank, weight_scale=layout.scale)
 
 
@@ -767,6 +813,7 @@ __all__ = [
     "PleTable",
     "PleTableLayout",
     "check_ple_geometry",
+    "effective_memory_available",
     "expected_ple_rows",
     "iter_mtp_expert_pieces",
     "iter_mtp_weights",

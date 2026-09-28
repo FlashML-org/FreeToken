@@ -449,3 +449,125 @@ def test_disk_source_is_revalidated_before_the_store_opens_its_descriptors(tmp_p
     _flip_dtype_in_place(shard)
     with pytest.raises(ValueError, match=rf"PLE shard {shard} changed after preflight: st_ctime_ns"):
         DiskRowTable(source, constants)
+
+
+# ======================================================================================
+# 4. pinned backend: effective-memory admission before the bank exists; rollback after
+# ======================================================================================
+
+
+def _live_mmaps():
+    from freetoken.moe import host_banks
+
+    return [m for m in host_banks._LIVE_BUFFERS if not m.closed]
+
+
+def test_effective_memory_is_the_tighter_of_meminfo_and_the_cgroup(tmp_path):
+    meminfo = tmp_path / "meminfo"
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    meminfo.write_text("MemTotal:       65536000 kB\nMemFree:        1000 kB\nMemAvailable:   60000000 kB\n")
+    (cgroup / "memory.max").write_text("max\n")
+    (cgroup / "memory.current").write_text("1000\n")
+    assert weight.effective_memory_available(meminfo=str(meminfo), cgroup=str(cgroup)) == 60_000_000 * 1024
+    (cgroup / "memory.max").write_text("50000000000\n")
+    (cgroup / "memory.current").write_text("10000000000\n")
+    assert weight.effective_memory_available(meminfo=str(meminfo), cgroup=str(cgroup)) == 40_000_000_000
+    (cgroup / "memory.current").write_text("60000000000\n")  # over its limit: a known zero, not "unknown"
+    assert weight.effective_memory_available(meminfo=str(meminfo), cgroup=str(cgroup)) == 0
+    meminfo.write_text("MemTotal: 1 kB\n")  # no MemAvailable, cgroup only
+    (cgroup / "memory.current").write_text("10000000000\n")
+    assert weight.effective_memory_available(meminfo=str(meminfo), cgroup=str(cgroup)) == 40_000_000_000
+    assert weight.effective_memory_available(meminfo=str(tmp_path / "absent"), cgroup=str(tmp_path / "absent")) is None
+    assert weight.effective_memory_available() == weight.effective_memory_available("/proc/meminfo", "/sys/fs/cgroup")
+
+
+@pytest.mark.parametrize(
+    "available, admitted",
+    [
+        (65_024 * 100 // 88, True),      # exactly the 12% headroom: 65,024 <= 73,890 * 88 // 100 = 65,023 -> refused
+        (65_024 * 100 // 88 + 2, True),  # one byte of headroom to spare
+        (65_024, False),                 # the table fits in RAM but not with headroom
+        (0, False),                      # a known zero is a hard refusal
+        (None, True),                    # unknown: best effort, admit
+    ],
+)
+def test_pinned_bank_is_admitted_by_effective_memory_before_it_is_allocated(tmp_path, monkeypatch, available, admitted):
+    _write_table(tmp_path)
+    monkeypatch.setattr(weight, "effective_memory_available", lambda: available)
+    if available == 65_024 * 100 // 88:
+        admitted = False  # 73,890 * 88 // 100 = 65,023 < 65,024
+    if admitted:
+        table = load_ple_table(str(tmp_path), _args(), pin=False)
+        assert table.bank.nbytes == 65_024
+        return
+    ceiling = available * 88 // 100
+    allocations = []
+    real_bank = weight.HostBank
+
+    class Bank(real_bank):
+        def __init__(self, *a, **k):
+            allocations.append(a)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(weight, "HostBank", Bank)
+    with pytest.raises(ValueError, match=rf"PLE table needs 65024 bytes of host memory for the pinned bank; effective memory available is {available} bytes, {ceiling} after the 12% headroom"):
+        load_ple_table(str(tmp_path), _args(), pin=False)
+    assert allocations == []
+
+
+def test_host_bank_discard_frees_the_mapping_and_forgets_it():
+    from freetoken.moe.host_banks import HostBank
+
+    before = len(_live_mmaps())
+    bank = HostBank((1024, 16), torch.float8_e4m3fn)
+    assert len(_live_mmaps()) == before + 1
+    view = bank.memoryview()
+    view.release()
+    bank.discard()
+    assert len(_live_mmaps()) == before
+    assert bank.tensor is None and bank.nbytes == 0
+    bank.discard()  # idempotent
+
+
+@pytest.mark.parametrize(
+    "case, failure, message",
+    [
+        ("a read fails", "read", r"disk went away"),
+        ("a shard changed under the read", "mutate", r"changed after preflight: st_ctime_ns"),
+        ("the pin fails", "pin", r"cudaHostRegister failed for 0\.0 GiB"),
+    ],
+)
+def test_failure_after_allocation_discards_the_bank_and_publishes_nothing(tmp_path, monkeypatch, case, failure, message):
+    from freetoken.moe.host_banks import HostBank, PinFailed
+
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    banks = []
+    real_bank = weight.HostBank
+    real_read = weight.read_range_into
+
+    class Bank(real_bank):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            banks.append(self)
+
+    def read(buf, path, **kwargs):
+        if failure == "read":
+            raise OSError("disk went away")
+        if failure == "mutate" and not getattr(read, "done", False):
+            read.done = True
+            _flip_dtype_in_place(Path(layout.files[1].path))
+        return real_read(buf, path, **kwargs)
+
+    monkeypatch.setattr(weight, "HostBank", Bank)
+    monkeypatch.setattr(weight, "read_range_into", read)
+    if failure == "pin":
+        monkeypatch.setattr(weight.torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(HostBank, "pin", lambda self: (_ for _ in ()).throw(PinFailed("cudaHostRegister failed for 0.0 GiB")))
+    live = len(_live_mmaps())
+    with pytest.raises((ValueError, OSError, PinFailed), match=message):
+        load_ple_table(str(tmp_path), _args(), pin=True)
+    assert len(banks) == 1
+    assert banks[0].tensor is None and banks[0].nbytes == 0  # discarded ...
+    assert len(_live_mmaps()) == live  # ... and its mapping is closed and forgotten
