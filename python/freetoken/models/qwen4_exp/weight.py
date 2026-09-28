@@ -11,9 +11,11 @@ Dropped: ``mtp.*`` (speculative head, read by :func:`iter_mtp_weights`); ``model
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import stat
 import struct
 from dataclasses import dataclass
 from typing import Iterator
@@ -404,16 +406,79 @@ class PleTableLayout:
         return self.total_rows * self.cols * self.dtype.itemsize
 
 
+_PLE_HEADER_MAX_BYTES = 64 << 20  # a real shard header is ~150 KB; a length past this is refused unread
+
+
+def _canonical_shard_path(path: str) -> str:
+    """Resolve a discovered shard path once (the HF cache is symlinks into ``blobs/``); every later open is O_NOFOLLOW on the target."""
+    try:
+        return os.path.realpath(path, strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve PLE shard {path}: {exc.strerror}") from exc
+
+
+def _open_ple_shard(path: str) -> int:
+    """Open a canonical shard path without following a symlink that has since appeared there; only a regular file is accepted."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)  # NONBLOCK: a FIFO must not park us
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"PLE shard {path} is a symlink; refusing to follow it") from exc
+        raise
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"PLE shard {path} is not a regular file")
+    return fd
+
+
+def _pread_exact(fd: int, nbytes: int, offset: int, path: str) -> bytes:
+    chunks = []
+    while nbytes:
+        chunk = os.pread(fd, min(nbytes, 1 << 20), offset)
+        if not chunk:
+            raise ValueError(f"PLE shard {path} ended after {offset} bytes; a further {nbytes} were declared")
+        chunks.append(chunk)
+        nbytes -= len(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
 def _safetensors_header(path: str) -> tuple[dict, int]:
-    with open(path, "rb") as fh:
-        n = struct.unpack("<Q", fh.read(8))[0]
-        return json.loads(fh.read(n)), 8 + n
+    """The shard's JSON header and its payload base, through a nofollow open and a bounded read: a header length past the budget or past the file is refused with the number, not read."""
+    fd = _open_ple_shard(path)
+    try:
+        size = os.fstat(fd).st_size
+        prefix = os.pread(fd, 8, 0)
+        if len(prefix) != 8:
+            raise ValueError(f"PLE shard {path} is {size} bytes; not a safetensors file")
+        n = struct.unpack("<Q", prefix)[0]
+        if n > _PLE_HEADER_MAX_BYTES:
+            raise ValueError(
+                f"PLE shard {path} declares a {n}-byte safetensors header; the budget is {_PLE_HEADER_MAX_BYTES} bytes"
+            )
+        if 8 + n > size:
+            raise ValueError(
+                f"PLE shard {path} declares a {n}-byte safetensors header that runs past the end of the {size}-byte file"
+            )
+        raw = _pread_exact(fd, n, 8, path)
+        try:
+            header = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
+            raise ValueError(f"PLE shard {path} safetensors header is not UTF-8 JSON: {exc}") from exc
+        if not isinstance(header, dict):
+            raise ValueError(f"PLE shard {path} safetensors header is a JSON {type(header).__name__}, expected an object")
+        return header, 8 + n
+    finally:
+        os.close(fd)
 
 
 def _read_bytes(path: str, offset: int, nbytes: int) -> bytes:
-    with open(path, "rb") as fh:
-        fh.seek(offset)
-        return fh.read(nbytes)
+    fd = _open_ple_shard(path)
+    try:
+        return _pread_exact(fd, nbytes, offset, path)
+    finally:
+        os.close(fd)
 
 
 def _data_offsets(where: str, meta: dict, payload_bytes: int) -> tuple[int, int]:
@@ -535,14 +600,15 @@ def check_ple_geometry(layout: PleTableLayout, qwen4_args) -> None:
 
 
 def _ple_table_files(folder: str) -> list[str]:
-    """Shards holding a piece of the n-gram table, from the index when there is one."""
+    """Shards holding a piece of the n-gram table, from the index when there is one; canonical paths (see :func:`_canonical_shard_path`)."""
     index = os.path.join(folder, "model.safetensors.index.json")
     if not os.path.exists(index):
-        return sorted(iter_weight_files(folder))
-    with open(index, encoding="utf-8") as fh:
-        weight_map = json.load(fh)["weight_map"]
-    files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
-    return sorted(os.path.join(folder, shard) for shard in files)
+        files = iter_weight_files(folder)
+    else:
+        with open(index, encoding="utf-8") as fh:
+            weight_map = json.load(fh)["weight_map"]
+        files = [os.path.join(folder, shard) for shard in {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}]
+    return sorted(_canonical_shard_path(path) for path in files)
 
 
 def ftw_side_files(model_path: str, out_dir: str) -> list[str]:

@@ -225,3 +225,97 @@ def test_indexless_folder_is_discovered_from_the_shard_headers(tmp_path):
     assert layout.total_rows == 4064
     assert {os.path.basename(p.path) for p in layout.parts} == {"model-00000-of-00002.safetensors", "model-00001-of-00002.safetensors"}
     assert len(raw) == PARTS
+
+
+# ======================================================================================
+# 2. discovery: nofollow shard opens, bounded header reads
+# ======================================================================================
+
+
+def test_hf_cache_symlink_layout_resolves_once_and_then_opens_nofollow(tmp_path):
+    """The HF cache is symlinks into blobs/: discovery canonicalises each shard path exactly once; every later open is O_NOFOLLOW on the target."""
+    snapshot, blobs = tmp_path / "snapshot", tmp_path / "blobs"
+    snapshot.mkdir()
+    blobs.mkdir()
+    raw = _write_table(snapshot)
+    for shard in sorted(snapshot.glob("*.safetensors")):
+        target = blobs / f"blob-{shard.name}"
+        shard.rename(target)
+        shard.symlink_to(target)
+    layout = ple_table_layout(str(snapshot))
+    assert layout.total_rows == 4064
+    assert {p.path for p in layout.parts} == {str(blobs / f"blob-model-{n:05d}-of-00002.safetensors") for n in range(2)}
+    table = load_ple_table(str(snapshot), _args(), pin=False)
+    assert table.tensor[:ROWS].view(torch.uint8).numpy().tobytes() == raw[f"{PREFIX}.shard_0.weight"]
+
+
+def test_symlink_and_non_regular_shard_paths_are_refused_by_name(tmp_path):
+    _write_table(tmp_path)
+    shard = tmp_path / "model-00000-of-00002.safetensors"
+    link = tmp_path / "link.safetensors"
+    link.symlink_to(shard)
+    with pytest.raises(ValueError, match=rf"PLE shard {link} is a symlink; refusing to follow it"):
+        weight._safetensors_header(str(link))
+    fifo = tmp_path / "fifo.safetensors"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match=rf"PLE shard {fifo} is not a regular file"):
+        weight._safetensors_header(str(fifo))
+    with pytest.raises(ValueError, match=rf"PLE shard {tmp_path} is not a regular file"):
+        weight._safetensors_header(str(tmp_path))
+    dangling = tmp_path / "model-00001-of-00002.safetensors"
+    dangling.unlink()
+    dangling.symlink_to(tmp_path / "gone")
+    with pytest.raises(ValueError, match=rf"cannot resolve PLE shard {dangling}: No such file or directory"):
+        ple_table_layout(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "case, header_len, message",
+    [
+        ("one byte over budget", (64 << 20) + 1,
+         r"declares a 67108865-byte safetensors header; the budget is 67108864 bytes"),
+        ("u64 max", (1 << 64) - 1,
+         r"declares a 18446744073709551615-byte safetensors header; the budget is 67108864 bytes"),
+        ("past the end of the file", None,
+         r"declares a {n}-byte safetensors header that runs past the end of the {size}-byte file"),
+    ],
+)
+def test_header_length_is_bounded_before_it_is_read(tmp_path, no_bank, case, header_len, message):
+    _write_table(tmp_path)
+    shard = tmp_path / "model-00000-of-00002.safetensors"
+    size = shard.stat().st_size
+    if header_len is None:
+        header_len = size - 7  # in budget, one byte past the file
+    message = message.format(n=header_len, size=size)
+    with shard.open("r+b") as fh:
+        fh.write(struct.pack("<Q", header_len))
+    with pytest.raises(ValueError, match=rf"PLE shard {shard} {message}"):
+        ple_table_layout(str(tmp_path))
+    with pytest.raises(ValueError, match=message):
+        load_ple_table(str(tmp_path), _args(), pin=False)
+    assert shard.stat().st_size == size  # nothing was read past the declared length, nothing written
+
+
+@pytest.mark.parametrize(
+    "case, edit, message",
+    [
+        ("length +1 runs into the payload", "plus_one", r"safetensors header is not UTF-8 JSON: 'utf-8' codec can't decode"),
+        ("not JSON", b"{not json", r"safetensors header is not UTF-8 JSON: Expecting property name"),
+        ("JSON array", b"[]", r"safetensors header is a JSON list, expected an object"),
+        ("six-byte file", b"", r"is 6 bytes; not a safetensors file"),
+    ],
+)
+def test_header_must_be_a_utf8_json_object(tmp_path, no_bank, case, edit, message):
+    _write_table(tmp_path)
+    shard = tmp_path / "model-00000-of-00002.safetensors"
+    data = shard.read_bytes()
+    if edit == "plus_one":
+        n = struct.unpack("<Q", data[:8])[0]
+        shard.write_bytes(struct.pack("<Q", n + 1) + data[8:])
+    elif edit == b"":
+        shard.write_bytes(b"\x00" * 6)
+    else:
+        padded = edit + b" " * (-len(edit) % 8)
+        shard.write_bytes(struct.pack("<Q", len(padded)) + padded + data[8 + struct.unpack("<Q", data[:8])[0] :])
+    with pytest.raises(ValueError, match=rf"PLE shard {shard} {message}"):
+        ple_table_layout(str(tmp_path))
