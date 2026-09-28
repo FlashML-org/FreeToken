@@ -61,9 +61,9 @@ _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
 _PLE_SHARD_RE = re.compile(
-    r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
+    r"\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
 )
-_PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+_PLE_SCALE_RE = re.compile(r"\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\.ngram_embedding\.weight_scale$")
 _PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
 # Zero-centered Qwen4ExpTextRMSNorm weights, loaded RAW: GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm
@@ -370,12 +370,168 @@ class PleTable:
 
 
 _PLE_ST_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
+_PLE_SCALE_ST_DTYPE = "BF16"
+
+
+@dataclass(frozen=True)
+class PleShardPart:
+    """One ``shard_<i>`` tensor of the table: where its ``rows_per_part x cols`` bytes sit on disk."""
+
+    index: int
+    name: str
+    path: str
+    file_offset: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class PleTableLayout:
+    """The table as the shard headers describe it, after the aggregate schema check: parts ``0..N-1`` of equal ``[rows_per_part, cols]`` blocks of one dtype (F8_E4M3 or BF16), one BF16 scale (1 for a bf16 table that stores none), one layer."""
+
+    parts: tuple[PleShardPart, ...]
+    scale: torch.Tensor  # bf16 scalar
+    rows_per_part: int
+    cols: int
+    layer: int
+    dtype: torch.dtype = torch.float8_e4m3fn
+
+    @property
+    def total_rows(self) -> int:
+        return len(self.parts) * self.rows_per_part
+
+    @property
+    def total_bytes(self) -> int:
+        return self.total_rows * self.cols * self.dtype.itemsize
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:
     with open(path, "rb") as fh:
         n = struct.unpack("<Q", fh.read(8))[0]
         return json.loads(fh.read(n)), 8 + n
+
+
+def _read_bytes(path: str, offset: int, nbytes: int) -> bytes:
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        return fh.read(nbytes)
+
+
+def _data_offsets(where: str, meta: dict, payload_bytes: int) -> tuple[int, int]:
+    """``meta["data_offsets"]`` as ``(begin, end)``, both inside the file's payload."""
+    offsets = meta.get("data_offsets")
+    ok = isinstance(offsets, list) and len(offsets) == 2 and all(type(o) is int for o in offsets)
+    if not ok or not 0 <= offsets[0] <= offsets[1] <= payload_bytes:
+        raise ValueError(f"PLE tensor {where} data_offsets {offsets} run past the {payload_bytes}-byte payload")
+    return offsets[0], offsets[1]
+
+
+def ple_table_layout(folder: str) -> PleTableLayout:
+    """Parse every shard header holding a piece of the table and check that they describe one consistent table.
+
+    Refuses, naming the tensor and file: a part that is not F8_E4M3 or BF16, or not the first part's dtype, not a positive 2-D shape, or a different shape from the first part; a byte extent that is not ``rows x cols x itemsize``; an extent outside its file; a scale that is not exactly one finite positive BF16 scalar (an fp8 table must store one; a bf16 table may omit it and is unscaled); tensors from two layers; duplicate or non-contiguous part indices. No table bytes are read.
+    """
+    parts: dict[int, PleShardPart] = {}
+    scale: tuple[str, bytes] | None = None  # (where, raw bf16)
+    layer: tuple[int, str] | None = None  # (layer id, the tensor it was taken from)
+    rows = cols = 0
+    dtype: torch.dtype | None = None  # the first part's dtype, which every other part must share
+    first = ""  # the part whose shape every other part must match
+    for path in _ple_table_files(folder):
+        header, base = _safetensors_header(path)
+        payload_bytes = os.path.getsize(path) - base
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            part = _PLE_SHARD_RE.search(key)
+            scale_match = None if part is not None else _PLE_SCALE_RE.search(key)
+            if part is None and scale_match is None:
+                continue
+            where = f"{key} in {os.path.basename(path)}"
+            key_layer = int((part or scale_match).group("layer"))
+            if layer is None:
+                layer = (key_layer, where)
+            elif key_layer != layer[0]:
+                raise ValueError(f"PLE tensor {where} is for layer {key_layer}; {layer[1]} is for layer {layer[0]}")
+            begin, end = _data_offsets(where, meta, payload_bytes)
+            if scale_match is not None:
+                if meta.get("dtype") != _PLE_SCALE_ST_DTYPE or meta.get("shape") not in ([], [1]) or end - begin != 2:
+                    raise ValueError(
+                        f"PLE weight_scale {where} must be one BF16 scalar, got dtype {meta.get('dtype')}, "
+                        f"shape {meta.get('shape')}, {end - begin} bytes"
+                    )
+                if scale is not None:
+                    raise ValueError(f"PLE table has two weight_scale tensors: {scale[0]} and {where}")
+                scale = (where, _read_bytes(path, base + begin, 2))
+                continue
+            shard_dtype = _PLE_ST_DTYPES.get(meta.get("dtype"))
+            if shard_dtype is None or dtype not in (None, shard_dtype):
+                raise ValueError(f"PLE shard {where} has dtype {meta.get('dtype')}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard")
+            dtype = shard_dtype
+            shape = meta.get("shape")
+            if not (isinstance(shape, list) and len(shape) == 2 and all(type(d) is int and d > 0 for d in shape)):
+                raise ValueError(f"PLE shard {where} has shape {shape}, expected a positive 2-D [rows, cols]")
+            if first and shape != [rows, cols]:
+                raise ValueError(f"PLE shard {where} is {shape}, expected {[rows, cols]} like {first}")
+            rows, cols = shape
+            first = first or where
+            itemsize = dtype.itemsize
+            if end - begin != rows * cols * itemsize:
+                raise ValueError(
+                    f"PLE shard {where} spans {end - begin} bytes; shape {shape} x {itemsize} byte{'s' if itemsize != 1 else ''} "
+                    f"needs {rows * cols * itemsize}"
+                )
+            index = int(part.group("shard"))
+            if index in parts:
+                seen = parts[index]
+                raise ValueError(f"duplicate PLE shard {index}: {seen.name} in {os.path.basename(seen.path)} and {where}")
+            parts[index] = PleShardPart(index, key, path, base + begin, end - begin)
+    if not parts or sorted(parts) != list(range(len(parts))):
+        raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(parts)[:8]}")
+    if scale is None:
+        if dtype is torch.float8_e4m3fn:
+            raise ValueError("PLE table has no weight_scale")
+        value = torch.tensor(1.0, dtype=torch.bfloat16)  # a bf16 table without one is unscaled
+    else:
+        value = torch.frombuffer(bytearray(scale[1]), dtype=torch.bfloat16).clone().reshape(())
+        if not bool(torch.isfinite(value)) or float(value) <= 0:
+            raise ValueError(f"PLE weight_scale {scale[0]} must be finite and positive, got {float(value)}")
+    return PleTableLayout(tuple(parts[i] for i in range(len(parts))), value, rows, cols, layer[0], dtype)
+
+
+def expected_ple_rows(qwen4_args, *, ple_index: int = 0) -> int:
+    """The row count the checkpoint table must have for this config.
+
+    HF sizes the table at init as the sum of the per-head n-gram vocabulary primes (the same
+    :func:`derive_ngram_hash_constants` the dummy-weight path uses), padded up to
+    ``make_ngram_vocab_size_divisible_by``; Qwen3.8-Flash-Next: 16 primes after 19,999,999 -> 320,001,536.
+    """
+    from .ple import derive_ngram_hash_constants
+
+    heads = (int(qwen4_args.ngram_size) - 1) * int(qwen4_args.heads_per_ngram)
+    _, sizes, _ = derive_ngram_hash_constants(  # vocab_size only shapes the multipliers, unused here
+        vocab_size=1, ngram_size=int(qwen4_args.ngram_size), num_ngram_heads=heads,
+        ngram_vocab_size_base=int(qwen4_args.ngram_vocab_size_base), ple_layer_index=ple_index,
+    )
+    divisible = int(qwen4_args.make_ngram_vocab_size_divisible_by)
+    return -(-sum(sizes) // divisible) * divisible
+
+
+def check_ple_geometry(layout: PleTableLayout, qwen4_args) -> None:
+    """The layout must be exactly the table this config addresses: part count, row width, layer, and the padded total row count (equal, not merely covering)."""
+    parts = int(qwen4_args.split_ngram_parts)
+    if len(layout.parts) != parts:
+        raise ValueError(f"PLE table needs shards 0..{parts - 1}, found {len(layout.parts)}")
+    if layout.cols != qwen4_args.ngram_head_dim:
+        raise ValueError(f"PLE table row is {layout.cols} wide, config says {qwen4_args.ngram_head_dim}")
+    layer_ids = tuple(getattr(qwen4_args, "ple_layer_ids", None) or ())
+    if layer_ids and layout.layer not in layer_ids:
+        raise ValueError(f"PLE table tensors are for layer {layout.layer}, config ple_layer_ids is {list(layer_ids)}")
+    expected = expected_ple_rows(qwen4_args, ple_index=layer_ids.index(layout.layer) if layer_ids else 0)
+    if layout.total_rows != expected:
+        raise ValueError(
+            f"PLE table has {layout.total_rows} rows ({len(layout.parts)} x {layout.rows_per_part}); "
+            f"config geometry requires {expected}"
+        )
 
 
 def _ple_table_files(folder: str) -> list[str]:
@@ -433,61 +589,23 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     An fp8 table needs the checkpoint's scalar ``weight_scale``; a bf16 table without one is unscaled.
     """
     folder = download_hf_weight(model_path)
-    parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
-    scale: torch.Tensor | None = None
-    rows = cols = 0
-    dtype: torch.dtype | None = None
-    for path in _ple_table_files(folder):
-        header, base = _safetensors_header(path)
-        for key, meta in header.items():
-            if key == "__metadata__":
-                continue
-            if key.endswith(_PLE_SCALE_SUFFIX):
-                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-                    scale = f.get_tensor(key).reshape(())
-                continue
-            match = _PLE_SHARD_RE.search(key)
-            if match is None:
-                continue
-            shard_dtype = _PLE_ST_DTYPES.get(meta["dtype"])
-            if shard_dtype is None or dtype not in (None, shard_dtype):
-                raise ValueError(f"PLE table shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard")
-            dtype = shard_dtype
-            shape = meta["shape"]
-            if rows and tuple(shape) != (rows, cols):
-                raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
-            rows, cols = shape
-            begin, end = meta["data_offsets"]
-            parts[int(match.group("shard"))] = (path, base + begin, end - begin)
+    layout = ple_table_layout(folder)
+    check_ple_geometry(layout, qwen4_args)
 
-    expected = int(qwen4_args.split_ngram_parts)
-    if sorted(parts) != list(range(expected)):
-        raise ValueError(
-            f"PLE table needs shards 0..{expected - 1}, found {len(parts)}: {sorted(parts)[:8]}"
-        )
-    if cols != qwen4_args.ngram_head_dim:
-        raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
-    if scale is None:
-        if dtype is torch.float8_e4m3fn:
-            raise ValueError("PLE table has no weight_scale")
-        scale = torch.tensor(1.0, dtype=torch.bfloat16)
-
-    bank = HostBank((expected * rows, cols), dtype)
-    shard_bytes = rows * cols * dtype.itemsize
-    bar = byte_bar(expected * shard_bytes, "Loading PLE table")
+    bank = HostBank((layout.total_rows, layout.cols), layout.dtype)
+    part_bytes = layout.rows_per_part * layout.cols * layout.dtype.itemsize
+    bar = byte_bar(layout.total_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()
-        for shard in range(expected):
-            path, offset, nbytes = parts[shard]
-            assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
+        for part in layout.parts:
+            read_range_into(buf, part.path, file_offset=part.file_offset, nbytes=part.nbytes,
+                            dest_offset=part.index * part_bytes, workers=workers, chunk=chunk)
+            bar.update(part.nbytes)
     finally:
         bar.close()
     if pin and torch.cuda.is_available():
         bank.pin()
-    return PleTable(bank=bank, weight_scale=scale)
+    return PleTable(bank=bank, weight_scale=layout.scale)
 
 
 # ======================================================================================
@@ -512,9 +630,14 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 __all__ = [
     "nvfp4_expert_spec",
+    "PleShardPart",
     "PleTable",
+    "PleTableLayout",
+    "check_ple_geometry",
+    "expected_ple_rows",
     "iter_mtp_expert_pieces",
     "iter_mtp_weights",
     "iter_weights",
     "load_ple_table",
+    "ple_table_layout",
 ]
