@@ -533,6 +533,21 @@ class HotExpertRepinManager:
                 "across %d layer(s): %s",
                 target, elapsed_ms, pinned_total, unpinned_total, touched, "; ".join(details),
             )
+            # 动态 K 与 prefill hit-D2D（cudaMemcpyBatchAsync 三源组装）目前存在
+            # 未定位的交互缺陷：扩缩后该路径偶发驱动 invalid argument 并毒化上下文
+            # （进程崩溃，见 2026-09-28 FP8 服务三次复现）。扩缩落地即永久关闭
+            # hit-D2D，prefill 走静态验证过的整层/三源组合拷贝——两者解耦后各自
+            # 安全；D2D 的收益（重复提示的命中行搬运）与动态 K 的收益（decode 未
+            # 命中分流）本就不同场景。
+            d2d_active = bool(getattr(cache, "_prefill_hit_d2d_active", False))
+            if d2d_active:
+                cache._prefill_hit_d2d_active = False
+                cache._batch_memcpy = False
+                cache._hit_d2d_runtime_disabled = True
+                logger.warning(
+                    "MoE prefill hit-D2D disabled after a dynamic pin-k apply "
+                    "(known interaction defect); prefill uses full-layer copies"
+                )
         return bool(unpinned_total or pinned_total)
 
     def maybe_repin(self, now: float | None = None) -> bool:

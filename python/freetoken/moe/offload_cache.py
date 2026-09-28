@@ -1510,6 +1510,10 @@ class OffloadMoeCache:
         """
         from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
 
+        # 运行时永久禁用位（动态 pin-k 应用后置位，见 hot_pin.apply_target_k）：
+        # begin_prefill 每块会重算活跃标志，没有这个位降级会被静默撤销。
+        if getattr(self, "_hit_d2d_runtime_disabled", False):
+            return False
         if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
         elif _skip_fast_index_copy_enabled():
