@@ -12,6 +12,7 @@ Dropped: ``mtp.*`` (speculative head, read by :func:`iter_mtp_weights`); ``model
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -387,14 +388,35 @@ class PleShardPart:
 
 
 @dataclass(frozen=True)
+class PleShardIdentity:
+    """What preflight saw of one shard file: its inode identity, size, timestamps and the SHA-256 of the header bytes it parsed.
+
+    Best-effort evidence that the file a payload read opens is the file the header came from; it does not authenticate the checkpoint."""
+
+    path: str
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+    header_base: int
+    header_sha256: str
+
+    @classmethod
+    def of(cls, path: str, st: os.stat_result, header_base: int, header_sha256: str) -> "PleShardIdentity":
+        return cls(path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, header_base, header_sha256)
+
+
+@dataclass(frozen=True)
 class PleTableLayout:
-    """The table as the shard headers describe it, after the aggregate schema check: parts ``0..N-1`` of equal ``[rows_per_part, cols]`` blocks of one dtype (F8_E4M3 or BF16), one BF16 scale (1 for a bf16 table that stores none), one layer."""
+    """The table as the shard headers describe it, after the aggregate schema check: parts ``0..N-1`` of equal ``[rows_per_part, cols]`` blocks of one dtype (F8_E4M3 or BF16), one BF16 scale (1 for a bf16 table that stores none), one layer; ``files`` is what preflight saw of each shard file."""
 
     parts: tuple[PleShardPart, ...]
     scale: torch.Tensor  # bf16 scalar
     rows_per_part: int
     cols: int
     layer: int
+    files: tuple[PleShardIdentity, ...]
     dtype: torch.dtype = torch.float8_e4m3fn
 
     @property
@@ -444,31 +466,65 @@ def _pread_exact(fd: int, nbytes: int, offset: int, path: str) -> bytes:
     return b"".join(chunks)
 
 
-def _safetensors_header(path: str) -> tuple[dict, int]:
-    """The shard's JSON header and its payload base, through a nofollow open and a bounded read: a header length past the budget or past the file is refused with the number, not read."""
+def _header_bytes(fd: int, path: str, size: int) -> bytes:
+    """The raw header of an open shard, bounded: a header length past the budget or past the file is refused with the number, not read."""
+    prefix = os.pread(fd, 8, 0)
+    if len(prefix) != 8:
+        raise ValueError(f"PLE shard {path} is {size} bytes; not a safetensors file")
+    n = struct.unpack("<Q", prefix)[0]
+    if n > _PLE_HEADER_MAX_BYTES:
+        raise ValueError(
+            f"PLE shard {path} declares a {n}-byte safetensors header; the budget is {_PLE_HEADER_MAX_BYTES} bytes"
+        )
+    if 8 + n > size:
+        raise ValueError(
+            f"PLE shard {path} declares a {n}-byte safetensors header that runs past the end of the {size}-byte file"
+        )
+    return _pread_exact(fd, n, 8, path)
+
+
+def _safetensors_header(path: str) -> tuple[dict, PleShardIdentity]:
+    """The shard's JSON header plus what was seen of the file, through a nofollow open and a bounded read."""
     fd = _open_ple_shard(path)
     try:
-        size = os.fstat(fd).st_size
-        prefix = os.pread(fd, 8, 0)
-        if len(prefix) != 8:
-            raise ValueError(f"PLE shard {path} is {size} bytes; not a safetensors file")
-        n = struct.unpack("<Q", prefix)[0]
-        if n > _PLE_HEADER_MAX_BYTES:
-            raise ValueError(
-                f"PLE shard {path} declares a {n}-byte safetensors header; the budget is {_PLE_HEADER_MAX_BYTES} bytes"
-            )
-        if 8 + n > size:
-            raise ValueError(
-                f"PLE shard {path} declares a {n}-byte safetensors header that runs past the end of the {size}-byte file"
-            )
-        raw = _pread_exact(fd, n, 8, path)
+        st = os.fstat(fd)
+        raw = _header_bytes(fd, path, st.st_size)
         try:
             header = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
             raise ValueError(f"PLE shard {path} safetensors header is not UTF-8 JSON: {exc}") from exc
         if not isinstance(header, dict):
             raise ValueError(f"PLE shard {path} safetensors header is a JSON {type(header).__name__}, expected an object")
-        return header, 8 + n
+        return header, PleShardIdentity.of(path, st, 8 + len(raw), hashlib.sha256(raw).hexdigest())
+    finally:
+        os.close(fd)
+
+
+_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+
+def _check_same_file(identity: PleShardIdentity, st: os.stat_result, when: str) -> None:
+    for field in _IDENTITY_FIELDS:
+        seen, now = getattr(identity, field), getattr(st, field)
+        if seen != now:
+            raise ValueError(f"PLE shard {identity.path} changed {when}: {field} {seen} -> {now}")
+
+
+def revalidate_ple_shard(identity: PleShardIdentity) -> None:
+    """Immediately before a payload read: the canonical path must still open nofollow to the same regular file (device, inode, size, mtime, ctime) and its header bytes must still hash to what preflight parsed. Refuses with the field or digest that moved."""
+    fd = _open_ple_shard(identity.path)
+    try:
+        _check_same_file(identity, os.fstat(fd), "after preflight")
+        raw = _header_bytes(fd, identity.path, identity.st_size)
+        if 8 + len(raw) != identity.header_base:
+            raise ValueError(
+                f"PLE shard {identity.path} header changed after preflight: length {identity.header_base - 8} -> {len(raw)}"
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != identity.header_sha256:
+            raise ValueError(
+                f"PLE shard {identity.path} header changed after preflight: sha256 {identity.header_sha256} -> {digest}"
+            )
     finally:
         os.close(fd)
 
@@ -501,9 +557,12 @@ def ple_table_layout(folder: str) -> PleTableLayout:
     rows = cols = 0
     dtype: torch.dtype | None = None  # the first part's dtype, which every other part must share
     first = ""  # the part whose shape every other part must match
+    files: list[PleShardIdentity] = []
     for path in _ple_table_files(folder):
-        header, base = _safetensors_header(path)
-        payload_bytes = os.path.getsize(path) - base
+        header, identity = _safetensors_header(path)
+        files.append(identity)
+        base = identity.header_base
+        payload_bytes = identity.st_size - base
         for key, meta in header.items():
             if key == "__metadata__":
                 continue
@@ -560,7 +619,7 @@ def ple_table_layout(folder: str) -> PleTableLayout:
         value = torch.frombuffer(bytearray(scale[1]), dtype=torch.bfloat16).clone().reshape(())
         if not bool(torch.isfinite(value)) or float(value) <= 0:
             raise ValueError(f"PLE weight_scale {scale[0]} must be finite and positive, got {float(value)}")
-    return PleTableLayout(tuple(parts[i] for i in range(len(parts))), value, rows, cols, layer[0], dtype)
+    return PleTableLayout(tuple(parts[i] for i in range(len(parts))), value, rows, cols, layer[0], tuple(files), dtype)
 
 
 def expected_ple_rows(qwen4_args, *, ple_index: int = 0) -> int:
@@ -660,13 +719,20 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 
     bank = HostBank((layout.total_rows, layout.cols), layout.dtype)
     part_bytes = layout.rows_per_part * layout.cols * layout.dtype.itemsize
+    identity = {f.path: f for f in layout.files}
     bar = byte_bar(layout.total_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()
+        verified: set[str] = set()
         for part in layout.parts:
+            if part.path not in verified:  # the file is what preflight parsed, right before its first read
+                revalidate_ple_shard(identity[part.path])
+                verified.add(part.path)
             read_range_into(buf, part.path, file_offset=part.file_offset, nbytes=part.nbytes,
                             dest_offset=part.index * part_bytes, workers=workers, chunk=chunk)
             bar.update(part.nbytes)
+        for shard in layout.files:  # ... and still is once its bytes are in the bank
+            _check_same_file(shard, os.stat(shard.path), "while reading")
     finally:
         bar.close()
     if pin and torch.cuda.is_available():
@@ -696,6 +762,7 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 __all__ = [
     "nvfp4_expert_spec",
+    "PleShardIdentity",
     "PleShardPart",
     "PleTable",
     "PleTableLayout",
@@ -706,4 +773,5 @@ __all__ = [
     "iter_weights",
     "load_ple_table",
     "ple_table_layout",
+    "revalidate_ple_shard",
 ]

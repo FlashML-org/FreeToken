@@ -319,3 +319,133 @@ def test_header_must_be_a_utf8_json_object(tmp_path, no_bank, case, edit, messag
         shard.write_bytes(struct.pack("<Q", len(padded)) + padded + data[8 + struct.unpack("<Q", data[:8])[0] :])
     with pytest.raises(ValueError, match=rf"PLE shard {shard} {message}"):
         ple_table_layout(str(tmp_path))
+
+
+# ======================================================================================
+# 3. mutation evidence: stat gate + header SHA-256 between preflight and the payload reads
+# ======================================================================================
+
+
+def _flip_dtype_in_place(shard: Path) -> None:
+    """Same inode, same size, mtime restored: only ctime and the header bytes betray the edit."""
+    before = shard.stat()
+    data = shard.read_bytes()
+    n = struct.unpack("<Q", data[:8])[0]
+    at = data.index(b"F8_E4M3", 8)
+    assert at < 8 + n
+    with shard.open("r+b") as fh:
+        fh.seek(at)
+        fh.write(b"F8_E5M2")
+    os.utime(shard, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = shard.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+
+
+def test_layout_records_each_shard_identity_and_header_digest(tmp_path):
+    import hashlib
+
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    assert [os.path.basename(f.path) for f in layout.files] == ["model-00000-of-00002.safetensors", "model-00001-of-00002.safetensors"]
+    for identity in layout.files:
+        st = os.stat(identity.path)
+        assert (identity.st_dev, identity.st_ino, identity.st_size, identity.st_mtime_ns, identity.st_ctime_ns) == (
+            st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        data = Path(identity.path).read_bytes()
+        assert identity.header_base == 8 + struct.unpack("<Q", data[:8])[0]
+        assert identity.header_sha256 == hashlib.sha256(data[8 : identity.header_base]).hexdigest()
+        weight.revalidate_ple_shard(identity)  # untouched: passes
+    source = source_from_safetensors(str(tmp_path))
+    assert source.files == layout.files
+
+
+@pytest.mark.parametrize(
+    "case, mutate, message",
+    [
+        ("same-inode header edit, mtime restored", _flip_dtype_in_place, r"changed after preflight: st_ctime_ns \d+ -> \d+"),
+        ("one byte appended", lambda p: p.open("ab").write(b"\0"), r"changed after preflight: st_size (\d+) -> \d+"),
+        ("replaced by a copy", lambda p: (p.with_suffix(".new").write_bytes(p.read_bytes()), os.replace(p.with_suffix(".new"), p)),
+         r"changed after preflight: st_ino \d+ -> \d+"),
+        ("swapped for a symlink", lambda p: (p.rename(p.with_suffix(".blob")), p.symlink_to(p.with_suffix(".blob"))),
+         r"is a symlink; refusing to follow it"),
+    ],
+)
+def test_shard_changed_between_preflight_and_read_is_refused_with_the_reason(tmp_path, case, mutate, message):
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    shard = Path(layout.files[1].path)
+    mutate(shard)
+    with pytest.raises(ValueError, match=rf"PLE shard {shard} {message}"):
+        weight.revalidate_ple_shard(layout.files[1])
+    weight.revalidate_ple_shard(layout.files[0])  # the other shard is still what preflight saw
+
+
+def test_header_digest_catches_an_edit_the_stat_gate_cannot_see(tmp_path):
+    """A writer that also restores ctime (privileged, or a coarse filesystem) still changes the bytes preflight hashed."""
+    import dataclasses
+
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    identity = layout.files[0]
+    _flip_dtype_in_place(Path(identity.path))
+    forged = dataclasses.replace(identity, st_ctime_ns=os.stat(identity.path).st_ctime_ns)
+    with pytest.raises(ValueError, match=rf"PLE shard {identity.path} header changed after preflight: sha256 {identity.header_sha256[:16]}\S* -> [0-9a-f]{{16}}"):
+        weight.revalidate_ple_shard(forged)
+
+
+def test_pinned_load_revalidates_each_shard_before_its_first_read(tmp_path, monkeypatch):
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    other = Path(layout.files[1].path)  # parts 1 and 3
+    reads = []
+    real = weight.read_range_into
+
+    def read_then_mutate(buf, path, **kwargs):
+        reads.append(os.path.basename(path))
+        if len(reads) == 1:
+            _flip_dtype_in_place(other)  # while part 0 is being read, model-00001 changes under us
+        return real(buf, path, **kwargs)
+
+    monkeypatch.setattr(weight, "read_range_into", read_then_mutate)
+    with pytest.raises(ValueError, match=rf"PLE shard {other} changed after preflight: st_ctime_ns"):
+        load_ple_table(str(tmp_path), _args(), pin=False)
+    assert reads == ["model-00000-of-00002.safetensors"]  # part 1's read never happened
+
+
+def test_pinned_load_refuses_a_shard_that_changed_while_it_was_being_read(tmp_path, monkeypatch):
+    _write_table(tmp_path)
+    layout = ple_table_layout(str(tmp_path))
+    first = Path(layout.files[0].path)
+    reads = []
+    real = weight.read_range_into
+
+    def read_then_mutate(buf, path, **kwargs):
+        reads.append(os.path.basename(path))
+        out = real(buf, path, **kwargs)
+        if len(reads) == 4:
+            first.open("ab").write(b"\0")  # after the last read, model-00000 grows
+        return out
+
+    monkeypatch.setattr(weight, "read_range_into", read_then_mutate)
+    with pytest.raises(ValueError, match=rf"PLE shard {first} changed while reading: st_size \d+ -> \d+"):
+        load_ple_table(str(tmp_path), _args(), pin=False)
+    assert len(reads) == 4
+
+
+def test_disk_source_is_revalidated_before_the_store_opens_its_descriptors(tmp_path):
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    from .common import EOS, hash_constants
+
+    _write_table(tmp_path)
+    args = _args()
+    source = source_from_safetensors(str(tmp_path), args)
+    multipliers, sizes, offsets = hash_constants(args)
+    constants = {
+        "num_ngram_heads": args.num_ngram_heads, "layer_multipliers": multipliers.tolist(),
+        "per_head_vocab_sizes": sizes.tolist(), "per_head_offsets": offsets.tolist(), "eos_token_id": EOS,
+    }
+    shard = Path(source.files[0].path)
+    _flip_dtype_in_place(shard)
+    with pytest.raises(ValueError, match=rf"PLE shard {shard} changed after preflight: st_ctime_ns"):
+        DiskRowTable(source, constants)
