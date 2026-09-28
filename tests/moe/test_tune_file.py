@@ -8,6 +8,7 @@ fetch_fraction 应用 / pin_k 只日志）。
 from __future__ import annotations
 
 import json
+import logging
 import os
 from types import SimpleNamespace
 
@@ -178,3 +179,80 @@ def test_poller_cap_follows_current_cache_value(tmp_path):
     os.utime(path, (1000.0, 1000.0))
     poller.poll_once()
     assert cache.calls == [(7, 0.6)]
+
+
+class _FakeRepinManager:
+    """记录 set_target_k 的最小管理器替身（越界拒绝与真实实现同规则）。
+
+    Business Logic（为什么需要这个替身）:
+        pin_k 的 poller 单测只关心"何时以何值调 set_target_k"与坏值的告警降级；
+        替身把轮询转发行为从 cache/张量细节中剥离，保持纯 CPU 可跑。
+
+    Code Logic（这个替身做什么）:
+        记录每次 set_target_k 的目标到 targets；容量外目标抛 ValueError（模拟真实
+        管理器的校验），供断言 poller 的告警转换。
+    """
+
+    def __init__(self, capacity: int = 8) -> None:
+        self.capacity = capacity
+        self.targets: list[int] = []
+
+    def set_target_k(self, k: int) -> None:
+        """与真实管理器同语义：越界拒绝，合法目标记录（运行期覆写语义）。"""
+        if not 0 <= k <= self.capacity:
+            raise ValueError(f"pin_k 目标 {k} 超出 [0, {self.capacity}]")
+        self.targets.append(k)
+
+
+def test_poller_pin_k_dispatches_to_manager(tmp_path, caplog):
+    """pin_k 经 cache.repin_manager 记为最新目标（下一 idle 安全点生效）；非整数/
+    越界告警忽略；无管理器（未启用动态重钉）保持忽略日志、绝不离场。"""
+    path = tmp_path / "tune.json"
+    cache = _FakeCache()
+    manager = _FakeRepinManager(capacity=8)
+    cache.repin_manager = manager
+    poller = TuneFilePoller(cache, str(path))
+
+    def touch(payload: str, mtime: float) -> None:
+        path.write_text(payload, encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    with caplog.at_level(logging.INFO, logger="freetoken.moe.tune_file"):
+        # 合法整数：目标转发给管理器
+        touch('{"pin_k": 6}', 1000.0)
+        poller.poll_once()
+        assert manager.targets == [6]
+        assert "pin_k -> 6" in caplog.text
+        # 与 fetch_fraction 组合：两条键各自应用，互不干扰
+        touch('{"pin_k": 2, "fetch_fraction": 0.5}', 2000.0)
+        poller.poll_once()
+        assert manager.targets == [6, 2]
+        assert cache.calls == [(32, 0.5)]
+        # pin_k-only 不触碰 fetch 语义；mtime 门控照常
+        touch('{"pin_k": 3}', 3000.0)
+        poller.poll_once()
+        poller.poll_once()  # mtime 未变：不重复应用
+        assert manager.targets == [6, 2, 3]
+        assert cache.calls == [(32, 0.5)]
+        touch('{"pin_k": 4}', 4000.0)
+        poller.poll_once()
+        assert manager.targets == [6, 2, 3, 4]
+    with caplog.at_level(logging.WARNING, logger="freetoken.moe.tune_file"):
+        # 非整数：告警忽略
+        touch('{"pin_k": 4.5}', 5000.0)
+        poller.poll_once()
+        assert manager.targets == [6, 2, 3, 4]
+        assert "不是整数" in caplog.text
+        # 越界：管理器的 ValueError 转告警，轮询线程绝不离场
+        touch('{"pin_k": 99}', 6000.0)
+        poller.poll_once()
+        assert manager.targets == [6, 2, 3, 4]
+        assert "已忽略" in caplog.text
+    # 无管理器（未启用动态重钉）：忽略日志、不触碰任何 fetch 状态
+    cache2 = _FakeCache()
+    poller2 = TuneFilePoller(cache2, str(path))
+    with caplog.at_level(logging.INFO, logger="freetoken.moe.tune_file"):
+        touch('{"pin_k": 3}', 7000.0)
+        poller2.poll_once()
+    assert "未启用动态重钉" in caplog.text
+    assert cache2.calls == []

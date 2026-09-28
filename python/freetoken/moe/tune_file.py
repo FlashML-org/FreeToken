@@ -38,9 +38,10 @@ def parse_tune_json(text: str) -> tuple[dict[str, float], list[str]]:
     Code Logic（这个函数做什么）:
         json.loads 解析（失败抛 ValueError，由调用方静默跳过），顶层必须是 object；
         只认两个键："fetch_fraction"（数值且在 [0, 1]，否则剔除并记一条告警）与
-        "pin_k"（数值，本阶段只解析不应用，Phase C 动态重钉接手）。返回
-        (updates, warnings)：updates 只含合法键（fetch_fraction 为 float）；warnings
-        是人读告警文本，由调用方负责打日志（每次文件变化至多一轮）。
+        "pin_k"（数值，交由动态重钉管理器在下一 idle 安全点应用）。返回
+        (updates, warnings)：updates 只含合法键（fetch_fraction 为 float、pin_k 为
+        float，整型语义由应用方校验）；warnings 是人读告警文本，由调用方负责打日志
+        （每次文件变化至多一轮）。
     """
     try:
         doc = json.loads(text)
@@ -84,7 +85,10 @@ class TuneFilePoller:
         读失败静默跳过（mtime 已记录，避免每轮重读重刷日志），fetch_fraction 合法
         则先 torch.cuda.synchronize 做安全栅栏（同动态重钉：不在 in-flight 回放
         中途改值）再 cache.set_fetch_params(cache.hybrid_max_fetch, fraction)
-        （cap 不变），pin_k 只日志"尚未实现"。stop() 置位事件并 join。
+        （cap 不变）。pin_k 经 cache.repin_manager（动态重钉管理器，engine 装配）
+        set_target_k 记录最新目标——应用是异步的，管理器在下一 idle 安全点扩缩落
+        地，文件里写多少次都只保留最新目标；非整数/越界值告警忽略；没有管理器
+        （未启用动态重钉）时保持原行为只打一条忽略日志。stop() 置位事件并 join。
     """
 
     def __init__(
@@ -154,4 +158,35 @@ class TuneFilePoller:
                 f"(cap {self.cache.hybrid_max_fetch} unchanged)"
             )
         if "pin_k" in updates:
-            logger.info_rank0("tune file: pin_k 尚未实现（Phase C 动态重钉接手），已忽略")
+            self._apply_pin_k(updates["pin_k"])
+
+    def _apply_pin_k(self, value: float) -> None:
+        """把 pin_k 交给动态重钉管理器记为最新目标（无管理器/坏值只告警，绝不离场）。
+
+        Business Logic（为什么需要这个函数）:
+            pin_k 的语义是"最新意图"而非"立即执行"：真实扩缩必须等 idle 安全点
+            （HotExpertRepinManager.apply_target_k），轮询线程只做目标转发；管理器
+            可能未装配（未启用动态重钉）或目标非法（越界），两种情况都以一条日志
+            收场——轮询线程绝不能带崩引擎。
+
+        Code Logic（这个函数做什么）:
+            经 cache.repin_manager 查找管理器（engine 装配在 cache 上，晚于 poller
+            启动也有效）：无管理器打忽略日志保持旧行为；非整数打告警；set_target_k
+            抛 ValueError（越界/未钉住）转告警；成功则打"下一 idle 安全点生效"日志。
+        """
+        manager = getattr(self.cache, "repin_manager", None)
+        if manager is None:
+            logger.info_rank0(
+                "tune file: pin_k 已忽略（未启用动态重钉：需要 --hot-expert-list 与 "
+                "--hot-expert-repin-interval-s > 0）"
+            )
+            return
+        if not float(value).is_integer():
+            logger.warning(f"tune file: pin_k {value!r} 不是整数，忽略")
+            return
+        try:
+            manager.set_target_k(int(value))
+        except ValueError as exc:
+            logger.warning(f"tune file: pin_k {value!r} 已忽略（{exc}）")
+            return
+        logger.info_rank0(f"tune file: pin_k -> {int(value)}（下一 idle 安全点生效）")

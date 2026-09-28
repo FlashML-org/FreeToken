@@ -232,3 +232,44 @@ C 钉住主功能 ──→ E 三源组装（解除 overlap 约束）
       └──→ F 动态重钉（在 E 之后，共享 offload_cache 状态字段）
 ```
 每步交付即跑测试；D/E/F 各自独立成 commit。
+
+## 12. 扩展四：运行中调参（--tune-file 的 fetch_fraction 与 pin_k）
+
+**目标**：服务运行中（decode 图已捕获、无法重捕获）不改代码地调 hybrid 拉取比例与每层活跃钉住数 K。
+
+### 12.1 值更新图安全机制（Phase B 铺垫）
+
+CUDA graph 捕获冻结的是内核标量实参的**值**、张量实参的**指针**。因此运行时可变的参数一律走"cache 持有、指针稳定、只改值"的设备张量：`fetch_params`（[2] int32：cap + Q16 定点比例）与 `pin_base_dev`（int32 标量，钉住排除区边界）。已捕获 decode 图在下一次 replay 即读到新值。
+
+### 12.2 固定容量布局 + 活跃计数动态
+
+钉住区从"每层前缀偏移的可变布局"改为**每层固定容量槽位**：
+
+- `pin_base = cache_size - L × K_cap`，层 l 的容量槽 = `[pin_base + l*K_cap, pin_base + (l+1)*K_cap)`，静态不变（rebuild 重解算时同步刷 `pin_base_dev`）；
+- `pin_ids [L, K_cap]`：前 `pin_counts[l]` 个为活跃钉住专家，尾部按**首钉 dup** 约定填充（合并查询每次拷贝整条容量行，填充项重复命中首钉的钉住槽——无 fetch、无越界、无需内核感知每层计数）；
+- 活跃 K 变化只改前缀长度与映射值（shape 不变 ⇒ 图安全）：**扩** = 冷专家 H2D 装入该层第 count 个槽（`install_pinned_experts`，同时解除其 LRU 残留副本槽的 id 映射）；**缩** = 尾部活跃钉住 D2H 换出到宿主空闲行（`unpin_tail_experts`），空槽盖 `_PIN_USAGE_SENTINEL`（2^62，flashlib 全 cache argmin 永不选中；hybrid 内核按 `off_c >= pin_base` 整段排除，不依赖该值）；
+- 已知取舍：缩 K 留空的容量槽不参与 LRU（在排除区内）；
+- 每层动态下界 `pin_floors[l]` = 加载期钉住数：宿主冷压缩 bank 行数 E - floors[l] 固定，缩 K 换出的行取自空闲行池（深度 = K_active - floors[l]），因此 **K_active ∈ [floors[l], K_cap]**。
+
+### 12.3 --tune-file 键语义
+
+| 键 | 生效时机 | 途径 |
+|---|---|---|
+| `fetch_fraction`（[0,1] 数值） | 即时（下一次 decode replay） | poller 同步栅栏后 `cache.set_fetch_params`（cap 不变） |
+| `pin_k`（整数） | 下一 idle 安全点 | poller 经 `cache.repin_manager.set_target_k` 记录**最新目标**（写多次只保留最新），scheduler 的 idle 点由 `HotExpertRepinManager.apply_target_k` 执行扩缩，先于常规 EMA 换血 |
+
+pin_k 应用规则：每层目标 = clamp(k, floors[l], K_cap)（CPU 解码层 floors=0 自然不钉）；扩容按窗口 EMA 选点（EMA 降序、平局小 id、跳过已钉与零热度），候选不足时保留目标静默等下个 idle；缩容免窗口。无管理器（未启用动态重钉）时 pin_k 打日志忽略；非整数/越界告警忽略。
+
+### 12.4 --hot-expert-slots 与容量
+
+- stats 模式（--hot-expert-list 指向热度统计 JSON）：slots = 加载期选点数，容量同值 ⇒ 静态；
+- **pin list 模式**（--hot-expert-list 指向 pin list JSON）：list 定初始 K（= floors），slots = 容量 K_cap，为运行中调 K 预留扩容空间（须 >= list 每层钉住数）；
+- 不传 slots：K_cap = 初始 pin_counts 的 max，行为与固定 K 完全一致（向后兼容）。
+
+### 12.5 守卫
+
+- 容量显式值 < 初始每层钉住数 → 拒绝；
+- K_cap > E → 拒绝；
+- `cache_size - L×K_cap >= max(2E, 512)`（LRU 地板；rebuild 同式校验）。
+
+**验收**：几何/管理器 CPU 单测（映射不变式、空闲行池、哨兵、floor clamp、窗口门控）；GPU 图安全测试（捕获带钉 ensure_experts_hybrid → idle 扩容 → replay 新钉恒命中、旧钉不变、残留副本槽去映射；缩容 replay 按恢复冷行换入）；tune 文件集成（pin_k → 管理器目标转发、坏值告警、无管理器旧行为）。

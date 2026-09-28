@@ -18,6 +18,9 @@ import numpy as np
 import pytest
 import torch
 
+import freetoken.moe.hot_pin  # noqa: F401 -- 须在 collection 期导入：pytest 9 的 caplog 只把
+# 捕获 handler 附加到"进入测试阶段时已在 loggerDict 里"的非传播 logger；本文件的测试函数
+# 都在函数内 import hot_pin，单独运行本文件时若此处不导入，caplog 断言会因 handler 缺席为空
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 from .test_hot_pin import (  # 复用钉住测试的装配助手与 flashlib oracle
@@ -342,6 +345,277 @@ def test_repin_manager_gates_and_execution(monkeypatch, caplog):
         HotExpertRepinManager(cache, hot, interval_s=0.0, gain=1.5, max_swaps=8)
     with pytest.raises(ValueError, match="gain"):
         HotExpertRepinManager(cache, hot, interval_s=10.0, gain=0.9, max_swaps=8)
+
+
+# ---------------------------------------------------------------------------
+# 运行中调 K：set_target_k / apply_target_k（固定容量布局 + 活跃计数动态）
+# ---------------------------------------------------------------------------
+
+
+def test_manager_target_k_grow_shrink(monkeypatch, caplog):
+    """扩容等窗口、缩容免窗口；每层目标 clamp 到 [floors, K_cap]；扩缩后映射不变式
+    （slot_for_id ↔ cold_row 互逆、空闲行池记账、哨兵、填充行）与合并查询端到端。"""
+    import freetoken.moe.hot_pin as hot_pin_mod
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
+
+    monkeypatch.setattr(offload_kernels, "lru_ensure", _lru_ensure_oracle)
+    _init_tp()
+    L, E = 2, 16
+    cache = _make_pinned_cache(
+        num_layers=L, num_experts=E, pins=(0, 1), k_per_layer=[2, 2],
+        cache_size=2 * L * 4 + max(2 * E, LRU_FLOOR) + 8,
+    )
+    _init_pins(cache, pins=(0, 1), k_per_layer=[2, 2], pin_capacity=4)
+    _load_pinned_slot_contents(cache)
+    hot = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hot_pin_mod.time, "monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]  # __init__ 取真实时钟，构造后对齐到受控时钟
+    manager = HotExpertRepinManager(cache, hot, interval_s=10.0, gain=1.5, max_swaps=8)
+
+    # 越界目标：就地拒绝（poller 侧转告警）
+    with pytest.raises(ValueError, match="超出"):
+        manager.set_target_k(5)
+    with pytest.raises(ValueError, match="超出"):
+        manager.set_target_k(-1)
+
+    # 扩容无窗口：整体等待，目标保留
+    manager.set_target_k(4)
+    assert manager.apply_target_k() is False
+    assert manager.target_k == 4
+    assert cache.pin_counts == [2, 2]
+
+    # A 域窗口：2/3 热（两层同流量），两个完整窗口后扩到 K=4
+    for _ in range(50):
+        hot.record(0, torch.tensor([[2, 3, 2, 3]], dtype=torch.int32))
+        hot.record(1, torch.tensor([[2, 3, 2, 3]], dtype=torch.int32))
+    clock["t"] = 1011.0
+    assert hot.maybe_flush() is True  # 开窗
+    clock["t"] = 1022.0
+    assert hot.maybe_flush() is True  # 封口
+    with caplog.at_level(logging.INFO, logger="freetoken.moe.hot_pin"):
+        assert manager.apply_target_k() is True
+    assert manager.target_k is None  # 目标消费后清空
+    assert cache.pin_counts == [4, 4]
+    assert "dynamic pin-k" in caplog.text
+    for l in range(L):
+        assert cache.pin_ids[l].tolist() == [0, 1, 2, 3]  # 扩到满容量：无填充尾
+        # 映射不变式：钉住 ⇔ cold_row == -1 ⇔ slot_for_id ∈ 容量区
+        cr = cache.cold_row[l].cpu().tolist()
+        sf = cache.slot_for_id[l].cpu().tolist()
+        for e in range(E):
+            if e < 4:
+                assert cr[e] == -1 and cache.pin_base + l * 4 <= sf[e] < cache.pin_base + (l + 1) * 4, (l, e)
+            else:
+                assert cr[e] >= 0 and sf[e] == -1, (l, e)
+        # 冷行号是冷集 × 非空闲行的双射：行 0/1 已让给空闲池
+        assert sorted(r for r in cr if r >= 0) == list(range(2, E - 2))
+        assert cache._pin_free_rows[l] == {0, 1}
+        # 钉住槽指纹 == 换入专家（bank 冷行 H2D）
+        for j, e in enumerate([0, 1, 2, 3]):
+            s = int(cache.pin_slots[l, j].item())
+            assert int(cache.id_of_slot[s].item()) == l * E + e
+            for _per_layer, bank_cache in cache.banks:
+                assert bank_cache[s].mean().item() == float(l * 100 + e)
+        # 三源 gather 索引与宿主冷行镜像刷新
+        assert cache._pin_gather_dst[l].tolist() == [0, 1, 2, 3]
+        assert cache._pin_gather_num[l].tolist() == [4]
+        np.testing.assert_array_equal(cache._cold_row_np[l], np.array(cr, dtype=np.int32))
+
+    # 合并查询端到端（oracle）：新钉恒命中，填充 dup 无害（无额外 fetch、无越界）
+    rng = np.random.default_rng(5)
+    for step in range(300):
+        layer_id = step % L
+        raw = torch.from_numpy(rng.integers(0, E, size=(1, 4)).astype(np.int32))
+        raw.view(-1)[0] = step % 4  # 轮询全部四个钉住专家
+        ids = raw.clone()
+        cache.ensure_experts(layer_id, ids)
+        for e in range(4):
+            s = int(cache.slot_for_id[layer_id, e].item())
+            assert s >= cache.pin_base and int(cache.id_of_slot[s].item()) == layer_id * E + e, (step, e)
+        _apply_copy_plan(cache, layer_id)
+
+    # 缩容免窗口：全新无窗口 hotness 的管理器也能缩（尾部 3 换出到空闲行）
+    hot2 = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0)
+    manager2 = HotExpertRepinManager(cache, hot2, interval_s=10.0, gain=1.5, max_swaps=8)
+    manager2.set_target_k(3)
+    # 未到墙钟也应用（目标 K 不受墙钟门控，首个 idle 安全点即生效）
+    assert manager2.maybe_repin(now=clock["t"]) is True
+    assert cache.pin_counts == [3, 3]
+    for l in range(L):
+        cr = cache.cold_row[l].cpu().tolist()
+        assert cr[3] == 0  # 换出到最小空闲行（空闲池 {0,1} 取 0）
+        assert cache._pin_free_rows[l] == {1}
+        assert cache.slot_for_id[l, 3].item() == -1
+        s3 = int(cache.pin_slots[l, 3].item())
+        assert int(cache.id_of_slot[s3].item()) == -1
+        assert int(cache.usage[s3].item()) == _PIN_USAGE_SENTINEL  # 空容量槽对 argmin 隐形
+        assert cache.pin_ids[l].tolist() == [0, 1, 2, 0]
+        # 换出字节回宿主 bank（D2H）：行 0 现在装专家 3
+        for per_layer, _bank_cache in cache.banks:
+            assert per_layer[l][0].mean().item() == float(l * 100 + 3)
+
+    # 已在目标上：无变更也消费目标
+    manager2.set_target_k(3)
+    assert manager2.apply_target_k() is False
+    assert manager2.target_k is None
+    # 下界 clamp：目标 1 < floor 2 -> 每层缩到 2（floor），不会低于加载期钉住数
+    manager2.set_target_k(1)
+    assert manager2.apply_target_k() is True
+    assert cache.pin_counts == [2, 2]
+    for l in range(L):
+        assert cache._pin_free_rows[l] == set()
+        assert int(cache.cold_row[l, 2].item()) == 1  # 依次取空闲行池剩余行
+    # 低于下界的换出被 cache 原语拒绝
+    with pytest.raises(ValueError, match="区间内"):
+        cache.unpin_tail_experts(0, 1)
+
+
+def test_target_k_grow_defers_until_window_ready(monkeypatch):
+    """扩容目标在窗口就绪前持续等待（目标保留），窗口齐备后的首个 idle 落地。"""
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+
+    _init_tp()
+    L, E = 1, 16
+    cache = _make_pinned_cache(num_layers=L, num_experts=E, pins=(0,), k_per_layer=[1],
+                               cache_size=L * 2 + max(2 * E, LRU_FLOOR) + 8)
+    _init_pins(cache, pins=(0,), k_per_layer=[1], pin_capacity=2)
+    _load_pinned_slot_contents(cache)
+    hot = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    hot._last_flush = clock["t"]  # __init__ 取真实时钟，构造后对齐到受控时钟
+    manager = HotExpertRepinManager(cache, hot, interval_s=10.0, gain=1.5, max_swaps=8)
+    manager.set_target_k(2)
+    assert manager.apply_target_k() is False
+    assert manager.target_k == 2
+    # 窗口只有零热度候选：仍不扩（零热度不构成钉住证据），目标保留
+    for _ in range(50):
+        hot.record(0, torch.tensor([[0, 0]], dtype=torch.int32))
+    clock["t"] = 1011.0
+    hot.maybe_flush()
+    clock["t"] = 1022.0
+    hot.maybe_flush()
+    assert hot.has_window
+    assert manager.apply_target_k() is False
+    assert manager.target_k == 2
+    # 换成专家 1 的真实热度后落地
+    for _ in range(50):
+        hot.record(0, torch.tensor([[1, 1]], dtype=torch.int32))
+    clock["t"] = 1033.0
+    hot.maybe_flush()
+    assert manager.apply_target_k() is True
+    assert cache.pin_counts == [2] and cache.pin_ids[0, :2].tolist() == [0, 1]
+    assert manager.target_k is None
+
+
+# ---------------------------------------------------------------------------
+# GPU：动态 K 值更新对已捕获 decode 图立即生效（hybrid 内核）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pin_k_dynamic_k_on_captured_hybrid_graph_gpu(monkeypatch):
+    """捕获带钉住的 ensure_experts_hybrid 进 CUDA graph，idle 扩容（装新钉）后
+    replay：新钉专家立即恒命中容量槽（不被改写 -1）、旧钉不受影响、扩容前该专家
+    的 LRU 残留副本槽已去映射；缩容后 replay 按恢复的冷行换入。"""
+    import freetoken.moe.hot_pin as hot_pin_mod
+    import freetoken.moe.hotness as hotness_mod
+    from freetoken.moe.hot_pin import HotExpertRepinManager
+    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
+
+    L, E = 1, 16
+    dev = torch.device("cuda")
+    cache = _make_pinned_cache(num_layers=L, num_experts=E, pins=(0, 1), device="cuda",
+                               decode_target="hybrid", dtype=torch.bfloat16,
+                               cache_size=L * 4 + max(2 * E, LRU_FLOOR) + 8)
+    _init_pins(cache, pins=(0, 1), k_per_layer=[2], pin_capacity=4)
+    _load_pinned_slot_contents(cache)
+    torch.cuda.synchronize()
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(hotness_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(hot_pin_mod.time, "monotonic", lambda: clock["t"])
+    hot = _make_hotness(num_layers=L, num_experts=E, window_interval_s=10.0, device="cuda")
+    hot._last_flush = clock["t"]
+    cache.hotness = hot
+    manager = HotExpertRepinManager(cache, hot, interval_s=10.0, gain=1.5, max_swaps=8)
+    cache.repin_manager = manager
+
+    # 预热 + 捕获：路由含未来新钉专家 2 与冷专家 5（捕获时 2 是 miss → 有 LRU 残留槽）
+    warm = torch.full((1, 4), 9, dtype=torch.int32, device=dev)
+    cache.ensure_experts_hybrid(0, warm)
+    torch.cuda.synchronize()
+    raw = torch.tensor([[0, 1, 2, 5]], dtype=torch.int32, device=dev)
+    graph = torch.cuda.CUDAGraph()
+    ids = torch.empty_like(raw)
+    ids.copy_(raw)
+    cache.ensure_experts_hybrid(0, ids)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        cache.ensure_experts_hybrid(0, ids)
+        cache.copy_missing()
+    torch.cuda.synchronize()
+    stale_slot = int(cache.slot_for_id[0, 2].item())
+    assert 0 <= stale_slot < cache.pin_base
+
+    # A 域窗口：2/3 热 → idle 扩容到 K=4（装 2/3 进各层空闲容量槽）
+    hot.record(0, torch.tensor([[2, 3]] * 100, dtype=torch.int32, device=dev))
+    clock["t"] = 1011.0
+    assert hot.maybe_flush() is True
+    clock["t"] = 1022.0
+    assert hot.maybe_flush() is True
+    manager.set_target_k(4)
+    assert manager.apply_target_k() is True
+    torch.cuda.synchronize()
+    assert cache.pin_counts == [4]
+    assert cache.pin_ids[0, :4].tolist() == [0, 1, 2, 3]
+    pin_slots = [int(cache.pin_slots[0, j].item()) for j in range(4)]
+    assert int(cache.slot_for_id[0, 2].item()) == pin_slots[2]
+    assert int(cache.id_of_slot[stale_slot].item()) == -1  # 残留副本槽已去映射
+    for _per_layer, bank_cache in cache.banks:
+        assert bank_cache[pin_slots[2]].mean().item() == 2.0
+        assert bank_cache[pin_slots[3]].mean().item() == 3.0
+
+    # 扩容后 replay：新钉 2 恒命中容量槽、旧钉不变、5 首次 replay 换入后恒命中
+    for step in range(20):
+        ids.copy_(raw)
+        graph.replay()
+        torch.cuda.synchronize()
+        got = ids.cpu().tolist()[0]
+        assert got[:3] == pin_slots[:3], (step, got)
+        assert got[3] >= 0, (step, got)
+        assert float(cache.banks[0][1][got[3]].mean().item()) == 5.0, (step, got)
+
+    # 缩容到 K=3（尾部 3 换出，2 保持钉住）→ replay：3 空槽盖哨兵，2/5 照常服务
+    manager.set_target_k(3)
+    assert manager.apply_target_k() is True
+    torch.cuda.synchronize()
+    assert cache.pin_counts == [3]
+    assert int(cache.slot_for_id[0, 3].item()) == -1
+    assert int(cache.id_of_slot[pin_slots[3]].item()) == -1
+    assert int(cache.usage[pin_slots[3]].item()) == _PIN_USAGE_SENTINEL
+    row3 = int(cache.cold_row[0, 3].item())
+    assert row3 >= 0
+    for per_layer, _bank_cache in cache.banks:
+        assert per_layer[0][row3].mean().item() == 3.0  # 换出字节回宿主
+
+    # 缩容后 replay：2/5 仍恒命中（映射与字节未动），路由输出合法
+    for step in range(20):
+        ids.copy_(raw)
+        graph.replay()
+        torch.cuda.synchronize()
+        got = ids.cpu().tolist()[0]
+        assert got[0] == pin_slots[0] and got[1] == pin_slots[1], (step, got)
+        assert got[2] == pin_slots[2], (step, got)  # 2 未被缩掉，仍恒命中
+        assert got[3] >= 0 and float(cache.banks[0][1][got[3]].mean().item()) == 5.0, (step, got)
 
 
 # ---------------------------------------------------------------------------

@@ -58,18 +58,26 @@ def _ensure_experts_pinned(cache, layer_id: int, expert_ids: torch.Tensor) -> No
 
     Code Logic（这个函数做什么）:
         取 (num_route_ids) 键的固定合并缓冲 comb，comb[:n] = 路由专家 id、
-        comb[n:] = 本层钉住 id（层内钉住数为 0 时无附加段），以 comb 为 query 调
-        lru_ensure（out 别名 comb 原地），再把前 n 个 slot id 写回 expert_ids；
-        最后把 src_indices 经 cold_row 重映射为冷行号（copy_missing 的取行索引，
-        num_indices 之外的垃圾项 remap 无害——fused copy 按设备侧长度读取）。
-        全程固定 shape、无 host 同步，CUDA graph 可捕获。
+        comb[n:] = 本层整条容量行（活跃钉住 id + 首钉 dup 填充；层内活跃钉住数为 0
+        时整段重复首路由 id），以 comb 为 query 调 lru_ensure（out 别名 comb 原地），
+        再把前 n 个 slot id 写回 expert_ids；最后把 src_indices 经 cold_row 重映射为
+        冷行号（copy_missing 的取行索引，num_indices 之外的垃圾项 remap 无害——fused
+        copy 按设备侧长度读取）。全程固定 shape、无 host 同步，CUDA graph 可捕获；
+        钉住段读的是 pin_ids 张量值，动态调 K 对已捕获图立即生效。
     """
     n = expert_ids.numel()
     comb = cache.pin_query_buffer(n)
     k = int(cache.pin_counts[layer_id])
+    k_cap = cache.pin_capacity
     comb[:n].copy_(expert_ids.view(-1))
     if k:
-        comb[n : n + k].copy_(cache.pin_ids[layer_id, :k])
+        # 全容量行拷贝（含未活跃尾部）：尾部按"首钉 dup"约定垫值（_pad_pin_row），
+        # 填充查询重复命中首钉的钉住槽——无 fetch、无越界。行内容每次 replay 重新
+        # 读取，运行中扩 K/换血的新钉住 id 对已捕获 decode 图立即生效。
+        comb[n : n + k_cap].copy_(cache.pin_ids[layer_id, :k_cap])
+    else:
+        # 无活跃钉住：尾部重复首路由 id（同一次查询的去重折叠项，无 fetch、无越界）
+        comb[n : n + k_cap].copy_(comb[:1].expand(k_cap))
     lru_ensure(
         comb,
         cache.slot_for_id.view(-1),
@@ -193,7 +201,9 @@ def _ensure_experts_hybrid_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -
     Code Logic（这个函数做什么）:
         以 cache.fetch_params（[2] int32：[0]=max_fetch、[1]=frac_q16，cache 持有
         永不重分配）单指针启动 _ensure_experts_hybrid_kernel；其余缓冲与 constexpr
-        与原实现一致（指针稳定性约束同 pin_slots 等既有设备缓冲）。
+        与原实现一致（指针稳定性约束同 pin_slots 等既有设备缓冲）。钉住边界
+        pin_base 同为设备标量（pin_base_dev，按指针读取）：本设计里容量区静态、
+        pin_base 运行中不变，设备化消除"标量实参捕获冻结"隐患并为后续区域缩放留路。
     """
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -213,9 +223,10 @@ def _ensure_experts_hybrid_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -
         cache.num_missing_full,
         cache.expert_recency,
         # 钉住：冷行映射（HAS_PINS=False 时不解引用，传任意 int32 张量占位）+
-        # 受害槽排除区起点（无钉住时 = cache_size，排除为空）
+        # 受害槽排除区起点（设备标量按指针读取；无钉住时 = cache_size，排除为空，
+        # 传任意张量占位指针）
         cache.cold_row if has_pins else expert_ids,
-        cache.pin_base if has_pins else cache.cache_size,
+        cache.pin_base_dev if has_pins else expert_ids,
         layer_id,
         expert_ids.numel(),
         # cap/比例设备张量：内核开头 tl.load 读取，值更新对已捕获图立即生效
@@ -431,7 +442,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "pin_base"])
+@triton.jit(do_not_specialize=["layer_id", "num_active"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -445,7 +456,7 @@ def _ensure_experts_hybrid_kernel(
     num_missing_full_ptr,
     expert_recency_ptr,
     cold_map_ptr,
-    pin_base,
+    pin_base_ptr,
     layer_id,
     num_active,
     fetch_params_ptr,
@@ -480,13 +491,19 @@ def _ensure_experts_hybrid_kernel(
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
     (``missing_rank``), the original routing-blind heuristic.
 
-    显存钉住（HAS_PINS）：Phase 2 的受害槽扫描排除顶部钉住区（``off_c >= pin_base``，
-    对应 CPU 镜像的 victim_limit）；``src_indices`` 经 ``cold_map_ptr``（cold_row 表）
+    显存钉住（HAS_PINS）：Phase 2 的受害槽扫描排除顶部容量区（``off_c >= pin_base``，
+    对应 CPU 镜像的 victim_limit；pin_base 经 ``pin_base_ptr`` 设备标量按指针读取，
+    捕获冻结的是指针而非值）；``src_indices`` 经 ``cold_map_ptr``（cold_row 表）
     改写为冷压缩 bank 的行号。钉住专家 ``slot_for_id`` 已预填，Phase 1 恒命中——
     永不进入 miss 集合，也永不被驱逐。"""
     # 运行时可变的 cap/比例（内核每次执行都重读；禁止 constexpr/特化以保持分支为运行时分支）
     max_fetch = tl.load(fetch_params_ptr)
     fetch_frac_q16 = tl.load(fetch_params_ptr + 1)
+    # 钉住排除边界（HAS_PINS=False 时占位指针不解引用，排除为空）
+    if HAS_PINS:
+        pin_base = tl.load(pin_base_ptr)
+    else:
+        pin_base = cache_size
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts

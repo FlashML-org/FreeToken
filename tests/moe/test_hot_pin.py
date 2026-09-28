@@ -149,8 +149,11 @@ def _cold_rank(expert, layer_pin_list):
     return expert - sum(1 for e in layer_pin_list if e < expert)
 
 
-def _init_pins(cache, pins=(3, 7), k_per_layer=None):
-    """用与 hot_pin 相同的契约装配钉住；返回每层钉住列表。"""
+def _init_pins(cache, pins=(3, 7), k_per_layer=None, pin_capacity=None):
+    """用与 hot_pin 相同的契约装配钉住；返回每层钉住列表。
+
+    pin_capacity 非空时以显式容量装配（运行中调 K 的固定容量布局；缺省 None =
+    容量等于初始钉住数，与既有行为一致）。"""
     k_per_layer = k_per_layer if k_per_layer is not None else [len(pins)] * cache.num_layers
     from freetoken.moe.hot_pin import cold_row_from_pins
 
@@ -161,7 +164,7 @@ def _init_pins(cache, pins=(3, 7), k_per_layer=None):
     for l, row in enumerate(pins_matrix):
         if row:
             pin_ids[l, : len(row)] = torch.tensor(row, dtype=torch.int32)
-    cache.init_hot_pins(pin_ids, k_per_layer, cold_row)
+    cache.init_hot_pins(pin_ids, k_per_layer, cold_row, pin_capacity=pin_capacity)
     return pins_matrix
 
 
@@ -363,6 +366,54 @@ def test_init_hot_pins_maps_accounting_and_floors(caplog):
     # K > E 拒绝
     with pytest.raises(ValueError, match="专家数"):
         small.init_hot_pins(torch.ones((1, 20), dtype=torch.int32), [20], cold_row_from_pins([[]], 16))
+
+
+def test_capacity_layout_geometry_guards_and_padding():
+    """固定容量布局：每层定宽槽位与静态 pin_base/pin_slots、未活跃槽哨兵与首钉
+    dup 填充行；容量显式值的三个守卫（< 初始钉住数 / > E / 容量下的 LRU 地板）。"""
+    from freetoken.moe.offload_cache import _PIN_USAGE_SENTINEL
+
+    L, E, k_cap = 2, 16, 4
+    cache = _make_pinned_cache(
+        num_layers=L, num_experts=E, pins=(3, 7), k_per_layer=[1, 2],
+        cache_size=2 * L * k_cap + max(2 * E, LRU_FLOOR) + 8,
+    )
+    pins_matrix = _init_pins(cache, pins=(3, 7), k_per_layer=[1, 2], pin_capacity=k_cap)
+    assert cache.pin_capacity == k_cap
+    assert cache.pin_floors == [1, 2]  # 动态下界 = 加载期各层钉住数
+    assert cache.pin_base == cache.cache_size - L * k_cap
+    for l in range(L):
+        # 每层定宽容量槽：[pin_base + l*K_cap, pin_base + (l+1)*K_cap)，静态不变
+        assert cache.pin_slots[l].tolist() == [
+            cache.pin_base + l * k_cap + j for j in range(k_cap)
+        ]
+    # 活跃前缀映射：层 l 第 j 个钉住专家占该层第 j 个槽
+    assert int(cache.slot_for_id[0, pins_matrix[0][0]].item()) == cache.pin_base
+    assert int(cache.slot_for_id[1, 3].item()) == cache.pin_base + k_cap
+    assert int(cache.slot_for_id[1, 7].item()) == cache.pin_base + k_cap + 1
+    # 未活跃容量槽：无 id 映射 + usage 哨兵（flashlib argmin 永不选中）
+    for l, count in enumerate([1, 2]):
+        for j in range(count, k_cap):
+            s = int(cache.pin_slots[l, j].item())
+            assert int(cache.id_of_slot[s].item()) == -1
+            assert int(cache.usage[s].item()) == _PIN_USAGE_SENTINEL
+    # 填充行 = 首钉 dup（合并查询全容量行拷贝的无害命中约定）
+    assert cache.pin_ids[0].tolist() == [3, 3, 3, 3]
+    assert cache.pin_ids[1].tolist() == [3, 7, 3, 3]
+
+    # 守卫：容量 < 初始钉住数（容量区必须装得下初始钉住集）
+    small = _make_pinned_cache(num_layers=1, num_experts=16, pins=(3, 1), cache_size=64, k_per_layer=[2])
+    from freetoken.moe.hot_pin import cold_row_from_pins
+
+    args = (torch.tensor([[3, 1]], dtype=torch.int32), [2], cold_row_from_pins([[3, 1]], 16))
+    with pytest.raises(ValueError, match="小于初始每层钉住数"):
+        small.init_hot_pins(*args, pin_capacity=1)
+    # 守卫：容量 > E
+    with pytest.raises(ValueError, match="超过专家数"):
+        small.init_hot_pins(*args, pin_capacity=20)
+    # 守卫：容量区扣掉后 LRU 地板不足
+    with pytest.raises(ValueError, match="LRU"):
+        small.init_hot_pins(*args, pin_capacity=2)
 
 
 def test_reset_and_rebuild_restore_pin_maps():

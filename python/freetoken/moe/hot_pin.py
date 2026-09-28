@@ -1,12 +1,13 @@
 """显存钉住热点专家的加载期装配与运行期动态重钉：pin list/stats 读取、校验、
-cold_row 构建、重钉决策与 idle 安全点迁移管理。
+cold_row 构建、重钉决策、运行中调 K（pin_k）与 idle 安全点迁移管理。
 
 本模块是选点工具（``freetoken.hotness.select``，纯 Python）与运行期
 ``OffloadMoeCache`` 之间的契约层：
 
 * ``resolve_hot_pin_plan`` 读取 ``--hot-expert-list``（pin list JSON，或配合
   ``--hot-expert-slots`` 的热度统计 JSON）并产出每层钉住专家列表与
-  ``cold_row [L, E] int32`` 冷行映射；
+  ``cold_row [L, E] int32`` 冷行映射；pin list + ``--hot-expert-slots`` 同传时
+  slots 是钉住容量 K_cap（运行中调 K 的扩容上限）；
 * CPU 解码层（``--moe-cpu-layers`` 命中的层）的钉住项在此剥离并告警——这些层的
   host bank 保持全量 ``[E]``（CPU executor 按原始专家 id 取行），只有 GPU 层参与
   冷压缩；
@@ -14,7 +15,8 @@ cold_row 构建、重钉决策与 idle 安全点迁移管理。
   迟滞过滤后的交换对；
 * ``HotExpertRepinManager`` 在 idle 安全点（scheduler 的 ``_execute_pending_rebuild``
   同位置）周期性触发决策并经 ``OffloadMoeCache.swap_pinned_experts`` 执行行级迁移
-  （设计文档 §10）。
+  （设计文档 §10）；``set_target_k``/``apply_target_k`` 承接 --tune-file 的
+  ``pin_k``：写入只记最新目标，idle 安全点在容量区内扩/缩每层活跃钉住数。
 
 纯几何/纯 Python（torch 仅用于 cold_row 张量与管理器的同步栅栏），可在无 GPU 环境单测。
 """
@@ -153,6 +155,26 @@ def cold_row_from_pins(pins: list[list[int]], num_experts: int) -> torch.Tensor:
     return torch.stack(cold_rows)
 
 
+def _looks_like_pin_list(path: str) -> bool:
+    """
+    Business Logic（为什么需要这个函数）:
+        --hot-expert-list 与 --hot-expert-slots 同传时有两种合法语义：stats 文件
+        （slots = 加载期选点数 = 容量）与 pin list 文件（slots = 钉住容量 K_cap，
+        为运行中调 K 预留扩容空间）；必须先按文件种类分派，否则 pin list 会被
+        误当 stats 解析报错。
+
+    Code Logic（这个函数做什么）:
+        读文件顶层 JSON（IO/解析失败按"不是 pin list"处理，交由后续校验报错），
+        含 "pins" 键即 pin list。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and "pins" in doc
+
+
 def resolve_hot_pin_plan(
     hot_expert_list: str | None,
     hot_expert_slots: int | None,
@@ -167,15 +189,28 @@ def resolve_hot_pin_plan(
         只消费结果，避免装配逻辑散落在加载路径里。
 
     Code Logic（这个函数做什么）:
-        两者都未设置返回 None（不钉住）；hot_expert_slots 设置时把 hot_expert_list
-        按热度统计 JSON 解读（复用 hotness.select.load_stats 校验 + select_pins 选
-        每层 top-K），否则按 pin list JSON 解读。随后剥离 cpu_layer_ids 命中层的
-        钉住项（告警一次，列出层与专家数），全部层为空时也返回 None（无可钉项）。
-        文件校验失败抛 ValueError。
+        两者都未设置返回 None（不钉住）。hot_expert_slots 与 pin list 同传时 slots
+        是钉住容量 K_cap（运行中调 K 的扩容上限，须 >= pin list 每层钉住数）；与
+        热度统计 JSON 同传时 slots 是加载期选点数（复用 hotness.select.load_stats
+        校验 + select_pins 选每层 top-K，容量同值 = 静态）。随后剥离 cpu_layer_ids
+        命中层的钉住项（告警一次，列出层与专家数），全部层为空时也返回 None（无可
+        钉项）。文件校验失败抛 ValueError。
     """
     if hot_expert_list is None and hot_expert_slots is None:
         return None
-    if hot_expert_slots is not None:
+    pins: list[list[int]]
+    pin_list_capacity: int | None = None
+    if (
+        hot_expert_list is not None
+        and hot_expert_slots is not None
+        and _looks_like_pin_list(hot_expert_list)
+    ):
+        # pin list + slots：slots = 钉住容量（初始 K 取 pin list，扩容空间由容量预留）
+        if hot_expert_slots < 1:
+            raise ValueError(f"--hot-expert-slots 必须 >= 1，实际为 {hot_expert_slots}")
+        pin_list_capacity = hot_expert_slots
+        pins = _load_pin_list(hot_expert_list, num_layers, num_experts)
+    elif hot_expert_slots is not None:
         if hot_expert_slots < 1:
             raise ValueError(f"--hot-expert-slots 必须 >= 1，实际为 {hot_expert_slots}")
         if hot_expert_list is None:
@@ -197,6 +232,14 @@ def resolve_hot_pin_plan(
         pins = select_pins(stats["counts"], slots)
     else:
         pins = _load_pin_list(hot_expert_list or "", num_layers, num_experts)
+
+    if pin_list_capacity is not None:
+        widest = max((len(p) for p in pins), default=0)
+        if pin_list_capacity < widest:
+            raise ValueError(
+                f"--hot-expert-slots {pin_list_capacity} 小于 pin list 每层钉住数 {widest}："
+                "容量区必须装得下初始钉住集"
+            )
 
     skipped: dict[int, list[int]] = {}
     if cpu_layer_ids:
@@ -275,10 +318,12 @@ def plan_repin_swaps(
 
 
 class HotExpertRepinManager:
-    """动态重钉管理器：周期触发窗口决策并在 idle 安全点执行行级迁移（设计 §10）。
+    """动态重钉管理器：周期触发窗口决策并在 idle 安全点执行行级迁移（设计 §10）；
+    兼管运行中调 K（``set_target_k``/``apply_target_k``，容量区内扩缩每层活跃钉住数）。
 
     由 engine 在钉住装配完成时挂到 ``OffloadMoeCache.repin_manager``；scheduler 在
-    ``_execute_pending_rebuild`` 同一个 idle 安全点调用 :meth:`maybe_repin`。
+    ``_execute_pending_rebuild`` 同一个 idle 安全点调用 :meth:`maybe_repin`（内部
+    先执行未落地的目标 K，再做常规 EMA 换血）。
     """
 
     def __init__(
@@ -299,7 +344,7 @@ class HotExpertRepinManager:
         Code Logic（这个函数做什么）:
             校验参数（interval_s > 0、gain >= 1.0、max_swaps >= 1）后保存 cache、
             窗口计数器与三旋钮；初始化上次触发墙钟（首个窗口需 interval_s 填充，
-            之前的触发会被 has_window 门挡住）。
+            之前的触发会被 has_window 门挡住）；目标 K 置空（pin_k 未写入）。
         """
         if interval_s <= 0:
             raise ValueError(f"--hot-expert-repin-interval-s 必须 > 0，实际为 {interval_s}")
@@ -313,6 +358,146 @@ class HotExpertRepinManager:
         self._gain = float(gain)
         self._max_swaps = int(max_swaps)
         self._last = time.monotonic()
+        # 运行中调 K 的最新目标（set_target_k 写入，apply_target_k 消费后清空；
+        # None = 无待落地目标，apply_target_k 在 idle 点的每次轮询直接快速返回）
+        self._target_k: int | None = None
+
+    @property
+    def target_k(self) -> int | None:
+        """当前待落地的目标 K（None = 无；测试与状态查询用）。"""
+        return self._target_k
+
+    def set_target_k(self, k: int) -> None:
+        """设置全局目标钉住数 K（各层同值，按层 clamp 到 [floors[l], K_cap]）。
+
+        Business Logic（为什么需要这个函数）:
+            运行中调 K（--tune-file 的 pin_k）需要与常规换血解耦的入口：写入只记录
+            "最新意图"（写多少次只保留最新值），真正的字节迁移推迟到下一个 idle
+            安全点；越界目标在这里就地拒绝，poller 侧转为告警，不让坏值进入执行。
+
+        Code Logic（这个函数做什么）:
+            校验 0 <= k <= cache.pin_capacity（容量由 --hot-expert-slots 或初始钉住
+            数决定；未装配钉住时抛 RuntimeError）后覆写 _target_k。应用是异步的：
+            apply_target_k 在 idle 安全点执行。
+        """
+        cap = self._cache.pin_capacity
+        if cap is None:
+            raise RuntimeError("cache 未装配钉住（init_hot_pins），无法设置 pin_k 目标")
+        if not 0 <= k <= cap:
+            raise ValueError(f"pin_k 目标 {k} 超出 [0, {cap}]（容量 = --hot-expert-slots 或初始钉住数）")
+        self._target_k = int(k)
+
+    def _growth_candidates(self, layer_id: int, want: int, pinned: set[int], ema: np.ndarray) -> list[int]:
+        """
+        Business Logic（为什么需要这个函数）:
+            扩容选点必须与选点工具/常规换血同一热度规则（EMA 降序、平局小 id），
+            且零热度候选不钉（零热度不构成"更热"证据，钉住只浪费容量槽）。
+
+        Code Logic（这个函数做什么）:
+            按全序遍历该层 EMA，跳过已在钉住集与零热度专家，取前 want 个尚未钉住
+            的专家 id（可能不足 want：窗口热度不足时扩多少算多少，余量留给下轮）。
+        """
+        row = ema[layer_id]
+        order = sorted(range(self._cache.num_experts), key=lambda e: (-row[e], e))
+        out: list[int] = []
+        for e in order:
+            if len(out) >= want:
+                break
+            if e in pinned or float(row[e]) <= 0.0:
+                continue
+            out.append(e)
+        return out
+
+    def apply_target_k(self) -> bool:
+        """
+        Business Logic（为什么需要这个函数）:
+            pin_k 的应用必须是 idle 安全点的同步操作（改写钉住槽字节与映射，不能与
+            在途读者并发），且要在常规换血之前完成——换血决策按当前钉住集计算，
+            扩缩落地后换血才不会重复迁移刚装入/换出的专家。
+
+        Code Logic（这个函数做什么）:
+            无待落地目标或缺钉住状态直接返回 False。每层目标 = clamp(k, floors[l],
+            K_cap)（floors = 加载期钉住数：宿主冷压缩 bank 行数决定缩 K 下界；CPU
+            解码层 floors = 0 自然保持不钉）。有扩容但尚无完整热度窗口时整体等待
+            （目标保留，缩容也等下一窗口——避免半应用状态）；窗口就绪但扩容候选
+            全无（窗口热度不足）时同样保留目标静默返回，等下一个 idle 安全点。
+            否则 torch.cuda.synchronize 做安全栅栏，逐层先缩（尾部换出）后扩
+            （install_pinned_experts 装入，选点见 _growth_candidates，热度不足时
+            扩多少算多少并在日志注明），再次 synchronize 暴露异步错误，打汇总日志
+            并清空目标。返回是否有变更。
+        """
+        if self._target_k is None or self._cache.pin_ids is None:
+            return False
+        target = self._target_k
+        cache = self._cache
+        floors = cache.pin_floors
+        cap = cache.pin_capacity
+        assert floors is not None and cap is not None
+        counts = list(cache.pin_counts)
+        targets = [min(max(target, floors[layer_id]), cap) for layer_id in range(cache.num_layers)]
+        shrinks = {
+            layer_id: targets[layer_id]
+            for layer_id in range(cache.num_layers)
+            if targets[layer_id] < counts[layer_id]
+        }
+        grows = {
+            layer_id: targets[layer_id]
+            for layer_id in range(cache.num_layers)
+            if targets[layer_id] > counts[layer_id]
+        }
+        if not shrinks and not grows:
+            # 已在目标上：无待办，消费目标（写重复 pin_k 不产生任何迁移）
+            self._target_k = None
+            return False
+        if grows and not self._hotness.has_window:
+            # 扩容选点需要窗口 EMA；窗口未就绪时目标保留，等首个完整窗口
+            return False
+        ema = self._hotness.ema_counts() if grows else None
+        # 选点先于栅栏（纯宿主计算）：扩容候选全无（窗口热度不足）时目标保留、
+        # 静默返回，等下一个 idle 安全点再试，不用日志刷屏
+        grow_picks: dict[int, list[int]] = {}
+        for layer_id in sorted(grows):
+            pinned_set = set(cache.pinned_id_lists()[layer_id])
+            grow_picks[layer_id] = self._growth_candidates(
+                layer_id, grows[layer_id], pinned_set, ema
+            )
+        if not shrinks and all(not picks for picks in grow_picks.values()):
+            return False
+        t0 = time.perf_counter()
+        if cache.device.type == "cuda":
+            # idle 安全点栅栏（同 maybe_repin 的换血）：所有流同步后无在途读者
+            torch.cuda.synchronize(cache.device)
+        unpinned_total = 0
+        pinned_total = 0
+        touched = 0
+        details: list[str] = []
+        for layer_id in sorted(set(shrinks) | set(grow_picks)):
+            if layer_id in shrinks:
+                out = cache.unpin_tail_experts(layer_id, shrinks[layer_id])
+                unpinned_total += len(out)
+                if out:
+                    details.append(f"L{layer_id}: -{out} (K {counts[layer_id]}->{shrinks[layer_id]})")
+            if layer_id in grow_picks:
+                put = cache.install_pinned_experts(layer_id, grow_picks[layer_id])
+                pinned_total += len(put)
+                shortfall = grows[layer_id] - len(put)
+                note = f"，{shortfall} 个候选窗口热度不足未钉" if shortfall else ""
+                details.append(
+                    f"L{layer_id}: +{put} (K {counts[layer_id]}->{counts[layer_id] + len(put)}{note})"
+                )
+            touched += 1
+        if cache.device.type == "cuda":
+            # 应用后再次同步：行级拷贝是异步的，任何错误就地暴露
+            torch.cuda.synchronize(cache.device)
+        self._target_k = None
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if touched:
+            logger.info_rank0(
+                "dynamic pin-k: target K=%d applied in %.1f ms -- %d pinned in, %d unpinned "
+                "across %d layer(s): %s",
+                target, elapsed_ms, pinned_total, unpinned_total, touched, "; ".join(details),
+            )
+        return bool(unpinned_total or pinned_total)
 
     def maybe_repin(self, now: float | None = None) -> bool:
         """
@@ -320,25 +505,28 @@ class HotExpertRepinManager:
             scheduler 的 idle 安全点每迭代都会到达，但重钉只能在"墙钟到点 && 已有
             完整热度窗口 && 确有迁移"三者同时成立时执行；执行前必须同步全部流，
             保证没有在途 GEMM/CPU GEMV/未完成 prefill chunk 读着即将改写的字节。
+            目标 K（pin_k）不受墙钟与窗口门控：变更后的首个 idle 安全点即应用，
+            先扩缩再换血。
 
         Code Logic（这个函数做什么）:
-            墙钟未到 interval_s 直接返回 False；到点即刷新（失败也不立刻重试，
-            下一个窗口再看）。无完整窗口/无钉住时返回 False。否则取 EMA 与当前
-            钉住集（GPU → host 一次拷贝）跑 plan_repin_swaps；有迁移先在 CUDA 设备
-            上 torch.cuda.synchronize 做安全栅栏，再逐层 swap_pinned_experts 执行，
-            最后打一条汇总日志（层、换入/换出对、计数比、耗时）并返回 True。
-            now 参数仅供测试注入时钟。
+            先 apply_target_k（无目标时零开销返回 False）；墙钟未到 interval_s 直接
+            返回其结果；到点即刷新（失败也不立刻重试，下一个窗口再看）。无完整
+            窗口/无钉住时返回。否则取 EMA 与当前钉住集（GPU → host 一次拷贝）跑
+            plan_repin_swaps；有迁移先在 CUDA 设备上 torch.cuda.synchronize 做安全
+            栅栏，再逐层 swap_pinned_experts 执行，最后打一条汇总日志（层、换入/
+            换出对、计数比、耗时）并返回 True。now 参数仅供测试注入时钟。
         """
+        applied = self.apply_target_k()
         now = time.monotonic() if now is None else now
         if now - self._last < self._interval_s:
-            return False
+            return applied
         self._last = now
         if not self._hotness.has_window or self._cache.pin_ids is None:
-            return False
+            return applied
         ema = self._hotness.ema_counts()
         plan = plan_repin_swaps(ema, self._cache.pinned_id_lists(), gain=self._gain, max_swaps=self._max_swaps)
         if not plan:
-            return False
+            return applied
         t0 = time.perf_counter()
         if self._cache.device.type == "cuda":
             # idle 安全点栅栏：所有流同步后无在途 GEMM/CPU GEMV/prefill chunk，

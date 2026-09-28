@@ -76,9 +76,10 @@ class EngineConfig:
     # top-K 专家在加载期单副本常驻显存 slot cache 顶部区（不参与 LRU 驱逐），host bank
     # 只装其余冷专家。两者都未设置时行为与不钉住完全一致。
     hot_expert_list: str | None = None
-    # 每层钉住槽位数 K：设置后 hot_expert_list 按 stats 文件解读并内部选点
-    # （复用 hotness/select.py 的 select_pins）；未设置时 hot_expert_list 必须已是
-    # pin list JSON。
+    # 每层钉住槽位数 K（双重语义）：配合 stats 文件时是加载期选点数（复用
+    # hotness/select.py 的 select_pins，容量同值 = 静态钉住）；配合 pin list JSON
+    # 时是钉住容量 K_cap（list 定初始 K，容量为运行中调 K 预留扩容空间）。
+    # 未设置时 hot_expert_list 必须已是 pin list JSON，容量 = 初始 K。
     hot_expert_slots: int | None = None
     # 动态重钉（设计 §10）：滑动窗口热度驱动的运行期重钉，钉住模式下按墙钟间隔
     # （秒）把 device 热度计数 D2H 成"当前窗口"，经 EMA（半衰期 = 窗口时长）平滑后
@@ -92,8 +93,9 @@ class EngineConfig:
     # 运行中调参文件（--tune-file）：指向 JSON 文件，引擎守护线程每 2s 检查 mtime，
     # 变化则应用其中的键："fetch_fraction"（hybrid 每步 PCIe 拉取比例，[0,1]；经
     # cache.set_fetch_params 写设备张量，对已捕获 decode 图立即生效，cap 不变）；
-    # "pin_k" 预留给 Phase C 动态重钉（本阶段只解析并日志）。非法 JSON / mtime 未变
-    # 静默跳过；越界值忽略并告警一次。None = 关闭。
+    # "pin_k"（整数，每层活跃钉住数 K 的全局目标：经动态重钉管理器记录最新值，
+    # 下一 idle 安全点在容量区内扩缩落地）。非法 JSON / mtime 未变静默跳过；越界值
+    # 忽略并告警一次。None = 关闭。
     tune_file: str | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None

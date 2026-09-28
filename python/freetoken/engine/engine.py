@@ -781,14 +781,22 @@ class Engine:
                     "--hot-expert-list: bank loader ignored the pin sets (no cold_row); "
                     "cannot pin hot experts"
                 )
-            # 钉住映射预填 + 顶部区校验 + 记账日志（pinned bytes / host 节省 / LRU 槽数）
+            # 钉住映射预填 + 顶部区校验 + 记账日志（pinned bytes / host 节省 / LRU 槽数）。
+            # 容量 K_cap 显式取 --hot-expert-slots（运行中 pin_k 的扩容上限）；stats
+            # 选点路径已截断到 E，这里同步截断容量，pin list 路径的超 E 容量由
+            # init_hot_pins 拒绝。
             counts = [len(experts) for experts in pin_plan.pins]
             k_max = max(counts, default=0)
+            pin_capacity = (
+                min(config.hot_expert_slots, num_experts)
+                if config.hot_expert_slots is not None
+                else None
+            )
             pin_ids = torch.zeros((num_moe_layers, k_max), dtype=torch.int32)
             for layer_id, experts in enumerate(pin_plan.pins):
                 if experts:
                     pin_ids[layer_id, : len(experts)] = torch.tensor(experts, dtype=torch.int32)
-            cache.init_hot_pins(pin_ids, counts, banks.cold_row)
+            cache.init_hot_pins(pin_ids, counts, banks.cold_row, pin_capacity=pin_capacity)
             if pin_arena is not None:
                 # 钉住权重入显存：GPU 暂存 -> slot cache 顶部区（行序 == pin list 序 == 槽位分配序）
                 cache.load_pinned_rows(pin_arena)
@@ -798,14 +806,16 @@ class Engine:
         if config.tune_file:
             # 运行中调参（最小可用）：daemon 线程每 2s 检查 JSON 文件 mtime，变化则
             # 经 cache.set_fetch_params 改值（fetch_params 指针稳定，对已捕获 decode
-            # 图立即生效）。cache 对象身份跨 rebuild 不变，线程引用始终有效。
+            # 图立即生效）；pin_k 经 cache.repin_manager 记为最新目标，下一 idle 安全
+            # 点扩缩落地。cache 对象身份跨 rebuild 不变，线程引用始终有效。
             from freetoken.moe.tune_file import POLL_INTERVAL_S, TuneFilePoller
 
             self._tune_poller = TuneFilePoller(cache, config.tune_file)
             self._tune_poller.start()
             logger.info_rank0(
                 f"tune file polling: {config.tune_file} every {POLL_INTERVAL_S:.0f}s "
-                "(fetch_fraction applies to captured decode graphs; pin_k reserved)"
+                "(fetch_fraction applies to captured decode graphs; pin_k applies at "
+                "the next idle safe point)"
             )
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.

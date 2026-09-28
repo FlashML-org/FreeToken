@@ -770,10 +770,15 @@ def parse_args(
         metavar="K",
         default=ServerArgs.hot_expert_slots,
         help=(
-            "With --hot-expert-list pointing at a hotness stats JSON: pin K experts per "
-            "layer, selected internally at load time with the selection tool's rule "
-            "(count descending, ties to the lower id). Without it, --hot-expert-list "
-            "must already be a pin list JSON and this flag must stay unset."
+            "Dual role. With --hot-expert-list pointing at a hotness stats JSON: pin "
+            "K experts per layer, selected internally at load time with the selection "
+            "tool's rule (count descending, ties to the lower id) -- K is then also "
+            "the pin capacity, so the pin count stays static. With --hot-expert-list "
+            "being a pin list JSON: the list sets the initial per-layer pin count and "
+            "K becomes the pin CAPACITY, reserving per-layer headroom so runtime "
+            "pin_k (--tune-file) can grow the active pin count up to K (shrinking is "
+            "bounded below by the list's initial count). Rejected alone (without "
+            "--hot-expert-list)."
         ),
     )
 
@@ -825,9 +830,12 @@ def parse_args(
             "\"fetch_fraction\" (hybrid decode's PCIe fetch split, [0, 1]; applied "
             "through cache.set_fetch_params with the fetch cap unchanged and takes "
             "effect on already-captured decode graphs without recapture) and "
-            "\"pin_k\" (reserved for dynamic repin; currently parsed and logged "
-            "only). Invalid JSON is silently skipped; out-of-range values are "
-            "ignored with one warning. Unset (default) disables polling."
+            "\"pin_k\" (integer; global target for the per-layer active pin count, "
+            "recorded via the dynamic-repin manager and applied at the NEXT idle "
+            "safe point within the pin capacity set by --hot-expert-slots; needs "
+            "dynamic repinning enabled, otherwise ignored with a log). Invalid JSON "
+            "is silently skipped; out-of-range values are ignored with one warning. "
+            "Unset (default) disables polling."
         ),
     )
 
