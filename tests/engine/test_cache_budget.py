@@ -295,6 +295,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens = 0
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
+        attention_backend = "triton"  # resolved before Engine init; derived-size backends charge 0
         model_config = StubModelConfig()
 
         class tp_info:
@@ -503,3 +504,57 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+# ---- attention workspace charged against the budget (issue #303) ----
+
+
+def _auto_kwargs(baseline_free, workspace_bytes):
+    return dict(
+        baseline_free=baseline_free,
+        weights_bytes=1000,
+        memory_ratio=0.95,
+        cache_per_page=10,
+        fixed_cache_size=500,
+        per_expert_bytes=100,
+        num_experts=4,
+        total_experts=32,
+        prefill_overlap=True,
+        kv_reserve_tokens=10,
+        page_size=1,
+        attention_workspace_bytes=workspace_bytes,
+    )
+
+
+def test_workspace_charge_keeps_plan_within_baseline():
+    # A tight memory_ratio must plan pools that leave the attention backend's fixed
+    # workspace room inside ratio*baseline, not die later in a CUDA OOM (issue #303).
+    from freetoken.engine.cache_budget import plan_cache_budget, resolve_moe_cache_auto
+
+    baseline_free = 10_000
+    workspace = 256
+    size, pages, _ = resolve_moe_cache_auto(**_auto_kwargs(baseline_free, workspace))
+    used = size * 100 + pages * 10 + 1000 + 500 + workspace
+    assert used <= int(0.95 * baseline_free)
+
+
+def test_workspace_charge_shrinks_the_plan():
+    # The workspace is not free: charging it must yield a plan no larger than the
+    # uncharged plan (the pre-fix behavior kept the pools at the uncharged size).
+    from freetoken.engine.cache_budget import resolve_moe_cache_auto
+
+    charged = resolve_moe_cache_auto(**_auto_kwargs(10_000, 256))
+    uncharged = resolve_moe_cache_auto(**_auto_kwargs(10_000, 0))
+    assert charged[0] + charged[1] < uncharged[0] + uncharged[1]
+
+
+def test_fixed_workspace_bytes_known_backends():
+    from freetoken.attention import fixed_workspace_bytes
+
+    assert fixed_workspace_bytes("fi") == 256 * 1024 * 1024
+    assert fixed_workspace_bytes("trtllm") == 128 * 1024 * 1024
+    # comma-separated prefill,decode backends sum both parts
+    assert fixed_workspace_bytes("fi,trtllm") == 256 * 1024 * 1024 + 128 * 1024 * 1024
+    # derived-size backends and unknown names charge nothing (never over-reserve)
+    assert fixed_workspace_bytes("triton") == 0
+    assert fixed_workspace_bytes("triton,fi") == 256 * 1024 * 1024

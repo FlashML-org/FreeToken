@@ -152,6 +152,25 @@ def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 
 
+def fixed_workspace_bytes(backend: str) -> int:
+    """Plan-time lower bound on a backend's fixed (non-paged) GPU workspace, summed over
+    comma-separated prefill,decode parts; ``auto`` must be resolved before calling.
+
+    The cache-budget planner charges this against the pool budget because the workspace
+    is allocated after the pools (issue #303). Only backends with a fixed-size workspace
+    are accounted:
+    - fi: FlashInfer float workspace, ``max(256 MiB, tmp_v_bound + 32 MiB)`` at
+      attention/fi.py -- the 256 MiB floor is the only statically known part.
+    - trtllm: fixed 128 MiB workspace buffer at attention/trtllm.py.
+    Backends whose buffers are derived sizes (triton metadata, dsa/m3 sparse scratch)
+    return 0 here; charging only these fixed floors never over-reserves."""
+    _FIXED_WORKSPACE_BYTES = {
+        "fi": 256 * 1024 * 1024,
+        "trtllm": 128 * 1024 * 1024,
+    }
+    return sum(_FIXED_WORKSPACE_BYTES.get(p.strip(), 0) for p in backend.split(","))
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         parts = backend.split(",")
@@ -193,6 +212,7 @@ __all__ = [
     "BaseAttnBackend",
     "AttentionSpec",
     "attention_backend_info",
+    "fixed_workspace_bytes",
     "create_attention_backend",
     "SUPPORTED_ATTENTION_BACKENDS",
     "validate_attn_backend",
