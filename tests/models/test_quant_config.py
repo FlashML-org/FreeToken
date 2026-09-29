@@ -8,7 +8,6 @@ from __future__ import annotations
 import glob
 import json
 import os
-import re
 import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -500,8 +499,8 @@ def _candidate_dirs() -> list[Path]:
 
 
 def _label(p: Path) -> str:
-    m = re.search(r"models--([^/]+)/snapshots", str(p))
-    name = m.group(1).replace("--", "/") if m else f"nvme:{p.name}"
+    repo = next((part for part in p.parts if part.startswith("models--")), None)
+    name = repo.removeprefix("models--").replace("--", "/") if repo else f"nvme:{p.name}"
     # an HF cache entry may hold the config and index without the shards; the tensor check then only has the names
     shards = set(_weight_map(p).values())
     return name if all((p / s).exists() for s in shards) else f"{name}[index-only]"
@@ -588,7 +587,11 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:
         spec = None
-    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ())
+    try:
+        qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ())
+    except NotImplementedError as exc:
+        # a scheme FreeToken declines inside a method it supports (e.g. W4A16 compressed-tensors)
+        pytest.skip(f"FreeToken declines this checkpoint: {exc}")
     weight_map = _weight_map(ckpt)
     tensors = _tensor_info(ckpt, weight_map)
     mismatches, checked = [], 0
