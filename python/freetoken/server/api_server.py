@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -56,6 +57,8 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # signal handler). The backend supervisor reads this so a worker exiting AS PART of that
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
+# zmq.asyncio needs add_reader, which the Proactor loop uvicorn picks on Windows does not implement.
+UVICORN_LOOP = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
@@ -95,6 +98,18 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     timer.daemon = True
     timer.start()
     return timer
+
+
+def _listener_ended(task: asyncio.Task) -> None:
+    """No reply reaches any request once the tokenizer listener is gone, so its end takes the serve down."""
+    if task.cancelled() or _SHUTTING_DOWN.is_set():
+        return
+    error = task.exception()
+    logger.error("Frontend listener stopped: %r; no request can be answered", error)
+    if _GLOBAL_STATE is not None:
+        _GLOBAL_STATE.fatal_error = f"frontend listener stopped: {error!r}"
+        _GLOBAL_STATE.maintenance_state = "failed"
+    _exit_after_backend_death(0.0)
 
 
 def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
@@ -186,6 +201,8 @@ class FrontendManager:
     # future resolution back onto the loop (asyncio Futures are not thread-safe). None until the
     # first send_one starts the listener.
     _loop: Any = None
+    # The listener task, held so its failure is observed rather than dropped with the task.
+    _listener: Any = None
     # Frontend-side tokenizer for /v1/messages/count_tokens, built lazily on the first count
     # and cached for the process lifetime. It is the SAME TokenizeManager the engine's
     # tokenizer worker runs (chat template + generation prompt, DSV4/GGUF handling), so a
@@ -318,7 +335,8 @@ class FrontendManager:
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
-            asyncio.create_task(self.listen())
+            self._listener = asyncio.create_task(self.listen())
+            self._listener.add_done_callback(_listener_ended)
             self.initialized = True
 
     async def send_one(self, msg: BaseTokenizerMsg):
@@ -900,7 +918,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False, loop=UVICORN_LOOP))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1040,4 +1058,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop=UVICORN_LOOP)
