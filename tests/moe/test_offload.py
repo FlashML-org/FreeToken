@@ -881,3 +881,16 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_releasing_a_filled_pageable_bank_keeps_it_usable():
+    # the converter releases each bank it has finished reading; a platform that cannot drop the pages keeps them, which the contract allows
+    import freetoken.moe.host_banks as hb
+
+    bank = hb.HostBank((4096,), torch.uint8, backing="mmap")
+    bank.tensor.fill_(7)
+    addr = bank.addr
+    bank.release()
+    assert bank.addr == addr and bank.residency is hb.HostResidency.PAGEABLE
+    bank.tensor.fill_(9)
+    assert int(bank.tensor.sum()) == 9 * 4096

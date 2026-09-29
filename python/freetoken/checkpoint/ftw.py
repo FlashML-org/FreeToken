@@ -277,7 +277,7 @@ class FTWReader:
                 if entry is None:
                     fd = os.open(os.path.join(self.dir, file), os.O_RDONLY)
                     try:
-                        m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                        m = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
                     finally:
                         os.close(fd)  # the mapping keeps its own reference to the file
                     try:
