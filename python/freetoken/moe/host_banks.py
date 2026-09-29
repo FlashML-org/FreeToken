@@ -35,6 +35,8 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
+# Linux-only: Windows has neither, and reads through the file cache instead.
+O_DIRECT_READS = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
 
 
 class PinFailed(RuntimeError):
@@ -190,7 +192,10 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        try:
+            self._buf.madvise(mmap.MADV_DONTNEED)
+        except AttributeError:
+            pass  # Windows has no madvise: the pages stay resident until the buffer closes
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
@@ -526,6 +531,9 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
+    if not O_DIRECT_READS:
+        return _read_range_buffered(mv, path, file_offset=file_offset, nbytes=nbytes,
+                                    dest_offset=dest_offset, workers=workers, chunk=chunk)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
         try:
@@ -562,6 +570,43 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
                 list(ex.map(rd, offs))
     finally:
         os.close(fd)
+    return nbytes
+
+
+def _read_range_buffered(mv: memoryview, path: str, *, file_offset: int, nbytes: int,
+                         dest_offset: int, workers: int, chunk: int) -> int:
+    """:func:`read_range_into` without O_DIRECT: the same chunked fan-out, one unbuffered handle per thread."""
+    local = threading.local()
+    handles: list = []
+    handles_lock = threading.Lock()
+
+    def rd(i: int) -> None:
+        handle = getattr(local, "handle", None)
+        if handle is None:
+            handle = local.handle = open(path, "rb", buffering=0)
+            with handles_lock:
+                handles.append(handle)
+        n = min(chunk, nbytes - i)
+        view = mv[dest_offset + i:dest_offset + i + n]
+        handle.seek(file_offset + i)
+        done = 0
+        while done < n:
+            got = handle.readinto(view[done:])
+            if not got:
+                raise OSError(f"short read: {done} of {n} bytes at {file_offset + i} in {path}")
+            done += got
+
+    try:
+        offs = list(range(0, nbytes, chunk))
+        if len(offs) <= 1:
+            for o in offs:
+                rd(o)
+        else:
+            with ThreadPoolExecutor(workers) as ex:
+                list(ex.map(rd, offs))
+    finally:
+        for handle in handles:
+            handle.close()
     return nbytes
 
 
