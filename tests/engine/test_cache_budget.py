@@ -523,3 +523,36 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+# ---- slots_to_free_for_reserve: the startup fit to a max-length prefill ----
+
+
+def test_the_reserve_shortfall_rounds_up_to_whole_slots_past_a_margin():
+    from freetoken.engine.cache_budget import slots_to_free_for_reserve
+
+    slot = 2_772_480  # one NVFP4 expert of Qwen3.8-Flash-Next
+    mib = 1 << 20
+    assert slots_to_free_for_reserve(free_at_peak=2000 * mib, reserve=2000 * mib, per_expert_bytes=slot) == 0
+    assert slots_to_free_for_reserve(free_at_peak=3000 * mib, reserve=2000 * mib, per_expert_bytes=slot) == 0
+    # one byte short still drops the whole margin, so the rebuild's own cost cannot swallow it
+    one_byte = slots_to_free_for_reserve(free_at_peak=2000 * mib - 1, reserve=2000 * mib, per_expert_bytes=slot)
+    assert one_byte * slot >= 128 * mib
+    # the measured case: 430 MiB left at the peak against a 2000 MiB reserve
+    drop = slots_to_free_for_reserve(free_at_peak=430 * mib, reserve=2000 * mib, per_expert_bytes=slot)
+    assert drop * slot >= 1570 * mib + 128 * mib
+
+
+def test_the_fit_reaches_the_reserve_when_a_rebuild_costs_memory_of_its_own():
+    # A start that failed: 0.69 GiB free against 2000 MiB, and 1.26 GiB of slots returned 1.24 GiB.
+    # Drops sized to the shortfall alone crept to 1.95 GiB and never arrived in three measurements.
+    from freetoken.engine.cache_budget import slots_to_free_for_reserve
+
+    slot, mib = 2_772_480, 1 << 20
+    reserve, rebuild_cost = 2000 * mib, 20 * mib
+    free = 706 * mib
+    for _ in range(2):  # the engine measures three times, so it shrinks at most twice
+        drop = slots_to_free_for_reserve(free, reserve, slot)
+        if drop:
+            free += drop * slot - rebuild_cost
+    assert free >= reserve

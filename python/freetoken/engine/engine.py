@@ -319,6 +319,11 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+# Shrinking the expert cache re-captures the CUDA graphs, which moves the peak it was sized
+# against; a second measurement settles it, and a third that still falls short never will.
+_PEAK_FIT_ATTEMPTS = 3
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -497,6 +502,8 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        if config.vram_reserve_mb:
+            self._fit_prefill_peak(config.vram_reserve_mb << 20)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1064,9 +1071,7 @@ class Engine:
         """Compile the Triton prefill path before the first real request.
 
         Decode CUDA graph capture warms the decode path, but the first prefill
-        can still pay Triton/cublas setup costs. Use the dummy request row and
-        restore it afterwards so padded decode graph replay keeps using the
-        dedicated dummy KV slot.
+        can still pay Triton/cublas setup costs.
         """
         if self.max_seq_len < 2:
             return
@@ -1077,19 +1082,74 @@ class Engine:
         warmup_lens = sorted({length for length in warmup_lens if length >= 2})
         if not warmup_lens:
             return
+        seconds = self._prefill_dummy(warmup_lens, input_ids=None)
+        logger.info_rank0(f"Prefill warmup complete for lengths {warmup_lens} in {seconds:.3f} s")
 
+    @torch.inference_mode()
+    def _fit_prefill_peak(self, reserve: int) -> None:
+        """Shrink the expert cache until a max-length prefill leaves ``reserve`` bytes free: the
+        budget does not price that chunk's activations, which the allocator keeps once reached."""
+        from freetoken.engine.cache_budget import slots_to_free_for_reserve
+
+        length = min(self.config.max_forward_len, self.max_seq_len)
+        # Real-looking ids, so routing spreads the chunk over the experts as a prompt does.
+        ids = torch.randint(
+            self.config.model_config.vocab_size, (length,),
+            generator=torch.Generator().manual_seed(0), dtype=torch.int32,
+        )
+        for attempt in range(_PEAK_FIT_ATTEMPTS):
+            seconds = self._prefill_dummy([length], input_ids=ids)
+            free = self._min_free_memory_keeping_cache()
+            logger.info_rank0(
+                f"A {length}-token prefill ({seconds:.1f} s) leaves {mem_GB(free)} free against "
+                f"a {mem_GB(reserve)} reserve"
+            )
+            if free >= reserve:
+                return
+            if self.moe_offload_cache is None or attempt == _PEAK_FIT_ATTEMPTS - 1:
+                break
+            size, per_expert = self._target_moe_and_expert_bytes(None)
+            drop = slots_to_free_for_reserve(free, reserve, per_expert)
+            logger.info_rank0(f"Shrinking the expert cache from {size} to {size - drop} slots")
+            try:
+                self.rebuild_runtime_cache(moe_cache_size=size - drop)
+            except CacheRebuildRejected as exc:
+                raise RuntimeError(
+                    f"--vram-reserve-mb {reserve >> 20} cannot be kept free: {exc}. Lower "
+                    "--memory-ratio or --max-prefill-length, or the reserve."
+                ) from exc
+        raise RuntimeError(
+            f"a {length}-token prefill still leaves less than --vram-reserve-mb {reserve >> 20} "
+            "free, and the expert cache cannot shrink further; lower --memory-ratio or "
+            "--max-prefill-length"
+        )
+
+    def _min_free_memory_keeping_cache(self) -> int:
+        """Free device memory, the minimum across TP ranks, WITHOUT emptying the allocator cache:
+        what the cache holds after a forward is exactly the peak being measured."""
+        torch.cuda.synchronize(self.device)
+        free = torch.tensor([get_free_memory(self.device)], dtype=torch.int64)
+        torch.distributed.all_reduce(free, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group)
+        return int(free.item())
+
+    def _prefill_dummy(self, lengths: list[int], input_ids: torch.Tensor | None) -> float:
+        """Prefill each length on the dummy row, restored afterwards so padded decode replay keeps
+        its dedicated KV slot; returns the GPU seconds spent."""
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
         try:
-            for length in warmup_lens:
+            for length in lengths:
                 dummy_row[:length] = torch.arange(
                     length, dtype=torch.int32, device=self.device
                 )
+                token_ids = (
+                    torch.zeros(length, dtype=torch.int32) if input_ids is None else input_ids[:length]
+                )
                 warm_req = Req(
-                    input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
+                    input_ids=token_ids,
                     table_idx=self.dummy_req.table_idx,
                     cached_len=0,
                     output_len=1,
@@ -1099,7 +1159,7 @@ class Engine:
                 )
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
+                batch.input_ids = token_ids.to(self.device)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
                 if self.config.model_config.model_is_mrope:
                     batch.mrope_positions = (
@@ -1115,10 +1175,7 @@ class Engine:
                 self.moe_offload_cache.reset()
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
-        logger.info_rank0(
-            f"Prefill warmup complete for lengths {warmup_lens} "
-            f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
-        )
+        return started.elapsed_time(ended) / 1000.0
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

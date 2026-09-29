@@ -333,6 +333,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--vram-reserve-mb",
+        type=int,
+        default=ServerArgs.vram_reserve_mb,
+        help="VRAM (MiB) to leave free for the rest of the machine at this engine's largest "
+        "prefill. The budget prices weights and caches but not a max-length chunk's activations, "
+        "which the allocator keeps once reached; with a reserve set, startup runs one such chunk "
+        "and shrinks the MoE expert cache until the reserve stays free. 0 skips the check.",
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
