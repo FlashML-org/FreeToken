@@ -1,8 +1,6 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
-#include <sys/cdefs.h>
-
 #include <cstddef>
 
 namespace device::warp {

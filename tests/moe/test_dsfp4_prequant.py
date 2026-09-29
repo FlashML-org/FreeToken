@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("freetoken.kernel._cpu_moe", reason="the CPU MoE executor is not built on this platform (setup.py)")
+
 H, I, E, TOPK = 1024, 512, 16, 4
 
 
