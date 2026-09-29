@@ -18,7 +18,6 @@ import os
 import queue
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator, Tuple
 
 import torch
@@ -36,32 +35,16 @@ _ST_DTYPE = {
 _ODIRECT_BLK = 4096
 
 
-def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mmap:
-    """Read a whole shard into a page-aligned mmap via CHUNKED multi-threaded O_DIRECT.
-    Multi-threading one fd scales even for single-shard checkpoints (measured ~7x at 8
-    threads): the kernel issues the parallel preads at high queue depth. DMA bypasses the
-    page cache, so there's nothing to drop afterwards."""
+def _read_shard_parallel(path: str, workers: int, chunk: int, drop_cache: bool) -> mmap.mmap:
+    """Read a whole shard into a page-aligned anonymous mmap with CHUNKED multi-threaded reads:
+    O_DIRECT where the platform has it, buffered where it does not (``read_range_into``).
+    Multi-threading one file scales even for single-shard checkpoints (measured ~7x at 8
+    threads): the kernel issues the parallel reads at high queue depth."""
+    from freetoken.moe.host_banks import read_range_into
+
     size = os.path.getsize(path)
-    asize = ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
-    buf = mmap.mmap(-1, asize)
-    mv = memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-    offs = list(range(0, size, chunk))
-
-    def rd(o):
-        want = min(chunk, asize - o)
-        want = min(want, ((size - o + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
-
-    try:
-        if len(offs) <= 1:
-            for o in offs:
-                rd(o)
-        else:
-            with ThreadPoolExecutor(workers) as ex:
-                list(ex.map(rd, offs))
-    finally:
-        os.close(fd)
+    buf = mmap.mmap(-1, max(_ODIRECT_BLK, ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK))
+    read_range_into(buf, path, file_offset=0, nbytes=size, workers=workers, chunk=chunk, drop_cache=drop_cache)
     return buf
 
 
@@ -74,14 +57,14 @@ def iter_expert_tensors_parallel(
     drop_cache: bool = True,
     prefetch: int = 2,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Parallel O_DIRECT analog of a model's serial expert ``iter_weights``.
+    """Parallel analog of a model's serial expert ``iter_weights``.
 
     Common scaffolding for the "parallel" load path: reads every shard that holds >=1 expert
     tensor (``is_expert(name)`` is the model's per-model predicate) with chunked
-    multi-threaded O_DIRECT, parses the safetensors header, and yields ``(name, tensor)``
+    multi-threaded reads, parses the safetensors header, and yields ``(name, tensor)``
     in checkpoint dtype/shape for the expert tensors.
 
-    A background reader PREFETCHES the next ``prefetch`` shards (each chunked O_DIRECT)
+    A background reader PREFETCHES the next ``prefetch`` shards (each read chunked)
     while the consumer places the current one, so the disk stays busy during placement
     instead of idling between shards (the gap that made the naive sequential version slow).
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
@@ -106,14 +89,7 @@ def iter_expert_tensors_parallel(
         try:
             for shard in shard_list:
                 path = os.path.join(model_path, shard)
-                if drop_cache:
-                    try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
-                    except OSError:
-                        pass
-                buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
+                buf = _read_shard_parallel(path, workers, chunk, drop_cache)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
                 hdr = json.loads(bytes(buf[8:8 + n]))
                 q.put((buf, hdr, 8 + n, shards[shard], os.path.getsize(path)))
