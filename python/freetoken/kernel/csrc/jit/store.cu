@@ -72,19 +72,19 @@ struct StoreKernel {
 
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
-        .with_device<kDLCUDA>(device_)
+        .template with_device<kDLCUDA>(device_)
         .with_dtype(dtype_)
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
         .with_strides({Y, 1})
-        .with_device<kDLCUDA>(device_)
+        .template with_device<kDLCUDA>(device_)
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
     TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
+        .template with_device<kDLCUDA>(device_)
+        .template with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
     const auto dtype_size = dtype_bytes(dtype_.unwrap());
