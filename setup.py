@@ -66,13 +66,14 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
             "because it links against the CUDA runtime API."
         )
     cuda_home = Path(CUDA_HOME)
-    library_dirs = [str(cuda_home / "lib64")]
-    if (cuda_home / "lib").exists():
-        library_dirs.append(str(cuda_home / "lib"))
+    # Windows toolkits keep the import libraries in lib/x64.
+    candidates = (cuda_home / "lib64", cuda_home / "lib", cuda_home / "lib" / "x64")
+    library_dirs = [str(path) for path in candidates if path.exists()]
     return [str(cuda_home / "include")], library_dirs
 
 
 IS_ROCM = _is_rocm()
+IS_WINDOWS = sys.platform == "win32"
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
@@ -85,7 +86,8 @@ else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     runtime_link_args = []
-    extra_compile = ["-O3", "-std=c++17"]
+    # cl ignores -O3 and -std with a warning (D9002): /O2 is its spelling, and BuildExtension adds /std:c++17.
+    extra_compile = ["/O2"] if IS_WINDOWS else ["-O3", "-std=c++17"]
 
 _check_toolchain()
 
@@ -108,17 +110,20 @@ setup(
         # use per-function target attributes (avx512bf16/avx512f) + a runtime
         # __builtin_cpu_supports dispatch, so the single binary stays portable
         # (scalar fallback) -- no global -march is set.
-        CppExtension(
-            name="freetoken.kernel._cpu_moe",
-            sources=[
-                "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
-            ],
-            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
-            library_dirs=runtime_library_dirs,
-            libraries=[runtime_lib],
-            extra_compile_args=extra_compile + ["-pthread"],
-            extra_link_args=runtime_link_args,
-        ),
+        # GCC target attributes and pthreads have no MSVC form; Windows serves the GPU offload path only.
+        *([
+            CppExtension(
+                name="freetoken.kernel._cpu_moe",
+                sources=[
+                    "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+                ],
+                include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+                library_dirs=runtime_library_dirs,
+                libraries=[runtime_lib],
+                extra_compile_args=extra_compile + ["-pthread"],
+                extra_link_args=runtime_link_args,
+            )
+        ] if not IS_WINDOWS else []),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([
             CppExtension(

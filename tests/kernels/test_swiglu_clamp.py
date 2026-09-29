@@ -8,6 +8,8 @@ compiled CPU MoE extension advertises the new generic act id.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -34,6 +36,10 @@ def test_triton_matches_reference():
     assert (x[..., :512].float() > LIMIT).any(), "test data never hit the clamp"
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("freetoken.kernel._cpu_moe") is None,
+    reason="the CPU MoE executor is not built on this platform (setup.py)",
+)
 def test_cpu_extension_supports_swiglu_clamp():
     from freetoken.moe.cpu_executor import compiled_extension_supports
 

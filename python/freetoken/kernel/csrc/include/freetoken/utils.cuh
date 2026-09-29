@@ -11,6 +11,14 @@
 #include <source_location>
 #include <type_traits>
 
+// __always_inline comes from glibc's <sys/cdefs.h>; MSVC-hosted nvcc has no such header.
+#if __has_include(<sys/cdefs.h>)
+#include <sys/cdefs.h>
+#endif
+#ifndef __always_inline
+#define __always_inline __forceinline__
+#endif
+
 namespace device {
 
 inline constexpr auto kWarpThreads = 32u;
