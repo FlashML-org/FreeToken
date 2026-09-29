@@ -52,6 +52,7 @@ NVMe checkpoint（真源，只读）
 - **计数器**：新模块 `moe/hotness.py`，`ExpertHotness` 类持有 `counts [L*E] int64`（device）。开启时每个 MoE 层前向执行：
   `counts.index_add_(0, topk_ids.flatten() + layer_id * num_experts, ones_like)`。
   - 固定 shape、无同步 → **CUDA graph 可捕获**（whole-graph replay 时同一 op 重复累加，语义正确）。
+  - `meta.total_tokens` 不走 Python 加法：CUDA 上 `record` 把本步 token 数 `add_` 进捕获前分配的设备标量，重放会再累加；`maybe_flush` / `save` 排空时并进宿主计数再落盘。CPU 路径仍直接加宿主计数。
   - 仅当 `hot_stats_out` 配置时启用；未配置时零开销（不进入前向路径）。
 - **排空与落盘**：无每步同步。宿主侧周期钩子放在 `Scheduler._process_last_data`（每 loop 迭代调用，`scheduler.py:419-428`）：按墙钟时间间隔（默认 60s，`--hot-stats-interval-s`）做一次 `counts.cpu()` 累加到宿主数组（98 KB D2H，可忽略），**每次排空顺带原子写一次 JSON**（tmp + `os.replace`）——崩溃/SIGKILL 最多丢一个间隔的统计。`Scheduler.shutdown()` 在 CUDA 仍健康时显式 `save()` 收口（此时设备排空保证成功）；`atexit` 兜底时 device 排空是 best-effort（解释器退出阶段 CUDA 上下文可能已失效，失败则退回宿主累计照常写盘，实测该路径曾因强制 `counts.cpu()` 丢掉整场统计，见 6fb25ee）。
 - **文件 schema**（统计 → 选点的契约）：
@@ -88,7 +89,7 @@ NVMe checkpoint（真源，只读）
 - 选顶部原因：prefill 双缓冲借用底部 `[0, 2E)`（`prefill_hit_compact` 阈值、`_invalidate_prefill_buffer`）；`materialize_layer` 写 `[0,E)`。顶部互不干扰。
 - 约束（init 校验，错误信息明确）：
   - LRU 区剩余 `cache_size - P ≥ max(2*E, 512)`，否则拒绝（防 LRU 退化）；
-  - `hot_expert_list` 的 K 超预算时截断并告警。
+  - 加载期每层钉住数必须小于专家数（冷 bank 至少 1 行）。pin list、`--hot-expert-slots` 选点和选点命令都在建 bank 之前拒绝 K ≥ E，不再截成全量。
   - v1 曾要求 `prefill_overlap` 必须为 False；扩展二（§9）的三源组装已解除该互斥，钉住 + `--moe-prefill-overlap`/hit-d2d 为合法配置。
 
 #### 3.3.2 初始化（`engine.py::_init_offload_moe_cache` 扩展）

@@ -238,6 +238,10 @@ def test_load_pin_list_roundtrip_and_errors(tmp_path):
     (tmp_path / "dup_layer.json").write_text(json.dumps(dup_layer), encoding="utf-8")
     with pytest.raises(ValueError, match="重复出现"):
         _load_pin_list(str(tmp_path / "dup_layer.json"), 2, 8)
+    # 一层钉满：冷 bank 至少 1 行，读表时拒绝，不拖到建 bank
+    _write_pin_list(tmp_path / "full.json", [list(range(8)), list(range(8))], 2, 8)
+    with pytest.raises(ValueError, match="冷 bank"):
+        _load_pin_list(str(tmp_path / "full.json"), 2, 8)
 
 
 def test_cold_row_is_inverse_of_pins():
@@ -293,6 +297,16 @@ def test_resolve_hot_pin_plan_entries_and_cpu_skip(tmp_path):
     assert plan.catalog == [[0, 1, 2, 3], [5, 4, 3, 2]]
     with pytest.raises(ValueError, match="active-k"):
         resolve_hot_pin_plan(str(ranked), 4, 2, 8, active_k=6)
+    # stats 路径钉满一层：读计划时拒绝，不再截成专家数后到建 bank 才失败
+    with pytest.raises(ValueError, match="冷 bank"):
+        resolve_hot_pin_plan(str(stats), 8, 2, 8)
+    almost = resolve_hot_pin_plan(str(stats), 7, 2, 8)
+    assert almost is not None and [len(row) for row in almost.pins] == [7, 7]
+    # pin list 的容量可以等于专家数（冷 bank 行数看加载期 K），不能更大
+    cap_ok = resolve_hot_pin_plan(str(path), 8, 2, 8)
+    assert cap_ok is not None and cap_ok.pins == [[6], [1]]
+    with pytest.raises(ValueError, match="超过专家数"):
+        resolve_hot_pin_plan(str(path), 9, 2, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +408,13 @@ def test_init_hot_pins_maps_accounting_and_floors(caplog):
             torch.tensor([[3, 1]], dtype=torch.int32), [2],
             cold_row_from_pins([[3, 1]], 16),
         )
-    # K > E 拒绝
-    with pytest.raises(ValueError, match="专家数"):
+    # K > E 与 K == E 都拒绝（冷 bank 至少 1 行）
+    with pytest.raises(ValueError, match="冷 bank"):
         small.init_hot_pins(torch.ones((1, 20), dtype=torch.int32), [20], cold_row_from_pins([[]], 16))
+    with pytest.raises(ValueError, match="冷 bank"):
+        small.init_hot_pins(
+            torch.zeros((1, 16), dtype=torch.int32), [16], cold_row_from_pins([list(range(16))], 16),
+        )
 
 
 def test_capacity_layout_geometry_guards_and_padding():

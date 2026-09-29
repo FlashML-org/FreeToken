@@ -70,8 +70,12 @@ class ExpertHotness:
         self.counts = torch.zeros(num_layers * num_experts, dtype=torch.int64, device=device)
         # 宿主侧累计数组（历次排空的累加结果），save 的数据源
         self._host_counts = np.zeros(num_layers * num_experts, dtype=np.int64)
-        # 累计记录的 token 数（每次 record 加 topk_ids.shape[0]），写进 meta
+        # 累计记录的 token 数（每次 record 加 topk_ids.shape[0]），写进 meta。
+        # CUDA 上先加进 _replay_tokens：图重放会重复这条加法，排空时再并进这里。
         self.total_tokens = 0
+        self._replay_tokens: torch.Tensor | None = (
+            torch.zeros((), dtype=torch.int64, device=device) if device.type == "cuda" else None
+        )
         self._last_flush = time.monotonic()
         self._t0 = time.monotonic()
         # atexit 防重入：install 只注册一次，_exit_flush 只落盘一次
@@ -106,12 +110,18 @@ class ExpertHotness:
             指针（use-after-free：释放后复用的 float 字节被当 int64 累加，真实
             NVFP4 服务中把计数器污染到 1e18 量级）。``ones_like`` 在 graph 捕获时
             落在各 graph 自己的内存池里，随池存活，replay 永远读到 1；eager 路径
-            （prefill）每层每次一小块分配，量级可忽略。host 侧 total_tokens 按本步
-            token 数递增（graph 捕获时只执行一次，属于已知的一次性 warm-up 偏差）。
+            （prefill）每层每次一小块分配，量级可忽略。token 总数：CPU 直接加进
+            total_tokens；CUDA 加进 _replay_tokens。后者是捕获前分配的设备标量，
+            整段加法会进 decode 图，重放按本步 token 数再累加，排空时并进
+            total_tokens。写在 Python 里的话重放不会再跑，落盘总数停在捕获那一次。
         """
         flat = topk_ids.flatten() + layer_id * self.num_experts
         self.counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.int64))
-        self.total_tokens += int(topk_ids.shape[0])
+        step_tokens = int(topk_ids.shape[0])
+        if self._replay_tokens is not None:
+            self._replay_tokens.add_(step_tokens)
+        else:
+            self.total_tokens += step_tokens
 
     def maybe_flush(self) -> bool:
         """
@@ -124,9 +134,10 @@ class ExpertHotness:
         Code Logic（这个函数做什么）:
             距上次排空未满间隔（窗口模式 = min(flush_interval_s, window_interval_s)，
             否则 flush_interval_s）直接返回 False；否则把 device 计数器 D2H 为增量
-            delta 并清零 device 侧，累加进宿主累计，窗口模式再交给 _feed_window，
-            最后原子写一次 JSON（调度循环内 CUDA 健康，落盘不必等退出；崩溃或
-            SIGKILL 最多丢一个间隔的统计），刷新墙钟后返回 True。
+            delta 并清零 device 侧，累加进宿主累计，同时把图重放的 token 标量并进
+            total_tokens。窗口模式再交给 _feed_window，最后原子写一次 JSON（调度
+            循环内 CUDA 健康，落盘不必等退出；崩溃或 SIGKILL 最多丢一个间隔的
+            统计），刷新墙钟后返回 True。
         """
         now = time.monotonic()
         interval = self.flush_interval_s
@@ -138,6 +149,7 @@ class ExpertHotness:
         # 顺序反了会把 delta 一起清成零
         delta = self.counts.detach().cpu().numpy().copy()
         self.counts.zero_()
+        self._drain_replay_tokens()
         self._last_flush = now
         self._host_counts += delta
         if os.getenv("FREETOKEN_REPIN_DEBUG"):
@@ -185,6 +197,26 @@ class ExpertHotness:
         self._window_acc = np.zeros_like(self._window_acc)
         self._window_started = now
         return True
+
+    def _drain_replay_tokens(self) -> None:
+        """
+        Business Logic（为什么需要这个函数）:
+            decode 走 CUDA graph 时，record 里的专家计数会随重放累加，但 Python
+            加法不会。token 总数若只在捕获时加一次，落盘 meta 会把整场 decode
+            看成那一次捕获，和 counts 对不上。
+
+        Code Logic（这个函数做什么）:
+            CPU 路径没有设备标量，直接返回。CUDA 上把 _replay_tokens 读回（与
+            counts 排空同一次同步），加进 host 侧 total_tokens 后清零。标量在
+            构造时分配，地址稳定，清零不换存储，已捕获的加法重放仍写回同一块。
+        """
+        counter = self._replay_tokens
+        if counter is None:
+            return
+        pending = int(counter.item())
+        if pending:
+            counter.zero_()
+            self.total_tokens += pending
 
     @property
     def has_window(self) -> bool:
@@ -255,8 +287,9 @@ class ExpertHotness:
 
         Code Logic（这个函数做什么）:
             out_path 为 None（纯窗口模式）时直接返回；否则先 best-effort 排空一次
-            device 计数器（退出阶段 CUDA 上下文可能已失效：排空失败只告警并继续，
-            宿主累计保有此前每个间隔的数据），组装 schema_version=1 的 payload
+            device 计数器和图重放 token 标量（退出阶段 CUDA 上下文可能已失效：排空
+            失败只告警并继续，宿主累计保有此前每个间隔的数据），组装 schema_version=1
+            的 payload
             （meta 附 num_layers/num_experts/total_tokens/duration_s/created_at，
             counts 为嵌套 list[int]，pinned_provider 给定时附 pin-list 风格的
             pinned 条目），写 out_path + ".tmp" 后 os.replace 原子替换。
@@ -266,6 +299,7 @@ class ExpertHotness:
         try:
             self._host_counts += self.counts.cpu().numpy()
             self.counts.zero_()
+            self._drain_replay_tokens()
         except Exception as exc:  # noqa: BLE001 -- atexit 阶段 CUDA 不可用属预期
             logger.warning(
                 "device hotness drain failed at save; host accumulator keeps "

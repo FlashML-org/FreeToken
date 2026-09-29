@@ -109,9 +109,9 @@ def select_pins(counts: list[list[int]], slots_per_layer: int) -> list[list[int]
 
     Code Logic（这个函数做什么）:
         对每层专家按 (-count, expert_id) 升序排序（等价于计数降序、平局小 id
-        优先），取前 slots_per_layer 个专家 id。slots_per_layer < 1 抛
-        ValueError；超过该层专家数时截断为全量（返回该层所有 id，仍按此序）。
-        返回 [num_layers][K] 的专家 id 列表。
+        优先），取前 slots_per_layer 个专家 id。slots_per_layer < 1，或大于等于
+        该层专家数（冷 bank 至少要留 1 行，钉满会在建 bank 时才失败）时抛
+        ValueError。返回 [num_layers][K] 的专家 id 列表。
     """
     if not counts:
         raise ValueError("counts 不能为空")
@@ -120,12 +120,15 @@ def select_pins(counts: list[list[int]], slots_per_layer: int) -> list[list[int]
     num_experts = len(counts[0])
     if any(len(row) != num_experts for row in counts):
         raise ValueError("counts 各层长度必须一致（矩形 [L][E]）")
+    if slots_per_layer >= num_experts:
+        raise ValueError(
+            f"slots_per_layer={slots_per_layer} 必须小于专家数 {num_experts}（冷 bank 至少 1 行）"
+        )
 
     pins: list[list[int]] = []
-    keep = min(slots_per_layer, num_experts)
     for row in counts:
         order = sorted(range(num_experts), key=lambda e: (-row[e], e))
-        pins.append(order[:keep])
+        pins.append(order[:slots_per_layer])
     return pins
 
 
@@ -203,12 +206,17 @@ def write_pin_list(
         原子（tmp + os.replace），避免留下半截文件被引擎误读。
 
     Code Logic（这个函数做什么）:
-        校验 pins 为 [num_layers][slots_per_layer] 的矩形、每层专家 id 在
-        [0, num_experts) 内且不重复，然后组装 {"schema_version": 1,
+        校验 slots_per_layer 小于专家数（冷 bank 至少 1 行），pins 为
+        [num_layers][slots_per_layer] 的矩形、每层专家 id 在 [0, num_experts)
+        内且不重复，然后组装 {"schema_version": 1,
         "num_layers", "num_experts", "per_layer_slots", "pins": [{"layer",
         "experts"}, ...]}，先写同目录临时文件再 os.replace 原子落盘。
         校验失败抛 ValueError。
     """
+    if slots_per_layer >= num_experts:
+        raise ValueError(
+            f"slots_per_layer={slots_per_layer} 必须小于专家数 {num_experts}（冷 bank 至少 1 行）"
+        )
     if len(pins) != num_layers:
         raise ValueError(f"pins 层数 ({len(pins)}) 与 num_layers ({num_layers}) 不一致")
     for layer_id, experts in enumerate(pins):
@@ -387,9 +395,10 @@ def _run_select(args: argparse.Namespace) -> int:
 
     Code Logic（这个函数做什么）:
         load_stats 校验读取；K 来自 --slots 或由 --budget-gib 经
-        _BANK_BYTES_PER_EXPERT 折算；select_pins 选点后向 stdout 打印头部
-        信息与 coverage_report；给了 -o 就 write_pin_list 落盘，否则打印前
-        几层选点示例。成功返回 0。
+        _BANK_BYTES_PER_EXPERT 折算。K 大于等于专家数直接拒绝（冷 bank 至少
+        1 行），不再截成全量。select_pins 选点后向 stdout 打印头部信息与
+        coverage_report；给了 -o 就 write_pin_list 落盘，否则打印前几层选点
+        示例。成功返回 0。
     """
     stats = load_stats(args.stats)
     meta = stats["meta"]
@@ -413,10 +422,10 @@ def _run_select(args: argparse.Namespace) -> int:
             f"({bytes_per_expert} bytes/专家) / {num_layers} 层"
         )
 
-    if slots_per_layer > num_experts:
-        # 与设计 §3.3.1 的超预算截断语义一致：K 超过专家数时截断为全量，不报错
-        print(f"警告: 每层 K={slots_per_layer} 超过专家数 {num_experts}，已截断", file=sys.stderr)
-        slots_per_layer = num_experts
+    if slots_per_layer >= num_experts:
+        raise ValueError(
+            f"每层 K={slots_per_layer} 必须小于专家数 {num_experts}（冷 bank 至少 1 行）"
+        )
 
     pins = select_pins(counts, slots_per_layer)
     print(f"stats: {args.stats}（layers={num_layers}, experts={num_experts}）")

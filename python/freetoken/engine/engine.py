@@ -772,16 +772,12 @@ class Engine:
                     "cannot pin hot experts"
                 )
             # 钉住映射预填 + 顶部区校验 + 记账日志（pinned bytes / host 节省 / LRU 槽数）。
-            # 容量 K_cap 显式取 --hot-expert-slots（运行中 pin_k 的扩容上限）；stats
-            # 选点路径已截断到 E，这里同步截断容量，pin list 路径的超 E 容量由
-            # init_hot_pins 拒绝。
+            # 容量 K_cap 就是 --hot-expert-slots。加载期钉住数 >= E 已在 resolve /
+            # pin list 拒绝；这里不再把容量截成 E。K_cap > E 由 init_hot_pins 拒绝，
+            # K_cap == E 仍合法：冷 bank 行数看加载期钉住数，那一步已经要求 < E。
             counts = [len(experts) for experts in pin_plan.pins]
             k_max = max(counts, default=0)
-            pin_capacity = (
-                min(config.hot_expert_slots, num_experts)
-                if config.hot_expert_slots is not None
-                else None
-            )
+            pin_capacity = config.hot_expert_slots
             pin_ids = torch.zeros((num_moe_layers, k_max), dtype=torch.int32)
             for layer_id, experts in enumerate(pin_plan.pins):
                 if experts:

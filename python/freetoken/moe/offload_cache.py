@@ -400,7 +400,7 @@ class OffloadMoeCache:
 
         Code Logic（这个函数做什么）:
             校验 pin_ids [L, K_max] / pin_counts / cold_row [L, E] 的一致性（层内
-            不重复、K ≤ E、cold_row 与钉住集互逆）与容量显式值 >= 初始钉住数；随后
+            不重复、每层钉住数 < E、cold_row 与钉住集互逆）与容量显式值 >= 初始钉住数；随后
             解算 K_cap = max(初始钉住数, pin_capacity)，检查 LRU 区
             cache_size - L*K_cap ≥ max(2E, 512)（防 LRU 退化；prefill overlap 双缓冲
             与钉住的兼容由三源组装保证，不再互斥）。计算各层容量槽位（顶部区按层
@@ -411,8 +411,10 @@ class OffloadMoeCache:
         """
         L, E = self.num_layers, self.num_experts
         k_init = max(pin_counts, default=0)
-        if k_init > E:
-            raise ValueError(f"每层钉住数 {k_init} 超过专家数 {E}")
+        if k_init >= E:
+            raise ValueError(
+                f"每层钉住数 {k_init} 必须小于专家数 {E}（冷 bank 至少 1 行）"
+            )
         if pin_capacity is not None and pin_capacity < k_init:
             raise ValueError(
                 f"钉住容量 pin_capacity={pin_capacity} 小于初始每层钉住数 {k_init}"
@@ -423,7 +425,7 @@ class OffloadMoeCache:
             raise ValueError(f"钉住容量 {k_cap} 超过专家数 {E}")
         assert pin_ids.shape == (L, k_init), (pin_ids.shape, pin_counts)
         assert len(pin_counts) == L
-        assert all(0 <= c <= E for c in pin_counts), pin_counts
+        assert all(0 <= c < E for c in pin_counts), pin_counts
         assert cold_row.shape == (L, E) and cold_row.dtype == torch.int32
         for layer_id, count in enumerate(pin_counts):
             experts = pin_ids[layer_id, :count].tolist()

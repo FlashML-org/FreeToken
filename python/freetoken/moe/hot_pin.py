@@ -82,8 +82,9 @@ def _load_pin_list(path: str, num_layers: int, num_experts: int) -> list[list[in
 
     Code Logic（这个函数做什么）:
         读取并校验 pin list JSON：schema_version 必须为 1；num_layers/num_experts
-        必须与当前模型一致；per_layer_slots 为正整数且每层 experts 长度与之相等、
-        专家 id 在 [0, num_experts) 内且层内不重复。条目按 layer 字段放回下标，
+        必须与当前模型一致；per_layer_slots 为正整数且小于专家数（冷 bank 至少
+        1 行），每层 experts 长度与之相等、专家 id 在 [0, num_experts) 内且层内
+        不重复。条目按 layer 字段放回下标，
         文件顺序不作数；layer 必须恰好覆盖 0..num_layers-1 各一次。校验失败抛
         ValueError；成功返回 [num_layers][K] 的专家 id 列表（层内保持文件顺序）。
     """
@@ -108,6 +109,10 @@ def _load_pin_list(path: str, num_layers: int, num_experts: int) -> list[list[in
     slots = payload.get("per_layer_slots")
     if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
         raise ValueError(f"pin list per_layer_slots 必须是正整数，实际为 {slots!r}")
+    if slots >= num_experts:
+        raise ValueError(
+            f"pin list per_layer_slots={slots} 必须小于专家数 {num_experts}（冷 bank 至少 1 行）"
+        )
     pins = payload.get("pins")
     if not isinstance(pins, list) or len(pins) != num_layers:
         raise ValueError(f"pin list pins 必须是 {num_layers} 个条目的 list: {path}")
@@ -262,12 +267,12 @@ def resolve_hot_pin_plan(
                 f"热度统计几何 ({meta['num_layers']} 层 x {meta['num_experts']} 专家) 与模型 "
                 f"({num_layers} 层 x {num_experts} 专家) 不一致: {hot_expert_list}"
             )
-        slots = min(hot_expert_slots, num_experts)
-        if slots != hot_expert_slots:
-            logger.warning_rank0(
-                f"--hot-expert-slots {hot_expert_slots} 超过专家数 {num_experts}，已截断为 {slots}"
+        if hot_expert_slots >= num_experts:
+            raise ValueError(
+                f"--hot-expert-slots {hot_expert_slots} 必须小于专家数 {num_experts}"
+                "（冷 bank 至少 1 行）"
             )
-        pins = select_pins(stats["counts"], slots)
+        pins = select_pins(stats["counts"], hot_expert_slots)
     else:
         pins = _load_pin_list(hot_expert_list or "", num_layers, num_experts)
 
@@ -277,6 +282,10 @@ def resolve_hot_pin_plan(
             raise ValueError(
                 f"--hot-expert-slots {pin_list_capacity} 小于 pin list 每层钉住数 {widest}："
                 "容量区必须装得下初始钉住集"
+            )
+        if pin_list_capacity > num_experts:
+            raise ValueError(
+                f"--hot-expert-slots {pin_list_capacity} 超过专家数 {num_experts}"
             )
 
     skipped: dict[int, list[int]] = {}

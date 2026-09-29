@@ -248,6 +248,14 @@ def test_record_inside_cuda_graph_accumulates_per_replay(tmp_path):
     delta = hot.counts - baseline
     assert int(delta.sum()) == 40  # 5 次 replay × 8 个路由
     assert int(delta[3]) == 40  # 全部落在专家 3（第 0 层平坦 id 空间）
+    # CUDA 上 token 数留在设备标量。重放不跑 Python 加法，宿主计数在排空前仍是 0
+    assert hot.total_tokens == 0
+    hot.flush_interval_s = 0
+    assert hot.maybe_flush()
+    # warmup 1 次 + 5 次重放，每次 4 token。捕获那一次不留副作用，与 counts 一致
+    assert hot.total_tokens == 4 + 5 * 4
+    meta = json.loads((tmp_path / "hotstats.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["total_tokens"] == hot.total_tokens
 
 
 # ---------------------------------------------------------------------------

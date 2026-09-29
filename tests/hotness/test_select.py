@@ -79,10 +79,14 @@ def test_select_pins_all_tied_takes_lowest_ids():
     assert select_pins(counts, 5) == [list(range(5))] * L
 
 
-def test_select_pins_k_beyond_experts_clamps_to_all():
-    """K 超过专家数时截断为全量（仍按降序）。"""
+def test_select_pins_rejects_k_covering_every_expert():
+    """K >= 专家数拒绝：冷 bank 至少留 1 行，不能截成全量再交给建 bank。"""
     counts = _uniform_counts()
-    assert select_pins(counts, 99) == [list(range(E - 1, -1, -1))] * L
+    with pytest.raises(ValueError, match="冷 bank"):
+        select_pins(counts, E)
+    with pytest.raises(ValueError, match="冷 bank"):
+        select_pins(counts, 99)
+    assert len(select_pins(counts, E - 1)[0]) == E - 1
 
 
 def test_select_pins_rejects_bad_inputs():
@@ -318,6 +322,16 @@ def test_cli_select_unknown_format_fails_cleanly(tmp_path: Path, capsys):
     )
     assert code == 2
     assert "nvfp4" in capsys.readouterr().err
+
+
+def test_cli_select_rejects_k_covering_every_expert(tmp_path: Path, capsys):
+    """--slots 钉满一层时退出码 2，不写出 pin list。"""
+    stats = _write_stats(tmp_path / "stats.json", _uniform_counts())
+    out = tmp_path / "pins.json"
+    code = main(["select", str(stats), "--slots", str(E), "-o", str(out)])
+    assert code == 2
+    assert "冷 bank" in capsys.readouterr().err
+    assert not out.exists()
 
 
 def test_cli_select_bad_stats_returns_two(tmp_path: Path, capsys):
