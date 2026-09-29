@@ -1770,18 +1770,17 @@ def _adjust_config(config: EngineConfig):
             )
         override("num_page_override", config.num_token_override // config.page_size)
 
-    # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
+    # The rope cos/sin table covers rotary_config.table_positions, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
     if seq_override is not None and rotary is not None and not is_dsv4:
-        if seq_override > rotary.max_position:
+        if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "
-                f"rope table ({rotary.max_position} positions). Serving past it would read "
-                "out of bounds; extend the checkpoint's rope_scaling / "
-                "max_position_embeddings in config.json instead."
+                f"rope table ({rotary.table_positions} positions). Serving past it would read "
+                "out of bounds; extend the rope with --hf-overrides (YaRN rope_parameters) instead."
             )
 
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process

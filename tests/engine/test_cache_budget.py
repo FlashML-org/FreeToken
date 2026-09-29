@@ -430,13 +430,17 @@ def test_page_table_width_covers_whole_trailing_pages():
             assert w > last_col and w % 32 == 0
 
 
-def _generic_rotary_cfg(max_position, override):
+def _generic_rotary_cfg(max_position, override, scaling=None):
     from types import SimpleNamespace
+
+    from freetoken.models.config import RotaryConfig
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
         has_swa_attention=False, has_linear_attention=False,
-        rotary_config=SimpleNamespace(max_position=max_position),
+        rotary_config=RotaryConfig(
+            head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
+        ),
     )
 
     class Cfg:
@@ -474,6 +478,19 @@ def test_adjust_config_allows_override_at_rope_table_boundary():
     from freetoken.engine.engine import _adjust_config
 
     _adjust_config(_generic_rotary_cfg(max_position=1024, override=1024))  # must not raise
+
+
+YARN_4X = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024}
+
+
+def test_adjust_config_allows_override_to_the_yarn_extended_table():
+    # A YaRN override that leaves max_position_embeddings at the trained length (Qwen3.8's 1M
+    # recipe) serves original * factor positions; the gate must follow the table, not the config.
+    from freetoken.engine.engine import _adjust_config
+
+    _adjust_config(_generic_rotary_cfg(max_position=1024, override=4096, scaling=YARN_4X))
+    with pytest.raises(ValueError, match=r"rope table \(4096 positions\)"):
+        _adjust_config(_generic_rotary_cfg(max_position=1024, override=4097, scaling=YARN_4X))
 
 
 def test_adjust_config_rope_gate_exempts_dsv4():

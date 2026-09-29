@@ -40,6 +40,8 @@ def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0, 
 
 
 def _model_config(kind):
+    from freetoken.models.config import RotaryConfig
+
     mc = SimpleNamespace(
         model_type=kind,
         single_stream_only=False,
@@ -48,7 +50,7 @@ def _model_config(kind):
         has_swa_attention=False,
         has_linear_attention=False,
         num_layers=4,
-        rotary_config=SimpleNamespace(max_position=1024),
+        rotary_config=RotaryConfig(head_dim=128, rotary_dim=128, max_position=1024, base=1e4, scaling=None),
     )
     if kind == "full":
         specs = (_spec("full", AttnType.FULL),)

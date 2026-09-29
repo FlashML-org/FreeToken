@@ -92,6 +92,13 @@ class RotaryConfig:
     mrope_section: list | None = None
     mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
 
+    @property
+    def table_positions(self) -> int:
+        """Positions the cos/sin table covers: the longest sequence this rope can serve."""
+        from freetoken.layers.rotary import rope_table_positions
+
+        return rope_table_positions(self.max_position, self.scaling)
+
 
 def mrope_layout_from_rope_params(rope_params: Any) -> str:
     """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved, else contiguous."""
