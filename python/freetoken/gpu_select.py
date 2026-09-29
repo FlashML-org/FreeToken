@@ -68,12 +68,11 @@ def single_gpu_arg(value: str) -> str:
     return entries[0]
 
 
-def _nvml_uuids() -> "list[str] | None":
-    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+def _load_nvml():
+    """The NVML library, or None when no candidate loads.
 
     Own ctypes loader instead of torch's _raw_device_uuid_nvml: that helper only knows the Linux library name, raises (not None) when the library is missing, and is private API.
     NVML exports are cdecl on every platform, so CDLL is right on Windows too (same as nvidia-ml-py).
-    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
     """
     import ctypes
 
@@ -85,14 +84,24 @@ def _nvml_uuids() -> "list[str] | None":
         ]
     else:
         candidates = ["libnvidia-ml.so.1"]
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _nvml_uuids() -> "list[str] | None":
+    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+
+    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
+    """
+    import ctypes
+
     try:
-        for name in candidates:
-            try:
-                lib = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
-        else:
+        lib = _load_nvml()
+        if lib is None:
             return None
         if lib.nvmlInit() != 0:
             return None
@@ -110,6 +119,36 @@ def _nvml_uuids() -> "list[str] | None":
                     return None
                 uuids.append(buf.value.decode("ascii", "replace"))
             return uuids
+        finally:
+            lib.nvmlShutdown()
+    except (OSError, AttributeError):
+        return None
+
+
+def nvml_free_bytes(uuid: "str | None") -> "int | None":
+    """Free memory of GPU ``uuid`` across every process, as nvidia-smi reports it; None when NVML cannot say.
+
+    Under WDDM, cudaMemGetInfo leaves out what other processes hold; this does not.
+    """
+    import ctypes
+
+    class Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    if uuid is None:
+        return None
+    try:
+        lib = _load_nvml()
+        if lib is None or lib.nvmlInit() != 0:
+            return None
+        try:
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByUUID(uuid.encode("ascii"), ctypes.byref(handle)) != 0:
+                return None
+            memory = Memory()
+            if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != 0:
+                return None
+            return int(memory.free)
         finally:
             lib.nvmlShutdown()
     except (OSError, AttributeError):

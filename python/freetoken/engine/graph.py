@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import gc
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.gpu_select import format_gpu_uuid, nvml_free_bytes
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -99,7 +101,21 @@ def _determine_cuda_graph_bs(
 
 
 def get_free_memory(device: torch.device) -> int:
-    return torch.cuda.mem_get_info(device)[0]
+    """Device memory a pool can take without spilling.
+
+    Under WDDM (Windows) cudaMemGetInfo leaves out what other processes hold, so a card the desktop
+    uses reads as free and a pool sized to it pages into shared memory; NVML counts every process.
+    """
+    free = torch.cuda.mem_get_info(device)[0]
+    if sys.platform != "win32":
+        return free
+    machine_free = nvml_free_bytes(_device_uuid(device))
+    return free if machine_free is None else min(free, machine_free)
+
+
+def _device_uuid(device: torch.device) -> str | None:
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return format_gpu_uuid(getattr(torch.cuda.get_device_properties(index), "uuid", None))
 
 
 class GraphRunner:
