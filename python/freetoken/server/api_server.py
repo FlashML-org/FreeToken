@@ -57,6 +57,10 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
+# The longest a stream stays silent before it sends an SSE comment. A long prompt prefills for
+# minutes before its first token, and clients time an idle body out (Node's fetch after 300 s).
+STREAM_KEEPALIVE_SECONDS = 15.0
+_STREAM_KEEPALIVE = b": keep-alive\n\n"
 
 
 def get_global_state() -> FrontendManager:
@@ -359,16 +363,33 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        """Relay ``generator``'s SSE chunks; while it is silent (a long prefill), send a comment every
+        ``STREAM_KEEPALIVE_SECONDS`` and abort the request if the client has gone."""
+        chunks = generator.__aiter__()
+        pending: asyncio.Future | None = None
         try:
-            async for chunk in generator:
-                # detect if the client has disconnected
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(chunks.__anext__())
+                done, _ = await asyncio.wait({pending}, timeout=STREAM_KEEPALIVE_SECONDS)
                 if await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
+                if not done:
+                    yield _STREAM_KEEPALIVE
+                    continue
+                try:
+                    chunk = pending.result()
+                except StopAsyncIteration:
+                    return
+                pending = None
                 yield chunk
         except asyncio.CancelledError:
             asyncio.create_task(self.abort_user(uid))
             raise
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
