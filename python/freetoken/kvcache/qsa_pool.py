@@ -18,6 +18,12 @@ Two tiers ride alongside the shadow slab and are NOT per-token:
 
 The slab is amortized into the per-token KV price (``unit_bytes``); the ring and scratch are
 fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
+
+Placed on the host (``--kv-placement host``), the K/V slabs live in pinned host memory and only
+the index tiers stay on the device, so the context is bounded by host RAM. Decode reads its
+selection in place over PCIe. A prefill cannot: every query row reads its own selection, so a
+chunk would move each cached token over the bus hundreds of times. It stages the batch's pages
+into a device window once per layer instead (``staging_window``), a fixed device cost.
 """
 
 from __future__ import annotations
@@ -26,11 +32,18 @@ import math
 from typing import Sequence
 
 import torch
+from freetoken.utils import init_logger, mem_GB
 
+from .base import KVPlacement
 from .mha_pool import MHAKVCache
+
+logger = init_logger(__name__)
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
 _INDEX_DTYPE_BYTES = 2
+# Tokens of one layer's K/V a host-placed pool stages on the device for a prefill. Wider costs
+# VRAM the expert cache could hold; a context past it is attended in several passes.
+STAGING_TOKENS = 1 << 17
 # t/h/w int32 rope position kept per KV slot on mrope models
 _ROPE_POS_BYTES = 3 * 4
 
@@ -66,7 +79,16 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
+        placement: KVPlacement = "device",
+        num_qo_heads: int = 0,
+        prefill_rows: int = 0,
     ) -> None:
+        """``num_qo_heads`` and ``prefill_rows`` size a host-placed pool's fold accumulator: the
+        query heads of one attention layer, and the most rows one forward attends."""
+        if placement == "host" and (num_qo_heads < 1 or prefill_rows < 1):
+            raise ValueError(
+                "a host-placed QSA pool needs num_qo_heads and prefill_rows for its fold accumulator"
+            )
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(
@@ -102,9 +124,38 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            placement=placement,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
+        self._staging: torch.Tensor | None = None
+        self._fold: tuple[torch.Tensor, torch.Tensor] | None = None
+        if placement == "host":
+            self._staging = self._alloc_staging_window()
+            self._fold = self._alloc_fold_workspace(prefill_rows, num_qo_heads, head_dim)
+            logger.info(
+                f"K/V in pinned host memory: {mem_GB(self.host_bytes)}; the device keeps the "
+                f"index tiers, a {STAGING_TOKENS}-token staging window and a {prefill_rows}-row "
+                "fold accumulator"
+            )
+
+    def _alloc_staging_window(self) -> torch.Tensor:
+        _, _, _, page_size, kv_heads, head_dim = self._kv_buffer.shape
+        return torch.zeros(
+            (2, STAGING_TOKENS // page_size, page_size, kv_heads, head_dim),
+            dtype=self._kv_buffer.dtype,
+            device=self._device,
+        )
+
+    def _alloc_fold_workspace(
+        self, rows: int, heads: int, head_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """float32 output and log2-sum-exp rows a prefill spanning several windows folds its
+        passes into; held for the pool's life so the deepest prefill allocates nothing more."""
+        return (
+            torch.zeros((rows, heads, head_dim), dtype=torch.float32, device=self._device),
+            torch.zeros((2, rows, heads), dtype=torch.float32, device=self._device),
+        )
 
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
@@ -160,7 +211,9 @@ class QSAKVCache(MHAKVCache):
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .base import spec_kv_bytes_per_token
+        """Device bytes only: host-placed K/V costs none per token, and its staging window and
+        fold accumulator are fixed."""
+        from .base import spec_index_bytes_per_token, spec_kv_slab_bytes_per_token
         from freetoken.attention import AttnType
 
         num_req_slots = config.max_running_req + 1
@@ -169,7 +222,14 @@ class QSAKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            per_token += spec_kv_bytes_per_token(spec, config)
+            slab = spec_kv_slab_bytes_per_token(spec, config)
+            per_token += spec_index_bytes_per_token(spec)
+            if config.kv_placement == "host":
+                fixed += slab * STAGING_TOKENS // spec.num_layers
+                # float32: the output rows [rows, heads, head_dim] and two lse rows [rows, heads]
+                fixed += config.max_forward_len * config.model_config.num_qo_heads * (spec.head_dim + 2) * 4
+            else:
+                per_token += slab
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
@@ -179,8 +239,8 @@ class QSAKVCache(MHAKVCache):
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
-        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
-        # the scratch rows are the fixed term kv_cost reports separately.
+        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring, the
+        # scratch rows and a host pool's staging window are the fixed term kv_cost reports.
         kv, swa = super().unit_bytes()
         tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
         slab = (
@@ -190,6 +250,27 @@ class QSAKVCache(MHAKVCache):
             * self._index_dtype.itemsize
         )
         return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
+
+    def staging_window(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device K and V pages ``[pages, page_size, kv_heads, head_dim]`` a host-placed pool's
+        prefill gathers one layer's pages into; shared by every layer, one at a time."""
+        assert self._staging is not None, "only a host-placed pool stages its K/V"
+        return self._staging[0], self._staging[1]
+
+    def fold_workspace(self, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """float32 ``total [rows, heads, head_dim]``, ``total_lse`` and ``part_lse [rows, heads]``
+        a host-placed prefill folds its window passes into; the caller initializes them."""
+        assert self._fold is not None, "only a host-placed pool folds window passes"
+        total, lse = self._fold
+        assert rows <= total.shape[0], f"{rows} rows exceed the {total.shape[0]} prefill rows"
+        return total[:rows], lse[0, :rows], lse[1, :rows]
+
+    @property
+    def host_bytes(self) -> int:
+        """Pinned host bytes the K/V slabs hold; zero on the device."""
+        if self.placement == "device":
+            return 0
+        return self._kv_buffer.numel() * self._kv_buffer.element_size()
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

@@ -6,7 +6,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
-from .base import BaseKVCachePool
+from .base import BaseKVCachePool, KVPlacement
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -20,6 +20,9 @@ class MHAKVCache(BaseKVCachePool):
     that hold no paged KV; passing the full-attention layer ids here allocates one
     storage slab per KV layer (not per model layer) and remaps the global id to its
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
+
+    ``placement="host"`` keeps the K/V slabs in pinned+mapped host memory behind a CUDA alias:
+    every kernel reads and writes them in place over PCIe, and they cost no device memory.
     """
 
     def __init__(
@@ -32,6 +35,7 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        placement: KVPlacement = "device",
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -47,15 +51,25 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self._placement: KVPlacement = placement
+        self._device = device
+        self._kv_buffer = self._allocate_kv(
+            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+
+    def _allocate_kv(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        match self._placement:
+            case "device":
+                return torch.empty(shape, device=self._device, dtype=dtype)
+            case "host":
+                from freetoken.kernel.pinned import alloc_pinned_tensor, mapped_cuda_view
+
+                return mapped_cuda_view(alloc_pinned_tensor(*shape, dtype=dtype), self._device)
+            case _:
+                raise ValueError(f"unknown KV placement {self._placement!r}")
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -66,17 +80,14 @@ class MHAKVCache(BaseKVCachePool):
         """
         _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
         dtype = self._kv_buffer.dtype
-        device = self._device
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self._kv_buffer = self._allocate_kv(
+            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
@@ -99,9 +110,16 @@ class MHAKVCache(BaseKVCachePool):
         self.rebuild(num_pages + 1)  # +1 for the dummy page (matches create_kvcache_pool)
 
     def unit_bytes(self) -> tuple[int, int]:
+        """Device bytes per token; host-placed K/V costs none."""
+        if self._placement == "host":
+            return 0, 0
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
         return int(buf.numel() * buf.element_size()) // tokens, 0
+
+    @property
+    def placement(self) -> KVPlacement:
+        return self._placement
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:

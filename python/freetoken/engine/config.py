@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.kvcache.base import KVPlacement
 from freetoken.layers.quantization import set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
@@ -94,6 +95,8 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # --kv-placement: "host" keeps the paged K/V in pinned host memory the GPU reads over PCIe
+    kv_placement: KVPlacement = "device"
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 

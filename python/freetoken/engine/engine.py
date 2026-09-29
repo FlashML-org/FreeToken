@@ -29,7 +29,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache import check_kv_placement, create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -1534,6 +1534,10 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+
+    # Before any weight is read: a placement the pool cannot serve would otherwise fail
+    # minutes later, after the expert banks are loaded.
+    check_kv_placement(model_config, config.kv_placement)
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family

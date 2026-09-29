@@ -56,6 +56,31 @@ def _host_ptr_identity() -> bool:
     return bool(_load_pinned_extension().host_ptr_identity())
 
 
+class _MappedHostArray:
+    """``__cuda_array_interface__`` over a pinned+mapped host tensor, so torch aliases it as a
+    CUDA tensor without a copy; the alias holds this object, and this object holds the host."""
+
+    def __init__(self, host: torch.Tensor) -> None:
+        self.host = host
+        self.__cuda_array_interface__ = {
+            "shape": tuple(host.shape),
+            "strides": None,
+            # bfloat16 has no typestr: export the same-width integer and view the dtype back
+            "typestr": f"<i{host.element_size()}",
+            "data": (device_ptr(host), False),
+            "version": 3,
+        }
+
+
+def mapped_cuda_view(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A CUDA tensor over pinned+mapped host memory: kernels read and write it in place over
+    PCIe, and it keeps ``host`` alive for as long as it or any view of it lives."""
+    with torch.cuda.device(device):
+        # Inside the device context: torch reports no pointer as pinned before its CUDA context exists.
+        assert host.is_pinned() and host.is_contiguous(), "only contiguous pinned+mapped host memory aliases"
+        return torch.as_tensor(_MappedHostArray(host), device=device).view(host.dtype)
+
+
 def device_ptr(t: torch.Tensor) -> int:
     """Base address of ``t`` as the GPU must dereference it.
 

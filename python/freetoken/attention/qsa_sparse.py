@@ -20,7 +20,9 @@ One QSA layer's forward, all ragged over ``[T, ...]`` metadata:
    clamped to ``kvlen // index_ratio`` -- slab rows are never cleared, so stale rows must stay
    unreachable), take the top ``index_budget // index_ratio`` blocks, expand them to token
    indices plus the causal tail of the open group;
-6. attend to exactly those tokens.
+6. attend to exactly those tokens -- in place, or, when the pool keeps its K/V in host memory
+   and this is a prefill, from device windows the batch's pages are staged into
+   (``plan_staging_windows``).
 
 Addressing: the engine pins ``page_size == 64`` (this backend's ``page_sizes``), so a group of
 ``index_ratio`` tokens never straddles a page and ``block_table[req, p] = page_table[req, p *
@@ -33,7 +35,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Callable, List, Sequence
 
 import torch
 from freetoken.core import Batch, get_global_ctx
@@ -69,6 +71,45 @@ def _resolve_block_topk() -> Callable | None:
     return qsa_block_topk
 
 
+def staging_moves_less(rows: int, select_width: int, cached_tokens: int) -> bool:
+    """Whether staging a prefill's cached pages moves fewer bytes over PCIe than reading them in
+    place: staging moves every cached token once, reading in place moves each row's selection."""
+    return rows * select_width > cached_tokens
+
+
+@dataclass(frozen=True)
+class StagingWindow:
+    """One device window of a host-placed prefill: the physical pages gathered into it, in
+    window order, and the block table that reads them there (-1 for every page outside it)."""
+
+    source_pages: torch.Tensor  # [n] int64
+    block_table: torch.Tensor  # [bs, pages] int32
+
+
+def plan_staging_windows(
+    block_table: torch.Tensor, page_counts: Sequence[int], capacity: int
+) -> list[StagingWindow]:
+    """Split the batch's cached pages, request by request in logical order, into windows of at
+    most ``capacity`` pages. One window attends in one pass; more fold by log-sum-exp."""
+    device = block_table.device
+    counts = torch.tensor(page_counts, dtype=torch.int64)
+    total = int(counts.sum())
+    requests = torch.repeat_interleave(torch.arange(len(page_counts)), counts)
+    first = torch.repeat_interleave(torch.cumsum(counts, 0) - counts, counts)
+    logical = torch.arange(total) - first
+    requests, logical = requests.to(device), logical.to(device)
+    physical = block_table[requests, logical].to(torch.int64)
+    windows = []
+    for start in range(0, total, capacity):
+        span = slice(start, min(start + capacity, total))
+        table = torch.full_like(block_table, -1)
+        table[requests[span], logical[span]] = torch.arange(
+            span.stop - span.start, dtype=block_table.dtype, device=device
+        )
+        windows.append(StagingWindow(physical[span], table))
+    return windows
+
+
 @dataclass
 class QSASparseMetadata(BaseAttnMetadata):
     # fmt: off
@@ -92,6 +133,8 @@ class QSASparseMetadata(BaseAttnMetadata):
     rope_rows:        torch.Tensor | None = None  # [T] int32 arange
     q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    # host-placed prefill only, built once per forward: the device windows its pages stage into
+    staging:          list[StagingWindow] | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -282,8 +325,6 @@ class QSASparseAttnBackend(BaseAttnBackend):
         layer_id: int,
         batch: Batch,
     ) -> torch.Tensor:
-        from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
-
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
@@ -295,18 +336,66 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # capture batch runs its warmup and its capture through ONE metadata object, and a
             # cached plan would bake the warmup's addresses into the graph.
             self._plan_index_writes(md, batch)
+            md.staging = self._plan_staging(md, rows=q.shape[0])
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
-        return qsa_sparse_paged_attention(
-            q,
-            self.kvcache.k_cache(layer_id),
-            self.kvcache.v_cache(layer_id),
-            indices,
-            md.block_table,
-            md.token_to_req,
-            torch.empty_like(q),
-        )
+        return self._attend(q, layer_id, indices, md)
+
+    def _plan_staging(self, md: QSASparseMetadata, rows: int) -> list[StagingWindow] | None:
+        """The windows a host-placed prefill stages its pages into, or None to read them in place."""
+        if self.kvcache.placement == "device" or md.is_decode:
+            return None
+        page_counts = [-(-length // self.page_size) for length in md.kv_len_cpu.tolist()]
+        if not staging_moves_less(rows, self.select_width, sum(page_counts) * self.page_size):
+            return None
+        capacity = self.kvcache.staging_window()[0].shape[0]
+        return plan_staging_windows(md.block_table, page_counts, capacity)
+
+    def _attend(
+        self, q: torch.Tensor, layer_id: int, indices: torch.Tensor, md: QSASparseMetadata
+    ) -> torch.Tensor:
+        from freetoken.kernel.triton.qsa import fold_attention_pass, qsa_sparse_paged_attention
+
+        k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
+        out = torch.empty_like(q)
+        if md.staging is None:
+            return qsa_sparse_paged_attention(
+                q, k_cache, v_cache, indices, md.block_table, md.token_to_req, out
+            )
+        window_k, window_v = self.kvcache.staging_window()
+        if len(md.staging) == 1:
+            (window,) = md.staging
+            self._stage(window, k_cache, v_cache, window_k, window_v)
+            return qsa_sparse_paged_attention(
+                q, window_k, window_v, indices, window.block_table, md.token_to_req, out
+            )
+        total, total_lse, part_lse = self.kvcache.fold_workspace(q.shape[0])
+        total.zero_()
+        total_lse.fill_(-float("inf"))
+        last = len(md.staging) - 1
+        for pass_index, window in enumerate(md.staging):
+            self._stage(window, k_cache, v_cache, window_k, window_v)
+            qsa_sparse_paged_attention(
+                q, window_k, window_v, indices, window.block_table, md.token_to_req, out,
+                lse=part_lse,
+            )
+            fold_attention_pass(
+                total, total_lse, out, part_lse, result=out if pass_index == last else None
+            )
+        return out
+
+    @staticmethod
+    def _stage(
+        window: StagingWindow,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        window_k: torch.Tensor,
+        window_v: torch.Tensor,
+    ) -> None:
+        pages = window.source_pages.numel()
+        torch.index_select(k_cache, 0, window.source_pages, out=window_k[:pages])
+        torch.index_select(v_cache, 0, window.source_pages, out=window_v[:pages])
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -539,4 +628,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._graph = {}
 
 
-__all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]
+__all__ = [
+    "QSASparseAttnBackend",
+    "QSASparseMetadata",
+    "StagingWindow",
+    "plan_staging_windows",
+    "staging_moves_less",
+]

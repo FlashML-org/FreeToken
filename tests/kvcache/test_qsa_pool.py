@@ -15,7 +15,11 @@ import pytest
 import torch
 
 from freetoken.attention import AttnType
-from freetoken.kvcache.base import spec_kv_bytes_per_token
+from freetoken.kvcache.base import (
+    spec_index_bytes_per_token,
+    spec_kv_bytes_per_token,
+    spec_kv_slab_bytes_per_token,
+)
 from freetoken.kvcache.qsa_pool import QSAKVCache
 from freetoken.models.config import KVCacheGroupSpec
 
@@ -37,7 +41,11 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+QO_HEADS = 4
+PREFILL_ROWS = 16
+
+
+def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None, placement="device"):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +60,9 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        placement=placement,
+        num_qo_heads=QO_HEADS,
+        prefill_rows=PREFILL_ROWS,
     )
 
 
@@ -70,8 +81,11 @@ def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
     )
 
 
-def _config(spec, *, page_size=64, max_running_req=3):
-    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False)
+def _config(spec, *, page_size=64, max_running_req=3, kv_placement="device"):
+    mc = SimpleNamespace(
+        num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False,
+        num_qo_heads=QO_HEADS,
+    )
     mc.kv_cache_group_specs = lambda: (spec,)
     return SimpleNamespace(
         model_config=mc,
@@ -79,6 +93,8 @@ def _config(spec, *, page_size=64, max_running_req=3):
         dtype=torch.bfloat16,
         tp_info=SimpleNamespace(size=1),
         max_running_req=max_running_req,
+        max_forward_len=PREFILL_ROWS,
+        kv_placement=kv_placement,
     )
 
 
@@ -203,7 +219,7 @@ def test_resolve_pool_class_and_factory():
     mc = SimpleNamespace(
         model_is_mrope=False,
         num_layers=8, has_swa_attention=False, has_linear_attention=True,
-        num_kv_heads=2, head_dim=64, dsv4_args=None,
+        num_kv_heads=2, head_dim=64, dsv4_args=None, num_qo_heads=QO_HEADS,
     )
     mc.kv_cache_group_specs = lambda: (spec,)
     assert resolve_pool_class(mc) is QSAKVCache
@@ -217,3 +233,75 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+# ------------------------------------------------------------------------- host placement
+
+
+@pytest.fixture
+def host_memory_on_the_cpu(monkeypatch):
+    """Host placement without a GPU: pinned memory is plain memory and its alias is itself."""
+    import freetoken.kernel.pinned as pinned
+    import freetoken.kvcache.qsa_pool as qsa_pool
+
+    monkeypatch.setattr(pinned, "alloc_pinned_tensor", lambda *shape, dtype: torch.empty(shape, dtype=dtype))
+    monkeypatch.setattr(pinned, "mapped_cuda_view", lambda host, device: host)
+    monkeypatch.setattr(qsa_pool, "STAGING_TOKENS", 128)
+
+
+def test_host_placement_keeps_the_index_tiers_and_one_window_on_the_device(host_memory_on_the_cpu):
+    pool = _pool(num_pages=4, placement="host")
+    assert pool.placement == "host"
+    # K/V: 2 slabs x 4 layers x 4 pages x 64 tokens x 2 heads x 64 dims x 2 bytes, all on the host
+    assert pool.host_bytes == 2 * 4 * 4 * 64 * 2 * 64 * 2
+    assert _pool(num_pages=4).host_bytes == 0
+    kv_bytes, swa_bytes = pool.unit_bytes()
+    assert (kv_bytes, swa_bytes) == (spec_index_bytes_per_token(_spec()), 0)
+    window_k, window_v = pool.staging_window()
+    assert window_k.shape == window_v.shape == (128 // 64, 64, 2, 64)
+    assert pool.cmp_k_cache(0).shape == (4 * 64 // 4 + 4, 32)
+    total, total_lse, part_lse = pool.fold_workspace(5)
+    assert total.shape == (5, QO_HEADS, 64) and total.dtype == torch.float32
+    assert total_lse.shape == part_lse.shape == (5, QO_HEADS) and total_lse.dtype == torch.float32
+    with pytest.raises(AssertionError, match="prefill rows"):
+        pool.fold_workspace(PREFILL_ROWS + 1)
+
+    pool.rebuild(8)
+    assert pool.k_cache(1).shape == (8, 64, 2, 64)
+    assert pool.host_bytes == 2 * 4 * 8 * 64 * 2 * 64 * 2
+    assert pool.staging_window()[0].shape == (2, 64, 2, 64)
+    assert pool.fold_workspace(PREFILL_ROWS)[0].shape == (PREFILL_ROWS, QO_HEADS, 64)
+    with pytest.raises(AssertionError, match="host-placed"):
+        _pool().staging_window()
+    with pytest.raises(AssertionError, match="host-placed"):
+        _pool().fold_workspace(1)
+
+
+def test_host_placement_prices_its_device_workspace_instead_of_every_token(host_memory_on_the_cpu):
+    spec = _spec()
+    config = _config(spec)
+    device_page, device_fixed, _, _ = QSAKVCache.kv_cost(config)
+    host_page, host_fixed, _, _ = QSAKVCache.kv_cost(_config(spec, kv_placement="host"))
+    slab = spec_kv_slab_bytes_per_token(spec, config)
+    assert device_page - host_page == slab * 64
+    assert host_page == spec_index_bytes_per_token(spec) * 64
+    # one staging window of one layer's K/V, and a float32 fold accumulator with its two lse rows
+    window = slab // spec.num_layers * 128
+    fold = PREFILL_ROWS * QO_HEADS * (64 + 2) * 4
+    assert host_fixed - device_fixed == window + fold
+    pool = _pool(placement="host")
+    workspace = (*pool.staging_window(), *pool.fold_workspace(PREFILL_ROWS))
+    assert host_fixed - device_fixed == sum(t.numel() * t.element_size() for t in workspace)
+
+
+def test_only_the_sparse_pool_takes_host_placement():
+    from freetoken.kvcache import check_kv_placement
+
+    sparse = SimpleNamespace(model_is_mrope=False, dsv4_args=None)
+    sparse.kv_cache_group_specs = lambda: (_spec(),)
+    dense = SimpleNamespace(model_is_mrope=False, dsv4_args=None)
+    dense.kv_cache_group_specs = lambda: (_spec(attn_type=AttnType.FULL, index_ratio=1),)
+    check_kv_placement(sparse, "host")
+    check_kv_placement(dense, "device")
+    with pytest.raises(ValueError, match="QSA sparse pool only"):
+        check_kv_placement(dense, "host")

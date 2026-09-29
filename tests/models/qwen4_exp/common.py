@@ -154,6 +154,7 @@ class Fixture:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
+        placement: str = "device",
     ) -> None:
         from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
@@ -170,6 +171,8 @@ class Fixture:
             dtype=dtype,
             device=self.device,
             num_req_slots=self.num_req_slots,
+            placement=placement,
+            prefill_rows=8192,
         )
         self.page_table = torch.zeros(
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device

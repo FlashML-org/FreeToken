@@ -215,6 +215,7 @@ def test_create_kv_pool_builds_the_right_family():
     config = SimpleNamespace(
         model_config=mc, page_size=1, cache_type="radix", max_running_req=2,
         swa_full_tokens_ratio=1.0, swa_num_pages_override=None, max_seq_len=64,
+        max_forward_len=64, kv_placement="device",
     )
     pool = create_kv_pool(config, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16)
     assert isinstance(pool, MHAKVCache)
@@ -232,7 +233,7 @@ def test_create_kv_pool_builds_the_right_family():
     config2 = SimpleNamespace(
         model_config=mc2, page_size=1, cache_type="swa_radix", max_running_req=2,
         swa_full_tokens_ratio=0.5, swa_num_pages_override=None, max_seq_len=64,
-        max_extend_tokens=64,
+        max_extend_tokens=64, max_forward_len=64, kv_placement="device",
     )
     pool2 = create_kv_pool(config2, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16)
     assert isinstance(pool2, HybridSWAKVCache)

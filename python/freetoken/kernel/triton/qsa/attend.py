@@ -21,6 +21,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    lse_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -46,6 +47,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -143,6 +145,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         0.0,
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
+    partial_lse = tl.where(
+        has_values,
+        max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+        -float("inf"),
+    )
     if NUM_SPLITS == 1:
         tl.store(
             output_ptr
@@ -152,12 +159,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             normalized_output,
             mask=output_mask,
         )
+        if WRITE_LSE:
+            tl.store(
+                lse_ptr + row * NUM_QUERY_HEADS + first_head + head_offsets,
+                partial_lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
     else:
-        partial_lse = tl.where(
-            has_values,
-            max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
-            -float("inf"),
-        )
         tl.store(
             partial_output_ptr
             + (
@@ -185,6 +193,7 @@ def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    lse_ptr,
     stride_output_row,
     stride_output_head,
     num_rows,
@@ -192,6 +201,7 @@ def _qsa_merge_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
@@ -222,6 +232,11 @@ def _qsa_merge_splitk_kernel(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
         merged,
     )
+    if WRITE_LSE:
+        tl.store(
+            lse_ptr + row * NUM_QUERY_HEADS + head,
+            tl.where(has_values, lse_max + tl.math.log2(tl.maximum(denominator, 1.0e-20)), -float("inf")),
+        )
 
 
 def qsa_sparse_paged_attention(
@@ -232,8 +247,10 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches; ``lse``, when given, receives each
+    head's log2-sum-exp so passes over disjoint pages fold (``fold_attention_pass``)."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -256,6 +273,8 @@ def qsa_sparse_paged_attention(
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
+    if lse is not None:
+        assert lse.shape == q.shape[:2] and lse.dtype == torch.float32 and lse.is_contiguous()
     if not q.shape[0]:
         return out
 
@@ -309,6 +328,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        out if lse is None else lse,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -334,6 +354,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        WRITE_LSE=lse is not None,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -344,6 +365,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        out if lse is None else lse,
         out.stride(0),
         out.stride(1),
         q.shape[0],
@@ -351,10 +373,101 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        WRITE_LSE=lse is not None,
         num_warps=2,
         num_stages=1,
     )
     return out
 
 
-__all__ = ["qsa_sparse_paged_attention"]
+@triton.jit
+def _fold_attention_pass_kernel(
+    total_ptr,
+    total_lse_ptr,
+    part_ptr,
+    part_lse_ptr,
+    result_ptr,
+    stride_total_row,
+    stride_total_head,
+    stride_part_row,
+    stride_part_head,
+    stride_result_row,
+    stride_result_head,
+    stride_lse_row,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    FINAL: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    lse_at = row * stride_lse_row + head
+    total_lse = tl.load(total_lse_ptr + lse_at)
+    part_lse = tl.load(part_lse_ptr + lse_at)
+    peak = tl.maximum(total_lse, part_lse)
+    empty = peak == -float("inf")
+    shift = tl.where(empty, 0.0, peak)
+    keep = tl.exp2(total_lse - shift)
+    take = tl.exp2(part_lse - shift)
+    norm = keep + take
+    safe_norm = tl.where(empty, 1.0, norm)
+    keep = tl.where(empty, 0.0, keep / safe_norm)
+    take = tl.where(empty, 0.0, take / safe_norm)
+
+    dims = tl.arange(0, BLOCK_D)
+    inside = dims < HEAD_DIM
+    total_at = total_ptr + row * stride_total_row + head * stride_total_head + dims
+    total = tl.load(total_at, mask=inside, other=0.0)
+    part = tl.load(
+        part_ptr + row * stride_part_row + head * stride_part_head + dims, mask=inside, other=0.0
+    ).to(tl.float32)
+    folded = total * keep + part * take
+    if FINAL:
+        result_at = result_ptr + row * stride_result_row + head * stride_result_head + dims
+        tl.store(result_at, folded.to(result_ptr.dtype.element_ty), mask=inside)
+    else:
+        tl.store(total_at, folded, mask=inside)
+        tl.store(total_lse_ptr + lse_at, shift + tl.log2(norm))
+
+
+def fold_attention_pass(
+    total: torch.Tensor,
+    total_lse: torch.Tensor,
+    part: torch.Tensor,
+    part_lse: torch.Tensor,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Fold one pass into ``total`` (float32) by log2-sum-exp share; given ``result`` (which may
+    be ``part``), the last fold writes the sum there and leaves ``total`` as it was."""
+    rows, heads, head_dim = part.shape
+    target = total if result is None else result
+    if total.shape != part.shape or target.shape != part.shape or total.dtype != torch.float32:
+        raise ValueError("fold_attention_pass takes a float32 total shaped like the pass")
+    if total_lse.shape != (rows, heads) or part_lse.shape != (rows, heads):
+        raise ValueError("fold_attention_pass takes one log2-sum-exp per row and head")
+    if total_lse.stride() != part_lse.stride() or total_lse.stride(1) != 1:
+        raise ValueError("fold_attention_pass takes row-major log2-sum-exp rows of one stride")
+    if total.stride(2) != 1 or part.stride(2) != 1 or target.stride(2) != 1:
+        raise ValueError("fold_attention_pass takes head-contiguous outputs")
+    if not rows or not heads:
+        return
+    _fold_attention_pass_kernel[(rows, heads)](
+        total,
+        total_lse,
+        part,
+        part_lse,
+        target,
+        total.stride(0),
+        total.stride(1),
+        part.stride(0),
+        part.stride(1),
+        target.stride(0),
+        target.stride(1),
+        total_lse.stride(0),
+        HEAD_DIM=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        FINAL=result is not None,
+        num_warps=1,
+    )
+
+
+__all__ = ["fold_attention_pass", "qsa_sparse_paged_attention"]
