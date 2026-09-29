@@ -23,8 +23,6 @@ from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
-# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
-_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
 
 
 @dataclass(frozen=True)
@@ -322,18 +320,11 @@ def load_expert_banks(
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
 
-    if parallel and not _PARALLEL_READER_SUPPORTED:
-        logger.warning_rank0(
-            "expert banks: parallel O_DIRECT reader unsupported on this platform "
-            "(no os.O_DIRECT/preadv) -> serial build"
-        )
-        parallel = False
-
     auto = parallel is None
     if auto:
         from freetoken.models.weight import experts_scattered
 
-        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
+        parallel = not dummy and experts_scattered(model_path)
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
