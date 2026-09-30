@@ -110,6 +110,16 @@ def e4m3_u8_to_f16_x128(v):
 
 
 @jit
+def e4m3_to_f16_x128(raw):
+    """An e4m3 value as a branched kernel loads it (fp8 on sm_89+, its uint8 bits
+    before) -> fp16 pre-scaled by 128, the same value on both."""
+    if e4m3_native_cx():
+        return raw.to(tl.float16) * 128.0
+    else:
+        return e4m3_u8_to_f16_x128(raw)
+
+
+@jit
 def round_e4m3(x):
     """Round fp32 onto the e4m3 value grid (RNE), fp32 -> fp32, in a SINGLE
     rounding step -- an fp32 -> fp16 -> 3-bit chain double-rounds when the fp16
