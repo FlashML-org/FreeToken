@@ -17,6 +17,11 @@
 // instead of a name-aliasing shim -- see PDL below for why that also means
 // with_attr(true) is a no-op on this path.
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+// Keep the JIT kernel shim local; the host-extension macro shim aliases several
+// of the same CUDA names and would collide with these kernel-side wrappers.
+#ifndef FREETOKEN_USE_ROCM
+#define FREETOKEN_USE_ROCM 1
+#endif
 #include <hip/hip_runtime.h>
 
 using cudaError_t = hipError_t;
@@ -51,6 +56,10 @@ constexpr hipDeviceAttribute_t cudaDevAttrCanUseHostPointerForRegisteredMem =
 // equivalent attribute, so this just falls back to an ordinary by-value parameter.
 #define __grid_constant__
 #else
+// Mark CUDA device builds explicitly so shared templates select CUDA paths.
+#ifndef FREETOKEN_USE_ROCM
+#define FREETOKEN_USE_ROCM 0
+#endif
 #include <cuda_runtime.h>
 #endif
 
@@ -211,6 +220,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if FREETOKEN_USE_ROCM
+    (void)use_pdl;
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -219,6 +232,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 

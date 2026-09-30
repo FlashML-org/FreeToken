@@ -15,6 +15,7 @@ def test_hip_gguf_flags_pin_the_active_gfx_target(monkeypatch):
     monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising=False)
     monkeypatch.delenv("FREETOKEN_HIP_GGUF_FAST_MATH", raising=False)
     monkeypatch.setattr(gguf.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(gguf.torch.cuda, "current_device", lambda: 0)  # Model the selected single GPU without initializing the masked real device.
     monkeypatch.setattr(
         gguf.torch.cuda,
         "get_device_properties",
@@ -39,3 +40,12 @@ def test_hip_gguf_flags_preserve_an_explicit_multi_target_choice(monkeypatch):
     assert gguf._hip_gguf_cflags() == ["-O3", "-DGGML_CUDA_MMV_Y=1"]
     assert gguf._hip_target_arch() == "gfx1100"
     assert os.environ["PYTORCH_ROCM_ARCH"] == "gfx1100;gfx1151"
+
+
+def test_hip_gguf_target_uses_the_selected_device(monkeypatch):  # Keep the JIT target tied to the current HIP device.
+    """A multi-GPU process must not compile only for device zero."""  # Explain the regression risk.
+    monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising=False)  # Exercise automatic device selection.
+    monkeypatch.setattr(gguf.torch.cuda, "is_available", lambda: True)  # Simulate an available HIP runtime.
+    monkeypatch.setattr(gguf.torch.cuda, "current_device", lambda: 1)  # Select the second GPU for this process.
+    monkeypatch.setattr(gguf.torch.cuda, "get_device_properties", lambda index: SimpleNamespace(gcnArchName=f"gfx{1100 if index == 0 else 1151}"))  # Expose distinct GPU targets.
+    assert gguf._hip_target_arch() == "gfx1151"  # The selected GPU, not device zero, determines the JIT target.

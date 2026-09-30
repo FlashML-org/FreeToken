@@ -114,7 +114,7 @@ def test_multi_index_copy_matchers_admit_only_cuda_and_rocm_devices():
     matcher_pattern = re.compile(
         r"TensorMatcher\(\{(?P<size>B|L|1)\}\)\s*"
         r"\.with_dtype<[^;]+?>\([^)]*\)\s*"
-        r"\.with_device\(device\)",
+        r"\.with_device<kDLCUDA,\s*kDLROCM>\(device\)",  # Require every descriptor matcher to admit CUDA and ROCm explicitly.
         re.DOTALL,
     )
     matches = list(matcher_pattern.finditer(matcher_block))

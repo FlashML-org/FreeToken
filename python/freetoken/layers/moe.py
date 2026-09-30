@@ -551,6 +551,8 @@ class OffloadMoELayer(MoELayer):
                 self.swiglu_limit,
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
+        from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl  # Resolve the legacy unquantized-bank fallback only when selected.
+
         gate_up, down = views
         impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
         return impl(

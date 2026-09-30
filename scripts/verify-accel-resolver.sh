@@ -42,21 +42,15 @@ resolve() {
         --python-platform "${PYTHON_PLATFORM}" \
         --output-file "${output}" \
         --no-cache > /dev/null
-    grep -E '^(flashinfer-python|sglang-kernel|torch==|torchvision==|triton==|rocm-sdk-(core|libraries|devel|device-gfx1151)==)' \
+    grep -E '^(flashinfer-python|sglang-kernel|torch==|torchvision==|triton==)' \
         "${output}" || true
 }
 
+ROCM_RUNTIME_PACKAGE_PATTERN='^(rocm|rocm-sdk-[^=]+|torch|torchvision|triton|amd-torch.*|amd-torchvision.*)=='
 for version in "${ROCM_PYTHON_VERSIONS[@]}"; do
     resolve rocm "${version}"
-    if ! grep -q '^triton==3\.7\.1+git0263a6a6\.rocm7\.14\.0' \
-        "${WORK_DIR}/rocm-${version}.txt"; then
-        printf 'error: ROCm did not resolve AMD PyTorch 7.14.0 Triton for Python %s\n' \
-            "${version}" >&2
-        exit 1
-    fi
-    if ! grep -q '^rocm-sdk-devel==7\.14\.0' \
-        "${WORK_DIR}/rocm-${version}.txt"; then
-        printf 'error: ROCm did not resolve the 7.14.0 development SDK for Python %s\n' \
+    if grep -Eiq "${ROCM_RUNTIME_PACKAGE_PATTERN}" "${WORK_DIR}/rocm-${version}.txt"; then
+        printf 'error: ROCm marker extra selected an accelerator runtime package for Python %s\n' \
             "${version}" >&2
         exit 1
     fi
@@ -65,16 +59,7 @@ done
 resolve cuda
 resolve accel
 
-printf '== rejecting rocm plus legacy CUDA extra ==\n'
-if uv pip compile "${WORK_DIR}/pyproject.toml" \
-    --extra rocm \
-    --extra accel \
-    --python-version "${PYTHON_VERSION}" \
-    --python-platform "${PYTHON_PLATFORM}" \
-    --output-file "${WORK_DIR}/rocm-accel.txt" \
-    --no-cache > /dev/null; then
-    printf 'error: ROCm and accel resolved together; the declared conflict is missing\n' >&2
-    exit 1
-fi
+# uv pip compile ignores tool.uv.conflicts, so the Python contract test verifies
+# the ROCm/CUDA extra exclusion directly from pyproject metadata instead.
 
-printf 'accelerator resolver contract passed\n'
+printf 'accelerator resolver contract passed; ROCm remains externally provisioned\n'

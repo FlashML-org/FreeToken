@@ -71,6 +71,12 @@ def is_triton_kernels_installed() -> bool:
     return not is_rocm_runtime() and _importable("triton_kernels")
 
 
+def is_rocm() -> bool:
+    """Report the active HIP runtime using the shared ROCm capability probe."""
+    # Preserve one source of truth for HIP detection across kernel call sites.
+    return is_rocm_runtime()
+
+
 @functools.cache
 def driver_cuda_version() -> int | None:
     """Max CUDA version the installed NVIDIA driver supports (``13000`` == CUDA 13.0),

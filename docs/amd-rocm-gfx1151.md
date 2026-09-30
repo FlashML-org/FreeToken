@@ -7,7 +7,7 @@ the AMD Ryzen AI Max+ 395 with Radeon 8060S (`gfx1151`).  The port preserves
 the NVIDIA implementation as a separate runtime path.  It does not use Vulkan
 or a CPU-only runner as a substitute for native GPU execution.
 
-The intended first deployment host is LAN-223.  It serves the same local API
+The intended first deployment target is a `gfx1151` Strix Halo system. It serves the same local API
 surface as upstream FreeToken, including OpenAI-compatible endpoints, while
 using HIP-compiled extensions and AMD Triton kernels.
 
@@ -25,7 +25,7 @@ initial full-model validation set is:
 The project records correctness, stability, API behavior, GPU memory, host
 memory, prefill throughput, decode throughput, TTFT, temperature, clocks, and
 throttling.  NVIDIA GPU tokens per second are context, not an AMD acceptance
-threshold: LAN-223 uses a shared-memory APU rather than discrete VRAM and
+threshold: the target uses a shared-memory APU rather than discrete VRAM and
 PCIe.
 
 ### Known scope boundary
@@ -46,7 +46,7 @@ behavior stays unchanged.
 
 - `setup.py` detects a ROCm PyTorch build and links the two native extensions
   to `libamdhip64` instead of `libcudart`.
-- `kernel/csrc/hip_compat.h` maps the small CUDA Runtime API subset used by
+- `kernel/csrc/include/freetoken/hip_compat.h` maps the small CUDA Runtime API subset used by
   FreeToken's pinned-memory and CPU MoE extensions to HIP equivalents.
 - CUDA JIT compilation removes NVCC-only flags on HIP and replaces CUDA-only
   launch behavior with compatible HIP launch behavior.
@@ -58,87 +58,41 @@ behavior stays unchanged.
   This matters because PyTorch presents HIP devices under `torch.cuda` for
   compatibility, and `gfx1151` must never be interpreted as a new NVIDIA SM.
 
-## Clean LAN-223 installation
+## ROCm 10 system and Python environment
 
-**Qualification status: partial; gfx1151 runtime remains unqualified.** On
-2026-09-25, the current candidate dependency set installed in a disposable
-Linux/x86_64 Python 3.14 environment on LAN-215 using AMD's ROCm 7.14.0 index
-and `gfx1151` device extras. `rocm-sdk init` exposed HIP 7.14.60850, and
-`pip install --no-build-isolation -e '.[rocm]'` built the pinned-tensor,
-CPU-MoE, and row-store native extensions. `pip check`, native-extension
-imports, the `flashlib` slot-cache import, and nine no-hardware install/setup
-contract tests passed. The GPU was hidden during the build and test/import
-checks; LAN-215 is a `gfx1150` host, and setup builds only host C++ extensions.
-After making HIP capability-query failure handling explicit and checking stream
-callback-enqueue errors, the three native extensions rebuilt with zero compiler
-warnings. `fast_index_copy.cuh` also compiled through ROCm 7.14 `hipcc` for the
-`gfx1151` target as a temporary host object; no FreeToken device kernel was
-emitted or run. This validates the candidate package/install and host-extension
-path, not FreeToken HIP JIT/device-kernel execution on `gfx1151` or end-to-end
-parity. The commands below remain experimental until those target-runtime
-gates pass.
+**Qualification status: partial; HIP device execution and parity remain open.**
+The qualified target class reports ROCm `10.0.0`, `/opt/rocm` selecting
+`/opt/rocm-10.0`, and AMD ROCm packages at release `10.0.0-4`. The validated
+Python runtime is PyTorch `2.13.0+rocm10.0.0`; its HIP component reports
+`7.15.26333`, which is component metadata inside the ROCm 10 environment, not
+a separate installed ROCm 7.x tree. AMD's release history identifies ROCm
+10.0.0 as the current production release ([release history](https://rocm.docs.amd.com/en/latest/release/versions.html)).
 
-Do not install into system Python, an existing llama.cpp environment, or the
-existing vLLM environment.  The reference layout is intentionally isolated:
+Use only the pre-provisioned ROCm 10 system stack and a matching isolated HIP
+Python environment. Do not install a ROCm 7.x SDK, wheel, index, or runtime
+package, and do not use the generic `rocm` package extra to provision the
+toolchain. The `rocm` extra is intentionally empty so dependency resolution
+cannot silently replace the supported ABI; provision ROCm 10 and its matching
+PyTorch/Triton stack before building FreeToken. Keep CUDA-only `flashinfer`,
+`sglang-kernel`, CUDA-indexed Torch wheels, and CUDA kernel-cache wheels out of
+the HIP environment.
 
-```text
-/home/david/freetoken-amd/
-  source/       this Git checkout
-  .venv/        Python 3.12, ROCm PyTorch, AMD Triton, FreeToken
-  artifacts/    commands, environment manifests, tests, logs, telemetry
-  models/       optional links to read-only local model storage
-```
+Keep source, Python environment, test artifacts, and models separate under a
+caller-selected `${FREETOKEN_WORK_ROOT}`:
 
-The candidate PyTorch pair is `torch==2.11.0+rocm7.14.0` and
-`torchvision==0.26.0+rocm7.14.0` from AMD's multi-architecture wheel index.
-The explicit `device-gfx1151` extras select AMD's matching device packages.
-The matching SDK, including its development tools and headers, must also be
-installed in this same isolated environment. Do not point the build at a
-different system ROCm installation: LAN-223 currently has ROCm 10.0 and
-7.2.4 trees, which are not the candidate 7.14 SDK.
+- `${FREETOKEN_WORK_ROOT}/source/` — the exact FreeToken checkout under test.
+- `${FREETOKEN_WORK_ROOT}/.venv/` — Python and the matching ROCm 10 HIP stack.
+- `${FREETOKEN_WORK_ROOT}/artifacts/` — revision, package, test, and runtime evidence.
+- `${FREETOKEN_WORK_ROOT}/models/` — optional read-only links to local model storage.
 
-```bash
-python -m pip install \
-  --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
-  "torch[device-gfx1151]==2.11.0+rocm7.14.0" \
-  "torchvision[device-gfx1151]==0.26.0+rocm7.14.0" \
-  "rocm[libraries,devel,device-gfx1151]==7.14.0"
-rocm-sdk init
-export ROCM_HOME="$(rocm-sdk path --root)"
-export PATH="$(rocm-sdk path --bin):$PATH"
-export ROCM_PATH="$ROCM_HOME"
-export HIP_PATH="$ROCM_HOME"
-hipcc --version
-python -c "import torch; assert torch.version.hip, torch.version.hip"
-```
-
-FreeToken's upstream CUDA package set must not be installed on AMD:
-`flashinfer`, `sglang-kernel`, CUDA-indexed Torch wheels, and the CUDA
-kernel-cache wheel are NVIDIA binaries. Standard pip does not read uv's source
-mapping, so do not expect `pip install "freetoken[rocm]"` to select the ROCm
-index automatically.
-
-The initial build command is run from `source` only after the isolated Python
-environment has a working HIP PyTorch import:
-
-```bash
-python -m pip install -e . --no-build-isolation
-```
-
-`--no-build-isolation` is intentional: the validated HIP Torch ABI already
-exists in this isolated environment and must be the ABI used for the native
-extensions. FreeToken's ordinary runtime dependencies still install, but Torch
-is not a base dependency and is therefore not re-resolved. Do not substitute
-the CUDA `accel` extra for this sequence.
-
-Maintainers can verify the metadata selection independently with
-`bash scripts/verify-accel-resolver.sh`. It creates a disposable directory,
-performs resolver dry-runs only, and rejects the invalid ROCm-plus-CUDA-extra
-selection; it neither installs packages nor changes a service.
-
-Use `hipcc --version`, `rocminfo`, and a small PyTorch HIP allocation before
-the FreeToken build. Record outputs in `artifacts/environment/`, with secrets
-and access tokens removed.
+Build from the exact candidate source with build isolation disabled and package
+dependencies unchanged; otherwise PEP 517 or a resolver may replace the
+pre-provisioned ROCm 10 PyTorch ABI. Record the source fingerprint, `/opt/rocm`
+target, ROCm package release, PyTorch/HIP versions, `gfx` target, build output,
+and dependency resolution in the artifact manifest. Confirm each target's actual
+architecture separately (`gfx1151` and `gfx1150`); do not infer target execution from a host-only build or a masked
+device test. See [AMD ROCm installation notes](install_amd.md) for the
+pre-provisioned environment boundary and build acceptance checks.
 
 ## Persistent GGUF HIP JIT cache
 
@@ -152,7 +106,8 @@ portable installation-specific location, set this before every `ft serve`
 launch and keep the directory across reboots and service restarts:
 
 ```bash
-export TORCH_EXTENSIONS_DIR=/home/david/freetoken-amd/cache/torch_extensions
+export FREETOKEN_WORK_ROOT="${FREETOKEN_WORK_ROOT:-$HOME/freetoken-amd}"
+export TORCH_EXTENSIONS_DIR="${FREETOKEN_WORK_ROOT}/cache/torch_extensions"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 ```
 
@@ -171,7 +126,7 @@ that development step is not part of normal operation.
 4. Run Qwen3.6-35B-A3B through `ft serve` on a non-conflicting local port.
 5. Test `/v1/models`, non-streaming `/v1/chat/completions`, and streamed
    `/v1/chat/completions` with fixed requests.
-6. Run `ft bench bw` on LAN-223.  Treat its recommendation as a measured
+6. Run `ft bench bw` on the target system. Treat its recommendation as a measured
    candidate, then verify it with full serving workloads.
 7. Repeat the same API and stability checks for the supported Gemma 4 MoE
    GGUF.
@@ -188,9 +143,9 @@ This branch incorporates the focused current-main ROCm work from FreeToken
 pull request #241, preserving its commits and authorship.  It adds explicit
 `gfx1151` safety coverage and project-specific validation documentation.
 Upstream review should receive a focused pull request containing code plus
-tests.  LAN-223 environment reports and benchmark artifacts belong in this
-fork unless the upstream maintainers request them.
+tests. Environment reports and benchmark artifacts remain private unless
+sanitized and explicitly approved for upstream publication.
 
-The completed 2026-08-28 native HIP validation, exact LAN-223 environment,
+The completed 2026-08-28 native HIP validation, exact private environment,
 API evidence, command shapes, and known limitations are documented in
 [`lan223-rocm-validation-2026-08-28.md`](lan223-rocm-validation-2026-08-28.md).

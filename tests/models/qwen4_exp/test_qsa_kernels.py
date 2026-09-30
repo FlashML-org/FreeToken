@@ -280,8 +280,16 @@ def test_block_topk_matches_torch_topk(n_blocks: int, width: int, bs: int, mode:
     qsa_block_topk(logits, visible, blocks)
     expected = _torch_topk_blocks(logits, visible, width)
 
-    # Selection is a set: torch.topk orders by descending score, the kernel by column id.
-    torch.testing.assert_close(blocks.sort(-1).values, expected.sort(-1).values)
+    # Equal scores make torch.topk's chosen indices backend-dependent, so compare winner scores.
+    safe_blocks = blocks.clamp_min(0).long()
+    chosen_scores = logits.gather(1, safe_blocks).masked_fill(blocks < 0, -float("inf"))
+    expected_scores = logits.gather(1, expected.clamp_min(0).long()).masked_fill(
+        expected < 0, -float("inf")
+    )
+    torch.testing.assert_close(
+        chosen_scores.sort(-1, descending=True).values,
+        expected_scores.sort(-1, descending=True).values,
+    )
     live = (blocks >= 0).sum(-1)
     torch.testing.assert_close(live, (expected >= 0).sum(-1))
     # expand.py reads ranks [0, complete_blocks), so a -1 may only sit in the tail.

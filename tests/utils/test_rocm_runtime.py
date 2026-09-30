@@ -61,7 +61,7 @@ def test_native_extension_build_uses_torch_hip_and_explicit_host_macro():
 
     root = Path(__file__).resolve().parents[2]
     setup_source = (root / "setup.py").read_text(encoding="utf-8")
-    compat_source = (root / "python/freetoken/kernel/csrc/hip_compat.h").read_text(
+    compat_source = (root / "python/freetoken/kernel/csrc/include/freetoken/hip_compat.h").read_text(
         encoding="utf-8"
     )
 

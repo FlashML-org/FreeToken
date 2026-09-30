@@ -20,6 +20,7 @@ accurate than the previous ``weight.to(bf16) * scale`` materialization, which it
 from __future__ import annotations
 
 import functools
+import os  # Read the bounded ROCm GEMV experiment controls at module initialization.
 import re
 
 import torch

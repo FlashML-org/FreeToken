@@ -1,6 +1,10 @@
 # Install
 
+AMD users: see the [AMD ROCm installation guide (WIP)](install_amd.md).
+
 ## CUDA (NVIDIA) requirements
+
+## Requirements
 
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
 - Python >= 3.10, with [uv](https://docs.astral.sh/uv/) recommended (plain
@@ -12,12 +16,12 @@ including the nightly kernel-cache wheel, are CUDA-only.
 ## AMD ROCm/HIP from source
 
 The ROCm path is a separate, explicit Linux x86_64 source-build procedure. It
-requires Python >=3.10 and a complete ROCm toolkit. It provisions a matched HIP
-Torch/TorchVision pair from PyTorch's ROCm index before building FreeToken
-without build isolation. Follow [AMD ROCm on Radeon
-8060S](amd-rocm-gfx1151.md#clean-installation) rather than using the CUDA
+requires Python >=3.10 and a complete ROCm toolkit. Provision a matched ROCm 10
+Torch and Triton environment independently before building FreeToken with
+dependency resolution and build isolation disabled. Follow [AMD ROCm on Radeon
+8060S](amd-rocm-gfx1151.md#rocm-10-system-and-python-environment) rather than using the CUDA
 commands below. Standard pip does not read uv's source mapping, so `pip install
-"freetoken[rocm]"` cannot by itself choose the ROCm wheel index.
+"freetoken[rocm]"` cannot by itself choose or validate the ROCm wheel index.
 
 ## Method 1: Install from PyPI
 

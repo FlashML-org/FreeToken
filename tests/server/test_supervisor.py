@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 
 from queue import Empty as _Empty
+import pytest  # Assert that a failed queue-close operation remains visible and retryable.
 
 from freetoken.utils import progress
 from freetoken.server.supervisor import BackendHandle, LoadProgress, drain_ready, phase_slug
@@ -237,6 +238,96 @@ def test_supervisor_silent_on_startup_death_during_shutdown():
     )
     assert "ready" not in seen
     assert "failure" not in seen  # silenced: expected exit during shutdown
+
+
+def test_supervisor_closes_the_startup_queue_after_orderly_shutdown():  # Prevent multiprocessing semaphore warnings at interpreter exit.
+    """The supervisor owns the parent queue handle and must release it on every return path."""  # State the lifecycle contract under test.
+    class ClosableQueue(queue.Queue):  # Model the lifecycle methods exposed by multiprocessing.Queue.
+        def __init__(self) -> None:  # Track cleanup calls while retaining ordinary queue behavior.
+            super().__init__()  # Initialize the in-memory acknowledgement queue.
+            self.closed = False  # Record whether the parent queue handle was closed.
+            self.joined = False  # Record whether its feeder thread was joined.
+
+        def close(self) -> None:  # Mirror multiprocessing.Queue.close without destroying test data.
+            self.closed = True  # Make the ownership release observable.
+
+        def join_thread(self) -> None:  # Mirror multiprocessing.Queue.join_thread.
+            self.joined = True  # Make feeder-thread cleanup observable.
+
+    class Proc:  # Provide one worker that exits as part of an orderly stop.
+        name = "freetoken-TP0-scheduler"  # Preserve a realistic worker identity.
+
+        def __init__(self) -> None:  # Begin alive so readiness can complete first.
+            self.alive = True  # Keep the supervisor in its post-ready watch loop.
+
+        def is_alive(self) -> bool:  # Expose the process-liveness protocol used by the supervisor.
+            return self.alive  # Return the state changed by the ready callback.
+
+    proc = Proc()  # Create the watched worker.
+    ack_queue = ClosableQueue()  # Use a queue whose cleanup is directly verifiable.
+    ack_queue.put("scheduler ready")  # Satisfy the startup readiness handshake.
+    handle = BackendHandle(ack_queue=ack_queue, processes=[proc], expected_acks=1)  # Bind queue ownership to the backend handle.
+    shutting_down = {"value": False}  # Share the orderly-stop state with the supervisor callback.
+    from freetoken.server.supervisor import run_backend_supervisor  # Import the lifecycle under test.
+
+    def on_ready() -> None:  # Transition from ready serving to an expected worker exit.
+        shutting_down["value"] = True  # Mark the death as part of normal shutdown.
+        proc.alive = False  # Make the supervisor observe worker termination.
+
+    run_backend_supervisor(  # Exercise the complete ready-to-shutdown lifecycle.
+        handle,  # Supply the queue and process handles owned by this serve instance.
+        LoadProgress(),  # Collect startup progress without external state.
+        on_ready=on_ready,  # Trigger the orderly worker exit after readiness.
+        poll=0.01,  # Keep the unit test bounded.
+        is_shutting_down=lambda: shutting_down["value"],  # Distinguish the expected exit from a crash.
+    )  # The parent queue should be released before this call returns.
+    assert ack_queue.closed is True  # Require the semaphore-owning handle to close.
+    assert ack_queue.joined is True  # Require its feeder thread to finish as well.
+
+
+def test_backend_handle_closes_the_startup_queue_only_once():  # Protect concurrent supervisor and lifespan cleanup.
+    class ClosableQueue:  # Expose only the lifecycle surface owned by BackendHandle.
+        def __init__(self) -> None:  # Count every cleanup call for idempotence assertions.
+            self.close_calls = 0  # Record parent endpoint releases.
+            self.join_calls = 0  # Record feeder-thread joins.
+
+        def close(self) -> None:  # Mirror multiprocessing.Queue.close.
+            self.close_calls += 1  # Make duplicate closure observable.
+
+        def join_thread(self) -> None:  # Mirror multiprocessing.Queue.join_thread.
+            self.join_calls += 1  # Make duplicate joins observable.
+
+    ack_queue = ClosableQueue()  # Create a queue with directly observable ownership release.
+    handle = BackendHandle(ack_queue=ack_queue)  # Bind cleanup state to the launch handle.
+    handle.close_startup_queue()  # Model the supervisor reaching its finally block first.
+    handle.close_startup_queue()  # Model lifespan shutdown requesting the same release afterward.
+    assert ack_queue.close_calls == 1  # Require exactly one endpoint close.
+    assert ack_queue.join_calls == 1  # Require exactly one feeder-thread join.
+
+
+def test_backend_handle_retries_cleanup_after_close_failure():  # Preserve retryability when queue cleanup raises partway through.
+    class FlakyQueue:  # Model a multiprocessing queue whose first close attempt fails.
+        def __init__(self) -> None:  # Track each cleanup phase independently.
+            self.close_calls = 0  # Count attempts to close parent endpoints.
+            self.join_calls = 0  # Count completed feeder-thread joins.
+
+        def close(self) -> None:  # Mirror the queue close surface.
+            self.close_calls += 1  # Make retries observable.
+            if self.close_calls == 1:  # Fail only the first attempt.
+                raise OSError("synthetic close failure")  # Reproduce the partial-cleanup path.
+
+        def join_thread(self) -> None:  # Mirror the feeder cleanup surface.
+            self.join_calls += 1  # Prove the successful retry reaches the final phase.
+
+    ack_queue = FlakyQueue()  # Create the failure-injecting queue.
+    handle = BackendHandle(ack_queue=ack_queue)  # Bind lifecycle state to the queue.
+    with pytest.raises(OSError, match="synthetic close failure"):  # Observe the first cleanup failure.
+        handle.close_startup_queue()  # Exercise the failure before completion is published.
+    assert handle._queue_closed is False  # Require a later owner to retain retry authority.
+    handle.close_startup_queue()  # Retry the complete cleanup sequence.
+    assert ack_queue.close_calls == 2  # Require the failed close operation to be retried.
+    assert ack_queue.join_calls == 1  # Require the successful attempt to join exactly once.
+    assert handle._queue_closed is True  # Publish completion only after both operations succeed.
 
 
 # ---------------------------------------------------------------------------

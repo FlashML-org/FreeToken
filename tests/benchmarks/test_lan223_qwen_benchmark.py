@@ -291,7 +291,21 @@ class LlamaCppControlScriptTests(unittest.TestCase):
         wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_timeshare_control.sh"
         contents = wrapper.read_text(encoding="utf-8")
 
-        self.assertIn('"status":"ok"', contents)
+        self.assertIn("health_is_ok()", contents)  # Require structured JSON validation rather than whitespace-sensitive matching.
+        self.assertIn("json.load(sys.stdin).get(\"status\") == \"ok\"", contents)  # Preserve the exact healthy-state contract.
         self.assertIn('find_freetoken_pid', contents)
         self.assertIn('sudo swapoff -a', contents)
         self.assertIn('bash "${RECOVERY_SCRIPT}"', contents)
+
+    def test_timeshare_control_arms_exit_recovery_before_stopping_freetoken(self) -> None:  # Prevent failures from stranding the protected service.
+        repository_root = Path(__file__).resolve().parents[2]  # Resolve the repository independently of the test runner's working directory.
+        wrapper = repository_root / "scripts" / "lan223" / "run_qwen_llamacpp_rocm_timeshare_control.sh"  # Select the destructive time-share wrapper.
+        contents = wrapper.read_text(encoding="utf-8")  # Inspect lifecycle ordering without stopping any process.
+        trap_position = contents.index("trap restore_freetoken_on_exit EXIT")  # Locate the unconditional recovery registration.
+        arm_position = contents.index("recovery_required=1")  # Locate the point after which recovery becomes mandatory.
+        kill_position = contents.index('kill "${freetoken_pid}"')  # Locate the protected process stop.
+        disarm_position = contents.rindex("recovery_required=0")  # Locate the post-health recovery completion marker.
+        health_position = contents.rindex("if ! wait_for_freetoken_health")  # Locate the final serving-state verification.
+        self.assertLess(trap_position, arm_position)  # Require the guard before recovery responsibility is armed.
+        self.assertLess(arm_position, kill_position)  # Require recovery responsibility before the stop signal.
+        self.assertLess(health_position, disarm_position)  # Disarm only after the protected API is serving again.

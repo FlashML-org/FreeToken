@@ -1,6 +1,6 @@
 [build-system]
-# torch must match the runtime range below: build isolation resolves this list on its
-# own, and a mismatch links the C++ extensions against the wrong libtorch.
+# Torch is needed while setup.py defines native extensions. AMD builds must disable
+# build isolation so this fallback cannot replace the pre-provisioned ROCm 10 ABI.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
 requires = ["setuptools>=77", "torch>=2.11,<2.14", "wheel"]
@@ -55,8 +55,8 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
-    # Torch and Triton are accelerator ABI dependencies. They intentionally
-    # live in the mutually exclusive CUDA and ROCm extras below.
+    # Accelerator runtimes are intentionally absent: CUDA selects exact wheels in
+    # its extra, while ROCm 10 is provisioned and verified outside package metadata.
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
     "uvicorn>=0.30,<1",
@@ -83,20 +83,8 @@ cuda = [
     "flashinfer-python[cu13]==0.6.18.post1",
     "sglang-kernel==0.4.5",
 ]
-rocm = [
-    "torch[device-gfx1151]==2.11.0+rocm7.14.0",
-    "torchvision[device-gfx1151]==0.26.0+rocm7.14.0",
-    "triton==3.7.1+git0263a6a6.rocm7.14.0; sys_platform == 'linux'",
-    "rocm[libraries]==7.14.0; sys_platform == 'linux'",
-    "rocm[devel]==7.14.0; sys_platform == 'linux'",
-    "rocm-sdk-core==7.14.0; sys_platform == 'linux'",
-    "rocm-sdk-libraries==7.14.0; sys_platform == 'linux'",
-    "rocm-sdk-devel==7.14.0; sys_platform == 'linux'",
-    "rocm-sdk-device-gfx1151==7.14.0; sys_platform == 'linux'",
-    "amd-torch-device-gfx1151==2.11.0+rocm7.14.0; sys_platform == 'linux'",
-    "amd-torch-device-gfx115x==2.11.0+rocm7.14.0; sys_platform == 'linux'",
-    "amd-torchvision-device-gfx1151==0.26.0+rocm7.14.0; sys_platform == 'linux'",
-]
+# The ROCm 10 runtime is pre-provisioned and verified; this marker extra must never select accelerator wheels.
+rocm = []
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[cuda]` (or legacy `freetoken[accel]`) for the CUDA native fast path.
@@ -119,10 +107,8 @@ accel = [
 # out of the default resolution — install it separately (`pip install 'vllm>=0.14,<0.15'`)
 # in a dedicated environment when you specifically need the Marlin path.
 
-# uv-only provenance pins. pip ignores this section, so a ROCm source build must
-# provision its matched PyTorch/AMD Triton stack from the AMD index before its
-# editable build. The gfx1151 extras select AMD's architecture-specific device
-# packages; PyTorch pins its matching generic `triton` distribution.
+# uv-only provenance pins. pip ignores this section. A ROCm source build must
+# provision its matched PyTorch/HIP/Triton stack from ROCm 10 before its editable build.
 # `explicit = true` scopes each index to packages named below; without it a
 # PyTorch index could shadow ordinary PyPI dependencies under uv's first-index
 # strategy.
@@ -130,32 +116,16 @@ accel = [
 torch = [
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cu130", extra = "accel" },
-    { index = "amd-rocm714", extra = "rocm" },
 ]
 torchvision = [
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cu130", extra = "accel" },
-    { index = "amd-rocm714", extra = "rocm" },
 ]
-triton = [{ index = "amd-rocm714", extra = "rocm" }]
-rocm = [{ index = "amd-rocm714", extra = "rocm" }]
-rocm-sdk-core = [{ index = "amd-rocm714", extra = "rocm" }]
-rocm-sdk-libraries = [{ index = "amd-rocm714", extra = "rocm" }]
-rocm-sdk-devel = [{ index = "amd-rocm714", extra = "rocm" }]
-rocm-sdk-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
-amd-torch-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
-amd-torch-device-gfx115x = [{ index = "amd-rocm714", extra = "rocm" }]
-amd-torchvision-device-gfx1151 = [{ index = "amd-rocm714", extra = "rocm" }]
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "amd-rocm714"
-url = "https://repo.amd.com/rocm/whl-multi-arch/"
 explicit = true
 
 [[tool.uv.index]]

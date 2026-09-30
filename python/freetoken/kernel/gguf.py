@@ -39,7 +39,7 @@ def _hip_target_arch() -> str | None:
         return explicit.split(";", 1)[0].strip()
     if not torch.cuda.is_available():
         return None
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", "")  # Compile for the selected HIP device, not GPU zero.
     return str(arch).split(":", 1)[0] or None
 
 

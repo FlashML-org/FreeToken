@@ -23,6 +23,7 @@ readonly AFTER_HEALTH_FILE="${ARTIFACT_ROOT}/freetoken-health-after.json"
 readonly SWAP_BEFORE_FILE="${ARTIFACT_ROOT}/swap-before.txt"
 readonly SWAP_AFTER_RELEASE_FILE="${ARTIFACT_ROOT}/swap-after-release.txt"
 readonly SWAP_AFTER_FILE="${ARTIFACT_ROOT}/swap-after.txt"
+recovery_required=0  # Arm recovery only immediately before stopping the verified FreeToken process.
 
 # Avoid overwriting evidence from an earlier run and reject partial setup before
 # stopping the live benchmark server.
@@ -47,6 +48,11 @@ find_freetoken_pid() {
     printf '%s\n' "${pid}"
 }
 
+# Parse health JSON structurally so harmless whitespace cannot trigger recovery.
+health_is_ok() {
+    python -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ok" else 1)'
+}
+
 # Wait for HTTP health instead of accepting a listener while FreeToken loads
 # native modules and model state after recovery.
 wait_for_freetoken_health() {
@@ -57,13 +63,33 @@ wait_for_freetoken_health() {
         # recovery only when the API explicitly reports the serving state.
         health_payload="$(curl -fsS "${FREETOKEN_HEALTH_URL}" 2>/dev/null || true)"
         printf '%s\n' "${health_payload}" >"${AFTER_HEALTH_FILE}"
-        if [[ "${health_payload}" == *'"status":"ok"'* ]]; then
+        if printf '%s' "${health_payload}" | health_is_ok; then
             return 0
         fi
         sleep 1
     done
     return 1
 }
+
+# Restore FreeToken after any failure or signal that occurs after the verified stop point.
+restore_freetoken_on_exit() {  # Keep protected-service recovery independent of the control result.
+    local original_status="$?"  # Preserve the failure or signal-derived shell status for the caller.
+    local health_payload  # Hold the single fast-path health response without leaking it globally.
+    trap - EXIT  # Prevent recursion when this handler exits with the original status.
+    set +e  # Make every recovery attempt best-effort even when one step fails.
+    if [[ "${recovery_required}" -eq 1 ]]; then  # Act only after this wrapper initiated the stop.
+        health_payload="$(curl -fsS "${FREETOKEN_HEALTH_URL}" 2>/dev/null)"  # Avoid starting a duplicate healthy server.
+        if ! printf '%s' "${health_payload}" | health_is_ok; then  # Recover when the protected API is absent or not serving.
+            bash "${RECOVERY_SCRIPT}" | tee "${ARTIFACT_ROOT}/freetoken-recovery-on-exit.txt"  # Preserve the emergency recovery artifact path.
+            if ! wait_for_freetoken_health; then  # Verify recovery rather than accepting a launched process.
+                echo "error: EXIT recovery did not restore healthy FreeToken" >&2  # Surface the unresolved protected-service failure.
+            fi
+        fi
+    fi
+    exit "${original_status}"  # Return the original benchmark outcome after recovery attempts finish.
+}
+
+trap restore_freetoken_on_exit EXIT  # Cover command failures plus INT/TERM shell exits through the EXIT path.
 
 # Preserve the configured swap file while clearing pages faulted by the prior
 # failed coexistence allocation. This does not alter vm.swappiness.
@@ -80,6 +106,7 @@ freetoken_pid="$(find_freetoken_pid)" || {
     exit 1
 }
 printf '%s\n' "${freetoken_pid}" >"${ARTIFACT_ROOT}/freetoken-server-pid.txt"
+recovery_required=1  # Make every subsequent exit responsible for restoring the stopped workload.
 kill "${freetoken_pid}"
 for _ in $(seq 1 180); do
     if ! kill -0 "${freetoken_pid}" 2>/dev/null; then
@@ -111,6 +138,7 @@ if ! wait_for_freetoken_health; then
     echo "error: FreeToken did not become healthy after time-share control" >&2
     exit 1
 fi
+recovery_required=0  # Disarm the EXIT guard only after serving health is proven.
 swapon --show --bytes >"${SWAP_AFTER_FILE}"
 
 # A benchmark failure is returned only after recovered FreeToken health passes.
