@@ -20,7 +20,8 @@
 #                                 Defaults to $DEFAULT_KERNEL_CACHE_WHEEL_URL; if
 #                                 unset and FREETOKEN_WHEEL is local, the script
 #                                 auto-detects a sibling freetoken_kernel_cache-*.whl.
-#   FREETOKEN_HOME                install root (default: ~/.freetoken); venv at $FREETOKEN_HOME/venv
+#   FREETOKEN_HOME                install root (default: ~/.freetoken); venv at $FREETOKEN_HOME/venv;
+#                                 a successful install writes it to environment.d
 #   FREETOKEN_PY_VERSION          python for the venv (default: 3.12 — must match the wheel tag)
 #   FREETOKEN_BIN_DIR             where to symlink `ft` (default: ~/.local/bin)
 #   FREETOKEN_ENV_DIR             environment.d dir (default: ~/.config/environment.d)
@@ -248,8 +249,8 @@ ln -sf "$FT_BIN" "$BIN_DIR/ft"
 say "symlinked $BIN_DIR/ft -> $FT_BIN"
 
 mkdir -p "$ENV_DIR"
-printf 'FREETOKEN_FT_BIN=%s\n' "$FT_BIN" > "$ENV_DIR/50-freetoken.conf"
-say "wrote $ENV_DIR/50-freetoken.conf (FREETOKEN_FT_BIN) — GUI picks it up after next login"
+printf 'FREETOKEN_HOME=%s\n' "$(cd "$FT_HOME" && pwd)" >"$ENV_DIR/50-freetoken.conf"
+say "wrote $ENV_DIR/50-freetoken.conf (FREETOKEN_HOME) - FreeToken Desktop reads the file, other programs see the variable after next login"
 
 # --- 5. Self-check ---------------------------------------------------------
 if "$FT_BIN" --help >/dev/null 2>&1; then
@@ -264,10 +265,9 @@ ${C_GREEN}FreeToken engine installed.${C_RESET}
 
   ft binary        $FT_BIN
   on PATH as       $BIN_DIR/ft   (ensure $BIN_DIR is on PATH)
-  Desktop env      FREETOKEN_FT_BIN via environment.d (re-login to apply)
+  Desktop env      FREETOKEN_HOME in $ENV_DIR/50-freetoken.conf
 
-Run in this shell without re-login:
-  export FREETOKEN_FT_BIN="$FT_BIN"
+Run:
   ft serve --model <path> --port 1919
 
 EOF
