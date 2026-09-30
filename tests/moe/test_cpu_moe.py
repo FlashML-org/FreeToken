@@ -75,6 +75,34 @@ def test_cpu_decode_matches_gpu_decode_kernel(bs):
     assert rel < 2e-2, f"bs={bs} rel err {rel.item()}"
 
 
+def test_cpu_decode_output_dtype_contract():
+    """The routed sum comes back unrounded for ``out_dtype=float32`` and rounded once to the
+    requested (default: input) dtype otherwise, whatever order the dtypes are requested in."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(0)
+    L, E, H, I, top_k, bs = 2, 8, 256, 128, 2, 3
+    dev = torch.device("cuda")
+    ex = CpuMoeExecutor(_make_cache(L, E, H, I), top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=0, max_tokens=bs, device=dev)
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    other = torch.randn_like(hidden)
+
+    from_fp32_hidden = ex.decode(1, hidden.float(), w, ids).clone()  # first call on this executor
+    ex.decode(1, other, w, ids, torch.float32)
+    unrounded = ex.decode(1, hidden, w, ids, torch.float32).clone()
+    ex.decode(1, other, w, ids, torch.float32)
+    rounded = ex.decode(1, hidden, w, ids).clone()
+    half = ex.decode(1, hidden, w, ids, torch.float16).clone()
+    torch.cuda.synchronize()
+    assert from_fp32_hidden.dtype == unrounded.dtype == torch.float32 and rounded.dtype == torch.bfloat16
+    assert torch.equal(from_fp32_hidden, unrounded)
+    assert torch.equal(rounded, unrounded.to(torch.bfloat16))
+    assert torch.equal(half, unrounded.to(torch.float16))
+
+
 def _pack_nvfp4(codes: torch.Tensor) -> torch.Tensor:
     """Pack an [..., IN] uint8 tensor of 4-bit codes to [..., IN//2], low nibble first."""
     lo = codes[..., 0::2]
@@ -499,8 +527,8 @@ def test_cpu_moe_decode_cuda_graph_replay():
     # must actually have exercised it -- guard against a silent fallback to the
     # host-func path making this test vacuous for the capture-embedded memops.
     if ex._flag_sync:
-        assert (layer, bs, False) in ex._flag_slots, "flag slot expected for the decode task"
-        slot = ex._flag_slots[(layer, bs, False)]
+        assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
+        slot = ex._flag_slots[(layer, bs)]
         assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
         assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
         assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"

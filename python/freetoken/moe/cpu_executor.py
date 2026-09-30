@@ -272,7 +272,7 @@ class CpuMoeExecutor:
         # self so the coordinator's pinned pointers stay valid for the executor's
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
-        self._flag_slots: dict[tuple[int, int, bool], int] = {}  # (layer_id, bs, fp32_out) -> slot
+        self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
         self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
         if self._flag_sync:
             self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
@@ -502,14 +502,13 @@ class CpuMoeExecutor:
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "y32": alloc_pinned_tensor(bs, self.H, dtype=torch.float32),  # the fp32 routed-sum contract
+                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.float32),  # the unrounded sum over routes
             }
             self._io[bs] = io
         return io
 
-    def _task_for(self, layer_id: int, bs: int, fp32_out: bool = False) -> int:
-        key = (layer_id, bs, fp32_out)
+    def _task_for(self, layer_id: int, bs: int) -> int:
+        key = (layer_id, bs)
         task = self._tasks.get(key)
         if task is None:
             io = self._io_for(bs)
@@ -520,7 +519,6 @@ class CpuMoeExecutor:
                 io["ids"].data_ptr(),
                 io["w"].data_ptr(),
                 io["y"].data_ptr(),
-                io["y32"].data_ptr() if fp32_out else 0,
             )
             self._tasks[key] = task
             # Allocate this (layer, bs) combo a flag slot and register its task with the
@@ -582,11 +580,10 @@ class CpuMoeExecutor:
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        fp32_out = out_dtype == torch.float32
-        assert out_dtype in (None, hidden_states.dtype, torch.float32), out_dtype
-        task = self._task_for(layer_id, bs, fp32_out)
-        out = torch.empty_like(hidden_states, dtype=torch.float32 if fp32_out else hidden_states.dtype)
-        slot = self._flag_slots.get((layer_id, bs, fp32_out)) if self._flag_sync else None
+        out_dtype = out_dtype or hidden_states.dtype
+        task = self._task_for(layer_id, bs)
+        out = torch.empty_like(hidden_states, dtype=torch.float32)
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
@@ -597,13 +594,13 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
-        return (bs, task, out, slot)
+        return (bs, task, out, slot, out_dtype)
 
     def decode_sync(self, pending: tuple) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot = pending
+        bs, task, out, slot, out_dtype = pending
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
@@ -613,9 +610,8 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
-        io = self._io[bs]
-        out.copy_(io["y32" if out.dtype == torch.float32 else "y"], non_blocking=True)
-        return out
+        out.copy_(self._io[bs]["y"], non_blocking=True)
+        return out if out_dtype == torch.float32 else out.to(out_dtype)
 
     def _watchdog_tick(self, suspects: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).

@@ -1084,15 +1084,10 @@ struct MoeTask {
   const bf16_t* x;     // [num_tokens, H]
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
-  bf16_t* y;           // [num_tokens, H] bf16 output (when y32 is null)
-  float* y32;          // [num_tokens, H] fp32 output: the routed sum kept in fp32 for the caller's merge
+  float* y;            // [num_tokens, H] the fp32 sum over routes; the caller rounds it
 };
 
-// Store one output element: the fp32 sum over routes as is, or rounded to bf16.
-static inline void store_out(const MoeTask* t, size_t idx, float acc) {
-  if (t->y32) t->y32[idx] = acc;
-  else t->y[idx] = f32_to_bf16(acc);
-}
+static inline void store_out(const MoeTask* t, size_t idx, float acc) { t->y[idx] = acc; }
 
 // Output-row tiling. Small enough to give every worker independent work even at
 // batch size 1; large enough to amortize the atomic work-grab.
@@ -1561,15 +1556,14 @@ struct CpuMoeExecutor {
   }
 
   uintptr_t create_task(int layer_id, int num_tokens, uintptr_t x_ptr,
-                        uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr, uintptr_t y32_ptr) {
+                        uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr) {
     MoeTask* t = new MoeTask{this,
                              layer_id,
                              num_tokens,
                              reinterpret_cast<const bf16_t*>(x_ptr),
                              reinterpret_cast<const int32_t*>(ids_ptr),
                              reinterpret_cast<const float*>(w_ptr),
-                             reinterpret_cast<bf16_t*>(y_ptr),
-                             reinterpret_cast<float*>(y32_ptr)};
+                             reinterpret_cast<float*>(y_ptr)};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
   }
@@ -2142,7 +2136,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("core_ids"))
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
-           py::arg("y_ptr"), py::arg("y32_ptr") = 0)
+           py::arg("y_ptr"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("sync_with_cuda_stream", &CpuMoeExecutor::sync_with_cuda_stream,
