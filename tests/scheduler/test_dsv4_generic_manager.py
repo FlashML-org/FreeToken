@@ -191,6 +191,36 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
     cm.check_integrity()
 
 
+@pytest.mark.parametrize("resumable", [True, False])
+def test_admission_turns_an_unresumable_hit_into_a_miss(resumable):
+    """A prefix hit the model cannot resume at (``BaseLLMModel.can_resume_at``) is admitted as a
+    miss: that request prefills from scratch, nothing raises and the hit's lock is not taken."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _, pt = _stack(num_pages=48)
+    prompt = torch.arange(1, 301, dtype=torch.int32)
+    _lifecycle(cm, _req(MRR - 1, prompt, n_decode=310), total_len=310)
+    asked = []
+
+    def can_resume_at(cached_len):
+        asked.append(cached_len)
+        return resumable
+
+    pm = PrefillManager(cm, TableManager(max_running_reqs=MRR, page_table=pt), DecodeManager(page_size=P), can_resume_at=can_resume_at)
+    pm.pending_list = [PendingReq(uid=1, input_ids=torch.cat([prompt, torch.tensor([7, 8], dtype=torch.int32)]),
+                                  sampling_params=SamplingParams(max_tokens=1))]
+    batch = pm.schedule_next_batch(1024)
+    assert asked == [256]
+    assert batch.reqs[0].cached_len == (256 if resumable else 0) and batch.reqs[0].extend_len == (46 if resumable else 302)
+    cm.allocate_paged(batch.reqs)
+    batch.reqs[0].complete_one()
+    cm.cache_req(batch.reqs[0], finished=True)
+    cm.check_integrity()
+
+
 def test_abort_anywhere_fuzz_conserves_and_isolates():
     """admit / extend / finish-or-abort at arbitrary points with shared prefixes + eviction
     pressure, on a deliberately small window tier. The generic conservation check (free + tree

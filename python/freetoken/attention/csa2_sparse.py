@@ -46,12 +46,23 @@ def replay_start(req: Req, window: int, bounded: bool) -> int:
     from the previous window-page boundary to produce their hidden states. That recompute is
     READ-ONLY on the cache (``PrefillSegment.write_from``) and reads SWA keys back to ``start -
     window + 1`` -- live by the cache contract (``KVCacheGroupSpec.swa_resume_history`` is two
-    windows in bounded mode: matched, locked and retained by the cache manager). Exact mode (or a
-    chunk that already carries a window) starts at ``cached_len``.
+    windows in bounded mode: matched, locked and retained by the cache manager; admission turns a
+    hit that would read further back into a miss, see ``replay_history``). Exact mode (or a chunk
+    that already carries a window) starts at ``cached_len``.
     """
     if not bounded or req.extend_len >= window or req.cached_len == 0:
         return req.cached_len
     return max(0, (req.device_len - window) // window * window)
+
+
+def replay_history(cached_len: int, window: int) -> int:
+    """The most window history behind ``cached_len`` a bounded-replay resume there reads: with one
+    new token the recompute starts furthest back, and its first query reads one window before that.
+    ``2 * window - 1`` for a hit on a window page."""
+    if cached_len == 0:
+        return 0
+    start = max(0, (cached_len + 1 - window) // window * window)
+    return cached_len - max(0, start - window + 1)
 
 
 @dataclass(frozen=True)
@@ -229,13 +240,6 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         extended = False
         for r in batch.reqs:
             start = replay_start(r, win, bounded)
-            if start < r.cached_len and not self._history_bound(r.table_idx, max(0, start - win + 1), r.cached_len):
-                # the cache contract (two live windows behind a hit) was broken upstream: refuse to
-                # compute with missing keys or to quietly shorten the decoder's history
-                raise RuntimeError(
-                    f"bounded replay of request {r.uid}: window history [{max(0, start - win + 1)}, {r.cached_len}) "
-                    "is not bound; the prefix cache admitted a hit without its resume history"
-                )
             extended |= start != r.cached_len
             segments.append(PrefillSegment(off, r.device_len - start, r.table_idx, start, write_from=r.cached_len))
             off += r.device_len - start
@@ -256,13 +260,6 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         last = torch.tensor([d.n for d in dec], dtype=torch.int32, device=self.device).cumsum_(0) - 1
         decoder_rows = torch.cat(rows).to(self.device, non_blocking=True) if rows else torch.empty(0, dtype=torch.int64, device=self.device)
         return CSA2AttnMetadata(last_indices=last, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, extended=extended)
-
-    def _history_bound(self, ti: int, lo: int, hi: int) -> bool:
-        """Whether every position in ``[lo, hi)`` still has its window KV bound (the SWA keys a
-        recompute of cached tokens reads)."""
-        if hi <= lo:
-            return True
-        return bool((self.window_slots_of(ti, lo, hi) >= 0).all().item())
 
     def encoder_stream(self, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
         """The prefill encoder stream ``(input_ids [T], positions [T] int64)``: the batch's own tensors,

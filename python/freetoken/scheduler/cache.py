@@ -90,10 +90,10 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
-    def match_req(self, req: PendingReq) -> MatchResult:
+    def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1]
+        ids = req.input_ids[: input_len - 1 if max_len is None else min(input_len - 1, max_len)]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)

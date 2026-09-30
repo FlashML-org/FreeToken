@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -94,12 +95,14 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
+        live_history = self.cache_manager.sliding_window_size
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            can_resume_at=None if live_history is None else partial(self.engine.model.can_resume_at, live_history=live_history),
         )
 
         # some alias for easy access

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
@@ -55,6 +55,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # the model's BaseLLMModel.can_resume_at over this cache's live window history
+    can_resume_at: Callable[[int], bool] | None = None
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -73,6 +75,12 @@ class PrefillAdder:
 
         # TODO: consider host cache match case
         mr = self.cache_manager.match_req(req)
+        hit = mr.cuda_handle.cached_len
+        if hit and self.can_resume_at is not None and not self.can_resume_at(hit):
+            logger.warning_rank0(
+                f"request {req.uid}: the prefix hit at {hit} lacks the window history resuming there reads; prefilling from scratch"
+            )
+            mr = self.cache_manager.match_req(req, max_len=0)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -275,6 +283,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    can_resume_at: Callable[[int], bool] | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -301,6 +310,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            can_resume_at=self.can_resume_at,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

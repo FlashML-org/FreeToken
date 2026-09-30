@@ -32,6 +32,11 @@ class BaseLLMModel(ABC, BaseOP):
         """First token the model recomputes; multimodal gathering uses the same interval."""
         return req.cached_len
 
+    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
+        """Whether a prefix hit ending at ``cached_len``, with ``live_history`` tokens of window KV
+        kept live behind it, holds everything the prefill resuming there reads."""
+        return True
+
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 

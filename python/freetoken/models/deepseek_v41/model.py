@@ -210,6 +210,11 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
         return replay_start(req, self._args.window_size, self.replays_prefill)
 
+    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
+        from freetoken.attention.csa2_sparse import replay_history
+
+        return not self.replays_prefill or replay_history(cached_len, self._args.window_size) <= live_history
+
     def _ensure_bound(self) -> None:
         if not self._bound:
             self.model.bind(get_global_ctx().kv_cache.device)

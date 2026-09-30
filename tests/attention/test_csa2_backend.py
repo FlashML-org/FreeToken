@@ -128,19 +128,22 @@ def test_private_window_layers_address_per_request_rings():
     assert set(topk[0, 0].tolist()) == {2 * P + j for j in range(P)}  # every ring index holds a position <= 300
 
 
-def test_bounded_extension_refuses_a_hit_without_its_resume_history():
-    """The cache contract keeps two windows live behind a bounded-mode hit (KVCacheGroupSpec
-    .swa_resume_history). If a hit ever arrives without them, the planner must not compute with
-    missing keys or quietly shorten the decoder's history: it fails loudly."""
-    backend, pool, _ = _stack("bounded")
-    pool.free_swa(torch.arange(0, P))  # page 0 evicted: the recompute of [128, 256) would read into it
-    batch = _prefill_batch([_req(2, 256, 44, uid=1)])
-    with pytest.raises(RuntimeError, match="resume history"):
+def test_bounded_extension_reads_only_the_resume_history():
+    """A bounded-mode extension recomputes from the previous window page, so the window keys it reads,
+    ``[start - P + 1, cached_len)``, stay inside the two windows the cache keeps live behind a
+    page-aligned hit (KVCacheGroupSpec.swa_resume_history). ``replay_history`` bounds that read for
+    admission, which turns a hit reading further back into a miss; the planner does not re-check."""
+    from freetoken.attention.csa2_sparse import replay_history
+
+    backend, _, _ = _stack("bounded")
+    for cached, new in ((256, 44), (256, 1), (256, P - 1), (384, 10)):
+        batch = _prefill_batch([_req(2, cached, new, uid=1)])
         backend.prepare_metadata(batch)
-    pool.alloc_swa(torch.arange(0, P))
-    batch = _prefill_batch([_req(2, 256, 44, uid=1)])
-    backend.prepare_metadata(batch)
-    assert batch.attn_metadata.segments[0].start_pos == 128 and batch.attn_metadata.extended
+        start = batch.attn_metadata.segments[0].start_pos
+        assert start == cached - P and batch.attn_metadata.extended
+        assert cached - (start - P + 1) <= replay_history(cached, P) == 2 * P - 1 <= backend.geom.resume_history
+    # off a window page the one-new-token recompute starts a page further back
+    assert replay_history(0, P) == 0 and replay_history(3 * P + 1, P) == 2 * P and replay_history(3 * P + 2, P) > backend.geom.resume_history
 
 
 def test_replay_start_rules():
