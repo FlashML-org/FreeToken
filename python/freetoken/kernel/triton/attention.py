@@ -349,6 +349,13 @@ def _decode_stage2_kernel(
     )
 
 
+def _decode_grouped_stage1_launch_config(group: int, head_dim: int, num_warps: int, is_hip: bool) -> dict[str, int]:  # Build backend-specific compiler controls for grouped decode stage one.
+    launch = {"num_warps": num_warps, "num_stages": 2}  # Preserve the accepted launch defaults for every backend and attention shape.
+    if is_hip and group == 8 and head_dim == 512:  # Match Gemma 4's spill-heavy full-attention tile without changing CUDA or smaller HIP tiles.
+        launch["waves_per_eu"] = 2  # Reduce AMD private spills and exact-shape latency with the qualified occupancy target.
+    return launch  # Return only compiler controls supported by the selected backend and shape.
+
+
 def decode_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -434,6 +441,7 @@ def decode_paged_attention(
         if rocm_num_warps_probe not in (1, 2, 4, 8):
             raise ValueError("rocm_num_warps_probe must be one of 1, 2, 4, or 8")
         num_warps = rocm_num_warps_probe
+    stage1_launch = _decode_grouped_stage1_launch_config(group, head_dim, num_warps, torch.version.hip is not None)  # Select the qualified backend and shape controls.
 
     _decode_grouped_stage1_kernel[
         (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
@@ -471,8 +479,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
-        num_warps=num_warps,
-        num_stages=2,
+        **stage1_launch,  # Apply standard launch controls plus the exact-shape HIP occupancy hint when qualified.
     )
     _decode_stage2_kernel[(batch, num_q_heads)](
         attn_logits,

@@ -5,6 +5,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+
+@pytest.mark.parametrize(  # Cover the qualified HIP tile plus every boundary that must retain standard compiler defaults.
+    ("is_hip", "group", "head_dim", "expected_waves"),  # Name each launch-config input and the optional AMD occupancy result.
+    [  # Enumerate exact-shape enablement and neighboring non-target cases.
+        (True, 8, 512, 2),  # Enable two waves per EU only for Gemma 4 full attention on HIP.
+        (True, 8, 256, None),  # Preserve the standard compiler choice for smaller HIP head dimensions.
+        (True, 2, 512, None),  # Preserve the standard compiler choice for a different HIP GQA group.
+        (False, 8, 512, None),  # Preserve CUDA behavior even when tensor geometry matches the HIP target.
+    ],  # Finish the bounded launch-config matrix.
+)  # Finish the parameterization decorator.
+def test_decode_grouped_stage1_launch_config(is_hip: bool, group: int, head_dim: int, expected_waves: int | None):  # Verify the occupancy hint cannot leak beyond the qualified target.
+    from freetoken.kernel.triton.attention import _decode_grouped_stage1_launch_config  # Import the pure launch-config helper without requiring a device.
+
+    actual = _decode_grouped_stage1_launch_config(group, head_dim, 4, is_hip)  # Build the same launch controls used by grouped decode.
+
+    assert actual["num_warps"] == 4  # Preserve the existing four-warp launch default.
+    assert actual["num_stages"] == 2  # Preserve the existing two-stage pipeline default.
+    assert actual.get("waves_per_eu") == expected_waves  # Restrict the AMD occupancy hint to the exact qualified shape.
+
 def _reference_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
