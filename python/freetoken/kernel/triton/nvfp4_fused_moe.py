@@ -20,9 +20,9 @@ MiniMax-M2 decode toward the RTX 5090 read-bandwidth ceiling (~87%); the residua
 dequant ALU, which a swizzled-layout tensor-core path (marlin / flashinfer b12x) closes but
 those need sm_80-99 / CUDA>=13 respectively.
 
-Prefill (:func:`_prefill_nvfp4_moe_kernel`) is tensor-core bound, so its dequant is arithmetic
-(the fp16 bit placement ``nvfp4_linear.py`` describes) and its activations load as one
-contiguous tile, split into the even and odd k the two nibbles of a byte multiply.
+Prefill (:func:`_prefill_nvfp4_moe_kernel`) is tensor-core bound, so it dequantizes with
+``nvfp4_linear.py``'s fp16 bit placement rather than the table, and loads its activations as
+one contiguous tile, split into the even and odd k the two nibbles of a byte multiply.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_to_f16_x128, e4m3_u8_to_f32
+from freetoken.kernel.triton.nvfp4_linear import _nvfp4_pair_f16
 
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -50,11 +51,9 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 
 @triton.jit
 def _e2m1_byte_f16_x2pow_neg14(packed):
-    """The two e2m1 codes of each byte (int32, low nibble first) -> two fp16 tensors holding 2^-14
-    of their values, exactly (the subnormal 0.5 included): magnitude bits to [11:9], sign to [15]."""
-    lo = (((packed & 0x08) << 12) | ((packed & 0x07) << 9)).to(tl.uint16).to(tl.float16, bitcast=True)
-    hi = (((packed & 0x80) << 8) | ((packed & 0x70) << 5)).to(tl.uint16).to(tl.float16, bitcast=True)
-    return lo, hi
+    """The two e2m1 codes of each byte (int32, low nibble first) -> (lo, hi) fp16 = value * 2^-14:
+    ``_nvfp4_pair_f16`` once the high nibble also sits at bits [19:16]."""
+    return _nvfp4_pair_f16(packed | (packed << 12))
 
 
 @triton.jit
