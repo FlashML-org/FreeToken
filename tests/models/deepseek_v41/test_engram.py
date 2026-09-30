@@ -120,6 +120,35 @@ def test_disk_table_matches_the_dequantized_shard(tmp_path):
 
 
 @requires_cuda
+def test_eager_staging_does_not_overwrite_an_in_flight_lookup(tmp_path):
+    """The overlap scheduler stages batch k+1 while batch k's lookup copy is still queued behind
+    the layers before the Engram layer (a sleep kernel here): batch k must read its own rows."""
+    from freetoken.models.deepseek_v41.engram_table import EngramDiskTable, engram_row_source
+
+    tensors = write_tiny_checkpoint(str(tmp_path))
+    hash = EngramHash(_args(), list(range(VOCAB)), VOCAB)
+    table = EngramDiskTable(engram_row_source(str(tmp_path), 1), hash.n_cols, torch.device("cuda"), max_graph_rows=4, max_extend_tokens=64)
+    fp8 = tensors["layers.1.engram.embed.weight"]
+    scale = torch.exp2(tensors["layers.1.engram.embed.scale"].view(torch.uint8).float() - 127.0)
+
+    def oracle(rows):
+        vals = fp8[rows.flatten()].float().view(-1, 1, 32) * scale[rows.flatten()].unsqueeze(-1)
+        return vals.view(rows.shape[0], -1).to(torch.bfloat16).cuda()
+
+    gen = torch.Generator().manual_seed(0)
+    batches = [hash.row_ids(torch.randint(3, VOCAB, (40,), generator=gen))[:, 0] for _ in range(4)]
+    got = []
+    for rows in batches:
+        table.stage(rows, graph=False)
+        table.flush(signal=False)
+        torch.cuda._sleep(50_000_000)
+        got.append(table.lookup(rows.shape[0]))
+    torch.cuda.synchronize()
+    for i, (rows, out) in enumerate(zip(batches, got)):
+        assert torch.equal(out, oracle(rows)), f"batch {i} read another batch's rows"
+
+
+@requires_cuda
 @torch.inference_mode()
 def test_host_fills_a_graph_decode_step_from_a_worker_thread(tmp_path):
     """The deferred graph-decode fill must not wait for the launch call to return: a 40-layer graph

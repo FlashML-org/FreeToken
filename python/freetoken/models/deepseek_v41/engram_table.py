@@ -94,7 +94,16 @@ class EngramDiskTable:
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * n_cols * self.row_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()
         self._graph_dev = torch.empty(max_graph_rows * n_cols * self.row_bytes, dtype=torch.uint8, device=device)
-        self._eager_pinned = self._eager_dev = None
+        # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
+        # host coordinator after the launch: a record inside the capture would not be observable)
+        self.graph_consumed = torch.cuda.Event()
+        # the overlap scheduler stages batch k+1 while batch k's lookup copy may still be queued: the
+        # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
+        # that last read it has run (``_eager_read[i]``, recorded right after that copy)
+        self._eager_pinned: list[torch.Tensor] = []
+        self._eager_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._eager_slot = 0
+        self._eager_dev = None
         self._grow_eager(max_extend_tokens)
         self.flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self.flag.zero_()
@@ -102,10 +111,13 @@ class EngramDiskTable:
 
     def _grow_eager(self, num_tokens: int) -> None:
         nbytes = num_tokens * self.n_cols * self.row_bytes
-        if self._eager_pinned is not None and self._eager_pinned.numel() >= nbytes:
+        if self._eager_pinned and self._eager_pinned[0].numel() >= nbytes:
             return
-        self._eager_pinned = alloc_pinned_tensor(nbytes, dtype=torch.uint8)
-        self._eager_pinned.zero_()  # a warmup prefill stages nothing and reads whatever sits here
+        for event in self._eager_read:
+            event.synchronize()
+        self._eager_pinned = [alloc_pinned_tensor(nbytes, dtype=torch.uint8) for _ in self._eager_read]
+        for buf in self._eager_pinned:
+            buf.zero_()  # a warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     # ----- host -----
@@ -113,11 +125,14 @@ class EngramDiskTable:
         """Queue ``row_ids [T, n_cols]`` (int64, host): values through the store, scales from the resident tensor."""
         n = row_ids.numel()
         if graph:
+            self.graph_consumed.synchronize()
             pinned = self._graph_pinned
             assert n <= self.max_graph_rows * self.n_cols, f"graph staging holds {self.max_graph_rows} rows, batch has {n // self.n_cols}"
         else:
             self._grow_eager(n // self.n_cols)
-            pinned = self._eager_pinned
+            self._eager_slot ^= 1
+            self._eager_read[self._eager_slot].synchronize()
+            pinned = self._eager_pinned[self._eager_slot]
         ids = row_ids.reshape(-1).to(torch.int64).contiguous()
         rows = pinned[: n * self.row_bytes].view(n, self.row_bytes)
         self.store.stage_rows(ids.data_ptr(), n, rows.data_ptr(), self.row_bytes)
@@ -131,13 +146,16 @@ class EngramDiskTable:
         from freetoken.kernel.row_store import wait_reset
         from freetoken.kernel.triton.csa2.pack import unpack_rows
 
+        stream = torch.cuda.current_stream(self.device)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self.wait_sync:
-            wait_reset(torch.cuda.current_stream(self.device), self.flag)
-        pinned, dev = (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
+            wait_reset(stream, self.flag)
+        pinned, dev = (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)
         n = num_tokens * self.n_cols
         nbytes = n * self.row_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+        if not capturing:
+            self._eager_read[self._eager_slot].record(stream)
         values = unpack_rows(dev[:nbytes].view(n, self.row_bytes), FP8_E8M0_B32, self.head_dim)
         return values.view(num_tokens, self.n_cols * self.head_dim)
 
@@ -244,6 +262,11 @@ class EngramHost:
         # the launch has been enqueued: wait for the deferred fill here so a failure surfaces before
         # this step's output is consumed (the fill only waits on the GPU readback, never on the host)
         self._await_pending()
+        if use_graph:
+            # only after this step's fill: the next fill waits on this launch, not the fill on it
+            stream = torch.cuda.current_stream(self.device)
+            for t in self.tables:
+                t.graph_consumed.record(stream)
 
 
 __all__ = ["EngramDiskTable", "EngramHost", "EngramRowSource", "engram_row_source"]

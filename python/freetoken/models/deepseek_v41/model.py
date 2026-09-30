@@ -267,7 +267,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             layer.attach_table(table)
         self._engram_host = EngramHost(hash, tables, device, sync_mode=os.getenv("FREETOKEN_ENGRAM_SYNC", "auto"))
         self.forward_host_ctx = self._engram_host.forward_host_ctx
-        return sum(t._graph_pinned.numel() + t._eager_pinned.numel() for t in tables)
+        return sum(t._graph_pinned.numel() + sum(b.numel() for b in t._eager_pinned) for t in tables)
 
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
