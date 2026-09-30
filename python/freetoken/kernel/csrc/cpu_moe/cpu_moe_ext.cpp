@@ -689,7 +689,9 @@ static void ensure_flag_kernels() {
     "extern \"C\" __global__ void ft_flag_submit(long long* done, long long* ready, long long slot){\n"
     "  done[slot]=0; __threadfence_system(); ready[slot]=1; __threadfence_system();\n}\n"
     "extern \"C\" __global__ void ft_flag_wait(long long* done, long long slot){\n"
-    "  volatile long long* d=done; while(d[slot]<1){} __threadfence_system();\n}\n";
+    "  volatile long long* d=done;\n"
+    "  while(d[slot]<1){ __builtin_amdgcn_s_sleep(2); }\n"
+    "  __threadfence_system();\n}\n";
   hiprtcProgram prog;
   if (hiprtcCreateProgram(&prog, src, "ft_flags.hip", 0, nullptr, nullptr) != HIPRTC_SUCCESS) return;
   hipDeviceProp_t props; hipGetDeviceProperties(&props, 0);
@@ -725,14 +727,31 @@ static void kernel_flag_wait(void* stream, uintptr_t done_addr, long long slot) 
   void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
   cumemop_check(hipModuleLaunchKernel(g_wait_fn, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_wait");
 }
+// Do stream-memop nodes replay inside a hipGraph on THIS runtime? The no-op-on-replay bug is a
+// ROCm 7.14 issue, fixed on ROCm 10 (hipRuntimeGetVersion encodes major*1e7+minor*1e5+patch:
+// 71460850 = 7.14, 71526333 = 7.15/ROCm 10). >= 7.15.0 -> use the zero-CU memop handshake; older
+// -> the kernel handshake (a spinning CU) since memops silently no-op on replay there. Cached.
+static bool graph_memops_ok() {
+  static int cached = -1;
+  if (cached < 0) {
+    int v = 0;
+    cached = (hipRuntimeGetVersion(&v) == hipSuccess && v >= 71500000) ? 1 : 0;
+  }
+  return cached != 0;
+}
 #endif
 
 static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t ready_addr,
                            int64_t slot) {
   auto* s = reinterpret_cast<void*>(stream);
 #if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
-  kernel_flag_submit(s, done_addr, ready_addr, (long long)slot);
-#else
+  // ROCm 7.14 no-ops stream-memop nodes on hipGraph replay, so drive the flag with a kernel node
+  // there (a spinning CU); ROCm 10 replays memops and uses the zero-CU memop path below.
+  if (!graph_memops_ok()) {
+    kernel_flag_submit(s, done_addr, ready_addr, (long long)slot);
+    return;
+  }
+#endif
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
   cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
@@ -741,18 +760,19 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
   cumemop_check(g_cu_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL,
                              kCuWriteDefault),
                 "cuStreamWriteValue64(ready)");
-#endif
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
 #if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
-  kernel_flag_wait(reinterpret_cast<void*>(stream), done_addr, (long long)slot);
-#else
+  if (!graph_memops_ok()) {
+    kernel_flag_wait(reinterpret_cast<void*>(stream), done_addr, (long long)slot);
+    return;
+  }
+#endif
   cumemop_check(mem_wait64(reinterpret_cast<void*>(stream),
                             (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
                             kCuWaitValueGeq),
                 "cuStreamWaitValue64(done)");
-#endif
 }
 
 struct DotChoice {

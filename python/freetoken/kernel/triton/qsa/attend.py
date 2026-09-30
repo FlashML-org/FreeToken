@@ -277,13 +277,16 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
-    # RDNA (gfx11/gfx12) has 64KB LDS/CU vs the GB300's 228KB these tiles were tuned for;
-    # shrink the KV tile so k+v staging fits the smaller LDS. ROCm-only: leave the
-    # NVIDIA tiles (which have the LDS headroom) byte-identical.
+    # These tiles were tuned for the GB300's 228KB LDS; AMD parts have less and it varies by arch
+    # (e.g. 64KB/CU on RDNA gfx11/gfx12), so k+v staging can overflow. Query the device's actual
+    # shared-memory limit rather than assuming a fixed size, and shrink the KV tile only when it
+    # doesn't fit -- so a larger-LDS arch keeps the wide tile. ROCm-gated so the NVIDIA tiles stay
+    # byte-identical (a small NV part could report a 48KB default and would otherwise clamp).
     if torch.version.hip is not None:
-        _LDS_BUDGET_BYTES = 64 * 1024
+        _props = torch.cuda.get_device_properties(q.device)
+        _lds_budget = getattr(_props, "shared_memory_per_block", 64 * 1024) or 64 * 1024
         _kv_bytes = k_cache.element_size()
-        while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _LDS_BUDGET_BYTES:
+        while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget:
             block_n //= 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
