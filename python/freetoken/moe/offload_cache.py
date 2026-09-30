@@ -124,6 +124,9 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
+    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
+    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -172,6 +175,10 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        if self.prefill_demand_tokens and self.decode_target != "gpu":
+            raise ValueError(
+                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
+            )
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
             assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
@@ -1067,17 +1074,20 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
+        return num_tokens <= self.prefill_demand_tokens
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, counts_as_decode: bool = True) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
+        if self.collect_decode_freq and counts_as_decode:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        ensure_experts(self, layer_id, expert_ids, record_stats=counts_as_decode)
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
