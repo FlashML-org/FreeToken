@@ -1,6 +1,7 @@
 """What each checkpoint's quant config resolves to: the dialect, the method behind every layer, and agreement with the stored tensors.
 
-Rows need the checkpoint's config.json locally (/mnt/nvme/models or the HF cache); absent ones skip.
+Rows need the checkpoint's config.json locally (/mnt/nvme/models or the HF cache); absent ones skip. The
+stored-tensor scan also reads $FREETOKEN_TEST_MODELS_ROOT.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ from freetoken.utils.hf import sidecar_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
+# the stored-tensor scan takes every checkpoint under this root (the case table above matches by name)
+SCAN_ROOT = os.environ.get("FREETOKEN_TEST_MODELS_ROOT", MODELS)
 HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
 
 BF16, FP8B, FP8T, MXFP8, NVFP4 = UnquantizedLinearMethod, Fp8BlockLinearMethod, Fp8TensorLinearMethod, Mxfp8LinearMethod, Nvfp4LinearMethod
@@ -547,7 +550,7 @@ def _weight_map(p: Path) -> dict[str, str] | None:
 
 
 def _candidate_dirs() -> list[Path]:
-    roots = glob.glob(os.path.join(HF_CACHE, "models--*/snapshots/*/")) + glob.glob(os.path.join(MODELS, "*/"))
+    roots = glob.glob(os.path.join(HF_CACHE, "models--*/snapshots/*/")) + glob.glob(os.path.join(SCAN_ROOT, "*/"))
     return [Path(d) for d in roots if (Path(d) / "config.json").exists() and _weight_map(Path(d)) is not None]
 
 
