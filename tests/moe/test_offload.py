@@ -125,6 +125,49 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
     assert calls["topk_ids"].tolist() == [[2, 1]]
 
 
+def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cache(monkeypatch):
+    layer, cache = _make_layer_and_cache()
+    cache.prefill_demand_tokens = 1
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    hidden_states = torch.randn(1, 8)
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, torch.tensor([[2, 1]], dtype=torch.int32)),
+    )
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("materialized", layer_id))
+
+    def ensure(layer_id, expert_ids, *, counts_as_decode=True):
+        calls["ensured"] = (layer_id, expert_ids.tolist(), counts_as_decode)
+        expert_ids.copy_(torch.tensor([[5, 3]], dtype=torch.int32))
+
+    monkeypatch.setattr(cache, "ensure_experts", ensure)
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+
+    def fake_fused(hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation, apply_router_weight_on_input,
+                   act_alpha=1.0, act_limit=float("inf")):
+        calls["w1"] = w1
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
+
+    out = layer.prefill_forward(hidden_states, torch.randn(1, 4))
+
+    assert out is hidden_states
+    assert "materialized" not in calls
+    assert calls["ensured"] == (0, [[2, 1]], False)
+    assert calls["copied"] is True
+    # the grouped GEMM reads the whole slot cache at the slots the admission wrote
+    assert calls["w1"].shape[0] == cache.cache_size
+    assert calls["topk_ids"].tolist() == [[5, 3]]
+
+    calls.clear()
+    layer.prefill_forward(torch.randn(2, 8), torch.randn(2, 4))
+    assert calls["materialized"] == 0 and "ensured" not in calls
+
+
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
