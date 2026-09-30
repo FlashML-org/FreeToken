@@ -308,7 +308,7 @@ def _prefill_nvfp4_moe_kernel(
         else:
             byte_mask = byte_idx < K_BYTES
             bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-            raw_scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0)
+            raw_scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0)
         # [BLOCK_KB, BLOCK_N]; every e2m1 * e4m3 product is exact in fp16 and in the dot dtype
         scale = e4m3_to_f16_x128(raw_scale)
         lo, hi = _e2m1_byte_f16_x2pow_neg14(bytes_)
