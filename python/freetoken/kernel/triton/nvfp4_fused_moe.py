@@ -19,6 +19,10 @@ the original LUT-gather variant kept for A/B comparison. The marlin-style wide l
 MiniMax-M2 decode toward the RTX 5090 read-bandwidth ceiling (~87%); the residual gap is FP4
 dequant ALU, which a swizzled-layout tensor-core path (marlin / flashinfer b12x) closes but
 those need sm_80-99 / CUDA>=13 respectively.
+
+Prefill (:func:`_prefill_nvfp4_moe_kernel`) is tensor-core bound, so its dequant is arithmetic
+(the fp16 bit placement ``nvfp4_linear.py`` describes) and its activations load as one
+contiguous tile, split into the even and odd k the two nibbles of a byte multiply.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_to_f16_x128, e4m3_u8_to_f32
 
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -42,6 +46,15 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
     return torch.tensor(
         _E2M1_VALUES, dtype=torch.float32, device=torch.device("cuda", device_index)
     )
+
+
+@triton.jit
+def _e2m1_byte_f16_x2pow_neg14(packed):
+    """The two e2m1 codes of each byte (int32, low nibble first) -> two fp16 tensors holding 2^-14
+    of their values, exactly (the subnormal 0.5 included): magnitude bits to [11:9], sign to [15]."""
+    lo = (((packed & 0x08) << 12) | ((packed & 0x07) << 9)).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (((packed & 0x80) << 8) | ((packed & 0x70) << 5)).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo, hi
 
 
 @triton.jit
@@ -238,7 +251,6 @@ def _prefill_nvfp4_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
-    lut_ptr,
     N,
     K,
     EM,
@@ -256,6 +268,7 @@ def _prefill_nvfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -277,8 +290,8 @@ def _prefill_nvfp4_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_kb = tl.arange(0, BLOCK_SIZE_KB)
-    a_ptrs_lo = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb)[None, :] * stride_ak)
-    a_ptrs_hi = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb + 1)[None, :] * stride_ak)
+    offs_k = tl.arange(0, 2 * BLOCK_SIZE_KB)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     packed_base = packed_ptr + slot * stride_pe + offs_bn[None, :] * stride_pn
@@ -288,30 +301,32 @@ def _prefill_nvfp4_moe_kernel(
     K_BYTES = K // 2
     for kb in range(0, tl.cdiv(K_BYTES, BLOCK_SIZE_KB)):
         byte_idx = kb * BLOCK_SIZE_KB + offs_kb
-        byte_mask = byte_idx < K_BYTES
-
         p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
-        bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-        lo = bytes_ & 0xF
-        hi = (bytes_ >> 4) & 0xF
-        sblk = byte_idx // 8
-        s_ptrs = scale_base + sblk[:, None] * stride_sblk
-        if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
+        s_ptrs = scale_base + (byte_idx // 8)[:, None] * stride_sblk
+        if EVEN_K:
+            bytes_ = tl.load(p_ptrs).to(tl.int32)
+            raw_scale = tl.load(s_ptrs)
         else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
+            byte_mask = byte_idx < K_BYTES
+            bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
+            raw_scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0)
+        # [BLOCK_KB, BLOCK_N]; every e2m1 * e4m3 product is exact in fp16 and in the dot dtype
+        scale = e4m3_to_f16_x128(raw_scale)
+        lo, hi = _e2m1_byte_f16_x2pow_neg14(bytes_)
+        b_lo = (lo * scale).to(a_ptr.dtype.element_ty)
+        b_hi = (hi * scale).to(a_ptr.dtype.element_ty)
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        else:
+            k_mask = kb * 2 * BLOCK_SIZE_KB + offs_k < K
+            a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+        a_lo, a_hi = tl.split(tl.reshape(a, (BLOCK_SIZE_M, BLOCK_SIZE_KB, 2)))
+        accumulator += tl.dot(a_lo, b_lo)
+        accumulator += tl.dot(a_hi, b_hi)
+        a_ptrs += BLOCK_SIZE_KB * 2 * stride_ak
 
-        a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype))
-        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype))
-
-        a_ptrs_lo += BLOCK_SIZE_KB * 2 * stride_ak
-        a_ptrs_hi += BLOCK_SIZE_KB * 2 * stride_ak
-
-    g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
+    # the placement's 2^-14 and the scale's 2^7 leave the products 2^-7 short
+    g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32) * 128.0
     accumulator = accumulator * g[None, :]
 
     if MUL_ROUTED_WEIGHT:

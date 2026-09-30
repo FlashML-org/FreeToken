@@ -46,7 +46,9 @@ def _dequant_ref(packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Te
     return w * s * row_global.float().unsqueeze(1)
 
 
-def _make_native_sources(device: torch.device, seed: int = 0) -> dict[str, list[torch.Tensor]]:
+def _make_native_sources(
+    device: torch.device, seed: int = 0, hidden: int = H, inter: int = I
+) -> dict[str, list[torch.Tensor]]:
     """Random ModelOpt-style banks, CPU pinned, with one expert whose w1/w3 globals differ.
 
     One flat ``[L*E, ...]`` RNG draw (so seeding is unaffected) split into L
@@ -61,15 +63,15 @@ def _make_native_sources(device: torch.device, seed: int = 0) -> dict[str, list[
     def rand_scale(*shape):
         return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
 
-    gate_up_global = torch.full((total, 2 * I), 1.0, dtype=torch.float16)
-    gate_up_global[:, I:] = 0.5  # w3 global != w1 global: exercises the alpha fold
-    down_global = torch.full((total, H), 0.75, dtype=torch.float16)
+    gate_up_global = torch.full((total, 2 * inter), 1.0, dtype=torch.float16)
+    gate_up_global[:, inter:] = 0.5  # w3 global != w1 global: exercises the alpha fold
+    down_global = torch.full((total, hidden), 0.75, dtype=torch.float16)
     flat = {
-        "gate_up_packed": rand_u8(total, 2 * I, H // 2),
-        "gate_up_scale": rand_scale(total, 2 * I, H // 16),
+        "gate_up_packed": rand_u8(total, 2 * inter, hidden // 2),
+        "gate_up_scale": rand_scale(total, 2 * inter, hidden // 16),
         "gate_up_global": gate_up_global,
-        "down_packed": rand_u8(total, H, I // 2),
-        "down_scale": rand_scale(total, H, I // 16),
+        "down_packed": rand_u8(total, hidden, inter // 2),
+        "down_scale": rand_scale(total, hidden, inter // 16),
         "down_global": down_global,
     }
     return {name: list(t.pin_memory().split(E)) for name, t in flat.items()}
@@ -84,8 +86,9 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 def _swigluoai_ref(h: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
     """MiniMax-M3 / gpt-oss clamped swiglu over UNINTERLEAVED [gate; up] halves."""
-    gate = h[:I].clamp(max=limit)
-    up = h[I:].clamp(-limit, limit)
+    gate, up = h.chunk(2)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(-limit, limit)
     return gate * torch.sigmoid(gate * alpha) * (up + 1.0)
 
 
@@ -110,7 +113,8 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu
             if activation == "swigluoai":
                 act = _swigluoai_ref(h)
             else:
-                act = torch.nn.functional.silu(h[:I]) * h[I:]
+                gate, up = h.chunk(2)
+                act = torch.nn.functional.silu(gate) * up
             out[t] += float(topk_weights[t, j]) * (dn @ act)
     return out
 
@@ -323,6 +327,74 @@ def test_triton_overlap_prefill_matches_dequant_reference():
         )
         _assert_close(out, ref)
         cache.release_prefill_layer(layer_id)
+
+
+@cuda
+def test_triton_prefill_dequant_reads_every_code_and_scale_exactly():
+    """The prefill GEMM decodes e2m1 by placing its bits in fp16 rather than through a table:
+    every code must read 2^-14 of its value, and every product with an e4m3 block scale must be
+    exact in bf16 -- the property that keeps the GEMM bit-identical to the table decode."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_to_f16_x128
+    from freetoken.kernel.triton.nvfp4_fused_moe import _e2m1_byte_f16_x2pow_neg14
+
+    @triton.jit
+    def dequant(bytes_ptr, scales_ptr, placed_ptr, weights_ptr, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        lo, hi = _e2m1_byte_f16_x2pow_neg14(tl.load(bytes_ptr + offs))
+        scale = e4m3_to_f16_x128(tl.load(scales_ptr + offs))
+        tl.store(placed_ptr + 2 * offs, lo)
+        tl.store(placed_ptr + 2 * offs + 1, hi)
+        tl.store(weights_ptr + 2 * offs, (lo * scale).to(tl.bfloat16))
+        tl.store(weights_ptr + 2 * offs + 1, (hi * scale).to(tl.bfloat16))
+
+    device = torch.device("cuda")
+    # every byte against every scale: each (low code, high code) pair meets all 256 scale codes
+    packed = torch.arange(256, dtype=torch.int32, device=device).repeat_interleave(256)
+    scales = torch.arange(256, dtype=torch.uint8, device=device).repeat(256).view(torch.float8_e4m3fn)
+    placed = torch.empty(2 * packed.numel(), dtype=torch.float16, device=device)
+    weights = torch.empty(2 * packed.numel(), dtype=torch.bfloat16, device=device)
+    dequant[(packed.numel() // 1024,)](packed, e4m3_kernel_view(scales), placed, weights, BLOCK=1024)
+
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=1).reshape(-1)
+    value = _E2M1.double().to(device)[codes.long()]
+    assert torch.equal(placed.double(), value * 2.0**-14)
+    assert torch.equal(placed.signbit(), value.signbit())
+    scale = scales.double().repeat_interleave(2)
+    finite = ~scale.isnan()
+    assert int(finite.sum()) == 2 * 256 * 254
+    assert torch.equal(weights.double()[finite], (value * scale * 2.0**-7)[finite])
+
+
+@cuda
+@pytest.mark.parametrize(
+    ("hidden", "inter", "tokens"),
+    [(H, I, 96), (272, 80, 96)],
+    ids=["tiled-k", "k-not-a-tile-multiple"],
+)
+def test_triton_prefill_large_batch_matches_dequant_reference(hidden, inter, tokens):
+    """A batch past the small-batch tile (> 64 tokens) through the Triton prefill grouped GEMM,
+    at a K the byte tile divides and at one it does not (272 and 80 leave 8 bytes over)."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+    device = torch.device("cuda")
+    sources = _make_native_sources(device, seed=13, hidden=hidden, inter=inter)
+    torch.manual_seed(14)
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (tokens, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(tokens, TOPK, dtype=torch.float32, device=device)
+    banks = [
+        sources[name][0].to(device)
+        for name in (
+            "gate_up_packed", "gate_up_scale", "gate_up_global",
+            "down_packed", "down_scale", "down_global",
+        )
+    ]
+    ref = _ref_moe(sources, 0, x, topk_weights, topk_ids)
+    out = fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, E, "silu", False)
+    _assert_close(out, ref)
 
 
 @cuda
