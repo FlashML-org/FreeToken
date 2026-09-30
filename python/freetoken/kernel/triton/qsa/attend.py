@@ -277,6 +277,15 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    # RDNA (gfx11/gfx12) has 64KB LDS/CU vs the GB300's 228KB these tiles were tuned for;
+    # shrink the KV tile so k+v staging fits the smaller LDS. ROCm-only: leave the
+    # NVIDIA tiles (which have the LDS headroom) byte-identical.
+    if torch.version.hip is not None:
+        _LDS_BUDGET_BYTES = 64 * 1024
+        _kv_bytes = k_cache.element_size()
+        while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _LDS_BUDGET_BYTES:
+            block_n //= 2
+
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)

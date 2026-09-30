@@ -11,12 +11,19 @@
 #endif
 
 // Warp-shuffle wrappers the donor pulls from sgl-kernel's utils.h (CUDA variants).
+// ROCm requires a 64-bit warp mask (amd_warp_sync_functions static_assert); the
+// vLLM/sgl donor passes uint32 masks. Widen to uint64_t on HIP.
+#ifdef __HIP_PLATFORM_AMD__
+#define SGLANG_WARP_MASK(mask) ((uint64_t)(mask))
+#else
+#define SGLANG_WARP_MASK(mask) (mask)
+#endif
 #ifndef SGLANG_SHFL_XOR_SYNC
-#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync(SGLANG_WARP_MASK(mask), (var), (lane_mask))
 #endif
 #ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
-  __shfl_xor_sync((mask), (var), (lane_mask), (width))
+  __shfl_xor_sync(SGLANG_WARP_MASK(mask), (var), (lane_mask), (width))
 #endif
 
 #define DISPATCH_CASE_FLOAT_TYPES(...)                 \
