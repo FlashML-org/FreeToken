@@ -426,13 +426,13 @@ def _nvfp4_gemm_kernel(
     for t in range(tiles_per):
         if EVEN_K:
             word = tl.load(b_ptrs, mask=n_mask[:, None], other=0)
-            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=n_mask[:, None], other=0))
+            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=n_mask[:, None], other=0.0))
             a_tile = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
         else:
             kw_ok = (tile0 + t) * BLOCK_KW + offs_kw < K_WORDS
             word = tl.load(b_ptrs, mask=n_mask[:, None] & kw_ok[None, :], other=0)
             s_mask = n_mask[:, None] & kw_ok[None, :]
-            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=s_mask, other=0))
+            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=s_mask, other=0.0))
             ak_ok = (tile0 + t) * BLOCK_KW * 8 + offs_ak < K
             a_tile = tl.load(a_ptrs, mask=m_mask[:, None] & ak_ok[None, :], other=0.0)
 
