@@ -95,7 +95,11 @@ def _paged_attention_kernel(
         l_i = 0.0
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
-    for start in range(0, kv_len, BLOCK_N):
+    effective_start = 0  # Begin at the first causal key when no sliding window is configured.
+    if SLIDING_WINDOW > 0:  # Avoid iterating over keys that the sliding mask will always reject.
+        effective_start = tl.maximum(0, q_pos - SLIDING_WINDOW + 1)  # Clamp the active window to the available prefix.
+    effective_end = tl.minimum(kv_len, q_pos + 1)  # Stop before future or unavailable cache entries.
+    for start in tl.range(effective_start, effective_end, BLOCK_N):  # Visit only keys that can contribute to this query.
         offs_n = start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < kv_len
         k_pos = offs_n
