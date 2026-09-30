@@ -51,14 +51,18 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    import torch as _torch
+    # --expt-relaxed-constexpr and -ccbin are nvcc-only; ROCm compiles hipified
+    # sources with clang++, which rejects them.
+    extra_cuda_cflags = ["-O3"] if _torch.version.hip is not None else ["-O3", "--expt-relaxed-constexpr"]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
         # default (CXX unset -> g++) can be a gcc too new for the torch headers.
         cxx_path = shutil.which(host_cxx) or host_cxx
-        extra_cuda_cflags += ["-ccbin", cxx_path]
+        if _torch.version.hip is None:
+            extra_cuda_cflags += ["-ccbin", cxx_path]
         os.environ["CXX"] = cxx_path
         os.environ["CC"] = _c_compiler_for(cxx_path)
 
