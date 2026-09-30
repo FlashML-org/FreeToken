@@ -251,6 +251,22 @@ def _emit_all(path: str) -> None:
     out["nv_moe_prefill"] = f32(fused_experts_nvfp4(
         hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids, S))
 
+    # a K no tile divides takes the masked loads, whose fill value must suit an fp8 pointer
+    Kr, H5, I5 = 272, 272, 80
+    pkr = torch.randint(0, 256, (N, Kr // 2), dtype=torch.uint8, device=dev)
+    scr = (torch.rand(N, Kr // 16, device=dev) * 2 + 0.1).to(FP8)
+    out["nv_gemm_inkernel_ragged_k"] = f32(nvfp4_dense_linear(
+        torch.randn(8, Kr, dtype=torch.bfloat16, device=dev), pkr, scr, g))
+    gup5 = torch.randint(0, 256, (S, 2 * I5, H5 // 2), dtype=torch.uint8, device=dev)
+    gus5 = (torch.rand(S, 2 * I5, H5 // 16, device=dev) + 0.1).to(FP8)
+    gug5 = (torch.rand(S, 2 * I5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    dnp5 = torch.randint(0, 256, (S, H5, I5 // 2), dtype=torch.uint8, device=dev)
+    dns5 = (torch.rand(S, H5, I5 // 16, device=dev) + 0.1).to(FP8)
+    dng5 = (torch.rand(S, H5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    out["nv_moe_prefill_ragged_k"] = f32(fused_experts_nvfp4(
+        torch.randn(2, H5, dtype=torch.bfloat16, device=dev),
+        gup5, gus5, gug5, dnp5, dns5, dng5, tw, tids, S))
+
     torch.save(out, path)
 
 
