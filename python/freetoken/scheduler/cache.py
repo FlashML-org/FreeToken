@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -102,7 +104,8 @@ class CacheManager:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value,
+                mamba_host=m.mamba_host)
         return self.prefix_cache.match_prefix(ids)
 
     @property
@@ -144,6 +147,76 @@ class CacheManager:
                 break
             self.linear_state_pool.free(er.mamba_slots)
             self._free(er.kv_indices)
+            self.linear_state_pool.free_host(er.host_slots)
+
+    # ------------------------------------------------------------------ mamba host bank
+    @property
+    def mamba_host_enabled(self) -> bool:
+        return self.is_hybrid and self.linear_state_pool.num_host_slots > 1
+
+    def ensure_mamba_host_slots(self, n: int) -> None:
+        """Make room in the pinned host bank by dropping LRU bank-resident checkpoints. Drops
+        no KV and no VRAM -- the boundary just stops being resumable."""
+        while self.linear_state_pool.num_free_host_slots < n:
+            dropped = self.prefix_cache.evict_host(n - self.linear_state_pool.num_free_host_slots)
+            if not dropped:
+                break
+            self.linear_state_pool.free_host(dropped)
+
+    def archive_chunk_track(self, req: Req) -> None:
+        """Prefill-chunk sibling of ``cache_req`` for the chunks that are deliberately never
+        committed (the intermediate ones -- committing their pages would double-free them). A
+        GDN checkpoint owns no pages, so only the checkpoint is copied out, to the host bank;
+        ``attach_host_tracks`` hangs it on the tree at the final commit, once the prefix's KV is
+        tree-owned. This is what makes a boundary in the MIDDLE of a long prompt resumable;
+        without it the deepest resume point of a chunked prompt is its last x64 boundary, so any
+        earlier edit re-prefills everything. The caller must be stream-ordered after the chunk's
+        forward (the scheduler drain is)."""
+        pool = self.linear_state_pool
+        length = req.mamba_last_track_seqlen
+        if length is None or req.mamba_ping_pong is None:
+            return          # this chunk froze no checkpoint
+        if not self.mamba_host_enabled:
+            logger.debug_rank0(
+                f"GDN bank: archive skipped (hybrid={self.is_hybrid}, "
+                f"host_slots={pool.num_host_slots})")
+            return
+        if align_down(length, self.page_size) != length:
+            logger.info_rank0(
+                f"GDN bank: boundary {length} not page aligned, cannot archive")
+            return
+        if pool.num_free_host_slots < 1:
+            self.ensure_mamba_host_slots(1)   # the LRU boundary gives way to a fresher one
+        if pool.num_free_host_slots < 1:
+            logger.info_rank0("GDN bank: full, nothing evictable -> no new resume point")
+            return          # every bank slot is mid-restore: keep running without a new point
+        frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+        host = pool.alloc_host(1)[0]
+        pool.to_host(frozen, host)
+        if req.mamba_host_tracks is None:
+            req.mamba_host_tracks = []
+        req.mamba_host_tracks.append((length, host))
+        logger.info_rank0(
+            f"GDN bank: archived boundary {length} -> host slot {host} "
+            f"({pool.num_free_host_slots}/{pool.num_host_slots - 1} free)")
+
+    def attach_host_tracks(self, req: Req, upto: int) -> None:
+        """Give the tree every boundary this prompt's chunks froze. One pass suffices: a boundary
+        is x64-aligned and <= cached_len, and the caller commits at align_down(cached_len,
+        page_size) >= it, so the KV it describes is already tree-owned by now. Whatever does not
+        land -- a device checkpoint already covers that boundary, or its KV left the tree -- goes
+        straight back to the bank."""
+        tracks, req.mamba_host_tracks = req.mamba_host_tracks, None
+        if not tracks:
+            return
+        dropped = [host for length, host in tracks
+                   if length > upto or not self.prefix_cache.attach_host(
+                       req.input_ids[:length], host)]
+        self.linear_state_pool.free_host(dropped)
+        logger.info_rank0(
+            f"GDN bank: commit attached {len(tracks) - len(dropped)} of {len(tracks)} "
+            f"boundaries {[length for length, _ in tracks]} up to {upto}"
+            + (f", refused bank slots {dropped}" if dropped else ""))
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -345,6 +418,7 @@ class CacheManager:
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
             free_upto = old_handle.cached_len
+            host_freed: List[int] = []
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
@@ -355,7 +429,7 @@ class CacheManager:
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
+                    req.input_ids[:L], page_indices[:L], frozen, host_freed)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -369,13 +443,18 @@ class CacheManager:
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx,
+                    host_freed)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
+            # Everything the device never checkpointed gets its bank checkpoint here -- the KV
+            # these boundaries describe only became tree-owned by the inserts above.
+            self.attach_host_tracks(req, insert_len)
+            pool.free_host(host_freed)
             self._free_req_slots(req, keep_live=keep_live)
             return
 
@@ -391,8 +470,9 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
+        host_freed: List[int] = []
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen)
+            req.input_ids[:L], page_indices[:L], frozen, host_freed)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
@@ -411,6 +491,10 @@ class CacheManager:
             pp = list(req.mamba_ping_pong)
             pp[frozen_idx] = pool.alloc(1)[0]
             req.mamba_ping_pong = tuple(pp)
+        # The chunk's own boundary went in as a device snapshot above; the boundaries the
+        # intermediate chunks froze ride in now that this prefix is tree-owned.
+        self.attach_host_tracks(req, L)
+        pool.free_host(host_freed)
         req.mamba_last_track_seqlen = None
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
@@ -507,6 +591,11 @@ class CacheManager:
             self.linear_state_pool.free(slots)
         req.mamba_ping_pong = None
         req.linear_slot_idx = None
+        # Chunk boundaries the final commit never managed to attach (aborted prefill, or the
+        # tokens left the tree): the bank slot is the request's to return, not the tree's.
+        if req.mamba_host_tracks:
+            self.linear_state_pool.free_host([h for _, h in req.mamba_host_tracks])
+        req.mamba_host_tracks = None
 
     def check_integrity(self) -> None:
         if self.is_hybrid:
@@ -521,6 +610,12 @@ class CacheManager:
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
             )
+            if pool.num_host_slots > 1:
+                tree_host = pc.mamba_host_evictable + pc.mamba_host_protected
+                assert pool.num_free_host_slots + tree_host <= pool.num_host_slots - 1, (
+                    f"mamba bank leak: free({pool.num_free_host_slots}) + tree({tree_host}) > "
+                    f"capacity({pool.num_host_slots - 1})"
+                )
         elif self.is_swa:
             pc = self.prefix_cache
             pc.check_integrity()  # full>=swa refs, tombstone => no swa lock
@@ -565,6 +660,7 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+            self.linear_state_pool.reclaim_all_host_slots()
 
     @contextmanager
     def lazy_free_region(self):
@@ -592,11 +688,13 @@ class CacheManager:
                 evicted = ev.kv_indices
                 self._free_swa(ev.swa_indices)
             elif self.is_hybrid:
-                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
+                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools; a
+                # bank-resident copy of the same boundary dies with the KV it describes.
                 er = self.prefix_cache.evict_full(need)
                 evicted = er.kv_indices
                 if er.mamba_slots:
                     self.linear_state_pool.free(er.mamba_slots)
+                self.linear_state_pool.free_host(er.host_slots)
             else:
                 evicted = self.prefix_cache.evict(need)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])

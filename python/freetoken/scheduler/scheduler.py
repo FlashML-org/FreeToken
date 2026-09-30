@@ -328,6 +328,10 @@ class Scheduler(SchedulerIOMixin):
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
+                    else:
+                        # The chunk's PAGES must stay out of the tree (double-free above), but its
+                        # x64 GDN checkpoint owns none: archive it here, stream-ordered after it.
+                        self.cache_manager.archive_chunk_track(req)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
@@ -621,9 +625,17 @@ class Scheduler(SchedulerIOMixin):
         if pool is None or not batch.is_prefill:
             return
         for req in batch.reqs:
-            if req.mamba_restore_src is not None:
-                pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
-                req.mamba_restore_src = None  # consumed: restore exactly once
+            src, host = req.mamba_restore_src, req.mamba_restore_host
+            # Consumed exactly once: a stale ref would re-copy over a live slot mid-decode.
+            req.mamba_restore_src = req.mamba_restore_host = None
+            if src is not None:
+                pool.copy_from(src, req.linear_slot_idx)
+            elif host is not None:
+                # Same COW-restore one tier up -- the checkpoint outlived its device slot in
+                # pinned RAM, which is what makes an intermediate chunk's boundary resumable.
+                pool.from_host(host, req.linear_slot_idx)
+                logger.info_rank0(
+                    f"GDN bank: resuming req {req.uid} from host slot {host}")
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an

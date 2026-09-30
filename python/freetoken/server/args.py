@@ -441,6 +441,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mamba-host-slots",
+        type=int,
+        default=ServerArgs.mamba_host_slots,
+        help="Hybrid GDN models: checkpoints of prefill-chunk boundaries kept in PINNED host RAM "
+        "(one slot = one whole GDN state, ~110 MB on a Qwen3-Coder-Next-class model) so a long "
+        "prompt stays resumable from a boundary in the middle of it, not just from its end. "
+        "0 (default) keeps today's behavior and costs no host RAM.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,
