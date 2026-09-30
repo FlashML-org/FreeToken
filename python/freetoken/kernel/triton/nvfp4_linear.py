@@ -43,7 +43,7 @@ import triton.language as tl
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native_cx,
-    e4m3_u8_to_f16_x128,
+    e4m3_to_f16_x128,
     e4m3_u8_to_f32,
 )
 
@@ -426,19 +426,13 @@ def _nvfp4_gemm_kernel(
     for t in range(tiles_per):
         if EVEN_K:
             word = tl.load(b_ptrs, mask=n_mask[:, None], other=0)
-            if e4m3_native_cx():
-                s128 = tl.load(s_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float16) * 128.0
-            else:
-                s128 = e4m3_u8_to_f16_x128(tl.load(s_ptrs, mask=n_mask[:, None], other=0))
+            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=n_mask[:, None], other=0))
             a_tile = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
         else:
             kw_ok = (tile0 + t) * BLOCK_KW + offs_kw < K_WORDS
             word = tl.load(b_ptrs, mask=n_mask[:, None] & kw_ok[None, :], other=0)
             s_mask = n_mask[:, None] & kw_ok[None, :]
-            if e4m3_native_cx():
-                s128 = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float16) * 128.0
-            else:
-                s128 = e4m3_u8_to_f16_x128(tl.load(s_ptrs, mask=s_mask, other=0))
+            s128 = e4m3_to_f16_x128(tl.load(s_ptrs, mask=s_mask, other=0))
             ak_ok = (tile0 + t) * BLOCK_KW * 8 + offs_ak < K
             a_tile = tl.load(a_ptrs, mask=m_mask[:, None] & ak_ok[None, :], other=0.0)
 
