@@ -1199,6 +1199,16 @@ def _fused_resident_ok(model_config) -> bool:
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
 
 
+def _explicit_q4_resident_ok(model_config) -> bool:
+    """Whether an explicit fused request can use the Gemma 4 packed-Q4 resident path."""
+    # Keep this capability model-specific until another loader supplies resident Q4 banks.
+    return (
+        getattr(model_config, "model_type", None) == "gemma4"
+        and getattr(model_config, "expert_quant", None) == "q4_0"
+        and getattr(model_config, "moe_weight_format", None) == "q4_0"
+    )
+
+
 def _ensure_expandable_segments() -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -1788,6 +1798,10 @@ def _adjust_config(config: EngineConfig):
         is_moe
         and expert_quant not in ("none", "fp8_block")
         and not is_offload_moe_strategy(config.moe_strategy)
+        # Gemma 4 alone supplies native packed Q4_0 banks to the explicit fused path.
+        and not (
+            config.moe_strategy == "fused" and _explicit_q4_resident_ok(model_config)
+        )
     ):
         raise ValueError(
             f"{expert_quant} experts require --moe-strategy offload or cpu, "

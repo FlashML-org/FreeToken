@@ -6,13 +6,14 @@ final-logit softcap), so this produces the *same* ``ModelConfig`` as
 ``gemma4.config.parse_config`` -- only the source is GGUF KV metadata instead of a
 HF config object. transformers' own GGUF->config conversion is rejected by the
 gemma4 strict dataclass (per-layer ``num_key_value_heads`` array), so we read the
-metadata directly. ``expert_quant`` is set to ``"q4_0"`` to route the routed experts
-through the native-Q4_0 offload-cache path.
+metadata directly. ``expert_quant`` is set to ``"q4_0"`` so routed experts retain
+their native packed representation in either the offload cache or explicit resident path.
 """
 
 from __future__ import annotations
 
 import os
+from math import prod
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -345,16 +346,12 @@ def iter_gguf_weights(
     embedding stay in their native packed block layout and are yielded as ``.qweight``
     (uint8); norms / router / per-layer scalars dequantize to bf16. q/k/v and gate/up
     are fused by concatenating packed rows along the output dim (same input dim ->
-    same ``row_bytes``). Routed experts are served from the offload cache, so they are
-    skipped here (asserts the offload contract like the other MoE models).
+    same ``row_bytes``). Routed experts are skipped for offload or yielded as packed
+    resident banks for the explicit fused strategy.
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts, (
-        "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
-        "experts are loaded into the offload cache via load_q4_0_expert_sources()."
-    )
     assert include_non_moe
     _require_tp1("weight loading")
 
@@ -371,6 +368,7 @@ def iter_gguf_weights(
     # Per-layer fusion buffers: layer -> {slot: packed[out, row_bytes]}.
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}
+    resident_experts_seen: set[tuple[int, str]] = set()
 
     def layer_of(name: str) -> int:
         return int(name.split(".")[1])
@@ -387,8 +385,72 @@ def iter_gguf_weights(
             continue  # rope frequencies recomputed in-engine
         if not name.startswith("blk."):
             continue
-        if any(name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
-            continue  # routed experts -> offload banks
+        expert_suffix = next(
+            (sfx for sfx in _EXPERT_SUFFIXES if name.endswith(sfx)), None
+        )
+        if expert_suffix is not None:
+            # Offload loads expert bytes separately through load_q4_0_expert_sources.
+            if not include_moe_experts:
+                continue
+            # The explicit resident path materializes each packed bank directly on device.
+            layer = layer_of(name)
+            canonical_name = f"blk.{layer}.{expert_suffix}"
+            if name != canonical_name:
+                raise ValueError(
+                    f"noncanonical Gemma 4 resident expert tensor name {name!r}; "
+                    f"expected {canonical_name!r}"
+                )
+            if t.ggml_type != GGML_Q4_0:
+                raise ValueError(
+                    "Gemma 4 resident experts require GGUF Q4_0 tensors; "
+                    f"{name} uses GGML type {t.ggml_type}"
+                )
+            base = f"model.layers.{layer}.feed_forward.experts"
+            # Preserve the checkpoint's already-fused gate/up expert row ordering.
+            if name.endswith("ffn_gate_up_exps.weight"):
+                role = "gate_up_q"
+                shape = (
+                    config.num_experts,
+                    2 * config.moe_intermediate_size,
+                    row_bytes(config.hidden_size, GGML_Q4_0),
+                )
+                logical_shape = (
+                    config.num_experts,
+                    2 * config.moe_intermediate_size,
+                    config.hidden_size,
+                )
+            # Preserve the checkpoint's down-projection expert row ordering.
+            elif name.endswith("ffn_down_exps.weight"):
+                role = "down_q"
+                shape = (
+                    config.num_experts,
+                    config.hidden_size,
+                    row_bytes(config.moe_intermediate_size, GGML_Q4_0),
+                )
+                logical_shape = (
+                    config.num_experts,
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                )
+            key = (layer, role)
+            if key in resident_experts_seen:
+                raise ValueError(f"duplicate Gemma 4 resident expert tensor {name}")
+            if tuple(t.shape) != logical_shape:
+                raise ValueError(
+                    f"Gemma 4 resident expert tensor {name} has logical shape {tuple(t.shape)}; "
+                    f"expected {logical_shape}"
+                )
+            packed = t.packed()
+            expected_bytes = prod(shape)
+            if packed.numel() != expected_bytes:
+                raise ValueError(
+                    f"Gemma 4 resident expert tensor {name} has {packed.numel()} packed bytes; "
+                    f"expected {expected_bytes} for shape {shape}"
+                )
+            resident_experts_seen.add(key)
+            yield f"{base}.{role}", packed.reshape(shape)
+            # Expert scaling is mapped to the router through the ordinary scalar path.
+            continue
 
         layer = layer_of(name)
         suffix = name.split(".", 2)[2]  # after "blk.N."
@@ -444,6 +506,19 @@ def iter_gguf_weights(
 
     assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
     assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
+    if include_moe_experts:
+        expected = {
+            (layer, role)
+            for layer in range(config.num_layers)
+            for role in ("gate_up_q", "down_q")
+        }
+        if resident_experts_seen != expected:
+            missing = sorted(expected - resident_experts_seen)
+            extra = sorted(resident_experts_seen - expected)
+            raise ValueError(
+                "Gemma 4 resident experts require one gate/up and down Q4_0 bank per layer; "
+                f"missing={missing}, extra={extra}"
+            )
 
     # Gemma's text GGUF stores the vision tower in a sibling ``*-mmproj.gguf``.
     # This stays behind the explicit vision opt-in so text-only serving never
@@ -508,8 +583,8 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 
     Quantized in the checkpoint -> swapped: attention qkv/o, shared-MLP gate_up/down
     (all Q4_0) and the token embedding (Q6_K, also the tied LM head). Left as dense
-    bf16 (F32 in the GGUF): the router gate, all RMSNorms, the per-layer scalars, and
-    the routed experts (served from the offload cache).
+    bf16 (F32 in the GGUF): the router gate, all RMSNorms, and per-layer scalars. Routed
+    experts remain packed Q4_0 in either the offload cache or explicit resident banks.
     """
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
 
