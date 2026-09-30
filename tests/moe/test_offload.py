@@ -498,6 +498,37 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     assert is_offload_moe_strategy(config.moe_strategy)
 
 
+def test_adjust_config_drops_the_demand_prefill_threshold_for_a_dense_model():
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _adjust_config
+
+    config = EngineConfig(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.float16,
+        attention_backend="triton",
+        moe_prefill_demand_tokens=512,
+    )
+    object.__setattr__(
+        config,
+        "model_config",
+        SimpleNamespace(
+            has_swa_attention=False,
+            has_linear_attention=False,
+            is_moe=False,
+            num_layers=10,
+            expert_quant="none",
+        ),
+    )
+
+    _adjust_config(config)
+
+    assert config.moe_prefill_demand_tokens == 0
+
+
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     import freetoken.core as core
     from freetoken.core import Context, Req, get_global_ctx
