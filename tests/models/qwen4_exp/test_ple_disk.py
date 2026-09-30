@@ -288,6 +288,24 @@ def test_disk_table_matches_oracle(tmp_path):
 
 
 @requires_cuda
+def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path):
+    """The overlap scheduler fills batch k+1 while batch k's lookup copy is still queued behind the
+    layers before it (a sleep kernel here): batch k must read its own rows."""
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+    steps = [(3, 4, 7), (4, 7, 9), (7, 9, 13), (9, 13, 5)]
+    ids = [emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda() for older, newer, token in steps]
+    got = []
+    for (older, newer, token), step_ids in zip(steps, ids):
+        disk.fill([torch.tensor([older, newer, token])], graph=False)
+        torch.cuda._sleep(50_000_000)
+        got.append(disk.lookup(step_ids))
+    torch.cuda.synchronize()
+    for i, (out, step_ids) in enumerate(zip(got, ids)):
+        assert _bitwise_equal(out, oracle.lookup(step_ids)), f"step {i} read another step's rows"
+
+
+@requires_cuda
 def test_graph_sync_protocol(tmp_path, monkeypatch):
     disk, oracle, args = _make_table(tmp_path)
     emb = _embedding()
