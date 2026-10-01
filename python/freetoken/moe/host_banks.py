@@ -26,6 +26,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from typing import Callable
 
 import torch
 
@@ -383,6 +384,18 @@ class LayerCompletionTracker:
             self._on_layer(layer_id, {name: per[layer_id] for name, per in self._banks.items()})
 
 
+def _read_chunks(read_chunk: Callable[[int], None], nbytes: int, chunk: int, workers: int) -> None:
+    """``read_chunk(offset)`` for every ``chunk``-sized piece of ``nbytes``: inline for one piece, else
+    on ``workers`` threads, whose parallel reads keep the disk at a deep queue."""
+    offsets = range(0, nbytes, chunk)
+    if len(offsets) <= 1:
+        for offset in offsets:
+            read_chunk(offset)
+        return
+    with ThreadPoolExecutor(workers) as executor:
+        list(executor.map(read_chunk, offsets))
+
+
 def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
                    chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
@@ -397,7 +410,6 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
             pass
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-    offs = list(range(0, size, chunk))
 
     def rd(o):
         want = min(chunk, len(mv) - o)
@@ -405,12 +417,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
         os.preadv(fd, [mv[o:o + want]], o)
 
     try:
-        if len(offs) <= 1:
-            for o in offs:
-                rd(o)
-        else:
-            with ThreadPoolExecutor(workers) as ex:
-                list(ex.map(rd, offs))
+        _read_chunks(rd, size, chunk, workers)
     finally:
         os.close(fd)
     return size
@@ -468,13 +475,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         mv[dst:dst + n] = bmv[head:head + n]
 
     try:
-        offs = list(range(0, nbytes, chunk))
-        if len(offs) <= 1:
-            for o in offs:
-                rd(o)
-        else:
-            with ThreadPoolExecutor(workers) as ex:
-                list(ex.map(rd, offs))
+        _read_chunks(rd, nbytes, chunk, workers)
     finally:
         os.close(fd)
     return nbytes
@@ -504,13 +505,7 @@ def _read_range_buffered(mv: memoryview, path: str, *, file_offset: int, nbytes:
             done += got
 
     try:
-        offs = list(range(0, nbytes, chunk))
-        if len(offs) <= 1:
-            for o in offs:
-                rd(o)
-        else:
-            with ThreadPoolExecutor(workers) as ex:
-                list(ex.map(rd, offs))
+        _read_chunks(rd, nbytes, chunk, workers)
     finally:
         for handle in handles:
             handle.close()
