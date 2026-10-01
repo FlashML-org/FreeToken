@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.gpu_select import format_gpu_uuid, nvml_free_bytes
+from freetoken.gpu_select import gpu_uuid, nvml_free_bytes
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -109,13 +109,9 @@ def get_free_memory(device: torch.device) -> int:
     free = torch.cuda.mem_get_info(device)[0]
     if sys.platform != "win32":
         return free
-    machine_free = nvml_free_bytes(_device_uuid(device))
-    return free if machine_free is None else min(free, machine_free)
-
-
-def _device_uuid(device: torch.device) -> str | None:
     index = torch.cuda.current_device() if device.index is None else device.index
-    return format_gpu_uuid(getattr(torch.cuda.get_device_properties(index), "uuid", None))
+    machine_free = nvml_free_bytes(gpu_uuid(index))
+    return free if machine_free is None else min(free, machine_free)
 
 
 class GraphRunner:
