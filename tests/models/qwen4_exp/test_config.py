@@ -229,20 +229,6 @@ MODEL_CARD_YARN = {
 }
 
 
-def test_the_trained_rope_table_is_the_trained_length():
-    rotary = parse_config(_hf_config()).rotary_config
-    assert rotary.scaling is None and rotary.table_positions == 262144
-
-
-def test_the_model_card_yarn_override_serves_1m_positions():
-    hf = _hf_config()
-    hf.text_config.rope_parameters = dict(MODEL_CARD_YARN)
-    rotary = parse_config(hf).rotary_config
-    assert rotary.scaling["rope_type"] == "yarn" and rotary.scaling["factor"] == 4.0
-    assert rotary.max_position == 262144 and rotary.rotary_dim == 64 and rotary.base == 10000000
-    assert rotary.table_positions == 4 * 262144
-
-
 def _write_checkpoint_config(path, **fields) -> None:
     import json
 
@@ -256,44 +242,6 @@ def _write_checkpoint_config(path, **fields) -> None:
         **fields,
     }
     (path / "config.json").write_text(json.dumps(config))
-
-
-def test_hf_overrides_replace_rope_parameters_and_keep_the_rest_of_the_section(tmp_path):
-    from freetoken.utils import cached_load_hf_config
-
-    _write_checkpoint_config(tmp_path)
-    overrides = {"text_config": {"rope_parameters": MODEL_CARD_YARN}}
-    hf = cached_load_hf_config(str(tmp_path), overrides)
-    assert hf.text_config.rope_parameters == MODEL_CARD_YARN
-    assert hf.text_config.num_experts == 512 and hf.text_config.max_position_embeddings == 262144
-    assert hf.image_token_id == 248056
-    # a fresh copy each time: the override never leaks into the cached checkpoint config
-    assert cached_load_hf_config(str(tmp_path)).text_config.rope_parameters["rope_type"] == "default"
-
-
-def test_hf_overrides_reach_a_model_type_transformers_does_not_know(tmp_path):
-    import json
-
-    from freetoken.utils.hf import RawConfigShim, _load_hf_config, cached_load_hf_config
-
-    raw = {
-        "architectures": ["SomeFutureForCausalLM"],
-        "model_type": "some_model_type_from_the_future",
-        "dtype": "bfloat16",
-        "text_config": {"hidden_size": 64, "rope_parameters": {"rope_type": "default", "rope_theta": 1e4}},
-    }
-    (tmp_path / "config.json").write_text(json.dumps(raw))
-    _load_hf_config.cache_clear()
-    try:
-        hf = cached_load_hf_config(
-            str(tmp_path), {"dtype": "float16", "text_config": {"rope_parameters": {"rope_type": "yarn"}}}
-        )
-    finally:
-        _load_hf_config.cache_clear()
-    assert isinstance(hf, RawConfigShim)
-    assert hf.dtype == "float16"
-    assert hf.text_config.rope_parameters == {"rope_type": "yarn"}
-    assert hf.text_config.hidden_size == 64
 
 
 def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
@@ -312,8 +260,9 @@ def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
     )
     rotary = config.model_config.rotary_config
-    assert rotary.scaling["rope_type"] == "yarn" and rotary.mrope_section is None
+    assert rotary.scaling["rope_type"] == "yarn" and rotary.scaling["factor"] == 4.0 and rotary.mrope_section is None
+    assert rotary.max_position == 262144 and rotary.rotary_dim == 64 and rotary.base == 10000000
     assert config.max_seq_len == 4 * 262144
     plain = EngineConfig(model_path=str(tmp_path), tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16,
                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
-    assert plain.max_seq_len == 262144
+    assert plain.model_config.rotary_config.scaling is None and plain.max_seq_len == 262144

@@ -1,3 +1,4 @@
+import copy
 import functools
 import json
 import os
@@ -240,7 +241,7 @@ def _with_overrides(config: Any, data: dict, overrides: Mapping[str, Any]) -> di
         if isinstance(value, Mapping) and isinstance(section, (PretrainedConfig, RawConfigShim)):
             merged[key] = _with_overrides(section, merged.get(key) or {}, value)
         else:
-            merged[key] = value
+            merged[key] = copy.deepcopy(value)
     return merged
 
 

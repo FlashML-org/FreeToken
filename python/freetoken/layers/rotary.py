@@ -131,6 +131,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         super().__init__(*args, **kwargs)
         assert self.is_neox, "mrope is defined on the NeoX half-rotation layout"
+        assert self._cos_sin_cache.shape[1] == self.rotary_dim, "mrope reads a rotary_dim-wide table, not a proportional rope's"
         half = self.rotary_dim // 2
         assert sum(mrope_section) == half, (mrope_section, half)
         self._section_table = build_section_table(tuple(mrope_section), layout)

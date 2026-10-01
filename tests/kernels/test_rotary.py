@@ -182,32 +182,24 @@ def test_yarn_table_covers_the_extended_context():
     torch.testing.assert_close(longer._cos_sin_cache[:256], rope._cos_sin_cache, rtol=0, atol=0)
 
 
-def test_one_table_serves_every_head_size_of_a_rope():
-    # The QSA indexer ropes 128-wide heads with the attention's 64 rotary dims: the same
-    # frequencies, so one table, not a second copy of a 1M-row fp32 tensor.
-    from freetoken.layers.rotary import get_rope
+def test_one_table_serves_every_rope_of_the_same_frequencies():
+    # The QSA indexer ropes 128-wide heads with the attention's 64 rotary dims, and mrope reads
+    # the same rows per axis: one table, not a second copy of a 1M-row fp32 tensor.
+    from freetoken.layers.rotary import MRotaryEmbedding, get_rope
 
     get_rope.cache_clear()
     attention = get_rope(head_dim=256, rotary_dim=64, max_position=64, base=1e7, rope_scaling=_yarn(4.0, 64))
     indexer = get_rope(head_dim=128, rotary_dim=64, max_position=64, base=1e7, rope_scaling=_yarn(4.0, 64))
-    assert attention is not indexer and indexer.head_size == 128
-    assert indexer._cos_sin_cache.data_ptr() == attention._cos_sin_cache.data_ptr()
+    mrope = get_rope(
+        head_dim=256, rotary_dim=64, max_position=64, base=1e7, rope_scaling=_yarn(4.0, 64),
+        mrope_section=(11, 11, 10), mrope_layout="interleaved",
+    )
+    assert indexer.head_size == 128 and isinstance(mrope, MRotaryEmbedding)
+    assert attention._cos_sin_cache.shape == (256, 64)
+    table = attention._cos_sin_cache.data_ptr()
+    assert indexer._cos_sin_cache.data_ptr() == table and mrope._cos_sin_cache.data_ptr() == table
 
     proportional = (("rope_type", "proportional"),)
     wide = get_rope(head_dim=128, rotary_dim=64, max_position=4, base=1e4, rope_scaling=proportional)
     narrow = get_rope(head_dim=64, rotary_dim=64, max_position=4, base=1e4, rope_scaling=proportional)
     assert wide._cos_sin_cache.shape == (4, 128) and narrow._cos_sin_cache.shape == (4, 64)
-
-
-def test_mrope_serves_yarn_from_the_1d_table():
-    from freetoken.layers.rotary import MRotaryEmbedding, get_rope
-
-    get_rope.cache_clear()
-    plain = get_rope(head_dim=256, rotary_dim=64, max_position=64, base=1e7, rope_scaling=_yarn(4.0, 64))
-    mrope = get_rope(
-        head_dim=256, rotary_dim=64, max_position=64, base=1e7, rope_scaling=_yarn(4.0, 64),
-        mrope_section=(11, 11, 10), mrope_layout="interleaved",
-    )
-    assert isinstance(mrope, MRotaryEmbedding)
-    assert mrope._cos_sin_cache.data_ptr() == plain._cos_sin_cache.data_ptr()
-    assert mrope._cos_sin_cache.shape == (256, 64)
