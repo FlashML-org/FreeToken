@@ -44,8 +44,7 @@ def _machine(monkeypatch, *, cuda_free: int, nvml: FakeNvml | None, platform: st
     """Fakes CUDA's reading, the device's UUID and the NVML library the engine would load."""
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (cuda_free, 24 * GIB))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid=DEVICE_UUID))
-    # raising=False: an engine that never reads NVML has no loader, and its free figure shows it
-    monkeypatch.setattr(gpu_select, "_load_nvml", lambda: nvml, raising=False)
+    monkeypatch.setattr(gpu_select, "_load_nvml", lambda: nvml)
     monkeypatch.setattr(sys, "platform", platform)
 
 
