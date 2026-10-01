@@ -187,11 +187,13 @@ def _decode_grouped_stage1_kernel(
     # VALID_BLOCK_H == min(cap, GROUP) is the number of query heads actually handled per program;
     # BLOCK_H is the power-of-two tile size for the head axis (tl.arange requires a power of two),
     # so a non-power-of-two GQA group (e.g. 24/4 == 6) rounds the tile up and masks the extra
-    # lanes. Each kv head spans cdiv(GROUP, VALID_BLOCK_H) head blocks.
-    kv_head = head_block_id // tl.cdiv(GROUP, VALID_BLOCK_H)
-    q_heads = head_block_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = q_heads < (head_block_id + 1) * VALID_BLOCK_H
-    mask_h = mask_h & (q_heads < NUM_Q_HEADS)
+    # lanes. Each kv head spans cdiv(GROUP, VALID_BLOCK_H) head blocks. Keep those
+    # blocks within the kv group so a partial tail block cannot spill into the next one.
+    blocks_per_kv = tl.cdiv(GROUP, VALID_BLOCK_H)
+    kv_head = head_block_id // blocks_per_kv
+    block_in_kv = head_block_id % blocks_per_kv
+    q_heads = kv_head * GROUP + block_in_kv * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (q_heads < (kv_head + 1) * GROUP) & (q_heads < NUM_Q_HEADS)
 
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -400,7 +402,11 @@ def decode_paged_attention(
     block_dv = triton.next_power_of_2(head_dim)
 
     _decode_grouped_stage1_kernel[
-        (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
+        (
+            batch,
+            num_kv_heads * triton.cdiv(group, valid_block_h),
+            max_kv_splits,
+        )
     ](
         q,
         k_cache,
