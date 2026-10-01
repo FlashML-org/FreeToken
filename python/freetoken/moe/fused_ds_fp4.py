@@ -12,7 +12,6 @@ from __future__ import annotations
 import torch
 import triton
 
-from freetoken.kernel.triton.autotune_cache import autotune_cache_kwargs
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 from freetoken.kernel.triton.dsv4.fused_moe import (
     _decode_dsfp4_moe_kernel,
@@ -22,15 +21,7 @@ from freetoken.kernel.triton.dsv4.fused_moe import (
 )
 from freetoken.moe.fused import moe_align_block_size
 
-_decode_kernel = triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_N": rows}, num_warps=warps)
-        for rows in (16, 32, 64) for warps in (1, 2, 4)
-    ],
-    # Each program owns one route; reuse its geometry across batch/prefill lengths.
-    key=["N", "K", "TOP_K"],
-    **autotune_cache_kwargs,
-)(_decode_dsfp4_moe_kernel)
+_TL_DTYPE = None
 
 
 def _compute_type(dtype: torch.dtype):
@@ -69,11 +60,16 @@ def _grouped_decode(
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
 
-    # Keep K reduction groups fixed; tune only independent output rows and warps.
+    # One fixed launch geometry, never tuned per machine: the row / warp split changes the per-row
+    # K reduction layout (and so the output bits) on some Triton versions. 16 rows on 2 warps is at
+    # or near the fastest split for the V4 and V4.1 decode shapes. Each K tile contains whole
+    # packed FP4 scale groups.
+    BLOCK_SIZE_N = 16
     BLOCK_SIZE_KB = 128
+    _NW = 2
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
-    grid = lambda meta: (total_routes, triton.cdiv(N, meta["BLOCK_SIZE_N"]))
-    _decode_kernel[grid](
+    grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
+    _decode_dsfp4_moe_kernel[grid](
         a, packed_cache, scale_u8, out, topk_weights, slots,
         _e2m1_lut(a.device.index),
         total_routes, N, K,
@@ -84,11 +80,13 @@ def _grouped_decode(
         topk_weights.stride(0) if topk_weights.ndim == 2 else 0,
         topk_weights.stride(1) if topk_weights.ndim == 2 else 0,
         slots.stride(0), slots.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_KB=BLOCK_SIZE_KB,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_compute_type(dtype),
+        num_warps=_NW,
     )
     return out
 
