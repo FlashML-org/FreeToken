@@ -69,6 +69,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--vram-reserve-mb` | 0 | VRAM (MiB) left free for the rest of the machine at the largest prefill: startup runs one max-length chunk and shrinks the MoE expert cache until the reserve stays free; 0 skips the check |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
