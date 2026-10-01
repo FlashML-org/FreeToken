@@ -140,6 +140,9 @@ class Batch:
     mm_rows: torch.Tensor | None = field(default=None, init=False)
     # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
     mm_block_ends: torch.Tensor | None = field(default=None, init=False)
+    # the same spans as absolute (start, end) pairs per page-table row, for backends that build
+    # their candidate lists per span rather than per token (DSV4's sparse attention)
+    mm_spans: dict | None = field(default=None, init=False)
     # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
     mm_encoder_jobs: list | None = field(default=None, init=False)
     mm_gather_plan: list | None = field(default=None, init=False)

@@ -59,7 +59,7 @@ class MuseGlimmerMMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
         t, h, w = item.grid_thw
         pads = [self.image_token_id] * ((t * h * w) // (self.merge * self.merge))
         return PromptReplacement.select_token_id([_IMAGE_START_ID, *pads, _IMAGE_END_ID], self.image_token_id)

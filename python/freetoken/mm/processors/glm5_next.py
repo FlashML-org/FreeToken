@@ -57,7 +57,7 @@ class Glm5NextMMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
         t, h, w = item.grid_thw
         return PromptReplacement([self.image_token_id] * ((t * h * w) // (self.merge * self.merge)))
 
