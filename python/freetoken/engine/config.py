@@ -31,8 +31,8 @@ class EngineConfig:
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
-    # The disk row store is built on Linux only (setup.py), so elsewhere the default is the one that runs.
+    # PLE table backend: "disk" reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
+    # The default is "disk" where setup.py builds its row store (Linux), "pinned" elsewhere.
     ple_backend: str = "disk" if sys.platform == "linux" else "pinned"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the

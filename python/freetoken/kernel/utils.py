@@ -20,7 +20,7 @@ DISABLE_KERNEL_CACHE_VERSION_CHECK_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE_VERSION
 DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
-# cl.exe ignores GCC spellings with only a warning, which silently compiled the C++20 headers as C++17.
+# cl.exe ignores GCC's spellings with only a warning and would compile the C++20 headers as C++17.
 DEFAULT_CFLAGS = ["/std:c++20", "/O2"] if sys.platform == "win32" else ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3"]
