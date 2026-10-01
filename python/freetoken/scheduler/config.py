@@ -23,7 +23,7 @@ def _free_loopback_ports(count: int) -> list[int]:
 
 def _choose_zmq_links() -> tuple[str, ...]:
     """The ZMQ endpoints, chosen once in the parent so every spawned worker reads the same ones;
-    loopback TCP ports on Windows, where libzmq has no ipc transport."""
+    loopback TCP ports where libzmq has no ipc transport, as on Windows."""
     import os
 
     import zmq
