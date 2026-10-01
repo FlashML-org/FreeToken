@@ -816,7 +816,7 @@ class Engine:
         self.cpu_moe_executor = executor
 
     def _sync_get_memory(self) -> Tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
+        """Get the min and max free memory across TP ranks, after emptying the allocator cache."""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)

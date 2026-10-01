@@ -505,7 +505,7 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     assert _pin_budget_bytes(reserved=2**30) is None
 
 
-# ---- slots_to_free_for_reserve: the startup fit to a max-length prefill ----
+# ---- the startup fit to a max-length prefill: slots_to_free_for_reserve, Engine._fit_prefill_peak ----
 
 MIB = 1 << 20
 EXPERT_BYTES = 2_772_480  # one NVFP4 expert of Qwen3.8-Flash-Next
