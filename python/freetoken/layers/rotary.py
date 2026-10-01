@@ -286,7 +286,7 @@ def rope_cos_sin_table(
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
 ) -> torch.Tensor:
     """The ``[positions, width]`` cos|sin table, one per distinct rope: only proportional rope
-    depends on the head size, so an indexer's wider heads read the attention's table."""
+    depends on the head size, so an indexer whose heads differ in width reads the attention's table."""
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     proportional = rope_map is not None and rope_map["rope_type"] == "proportional"
     device = torch.get_default_device()
