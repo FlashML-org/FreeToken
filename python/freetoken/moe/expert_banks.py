@@ -296,9 +296,9 @@ def load_expert_banks(
     the same normalized ``ExpertBanks`` and both pinning after fill:
 
     * **Fast path (FTW)**: if ``model_path`` is a converted FTW checkpoint, read its
-      repacked banks directly (contiguous chunked O_DIRECT). No auto-conversion.
+      repacked banks directly (contiguous chunked O_DIRECT, or mmap where it is unavailable). No auto-conversion.
     * **Slow path** (the original checkpoint): auto-pick **parallel** (the common parallel chunked
-      O_DIRECT reader) when experts are stored as many small tensors -- the serial read is
+      reader, O_DIRECT where the platform has it) when experts are stored as many small tensors -- the serial read is
       slow there -- else the **serial baseline** (packed experts: serial already saturates,
       parallel only adds read amplification). parallel unavailable for a quant falls back to serial.
 
