@@ -943,7 +943,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
     Args:
-        config: Server configuration (host/port, ZMQ IPC addresses, etc).
+        config: Server configuration (host/port, ZMQ addresses, etc).
         start_backend: Callback that launches the backend worker processes (TP schedulers +
             tokenizer/detokenizer).
         run_shell: If True, also attach the interactive terminal shell to the served API.
