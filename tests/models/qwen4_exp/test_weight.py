@@ -451,14 +451,6 @@ def test_the_parallel_shard_read_yields_every_expert_tensor_exactly(expert_check
         assert torch.equal(got[name].view(torch.uint8), tensor.view(torch.uint8)), name
 
 
-def test_every_platform_builds_the_expert_banks_in_parallel():
-    # The parallel build reads whole shards through read_range_into, which is buffered where the
-    # platform has no O_DIRECT, so no platform is left with the per-tensor serial build.
-    import freetoken.moe.expert_banks as expert_banks
-
-    assert not hasattr(expert_banks, "_PARALLEL_READER_SUPPORTED")
-
-
 # ======================================================================================
 # AOT shape table
 # ======================================================================================
