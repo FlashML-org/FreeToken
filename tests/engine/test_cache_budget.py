@@ -507,32 +507,70 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
 
 # ---- slots_to_free_for_reserve: the startup fit to a max-length prefill ----
 
+MIB = 1 << 20
+EXPERT_BYTES = 2_772_480  # one NVFP4 expert of Qwen3.8-Flash-Next
+
 
 def test_the_reserve_shortfall_rounds_up_to_whole_slots_past_a_margin():
     from freetoken.engine.cache_budget import slots_to_free_for_reserve
 
-    slot = 2_772_480  # one NVFP4 expert of Qwen3.8-Flash-Next
-    mib = 1 << 20
-    assert slots_to_free_for_reserve(free_at_peak=2000 * mib, reserve=2000 * mib, per_expert_bytes=slot) == 0
-    assert slots_to_free_for_reserve(free_at_peak=3000 * mib, reserve=2000 * mib, per_expert_bytes=slot) == 0
+    def drop(free_at_peak: int) -> int:
+        return slots_to_free_for_reserve(free_at_peak=free_at_peak, reserve=2000 * MIB, per_expert_bytes=EXPERT_BYTES)
+
+    assert drop(2000 * MIB) == 0 and drop(3000 * MIB) == 0
     # one byte short still drops the whole margin, so the rebuild's own cost cannot swallow it
-    one_byte = slots_to_free_for_reserve(free_at_peak=2000 * mib - 1, reserve=2000 * mib, per_expert_bytes=slot)
-    assert one_byte * slot >= 128 * mib
+    assert drop(2000 * MIB - 1) * EXPERT_BYTES >= 128 * MIB
     # the measured case: 430 MiB left at the peak against a 2000 MiB reserve
-    drop = slots_to_free_for_reserve(free_at_peak=430 * mib, reserve=2000 * mib, per_expert_bytes=slot)
-    assert drop * slot >= 1570 * mib + 128 * mib
+    assert drop(430 * MIB) * EXPERT_BYTES >= 1570 * MIB + 128 * MIB
+
+
+class _ReserveFitEngine:
+    """What _fit_prefill_peak drives: a max-length prefill that leaves ``free`` bytes, and a cache
+    rebuild that hands back ``returned`` of what the dropped slots held, less ``rebuild_cost``."""
+
+    def __init__(self, free: int, *, returned: float = 1.0, rebuild_cost: int = 0, refuses: bool = False):
+        self.config = SimpleNamespace(max_forward_len=8192, model_config=SimpleNamespace(vocab_size=248320))
+        self.max_seq_len = 1 << 20
+        self.moe_offload_cache = SimpleNamespace(cache_size=2900)
+        self.free, self.returned, self.rebuild_cost, self.refuses = free, returned, rebuild_cost, refuses
+
+    def _prefill_dummy(self, lengths, input_ids) -> float:
+        return 1.0
+
+    def _min_free_memory_keeping_cache(self) -> int:
+        return self.free
+
+    def _target_moe_and_expert_bytes(self, moe_cache_size):
+        return self.moe_offload_cache.cache_size, EXPERT_BYTES
+
+    def rebuild_runtime_cache(self, *, moe_cache_size: int) -> None:
+        from freetoken.kvcache.base import CacheRebuildRejected
+
+        if self.refuses:
+            raise CacheRebuildRejected(f"moe_cache_size={moe_cache_size} is below the minimum")
+        dropped = (self.moe_offload_cache.cache_size - moe_cache_size) * EXPERT_BYTES
+        self.free += int(dropped * self.returned) - self.rebuild_cost
+        self.moe_offload_cache.cache_size = moe_cache_size
 
 
 def test_the_fit_reaches_the_reserve_when_a_rebuild_costs_memory_of_its_own():
     # A start that failed: 0.69 GiB free against 2000 MiB, and 1.26 GiB of slots returned 1.24 GiB.
     # Drops sized to the shortfall alone crept to 1.95 GiB and never arrived in three measurements.
-    from freetoken.engine.cache_budget import slots_to_free_for_reserve
+    from freetoken.engine.engine import Engine
 
-    slot, mib = 2_772_480, 1 << 20
-    reserve, rebuild_cost = 2000 * mib, 20 * mib
-    free = 706 * mib
-    for _ in range(2):  # the engine measures three times, so it shrinks at most twice
-        drop = slots_to_free_for_reserve(free, reserve, slot)
-        if drop:
-            free += drop * slot - rebuild_cost
-    assert free >= reserve
+    engine = _ReserveFitEngine(706 * MIB, rebuild_cost=20 * MIB)
+    Engine._fit_prefill_peak(engine, 2000 * MIB)
+    assert engine.free >= 2000 * MIB and engine.moe_offload_cache.cache_size < 2900
+
+
+@pytest.mark.parametrize(
+    ("returned", "refuses", "message"),
+    [(0.0, False, "still leaves less than --vram-reserve-mb 2000"), (1.0, True, "--vram-reserve-mb 2000 cannot be kept free")],
+    ids=["frees-nothing", "refused"],
+)
+def test_a_reserve_the_expert_cache_cannot_free_fails_the_start(returned, refuses, message):
+    from freetoken.engine.engine import Engine
+
+    engine = _ReserveFitEngine(706 * MIB, returned=returned, refuses=refuses)
+    with pytest.raises(RuntimeError, match=message):
+        Engine._fit_prefill_peak(engine, 2000 * MIB)
