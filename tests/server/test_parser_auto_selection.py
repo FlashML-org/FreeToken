@@ -87,6 +87,10 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
 
 
+def test_mimo_v2_uses_its_tool_and_reasoning_protocols():
+    assert _inferred("MiMoV2ForCausalLM") == ("mimo_v2", "mimo_v2")
+
+
 def test_an_explicit_choice_beats_inference():
     config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):

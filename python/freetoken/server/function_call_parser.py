@@ -13,6 +13,7 @@
 
 import ast
 import json
+import math
 import os
 import logging
 import re
@@ -360,48 +361,84 @@ class BaseFormatDetector(ABC):
 
     def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
-        if value.lower() == "null":
-            return None
-
         if param_name not in param_config:
             return value
 
-        prop = param_config.get(param_name, {})
-        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+        valid, converted = self._resolve_param_value(
+            value, self._param_schema_options(param_config[param_name])
+        )
+        return converted if valid else value
 
-        if param_type in ("string", "str", "enum"):
-            return value
-        elif param_type.startswith("int") or param_type == "integer":
-            try:
-                return int(value)
-            except (ValueError, TypeError):
-                return value
-        elif param_type in ("number", "float", "double"):
-            try:
-                fv = float(value)
-                return int(fv) if fv == int(fv) else fv
-            except (ValueError, TypeError):
-                return value
-        elif param_type in ("boolean", "bool"):
-            return value.lower() == "true"
-        elif param_type in ("object", "array"):
-            try:
-                return json.loads(value)
-            except (json.JSONDecodeError, TypeError, ValueError):
+    @staticmethod
+    def _param_schema_options(prop: Any) -> list[Dict]:
+        """Flatten JSON Schema unions into ordered alternatives for value coercion."""
+        if not isinstance(prop, dict):
+            return [{"type": "string"}]
+
+        alternatives = prop.get("anyOf") or prop.get("oneOf")
+        if alternatives:
+            options = [
+                option
+                for alternative in alternatives
+                for option in BaseFormatDetector._param_schema_options(alternative)
+            ]
+        else:
+            param_type = prop.get("type", "string")
+            types = param_type if isinstance(param_type, list) else [param_type]
+            options = [{**prop, "type": item} for item in types]
+
+        if prop.get("nullable") and not any(option.get("type") == "null" for option in options):
+            options.append({"type": "null"})
+        return options or [{"type": "string"}]
+
+    def _resolve_param_value(self, value: str, options: list[Dict]) -> tuple[bool, Any]:
+        """Return a schema-matched value, keeping strings verbatim (including `null`)."""
+        for option in options:
+            param_type = str(option.get("type", "string")).strip().lower()
+            stripped = value.strip()
+            if param_type in ("string", "str", "enum"):
+                return True, value
+            if param_type == "null":
+                if stripped.lower() == "null":
+                    return True, None
+            elif param_type.startswith("int") or param_type == "integer":
                 try:
-                    return ast.literal_eval(value)
-                except (ValueError, SyntaxError, TypeError):
-                    return value
-        return value
+                    return True, int(stripped)
+                except (ValueError, TypeError):
+                    pass
+            elif param_type in ("number", "float", "double"):
+                try:
+                    number = float(stripped)
+                    if math.isfinite(number):
+                        return True, int(number) if number.is_integer() else number
+                except (ValueError, TypeError):
+                    pass
+            elif param_type in ("boolean", "bool"):
+                if stripped.lower() in ("true", "false"):
+                    return True, stripped.lower() == "true"
+            elif param_type in ("object", "array"):
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    try:
+                        parsed = ast.literal_eval(value)
+                    except (ValueError, SyntaxError, TypeError):
+                        continue
+                if (param_type == "object" and isinstance(parsed, dict)) or (
+                    param_type == "array" and isinstance(parsed, list)
+                ):
+                    return True, parsed
+        return False, value
 
     def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
         """Normalized schema type for a parameter; ``missing`` when undeclared."""
         if param_name not in param_config:
             return missing
-        prop = param_config.get(param_name, {})
-        if not isinstance(prop, dict):
+        options = self._param_schema_options(param_config[param_name])
+        types = [str(option.get("type", "string")).strip().lower() for option in options]
+        if all(param_type in ("string", "str", "enum") for param_type in types):
             return "string"
-        return str(prop.get("type", "string")).strip().lower()
+        return types[0] if len(types) == 1 else "union"
 
     @staticmethod
     def _json_escape_chunk(text: str) -> str:
@@ -677,12 +714,14 @@ class InvokeParamStreamMixin:
     _ps_trim: str = "\n"
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
+    _ps_boundary_lookahead: int = 128
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
         self._ps_key = ""
         self._ps_lead = "{"
         self._ps_emitted_any = False
+        self._ps_json_started = False
         self._ps_lead_trimmed = False
         self._ps_param_config: Dict = {}
 
@@ -705,6 +744,84 @@ class InvokeParamStreamMixin:
         if self._ps_trim_single:
             return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
         return text.rstrip(self._ps_trim)
+
+    def _ps_find_boundary(self, text: str) -> tuple[int, str | None]:
+        pos, token = -1, None
+        for candidate in dict.fromkeys(
+            (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
+        ):
+            if not candidate:
+                continue
+            candidate_pos = text.find(candidate)
+            if candidate_pos != -1 and (pos == -1 or candidate_pos < pos):
+                pos, token = candidate_pos, candidate
+        return pos, token
+
+    def _ps_partial_boundary_len(self, text: str) -> int:
+        return max(
+            (
+                self._ends_with_partial_token(text, token)
+                for token in dict.fromkeys(
+                    (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
+                )
+                if token
+            ),
+            default=0,
+        )
+
+    def _ps_following_call_pos(self, text: str, pos: int, boundary: str) -> int:
+        if boundary == self._ps_invoke_close:
+            outer_pos = text.find(self._ps_outer_close, pos + len(boundary))
+            if outer_pos == -1:
+                return -1
+            after_outer = outer_pos + len(self._ps_outer_close)
+        elif boundary == self._ps_outer_close:
+            after_outer = pos + len(boundary)
+        else:
+            return -1
+
+        open_pos = text.find(self._ps_outer_open, after_outer)
+        if open_pos == -1:
+            return -1
+        invoke_pos = text.find(self._ps_invoke_open_prefix, open_pos + len(self._ps_outer_open))
+        if invoke_pos == -1:
+            return -1
+        match = self._ps_invoke_open_re.search(text, invoke_pos)
+        return open_pos if match is not None else -1
+
+    def _ps_closer_pair_end(self, text: str, pos: int, boundary: str) -> int:
+        if boundary == self._ps_outer_close:
+            return pos + len(boundary)
+        if boundary != self._ps_invoke_close:
+            return -1
+        outer_pos = text.find(self._ps_outer_close, pos + len(boundary))
+        if outer_pos == -1 or text[pos + len(boundary):outer_pos].strip():
+            return -1
+        return outer_pos + len(self._ps_outer_close)
+
+    def _ps_boundary_resolution(
+        self, text: str, *, end_of_stream: bool = False
+    ) -> tuple[int, str | None, str | None]:
+        """Prefer a later parameter close; a complete following call confirms recovery."""
+        pos, boundary = self._ps_find_boundary(text)
+        if boundary is None:
+            return pos, boundary, None
+        if boundary == self._ps_param_close:
+            return pos, boundary, "parameter"
+
+        next_call = self._ps_following_call_pos(text, pos, boundary)
+        parameter_close = text.find(self._ps_param_close, pos + len(boundary))
+        if next_call != -1 and (parameter_close == -1 or next_call < parameter_close):
+            return pos, boundary, "structural"
+        if parameter_close != -1:
+            return parameter_close, self._ps_param_close, "parameter"
+        closer_pair_end = self._ps_closer_pair_end(text, pos, boundary)
+        if end_of_stream or (
+            closer_pair_end != -1
+            and len(text) - closer_pair_end > self._ps_boundary_lookahead
+        ):
+            return pos, boundary, "structural"
+        return pos, boundary, "pending"
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
@@ -733,6 +850,15 @@ class InvokeParamStreamMixin:
                 if isinstance(parsed, dict):
                     self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
                 return
+
+        def _close_invoke() -> None:
+            _emit("}" if self._ps_json_started else "{}")
+            _update_prev()
+            self.current_tool_id += 1
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+            self._args_started = False
+            self._ps_json_started = False
 
         while True:
             buf = self._buffer
@@ -789,6 +915,7 @@ class InvokeParamStreamMixin:
                             "arguments": {},
                         }
                         self._args_started = False
+                        self._ps_json_started = False
                         self._ps_param_config = self._get_param_config(func_name, tools)
                         self._ps_mode = "invoke"
                     else:
@@ -810,11 +937,7 @@ class InvokeParamStreamMixin:
                 e = buf.find(self._ps_invoke_close)
                 if e != -1 and (p == -1 or e < p):
                     if mode == "invoke":
-                        _emit("}" if self._args_started else "{}")
-                        _update_prev()
-                        self.current_tool_id += 1
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
+                        _close_invoke()
                     self._buffer = buf[e + len(self._ps_invoke_close):]
                     self._ps_mode = "block"
                     continue
@@ -827,13 +950,14 @@ class InvokeParamStreamMixin:
                         self._ps_mode = "pskip"
                         continue
                     self._ps_key = m.group(1).strip()
-                    lead = "{" if not self._args_started else ","
-                    self._args_started = True
+                    lead = "{" if not self._ps_json_started else ","
                     ptype = self._schema_param_type(
                         self._ps_key, self._ps_param_config, self._ps_missing_type
                     )
                     if ptype in ("string", "str", "enum"):
                         _emit(lead + json.dumps(self._ps_key, ensure_ascii=False) + ':"')
+                        self._ps_json_started = True
+                        self._args_started = True
                         self._ps_emitted_any = False
                         self._ps_lead_trimmed = False
                         self._ps_mode = "pstr"
@@ -859,9 +983,44 @@ class InvokeParamStreamMixin:
                         continue
                     if buf:
                         self._ps_lead_trimmed = True
-                end = buf.find(self._ps_param_close)
-                if end == -1:
-                    hold = self._ends_with_partial_token(buf, self._ps_param_close)
+                end, boundary, resolution = self._ps_boundary_resolution(buf)
+                if resolution == "parameter":
+                    tail = self._ps_trim_trailing(buf[:end])
+                    _emit(self._json_escape_chunk(tail) + '"')
+                    _update_prev()
+                    self._buffer = buf[end + len(self._ps_param_close):]
+                    self._ps_mode = "invoke"
+                    continue
+                if resolution == "structural" and boundary == self._ps_invoke_close:
+                    tail = self._ps_trim_trailing(buf[:end])
+                    _emit(self._json_escape_chunk(tail) + '"')
+                    _update_prev()
+                    self._buffer = buf[end:]
+                    self._ps_mode = "invoke"
+                    continue
+                if resolution == "structural" and boundary == self._ps_outer_close:
+                    tail = self._ps_trim_trailing(buf[:end])
+                    _emit(self._json_escape_chunk(tail) + '"')
+                    _update_prev()
+                    self._buffer = buf[end:]
+                    _close_invoke()
+                    self._ps_mode = "block"
+                    continue
+                if resolution == "pending":
+                    if len(buf) - end > self._ps_boundary_lookahead:
+                        hold = self._ps_partial_boundary_len(buf)
+                        safe = buf[: len(buf) - hold] if hold else buf
+                    else:
+                        safe = buf[:end]
+                    keep = len(safe) - len(safe.rstrip(self._ps_trim))
+                    emit_now = safe[: len(safe) - keep]
+                    if emit_now:
+                        _emit(self._json_escape_chunk(emit_now))
+                        self._ps_emitted_any = True
+                        self._buffer = buf[len(emit_now):]
+                    break
+                if boundary is None:
+                    hold = self._ps_partial_boundary_len(buf)
                     safe = buf[: len(buf) - hold] if hold else buf
                     keep = len(safe) - len(safe.rstrip(self._ps_trim))
                     emit_now = safe[: len(safe) - keep]
@@ -870,32 +1029,159 @@ class InvokeParamStreamMixin:
                         self._ps_emitted_any = True
                         self._buffer = buf[len(emit_now):]
                     break
-                tail = self._ps_trim_trailing(buf[:end])
-                _emit(self._json_escape_chunk(tail) + '"')
-                _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
-                self._ps_mode = "invoke"
-                continue
 
             if mode in ("pbuf", "pskip"):
-                end = buf.find(self._ps_param_close)
-                if end == -1:
-                    break  # hold the whole value until the parameter closes
-                if mode == "pbuf":
-                    raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
-                    converted = self._ps_convert_value(self._ps_key, raw)
-                    _emit(
-                        self._ps_lead
-                        + json.dumps(self._ps_key, ensure_ascii=False)
-                        + ":"
-                        + json.dumps(converted, ensure_ascii=False)
-                    )
-                    _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
-                self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
-                continue
+                end, boundary, resolution = self._ps_boundary_resolution(buf)
+                if resolution == "parameter":
+                    if mode == "pbuf":
+                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
+                        valid, converted = self._ps_resolve_value(self._ps_key, raw)
+                        if valid:
+                            self._ps_json_started = True
+                            self._args_started = True
+                            _emit(
+                                self._ps_lead
+                                + json.dumps(self._ps_key, ensure_ascii=False)
+                                + ":"
+                                + json.dumps(converted, ensure_ascii=False)
+                            )
+                            _update_prev()
+                    self._buffer = buf[end + len(self._ps_param_close):]
+                    self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
+                    continue
+
+                if resolution == "structural" and boundary == self._ps_invoke_close:
+                    if mode == "pbuf":
+                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
+                        valid, converted = self._ps_resolve_value(self._ps_key, raw)
+                        if valid:
+                            self._ps_json_started = True
+                            self._args_started = True
+                            _emit(
+                                self._ps_lead
+                                + json.dumps(self._ps_key, ensure_ascii=False)
+                                + ":"
+                                + json.dumps(converted, ensure_ascii=False)
+                            )
+                            _update_prev()
+                    self._buffer = buf[end:]
+                    self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
+                    continue
+
+                if resolution == "structural" and boundary == self._ps_outer_close:
+                    if mode == "pbuf":
+                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
+                        valid, converted = self._ps_resolve_value(self._ps_key, raw)
+                        if valid:
+                            self._ps_json_started = True
+                            self._args_started = True
+                            _emit(
+                                self._ps_lead
+                                + json.dumps(self._ps_key, ensure_ascii=False)
+                                + ":"
+                                + json.dumps(converted, ensure_ascii=False)
+                            )
+                            _update_prev()
+                        _close_invoke()
+                    self._buffer = buf[end:]
+                    self._ps_mode = "block"
+                    continue
+
+                if resolution in (None, "pending"):
+                    break  # hold the value until a parameter or structural closer arrives
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finalize_streaming(self) -> List[ToolCallItem]:
+        """Close an open argument object so concatenated deltas remain valid JSON."""
+        mode = getattr(self, "_ps_mode", "idle")
+        if mode not in ("invoke", "pstr", "pbuf") or self.current_tool_id < 0:
+            return []
+
+        calls: List[ToolCallItem] = []
+
+        def emit(fragment: str) -> None:
+            if fragment:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                )
+
+        buf = self._buffer
+        residual = buf
+        next_mode = "block"
+        if mode == "pstr":
+            end, boundary, resolution = self._ps_boundary_resolution(buf, end_of_stream=True)
+            if resolution == "parameter":
+                raw = buf[:end]
+                residual = buf[end + len(self._ps_param_close):]
+            elif resolution == "structural":
+                raw = buf[:end]
+                residual = buf[end + len(boundary):]
+                if boundary == self._ps_invoke_close and residual.startswith(self._ps_outer_close):
+                    residual = residual[len(self._ps_outer_close):]
+                    next_mode = "idle"
+                elif boundary == self._ps_outer_close:
+                    next_mode = "idle"
+            else:
+                hold = self._ps_partial_boundary_len(buf)
+                raw = buf[: len(buf) - hold] if hold else buf
+            emit(self._json_escape_chunk(self._ps_trim_trailing(raw)) + '"')
+        elif mode == "pbuf":
+            end, boundary, resolution = self._ps_boundary_resolution(buf, end_of_stream=True)
+            if resolution == "parameter":
+                raw = buf[:end]
+                residual = buf[end + len(self._ps_param_close):]
+            elif resolution == "structural":
+                raw = buf[:end]
+                residual = buf[end + len(boundary):]
+                if boundary == self._ps_invoke_close and residual.startswith(self._ps_outer_close):
+                    residual = residual[len(self._ps_outer_close):]
+                    next_mode = "idle"
+                elif boundary == self._ps_outer_close:
+                    next_mode = "idle"
+            else:
+                hold = self._ps_partial_boundary_len(buf)
+                raw = buf[: len(buf) - hold] if hold else buf
+            raw = self._ps_trim_trailing(self._ps_trim_leading(raw))
+            valid, converted = self._ps_resolve_value(self._ps_key, raw)
+            if valid:
+                self._ps_json_started = True
+                self._args_started = True
+                emit(
+                    self._ps_lead
+                    + json.dumps(self._ps_key, ensure_ascii=False)
+                    + ":"
+                    + json.dumps(converted, ensure_ascii=False)
+                )
+
+        emit("}" if self._ps_json_started else "{}")
+        self._update_streamed_arguments()
+        self._buffer = residual
+        self._ps_mode = next_mode
+        self._args_started = False
+        self._ps_json_started = False
+        return calls
+
+    def _ps_resolve_value(self, key: str, raw: str) -> tuple[bool, Any]:
+        if key not in self._ps_param_config and self._ps_missing_type == "loose":
+            return True, _parse_loose_json_value(raw)
+        if key not in self._ps_param_config:
+            return True, raw
+        options = self._param_schema_options(self._ps_param_config[key])
+        return self._resolve_param_value(raw, options)
+
+    def _update_streamed_arguments(self) -> None:
+        ledger = self.streamed_args_for_tool[self.current_tool_id]
+        candidates = (ledger, ledger + "}")
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
 
     def finish_streaming(self) -> str:
         residual, self._buffer = self._buffer, ""
@@ -1966,12 +2252,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
             except ValueError:
                 continue
             param_name = match[:idx].strip()
-            param_value = match[idx + 1 :]
-            # Strip leading/trailing newlines from value
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+            param_value = self._ps_trim_trailing(self._ps_trim_leading(match[idx + 1 :]))
 
             param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
 
@@ -1998,11 +2279,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 continue
 
             param_name = match[:idx].strip()
-            param_value = match[idx + 1 :]
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+            param_value = self._ps_trim_trailing(self._ps_trim_leading(match[idx + 1 :]))
 
             if param_value.strip():
                 has_visible_value = True
@@ -2046,6 +2323,53 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     calls.append(item)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
+class MiMoV2ToolCallDetector(Qwen3CoderDetector):
+    """MiMo uses Qwen3Coder's envelope but treats parameter contents verbatim."""
+
+    _ps_trim = ""
+    _ps_trim_single = False
+    returns_full_normal_text = True
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Replay the streaming grammar so literal closer text inside values survives."""
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx] if idx != -1 else text
+        normal_parts = [normal_text]
+        clone = type(self)()
+        raw_calls: List[ToolCallItem] = []
+        saw_call = False
+        chunk = text
+        while True:
+            result = clone.parse_streaming_increment(chunk, tools)
+            raw_calls.extend(result.calls)
+            if saw_call:
+                normal_parts.append(result.normal_text)
+            saw_call = saw_call or bool(result.calls)
+            if not chunk and not result.calls and not result.normal_text:
+                break
+            chunk = ""
+        raw_calls.extend(clone.finalize_streaming())
+        clone.finish_streaming()
+
+        order: List[int] = []
+        by_index: Dict[int, Dict[str, str]] = {}
+        for item in raw_calls:
+            if item.name is not None and item.tool_index not in by_index:
+                by_index[item.tool_index] = {"name": item.name, "params": ""}
+                order.append(item.tool_index)
+            if item.parameters and item.tool_index in by_index:
+                by_index[item.tool_index]["params"] += item.parameters
+        calls = [
+            ToolCallItem(
+                tool_index=ordinal,
+                name=by_index[index]["name"],
+                parameters=by_index[index]["params"] or "{}",
+            )
+            for ordinal, index in enumerate(order)
+        ]
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
 
 class Gemma4Detector(BaseFormatDetector):
@@ -3532,6 +3856,7 @@ class FunctionCallParser:
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
         "muse_glimmer": MuseGlimmerDetector,
+        "mimo_v2": MiMoV2ToolCallDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
@@ -3595,7 +3920,12 @@ class FunctionCallParser:
                 normal = parsed_result.normal_text or ""
                 # Only plain text: an unterminated final block would make the
                 # "last closer" precede it and leak markup into content.
-                if tail.strip() and tail.strip() not in normal and not self.detector.has_tool_call(tail):
+                if (
+                    tail.strip()
+                    and not getattr(self.detector, "returns_full_normal_text", False)
+                    and tail.strip() not in normal
+                    and not self.detector.has_tool_call(tail)
+                ):
                     parsed_result.normal_text = normal + tail
             return parsed_result
         else:

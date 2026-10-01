@@ -206,8 +206,9 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if info.requires_flashinfer and not _flashinfer_available():
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
-                "not installed. Install it with `pip install 'freetoken[fi]'` (or "
-                "'freetoken[accel]'), or use --attention-backend triton."
+                "unavailable (not installed or failed to import; see the earlier diagnostic). "
+                "Install it with `pip install 'freetoken[fi]'` (or 'freetoken[accel]'), "
+                "or use --attention-backend triton."
             )
         if info.requires_sgl_kernel and not _sgl_flash_attn_available():
             raise RuntimeError(
@@ -326,6 +327,10 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        if config.model_spec.model_cls == "MiMoV2ForCausalLM" and config.tp_info.size != 1:
+            raise ValueError(
+                f"MiMo v2 supports tensor parallel size 1 only; got TP={config.tp_info.size}"
+            )
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))

@@ -27,6 +27,7 @@ class Nvfp4ExpertSourceSpec:
     # The checkpoint stores the QUANT-side global scale (local fp8 scales were
     # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
+    validate_weight_map: Callable[[dict[str, str], object], None] | None = None
 
 
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
@@ -88,6 +89,8 @@ def iter_nvfp4_expert_pieces(
     drop = drop_page_cache or _drop
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
+    if spec.validate_weight_map is not None:
+        spec.validate_weight_map(weight_map, config)
 
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:

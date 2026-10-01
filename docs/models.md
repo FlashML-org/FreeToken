@@ -19,6 +19,18 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
+| MiMo v2.6 Flash (text-only) | `MiMoV2ForCausalLM` safetensors checkpoints (BF16 or ModelOpt routed W4A16_NVFP4) |
+
+### MiMo v2.6 Flash capabilities
+
+MiMo v2.6 Flash is supported at tensor parallel size 1. The loader serves only the
+text tower; vision, audio, speech-embedding, and MTP weights are intentionally
+excluded. BF16 checkpoints may use an index or a single safetensors file without
+one. Routed experts may be BF16 resident weights or ModelOpt `MIXED_PRECISION`
+experts explicitly listed as `W4A16_NVFP4` with group size 16. The NVFP4 expert
+path uses the ModelOpt `weight_scale_2` global-scale layout and the offload backend;
+other quantization dialects, quantized dense projections, shared experts, and TP>1
+are not supported by this family loader.
 
 ### Image input
 

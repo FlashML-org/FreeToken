@@ -393,22 +393,25 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
 
 class ThinkReasoningParser(BaseReasoningParser):
     """Generic ``<think>``/``</think>`` reasoning parser for models that wrap their
-    chain-of-thought in think tags (Qwen3/3.5, GLM-4.x, MiniMax-M2). No DSML tool
-    marker — reasoning ends at ``</think>``.
+    chain-of-thought in think tags (Qwen3/3.5, GLM-4.x, MiniMax-M2, MiMo V2).
 
     Assumes the model closes ``</think>`` before any tool call. These families do
-    so in well-formed thinking mode; unlike dsv4 there is no ``tool_start_token``
-    fallback, so a (malformed) turn that skips ``</think>`` and runs straight into
-    a tool call would fold that block into reasoning. Add a family-appropriate
-    ``tool_start_token`` (as ``DeepSeekV32ReasoningParser`` does) if that surfaces.
+    so in well-formed thinking mode. A family may provide a ``tool_start_token``
+    fallback when malformed output skips ``</think>`` before a tool call.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = True,
+        tool_start_token: Optional[str] = None,
+    ) -> None:
         super().__init__(
             think_start_token=THINK_START_TOKEN,
             think_end_token=THINK_END_TOKEN,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token=tool_start_token,
         )
 
 
@@ -877,6 +880,7 @@ class ReasoningParser:
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": ThinkReasoningParser,
+        "mimo_v2": ThinkReasoningParser,
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
@@ -893,8 +897,13 @@ class ReasoningParser:
         parser_class = self.ReasoningParserEnum.get(reasoning_parser)
         if parser_class is None:
             raise ValueError(f"Unsupported reasoning_parser: {reasoning_parser}")
+        parser_kwargs = {}
+        if reasoning_parser == "mimo_v2":
+            parser_kwargs["tool_start_token"] = "<tool_call>"
         self.detector = parser_class(
-            force_reasoning=force_reasoning, stream_reasoning=stream_reasoning
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            **parser_kwargs,
         )
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, str]:

@@ -3,14 +3,21 @@
 When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
 ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
-importable (no import side effects), and the result is cached.
+importable (no import side effects), and the result is cached. flashinfer is
+the exception: it probes with a real import because a version-mismatched
+python/cubin/jit-cache mix is ``find_spec``-visible yet raises on import (see
+``is_flashinfer_installed``).
 """
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.util
 
 import torch
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def _importable(name: str) -> bool:
@@ -25,7 +32,30 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
-    return _importable("flashinfer")
+    # ``find_spec`` only proves a wheel is present: a version-mismatched
+    # flashinfer-python / -cubin / -jit-cache mix imports raise, so callers
+    # would crash instead of falling back to triton. Probe with a real import,
+    # swallowing any failure like ``driver_cuda_version()`` / ``driver_hip_version()``.
+    try:
+        importlib.import_module("flashinfer")
+    except ModuleNotFoundError as exc:
+        if exc.name == "flashinfer":
+            logger.info_rank0("flashinfer is not installed; using the Triton kernel fallback")
+        else:
+            detail = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+            logger.warning_rank0(
+                f"flashinfer is installed but failed to import ({type(exc).__name__}: {detail}); "
+                "using the Triton kernel fallback"
+            )
+        return False
+    except Exception as exc:
+        detail = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+        logger.warning_rank0(
+            f"flashinfer is installed but failed to import ({type(exc).__name__}: {detail}); "
+            "using the Triton kernel fallback"
+        )
+        return False
+    return True
 
 
 @functools.cache

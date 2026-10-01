@@ -266,6 +266,18 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # MiMo v2.6 Flash (text-only): full group 4 kv heads x 192, SWA group 8 x 192
+        # (V heads 128 padded to the pool head_dim by the family); 47 MoE layers of
+        # 256 NVFP4 experts, layer 0 dense.
+        name="MiMo-v2.6-Flash-NVFP4",
+        architecture="MiMoV2ForCausalLM",
+        hidden_size=4096,
+        kv_groups=((4, 192), (8, 192)),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=_NVFP4_FORMATS,
+    ),
+    AotModel(
         # MLA latent-KV: the dsa backend writes the latent via torch scatter,
         # not store_cache (same as DSV4 below), so no paged-KV store groups.
         name="zai-org/GLM-5.2-NVFP4",

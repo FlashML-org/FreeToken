@@ -183,6 +183,8 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        if any(tag in marker for tag in ("mimo_v2", "mimov2", "mimo-v2")):
+            return "mimo_v2"
         # M3 first: its marker also contains the bare "minimax" substring, but the
         # namespaced tool grammar is a different protocol from M2's.
         if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
@@ -232,6 +234,8 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        if any(tag in marker for tag in ("mimo_v2", "mimov2", "mimo-v2")):
+            return "mimo_v2"
         if "deepseek" in marker and any(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):

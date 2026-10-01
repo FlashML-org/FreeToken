@@ -262,6 +262,299 @@ def test_parser_accepts_family_specific_tool_call_shapes(
     assert json.loads(result.calls[0].parameters) == expected_args
 
 
+def test_mimo_tool_parser_resolves_schema_unions_and_string_null():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "score": {"type": "number"},
+                    "cached": {"type": "boolean"},
+                    "filters": {"type": "array"},
+                    "metadata": {"type": "object"},
+                    "nullable_int": {"type": ["integer", "null"]},
+                    "nullable_bool": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+                    "nullable_array": {"oneOf": [{"type": "array"}, {"type": "null"}]},
+                    "nullable_object": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                    "nullable_number": {"type": ["number", "null"]},
+                    "literal_null": {"type": "string"},
+                    "actual_null": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                },
+            },
+        },
+    }]
+    block = (
+        "<tool_call><function=lookup>"
+        "<parameter=query>MiMo docs</parameter>"
+        "<parameter=limit>3</parameter>"
+        "<parameter=score>1.5</parameter>"
+        "<parameter=cached>true</parameter>"
+        '<parameter=filters>["recent", "public"]</parameter>'
+        '<parameter=metadata>{"source":"api"}</parameter>'
+        "<parameter=nullable_int>7</parameter>"
+        "<parameter=nullable_bool>false</parameter>"
+        "<parameter=nullable_array>[1,2]</parameter>"
+        '<parameter=nullable_object>{"ok":true}</parameter>'
+        "<parameter=nullable_number>1.25</parameter>"
+        "<parameter=literal_null>null</parameter>"
+        "<parameter=actual_null>null</parameter>"
+        "</function></tool_call>"
+    )
+    result = FunctionCallParser(tools, "mimo_v2").parse_non_stream(
+        "Before call. " + block + " After call."
+    )
+
+    assert result.normal_text == "Before call.  After call."
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "lookup"
+    assert json.loads(result.calls[0].parameters) == {
+        "query": "MiMo docs",
+        "limit": 3,
+        "score": 1.5,
+        "cached": True,
+        "filters": ["recent", "public"],
+        "metadata": {"source": "api"},
+        "nullable_int": 7,
+        "nullable_bool": False,
+        "nullable_array": [1, 2],
+        "nullable_object": {"ok": True},
+        "nullable_number": 1.25,
+        "literal_null": "null",
+        "actual_null": None,
+    }
+
+    parser = FunctionCallParser(tools, "mimo_v2")
+    emitted = []
+    for i in range(0, len(block), 5):
+        _, calls = parser.parse_stream_chunk(block[i : i + 5])
+        emitted.extend(calls)
+    streamed = json.loads("".join(call.parameters for call in emitted if call.name is None))
+    assert streamed == json.loads(result.calls[0].parameters)
+
+
+def test_mimo_tool_parser_streaming_schema_union_matches_one_shot():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        },
+    }]
+    block = "<tool_call><function=lookup><parameter=limit>3</parameter></function></tool_call>"
+    parser = FunctionCallParser(tools, "mimo_v2")
+    calls = []
+    text = []
+    for i in range(0, len(block), 3):
+        normal, emitted = parser.parse_stream_chunk(block[i : i + 3])
+        text.append(normal)
+        calls.extend(emitted)
+    assert "".join(text) == ""
+    named = next(call for call in calls if call.name is not None)
+    assert named.name == "lookup"
+    assert json.loads("".join(call.parameters for call in calls if call.name is None)) == {
+        "limit": 3
+    }
+    assert parser.finish_stream() == ""
+
+    truncated = FunctionCallParser(tools, "qwen3_coder").parse_non_stream(
+        "Checking. <tool_call><function=lookup><parameter=limit>3</parameter>"
+    )
+    assert truncated.normal_text == "Checking."
+    assert len(truncated.calls) == 1
+    assert truncated.calls[0].name == "lookup"
+    assert json.loads(truncated.calls[0].parameters) == {"limit": 3}
+
+
+def test_mimo_preserves_exact_string_values_while_qwen_keeps_legacy_trim():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "echo",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "leading": {"type": "string"},
+                    "empty": {"type": "string"},
+                    "special": {"type": "string"},
+                    "json": {"type": "object"},
+                },
+            },
+        },
+    }]
+    expected = {
+        "leading": "\nline\n\n",
+        "empty": "",
+        "special": 'quote " slash\\ snow 雪 </function></tool_call>',
+        "json": {"function": "</function>", "outer": "</tool_call>"},
+    }
+    block = (
+        "<tool_call><function=echo>"
+        "<parameter=leading>\nline\n\n</parameter>"
+        "<parameter=empty></parameter>"
+        '<parameter=special>quote " slash\\ snow 雪 </function></tool_call></parameter>'
+        '<parameter=json>{"function":"</function>","outer":"</tool_call>"}</parameter>'
+        "</function></tool_call>"
+    )
+    one_shot = FunctionCallParser(tools, "mimo_v2").parse_non_stream(block)
+    assert json.loads(one_shot.calls[0].parameters) == expected
+
+    streamed = FunctionCallParser(tools, "mimo_v2")
+    chunks = []
+    calls = []
+    for i in range(0, len(block), 2):
+        normal, emitted = streamed.parse_stream_chunk(block[i : i + 2])
+        chunks.append(normal)
+        calls.extend(emitted)
+    streamed_args = json.loads(
+        "".join(call.parameters for call in calls if call.name is None)
+    )
+    assert streamed_args == expected
+    assert "".join(chunks) == ""
+
+    qwen_block = (
+        "<tool_call><function=echo><parameter=leading>\nline\n\n</parameter>"
+        "</function></tool_call>"
+    )
+    qwen = FunctionCallParser(tools, "qwen3_coder").parse_non_stream(qwen_block)
+    assert json.loads(qwen.calls[0].parameters) == {"leading": "line\n"}
+
+
+def test_mimo_outer_close_only_at_end_of_stream_recovers_string_call():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "echo",
+            "parameters": {"properties": {"text": {"type": "string"}}},
+        },
+    }]
+    wire = "<tool_call><function=echo><parameter=text>partial</tool_call>"
+    parser = FunctionCallParser(tools, "mimo_v2")
+    fragments = []
+    for i in range(0, len(wire), 2):
+        _, calls = parser.parse_stream_chunk(wire[i : i + 2])
+        fragments.extend(call.parameters for call in calls if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"text": "partial"}
+    assert parser.finish_stream() == ""
+
+
+def test_mimo_unknown_tool_with_missing_parameter_close_does_not_swallow_next_call(monkeypatch):
+    monkeypatch.setattr("freetoken.server.function_call_parser.FORWARD_UNKNOWN_TOOLS", False)
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"properties": {"limit": {"type": "integer"}}},
+        },
+    }]
+    wire = (
+        "<tool_call><function=unknown><parameter=unused>ignored"
+        "</function></tool_call>"
+        "<tool_call><function=lookup><parameter=limit>3</parameter>"
+        "</function></tool_call>"
+    )
+    parser = FunctionCallParser(tools, "mimo_v2")
+    calls = []
+    for i in range(0, len(wire), 2):
+        _, emitted = parser.parse_stream_chunk(wire[i : i + 2])
+        calls.extend(emitted)
+    named = [call for call in calls if call.name is not None]
+    assert [call.name for call in named] == ["lookup"]
+    args = "".join(call.parameters for call in calls if call.name is None)
+    assert json.loads(args) == {"limit": 3}
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "expected"),
+    [
+        ("limit", "3</parameter>", {"limit": 3}),
+        ("limit", "42", {"limit": 42}),
+        ("enabled", "true", {"enabled": True}),
+        ("nullable", "null", {"nullable": None}),
+        ("enabled", "tru", {}),
+        ("items", "[1,", {}),
+        ("text", 'quote " slash\\ 雪', {"text": 'quote " slash\\ 雪'}),
+    ],
+)
+def test_mimo_truncated_stream_finalizes_prefix_stable_json(parameter, value, expected):
+    properties = {
+        "limit": {"type": "integer"},
+        "enabled": {"type": "boolean"},
+        "nullable": {"type": ["integer", "null"]},
+        "items": {"type": "array"},
+        "text": {"type": "string"},
+    }
+    tools = [{
+        "type": "function",
+        "function": {"name": "demo", "parameters": {"properties": properties}},
+    }]
+    prefix = f"<tool_call><function=demo><parameter={parameter}>"
+    parser = FunctionCallParser(tools, "mimo_v2")
+    fragments = []
+    for piece in (prefix, value):
+        _, calls = parser.parse_stream_chunk(piece)
+        fragments.extend(call.parameters for call in calls if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    joined = "".join(fragments)
+    assert joined.startswith("{")
+    assert json.loads(joined) == expected
+
+
+def test_minimax_m2_string_cutoff_finalizes_valid_json():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+    }]
+    wire = (
+        "<minimax:tool_call><invoke name=\"search\"><parameter name=\"query\">"
+        "partial query"
+    )
+    parser = FunctionCallParser(tools, "minimax")
+    fragments = []
+    for i in range(0, len(wire), 4):
+        _, calls = parser.parse_stream_chunk(wire[i : i + 4])
+        fragments.extend(call.parameters for call in calls if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"query": "partial query"}
+
+
+def test_minimax_m2_literal_invoke_closer_is_preserved_in_parameter():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+    }]
+    wire = (
+        '<minimax:tool_call><invoke name="search"><parameter name="query">'
+        "value </invoke> still value</parameter></invoke></minimax:tool_call>"
+    )
+    parser = FunctionCallParser(tools, "minimax")
+    calls = []
+    for i in range(0, len(wire), 3):
+        _, emitted = parser.parse_stream_chunk(wire[i : i + 3])
+        calls.extend(emitted)
+    args = "".join(call.parameters for call in calls if call.name is None)
+    assert json.loads(args) == {"query": "value </invoke> still value"}
+
+
 # --------------------------------------------------------------------------- #
 # Streaming incremental parsing (parse_stream_chunk)
 # --------------------------------------------------------------------------- #
@@ -275,7 +568,7 @@ def _feed(parser, chunks):
     return texts, calls
 
 
-@pytest.mark.parametrize("parser_name", ["qwen25", "glm47", "gemma4", "minimax", "deepseekv32", "qwen3_coder"])
+@pytest.mark.parametrize("parser_name", ["qwen25", "glm47", "gemma4", "minimax", "deepseekv32", "qwen3_coder", "mimo_v2"])
 def test_streaming_plain_text_releases_per_chunk(parser_name):
     # A pure-text response must stream out chunk by chunk, not buffer to the end.
     parser = FunctionCallParser(TOOLS, tool_call_parser=parser_name)

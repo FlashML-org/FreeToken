@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
@@ -221,6 +222,490 @@ def test_glm_reasoning_parser_honors_disabled_thinking_with_tools():
     on = chat_request_to_genspec(chat_request(), {})
     parser = _make_reasoning_parser(on, state)
     assert parser is not None and parser.detector.force_reasoning is True
+
+
+def test_mimo_reasoning_parser_never_forces_implicit_thinking():
+    from freetoken.server.generation import _make_reasoning_parser
+
+    state = FakeState([], tool_call_parser="mimo_v2", reasoning_parser="mimo_v2")
+    for kwargs in (
+        {},
+        {"reasoning_effort": "high"},
+        {"reasoning_effort": "none"},
+        {"chat_template_kwargs": {"enable_thinking": True}},
+    ):
+        spec = chat_request_to_genspec(chat_request(**kwargs), {})
+        parser = _make_reasoning_parser(spec, state)
+        assert parser is not None and parser.detector.force_reasoning is False
+
+    no_tools = chat_request_to_genspec(chat_request(tools=None, reasoning_effort="high"), {})
+    parser = _make_reasoning_parser(no_tools, state)
+    assert parser is not None and parser.detector.force_reasoning is False
+
+
+def test_mimo_tool_response_roundtrips_through_openai_history_and_tool_result():
+    output = (
+        "<think>Check the forecast for the requested city.</think>"
+        "Looking it up. "
+        "<tool_call><function=get_weather>"
+        "<parameter=city>Paris</parameter></function></tool_call>"
+    )
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+    first = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    assistant = first["choices"][0]["message"]
+    assert first["choices"][0]["finish_reason"] == "tool_calls"
+    assert assistant["reasoning_content"] == "Check the forecast for the requested city."
+    assert assistant["content"] == "Looking it up. "
+    call = assistant["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris"}
+
+    follow_up = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {"role": "user", "content": "weather in Paris?"},
+            assistant,
+            {"role": "tool", "tool_call_id": call["id"], "content": "sunny"},
+        ],
+        tools=tool_schema(),
+        max_tokens=8,
+    )
+    replay = chat_request_to_genspec(follow_up, {}).messages
+    assert replay[-2]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert replay[-1] == {
+        "role": "tool",
+        "tool_call_id": call["id"],
+        "content": "sunny",
+    }
+
+
+def test_mimo_openai_stream_cutoffs_keep_argument_deltas_valid_json():
+    schema = [{
+        "type": "function",
+        "function": {
+            "name": "demo",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "enabled": {"type": "boolean"},
+                    "items": {"type": "array"},
+                    "text": {"type": "string"},
+                },
+            },
+        },
+    }]
+    cases = (
+        (
+            "<tool_call><function=demo><parameter=limit>3</parameter>",
+            {"limit": 3},
+        ),
+        (
+            '<tool_call><function=demo><parameter=text>quote " slash\\ snow 雪',
+            {"text": 'quote " slash\\ snow 雪'},
+        ),
+        (
+            "<tool_call><function=demo><parameter=limit>42",
+            {"limit": 42},
+        ),
+        (
+            "<tool_call><function=demo><parameter=enabled>true",
+            {"enabled": True},
+        ),
+        (
+            "<tool_call><function=demo><parameter=items>[1,2]",
+            {"items": [1, 2]},
+        ),
+        (
+            "<tool_call><function=demo><parameter=enabled>tru",
+            {},
+        ),
+        (
+            "<tool_call><function=demo><parameter=items>[1,",
+            {},
+        ),
+    )
+    for tool_parser in ("qwen3_coder", "mimo_v2"):
+        for output, expected in cases:
+            pieces = [output[i : i + 5] for i in range(0, len(output), 5)]
+            state = FakeState(
+                [
+                    UserReply(
+                        uid=42,
+                        incremental_output=piece,
+                        finished=(i == len(pieces) - 1),
+                        finish_reason="length" if i == len(pieces) - 1 else None,
+                    )
+                    for i, piece in enumerate(pieces)
+                ],
+                tool_call_parser=tool_parser,
+                reasoning_parser="mimo_v2" if tool_parser == "mimo_v2" else None,
+            )
+            req = ChatCompletionRequest(
+                model="client-model",
+                messages=[{"role": "user", "content": "run the tool"}],
+                tools=schema,
+                stream=True,
+                max_tokens=8,
+            )
+            events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+            deltas = [
+                call["function"].get("arguments", "")
+                for event in events
+                if isinstance(event, dict)
+                for choice in event.get("choices", [])
+                for call in choice.get("delta", {}).get("tool_calls", [])
+            ]
+            assert json.loads("".join(deltas)) == expected
+            assert events[-2]["choices"][0]["finish_reason"] == "length"
+
+
+def test_mimo_openai_stream_recovers_missing_parameter_close_before_next_call():
+    schema = [
+        {
+            "type": "function",
+            "function": {
+                "name": "first",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "typed",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "second",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "outer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            },
+        },
+    ]
+    output = (
+        "<tool_call><function=first><parameter=text>first value"
+        "</function></tool_call>"
+        "<tool_call><function=typed><parameter=count>5</function></tool_call>"
+        "<tool_call><function=outer><parameter=text>outer only</tool_call>"
+        "<tool_call><function=second><parameter=count>2</parameter>"
+        "</function></tool_call>"
+    )
+    pieces = [output[i : i + 3] for i in range(0, len(output), 3)]
+    state = FakeState(
+        [
+            UserReply(
+                uid=42,
+                incremental_output=piece,
+                finished=(i == len(pieces) - 1),
+            )
+            for i, piece in enumerate(pieces)
+        ],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+    req = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run both tools"}],
+        tools=schema,
+        stream=True,
+        max_tokens=16,
+    )
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+    calls = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for choice in event.get("choices", []):
+            for delta in choice.get("delta", {}).get("tool_calls", []):
+                current = calls.setdefault(delta["index"], {"name": None, "arguments": ""})
+                current["name"] = delta.get("function", {}).get("name") or current["name"]
+                current["arguments"] += delta.get("function", {}).get("arguments", "")
+
+    assert [calls[index]["name"] for index in sorted(calls)] == [
+        "first", "typed", "outer", "second"
+    ]
+    assert json.loads(calls[0]["arguments"]) == {"text": "first value"}
+    assert json.loads(calls[1]["arguments"]) == {"count": 5}
+    assert json.loads(calls[2]["arguments"]) == {"text": "outer only"}
+    assert json.loads(calls[3]["arguments"]) == {"count": 2}
+    assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_rejected_typed_argument_keeps_following_call_valid_in_shared_stream_parsers():
+    schema = [
+        {
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "next",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            },
+        },
+    ]
+    cases = (
+        (
+            "qwen3_coder",
+            None,
+            "<tool_call><function=demo><parameter=enabled>perhaps</parameter>"
+            "<parameter=count>2</parameter></function>"
+            "<function=next><parameter=count>3</parameter></function></tool_call>",
+        ),
+        (
+            "mimo_v2",
+            "mimo_v2",
+            "<tool_call><function=demo><parameter=enabled>perhaps</parameter>"
+            "<parameter=count>2</parameter></function>"
+            "<function=next><parameter=count>3</parameter></function></tool_call>",
+        ),
+        (
+            "minimax",
+            None,
+            '<minimax:tool_call><invoke name="demo">'
+            '<parameter name="enabled">perhaps</parameter>'
+            '<parameter name="count">2</parameter></invoke>'
+            '<invoke name="next"><parameter name="count">3</parameter></invoke>'
+            '</minimax:tool_call>',
+        ),
+        (
+            "muse_glimmer",
+            "muse_glimmer",
+            '<|start|>assistant to=demo.demo<|message|><atem:function_calls>'
+            '<atem:invoke name="demo"><atem:parameter name="enabled">perhaps</atem:parameter>'
+            '<atem:parameter name="count">2</atem:parameter></atem:invoke>'
+            '<atem:invoke name="next"><atem:parameter name="count">3</atem:parameter>'
+            '</atem:invoke>'
+            '</atem:function_calls><|eot|>',
+        ),
+    )
+    for tool_parser, reasoning_parser, output in cases:
+        pieces = [output[i : i + 3] for i in range(0, len(output), 3)]
+        state = FakeState(
+            [
+                UserReply(
+                    uid=42,
+                    incremental_output=piece,
+                    finished=(i == len(pieces) - 1),
+                )
+                for i, piece in enumerate(pieces)
+            ],
+            tool_call_parser=tool_parser,
+            reasoning_parser=reasoning_parser,
+        )
+        req = ChatCompletionRequest(
+            model="client-model",
+            messages=[{"role": "user", "content": "run demo"}],
+            tools=schema,
+            stream=True,
+            max_tokens=8,
+        )
+        events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+        calls = {}
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            for choice in event.get("choices", []):
+                for delta in choice.get("delta", {}).get("tool_calls", []):
+                    current = calls.setdefault(delta["index"], {"name": None, "arguments": ""})
+                    current["name"] = delta.get("function", {}).get("name") or current["name"]
+                    current["arguments"] += delta.get("function", {}).get("arguments", "")
+        assert [calls[index]["name"] for index in sorted(calls)] == ["demo", "next"], tool_parser
+        assert json.loads(calls[0]["arguments"]) == {"count": 2}, tool_parser
+        assert json.loads(calls[1]["arguments"]) == {"count": 3}, tool_parser
+
+
+def test_mimo_nonstream_and_stream_preserve_text_between_tool_calls():
+    schema = [{
+        "type": "function",
+        "function": {
+            "name": "demo",
+            "parameters": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+            },
+        },
+    }]
+    request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run twice"}],
+        tools=schema,
+        max_tokens=16,
+    )
+
+    def check_roundtrip(output, expected):
+        nonstream_state = FakeState(
+            [UserReply(uid=42, incremental_output=output, finished=True)],
+            tool_call_parser="mimo_v2",
+            reasoning_parser="mimo_v2",
+        )
+        nonstream = run(
+            handle_chat_completion(request, request=None, state=nonstream_state, model_sampling={})
+        )
+        nonstream_content = nonstream["choices"][0]["message"]["content"]
+        assert nonstream_content == expected
+
+        pieces = [output[i : i + 4] for i in range(0, len(output), 4)]
+        stream_state = FakeState(
+            [
+                UserReply(
+                    uid=42,
+                    incremental_output=piece,
+                    finished=(i == len(pieces) - 1),
+                )
+                for i, piece in enumerate(pieces)
+            ],
+            tool_call_parser="mimo_v2",
+            reasoning_parser="mimo_v2",
+        )
+        stream_request = ChatCompletionRequest(
+            model="client-model",
+            messages=[{"role": "user", "content": "run twice"}],
+            tools=schema,
+            stream=True,
+            max_tokens=16,
+        )
+        events = parse_sse(
+            run(_collect(stream_chat_completion_chunks(42, stream_request, stream_state)))
+        )
+        streamed_content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in events
+            if isinstance(event, dict)
+            for choice in event.get("choices", [])
+        )
+        assert streamed_content == nonstream_content
+
+    first = "<tool_call><function=demo><parameter=count>1</parameter></function></tool_call>"
+    second = "<tool_call><function=demo><parameter=count>2</parameter></function></tool_call>"
+    for middle, expected in (("middle", "BeforemiddleAfter"), ("After", "BeforeAfterAfter")):
+        check_roundtrip("Before" + first + middle + second + "After", expected)
+
+
+def test_mimo_history_renders_verbatim_arguments_in_reference_template():
+    import os
+    from pathlib import Path
+
+    from jinja2 import Environment
+
+    expected = {
+        "leading": "\nline\n\n",
+        "empty": "",
+        "special": 'quote " slash\\ snow 雪',
+    }
+    output = (
+        "<tool_call><function=echo>"
+        "<parameter=leading>\nline\n\n</parameter>"
+        "<parameter=empty></parameter>"
+        '<parameter=special>quote " slash\\ snow 雪</parameter>'
+        "</function></tool_call>"
+    )
+    schema = [{
+        "type": "function",
+        "function": {
+            "name": "echo",
+            "parameters": {
+                "type": "object",
+                "properties": {key: {"type": "string"} for key in expected},
+            },
+        },
+    }]
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+    request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "echo these values"}],
+        tools=schema,
+        max_tokens=8,
+    )
+    response = run(handle_chat_completion(request, request=None, state=state, model_sampling={}))
+    assistant = response["choices"][0]["message"]
+    assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == expected
+
+    follow_up = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {"role": "user", "content": "echo these values"},
+            assistant,
+            {
+                "role": "tool",
+                "tool_call_id": assistant["tool_calls"][0]["id"],
+                "content": "received",
+            },
+        ],
+        tools=schema,
+        max_tokens=8,
+    )
+    spec = chat_request_to_genspec(follow_up, {})
+    root = Path(__file__).resolve().parents[2]
+    template_path = Path(
+        os.environ.get(
+            "FREETOKEN_MIMO_CHAT_TEMPLATE",
+            root / "validation" / "real_ckpt_ref" / "chat_template.jinja",
+        )
+    )
+    if not template_path.is_file():
+        pytest.skip("MiMo validation chat template is not available")
+    template = template_path.read_text()
+    environment = Environment()
+    environment.filters["tojson"] = lambda value, ensure_ascii=True: json.dumps(
+        value, ensure_ascii=ensure_ascii
+    )
+    rendered = environment.from_string(template).render(
+        messages=spec.messages,
+        tools=spec.template_tools,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    expected_envelope = (
+        "<tool_call><function=echo>"
+        "<parameter=leading>\nline\n\n</parameter>"
+        "<parameter=empty></parameter>"
+        '<parameter=special>quote " slash\\ snow 雪</parameter>'
+        "</function></tool_call>"
+    )
+    assert expected_envelope in rendered
 
 
 def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():

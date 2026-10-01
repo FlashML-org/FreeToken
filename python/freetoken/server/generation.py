@@ -378,7 +378,11 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     reasoning parser configured. ``force_reasoning`` matches the encode-side
     thinking mode so chat-mode content is never mislabeled as reasoning."""
     parser_name = getattr(state.config, "reasoning_parser", None)
-    if parser_name == "qwen3":
+    if parser_name == "mimo_v2":
+        # MiMo's template leaves generation outside <think> in every mode, including
+        # when tools are present; the model emits its own opener when it reasons.
+        force_reasoning = False
+    elif parser_name == "qwen3":
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
         # enable_thinking is explicitly false, so the model emits only the closing
         # </think>. Mirror that default here, else the chain-of-thought leaks into content.

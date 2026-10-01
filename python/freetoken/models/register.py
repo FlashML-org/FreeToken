@@ -276,6 +276,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm4MoeForCausalLM",
         packed_modules_mapping=_EXPERTS_PACKED,
     ),
+    # MiMo v2.6 Flash (model_type mimo_v2): text-only 48-layer hybrid -- 9 full + 39 SWA
+    # (window 128, fp32 sinks on the SWA group) with head_dim 192 / 128-dim V heads (padded
+    # to 192 in the family's attention), dual rope (1e7 / 1e4, partial 0.334 -> rotary_dim 64),
+    # fused F32 qkv, layer-0 dense MLP, then 256-expert sigmoid/noaux_tc MoE top-8 with no
+    # shared expert; the modelopt release stores the experts NVFP4 for the offload cache.
+    "MiMoV2ForCausalLM": ModelSpec(
+        "freetoken.models.mimo_v2",
+        "MiMoV2ForCausalLM",
+        packed_modules_mapping=_EXPERTS_PACKED,
+    ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
     # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from
     # the offload cache.

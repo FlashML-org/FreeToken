@@ -404,3 +404,27 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
+
+
+def test_mimo_tp_rejected_before_engine_gpu_or_distributed_setup(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine import engine as engine_module
+
+    config = SimpleNamespace(
+        model_spec=SimpleNamespace(model_cls="MiMoV2ForCausalLM"),
+        tp_info=DistributedInfo(rank=0, size=2),
+    )
+    monkeypatch.setattr(
+        engine_module.torch.cuda,
+        "is_initialized",
+        lambda: pytest.fail("TP admission must precede CUDA initialization checks"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "set_tp_info",
+        lambda **_kwargs: pytest.fail("TP admission must precede distributed setup"),
+    )
+    with pytest.raises(ValueError, match="tensor parallel size 1 only; got TP=2"):
+        engine_module.Engine(config)

@@ -91,7 +91,7 @@ def test_harmony_streaming_splits_marker_across_chunks():
 import pytest
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "mimo_v2"])
 def test_think_non_stream_splits_reasoning(name):
     parser = ReasoningParser(name, force_reasoning=False)
     reasoning, content = parser.parse_non_stream("<think>weigh options</think>final answer")
@@ -99,7 +99,7 @@ def test_think_non_stream_splits_reasoning(name):
     assert content == "final answer"
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "mimo_v2"])
 def test_think_implicit_only_closing_tag(name):
     # Implicit-think: template injected the opening <think>; output starts inside.
     parser = ReasoningParser(name, force_reasoning=True)
@@ -108,12 +108,38 @@ def test_think_implicit_only_closing_tag(name):
     assert content == "the answer"
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "mimo_v2"])
 def test_think_no_reasoning_passthrough(name):
     parser = ReasoningParser(name, force_reasoning=False)
     reasoning, content = parser.parse_non_stream("just an answer")
     assert reasoning == ""
     assert content == "just an answer"
+
+
+def test_mimo_missing_think_closer_keeps_tool_envelope_in_content():
+    text = "<think>planning the call<tool_call><function=read></function></tool_call>"
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert parser.parse_non_stream(text) == (
+        "planning the call",
+        "<tool_call><function=read></function></tool_call>",
+    )
+
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert _stream(
+        parser,
+        ["<think>planning", " the call<tool_", "call>", "<function=read></function></tool_call>"],
+    ) == (
+        "planning the call",
+        "<tool_call><function=read></function></tool_call>",
+    )
+
+
+def test_mimo_truncated_reasoning_flushes_to_reasoning():
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert _stream(parser, ["<think>unfinished thought</th"]) == (
+        "unfinished thought</th",
+        "",
+    )
 
 
 # ----------------------------------------------------------------------- gemma

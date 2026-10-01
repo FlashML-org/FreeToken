@@ -161,6 +161,9 @@ class FullAttentionGroupConfig(BaseAttentionGroupConfig):
     # GQA + ratio > 1 -> AttnType.QSA (Qwen3.8); MLA + ratio > 1 -> the glm5_next
     # kpool DSA layout (attn type stays DSA; the pool factory branches on mla).
     index_ratio: int = 1
+    # V head width when it differs from head_dim (MiMo v2: V 128 is zero-padded to the
+    # group head_dim by the model itself); 0 = V is head_dim-wide (every other family).
+    v_head_dim: int = 0
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     sliding_window: int
     # image token spans attend to each other in both directions on these layers
     bidirectional_mm_blocks: bool = False
+    # V head width when it differs from head_dim (see FullAttentionGroupConfig.v_head_dim).
+    v_head_dim: int = 0
 
 
 @dataclass(frozen=True)
@@ -300,6 +305,8 @@ class ModelConfig:
     n_group: int = 1
     topk_group: int = 1
     attn_sm_scale: float | None = None  # None -> 1/sqrt(head_dim)
+    # Optional model-wide value scaling applied after attention's V projection.
+    attention_value_scale: float | None = None
     final_logit_softcapping: float | None = None
     embedding_scale: float | None = None
     # Second RMSNorm eps for models whose post-sublayer norms use a different eps than the

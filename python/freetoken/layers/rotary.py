@@ -8,6 +8,10 @@ import torch
 
 from .base import StateLessOP
 
+# The only head sizes flashinfer's rope dispatch compiles for; anything else (even 192)
+# runs the size-agnostic triton kernel instead.
+FLASHINFER_HEAD_SIZES = (64, 128, 256, 512)
+
 
 class RotaryEmbedding(StateLessOP):
     def __init__(
@@ -57,11 +61,19 @@ class RotaryEmbedding(StateLessOP):
         sin = freqs.sin() * attention_factor
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
-        assert self.head_size in [64, 128, 256, 512]
+        # head_size only has to be a sane even stride: the triton rope is masked over
+        # rotary_dim and treats head_size as a plain stride (kernel/triton/rope.py) and
+        # is graph-capture-safe, so ANY even size runs. The whitelist below gates ONLY
+        # the flashinfer fast path (the widths its dispatch table compiles for).
+        if self.head_size <= 0 or self.head_size % 2 != 0 or self.head_size > 2048:
+            raise ValueError(
+                f"Unsupported rope head_size {self.head_size}: must be a positive even "
+                f"dimension <= 2048."
+            )
 
         from freetoken.kernel.backend import is_flashinfer_installed
 
-        if is_flashinfer_installed():
+        if is_flashinfer_installed() and self.head_size in FLASHINFER_HEAD_SIZES:
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
         else:
             from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace

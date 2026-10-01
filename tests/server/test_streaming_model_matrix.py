@@ -72,6 +72,10 @@ CALL_BLOCKS = {
         "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
         "</function></tool_call>"
     ),
+    "mimo_v2": (
+        "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
+        "</function></tool_call>"
+    ),
     "glm47": (
         "<tool_call>read<arg_key>filePath</arg_key><arg_value>/tmp/test_calc.py</arg_value></tool_call>"
     ),
@@ -106,6 +110,7 @@ MARKUP_MARKERS = {
     "deepseekv32": ["｜DSML｜"],
     "qwen25": ["<tool_call>", "</tool_call>"],
     "qwen3_coder": ["<tool_call>", "<function="],
+    "mimo_v2": ["<tool_call>", "<function="],
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
     "minimax": ["<minimax:tool_call>", "<invoke"],
@@ -122,6 +127,7 @@ MARKUP_MARKERS = {
 REASONING_FAMILIES = {
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
+    "mimo-v2": ("mimo_v2", "mimo_v2", "<think>", "</think>"),
     "qwen": ("qwen25", "qwen3", "", "</think>"),
     "glm4.7": ("glm47", "glm", "", "</think>"),
     "minimax-m2": ("minimax", "minimax", "", "</think>"),
@@ -307,6 +313,7 @@ def test_reasoning_generation_level(name):
     calls = _calls(events)
     assert len(calls) == 1 and calls[0].name == "read"
     assert json.loads(calls[0].parameters) == READ_ARGS
+    assert events[-1].finish_reason == "tool_calls"
 
     full = _full_result(text, tool, reasoning)
     assert full.reasoning.strip() == THINKING
@@ -549,6 +556,15 @@ def test_two_calls_get_output_ordinals():
             ],
             {"filePath": "/a"},
         ),
+        (  # invoke/parameter envelope: complete typed value survives an open outer block
+            "qwen3_coder",
+            [
+                "Checking. ",
+                "<tool_call><function=read>",
+                "<parameter=filePath>/a</parameter>",
+            ],
+            {"filePath": "/a"},
+        ),
         (  # tag-block family: unterminated block recovered by closing it
             "glm47",
             ["Checking. ", "<tool_call>read\n", "<arg_key>filePath</arg_key><arg_value>/a</arg_value>\n"],
@@ -562,6 +578,20 @@ def test_truncated_call_recovers_arguments(tool, chunks, expected_args):
     assert len(calls) == 1 and calls[0].name == "read"
     assert json.loads(calls[0].parameters) == expected_args
     assert events[-1].finish_reason == "length"  # truncation wins over tool_calls
+
+
+def test_mimo_missing_think_closer_preserves_truncated_tool_call():
+    text = (
+        "<think>Planning the lookup. "
+        "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
+    )
+    chunks = _random_chunks(text, 23)
+    events = _stream_events(chunks, "mimo_v2", "mimo_v2", finish_reason="length")
+    assert _reasoning(events).strip() == "Planning the lookup."
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == READ_ARGS
+    assert events[-1].finish_reason == "length"
 
 
 def test_dsv4_reasoning_then_tool_block_streams_and_orders_correctly():
