@@ -584,9 +584,15 @@ static void* cumemop_dlsym(void* h, const char* n) {
 #else
 #include <dlfcn.h>
 static void* cumemop_dlopen() {
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+  void* h = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+  if (h == nullptr) h = dlopen("/opt/rocm/lib/libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+  return h;
+#else
   void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
   if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
   return h;
+#endif
 }
 static void* cumemop_dlsym(void* h, const char* n) { return dlsym(h, n); }
 #endif
@@ -595,6 +601,23 @@ using cuMemOp64_fn = int (*)(void* stream, unsigned long long addr, unsigned lon
                              unsigned int flags);
 static cuMemOp64_fn g_cu_write64 = nullptr;
 static cuMemOp64_fn g_cu_wait64 = nullptr;
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+// HIP's hipStreamWaitValue64 has a 5th `mask` parameter that cuStreamWaitValue64 lacks;
+// calling it through the 4-arg CUDA type leaves the mask as a garbage register -> the
+// wait predicate never satisfies and the stream hangs. Load the real 5-arg symbol and
+// always pass a full mask.
+using hipWait64_fn = int (*)(void* stream, unsigned long long addr, unsigned long long value,
+                            unsigned int flags, unsigned long long mask);
+static hipWait64_fn g_hip_wait64 = nullptr;
+#endif
+static inline int mem_wait64(void* s, unsigned long long addr, unsigned long long value,
+                             unsigned int flags) {
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+  return g_hip_wait64(s, addr, value, flags, ~0ULL);
+#else
+  return g_cu_wait64(s, addr, value, flags);
+#endif
+}
 static constexpr unsigned int kCuWaitValueGeq = 0x0;   // CU_STREAM_WAIT_VALUE_GEQ
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
 
@@ -604,6 +627,11 @@ static bool cumemop_resolve() {
     if (h == nullptr) return false;
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
     // names with the same signature.
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
+    g_hip_wait64 = reinterpret_cast<hipWait64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
+    return g_cu_write64 != nullptr && g_hip_wait64 != nullptr;
+#else
     g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
     if (g_cu_write64 == nullptr)
       g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64"));
@@ -611,6 +639,7 @@ static bool cumemop_resolve() {
     if (g_cu_wait64 == nullptr)
       g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
     return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
+#endif
   }();
   return resolved;
 }
@@ -621,7 +650,7 @@ static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   if (!cumemop_resolve()) return false;
   auto* s = reinterpret_cast<void*>(stream);
   if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
-  if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
+  if (mem_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
   return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
 }
 
@@ -643,9 +672,86 @@ static void cumemop_check(int rc, const char* what) {
   }
 }
 
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+#include <hip/hiprtc.h>
+#include <vector>
+#include <string>
+// hipGraph replays memcpy/kernel nodes but NOT stream-memop nodes (they no-op on
+// relaunch on ROCm 7.14 -- verified: memop write 0/50, memop wait ~1/20, kernel 50/50).
+// So drive the GPU<->CPU flag handshake with tiny kernels (runtime-compiled via hiprtc
+// so this host-only extension needs no device-source build step). Under capture these
+// become kernel nodes that replay correctly with the freshly written pinned flags.
+static hipFunction_t g_submit_fn = nullptr, g_wait_fn = nullptr;
+static bool g_flag_kfn_ready = false;
+static void ensure_flag_kernels() {
+  if (g_flag_kfn_ready) return;
+  static const char* src =
+    "extern \"C\" __global__ void ft_flag_submit(long long* done, long long* ready, long long slot){\n"
+    "  done[slot]=0; __threadfence_system(); ready[slot]=1; __threadfence_system();\n}\n"
+    "extern \"C\" __global__ void ft_flag_wait(long long* done, long long slot){\n"
+    "  volatile long long* d=done;\n"
+    "  while(d[slot]<1){ __builtin_amdgcn_s_sleep(2); }\n"
+    "  __threadfence_system();\n}\n";
+  hiprtcProgram prog;
+  if (hiprtcCreateProgram(&prog, src, "ft_flags.hip", 0, nullptr, nullptr) != HIPRTC_SUCCESS) return;
+  hipDeviceProp_t props; hipGetDeviceProperties(&props, 0);
+  std::string archopt = std::string("--gpu-architecture=") + props.gcnArchName;
+  const char* opts[] = { archopt.c_str() };
+  hiprtcResult cr = hiprtcCompileProgram(prog, 1, opts);
+  if (cr != HIPRTC_SUCCESS) {
+    size_t lsz = 0; hiprtcGetProgramLogSize(prog, &lsz);
+    std::vector<char> log(lsz + 1, 0); if (lsz) hiprtcGetProgramLog(prog, log.data());
+    std::fprintf(stderr, "[freetoken/cpu_moe] hiprtc compile failed: %s\n", log.data());
+    hiprtcDestroyProgram(&prog); return;
+  }
+  size_t codeSize = 0; hiprtcGetCodeSize(prog, &codeSize);
+  std::vector<char> code(codeSize); hiprtcGetCode(prog, code.data());
+  hiprtcDestroyProgram(&prog);
+  hipModule_t mod;
+  if (hipModuleLoadData(&mod, code.data()) != hipSuccess) return;
+  hipModuleGetFunction(&g_submit_fn, mod, "ft_flag_submit");
+  hipModuleGetFunction(&g_wait_fn, mod, "ft_flag_wait");
+  g_flag_kfn_ready = (g_submit_fn != nullptr && g_wait_fn != nullptr);
+}
+static void kernel_flag_submit(void* stream, uintptr_t done_addr, uintptr_t ready_addr, long long slot) {
+  ensure_flag_kernels();
+  struct { void* d; void* r; long long s; } args{(void*)done_addr, (void*)ready_addr, slot};
+  size_t sz = sizeof(args);
+  void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
+  cumemop_check(hipModuleLaunchKernel(g_submit_fn, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_submit");
+}
+static void kernel_flag_wait(void* stream, uintptr_t done_addr, long long slot) {
+  ensure_flag_kernels();
+  struct { void* d; long long s; } args{(void*)done_addr, slot};
+  size_t sz = sizeof(args);
+  void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
+  cumemop_check(hipModuleLaunchKernel(g_wait_fn, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_wait");
+}
+// Do stream-memop nodes replay inside a hipGraph on THIS runtime? The no-op-on-replay bug is a
+// ROCm 7.14 issue, fixed on ROCm 10 (hipRuntimeGetVersion encodes major*1e7+minor*1e5+patch:
+// 71460850 = 7.14, 71526333 = 7.15/ROCm 10). >= 7.15.0 -> use the zero-CU memop handshake; older
+// -> the kernel handshake (a spinning CU) since memops silently no-op on replay there. Cached.
+static bool graph_memops_ok() {
+  static int cached = -1;
+  if (cached < 0) {
+    int v = 0;
+    cached = (hipRuntimeGetVersion(&v) == hipSuccess && v >= 71500000) ? 1 : 0;
+  }
+  return cached != 0;
+}
+#endif
+
 static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t ready_addr,
                            int64_t slot) {
   auto* s = reinterpret_cast<void*>(stream);
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+  // ROCm 7.14 no-ops stream-memop nodes on hipGraph replay, so drive the flag with a kernel node
+  // there (a spinning CU); ROCm 10 replays memops and uses the zero-CU memop path below.
+  if (!graph_memops_ok()) {
+    kernel_flag_submit(s, done_addr, ready_addr, (long long)slot);
+    return;
+  }
+#endif
   // Order matters and is preserved by the front end: reset done BEFORE raising ready,
   // so the coordinator's completion write for THIS step can never be wiped.
   cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
@@ -657,7 +763,13 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
+#if (defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__))
+  if (!graph_memops_ok()) {
+    kernel_flag_wait(reinterpret_cast<void*>(stream), done_addr, (long long)slot);
+    return;
+  }
+#endif
+  cumemop_check(mem_wait64(reinterpret_cast<void*>(stream),
                             (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
                             kCuWaitValueGeq),
                 "cuStreamWaitValue64(done)");
