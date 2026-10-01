@@ -248,7 +248,7 @@ def test_triton_pre_only_matches_torch():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_tuned_mhc_preserves_chunked_results_and_graph_replay():
+def test_mhc_split_preserves_chunked_results_and_graph_replay():
     from freetoken.kernel.triton.mhc import mhc_fused_post_pre_single_pass_triton as fused
 
     torch.manual_seed(26)

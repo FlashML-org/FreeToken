@@ -13,8 +13,6 @@ fp32 up to reduction order); tests/layers/test_mhc.py pins the parity. N
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 import triton
 import triton.language as tl
@@ -212,33 +210,11 @@ def _mhc_stage23_kernel(
         )
 
 
-@lru_cache(maxsize=None)
-def _stage1_hidden_tile(h: int, n: int, dtype: torch.dtype, device: torch.device) -> int:
-    from triton.testing import do_bench
-
-    with torch.cuda.device(device):
-        # Always tune one token, so the reduction tree is independent of prefill chunking.
-        mix = 2 * n + n * n
-        blk_mix = triton.next_power_of_2(mix)
-        x = torch.ones(1, h, dtype=dtype, device=device)
-        res = torch.ones(1, n, h, dtype=dtype, device=device)
-        post = torch.ones(1, n, device=device)
-        comb = torch.eye(n, device=device).unsqueeze(0)
-        fn = torch.ones(mix, n * h, device=device)
-        out = torch.empty_like(res)
-        timings = {}
-        for tile in sorted({min(v, triton.next_power_of_2(h)) for v in (64, 128, 256, 512)}):
-            ns = triton.cdiv(h, tile)
-            sq = torch.empty(1, ns, device=device)
-            partial = torch.empty(1, ns, blk_mix, device=device)
-            def run():
-                _mhc_stage1_kernel[(1, ns)](
-                    x, res, post, comb, fn, out, sq, partial,
-                    H=h, N=n, MIX=mix, BLK_MIX=blk_mix, SPLIT=tile, BLOCK_H=tile,
-                    NS=ns, HAS_POST=True, num_warps=4, num_stages=2,
-                )
-            timings[tile] = do_bench(run, warmup=5, rep=20, return_mode="median")
-        return min(timings, key=timings.get)
+def _stage1_hidden_tile(h: int) -> int:
+    """The stage-1 hidden split. It fixes the fp32 reduction order over the hidden width, so it
+    depends on the width alone and results reproduce across processes, machines and chunk sizes.
+    128 gives 32 / 40 programs per token at widths 4096 / 5120."""
+    return min(128, triton.next_power_of_2(h))
 
 
 def _mhc_fused_launch(
@@ -271,7 +247,7 @@ def _mhc_fused_launch(
     comb_out = torch.empty(t, n, n, dtype=torch.float32, device=dev)
     li_out = torch.empty(t, h, dtype=residual.dtype, device=dev)
 
-    block_h = split = _stage1_hidden_tile(h, n, residual.dtype, dev)
+    block_h = split = _stage1_hidden_tile(h)
     ns = triton.cdiv(h, split)
     blk_mix = triton.next_power_of_2(mix)
     sq_part = torch.empty(t, ns, dtype=torch.float32, device=dev)
