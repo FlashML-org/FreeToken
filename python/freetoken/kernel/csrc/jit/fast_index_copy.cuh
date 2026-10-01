@@ -40,7 +40,7 @@ inline constexpr auto get_mem_package() {
     }
 }
 
-__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+__device__ __forceinline__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
 #if FREETOKEN_USE_ROCM
     return uint1{__builtin_nontemporal_load(&src->x)};
 #else
@@ -50,7 +50,7 @@ __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 
 #endif
 }
 
-__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+__device__ __forceinline__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
 #if FREETOKEN_USE_ROCM
     const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint2*>(src));
     return __builtin_bit_cast(uint2, value);
@@ -61,7 +61,7 @@ __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 
 #endif
 }
 
-__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+__device__ __forceinline__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
 #if FREETOKEN_USE_ROCM
     const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint4*>(src));
     return __builtin_bit_cast(uint4, value);
@@ -72,7 +72,7 @@ __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 
 #endif
 }
 
-__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+__device__ __forceinline__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
 #if FREETOKEN_USE_ROCM
     __builtin_nontemporal_store(value.x, &dst->x);
 #else
@@ -81,7 +81,7 @@ __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& v
 #endif
 }
 
-__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+__device__ __forceinline__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
 #if FREETOKEN_USE_ROCM
     __builtin_nontemporal_store(
         __builtin_bit_cast(native_uint2, value), reinterpret_cast<native_uint2*>(dst));
@@ -92,7 +92,7 @@ __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& v
 #endif
 }
 
-__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+__device__ __forceinline__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
 #if FREETOKEN_USE_ROCM
     __builtin_nontemporal_store(
         __builtin_bit_cast(native_uint4, value), reinterpret_cast<native_uint4*>(dst));
@@ -105,7 +105,7 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
 #endif
 }
 
-__always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
+__device__ __forceinline__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
@@ -121,7 +121,7 @@ template <std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
-__always_inline __device__ auto load_vec(const void* __restrict__ src) {
+__device__ __forceinline__ auto load_vec(const void* __restrict__ src) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -141,7 +141,7 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 }
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
-__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
+__device__ __forceinline__ void store_vec(void* __restrict__ dst, const Tp& vec) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
