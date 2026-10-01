@@ -186,7 +186,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "image_token_id": args.image_token_id,
             }
             disk_table = DiskRowTable(
-                resolve_row_source(folder),
+                resolve_row_source(folder, args),
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,
