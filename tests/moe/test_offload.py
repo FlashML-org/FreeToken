@@ -283,6 +283,22 @@ def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
         )
 
 
+@pytest.mark.parametrize("decode_target", ["cpu", "hybrid"])
+def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(decode_target):
+    # a demand-loaded chunk admits its experts into GPU decode's slot cache, which cpu and hybrid decode do not read
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    with pytest.raises(ValueError, match="needs GPU decode"):
+        OffloadMoeCache(
+            num_layers=1,
+            num_experts=4,
+            cache_size=6,
+            device=torch.device("cpu"),
+            decode_target=decode_target,
+            prefill_demand_tokens=64,
+        )
+
+
 def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
