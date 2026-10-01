@@ -1,8 +1,10 @@
-"""FTW replay: dropping entries by name before their bytes are read, and the vision-tower presence check."""
+"""FTW replay: dropping entries by name before their bytes are read, the mmap path, and the vision-tower presence check."""
+
+import math
 
 import torch
 
-from freetoken.checkpoint.ftw import FTWReader, FTWWriter, ftw_tensor_names, iter_ftw_weights
+from freetoken.checkpoint.ftw import ALIGN, FTWReader, FTWWriter, ftw_tensor_names, iter_ftw_weights
 from freetoken.models.weight import ftw_lacks_vision, load_weight
 
 
@@ -30,6 +32,18 @@ def test_keep_drops_entries_before_their_bytes_are_read(tmp_path, monkeypatch):
     assert read == ["model.a.weight", "model.c.weight"]
     for name, tensor in got.items():
         assert torch.equal(tensor, tensors[name])
+
+
+def test_the_mmap_path_reads_what_was_written(tmp_path, monkeypatch):
+    # the reader maps the shards where there is no O_DIRECT (Windows) or the filesystem refuses it
+    tensors = _write_ftw(tmp_path, ["model.a.weight", "model.b.weight"])
+    reader = FTWReader(str(tmp_path))
+    monkeypatch.setattr(reader, "_direct", 0)
+    for entry in reader.entries("weight"):
+        dest = bytearray(math.ceil(entry["nbytes"] / ALIGN) * ALIGN)
+        reader.read_into(memoryview(dest), entry)
+        assert bytes(dest[:entry["nbytes"]]) == tensors[entry["name"]].view(torch.uint8).numpy().tobytes()
+    reader.close()
 
 
 def test_no_keep_replays_every_entry(tmp_path):
