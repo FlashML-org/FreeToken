@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Callable, List, Sequence
 
 import torch
 from freetoken.core import Batch, get_global_ctx
-from freetoken.utils import init_logger
+from freetoken.utils import div_ceil, init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 
@@ -346,7 +346,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """The windows a host-placed prefill stages its pages into, or None to read them in place."""
         if self.kvcache.placement == "device" or md.is_decode:
             return None
-        page_counts = [-(-length // self.page_size) for length in md.kv_len_cpu.tolist()]
+        page_counts = [div_ceil(length, self.page_size) for length in md.kv_len_cpu.tolist()]
         if not staging_moves_less(rows, self.select_width, sum(page_counts) * self.page_size):
             return None
         capacity = self.kvcache.staging_window()[0].shape[0]
