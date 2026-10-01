@@ -537,8 +537,8 @@ class _ReserveFitEngine:
     def _prefill_dummy(self, lengths, input_ids) -> float:
         return 1.0
 
-    def _min_free_memory_keeping_cache(self) -> int:
-        return self.free
+    def _free_memory_across_ranks(self) -> tuple[int, int]:
+        return self.free, self.free
 
     def _target_moe_and_expert_bytes(self, moe_cache_size):
         return self.moe_offload_cache.cache_size, EXPERT_BYTES

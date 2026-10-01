@@ -820,13 +820,7 @@ class Engine:
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-        free_memory = get_free_memory(self.device)
-        free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
-        torch.distributed.all_reduce(
-            free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
-        min_free_memory = int(free_mem_tensor[0].item())
-        max_free_memory = -int(free_mem_tensor[1].item())
+        min_free_memory, max_free_memory = self._free_memory_across_ranks()
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
@@ -835,6 +829,16 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
+
+    def _free_memory_across_ranks(self) -> Tuple[int, int]:
+        """The min and max free device memory across TP ranks, with what the allocator caches still
+        held: after a forward, that is the peak the forward reached."""
+        free_memory = get_free_memory(self.device)
+        free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
+        torch.distributed.all_reduce(
+            free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+        )
+        return int(free_mem_tensor[0].item()), -int(free_mem_tensor[1].item())
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
         from freetoken.engine.cache_budget import expert_bytes_per_slot
@@ -1079,7 +1083,7 @@ class Engine:
         )
         for attempt in range(_PEAK_FIT_ATTEMPTS):
             seconds = self._prefill_dummy([length], input_ids=ids)
-            free = self._min_free_memory_keeping_cache()
+            free, _ = self._free_memory_across_ranks()
             logger.info_rank0(
                 f"A {length}-token prefill ({seconds:.1f} s) leaves {mem_GB(free)} free against "
                 f"a {mem_GB(reserve)} reserve"
@@ -1103,14 +1107,6 @@ class Engine:
             "free, and the expert cache cannot shrink further; lower --memory-ratio or "
             "--max-prefill-length"
         )
-
-    def _min_free_memory_keeping_cache(self) -> int:
-        """Free device memory, the minimum across TP ranks, WITHOUT emptying the allocator cache:
-        what the cache holds after a forward is exactly the peak being measured."""
-        torch.cuda.synchronize(self.device)
-        free = torch.tensor([get_free_memory(self.device)], dtype=torch.int64)
-        torch.distributed.all_reduce(free, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group)
-        return int(free.item())
 
     def _prefill_dummy(self, lengths: list[int], input_ids: torch.Tensor | None) -> float:
         """Prefill each length on the dummy row, restored afterwards so padded decode replay keeps
