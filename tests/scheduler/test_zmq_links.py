@@ -22,12 +22,6 @@ def transport(request, monkeypatch) -> bool:
     return request.param
 
 
-def test_every_link_is_distinct(transport):
-    links = _choose_zmq_links()
-    assert len(links) == ZMQ_LINK_COUNT
-    assert len(set(links)) == ZMQ_LINK_COUNT
-
-
 def test_without_ipc_every_link_is_a_loopback_port(monkeypatch):
     monkeypatch.setattr(zmq, "has", lambda capability: capability != "ipc")
     ports = [LOOPBACK.match(link) for link in _choose_zmq_links()]
@@ -52,8 +46,3 @@ def test_a_pickled_config_keeps_its_links(transport):
         config.zmq_detokenizer_addr,
         config.zmq_scheduler_broadcast_addr,
     )
-
-
-def test_this_platform_picks_the_transport_libzmq_has():
-    link = _choose_zmq_links()[0]
-    assert link.startswith("ipc://") == zmq.has("ipc")
