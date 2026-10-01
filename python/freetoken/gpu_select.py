@@ -9,6 +9,7 @@ The parent resolves --gpu entries to full UUIDs via NVML (resolve_gpu_uuids) and
 Each worker publishes its own entry (set_assigned_gpu / assign_gpu) and binds it when CUDA comes up (bind_assigned_gpu) by matching the UUID against CUDA's visible devices.
 One process runs on one GPU. Binding is unconditional: a process that publishes nothing binds a default ordinal and records it, so assigned_visible_gpu() names that card in every case.
 No process mutates CUDA_VISIBLE_DEVICES, and the UUID match holds under any CUDA_DEVICE_ORDER.
+NVML also reports a GPU's free memory across every process (nvml_free_bytes), which WDDM's cudaMemGetInfo does not.
 
 Stdlib only (torch is imported lazily); not under freetoken.utils, which imports transformers.
 """
