@@ -44,6 +44,15 @@ def test_the_gemv_matches_an_fp32_reference(N: int, K: int, out_dtype: torch.dty
     assert relative.item() < tolerance, relative.item()
 
 
+def test_the_gemv_refuses_a_weight_of_another_width():
+    from freetoken.kernel.triton.bf16_gemv import bf16_gemv
+
+    x = torch.randn(1, 2560, device=DEV, dtype=torch.bfloat16)
+    for weight in (_weight(512, 2048, seed=4), _weight(512, 3072, seed=5)):
+        with pytest.raises(AssertionError, match="K=2560"):
+            bf16_gemv(x, weight, torch.bfloat16)
+
+
 def test_the_bf16_linear_method_prefers_the_triton_kernel():
     from freetoken.layers.quantization.linear.base import LinearConfig
     from freetoken.layers.quantization.linear.unquantized import UnquantizedLinearMethod

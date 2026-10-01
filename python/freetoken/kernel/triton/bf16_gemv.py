@@ -39,6 +39,8 @@ def bf16_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> 
     bf16; returns ``[..., N]`` in ``out_dtype``."""
     *lead, K = x.shape
     N = weight.shape[0]
+    # F.linear raises on a mismatch; the kernel would read across rows, or past the weight's end
+    assert weight.shape[1] == K, f"x has K={K}, the weight is {tuple(weight.shape)}"
     x1 = x.reshape(K).contiguous()
     out = torch.empty(N, dtype=out_dtype, device=x.device)
     # two rows a program spreads even a small GEMV over every SM, and a K tile up to 4096 wide
