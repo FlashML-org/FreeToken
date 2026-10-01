@@ -23,7 +23,6 @@ from .offload_cache import _BANK_BYTES_PER_EXPERT, placeholder_bank
 logger = init_logger(__name__)
 
 
-
 @dataclass(frozen=True)
 class ExpertBanks:
     """Loaded expert banks, normalized for ``OffloadMoeCache`` wiring."""
