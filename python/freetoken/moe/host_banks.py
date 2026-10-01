@@ -36,6 +36,8 @@ logger = init_logger(__name__)
 _BLK = 4096  # O_DIRECT alignment (page size)
 # Linux-only: Windows has neither, and reads through the file cache instead.
 O_DIRECT_READS = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+# Windows mmaps have no madvise: a released pageable bank stays resident until its buffer closes.
+RELEASABLE_PAGES = hasattr(mmap, "MADV_DONTNEED")
 
 
 class PinFailed(RuntimeError):
@@ -149,12 +151,9 @@ class HostBank:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
-        if self._pinned:
+        if self._pinned or not RELEASABLE_PAGES:
             return
-        try:
-            self._buf.madvise(mmap.MADV_DONTNEED)
-        except AttributeError:
-            pass  # Windows has no madvise: the pages stay resident until the buffer closes
+        self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
