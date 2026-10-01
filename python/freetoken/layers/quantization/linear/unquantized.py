@@ -1,4 +1,4 @@
-"""bf16 Linear: one kernel (torch), no scheme."""
+"""bf16 Linear: a single bf16 row on CUDA through the Triton GEMV, every other input through torch; no scheme."""
 
 from __future__ import annotations
 
