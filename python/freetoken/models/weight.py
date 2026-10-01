@@ -43,7 +43,7 @@ def _read_shard_parallel(path: str, workers: int, chunk: int, drop_cache: bool) 
     from freetoken.moe.host_banks import read_range_into
 
     size = os.path.getsize(path)
-    buf = mmap.mmap(-1, max(_ODIRECT_BLK, ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK))
+    buf = mmap.mmap(-1, ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
     read_range_into(buf, path, file_offset=0, nbytes=size, workers=workers, chunk=chunk, drop_cache=drop_cache)
     return buf
 
