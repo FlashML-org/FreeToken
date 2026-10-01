@@ -280,10 +280,11 @@ class FTWReader:
                         m = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
                     finally:
                         os.close(fd)  # the mapping keeps its own reference to the file
-                    try:
-                        m.madvise(mmap.MADV_SEQUENTIAL)  # kernel readahead for streaming
-                    except (AttributeError, OSError):
-                        pass
+                    if hasattr(mmap, "MADV_SEQUENTIAL"):  # Windows mmaps have no madvise
+                        try:
+                            m.madvise(mmap.MADV_SEQUENTIAL)  # kernel readahead for streaming
+                        except OSError:
+                            pass
                     entry = (m, memoryview(m))
                     self._maps[file] = entry
         return entry[1]
