@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 if not torch.cuda.is_available():  # pragma: no cover
     pytest.skip("CUDA required", allow_module_level=True)
@@ -71,19 +70,6 @@ def gemv_calls(monkeypatch) -> list[tuple[int, ...]]:
     return calls
 
 
-def test_a_single_bf16_row_runs_the_gemv(gemv_calls: list[tuple[int, ...]]):
-    from freetoken.layers.quantization.linear.unquantized import TritonLinearKernel
-
-    layer = SimpleNamespace(weight=_weight(4096, 2560, seed=1), bias=None)
-    x = torch.randn(1, 2560, device=DEV, dtype=torch.bfloat16)
-
-    y = TritonLinearKernel().apply(layer, x)
-
-    assert gemv_calls == [(1, 2560)]
-    reference = F.linear(x.float(), layer.weight.float())
-    assert ((y.float() - reference).abs().max() / reference.abs().max()).item() < 1e-2
-
-
 @pytest.mark.parametrize(
     "rows,activation,with_bias",
     [(2, torch.bfloat16, False), (64, torch.bfloat16, False), (1, torch.float32, False), (1, torch.bfloat16, True)],
@@ -104,7 +90,7 @@ def test_every_other_input_keeps_the_torch_path(
     assert torch.equal(y, TorchLinearKernel().apply(layer, x))
 
 
-def test_the_gemv_replays_in_a_cuda_graph():
+def test_a_single_bf16_row_runs_the_gemv_and_replays_in_a_cuda_graph(gemv_calls: list[tuple[int, ...]]):
     from freetoken.layers.quantization.linear.unquantized import TritonLinearKernel
 
     kernel = TritonLinearKernel()
@@ -123,3 +109,4 @@ def test_the_gemv_replays_in_a_cuda_graph():
     graph.replay()
 
     assert torch.equal(y, kernel.apply(layer, x))
+    assert gemv_calls == [(1, 2560)] * 3
