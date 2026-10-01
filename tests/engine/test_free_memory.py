@@ -41,7 +41,7 @@ class FakeNvml:
 
 
 def _machine(monkeypatch, *, cuda_free: int, nvml: FakeNvml | None, platform: str) -> None:
-    """Fakes CUDA's reading, the device's UUID and the NVML library the engine would load."""
+    """Fakes CUDA's reading, the device's UUID, the NVML library the engine would load and the platform."""
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (cuda_free, 24 * GIB))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid=DEVICE_UUID))
     monkeypatch.setattr(gpu_select, "_load_nvml", lambda: nvml)
