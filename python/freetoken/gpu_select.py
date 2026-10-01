@@ -262,7 +262,7 @@ def _visible_of_physical(uuid: str) -> int:
     seen: list[str] = []
     hits: list[int] = []
     for v in range(torch.cuda.device_count()):
-        u = format_gpu_uuid(getattr(torch.cuda.get_device_properties(v), "uuid", None))
+        u = gpu_uuid(v)
         seen.append(u or "?")
         if u is not None and u.upper().startswith(uuid.upper()):
             hits.append(v)
@@ -313,6 +313,13 @@ def format_gpu_uuid(raw) -> str | None:
     return None if raw is None else f"{UUID_PREFIX}{raw}"
 
 
+def gpu_uuid(index: int) -> str | None:
+    """nvidia-smi form GPU-<uuid> of visible device ``index``; None where torch reports no uuid."""
+    import torch
+
+    return format_gpu_uuid(getattr(torch.cuda.get_device_properties(index), "uuid", None))
+
+
 def gpu_identity(index: int) -> dict:
     """{index, name, uuid, total_bytes} of visible device ``index``."""
     import torch
@@ -321,6 +328,6 @@ def gpu_identity(index: int) -> dict:
     return {
         "index": index,
         "name": props.name,
-        "uuid": format_gpu_uuid(getattr(props, "uuid", None)),
+        "uuid": gpu_uuid(index),
         "total_bytes": int(props.total_memory),
     }
