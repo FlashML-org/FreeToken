@@ -103,10 +103,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool
-    from .dsv41_paged_pool import DSV41PagedKVCache
-
-    if resolve_pool_class(model_config) is DSV41PagedKVCache:
+    if getattr(model_config, "dsv41_args", None) is not None:
         from .dsv41_cost_model import _dsv41_pool_sizes, dsv41_geometry
+        from .dsv41_paged_pool import DSV41PagedKVCache
 
         # Same route as DSV4: the generic CacheManager over the shared page table; the pool is the
         # swa_pool plug-in (window tier + per-source packed main / index pools + state rings).
