@@ -91,6 +91,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "LlamaForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
     ),
+    # LLama architecture Entry for the GGUF support 
+    "LlamaGGUFForCausalLM":ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "Qwen2ForCausalLM": ModelSpec(
         "freetoken.models.qwen2",
         "Qwen2ForCausalLM",
