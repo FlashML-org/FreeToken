@@ -16,8 +16,8 @@ auto test(tvm::ffi::TensorView x, tvm::ffi::TensorView y) -> void {
   const auto M = 1024;
   host::TensorMatcher({N, M})
       .with_strides({-1, 1}) // -1 means any
-      .with_dtype<int, float>()
-      .with_device<kDLCPU>()
+      .template with_dtype<int, float>()
+      .template with_device<kDLCPU>()
       .verify(x);
   host::TensorMatcher({N, M}) // default contiguous
       .with_dtype({{kDLInt, 32, 1}, {kDLInt, 64, 1}})
