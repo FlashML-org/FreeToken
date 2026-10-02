@@ -52,6 +52,7 @@ class Glm5NextSparseBlock(BaseOP):
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
             swiglu_limit=config.swiglu_limit,
+            tensor_parallel=True,
             quant_config=config.quant,
             prefix=f"{prefix}.shared_experts",
         )

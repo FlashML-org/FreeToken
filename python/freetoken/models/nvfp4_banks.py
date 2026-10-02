@@ -8,6 +8,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.distributed import get_tp_info
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -63,6 +64,23 @@ def _kind_suffix(kind: str) -> str:
     return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
 
 
+# gate/up and their block scales carry I on the row axis, down and its scales on the column axis; the
+# per-expert global scale has no I axis and is shared by every rank.
+_I_AXIS = {"gate": 0, "up": 0, "gate_scale": 0, "up_scale": 0, "down": 1, "down_scale": 1}
+
+
+def shard_nvfp4_piece(role: str, t: torch.Tensor, *, rank: int, tp_size: int) -> torch.Tensor:
+    """This rank's block of the intermediate dim in one NVFP4 expert tensor, in its own storage."""
+    axis = _I_AXIS.get(role)
+    if tp_size == 1 or axis is None:
+        return t
+    total = t.shape[axis]
+    if total % tp_size:
+        raise ValueError(f"NVFP4 expert piece {role!r} has {total} entries on axis {axis}, not divisible by TP={tp_size}")
+    step = total // tp_size
+    return t.narrow(axis, rank * step, step).clone(memory_format=torch.contiguous_format)
+
+
 def iter_nvfp4_expert_pieces(
     model_path: str,
     config,
@@ -108,6 +126,14 @@ def iter_nvfp4_expert_pieces(
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
+    tp = get_tp_info()
+
+    def _local(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        role = wanted[name][2]
+        if role.endswith("_global"):
+            return _ingest_global(spec, tensor)
+        return shard_nvfp4_piece(role, tensor, rank=tp.rank, tp_size=tp.size)
+
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
         for name, shard in weight_map.items():
@@ -118,19 +144,16 @@ def iter_nvfp4_expert_pieces(
             drop(path)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name in by_shard[shard]:
-                    tensor = f.get_tensor(name)
-                    if wanted[name][2].endswith("_global"):
-                        tensor = _ingest_global(spec, tensor)
-                    yield name, tensor
+                    piece = _local(name, f.get_tensor(name))
+                    yield name, piece
+                    del piece
             drop(path)
 
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
-            if wanted[name][2].endswith("_global"):
-                tensor = _ingest_global(spec, tensor)
-            yield name, tensor
+            yield name, _local(name, tensor)
 
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
 

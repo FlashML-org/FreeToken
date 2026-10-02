@@ -41,14 +41,17 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
+        if cfg.tp_size > 1 and (cfg.intermediate % cfg.tp_size or cfg.local_intermediate % (2 * GROUP)):
+            return f"TP={cfg.tp_size} leaves {cfg.intermediate / cfg.tp_size:g} of the expert intermediate; needs whole {2 * GROUP}-wide blocks"
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # rank-local on I, full on H: each rank holds only its block of the intermediate dim
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -61,7 +64,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, cfg.local_intermediate))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))

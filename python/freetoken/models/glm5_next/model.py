@@ -64,7 +64,7 @@ class Glm5NextDecoderLayer(BaseOP):
         else:
             self.mlp = Glm5NextGatedMLP(
                 config.hidden_size, config.intermediate_size, swiglu_limit=config.swiglu_limit,
-                quant_config=config.quant, prefix=f"{prefix}.mlp",
+                tensor_parallel=True, quant_config=config.quant, prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)

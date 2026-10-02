@@ -1,7 +1,7 @@
 """Glm5NextKDA op vs an eager reference (projection/conv/gate/norm wiring).
 
 The kernel math itself is validated in tests/kernels/test_kda.py; this test checks
-the OP-level wiring: the fused in_proj split (q|k|v|b|f_a|g_a), the merged q|k|v
+the OP-level wiring: the fused in_proj splits (q|k|v|b and f_a|g_a), the merged q|k|v
 depthwise causal conv (+silu) against the state pool, the low-rank f/g gates, the
 sigmoid-gated output RMSNorm, and prefill -> decode state continuity through
 ``LinearStatePool``.
@@ -57,7 +57,8 @@ def _make_op(seed=0):
     op = Glm5NextKDA(cfg, layer_id=0)
     torch.manual_seed(seed)
     dev, dt = "cuda", torch.bfloat16
-    op.in_proj.weight = torch.randn(3 * P + H + 2 * D, HIDDEN, device=dev, dtype=dt) * 0.05
+    op.in_proj.weight = torch.randn(3 * P + H, HIDDEN, device=dev, dtype=dt) * 0.05
+    op.in_proj_fg.weight = torch.randn(2 * D, HIDDEN, device=dev, dtype=dt) * 0.05
     op.f_b_proj.weight = torch.randn(P, D, device=dev, dtype=dt) * 0.05
     op.g_b_proj.weight = torch.randn(P, D, device=dev, dtype=dt) * 0.05
     op.conv1d.weight = torch.randn(3 * P, 1, KERNEL, device=dev, dtype=dt) * 0.2
@@ -98,8 +99,9 @@ def _reference_forward(op, x_seq, conv_ctx=None, h0=None):
     """Eager op reference for one sequence [T, HIDDEN] (fp32 where the kernels are
     fp32). Returns (out [T, HIDDEN], conv_tail [3P, KERNEL-1], state [H, D, D])."""
     T = x_seq.shape[0]
-    proj = x_seq.to(torch.bfloat16) @ op.in_proj.weight.T
-    conv_in, b, f_a, g_a = torch.split(proj, [3 * P, H, D, D], dim=-1)
+    x_bf = x_seq.to(torch.bfloat16)
+    conv_in, b = torch.split(x_bf @ op.in_proj.weight.T, [3 * P, H], dim=-1)
+    f_a, g_a = torch.split(x_bf @ op.in_proj_fg.weight.T, [D, D], dim=-1)
     g1 = (f_a @ op.f_b_proj.weight.T).float()
     g2 = g_a @ op.g_b_proj.weight.T
 

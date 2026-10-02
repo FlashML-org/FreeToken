@@ -33,10 +33,11 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.layers.quantization import QuantKind
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
 # Shared with GLM-5.2 (weight.py imports privately from the same package).
 from freetoken.models.glm_moe_dsa.attention import _IdxLayerNorm
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -95,8 +96,10 @@ class Glm5NextAttention(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.layer_id = layer_id
+        # The indexer and the MLA latent (q_a / kv_a) stay replicated: every rank must select the same
+        # blocks and reads the same latent KV. Heads split: q_b / kv_b column-parallel, o_proj row-parallel.
         self.indexer = Glm5NextIndexer(config, layer_id, prefix=f"{prefix}.indexer")
-        self.num_heads = args.num_heads
+        self.num_heads = div_even(args.num_heads, get_tp_info().size)
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim  # 0 (NoPE)
         self.qk_head_dim = args.qk_head_dim
@@ -112,8 +115,8 @@ class Glm5NextAttention(BaseOP):
             quant_config=config.quant, prefix=f"{prefix}.q_a_proj",
         )
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
-        self.q_b_proj = LinearReplicated(
-            args.q_lora_rank, self.num_heads * self.qk_head_dim, has_bias=False,
+        self.q_b_proj = LinearColParallelMerged(
+            args.q_lora_rank, [args.num_heads * self.qk_head_dim], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.q_b_proj",
         )
         # NoPE: kv_a projects to bare ckv (no +qk_rope_head_dim rows).
@@ -123,15 +126,15 @@ class Glm5NextAttention(BaseOP):
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
         # the MLA absorption reads kv_b_proj.weight as bmm operands, so only an unquantized scheme is served
-        self.kv_b_proj = LinearReplicated(
+        self.kv_b_proj = LinearColParallelMerged(
             self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            [args.num_heads * (self.qk_nope_head_dim + self.v_head_dim)],
             has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
         )
         assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
-        self.o_proj = LinearReplicated(
-            self.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
+        self.o_proj = LinearRowParallel(
+            args.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self._w_uk: torch.Tensor | None = None
