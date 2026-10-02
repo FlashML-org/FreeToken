@@ -85,7 +85,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.self_attn.forward(block_input, batch)
         hidden, rn_mlp = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
         block_input, inject = self.mlp_hyper_connection.mix(hidden, rn=rn_mlp)
-        return hidden, self.mlp.forward(block_input), inject
+        return hidden, self.mlp.forward_parts(block_input), inject
 
 
 class Qwen4ExpModel(BaseOP):
@@ -129,7 +129,9 @@ class Qwen4ExpModel(BaseOP):
             hidden, mlp_out, inject = layer.forward(hidden, batch, rn=rn)
             nxt = layers[i + 1] if i + 1 < len(layers) else None
             if nxt is not None and nxt.ple is not None:
-                hidden = layer.mlp_hyper_connection.combine(hidden, mlp_out, inject)
+                hidden = layer.mlp_hyper_connection.combine(
+                    hidden, layer.mlp_hyper_connection._epilogue(mlp_out), inject
+                )
                 rn = None
             else:
                 consumer = nxt.attn_hyper_connection if nxt is not None else self.hyper_connection_mixer

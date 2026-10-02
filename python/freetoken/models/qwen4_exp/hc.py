@@ -157,14 +157,36 @@ class GatedResidual(BaseOP):
         return self._combine_torch(R, y, s)
 
     def combine_norm(
-        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor, next_block: "GatedResidual"
+        self, R: torch.Tensor, y: torch.Tensor | tuple, s: torch.Tensor, next_block: "GatedResidual"
     ) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        """combine() fused with ``next_block``'s hc_norm; returns (R', Rn'). CPU keeps the split path (Rn' = None)."""
+        """combine() fused with ``next_block``'s hc_norm; returns (R', Rn'). CPU keeps the split path (Rn' = None).
+
+        ``y`` may be an (routed, shared, gate) epilogue tuple: the shared-expert gate
+        mul-add is then folded into the fused kernel, bit-exact vs the split path."""
+        gated = isinstance(y, tuple)
         if not R.is_cuda:
-            return self.combine(R, y, s), None
+            return self.combine(R, self._epilogue(y), s), None
+        if gated:
+            routed, shared, gate = y
+            return hc_combine_norm(
+                R, routed, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count,
+                shared=shared, gate=gate,
+            )
         return hc_combine_norm(
             R, y, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count
         )
+
+    @staticmethod
+    def _epilogue(y: torch.Tensor | tuple) -> torch.Tensor:
+        """Materialize an (routed, shared, gate) tuple with the standalone epilogue."""
+        if not isinstance(y, tuple):
+            return y
+        from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add
+
+        routed, shared, gate = y
+        if not routed.is_cuda:
+            return (routed.float() + gate[:, None] * shared.float()).to(routed.dtype)
+        return shared_gate_mul_add(routed, shared, gate)
 
 
 __all__ = ["GatedResidual", "GroupedPlusOneRMSNorm", "grouped_plus_one_rms_norm"]
