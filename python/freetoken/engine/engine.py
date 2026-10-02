@@ -1220,7 +1220,7 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args = model_config.dsv41_args
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
-    args.decoder_replay = config.decoder_replay
+    args.swa_decoder_replay = config.swa_decoder_replay
     # the replay mode decides how much live window history a prefix hit needs (geometry.resume_windows):
     # rebuild the attention group's geometry so the cache manager, the pool and its cost model agree
     object.__setattr__(  # ModelConfig is frozen; this is the config-resolution step that owns it
@@ -1230,7 +1230,7 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
-        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; decoder replay: {args.decoder_replay} "
+        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay} "
         f"(prefix hits keep {dsv41_geometry(args).resume_history} tokens of window history)"
     )
     if getattr(config, "cache_type", "radix") != "naive":

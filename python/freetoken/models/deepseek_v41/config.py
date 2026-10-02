@@ -3,7 +3,7 @@
 ``parse_config`` maps the standard transformer fields into :class:`ModelConfig`, carries the full
 :class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module, and declares the DSV41
 attention group whose :class:`DSV41Geometry` prices the KV pool. The engine reconciles the runtime
-knobs (``max_seq_len``, ``decoder_replay``) onto ``dsv41_args`` at config resolution.
+knobs (``max_seq_len``, ``swa_decoder_replay``) onto ``dsv41_args`` at config resolution.
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ def dsv41_geometry(args: DeepseekV41Args) -> DSV41Geometry:
         compress_ratios=tuple(args.compress_ratios[: args.n_layers]),
         kv_source_layer_ids=args.backbone_kv_sources,
         # bounded replay recomputes the window before a prefix hit, which reads the window before that
-        resume_windows=1 if args.decoder_replay == "exact" else 2,
+        resume_windows=1 if args.swa_decoder_replay == "exact" else 2,
         # bounded replay computes the decoder only over each request's last window: that KV is
         # request-private and lives in per-request rings, never in radix-shared pages
-        private_window_layer_ids=() if args.decoder_replay == "exact" else tuple(range(args.decoder_start_layer, args.n_layers)),
+        private_window_layer_ids=() if args.swa_decoder_replay == "exact" else tuple(range(args.decoder_start_layer, args.n_layers)),
     )
 
 

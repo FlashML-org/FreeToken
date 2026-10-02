@@ -28,7 +28,7 @@ P = 128
 
 
 class TinyEngine:
-    def __init__(self, checkpoint: str, *, max_seq_len: int = 1024, max_running_req: int = 2, decoder_replay: str = "exact", engram_table=None, quantized: bool = False):
+    def __init__(self, checkpoint: str, *, max_seq_len: int = 1024, max_running_req: int = 2, swa_decoder_replay: str = "exact", engram_table=None, quantized: bool = False):
         self.device = torch.device("cuda")
         self.checkpoint = checkpoint
         if try_get_tp_info() is None:
@@ -39,7 +39,7 @@ class TinyEngine:
         args = mc.dsv41_args
         args.max_seq_len = max_seq_len
         args.max_batch_size = max_running_req + 1
-        args.decoder_replay = decoder_replay
+        args.swa_decoder_replay = swa_decoder_replay
         self.args = args
         # the replay mode shapes the kvcache geometry (resume history, private decoder rings): rebuild
         # the attention group the way engine._adjust_dsv41_config does

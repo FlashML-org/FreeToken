@@ -26,7 +26,7 @@ def _tokens(n: int, seed: int) -> list[int]:
 def test_prefill_and_decode(checkpoint):
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="exact")
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact")
     r0 = eng.new_request(0, _tokens(300, 1))
     logits = eng.prefill([r0])
     assert logits.shape == (1, VOCAB) and torch.isfinite(logits).all()
@@ -67,7 +67,7 @@ def test_chunked_prefill_matches_single_shot(checkpoint):
     compressor carry, the window ring and the compressed rows are all resumed through the pool."""
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="exact")
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact")
     toks = _tokens(300, 3)
     whole = eng.new_request(0, toks)
     ref = eng.prefill([whole])
@@ -82,7 +82,7 @@ def test_chunked_prefill_matches_single_shot(checkpoint):
 def test_bounded_replay_runs(checkpoint):
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     r0 = eng.new_request(0, _tokens(300, 4))
     logits = eng.prefill([r0])
     assert logits.shape == (1, VOCAB) and torch.isfinite(logits).all()
@@ -96,9 +96,9 @@ def test_bounded_replay_is_exact_within_one_window(checkpoint):
     from .harness import TinyEngine
 
     toks = _tokens(100, 5)
-    exact = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="exact")
+    exact = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact")
     want = exact.prefill([exact.new_request(0, toks)])
-    bounded = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+    bounded = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     got = bounded.prefill([bounded.new_request(0, toks)])
     assert torch.equal(got, want)
 
@@ -109,7 +109,7 @@ def test_bounded_replay_extends_a_short_final_chunk_back_over_the_window(checkpo
     prefill of the same prompt."""
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     toks = _tokens(300, 6)
     whole = eng.new_request(0, toks)
     ref = eng.prefill([whole])
@@ -126,7 +126,7 @@ def test_bounded_extension_never_rewrites_cached_history(checkpoint):
     main / index rows (and ring carries) of positions before the hit keep whatever they held."""
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     toks = _tokens(300, 7)
     req = eng.new_request(0, toks)
     req.device_len = 256
@@ -155,7 +155,7 @@ def test_bounded_prefix_hit_matches_cold_prefill(checkpoint):
     the shared history, both live by the cache contract) produces the cold prefill's logits exactly."""
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=2048, max_running_req=2, decoder_replay="bounded")
+    eng = TinyEngine(checkpoint, max_seq_len=2048, max_running_req=2, swa_decoder_replay="bounded")
     prefix = _tokens(768, 11)
     donor = eng.new_request(0, prefix + _tokens(20, 12))
     cold = eng.prefill([donor])
@@ -176,7 +176,7 @@ def test_shared_prefix_replays_do_not_disturb_each_other(checkpoint):
     a_toks, b_toks = prefix + _tokens(20, 14), prefix + _tokens(40, 15)
 
     def run(interleave: bool):
-        eng = TinyEngine(checkpoint, max_seq_len=2048, max_running_req=2, decoder_replay="bounded")
+        eng = TinyEngine(checkpoint, max_seq_len=2048, max_running_req=2, swa_decoder_replay="bounded")
         a = eng.new_request(0, a_toks)
         eng.prefill([a])
         eng.finish_prefill([a])
@@ -207,7 +207,7 @@ def test_commit_dedup_onto_a_longer_prompts_pages_keeps_the_decoder_state(checkp
     a_toks = donor_toks[:128]
 
     def run(repoint: bool):
-        eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+        eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
         d = eng.new_request(0, donor_toks)
         eng.prefill([d])
         eng.finish_prefill([d])
@@ -229,7 +229,7 @@ def test_moe_merge_keeps_the_routed_sum_in_fp32_until_the_shared_add(checkpoint)
 
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=512, max_running_req=1, decoder_replay="exact")
+    eng = TinyEngine(checkpoint, max_seq_len=512, max_running_req=1, swa_decoder_replay="exact")
     moe = eng.model.model.layers.op_list[2].ffn
     x = torch.randn(3, eng.args.dim, device="cuda", dtype=torch.bfloat16)
     routed32 = torch.randn(3, eng.args.dim, device="cuda") * 3
@@ -286,7 +286,7 @@ def test_cached_prefix_kv_is_independent_of_the_batch_that_produced_it(checkpoin
     context; the harness rebinds it on every forward, so they may interleave."""
     from .harness import TinyEngine
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay=replay)
+    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay=replay)
     prefix = _tokens(128, 41)
     a = eng.new_request(0, prefix)
     la = eng.prefill([a])
@@ -305,7 +305,7 @@ def test_cached_prefix_kv_is_independent_of_the_batch_that_produced_it(checkpoin
         assert torch.equal(pool.idx_pool[src][ra], pool.idx_pool[src][rd]), f"index rows differ on source {src}"
     # the same prefix in a two-request batch with an unequal partner, and a one-token prefill (the
     # M = 1 rows must come from the same kernels as any other prefill row)
-    eng2 = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, decoder_replay=replay)
+    eng2 = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay=replay)
     b1 = eng2.new_request(0, prefix)
     b2 = eng2.new_request(1, _tokens(77, 43))
     lb = eng2.prefill([b1, b2])

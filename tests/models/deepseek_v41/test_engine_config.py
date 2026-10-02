@@ -30,13 +30,13 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: True)
     write_tiny_checkpoint(str(tmp_path))
-    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", decoder_replay=replay, max_seq_len_override=2048)
+    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay=replay, max_seq_len_override=2048)
     _adjust_config(config)
     assert config.attention_backend == "dsv41_sparse"
     assert config.page_size == 128 and config.cache_type == "swa_radix"
     assert resolve_pool_class(config.model_config) is DSV41PagedKVCache
     args = config.model_config.dsv41_args
-    assert args.decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
+    assert args.swa_decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
     # the cache contract follows the replay mode: a bounded-mode prefix hit recomputes the window before
     # it, so the cache manager must match / lock / retain two windows of live history behind a hit
@@ -60,7 +60,7 @@ def test_bounded_mode_cache_refuses_a_hit_with_one_live_window(tmp_path, monkeyp
     monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: True)
     write_tiny_checkpoint(str(tmp_path))
-    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", decoder_replay="bounded", max_seq_len_override=2048)
+    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay="bounded", max_seq_len_override=2048)
     _adjust_config(config)
     resume = next(g for g in config.model_config.kv_cache_group_specs() if g.resume_history is not None).resume_history
     assert resume == 256

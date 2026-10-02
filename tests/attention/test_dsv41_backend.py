@@ -34,12 +34,12 @@ def _ctx(pool):
     return ctx
 
 
-def _stack(decoder_replay="exact", num_pages=32, max_seq_len=8192):
+def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
     from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
-    private = tuple(range(3, len(RATIOS))) if decoder_replay != "exact" else ()
+    private = tuple(range(3, len(RATIOS))) if swa_decoder_replay != "exact" else ()
     geom = DSV41Geometry(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES,
-                        resume_windows=1 if decoder_replay == "exact" else 2, private_window_layer_ids=private)
+                        resume_windows=1 if swa_decoder_replay == "exact" else 2, private_window_layer_ids=private)
     pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
@@ -50,7 +50,7 @@ def _stack(decoder_replay="exact", num_pages=32, max_seq_len=8192):
     pool.full_loc_map = pt
     _ctx(pool)
     group = SimpleNamespace(geometry=geom)
-    args = SimpleNamespace(decoder_replay=decoder_replay, decoder_start_layer=3)
+    args = SimpleNamespace(swa_decoder_replay=swa_decoder_replay, decoder_start_layer=3)
     backend = DSV41SparseAttnBackend(SimpleNamespace(attention_groups=(group,), dsv41_args=args))
     return backend, pool, pt
 

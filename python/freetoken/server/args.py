@@ -637,13 +637,13 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--decoder-replay",
-        default=ServerArgs.decoder_replay,
+        "--swa-decoder-replay",
+        default=ServerArgs.swa_decoder_replay,
         choices=["bounded", "exact"],
         help=(
-            "DeepSeek-V4.1 decoder prefill. 'bounded' (default) runs the 20 decoder layers on each "
-            "prompt's last 128 tokens with the sliding window truncated there (DeepSeek's Decoder SWA "
-            "Bounded Replay); 'exact' runs them on every prompt token (the reference numerics)."
+            "DeepSeek-V4.1 Decoder SWA Bounded Replay. 'bounded' (default) runs the 20 decoder layers "
+            "on each prompt's last 128 tokens with their sliding window truncated there, as in the "
+            "tech report; 'exact' runs them on every prompt token (the reference numerics)."
         ),
     )
 

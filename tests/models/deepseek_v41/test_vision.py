@@ -152,7 +152,7 @@ def test_image_logits_and_decode_match_reference(tmp_path, quantized):
     tensors = _checkpoint(tmp_path, quantized)
     text = tiny_text_config(moe_intermediate_size=256) if quantized else tiny_text_config()
     ref = Reference(tensors, text, max_seq_len=512, max_batch_size=2, quantized=quantized, vision_config=VC)
-    eng = TinyEngine(str(tmp_path), max_seq_len=512, decoder_replay='exact', quantized=quantized)
+    eng = TinyEngine(str(tmp_path), max_seq_len=512, swa_decoder_replay='exact', quantized=quantized)
     _engram_table_for(eng, tensors, text)
     result = _inputs()
     ids = result.input_ids.clone()
@@ -184,7 +184,7 @@ def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):
     from .harness import TinyEngine
     from .test_reference_parity import _engram_table_for
     tensors = _checkpoint(tmp_path)
-    eng = TinyEngine(str(tmp_path), max_seq_len=1024, decoder_replay=mode)
+    eng = TinyEngine(str(tmp_path), max_seq_len=1024, swa_decoder_replay=mode)
     _engram_table_for(eng, tensors, tiny_text_config())
     def inputs():
         ids = [3] * 80 + [VOCAB - 1] + [4] * 37 + [VOCAB - 1] + [4] * 31 + [VOCAB - 1]

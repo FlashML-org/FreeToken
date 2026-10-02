@@ -13,7 +13,7 @@ Causal Encoder-Decoder: the decoder's kv source (layer 20) compresses ITS INPUT 
 hidden state -- into the global KV every decoder layer reads. Under Decoder SWA Bounded Replay the
 decoder layers run on each request's last ``window_size`` prompt tokens only (their sliding window
 truncated at the replay start, see the backend); layer 20 still publishes global KV for every
-prompt token. ``--decoder-replay exact`` runs the decoder on every token (the reference numerics).
+prompt token. ``--swa-decoder-replay exact`` runs the decoder on every token (the reference numerics).
 
 KV addressing is the attention backend's; pool buffers are read off the live pool per access, so a
 runtime cache rebuild needs no unbind. Decode is batched and CUDA-graph safe (the DSV4 precedent).
@@ -203,7 +203,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     @property
     def replays_prefill(self) -> bool:
-        return self._args.decoder_replay != "exact"
+        return self._args.swa_decoder_replay != "exact"
 
     def prefill_start(self, req) -> int:
         from freetoken.attention.dsv41_sparse import replay_start

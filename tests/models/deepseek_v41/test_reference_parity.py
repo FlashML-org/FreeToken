@@ -127,7 +127,7 @@ def test_quantized_offload_prefill_and_decode_match_reference(tmp_path, mode, ba
     tensors = write_tiny_checkpoint(str(tmp_path), seed=11, quantized=True)
     text = tiny_text_config(moe_intermediate_size=256)
     ref = Reference(tensors, text, max_seq_len=1024, max_batch_size=3, quantized=True)
-    eng = TinyEngine(str(tmp_path), decoder_replay=mode, quantized=True)
+    eng = TinyEngine(str(tmp_path), swa_decoder_replay=mode, quantized=True)
     _engram_table_for(eng, tensors, text)
     ids = torch.stack([_tokens(300, 1 + i) for i in range(batch_size)])
     want = ref.prefill_batch(ids) if mode == "exact" else ref.prefill_bounded(ids)
@@ -148,7 +148,7 @@ def test_exact_prefill_and_greedy_decode_match_the_reference(checkpoint):
     folder, tensors = checkpoint
     text = tiny_text_config()
     ref = Reference(tensors, text, max_seq_len=1024, max_batch_size=3)
-    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, decoder_replay="exact")
+    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact")
     _engram_table_for(eng, tensors, text)
 
     ids = _tokens(300, 1)
@@ -173,7 +173,7 @@ def test_batched_prefill_and_decode_match_the_reference(checkpoint):
     folder, tensors = checkpoint
     text = tiny_text_config()
     ref = Reference(tensors, text, max_seq_len=1024, max_batch_size=3)
-    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, decoder_replay="exact")
+    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact")
     _engram_table_for(eng, tensors, text)
 
     ids = torch.stack([_tokens(200, 2), _tokens(200, 3)])
@@ -197,7 +197,7 @@ def test_bounded_replay_matches_the_reference_oracle(checkpoint):
     folder, tensors = checkpoint
     text = tiny_text_config()
     ref = Reference(tensors, text, max_seq_len=1024, max_batch_size=3)
-    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, decoder_replay="bounded")
+    eng = TinyEngine(folder, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     _engram_table_for(eng, tensors, text)
 
     ids = _tokens(300, 4)

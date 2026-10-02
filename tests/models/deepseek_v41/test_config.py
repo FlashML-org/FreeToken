@@ -27,7 +27,7 @@ def test_roles_follow_the_dsv41_mode_table():
     assert args.roles[4].is_candidate_source and args.roles[5].uses_candidates and not args.roles[2].uses_candidates
     assert args.decoder_start_layer == 4 and args.backbone_kv_sources == (2, 4)
     assert args.freqs_params(0)[1] == 0 and args.freqs_params(2)[1] == 1024  # yarn only on compressing layers
-    assert args.decoder_replay == "bounded"
+    assert args.swa_decoder_replay == "bounded"
 
 
 def test_shipping_layout_roles():

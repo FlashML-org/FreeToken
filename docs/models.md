@@ -79,12 +79,12 @@ warning; pass `--moe-strategy offload` to use them.
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
   demand (keep them on a fast NVMe; the 6 GiB of table scales stay in host RAM), using
   bounded pinned staging buffers; an FTW conversion copies them next
-  to the checkpoint as `engram-table-NN.safetensors`. `--decoder-replay bounded`
+  to the checkpoint as `engram-table-NN.safetensors`. `--swa-decoder-replay bounded`
   (default) runs the 20 decoder layers on each prompt's last 128 tokens, as DeepSeek deploys
   it. That decoder KV is request-private (per-request rings, never in radix-shared pages, so
   prefix reuse and commit-time page dedup only ever share encoder / compressed KV), and a
   prefix hit keeps two live windows of history behind it so the encoder can recompute the
-  replayed tokens' hidden states. `--decoder-replay exact` runs the decoder on every prompt
+  replayed tokens' hidden states. `--swa-decoder-replay exact` runs the decoder on every prompt
   token and caches its window KV like any other layer. Run
   `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
   choosing a MoE strategy. `--moe-strategy hybrid` splits expert misses using those

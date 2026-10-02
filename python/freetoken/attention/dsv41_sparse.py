@@ -206,7 +206,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         self.geom: DSV41Geometry = geom
         self.window_size = geom.window
         args = config.dsv41_args
-        self.decoder_replay: str = getattr(args, "decoder_replay", "exact")
+        self.swa_decoder_replay: str = getattr(args, "swa_decoder_replay", "exact")
         self.decoder_start: int = getattr(args, "decoder_start_layer", geom.n_layers)
         self.capture: DSV41CaptureData | None = None
         self.capture_bs: List[int] = []
@@ -233,7 +233,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         Bounded replay: each request's encoder segment starts at ``replay_start`` (extended
         backwards over cached tokens when the chunk is shorter than a window) and its decoder
         segment is its last ``min(n_win, n)`` tokens with the window floored at the replay start."""
-        bounded = self.decoder_replay != "exact"
+        bounded = self.swa_decoder_replay != "exact"
         win = self.window_size
         segments: List[PrefillSegment] = []
         off = 0
