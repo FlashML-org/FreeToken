@@ -104,13 +104,12 @@ def routed_experts_fp4(
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
-    Precision matches the reference ``Expert.forward`` over ``fp4_gemm(act_quant(x, act_block),
-    W_fp4)``: the gate_up and down activations are FP8-round-tripped (block ``act_block`` -- the
-    checkpoint's fp8 block, 128 on V4 and 32 on V4.1 -- ue8m0) before each GEMM, and the routing
-    weight multiplies the fp32 SwiGLU intermediate BEFORE its bf16 cast and fp8 quant (the down
-    output is summed unweighted). Since an fp8 value x pow2 scale is exact in bf16, the
-    round-tripped activation entering the bf16 decode kernel is bit-identical to the reference's
-    dequantized FP8 activation."""
+    Precision matches the reference ``fp4_gemm(act_quant(x, act_block), W_fp4)``: the gate_up
+    and down activations are FP8-round-tripped (block ``act_block`` -- the checkpoint's fp8 block,
+    128 on V4 and 32 on V4.1 -- ue8m0) before each GEMM. Since an fp8 value x pow2 scale is exact
+    in bf16, the round-tripped activation entering the bf16 decode kernel is bit-identical to the
+    reference's dequantized FP8 activation (validated max diff = 0 vs the tilelang ``fp4_gemm``
+    reference). The routing weight scales each route's down output in the GEMM epilogue."""
     T, top_k = slots.shape
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -121,11 +120,11 @@ def routed_experts_fp4(
         x, gate_up_packed, gate_up_scale, slots, None,
         a_row_is_route=False, mul_routed_weight=False,
     )  # [T, top_k, 2I]
-    # [T, top_k, I]: routing weight applied in fp32, then the down activation's FP8 round-trip, one pass
-    act = fused_swiglu(gate_up, swiglu_limit, topk_weights, act_block=act_block).reshape(T * top_k, I)
+    # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(T * top_k, I)
     down = _grouped_decode(
-        act, down_packed, down_scale, slots, None,
-        a_row_is_route=True, mul_routed_weight=False,
+        act, down_packed, down_scale, slots, topk_weights,
+        a_row_is_route=True, mul_routed_weight=True,
     )  # [T, top_k, H]
     return down.sum(dim=1)  # [T, H]
 
@@ -222,12 +221,12 @@ def routed_experts_fp4_prefill(
         x, gate_up_packed, gate_up_scale, gate_up, tw,
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
     )
-    # [T, top_k, I]: routing weight applied in fp32, then the down activation's FP8 round-trip, one pass
-    act = fused_swiglu(gate_up, swiglu_limit, tw, act_block=act_block).reshape(routes, I)
+    # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(routes, I)
     down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,
-        sorted_ids, expert_ids, ntpp, routes, 1, False, cfg,
+        sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,
     )
     return down.sum(dim=1)  # [T, H]
 

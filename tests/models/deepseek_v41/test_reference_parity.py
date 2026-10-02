@@ -19,6 +19,10 @@ pytestmark = requires_cuda
 
 # The sparse-attention implementations accumulate in different orders.
 ATOL = RTOL = 1e-2
+# The fp4 experts also round the routed sum to bf16 before the shared-expert add and weight each
+# expert's down output; the reference keeps that sum fp32 and weights the intermediate before its fp8
+# round-trip (10 seeds x 16 checks: max |err| 0.019, against 0.007 in the reference's order).
+QUANT_TOL = 2e-2
 
 
 @pytest.fixture(scope="module")
@@ -113,10 +117,10 @@ def _engram_table_for(engine, tensors, text):
     engine.engram_host = host
 
 
-def _compare(name, got, want):
+def _compare(name, got, want, *, tol=ATOL):
     err = (got - want).abs().max().item()
     assert torch.equal(got.argmax(-1), want.argmax(-1)), f"{name}: argmax differs (max abs err {err:.4f})"
-    torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL, msg=lambda m: f"{name}: {m}")
+    torch.testing.assert_close(got, want, atol=tol, rtol=tol, msg=lambda m: f"{name}: {m}")
 
 
 @pytest.mark.parametrize("mode", ["exact", "bounded"])
@@ -133,13 +137,13 @@ def test_quantized_offload_prefill_and_decode_match_reference(tmp_path, mode, ba
     want = ref.prefill_batch(ids) if mode == "exact" else ref.prefill_bounded(ids)
     reqs = [eng.new_request(i, row.tolist()) for i, row in enumerate(ids)]
     got = eng.prefill(reqs)
-    _compare(f"quantized {mode} prefill", got, want)
+    _compare(f"quantized {mode} prefill", got, want, tol=QUANT_TOL)
     eng.finish_prefill(reqs)
     for step in range(3):
         token = want.argmax(-1)
         want = ref.decode(token, ids.shape[-1] + step)
         got = eng.decode(reqs, token.tolist())
-        _compare(f"quantized {mode} decode {step}", got, want)
+        _compare(f"quantized {mode} decode {step}", got, want, tol=QUANT_TOL)
 
 
 def test_exact_prefill_and_greedy_decode_match_the_reference(checkpoint):

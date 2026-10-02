@@ -1,17 +1,15 @@
-"""ds_fp4 (DeepSeek W4A8) experts against an INDEPENDENT torch transcription of the reference
-``Expert.forward`` over ``fp4_gemm(act_quant(x), W)``:
+"""ds_fp4 (DeepSeek W4A8) experts against an INDEPENDENT torch transcription over
+``fp4_gemm(act_quant(x, block), W)`` at both fp8 activation blocks (128 on V4, 32 on V4.1):
 
     x_q  = fp8_roundtrip(x, block)                       # act_quant(..., inplace)
     gate = bf16(x_q @ deq(W1)^T), up = bf16(x_q @ deq(W3)^T)   # fp4_gemm outputs bf16
-    h    = silu(min(gate, L)) * clamp(up, -L, L)          # fp32
-    h    = w_r * h                                        # routing weight on the fp32 intermediate
-    y_r  = bf16(fp8_roundtrip(bf16(h), block) @ deq(W2)^T)
+    h    = bf16(silu(min(gate, L)) * clamp(up, -L, L))
+    y_r  = bf16(w_r * (fp8_roundtrip(h, block) @ deq(W2)^T))   # routing weight in the down epilogue
     y    = sum_r y_r
 
-The placement of the routing weight matters under quantization: weighting the down OUTPUT instead
-(the old shared-kernel behaviour) changes which fp8 grid the intermediate lands on. Both the GEMV
-(decode) and the grouped GEMM (prefill) paths must follow the reference order; the CPU executor's
-parity with the GPU path is covered by tests/moe/test_dsfp4_prequant.py.
+The routing weight scales the down output (the placement main serves V4 with); the reference
+``Expert.forward`` scales the intermediate before its fp8 quant instead. The GEMV (decode), the
+grouped GEMM (prefill) and the CPU executor all follow this transcription.
 """
 
 from __future__ import annotations
@@ -51,9 +49,8 @@ def _fp8_roundtrip(x: torch.Tensor, block: int) -> torch.Tensor:
 
 
 def reference(x, slots, weights, banks, block):
-    """The reference MoE over dequantized banks: per-route bf16 expert outputs accumulated into an
-    fp32 ``y`` (``y[idx] += expert(...)``), returned in fp32 -- the caller merges the shared expert
-    and rounds once (``y += shared; y.type_as(x)``)."""
+    """The MoE over dequantized banks: per-route bf16 expert outputs accumulated into an fp32 ``y``,
+    returned in fp32 (the kernels round that sum to bf16)."""
     gu_p, gu_s, dn_p, dn_s = banks
     W13 = _dequant(gu_p, gu_s)  # [E, 2I, H]
     W2 = _dequant(dn_p, dn_s)  # [E, H, I]
@@ -65,10 +62,9 @@ def reference(x, slots, weights, banks, block):
             e = int(slots[t, r])
             gu = (xq[t] @ W13[e].T).to(torch.bfloat16).float()
             gate, up = gu[:I].clamp(max=LIMIT), gu[I:].clamp(-LIMIT, LIMIT)
-            h = torch.nn.functional.silu(gate) * up
-            h = (weights[t, r].float() * h).to(torch.bfloat16)  # routing weight BEFORE the bf16 cast
+            h = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
             hq = _fp8_roundtrip(h.view(1, -1), block).float().view(-1)
-            y[t] += (hq @ W2[e].T).to(torch.bfloat16).float()
+            y[t] += (weights[t, r].float() * (hq @ W2[e].T)).to(torch.bfloat16).float()
     return y
 
 
@@ -82,7 +78,7 @@ def _inputs(T, device, seed=1):
 
 
 @pytest.mark.parametrize("block", [32, 128])
-def test_gemv_path_follows_the_reference_weighting(block):
+def test_gemv_path_matches_the_transcription(block):
     from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
     banks = _banks("cuda")
@@ -90,13 +86,10 @@ def test_gemv_path_follows_the_reference_weighting(block):
     got = routed_experts_fp4(x, slots, w, *banks, LIMIT, act_block=block).float()
     want = reference(x, slots, w, banks, block)
     torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
-    # output-side weighting (the old placement) is measurably different from the reference
-    wrong = routed_experts_fp4(x, slots, torch.ones_like(w), *banks, LIMIT, act_block=block).float()
-    assert not torch.allclose(wrong, want, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("block", [32, 128])
-def test_cpu_executor_follows_the_reference_weighting(block):
+def test_cpu_executor_matches_the_transcription(block):
     """The ``ds_fp4`` CPU executor (cpu / hybrid decode) implements the same contract as the GPU path."""
     from types import SimpleNamespace
 
@@ -120,7 +113,7 @@ def test_cpu_executor_follows_the_reference_weighting(block):
     torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
 
 
-def test_grouped_prefill_path_follows_the_reference_weighting():
+def test_grouped_prefill_path_matches_the_transcription():
     from freetoken.moe import fused_ds_fp4
 
     banks = _banks("cuda")

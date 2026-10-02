@@ -12,10 +12,8 @@ E8M0 = torch.float8_e8m0fnu
 
 
 class TritonMxfp4MoEKernel(MoEKernel):
-    """Standard OCP MXFP4 experts (DeepSeek-V4 / V4.1 ds_fp4): e2m1 pairs + e8m0 scales, no bias.
-    W4A8 numerics of the reference ``Expert.forward``: fp8 activation round-trips at the
-    checkpoint's block, the routing weight multiplied into the fp32 intermediate (both the GPU
-    kernels and the ``ds_fp4`` CPU executor implement this placement)."""
+    """Standard OCP MXFP4 experts (DeepSeek-V4 / V4.1 ds_fp4): e2m1 pairs + e8m0 scales, no bias;
+    W4A8 with the fp8 activation round-trips at the checkpoint's block."""
 
     name = "triton"
     cpu_format = "ds_fp4"

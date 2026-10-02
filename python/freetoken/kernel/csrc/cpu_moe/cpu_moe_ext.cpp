@@ -1696,7 +1696,6 @@ struct CpuMoeExecutor {
     const int tok = static_cast<int>(tk / top_k);
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
-    const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -1759,9 +1758,7 @@ struct CpuMoeExecutor {
   // ----------------------------- ds_fp4 (DSV4) -------------------------------
   // Row-major e2m1 + e8m0/32 (no global); silu-swiglu with clamp; FP8-roundtripped
   // activations (x once in submit -> xq_scratch; the intermediate g in a dedicated
-  // round-trip phase between the two passes). The router weight multiplies the fp32
-  // intermediate before its bf16 cast / fp8 round-trip (reference Expert.forward); the
-  // down outputs are summed unweighted.
+  // round-trip phase between the two passes). Router weight applies on the down output.
 
   void do_pass1_dsfp4(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
@@ -1770,7 +1767,6 @@ struct CpuMoeExecutor {
     const int tok = static_cast<int>(tk / top_k);
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
-    const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -1796,7 +1792,7 @@ struct CpuMoeExecutor {
         else if (up < -lim) up = -lim;
       }
       const float glu = gate / (1.0f + std::exp(-gate));  // silu(gate)
-      g_row[i] = f32_to_bf16(glu * up * wt);  // routing weight in fp32, before the bf16 cast
+      g_row[i] = f32_to_bf16(glu * up);
     }
   }
 
@@ -1834,13 +1830,14 @@ struct CpuMoeExecutor {
       for (int k = 0; k < top_k; ++k) {
         const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
         if (e < 0 || e >= num_experts) continue;
+        const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
         const float* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
         const float* go = go_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
         const uint8_t* dp = dn_packed_l + (size_t)e * (size_t)H * Ih + (size_t)h * Ih;
         const uint8_t* ds = dn_scale_l + (size_t)e * (size_t)H * Is + (size_t)h * Is;
-        // Each route's down output (already routing-weighted through the intermediate) is
-        // rounded to bf16 before the fp32 sum over routes (down [T, top_k, H] bf16 -> .sum(dim=1)).
-        acc += bf16_to_f32(f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut)));
+        // The reference rounds each route's weighted down output to bf16 before the
+        // fp32 sum over routes (down [T, top_k, H] bf16 -> .sum(dim=1)).
+        acc += bf16_to_f32(f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut) * wt));
       }
       y_row[h] = f32_to_bf16(acc);
     }

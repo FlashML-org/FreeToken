@@ -149,7 +149,8 @@ def test_vision_encoder_matches_official_with_padded_grid(tmp_path, placement):
 @pytest.mark.parametrize('quantized', [False, True])
 def test_image_logits_and_decode_match_reference(tmp_path, quantized):
     from .harness import TinyEngine
-    from .test_reference_parity import Reference, _compare, _engram_table_for
+    from .test_reference_parity import ATOL, QUANT_TOL, Reference, _compare, _engram_table_for
+    tol = QUANT_TOL if quantized else ATOL
     tensors = _checkpoint(tmp_path, quantized)
     text = tiny_text_config(moe_intermediate_size=256) if quantized else tiny_text_config()
     ref = Reference(tensors, text, max_seq_len=512, max_batch_size=2, quantized=quantized, vision_config=VC)
@@ -170,13 +171,13 @@ def test_image_logits_and_decode_match_reference(tmp_path, quantized):
     req = eng.new_request(0, result.input_ids.tolist())
     req.mm_items = result.mm_items
     got = _prefill(eng, [req])
-    _compare('image prefill', got, want)
+    _compare('image prefill', got, want, tol=tol)
     eng.finish_prefill([req])
     for step in range(3):
         token = want.argmax(-1)
         want = ref.decode(token, len(ids) + step)
         got = eng.decode([req], token.tolist())
-        _compare(f'image decode {step}', got, want)
+        _compare(f'image decode {step}', got, want, tol=tol)
 
 
 @requires_cuda

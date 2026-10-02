@@ -129,18 +129,15 @@ def _decode_dsfp4_moe_kernel(
 def _swiglu_kernel(
     gu_ptr,            # [R, 2I] gate_up (compute dtype)
     out_ptr,           # [R, I] activated (compute dtype)
-    w_ptr,             # [R] fp32 per-route routing weight (HAS_WEIGHT)
     R, I, limit,
     stride_gr, stride_gi, stride_or, stride_oi,
-    BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, HAS_WEIGHT: tl.constexpr, compute_type: tl.constexpr,
+    BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, compute_type: tl.constexpr,
     ACT_BLOCK: tl.constexpr,  # > 0: fp8 (e4m3, ue8m0 per ACT_BLOCK) round-trip of the stored value, fused
 ):
-    """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit) [* weight[row]]``.
+    """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit)``.
 
-    Collapses the gate/up split + two clamps + silu + mul + the routing-weight multiply + the
-    fp32 round-trip between the two FP4 GEMVs into one pass. The reference ``Expert.forward``
-    applies the routing weight to the fp32 intermediate BEFORE the bf16 cast and the down
-    projection's fp8 activation quant, so the weight lives here, not on the down output. With
+    Collapses the gate/up split + two clamps + silu + mul + the fp32 round-trip
+    (6 elementwise launches over [R, I]) between the two FP4 GEMVs into one pass. With
     ``ACT_BLOCK`` the down projection's activation quant (``act_quant_fp8_inplace`` on the bf16
     value: ``s = 2**ceil(log2(max(|x|, 1e-4) / 448))``, e4m3 rounding, dequant) is applied to the
     same tile before the store -- one launch and one memory pass fewer, bit-identical."""
@@ -154,8 +151,6 @@ def _swiglu_kernel(
         g = tl.minimum(g, limit)
         u = tl.minimum(tl.maximum(u, -limit), limit)
     act = (g * tl.sigmoid(g)) * u
-    if HAS_WEIGHT:
-        act = act * tl.load(w_ptr + row).to(tl.float32)
     if ACT_BLOCK > 0:
         tl.static_assert(BLOCK % ACT_BLOCK == 0, "the tile holds whole quant blocks")
         xs = tl.reshape(act.to(compute_type).to(tl.float32), (BLOCK // ACT_BLOCK, ACT_BLOCK))  # the value the store would hold
@@ -302,28 +297,21 @@ def _compute_type(dtype: torch.dtype):
     return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[dtype]
 
 
-def fused_swiglu(gate_up: torch.Tensor, limit: float, routed_weights: torch.Tensor | None = None, *, act_block: int = 0) -> torch.Tensor:
-    """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``). ``routed_weights``
-    (one fp32 weight per leading row, i.e. per route) is multiplied into the fp32 intermediate before
-    the store -- the reference's routing-weight placement for the quantized experts. ``act_block > 0``
+def fused_swiglu(gate_up: torch.Tensor, limit: float, *, act_block: int = 0) -> torch.Tensor:
+    """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``). ``act_block > 0``
     also applies the down projection's fp8 activation round-trip (block ``act_block``) in the same pass."""
     *lead, two_I = gate_up.shape
     I = two_I // 2
     gu = gate_up.reshape(-1, two_I)
     R = gu.shape[0]
     out = torch.empty((R, I), dtype=gate_up.dtype, device=gate_up.device)
-    if routed_weights is not None:
-        w = routed_weights.reshape(-1).to(torch.float32).contiguous()
-        assert w.numel() == R, (w.numel(), R)
-    else:
-        w = out
     BLOCK = 1024
     assert act_block == 0 or (I % act_block == 0 and BLOCK % act_block == 0), (I, act_block)
     grid = (R, triton.cdiv(I, BLOCK))
     _swiglu_kernel[grid](
-        gu, out, w, R, I, float(limit),
+        gu, out, R, I, float(limit),
         gu.stride(0), gu.stride(1), out.stride(0), out.stride(1),
-        BLOCK=BLOCK, HAS_LIMIT=limit > 0, HAS_WEIGHT=routed_weights is not None,
+        BLOCK=BLOCK, HAS_LIMIT=limit > 0,
         compute_type=_compute_type(gate_up.dtype), ACT_BLOCK=act_block, num_warps=4,
     )
     return out.reshape(*lead, I)
