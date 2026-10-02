@@ -79,22 +79,26 @@ warning; pass `--moe-strategy offload` to use them.
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
   demand (keep them on a fast NVMe; the 6 GiB of table scales stay in host RAM), using
   bounded pinned staging buffers; an FTW conversion copies them next
-  to the checkpoint as `engram-table-NN.safetensors`. `--swa-decoder-replay bounded`
-  (default) runs the 20 decoder layers on each prompt's last 128 tokens, as DeepSeek deploys
-  it. That decoder KV is request-private (per-request rings, never in radix-shared pages, so
-  prefix reuse and commit-time page dedup only ever share encoder / compressed KV), and a
-  prefix hit keeps two live windows of history behind it so the encoder can recompute the
-  replayed tokens' hidden states. `--swa-decoder-replay exact` runs the decoder on every prompt
-  token and caches its window KV like any other layer. Run
-  `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
-  choosing a MoE strategy. `--moe-strategy hybrid` splits expert misses using those
-  measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` controls the token
-  capacity reserved before allocating the expert cache, subject to the attention
-  pool's structural minimum. Size this reserve for the intended context and concurrency.
-  `--max-extend-length` controls prefill chunk size and its workspace requirement.
-  Image input uses the shared
-  multimodal processor and encoder cache, including chunked prefill and prefix replay;
-  `--text-model-only` skips the vision weights. DSpark speculative decoding is not served.
+  to the checkpoint as `engram-table-NN.safetensors`.
+  SWA bounded replay (DeepSeek_V41_Tech_Report.pdf, shipped in the checkpoint, §3.2.2): a replayed
+  segment recomputes only the SWA KV of its last `n_win` tokens and truncates each query's window to
+  the segment. *Encoder* replay rebuilds the encoder SWA KV behind a prefix hit from the global KV
+  alone (approximate; the report's fallback when the SWA KV of a hit has been evicted). *Decoder*
+  replay runs the decoder layers on each prompt's last `n_win` tokens only; their SWA KV is never
+  prefix-cached and post-training simulated it. FreeToken keeps encoder SWA KV in the radix cache and
+  recomputes from it exactly (no encoder replay); `--swa-decoder-replay bounded` (default) is the
+  report's decoder replay, `exact` runs the decoder on every prompt token (reference numerics).
+  Bounded output differs from exact by construction and does not depend on the prefill chunk size.
+  Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
+  replay saves decoder-layer compute, not prefill time.
+  Run `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
+  choosing a MoE strategy; `--moe-strategy hybrid` splits expert misses using those
+  measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` sets the token capacity reserved
+  before the expert cache is allocated, subject to the attention pool's structural minimum; size it
+  for the intended context and concurrency. `--max-extend-length` controls the prefill chunk size
+  and its workspace. Image input uses the shared multimodal processor and encoder cache, including
+  chunked prefill and prefix replay; `--text-model-only` skips the vision weights. DSpark
+  speculative decoding is not served.
   `reasoning_effort` takes `low`, `high` or `max`; the 1-100 integer budget goes through the
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
