@@ -26,17 +26,6 @@ if TYPE_CHECKING:
 
 
 class BaseLLMModel(ABC, BaseOP):
-    replays_prefill = False
-
-    def prefill_start(self, req) -> int:
-        """First token the model recomputes; multimodal gathering uses the same interval."""
-        return req.cached_len
-
-    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
-        """Whether a prefix hit ending at ``cached_len``, with ``live_history`` tokens of window KV
-        kept live behind it, holds everything the prefill resuming there reads."""
-        return True
-
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 
@@ -56,6 +45,21 @@ class SupportsMultimodal(Protocol):
 
     def place_encoder_weights(self, mode: str) -> None:
         """Every encoder tower's weights: ``gpu`` resident or ``host`` streamed from pinned banks."""
+        ...
+
+
+@runtime_checkable
+class ReplaysPrefill(Protocol):
+    """A model whose prefill can start before ``cached_len``, recomputing cached tokens (DeepSeek-V4.1's
+    bounded replay); the scheduler and the encoder cache follow that interval."""
+
+    def prefill_start(self, req) -> int:
+        """First token the prefill recomputes; multimodal gathering uses the same interval."""
+        ...
+
+    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
+        """Whether a prefix hit ending at ``cached_len``, with ``live_history`` tokens of window KV
+        kept live behind it, holds everything the prefill resuming there reads."""
         ...
 
 

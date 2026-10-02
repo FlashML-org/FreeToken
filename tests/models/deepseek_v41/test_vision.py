@@ -18,6 +18,7 @@ from freetoken.engine.engine import Engine
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.encoder_cache import EncoderCache
 from freetoken.mm.processors.deepseek_v41 import DeepseekV41MMProcessor
+from freetoken.models.blocks import ReplaysPrefill
 from freetoken.models.deepseek_v41.config import VisionConfig
 from freetoken.scheduler.mm import plan_mm_batch
 from freetoken.utils.torch_utils import torch_dtype
@@ -70,7 +71,7 @@ def _inputs(length=151):
 
 def _prefill(eng, reqs):
     if not hasattr(eng, 'encoder_cache'):
-        eng.encoder_cache = EncoderCache(retain_until_prefill_end=eng.model.replays_prefill)
+        eng.encoder_cache = EncoderCache(retain_until_prefill_end=isinstance(eng.model, ReplaysPrefill))
         eng.dtype = torch.bfloat16
         eng._mm_registered = set()
     for req in reqs:

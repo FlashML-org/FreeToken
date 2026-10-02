@@ -160,3 +160,15 @@ def test_fp8_wo_a_layer_rejects_a_dequantized_ftw_layout_clearly():
     state2["attn.wo_a"], state2["attn.wo_a_scale"] = w, scale
     bf16_layer.load_state_dict(state2, prefix="attn")
     assert torch.equal(bf16_layer.wo_a, w.to(torch.bfloat16))
+
+
+def test_only_v41_declares_the_prefill_replay_hooks():
+    """The replay hooks are a V4.1 capability (``ReplaysPrefill``), not ``BaseLLMModel`` members:
+    every other family keeps the scheduler's ``cached_len`` interval and plain admission."""
+    from freetoken.models.blocks import BaseLLMModel, ReplaysPrefill
+    from freetoken.models.deepseek_v4.model import DeepseekV4ForCausalLM
+    from freetoken.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    assert issubclass(DeepseekV41ForCausalLM, ReplaysPrefill)
+    assert not issubclass(DeepseekV4ForCausalLM, ReplaysPrefill)
+    assert not any(hasattr(BaseLLMModel, name) for name in ("prefill_start", "can_resume_at", "replays_prefill"))

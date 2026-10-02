@@ -397,9 +397,12 @@ class Engine:
         if config.active_encoders:
             from freetoken.mm.encoder_cache import EncoderCache
             from freetoken.mm.processor import get_mm_processor
+            from freetoken.models.blocks import ReplaysPrefill
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
-            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device, retain_until_prefill_end=self.model.replays_prefill)
+            self.encoder_cache = EncoderCache(
+                storage=config.mm.embed_cache_device, retain_until_prefill_end=isinstance(self.model, ReplaysPrefill)
+            )
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
                 f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"

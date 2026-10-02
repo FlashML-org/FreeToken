@@ -55,7 +55,7 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
-    # the model's BaseLLMModel.can_resume_at over this cache's live window history
+    # the model's ReplaysPrefill.can_resume_at over this cache's live window history
     can_resume_at: Callable[[int], bool] | None = None
 
     def __post_init__(self) -> None:

@@ -193,7 +193,7 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
 
 @pytest.mark.parametrize("resumable", [True, False])
 def test_admission_turns_an_unresumable_hit_into_a_miss(resumable):
-    """A prefix hit the model cannot resume at (``BaseLLMModel.can_resume_at``) is admitted as a
+    """A prefix hit the model cannot resume at (``ReplaysPrefill.can_resume_at``) is admitted as a
     miss: that request prefills from scratch, nothing raises and the hit's lock is not taken."""
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
