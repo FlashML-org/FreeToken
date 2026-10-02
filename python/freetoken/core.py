@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.tokenizer.detokenize import DecodeStatus
 
 
 @dataclass
@@ -64,6 +65,7 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    stop_decode_status: DecodeStatus | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
