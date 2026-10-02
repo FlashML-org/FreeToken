@@ -710,6 +710,30 @@ def _reasoning_geometry(state: Any) -> dict | None:
     return {"gears": list(gears), "default": default, "kwargs": kwargs}
 
 
+def kv_pool_geometry(state: Any) -> tuple[int, int]:
+    """The allocated KV pool as ``(num_pages, page_size)``, most-recent-truth first: the last
+    rebuild's result, else the running UserReply snapshot, else the load-time ("meta", …) ack.
+    ``num_pages`` is 0 until one of those lands (still loading / older engine build).
+
+    Split out of cache_geometry so /v1/models can clamp the advertised context to the pool
+    without recomputing the whole panel payload -- both callers must agree on the resolution
+    order or they would report different capacities for the same server.
+    """
+    stats = getattr(state, "stats", None)
+    last = getattr(state, "last_rebuild", None) or {}
+    pools = getattr(state, "cache_pools", None) or {}
+    num_pages = int(
+        last.get("num_pages")
+        or getattr(stats, "kv_total_pages", 0)
+        or pools.get("num_pages", 0)
+        or 0
+    )
+    page_size = int(
+        pools.get("page_size", 0) or getattr(getattr(state, "config", None), "page_size", 1) or 1
+    )
+    return num_pages, page_size
+
+
 def cache_geometry(state: Any) -> dict:
     """Current cache geometry for the desktop cache panel. Each pool size resolves
     most-recent-truth first: the last rebuild's result, else the running UserReply snapshot
@@ -725,11 +749,10 @@ def cache_geometry(state: Any) -> dict:
     config = state.config
     last = getattr(state, "last_rebuild", None) or {}
     pools = getattr(state, "cache_pools", None) or {}
-    num_pages = int(last.get("num_pages") or tr.kv_total_pages or pools.get("num_pages", 0) or 0)
+    num_pages, page_size = kv_pool_geometry(state)
     num_mamba_slots = int(
         last.get("mamba_slots") or tr.mamba_total_slots or pools.get("num_mamba_slots", 0) or 0
     )
-    page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
     moe_cache_size = last.get("moe_cache_size")
     if moe_cache_size is None:
         moe_cache_size = int(pools.get("moe_cache_size", 0) or 0) or configured_moe_cache_size(
