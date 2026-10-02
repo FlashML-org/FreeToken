@@ -48,6 +48,11 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # Disk tier (None when off): a moe.disk_tier.Nvfp4DiskIndex over the original
+    # checkpoint plus how many experts per layer are RAM-resident (the rest are
+    # disk-resident and fetched on slot-cache miss).
+    disk_index: object | None = field(default=None)
+    disk_ram_experts: int = 0
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -75,6 +80,7 @@ def build_expert_banks(
     device: torch.device,
     layer_sink=None,
     dummy: bool = False,
+    ram_prefix: int | None = None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -83,6 +89,13 @@ def build_expert_banks(
     complete once its ``num_experts`` rows have arrived: with ``layer_sink=None`` its banks
     are pinned in the background, otherwise the sink receives them (converter). ``dummy``
     skips the pieces and fills the banks with finite random contents.
+
+    ``ram_prefix`` (the disk tier): rows ``[ram_prefix, E)`` are disk-resident. The
+    reader yields an EMPTY piece for each of them (nothing was read from the
+    checkpoint), so ``_fill`` marks the rows complete without touching the banks,
+    only the first ``ram_prefix`` rows are pinned (``PinPipeline(prefix_rows=...)``),
+    and the released tail pages are dropped (``release_bank_tails``) once the load
+    settles. The rows stay allocated -- they are the tier's fetch destination.
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
@@ -123,6 +136,15 @@ def build_expert_banks(
             if written[layer_id, e0:e1].any():
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
             written[layer_id, e0:e1] = 1
+            if not piece:
+                # Disk tier: a disk-resident row. Nothing was read from the
+                # checkpoint and the bank rows stay unbacked (the tier fetches
+                # into the GPU slot cache, never through the bank tail) -- but
+                # the row still counts toward layer completion.
+                if tracker is not None:
+                    for _ in range(e1 - e0):
+                        tracker.note(layer_id)
+                continue
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
             got = method.pack(piece, out)
             for role, values in got.items():
@@ -137,10 +159,18 @@ def build_expert_banks(
     if layer_sink is not None:
         _fill(layer_sink)
     elif torch.cuda.is_available():
-        with PinPipeline() as pins:
+        with PinPipeline(prefix_rows=ram_prefix) as pins:
             _fill(pins)
     else:
         _fill(None)
+
+    if ram_prefix is not None:
+        # Drop the released tail pages now that the load has settled (the prefix
+        # is pinned; the tail rows were never written).
+        from freetoken.moe.disk_tier import check_tail_unbacked, release_bank_tails
+
+        release_bank_tails(hb, E, ram_prefix)
+        check_tail_unbacked(hb, E, ram_prefix)
 
     return ExpertBanks(
         legacy_format_for(method.kind, kernel.name), banks,
@@ -192,16 +222,53 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
-    from freetoken.moe.expert_pieces import iter_expert_pieces
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk,
+                         layer_sink=None, disk_tier=None) -> ExpertBanks:
+    from freetoken.moe.expert_pieces import iter_expert_pieces, nvfp4_expert_spec_of
 
     num_layers = model_config.num_moe_layers
     if dummy:
         return build_expert_banks(method, num_layers, None, device=device, dummy=True)
+
+    # Disk tier: v0 speaks the native NVFP4 (triton) bank layout -- the index and
+    # the fetch path are written against it. Fail before any bank is allocated.
+    disk_index = None
+    if disk_tier is not None:
+        from freetoken.layers.quantization import QuantKind
+
+        if method.kind is not QuantKind.NVFP4 or method.kernel.name != "triton":
+            raise NotImplementedError(
+                f"disk tier requires the native NVFP4 layout (got kind={method.kind!r}, "
+                f"kernel={method.kernel.name!r})")
+        if layer_sink is not None:
+            raise NotImplementedError("disk tier is a serving path; the converter (layer_sink) is not supported")
+        source_spec = nvfp4_expert_spec_of(model_path, model_config)
+        if source_spec is None:
+            raise NotImplementedError(
+                f"--moe-disk-tier on: {model_config.architectures[0]} exposes no "
+                "nvfp4_expert_spec, so the tier cannot locate expert rows in the "
+                "checkpoint (the loader would release them and never refetch)")
+        # Build the index HERE, next to the release below: a family that reaches
+        # the release without an index would serve zeroed experts. Resolving the
+        # spec through the family hook keeps the index and the loader reading
+        # the same rows.
+        from freetoken.moe.disk_tier import Nvfp4DiskIndex
+
+        disk_index = Nvfp4DiskIndex(model_path, model_config, source_spec)
+
     pieces = iter_expert_pieces(
-        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,
+        skip_experts_from=disk_tier.ram_experts if disk_tier is not None else None,
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+    banks = build_expert_banks(
+        method, num_layers, pieces, device=device, layer_sink=layer_sink,
+        ram_prefix=disk_tier.ram_experts if disk_tier is not None else None,
+    )
+    if disk_index is not None:
+        import dataclasses
+
+        banks = dataclasses.replace(banks, disk_index=disk_index, disk_ram_experts=disk_tier.ram_experts)
+    return banks
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -286,6 +353,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    disk_tier=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -314,6 +382,10 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if disk_tier is not None:
+            raise NotImplementedError(
+                "disk tier v0 reads the original safetensors checkpoint; FTW checkpoints "
+                "are not supported yet (serve from the source path)")
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
@@ -354,7 +426,8 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
+            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk,
+                                        layer_sink, disk_tier=disk_tier)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 
     with requested_residency(layer_residency) as residency_plan:
