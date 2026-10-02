@@ -1,11 +1,11 @@
-"""DeepSeek-V4.1-Flash hyperparameters and the static per-layer CSA2 roles.
+"""DeepSeek-V4.1-Flash hyperparameters and the static per-layer attention roles.
 
 ``DeepseekV41Args`` mirrors the reference ``ModelArgs`` (``inference/model.py``) field for field,
 read from the HF ``config.json``'s ``text_config`` (the ``inference/config.json`` dialect is also
 accepted). Everything the engine reconciles at runtime (``max_seq_len``, the replay policy) is
 attached by ``parse_config`` / the engine, not read from the checkpoint.
 
-``LayerRole`` is the CSA2 mode table (tech report sec. 2.3.1): every compressing layer is Full
+``LayerRole`` is the attention mode table (tech report sec. 2.3.1): every compressing layer is Full
 (owns the compressed KV + indexer K), Reindex (own indexer over a shared K) or Reuse (shared
 Top-K); the candidate pool of the Hierarchical Sparse Indexer (sec. 2.3.2) is produced by the
 first decoder Full layer and consumed by the decoder Reindex layers after it.
@@ -86,7 +86,7 @@ class DeepseekV41Args:
     norm_eps: float = 1e-20
     o_groups: int = 8
     o_lora_rank: int = 1024
-    # sparse attention (CSA2)
+    # sparse attention
     window_size: int = 128
     compress_ratios: tuple[int, ...] = ()  # one per layer, MTP layers included
     kv_source_layers: tuple[int, ...] = ()

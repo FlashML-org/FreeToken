@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1 (CSA2) sparse-attention backend.
+"""DeepSeek-V4.1 sparse-attention backend.
 
 Same contract and division of labour as ``dsv4_sparse``: the backend owns the per-forward KV
 ADDRESSING over the shared page table (window ring slots, compressed rows, compress-state carry,
@@ -6,7 +6,7 @@ the decode snapshot and the CUDA-graph staging buffers) plus the selection helpe
 index arithmetic (causal top-k, the hierarchical candidate pool); the model computes projections
 and hands the picks back to be resolved into pool rows.
 
-What CSA2 adds on top of DSV4's vocabulary:
+What DSV41 adds on top of DSV4's vocabulary:
 
 * **cross-layer sharing** -- the compressed tiers belong to the kv-source layer; a consumer layer
   addresses ``source_of(layer)``'s pools. The Top-K rows and the candidate pool the Full / Reindex
@@ -116,7 +116,7 @@ class SharedSelection:
 
 
 @dataclass
-class CSA2AttnMetadata(BaseAttnMetadata):
+class DSV41AttnMetadata(BaseAttnMetadata):
     last_indices: torch.Tensor
     # Prefill: the encoder pass tiles the encoder stream -- the new tokens, extended backwards
     # over re-prefilled cached tokens under bounded replay (``extended``; the model builds that
@@ -182,13 +182,13 @@ class CSA2AttnMetadata(BaseAttnMetadata):
 
 
 @dataclass
-class CSA2CaptureData:
+class DSV41CaptureData:
     full_snap: torch.Tensor
     last_indices: torch.Tensor
     table_rows: torch.Tensor  # each batch row's page-table row (the private window rings key on it)
 
     @classmethod
-    def create(cls, max_bs: int, width: int, device: torch.device) -> "CSA2CaptureData":
+    def create(cls, max_bs: int, width: int, device: torch.device) -> "DSV41CaptureData":
         return cls(
             full_snap=torch.full((max_bs, width), -1, dtype=torch.int64, device=device),
             last_indices=torch.arange(max_bs, dtype=torch.int32, device=device),
@@ -196,19 +196,19 @@ class CSA2CaptureData:
         )
 
 
-class CSA2SparseAttnBackend(BaseAttnBackend):
+class DSV41SparseAttnBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
-        from freetoken.kvcache.csa2_geometry import CSA2Geometry
+        from freetoken.kvcache.dsv41_geometry import DSV41Geometry
 
         self.config = config
         self.device = get_global_ctx().kv_cache.device
-        geom = next(g.geometry for g in config.attention_groups if isinstance(getattr(g, "geometry", None), CSA2Geometry))
-        self.geom: CSA2Geometry = geom
+        geom = next(g.geometry for g in config.attention_groups if isinstance(getattr(g, "geometry", None), DSV41Geometry))
+        self.geom: DSV41Geometry = geom
         self.window_size = geom.window
         args = config.dsv41_args
         self.decoder_replay: str = getattr(args, "decoder_replay", "exact")
         self.decoder_start: int = getattr(args, "decoder_start_layer", geom.n_layers)
-        self.capture: CSA2CaptureData | None = None
+        self.capture: DSV41CaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self._window_ar = torch.arange(self.window_size, device=self.device)
@@ -219,16 +219,16 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
 
     # ----- generic contract -------------------------------------------------------------
     def forward(self, q, k, v, layer_id, batch, attn_spec: AttentionSpec | None = None):
-        raise NotImplementedError("CSA2 attention is driven per-tier from the model module; use CSA2SparseAttnBackend.attend().")
+        raise NotImplementedError("DSV41 attention is driven per-tier from the model module; use DSV41SparseAttnBackend.attend().")
 
     def prepare_metadata(self, batch: Batch) -> None:
         if not batch.is_decode:
             batch.attn_metadata = self._prefill_metadata(batch)
             return
         last = torch.tensor([r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device).cumsum_(0) - 1
-        batch.attn_metadata = CSA2AttnMetadata(last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar)
+        batch.attn_metadata = DSV41AttnMetadata(last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar)
 
-    def _prefill_metadata(self, batch: Batch) -> CSA2AttnMetadata:
+    def _prefill_metadata(self, batch: Batch) -> DSV41AttnMetadata:
         """Exact mode: one stream of every new token, the decoder pass is that same stream.
         Bounded replay: each request's encoder segment starts at ``replay_start`` (extended
         backwards over cached tokens when the chunk is shorter than a window) and its decoder
@@ -245,7 +245,7 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
             off += r.device_len - start
         if not bounded:
             last = torch.tensor([s.n for s in segments], dtype=torch.int32, device=self.device).cumsum_(0) - 1
-            return CSA2AttnMetadata(last_indices=last, segments=segments, decoder_segments=segments, decoder_rows=None, extended=extended)
+            return DSV41AttnMetadata(last_indices=last, segments=segments, decoder_segments=segments, decoder_rows=None, extended=extended)
         dec: List[PrefillSegment] = []
         rows: list[torch.Tensor] = []
         doff = 0
@@ -259,7 +259,7 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
             doff += n_replay
         last = torch.tensor([d.n for d in dec], dtype=torch.int32, device=self.device).cumsum_(0) - 1
         decoder_rows = torch.cat(rows).to(self.device, non_blocking=True) if rows else torch.empty(0, dtype=torch.int64, device=self.device)
-        return CSA2AttnMetadata(last_indices=last, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, extended=extended)
+        return DSV41AttnMetadata(last_indices=last, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, extended=extended)
 
     def encoder_stream(self, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
         """The prefill encoder stream ``(input_ids [T], positions [T] int64)``: the batch's own tensors,
@@ -275,7 +275,7 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         self.max_graph_bs = max(bs_list)
-        self.capture = CSA2CaptureData.create(self.max_graph_bs, max_seq_len, self.device)
+        self.capture = DSV41CaptureData.create(self.max_graph_bs, max_seq_len, self.device)
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
@@ -297,15 +297,15 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         w = min(src.shape[1], cap.full_snap.shape[1])
         cap.full_snap[:bs, :w].copy_(src[:bs, :w])
         cap.table_rows[:bs].copy_(rows_ti[:bs])
-        batch.attn_metadata = CSA2AttnMetadata(
+        batch.attn_metadata = DSV41AttnMetadata(
             last_indices=cap.last_indices[:bs], full_snap=cap.full_snap[:bs], table_rows=cap.table_rows[:bs], window_ar=self._window_ar,
         )
 
     # ----- metadata / selection access -------------------------------------------------
     @property
-    def metadata(self) -> CSA2AttnMetadata:
+    def metadata(self) -> DSV41AttnMetadata:
         md = get_global_ctx().batch.attn_metadata
-        assert isinstance(md, CSA2AttnMetadata)
+        assert isinstance(md, DSV41AttnMetadata)
         return md
 
     @property
@@ -430,7 +430,7 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         """``[B, S, T]`` full-range scores (live columns written) or ``[B, S, NC]`` candidate scores; the
         row of compressed position ``t`` is ``locs[b, t * ratio] // ratio``."""
-        from freetoken.kernel.triton.csa2.indexer import indexer_logits_packed
+        from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
 
         return indexer_logits_packed(q, weights, self.pool.idx_pool[source], self.geom.idx_fmt, locs, ratio, live, T=T, candidates=candidates)
 
@@ -439,21 +439,21 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         """Exact causal top-k over ``[B, S, T]`` full-range scores (columns at or past ``live`` unread):
         compressed positions ``[B, S, topk]`` int32 in ascending order, ``-1`` in the tail for picks
         that do not exist (fewer live or finite positions than ``topk``). Ties: lowest position wins."""
-        from freetoken.kernel.triton.csa2.topk import csa2_topk
+        from freetoken.kernel.triton.dsv41.topk import dsv41_topk
 
         b, s, t = scores.shape
-        return csa2_topk(scores.reshape(b * s, t), live.reshape(b * s), topk).view(b, s, topk)
+        return dsv41_topk(scores.reshape(b * s, t), live.reshape(b * s), topk).view(b, s, topk)
 
     @staticmethod
     def select_topk_in_candidates(scores: torch.Tensor, candidates: torch.Tensor, topk: int) -> torch.Tensor:
         """Top-k over ``[B, S, NC]`` candidate-aligned scores -> the picked compressed positions
         ``[B, S, topk]`` int32. The candidate list is a sorted valid prefix (``-1`` tail) and empty /
         unreachable slots score ``-inf``, so the ascending winning slots map to ascending positions."""
-        from freetoken.kernel.triton.csa2.topk import csa2_topk
+        from freetoken.kernel.triton.dsv41.topk import dsv41_topk
 
         b, s, nc = scores.shape
         live = torch.full((b * s,), nc, dtype=torch.int32, device=scores.device)
-        slots = csa2_topk(scores.reshape(b * s, nc), live, topk).view(b, s, topk)
+        slots = dsv41_topk(scores.reshape(b * s, nc), live, topk).view(b, s, topk)
         pos = candidates.gather(-1, slots.clamp_min(0).to(torch.int64)).to(torch.int32)
         return torch.where(slots < 0, -1, pos)
 
@@ -464,10 +464,10 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         expanded to the compact candidate list ``[B, S, topk_blocks * block_size]`` int32 of
         compressed positions (ascending, ``-1`` tail). Mirrors the reference ``select_candidate_blocks``
         (which returns the equivalent boolean mask)."""
-        from freetoken.kernel.triton.csa2.topk import csa2_candidate_blocks
+        from freetoken.kernel.triton.dsv41.topk import dsv41_candidate_blocks
 
         b, s, t = scores.shape
-        return csa2_candidate_blocks(scores.reshape(b * s, t), live.reshape(b * s), topk_blocks, block_size).view(b, s, -1)
+        return dsv41_candidate_blocks(scores.reshape(b * s, t), live.reshape(b * s), topk_blocks, block_size).view(b, s, -1)
 
     @staticmethod
     def positions_to_rows(positions: torch.Tensor, locs: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -486,7 +486,7 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         """Paged sparse attention over ``[window | compressed]`` global rows; the compressed half reads
         the layer's kv source (window-only layers pass ``n_window == topk``). ``split=False`` keeps a
         one-query call on the single-program kernel (prefill: the result must not depend on ``m``)."""
-        from freetoken.kernel.triton.csa2.sparse_attn import sparse_attn_packed
+        from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
         pool, geom = self.pool, self.geom
         src = geom.kv_source_of(layer_id)
@@ -497,4 +497,4 @@ class CSA2SparseAttnBackend(BaseAttnBackend):
         )
 
 
-__all__ = ["CSA2SparseAttnBackend", "CSA2AttnMetadata", "PrefillSegment", "SharedSelection", "prompt_len", "replay_start"]
+__all__ = ["DSV41SparseAttnBackend", "DSV41AttnMetadata", "PrefillSegment", "SharedSelection", "prompt_len", "replay_start"]

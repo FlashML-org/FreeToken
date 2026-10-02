@@ -1,4 +1,4 @@
-"""Engine config resolution for DeepSeek-V4.1 on the tiny checkpoint: the CSA2 backend and pool are
+"""Engine config resolution for DeepSeek-V4.1 on the tiny checkpoint: the DSV41 backend and pool are
 picked, the page size is the window page, the replay knob lands on the model args, and the fp8
 dialect (block 32, fp4 experts) reaches the quant layer with the matching activation block."""
 
@@ -14,7 +14,7 @@ from freetoken.distributed import DistributedInfo
 from freetoken.scheduler.config import SchedulerConfig
 from freetoken.engine.engine import _adjust_config
 from freetoken.kvcache import resolve_pool_class
-from freetoken.kvcache.csa2_paged_pool import CSA2PagedKVCache
+from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 
 from .common import write_tiny_checkpoint
 
@@ -24,7 +24,7 @@ def _engine_config(path, **over):
 
 
 @pytest.mark.parametrize("replay", ["bounded", "exact"])
-def test_resolution_picks_csa2_and_the_replay_knob(tmp_path, monkeypatch, replay):
+def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, replay):
     from freetoken.engine import engine
 
     monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
@@ -32,9 +32,9 @@ def test_resolution_picks_csa2_and_the_replay_knob(tmp_path, monkeypatch, replay
     write_tiny_checkpoint(str(tmp_path))
     config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", decoder_replay=replay, max_seq_len_override=2048)
     _adjust_config(config)
-    assert config.attention_backend == "csa2_sparse"
+    assert config.attention_backend == "dsv41_sparse"
     assert config.page_size == 128 and config.cache_type == "swa_radix"
-    assert resolve_pool_class(config.model_config) is CSA2PagedKVCache
+    assert resolve_pool_class(config.model_config) is DSV41PagedKVCache
     args = config.model_config.dsv41_args
     assert args.decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
@@ -46,7 +46,7 @@ def test_resolution_picks_csa2_and_the_replay_knob(tmp_path, monkeypatch, replay
     assert geom.resume_history == want and spec.resume_history == want and spec.sliding_window == 128
     # bounded replay keeps the decoder's per-request window KV in private rings, off the shared pages
     assert geom.private_window_layer_ids == (tuple(range(args.decoder_start_layer, args.n_layers)) if replay == "bounded" else ())
-    assert CSA2PagedKVCache.min_kv_tokens(config) // 128 == 8 + (2 * geom.resume_windows + 1) * config.max_running_req + 2 * (config.max_running_req + 1) + 1
+    assert DSV41PagedKVCache.min_kv_tokens(config) // 128 == 8 + (2 * geom.resume_windows + 1) * config.max_running_req + 2 * (config.max_running_req + 1) + 1
 
 
 def test_bounded_mode_cache_refuses_a_hit_with_one_live_window(tmp_path, monkeypatch):

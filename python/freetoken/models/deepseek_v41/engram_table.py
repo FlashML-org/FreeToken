@@ -144,7 +144,7 @@ class EngramDiskTable:
     # ----- device (EngramTable protocol) -----
     def lookup(self, num_tokens: int) -> torch.Tensor:
         from freetoken.kernel.row_store import wait_reset
-        from freetoken.kernel.triton.csa2.pack import unpack_rows
+        from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
         stream = torch.cuda.current_stream(self.device)
         capturing = torch.cuda.is_current_stream_capturing()

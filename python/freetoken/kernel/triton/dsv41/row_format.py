@@ -1,4 +1,4 @@
-"""Device-side row-format helpers shared by the CSA2 kernels.
+"""Device-side row-format helpers shared by the DSV41 kernels.
 
 The Python-side descriptors live in ``freetoken.kvcache.row_format``; the ``FMT`` constexpr a
 kernel receives is ``RowFormat.code``:

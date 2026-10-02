@@ -1,4 +1,4 @@
-"""Lightning-Indexer logits over PACKED index keys (DeepSeek-V4.1 CSA2, Full and Reindex modes).
+"""Lightning-Indexer logits over PACKED index keys (DeepSeek-V4.1, Full and Reindex modes).
 
     logits[b, s, j] = sum_h relu(q[b, s, h, :] . k(b, pos_j)) * weights[b, s, h]
 
@@ -15,7 +15,7 @@ Two position sets, one kernel:
   ``[B, S, T]`` over the staged width ``T``, but only the live tiles (columns below ``live[b, s]``
   rounded up to ``BLOCK_T``, the rest of the last tile ``-inf``) are WRITTEN. A fixed grid of worker
   programs strides over the live tiles, so both the work and the launch geometry follow the live
-  history rather than the staged width; consumers (``csa2/topk.py``) read below ``live`` only, so
+  history rather than the staged width; consumers (``dsv41/topk.py``) read below ``live`` only, so
   the dead area needs no fill.
 * **candidate pool** (Reindex mode, Hierarchical Sparse Indexer): position ``j`` is
   ``candidates[b, s, j]`` (a compressed position, ``-1`` = empty slot); the output is ``[B, S, NC]``

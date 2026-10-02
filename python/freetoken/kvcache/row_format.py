@@ -11,8 +11,8 @@ A row is laid out as ``[values | scales]``: ``value_bytes(dim)`` bytes of (packe
 ``scale_bytes(dim)`` scale bytes, so one gather fetches both. e2m1 pairs pack the even channel into the low
 nibble and the odd channel into the high nibble (``torch.float4_e2m1fn_x2`` / ``convert.py`` order).
 
-The Triton side (``kernel/triton/csa2/row_format.py``) selects the dequant path from ``RowFormat.code``
-(a constexpr); the pack / unpack wrappers in ``kernel/triton/csa2/pack.py`` reproduce the reference
+The Triton side (``kernel/triton/dsv41/row_format.py``) selects the dequant path from ``RowFormat.code``
+(a constexpr); the pack / unpack wrappers in ``kernel/triton/dsv41/pack.py`` reproduce the reference
 ``act_quant`` / ``fp4_act_quant`` numerics exactly, including the bf16 rounding of the dequantized value
 the reference bakes into its cache.
 """

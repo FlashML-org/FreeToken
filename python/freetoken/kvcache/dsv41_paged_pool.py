@@ -1,6 +1,6 @@
-"""CSA2 paged KV pool (DeepSeek-V4.1): packed byte tiers over the shared page table.
+"""DSV41 paged KV pool (DeepSeek-V4.1): packed byte tiers over the shared page table.
 
-Tiers, sized from a budget (``csa2_cost_model``) not from ``num_requests``:
+Tiers, sized from a budget (``dsv41_cost_model``) not from ``num_requests``:
 
 * ``window_pool[L]``      -- every layer; the P-sliding KV ring in ``geom.win_fmt`` (fp8) rows, page-granular.
 * ``main_pool[src]``      -- per kv-source layer; compressed KV latents in ``geom.main_fmt`` (fp4) rows.
@@ -26,22 +26,22 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .csa2_cost_model import (
-    CSA2PoolSizes,
-    csa2_kv_unit_bytes,
-    csa2_window_unit_bytes,
+from .dsv41_cost_model import (
+    DSV41PoolSizes,
+    dsv41_kv_unit_bytes,
+    dsv41_window_unit_bytes,
 )
-from .csa2_geometry import CSA2Geometry
+from .dsv41_geometry import DSV41Geometry
 from .window_tier import CompressStateRing, WindowTierPagedPool
 
 logger = init_logger(__name__)
 
 
-class CSA2PagedKVCache(WindowTierPagedPool):
+class DSV41PagedKVCache(WindowTierPagedPool):
     def __init__(
         self,
-        sizes: CSA2PoolSizes,
-        geom: CSA2Geometry,
+        sizes: DSV41PoolSizes,
+        geom: DSV41Geometry,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         n_scratch: int = 1,
@@ -117,12 +117,12 @@ class CSA2PagedKVCache(WindowTierPagedPool):
     # ----- engine-facing sizing / rebuild surface -----
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .csa2_cost_model import _csa2_swa_ratio, _csa2_window_floor_pages, csa2_auto_cost_model, csa2_geometry
+        from .dsv41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model, dsv41_geometry
 
-        geom = csa2_geometry(config)
+        geom = dsv41_geometry(config)
         P = geom.window
-        per_page, fixed, min_reserve = csa2_auto_cost_model(
-            geom, _csa2_swa_ratio(config), _csa2_window_floor_pages(config, geom), P, n_scratch=config.max_running_req + 1
+        per_page, fixed, min_reserve = dsv41_auto_cost_model(
+            geom, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, geom), P, n_scratch=config.max_running_req + 1
         )
         return per_page, fixed, config.page_size, min_reserve
 
@@ -130,53 +130,53 @@ class CSA2PagedKVCache(WindowTierPagedPool):
     def solve_num_pages(cls, config, available_memory: int) -> int:
         from freetoken.utils import mem_GB
 
-        from .csa2_cost_model import (
-            _csa2_pool_sizes,
-            _csa2_swa_ratio,
-            _csa2_window_floor_pages,
-            csa2_geometry,
-            csa2_pool_bytes,
-            csa2_solve_num_pages,
+        from .dsv41_cost_model import (
+            _dsv41_pool_sizes,
+            _dsv41_swa_ratio,
+            _dsv41_window_floor_pages,
+            dsv41_geometry,
+            dsv41_pool_bytes,
+            dsv41_solve_num_pages,
         )
 
-        geom = csa2_geometry(config)
+        geom = dsv41_geometry(config)
         P = geom.window
         num_pages = config.num_page_override
         if num_pages is None:
-            sizes = csa2_solve_num_pages(
-                available_memory, geom, _csa2_swa_ratio(config), _csa2_window_floor_pages(config, geom), P,
+            sizes = dsv41_solve_num_pages(
+                available_memory, geom, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, geom), P,
                 n_scratch=config.max_running_req + 1,
             )
             num_pages = sizes.full_token // P - 1  # one physical page is the dummy
         else:
-            floor = _csa2_window_floor_pages(config, geom)
+            floor = _dsv41_window_floor_pages(config, geom)
             if num_pages < floor:
                 raise ValueError(
-                    f"--num-pages {num_pages} ({num_pages * P} tokens) is below the CSA2 window working-set "
+                    f"--num-pages {num_pages} ({num_pages * P} tokens) is below the DSV41 window working-set "
                     f"floor {floor} pages ({floor * P} tokens); raise --num-pages or lower max_running_req/max_seq_len"
                 )
-            sizes = _csa2_pool_sizes(config, num_pages + 1)
+            sizes = _dsv41_pool_sizes(config, num_pages + 1)
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
-        real = csa2_pool_bytes(sizes, geom, config.max_running_req + 1)
+        real = dsv41_pool_bytes(sizes, geom, config.max_running_req + 1)
         logger.info(
-            f"Allocating {num_pages * P} tokens for CSA2 KV cache ({sizes.n_win_pages} window pages), total = {mem_GB(real)}"
+            f"Allocating {num_pages * P} tokens for DSV41 KV cache ({sizes.n_win_pages} window pages), total = {mem_GB(real)}"
         )
         return num_pages
 
     @classmethod
     def window_spec(cls, config):
         from .base import WindowPoolSpec
-        from .csa2_cost_model import _csa2_window_floor_pages, csa2_geometry
+        from .dsv41_cost_model import _dsv41_window_floor_pages, dsv41_geometry
 
-        geom = csa2_geometry(config)
-        return WindowPoolSpec(geom.window, _csa2_window_floor_pages(config, geom) - 1)
+        geom = dsv41_geometry(config)
+        return WindowPoolSpec(geom.window, _dsv41_window_floor_pages(config, geom) - 1)
 
     @classmethod
     def min_kv_tokens(cls, config) -> int:
-        from .csa2_cost_model import _csa2_window_floor_pages, csa2_geometry
+        from .dsv41_cost_model import _dsv41_window_floor_pages, dsv41_geometry
 
-        geom = csa2_geometry(config)
-        return _csa2_window_floor_pages(config, geom) * geom.window
+        geom = dsv41_geometry(config)
+        return _dsv41_window_floor_pages(config, geom) * geom.window
 
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
@@ -188,22 +188,22 @@ class CSA2PagedKVCache(WindowTierPagedPool):
         from freetoken.utils import mem_GB
 
         from .base import CacheRebuildRejected
-        from .csa2_cost_model import _csa2_pool_sizes, _csa2_window_floor_pages, csa2_pool_bytes
+        from .dsv41_cost_model import _dsv41_pool_sizes, _dsv41_window_floor_pages, dsv41_pool_bytes
 
         if num_pages is not None:
-            floor = _csa2_window_floor_pages(config, self.geom)
+            floor = _dsv41_window_floor_pages(config, self.geom)
             if num_pages < floor:
                 raise CacheRebuildRejected(
-                    f"num_pages {num_pages} is below the CSA2 window working-set floor {floor} "
+                    f"num_pages {num_pages} is below the DSV41 window working-set floor {floor} "
                     f"(max_running_req={config.max_running_req}); admission would deadlock"
                 )
         if num_pages is not None or num_swa_pages is not None:
             target_pages = num_pages if num_pages is not None else current_num_pages
-            kv_sizes = _csa2_pool_sizes(config, target_pages + 1, num_swa_pages=num_swa_pages)
+            kv_sizes = _dsv41_pool_sizes(config, target_pages + 1, num_swa_pages=num_swa_pages)
         else:
             kv_sizes = self.sizes
         budget = net_cache_budget_bytes(config.memory_ratio, baseline_free, weights_bytes, 0)
-        need = target_moe * per_expert_bytes + csa2_pool_bytes(kv_sizes, self.geom, config.max_running_req + 1)
+        need = target_moe * per_expert_bytes + dsv41_pool_bytes(kv_sizes, self.geom, config.max_running_req + 1)
         if need > budget:
             kv_part = f"kv={num_pages} P-pages" if num_pages is not None else "kv=current pool"
             raise CacheRebuildRejected(
@@ -212,45 +212,45 @@ class CSA2PagedKVCache(WindowTierPagedPool):
             )
 
     def rebuild_from_config(self, config, num_pages: int, *, num_swa_pages: int | None = None) -> None:
-        from .csa2_cost_model import _csa2_pool_sizes
+        from .dsv41_cost_model import _dsv41_pool_sizes
 
-        self.rebuild(_csa2_pool_sizes(config, num_pages + 1, num_swa_pages=num_swa_pages))
+        self.rebuild(_dsv41_pool_sizes(config, num_pages + 1, num_swa_pages=num_swa_pages))
 
     def _drop_buffers(self) -> None:
         self.window_pool = self.main_pool = self.idx_pool = self.state_ring = None  # type: ignore[assignment]
 
     def unit_bytes(self) -> tuple[int, int]:
-        return csa2_kv_unit_bytes(self.geom, self.P), csa2_window_unit_bytes(self.geom, self.P)
+        return dsv41_kv_unit_bytes(self.geom, self.P), dsv41_window_unit_bytes(self.geom, self.P)
 
     # ----- writes (quantize + scatter) -----
     def store_window(self, kv: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
-        from freetoken.kernel.triton.csa2.pack import pack_rows
+        from freetoken.kernel.triton.dsv41.pack import pack_rows
 
         pack_rows(kv, self.geom.win_fmt, pool=self.window_pool[layer_id], row_ids=window_slot)
 
     def store_main(self, latent: torch.Tensor, source: int, rows: torch.Tensor) -> None:
-        from freetoken.kernel.triton.csa2.pack import pack_rows
+        from freetoken.kernel.triton.dsv41.pack import pack_rows
 
         pack_rows(latent, self.geom.main_fmt, pool=self.main_pool[source], row_ids=rows)
 
     def store_index(self, k: torch.Tensor, source: int, rows: torch.Tensor) -> None:
-        from freetoken.kernel.triton.csa2.pack import pack_rows
+        from freetoken.kernel.triton.dsv41.pack import pack_rows
 
         pack_rows(k, self.geom.idx_fmt, pool=self.idx_pool[source], row_ids=rows)
 
     # ----- reads (gather + dequantize; tests and torch reference paths) -----
     def read_window(self, layer_id: int, window_slot: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.csa2.pack import unpack_rows
+        from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
         return unpack_rows(self.window_pool[layer_id], self.geom.win_fmt, self.head_dim, window_slot)
 
     def read_main(self, source: int, rows: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.csa2.pack import unpack_rows
+        from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
         return unpack_rows(self.main_pool[source], self.geom.main_fmt, self.head_dim, rows)
 
     def read_index(self, source: int, rows: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.csa2.pack import unpack_rows
+        from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
         return unpack_rows(self.idx_pool[source], self.geom.idx_fmt, self.index_head_dim, rows)
 
@@ -266,4 +266,4 @@ class CSA2PagedKVCache(WindowTierPagedPool):
         return self.geom.n_layers
 
 
-__all__ = ["CSA2PagedKVCache"]
+__all__ = ["DSV41PagedKVCache"]

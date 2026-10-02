@@ -1,4 +1,4 @@
-"""Config parsing, the CSA2 layer-role table, registry dispatch and loader / model key parity."""
+"""Config parsing, the DSV41 layer-role table, registry dispatch and loader / model key parity."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from freetoken.utils.torch_utils import torch_dtype
 from .common import ENGRAM_LAYERS, INDEX_SOURCES, KV_SOURCES, N_LAYERS, RATIOS, tiny_hf_config, write_tiny_checkpoint
 
 
-def test_roles_follow_the_csa2_mode_table():
+def test_roles_follow_the_dsv41_mode_table():
     args = parse_config(tiny_hf_config()).dsv41_args
     modes = [r.mode for r in args.roles]
     assert modes == [Mode.WINDOW, Mode.WINDOW, Mode.FULL, Mode.REUSE, Mode.FULL, Mode.REINDEX]
@@ -61,7 +61,7 @@ def test_registry_and_geometry():
     mc = parse_config(tiny_hf_config())
     geom = mc.attention_groups[0].geometry
     assert geom.kv_source_layer_ids == (2, 4) and geom.compress_ratios == tuple(RATIOS[:N_LAYERS])
-    assert mc.kv_cache_group_specs()[0].attn_type.value == "csa2"
+    assert mc.kv_cache_group_specs()[0].attn_type.value == "dsv41"
     assert mc.num_layers == N_LAYERS and mc.dsv41_args is not None
 
 
@@ -130,7 +130,7 @@ def test_fp8_wo_a_layer_rejects_a_dequantized_ftw_layout_clearly():
     from types import SimpleNamespace
 
     from freetoken.layers.quantization.scheme import fp8_block_scheme
-    from freetoken.models.deepseek_v41.attention import CSA2Attention
+    from freetoken.models.deepseek_v41.attention import DSV41Attention
 
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
@@ -143,8 +143,8 @@ def test_fp8_wo_a_layer_rejects_a_dequantized_ftw_layout_clearly():
         get_quant_method=lambda layer, prefix: plain.get_quant_method(layer, prefix),
     )
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        fp8_layer = CSA2Attention(args, args.roles[2], quant_config=quant, prefix="attn")
-        bf16_layer = CSA2Attention(args, args.roles[2], quant_config=None, prefix="attn")
+        fp8_layer = DSV41Attention(args, args.roles[2], quant_config=quant, prefix="attn")
+        bf16_layer = DSV41Attention(args, args.roles[2], quant_config=None, prefix="attn")
     assert fp8_layer.wo_a.dtype == torch.float8_e4m3fn and bf16_layer.wo_a.dtype == torch.bfloat16
     rows, cols = fp8_layer.wo_a.shape
     with torch.device("meta"):

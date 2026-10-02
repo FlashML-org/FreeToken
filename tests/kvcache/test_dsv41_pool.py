@@ -1,4 +1,4 @@
-"""CSA2 paged KV pool + cost model (CPU, no model): geometry validation, per-source tiers, sizing /
+"""DSV41 paged KV pool + cost model (CPU, no model): geometry validation, per-source tiers, sizing /
 byte accounting, the window free-list duck-type, full-loc translation; packed writes on CUDA."""
 
 from __future__ import annotations
@@ -6,16 +6,16 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.csa2_cost_model import (
-    csa2_cache_per_page,
-    csa2_kv_unit_bytes,
-    csa2_pool_bytes,
-    csa2_pool_sizes,
-    csa2_solve_num_pages,
-    csa2_window_unit_bytes,
+from freetoken.kvcache.dsv41_cost_model import (
+    dsv41_cache_per_page,
+    dsv41_kv_unit_bytes,
+    dsv41_pool_bytes,
+    dsv41_pool_sizes,
+    dsv41_solve_num_pages,
+    dsv41_window_unit_bytes,
 )
-from freetoken.kvcache.csa2_geometry import CSA2Geometry
-from freetoken.kvcache.csa2_paged_pool import CSA2PagedKVCache
+from freetoken.kvcache.dsv41_geometry import DSV41Geometry
+from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.kvcache.row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
 
 DEVICE = torch.device("cpu")
@@ -25,16 +25,16 @@ RATIOS = (0, 0, 2, 2, 2, 2, 2, 1, 1, 1)
 SOURCES = (2, 5, 7)
 
 
-def _geom(**over) -> CSA2Geometry:
+def _geom(**over) -> DSV41Geometry:
     base = dict(n_layers=10, head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES)
     base.update(over)
-    return CSA2Geometry(**base)
+    return DSV41Geometry(**base)
 
 
 def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
     geom = _geom()
-    sizes = csa2_pool_sizes(num_pages, geom, swa_ratio, P)
-    return CSA2PagedKVCache(sizes, geom, DEVICE, n_scratch=n_scratch), sizes, geom
+    sizes = dsv41_pool_sizes(num_pages, geom, swa_ratio, P)
+    return DSV41PagedKVCache(sizes, geom, DEVICE, n_scratch=n_scratch), sizes, geom
 
 
 def test_window_control_uses_pool_units_and_restores_concrete_capacity():
@@ -44,7 +44,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
     from freetoken.kvcache.cache_status import (
         _supports_swa_ratio, compute_cache_floors, compute_cache_pools,
     )
-    from freetoken.kvcache.csa2_cost_model import _csa2_pool_sizes
+    from freetoken.kvcache.dsv41_cost_model import _dsv41_pool_sizes
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.server.api_server import CacheRebuildRequest, _resolve_num_swa_pages, cache_geometry
     from freetoken.server.stats import _swa_page_size
@@ -56,7 +56,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
         model_config=SimpleNamespace(
             dsv4_args=None, has_swa_attention=False,
             attention_groups=[SimpleNamespace(geometry=geom)],
-            kv_cache_group_specs=lambda: [SimpleNamespace(attn_type=AttnType.CSA2)],
+            kv_cache_group_specs=lambda: [SimpleNamespace(attn_type=AttnType.DSV41)],
         ),
     )
     engine = SimpleNamespace(
@@ -66,7 +66,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
     assert _supports_swa_ratio(config)
     assert compute_cache_pools(engine)["swa_page_size"] == P
     assert compute_cache_pools(engine)["num_swa_pages"] == 31
-    floor = _csa2_pool_sizes(config, 64, num_swa_pages=1).n_win_pages - 1
+    floor = _dsv41_pool_sizes(config, 64, num_swa_pages=1).n_win_pages - 1
     assert compute_cache_floors(engine)["swa_tokens"] == floor * P
     prior = Scheduler._current_cache_geometry(SimpleNamespace(engine=engine, config=config))
     assert prior["num_swa_pages"] == 31
@@ -100,10 +100,10 @@ def test_geometry_derives_sources_and_rings():
 def test_v41_global_kv_is_890_bytes_per_token():
     """The tech report's headline: 3 ratio-2 encoder sources + 1 ratio-1 decoder source = 890 B/token."""
     ratios = (0, 0) + (2,) * 18 + (1,) * 20
-    g = CSA2Geometry(n_layers=40, head_dim=512, index_head_dim=128, window=128, compress_ratios=ratios, kv_source_layer_ids=(2, 8, 14, 20))
+    g = DSV41Geometry(n_layers=40, head_dim=512, index_head_dim=128, window=128, compress_ratios=ratios, kv_source_layer_ids=(2, 8, 14, 20))
     per_token_global = sum((g.main_row_bytes + g.idx_row_bytes) // g.ratio_of(s) for s in g.kv_source_layer_ids)
     assert per_token_global == 890
-    assert csa2_kv_unit_bytes(g, 128) == 890 + 8  # + the int64 full->window map slot
+    assert dsv41_kv_unit_bytes(g, 128) == 890 + 8  # + the int64 full->window map slot
 
 
 def test_pool_tiers_per_source_and_aliasing():
@@ -125,19 +125,19 @@ def test_pool_tiers_per_source_and_aliasing():
 
 def test_pool_bytes_match_allocation_and_solver_respects_budget():
     pool, sizes, geom = _pool(num_pages=16, swa_ratio=0.25)
-    assert pool.total_bytes() == csa2_pool_bytes(sizes, geom, n_scratch=1)
-    assert csa2_cache_per_page(geom, 0.25, P) > 0
-    assert csa2_window_unit_bytes(geom, P) == -(-(10 * P * 528 + 2 * 2 * 4096) // P)
+    assert pool.total_bytes() == dsv41_pool_bytes(sizes, geom, n_scratch=1)
+    assert dsv41_cache_per_page(geom, 0.25, P) > 0
+    assert dsv41_window_unit_bytes(geom, P) == -(-(10 * P * 528 + 2 * 2 * 4096) // P)
     budget = 64 << 20
-    solved = csa2_solve_num_pages(budget, geom, 0.25, floor_win_pages=4, P=P, n_scratch=3)
-    assert csa2_pool_bytes(solved, geom, 3) <= budget
+    solved = dsv41_solve_num_pages(budget, geom, 0.25, floor_win_pages=4, P=P, n_scratch=3)
+    assert dsv41_pool_bytes(solved, geom, 3) <= budget
     # one more page, sized the way the solver sizes (window = max(floor, ceil(ratio * pages))), overflows
     more = solved.full_token // P + 1
-    bigger = csa2_pool_sizes(more, geom, 0.25, P, n_win_pages=max(4, (round(0.25 * more * P) + P - 1) // P))
-    assert csa2_pool_bytes(bigger, geom, 3) > budget
+    bigger = dsv41_pool_sizes(more, geom, 0.25, P, n_win_pages=max(4, (round(0.25 * more * P) + P - 1) // P))
+    assert dsv41_pool_bytes(bigger, geom, 3) > budget
     assert solved.n_win_pages >= 4
     with pytest.raises(ValueError):
-        csa2_solve_num_pages(1 << 10, geom, 0.25, floor_win_pages=4, P=P)
+        dsv41_solve_num_pages(1 << 10, geom, 0.25, floor_win_pages=4, P=P)
 
 
 def test_translation_state_loc_and_cmp_rows():
@@ -154,8 +154,8 @@ def test_translation_state_loc_and_cmp_rows():
     top = pool.cmp_rows(torch.tensor([sizes.full_token - 1]), 2).item()
     assert top < pool.scratch_base[2]
     ws = pool.translate_full_to_window(torch.tensor([127, 3 * P]))
-    assert CSA2PagedKVCache.state_loc(ws, 2, P).tolist() == [2 * 2 + 1, 0]
-    assert CSA2PagedKVCache.state_loc(torch.tensor([-1]), 2, P).item() == -1
+    assert DSV41PagedKVCache.state_loc(ws, 2, P).tolist() == [2 * 2 + 1, 0]
+    assert DSV41PagedKVCache.state_loc(torch.tensor([-1]), 2, P).item() == -1
 
 
 def _expand(bases):
@@ -184,11 +184,11 @@ def test_swa_duck_type_alloc_free_and_dummy():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="packed writes run through triton")
 def test_packed_writes_round_trip_on_cuda():
-    from kernels.test_csa2_pack import reference_roundtrip  # tests/ is on sys.path under pytest
+    from kernels.test_dsv41_pack import reference_roundtrip  # tests/ is on sys.path under pytest
 
     geom = _geom()
-    sizes = csa2_pool_sizes(4, geom, 0.5, P)
-    pool = CSA2PagedKVCache(sizes, geom, torch.device("cuda"), n_scratch=2)
+    sizes = dsv41_pool_sizes(4, geom, 0.5, P)
+    pool = DSV41PagedKVCache(sizes, geom, torch.device("cuda"), n_scratch=2)
     kv = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
     slots = torch.tensor([0, 130, 5], device="cuda")
     pool.store_window(kv, 4, slots)

@@ -1,4 +1,4 @@
-"""CSA2 indexer logits over packed fp4 index keys: full-range (Full mode) and candidate-restricted
+"""DSV41 indexer logits over packed fp4 index keys: full-range (Full mode) and candidate-restricted
 (Reindex mode) against a torch reference on the dequantized keys, with causality from ``live``. The
 row of a compressed position comes from the request's full-token locs (``locs[t * ratio] // ratio``);
 in Full mode only the live columns are written."""
@@ -20,7 +20,7 @@ RATIO = 2
 
 
 def _setup(b, s, t, seed):
-    from freetoken.kernel.triton.csa2.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
 
     torch.manual_seed(seed)
     keys = torch.randn(ROWS, D, device="cuda", dtype=torch.bfloat16)
@@ -61,7 +61,7 @@ def _reference(q, w, deq, k_rows, live, positions):
 
 
 def test_full_range_matches_reference_with_causal_live():
-    from freetoken.kernel.triton.csa2.indexer import indexer_logits_packed
+    from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
 
     b, s, t = 2, 5, 300
     pool, deq, q, w, k_rows, locs = _setup(b, s, t, seed=1)
@@ -80,8 +80,8 @@ def test_full_range_matches_reference_with_causal_live():
 
 
 def test_quantized_queries_preserve_reference_score_rounding():
-    from freetoken.kernel.triton.csa2.indexer import indexer_logits_packed
-    from freetoken.kernel.triton.csa2.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
 
     torch.manual_seed(23)
     t, s, topk = 4096, 32, 512
@@ -102,7 +102,7 @@ def test_quantized_queries_preserve_reference_score_rounding():
 
 def test_full_range_worker_grid_covers_wide_histories(monkeypatch):
     """More live tiles than worker programs: each worker strides over its share."""
-    from freetoken.kernel.triton.csa2 import indexer as mod
+    from freetoken.kernel.triton.dsv41 import indexer as mod
 
     b, s, t = 1, 2, 4096  # 64 tiles
     pool, deq, q, w, k_rows, locs = _setup(b, s, t, seed=4)
@@ -124,7 +124,7 @@ def test_full_range_worker_grid_covers_wide_histories(monkeypatch):
 
 
 def test_candidate_pool_matches_reference():
-    from freetoken.kernel.triton.csa2.indexer import indexer_logits_packed
+    from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
 
     b, s, t, nc = 2, 3, 400, 96
     pool, deq, q, w, k_rows, locs = _setup(b, s, t, seed=2)

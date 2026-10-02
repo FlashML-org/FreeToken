@@ -1,13 +1,13 @@
-"""CSA2Geometry: everything the KV pool and its cost model need to know about a
+"""DSV41Geometry: everything the KV pool and its cost model need to know about a
 Compressed-Sparse-Attention-2 model (DeepSeek-V4.1), independent of the model package.
 
 Every layer has a sliding window (``window`` tokens) of layer-local KV. Layers with
 ``compress_ratio > 0`` also attend over the global compressed KV, which only the
 ``kv_source_layer_ids`` produce (one latent per ``ratio`` tokens, plus the indexer key
-projected from it); every other CSA2 layer reads the most recent source's pools. The pool
+projected from it); every other DSV41 layer reads the most recent source's pools. The pool
 therefore allocates the global tiers PER SOURCE and aliases consumers onto them.
 
-Built by the model's ``parse_config`` and carried on ``CSA2AttentionGroupConfig``; the kvcache
+Built by the model's ``parse_config`` and carried on ``DSV41AttentionGroupConfig``; the kvcache
 side reads only this object (never the model args), so the two packages stay decoupled.
 """
 
@@ -19,7 +19,7 @@ from .row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32, RowFormat
 
 
 @dataclass(frozen=True)
-class CSA2Geometry:
+class DSV41Geometry:
     n_layers: int
     head_dim: int  # the shared latent width (K == V)
     index_head_dim: int
@@ -114,4 +114,4 @@ class CSA2Geometry:
         return 2 * self.head_dim * 4
 
 
-__all__ = ["CSA2Geometry"]
+__all__ = ["DSV41Geometry"]

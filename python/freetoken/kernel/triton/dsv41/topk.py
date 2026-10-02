@@ -1,4 +1,4 @@
-"""Exact top-k and block-candidate selection whose work follows the live history (DeepSeek-V4.1 CSA2).
+"""Exact top-k and block-candidate selection whose work follows the live history (DeepSeek-V4.1).
 
 The indexer scores a request's compressed positions into a buffer as wide as the staged history
 (``max_seq_len / ratio``, fixed while a CUDA graph is captured), but only the first ``live[row]``
@@ -9,7 +9,7 @@ past ``live`` is ever read, so the score buffer's dead area needs no initializat
 
 Selection is a fixed pipeline of small kernels with explicit workspace contracts:
 
-* ``csa2_topk``: exact top-k of ``[R, T]`` fp32 scores below ``live``. Level 0 gives every
+* ``dsv41_topk``: exact top-k of ``[R, T]`` fp32 scores below ``live``. Level 0 gives every
   ``CHUNK``-wide slice of a row its own program, which radix-selects the slice's top-k into a
   ``(key, column)`` candidate workspace (a global winner beats at most k-1 columns, so it is
   inside its own slice's top-k: the union is exact). Further levels apply the same program to the
@@ -17,10 +17,10 @@ Selection is a fixed pipeline of small kernels with explicit workspace contracts
   winners in ascending column order, ``-1`` padded. Slices past ``live`` exit at once and a
   slice with no more entries than ``k`` is copied through, so a short history costs a handful of
   near-empty launches. The radix primitives are the QSA block top-k's (``kernel/triton/qsa/topk``).
-* ``csa2_block_scores``: per-``block_size`` block maxima over the live prefix (the Hierarchical
+* ``dsv41_block_scores``: per-``block_size`` block maxima over the live prefix (the Hierarchical
   Sparse Indexer's level one), the block holding the newest live position pinned to ``+inf`` so it
   is always kept; a fixed worker grid strides over the live blocks.
-* ``csa2_candidate_blocks``: the two above plus a fixed-width expansion into the compact candidate
+* ``dsv41_candidate_blocks``: the two above plus a fixed-width expansion into the compact candidate
   list ``[R, topk_blocks * block_size]`` of compressed positions, ascending with ``-1`` in the tail.
 
 Tie rule (documented, deterministic): scores order descending, equal scores by ascending column,
@@ -56,7 +56,7 @@ def _load_entries(src_ptr, col_ptr, base, offsets, limit, SRC_LOGITS: tl.constex
 
 
 @triton.jit
-def _csa2_topk_level_kernel(
+def _dsv41_topk_level_kernel(
     src_ptr, src_col_ptr, live_in_ptr, key_out_ptr, col_out_ptr, live_out_ptr,
     stride_src_row, stride_out_row, num_columns,
     TOP_K: tl.constexpr, PAD_K: tl.constexpr, CHUNK: tl.constexpr, N_SPLITS: tl.constexpr,
@@ -107,7 +107,7 @@ def _final_tile(src_row, col_row, out_row, limit, TOP_K: tl.constexpr, BLOCK: tl
 
 
 @triton.jit
-def _csa2_topk_final_kernel(
+def _dsv41_topk_final_kernel(
     src_ptr, src_col_ptr, live_ptr, out_ptr,
     stride_src_row, stride_out_row, num_columns,
     TOP_K: tl.constexpr, PAD_K: tl.constexpr,
@@ -144,7 +144,7 @@ def topk_plan(columns: int, k: int) -> list[tuple[int, int]]:
     ``CHUNK / k >= 2`` per level for ``k <= MAX_K``; larger ``k`` would stall (``k == CHUNK`` never
     shrinks) and is rejected here, before any launch."""
     if not 0 < k <= MAX_K:
-        raise ValueError(f"csa2_topk supports 1 <= k <= {MAX_K}, got {k}")
+        raise ValueError(f"dsv41_topk supports 1 <= k <= {MAX_K}, got {k}")
     levels: list[tuple[int, int]] = []
     width = columns
     while width > FINAL_MAX:
@@ -156,7 +156,7 @@ def topk_plan(columns: int, k: int) -> list[tuple[int, int]]:
     return levels
 
 
-def csa2_topk(scores: torch.Tensor, live: torch.Tensor, k: int, out: torch.Tensor | None = None) -> torch.Tensor:
+def dsv41_topk(scores: torch.Tensor, live: torch.Tensor, k: int, out: torch.Tensor | None = None) -> torch.Tensor:
     """Exact top-``k`` columns of every ``scores`` row among its first ``live[row]`` columns.
 
     ``scores [R, T]`` fp32 row-contiguous (columns at or past ``live`` are never read; ``-inf``
@@ -181,7 +181,7 @@ def csa2_topk(scores: torch.Tensor, live: torch.Tensor, k: int, out: torch.Tenso
         keys = torch.empty((R, n_splits * k), dtype=torch.int32, device=scores.device)
         cols = torch.empty((R, n_splits * k), dtype=torch.int32, device=scores.device)
         live_out = torch.empty((R,), dtype=torch.int32, device=scores.device)
-        _csa2_topk_level_kernel[(R, n_splits)](
+        _dsv41_topk_level_kernel[(R, n_splits)](
             src, src_col, src_live, keys, cols, live_out,
             src.stride(0), keys.stride(0), level_width,
             TOP_K=k, PAD_K=pad_k, CHUNK=CHUNK, N_SPLITS=n_splits, SRC_LOGITS=src_logits,
@@ -189,7 +189,7 @@ def csa2_topk(scores: torch.Tensor, live: torch.Tensor, k: int, out: torch.Tenso
         )
         src, src_col, src_live, width, src_logits = keys, cols, live_out, n_splits * k, False
     block = triton.next_power_of_2(max(width, 1))
-    _csa2_topk_final_kernel[(R,)](
+    _dsv41_topk_final_kernel[(R,)](
         src, src_col, src_live, out,
         src.stride(0), out.stride(0), width,
         TOP_K=k, PAD_K=pad_k,
@@ -200,7 +200,7 @@ def csa2_topk(scores: torch.Tensor, live: torch.Tensor, k: int, out: torch.Tenso
 
 
 @triton.jit
-def _csa2_block_scores_kernel(
+def _dsv41_block_scores_kernel(
     scores_ptr, live_ptr, blk_ptr,
     stride_s_row, stride_b_row, num_blocks,
     BLOCK_SIZE: tl.constexpr, TILE: tl.constexpr, N_WORKERS: tl.constexpr,
@@ -225,7 +225,7 @@ def _csa2_block_scores_kernel(
         tl.store(b_row + blocks, best, mask=b_mask)
 
 
-def csa2_block_scores(scores: torch.Tensor, live: torch.Tensor, block_size: int, out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def dsv41_block_scores(scores: torch.Tensor, live: torch.Tensor, block_size: int, out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """``(block scores [R, cdiv(T, block_size)] fp32, live blocks [R] int32)``: each live block's best
     live position (``+inf`` for the newest block); blocks at or past the live count are not written."""
     R, T = scores.shape
@@ -239,21 +239,21 @@ def csa2_block_scores(scores: torch.Tensor, live: torch.Tensor, block_size: int,
     assert block_size == triton.next_power_of_2(block_size), block_size
     sm_count = torch.cuda.get_device_properties(scores.device).multi_processor_count
     workers = min(triton.cdiv(nb, BLOCK_SCORE_TILE), max(1, triton.cdiv(sm_count, R)))
-    _csa2_block_scores_kernel[(R, workers)](
+    _dsv41_block_scores_kernel[(R, workers)](
         scores, live, out, scores.stride(0), out.stride(0), nb,
         BLOCK_SIZE=block_size, TILE=BLOCK_SCORE_TILE, N_WORKERS=workers, num_warps=4,
     )
     return out, live_blocks
 
 
-def csa2_candidate_blocks(scores: torch.Tensor, live: torch.Tensor, topk_blocks: int, block_size: int) -> torch.Tensor:
+def dsv41_candidate_blocks(scores: torch.Tensor, live: torch.Tensor, topk_blocks: int, block_size: int) -> torch.Tensor:
     """Level one of the Hierarchical Sparse Indexer over ``[R, T]`` scores: the ``topk_blocks`` best
     live blocks (the newest always among them) expanded to the compact candidate list ``[R,
     topk_blocks * block_size]`` of compressed positions -- ascending, ``-1`` for positions at or past
     ``live`` and for unfilled blocks, all in the tail (a sorted valid prefix)."""
     R, T = scores.shape
-    blk, live_blocks = csa2_block_scores(scores, live, block_size)
-    keep = csa2_topk(blk, live_blocks, min(topk_blocks, blk.shape[1]))  # [R, KB] ascending, -1 tail
+    blk, live_blocks = dsv41_block_scores(scores, live, block_size)
+    keep = dsv41_topk(blk, live_blocks, min(topk_blocks, blk.shape[1]))  # [R, KB] ascending, -1 tail
     pos = keep.to(torch.int64).unsqueeze(-1) * block_size + torch.arange(block_size, device=scores.device)
     dead = (keep < 0).unsqueeze(-1) | (pos >= live.to(torch.int64).view(R, 1, 1))
     out = torch.where(dead, -1, pos).flatten(1).to(torch.int32)
@@ -262,4 +262,4 @@ def csa2_candidate_blocks(scores: torch.Tensor, live: torch.Tensor, topk_blocks:
     return out
 
 
-__all__ = ["csa2_topk", "csa2_block_scores", "csa2_candidate_blocks", "topk_plan", "CHUNK", "FINAL_MAX", "MAX_K"]
+__all__ = ["dsv41_topk", "dsv41_block_scores", "dsv41_candidate_blocks", "topk_plan", "CHUNK", "FINAL_MAX", "MAX_K"]

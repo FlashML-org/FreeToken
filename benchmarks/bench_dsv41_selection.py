@@ -1,18 +1,18 @@
-"""Decode selection pipeline of one CSA2 full-width index layer under CUDA-graph replay.
+"""Decode selection pipeline of one DSV41 full-width index layer under CUDA-graph replay.
 
 Holds the live history fixed and varies the staged capacity (``max_seq_len / ratio``), so the
 numbers show whether the pipeline's cost follows the live history or the capacity. Two pipelines:
 
 * ``torch``  -- the max-width baseline: scores over the whole staged width (dead tiles ``-inf``),
   ``torch.topk`` over it, block maxima + ``topk`` over every block, expansion.
-* ``kernels`` -- ``kernel/triton/csa2``: the worker-grid scorer over the live tiles, the level-wise
-  exact top-k and the block-candidate kernels (``csa2_topk`` / ``csa2_candidate_blocks``).
+* ``kernels`` -- ``kernel/triton/dsv41``: the worker-grid scorer over the live tiles, the level-wise
+  exact top-k and the block-candidate kernels (``dsv41_topk`` / ``dsv41_candidate_blocks``).
 
 Selected score multisets are checked per request; exact ties may select different positions.
 V4.1 shape: B=1, 32 index heads, D=128, token
 top-k 512, 2048 candidate blocks of 8, ratio 1 (the decoder's kv source) unless overridden.
 
-    python benchmarks/bench_csa2_selection.py [--live 4096] [--capacities 4096,65536,1048576] [--bs 1]
+    python benchmarks/bench_dsv41_selection.py [--live 4096] [--capacities 4096,65536,1048576] [--bs 1]
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ import time
 
 import torch
 
-from freetoken.kernel.triton.csa2.indexer import indexer_logits_packed
-from freetoken.kernel.triton.csa2.pack import pack_rows
-from freetoken.kernel.triton.csa2.topk import csa2_candidate_blocks, csa2_topk
+from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
+from freetoken.kernel.triton.dsv41.pack import pack_rows
+from freetoken.kernel.triton.dsv41.topk import dsv41_candidate_blocks, dsv41_topk
 from freetoken.kvcache.row_format import FP4_E8M0_B32
 
 H, D, TOPK, KB, BS = 32, 128, 512, 2048, 8
@@ -59,8 +59,8 @@ def kernel_pipeline(q, w, pool, locs, ratio, live, T, candidate_source: bool, sc
     B = q.shape[0]
     indexer_logits_packed(q, w, pool, FP4_E8M0_B32, locs, ratio, live, T=T, out=scores)
     flat = scores.view(B, T)
-    picks = csa2_topk(flat, live.view(B), TOPK).view(B, 1, TOPK)
-    cand = csa2_candidate_blocks(flat, live.view(B), KB, BS).view(B, 1, -1) if candidate_source else None
+    picks = dsv41_topk(flat, live.view(B), TOPK).view(B, 1, TOPK)
+    cand = dsv41_candidate_blocks(flat, live.view(B), KB, BS).view(B, 1, -1) if candidate_source else None
     return picks, cand
 
 

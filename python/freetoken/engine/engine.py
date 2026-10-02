@@ -129,8 +129,8 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
-    if AttnType.CSA2 in required:
-        candidates.append(("csa2_sparse", True))
+    if AttnType.DSV41 in required:
+        candidates.append(("dsv41_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
@@ -1206,15 +1206,15 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     return requested
 
 
-def _adjust_csa2_config(config: EngineConfig, override) -> None:
-    """DeepSeek-V4.1 (CSA2) config reconciliation, the DSV4 policy with the replay knob: sync the
+def _adjust_dsv41_config(config: EngineConfig, override) -> None:
+    """DeepSeek-V4.1 config reconciliation, the DSV4 policy with the replay knob: sync the
     runtime into ``dsv41_args``, page_size = the window page P, radix -> swa_radix, decode graph
     batches <= max_running_req. Unlike DSV4 the prefill chunk keeps ``max_extend_tokens`` (whole
     window pages): at a 1M ceiling the window pool alone would admit ~40K-token chunks whose
     activations (64 x 512 latent queries per token) do not fit next to the expert cache."""
     import dataclasses
 
-    from freetoken.models.deepseek_v41.config import csa2_geometry
+    from freetoken.models.deepseek_v41.config import dsv41_geometry
 
     model_config = config.model_config
     args = model_config.dsv41_args
@@ -1225,13 +1225,13 @@ def _adjust_csa2_config(config: EngineConfig, override) -> None:
     # rebuild the attention group's geometry so the cache manager, the pool and its cost model agree
     object.__setattr__(  # ModelConfig is frozen; this is the config-resolution step that owns it
         model_config, "attention_groups",
-        tuple(dataclasses.replace(g, geometry=csa2_geometry(args)) if getattr(g, "kind", None) == "csa2" else g for g in model_config.attention_groups),
+        tuple(dataclasses.replace(g, geometry=dsv41_geometry(args)) if getattr(g, "kind", None) == "dsv41" else g for g in model_config.attention_groups),
     )
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
-        f"CSA2 KV pages are {P}-token window pages; page_size set to {P}; decoder replay: {args.decoder_replay} "
-        f"(prefix hits keep {csa2_geometry(args).resume_history} tokens of window history)"
+        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; decoder replay: {args.decoder_replay} "
+        f"(prefix hits keep {dsv41_geometry(args).resume_history} tokens of window history)"
     )
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
@@ -1526,7 +1526,7 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
-    is_csa2 = getattr(model_config, "dsv41_args", None) is not None
+    is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
@@ -1570,8 +1570,8 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
-    if is_csa2:
-        _adjust_csa2_config(config, override)
+    if is_dsv41:
+        _adjust_dsv41_config(config, override)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
@@ -1858,7 +1858,7 @@ def _adjust_config(config: EngineConfig):
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
-    if seq_override is not None and rotary is not None and not (is_dsv4 or is_csa2):
+    if seq_override is not None and rotary is not None and not (is_dsv4 or is_dsv41):
         if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "

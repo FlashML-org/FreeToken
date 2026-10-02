@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash model (engine-native port of ``inference/model.py``).
 
     embed -> hc_mult residual streams -> [Engram at 1, 14] -> 40 blocks (single-pass mHC around
-    CSA2 attention and MoE) -> collapse with the last block's pre gates -> norm -> head
+    DSV41 attention and MoE) -> collapse with the last block's pre gates -> norm -> head
 
 Single-pass mHC (``layers/mhc.py``): each sublayer boundary applies the PREVIOUS sublayer's post /
 comb to the streams, predicts this sublayer's (pre, post, comb) from the updated streams, and mixes
@@ -24,14 +24,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, NamedTuple
 
 import torch
-from freetoken.attention.csa2_sparse import CSA2AttnMetadata, PrefillSegment
+from freetoken.attention.dsv41_sparse import DSV41AttnMetadata, PrefillSegment
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
 from freetoken.layers.mhc import mhc_fused_post_pre_single_pass, mhc_mix_input, mhc_post
 from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 
 from .args import DeepseekV41Args
-from .attention import CSA2Attention, DecodeStepContext
+from .attention import DSV41Attention, DecodeStepContext
 from .engram import EngramLayer
 from .moe import MoE
 
@@ -76,7 +76,7 @@ class Block(BaseOP):
         self.sinkhorn = args.hc_sinkhorn_iters
         hc, dim = args.hc_mult, args.dim
         mix = (2 + hc) * hc
-        self.attn = CSA2Attention(args, self.role, quant_config=config.quant, prefix=f"{prefix}.attn")
+        self.attn = DSV41Attention(args, self.role, quant_config=config.quant, prefix=f"{prefix}.attn")
         self.ffn = MoE(config, layer_id, prefix=f"{prefix}.ffn")
         self.attn_norm = RMSNorm(dim, args.norm_eps)
         self.ffn_norm = RMSNorm(dim, args.norm_eps)
@@ -145,7 +145,7 @@ class Transformer(BaseOP):
     def _exit(self, s: Streams) -> torch.Tensor:
         return self.norm.forward(mhc_mix_input(s.materialize(), s.pre))
 
-    def prefill(self, input_ids: torch.Tensor, positions: torch.Tensor, md: CSA2AttnMetadata) -> torch.Tensor:
+    def prefill(self, input_ids: torch.Tensor, positions: torch.Tensor, md: DSV41AttnMetadata) -> torch.Tensor:
         """Ragged prefill over the flat new-token stream; returns the hidden states the head reads
         (the decoder stream under bounded replay, where ``md.last_indices`` also point)."""
         s = self._entry(input_ids)
@@ -169,7 +169,7 @@ class Transformer(BaseOP):
             s = block.forward_prefill(s, segs, positions, image_mask)
         return self._exit(s)
 
-    def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, md: CSA2AttnMetadata, cmp_stage_cap: int) -> torch.Tensor:
+    def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, md: DSV41AttnMetadata, cmp_stage_cap: int) -> torch.Tensor:
         B = input_ids.shape[0]
         rows = torch.arange(B, device=input_ids.device)
         s = self._entry(input_ids)
@@ -206,12 +206,12 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         return self._args.decoder_replay != "exact"
 
     def prefill_start(self, req) -> int:
-        from freetoken.attention.csa2_sparse import replay_start
+        from freetoken.attention.dsv41_sparse import replay_start
 
         return replay_start(req, self._args.window_size, self.replays_prefill)
 
     def can_resume_at(self, cached_len: int, live_history: int) -> bool:
-        from freetoken.attention.csa2_sparse import replay_history
+        from freetoken.attention.dsv41_sparse import replay_history
 
         return not self.replays_prefill or replay_history(cached_len, self._args.window_size) <= live_history
 
@@ -278,7 +278,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         self._ensure_bound()
         batch = get_global_ctx().batch
         md = batch.attn_metadata
-        assert isinstance(md, CSA2AttnMetadata)
+        assert isinstance(md, DSV41AttnMetadata)
         if batch.is_prefill:
             input_ids, positions = get_global_ctx().attn_backend.encoder_stream(batch)
             hidden = self.model.prefill(input_ids, positions, md)

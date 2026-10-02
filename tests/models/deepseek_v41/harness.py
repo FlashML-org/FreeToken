@@ -1,4 +1,4 @@
-"""A minimal in-process engine for the tiny DeepSeek-V4.1 model: builds the CSA2 pool, backend and
+"""A minimal in-process engine for the tiny DeepSeek-V4.1 model: builds the DSV41 pool, backend and
 context by hand (no scheduler), loads a synthetic bf16 or FP8/MXFP4 checkpoint with resident or offloaded experts, and drives
 ragged prefill / batched decode batches through ``model.forward()``. Shared by the forward smoke test
 and the reference-parity test."""
@@ -12,13 +12,13 @@ import torch
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.engine import _materialize_loaded_weight_state_dict
-from freetoken.kvcache.csa2_cost_model import csa2_pool_sizes
-from freetoken.kvcache.csa2_paged_pool import CSA2PagedKVCache
+from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.layers.quantization.method import finalize_quant
 from freetoken.models import create_model
-from freetoken.models.deepseek_v41.config import csa2_geometry, parse_config
+from freetoken.models.deepseek_v41.config import dsv41_geometry, parse_config
 from freetoken.models.deepseek_v41.engram import ZeroEngramTable
 from freetoken.models.deepseek_v41.weight import iter_weights
 from freetoken.utils.hf import cached_load_hf_config
@@ -42,8 +42,8 @@ class TinyEngine:
         args.decoder_replay = decoder_replay
         self.args = args
         # the replay mode shapes the kvcache geometry (resume history, private decoder rings): rebuild
-        # the attention group the way engine._adjust_csa2_config does
-        groups = tuple(replace(g, geometry=csa2_geometry(args)) for g in mc.attention_groups)
+        # the attention group the way engine._adjust_dsv41_config does
+        groups = tuple(replace(g, geometry=dsv41_geometry(args)) for g in mc.attention_groups)
         quant = NoQuantConfig()
         if quantized:
             from freetoken.models.register import checkpoint_quant_config, get_model_spec
@@ -79,7 +79,7 @@ class TinyEngine:
         geom = mc.attention_groups[0].geometry
         self.max_running_req = max_running_req
         num_pages = max_seq_len // P
-        self.pool = CSA2PagedKVCache(csa2_pool_sizes(num_pages + 1, geom, 1.0, P), geom, self.device, n_scratch=max_running_req + 1)
+        self.pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, self.device, n_scratch=max_running_req + 1)
         self.pool._init_paged_state(max_running_req, radix=False)
         self.page_table = torch.zeros(max_running_req + 1, max_seq_len, dtype=torch.int32, device=self.device)
         self.page_table[max_running_req].fill_(num_pages * P)  # the dummy row -> the reserved tail page
@@ -89,12 +89,12 @@ class TinyEngine:
         except AssertionError:
             ctx = Context(page_size=P)
             set_global_ctx(ctx)
-        from freetoken.attention.csa2_sparse import CSA2SparseAttnBackend
+        from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
         self.ctx = ctx
         ctx.page_table = self.page_table
         ctx.kv_cache = self.pool  # the backend reads the pool's device from the context
-        self.backend = CSA2SparseAttnBackend(self.config)
+        self.backend = DSV41SparseAttnBackend(self.config)
         self._next_page = 0
         self._bind()
 

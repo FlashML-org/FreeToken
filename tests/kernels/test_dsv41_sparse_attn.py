@@ -1,4 +1,4 @@
-"""CSA2 sparse attention over packed pools against a torch reference on the DEQUANTIZED pools.
+"""DSV41 sparse attention over packed pools against a torch reference on the DEQUANTIZED pools.
 
 ``m == 1`` takes the split-k decode path, ``m > 1`` the single-program prefill one. Tolerance follows
 the dsv4 sparse-attention tests (5e-2 on fp32-cast bf16): the online-softmax accumulation order differs
@@ -43,7 +43,7 @@ def _reference(q, win, cmp, sink, idx, n_window, scale, counts):
 
 
 def _pools(win_fmt, cmp_fmt, seed):
-    from freetoken.kernel.triton.csa2.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
 
     torch.manual_seed(seed)
     win_vals = torch.randn(N_WIN_SLOTS, D, device="cuda", dtype=torch.bfloat16)
@@ -66,7 +66,7 @@ def _topk(b, m, n_cmp_cols, seed, ring_fill=None):
 @pytest.mark.parametrize("m", [1, 3])
 @pytest.mark.parametrize("fmts", [(FP8_E8M0_B32, FP4_E4M3_B16), (BF16, BF16)], ids=["fp8+fp4", "bf16"])
 def test_matches_reference_on_dequantized_pools(m, fmts):
-    from freetoken.kernel.triton.csa2.sparse_attn import sparse_attn_packed
+    from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
     win_fmt, cmp_fmt = fmts
     b, n_cmp_cols = 2, 256
@@ -82,7 +82,7 @@ def test_matches_reference_on_dequantized_pools(m, fmts):
 
 
 def test_cmp_counts_bound_the_visited_columns():
-    from freetoken.kernel.triton.csa2.sparse_attn import sparse_attn_packed
+    from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
     b, m, n_cmp_cols = 3, 1, 512
     win_pool, cmp_pool, win_deq, cmp_deq = _pools(FP8_E8M0_B32, FP4_E4M3_B16, seed=3)
@@ -98,7 +98,7 @@ def test_cmp_counts_bound_the_visited_columns():
 
 
 def test_all_masked_query_yields_zeros():
-    from freetoken.kernel.triton.csa2.sparse_attn import sparse_attn_packed
+    from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
     win_pool, cmp_pool, _, _ = _pools(FP8_E8M0_B32, FP4_E4M3_B16, seed=5)
     q = torch.randn(1, 2, H, D, device="cuda", dtype=torch.bfloat16)

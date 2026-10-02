@@ -29,7 +29,7 @@ from .dsv4_cost_model import (
     dsv4_window_unit_bytes,
     ring_size_for_ratio,
 )
-# The window-tier building blocks and the pool base live in window_tier.py (shared with the CSA2
+# The window-tier building blocks and the pool base live in window_tier.py (shared with the DSV41
 # pool); the first two are re-exported here for the DSV4 callers and tests that import them from
 # this module.
 from .window_tier import CompressStateRing, FreeListAllocator, WindowTierPagedPool  # noqa: F401

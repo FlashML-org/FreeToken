@@ -1,4 +1,4 @@
-"""CSA2 Lightning Indexer (reference ``Indexer``): scores the compressed positions and keeps the
+"""DSV41 Lightning Indexer (reference ``Indexer``): scores the compressed positions and keeps the
 ``index_topk`` best per query.
 
 A Full-mode layer owns the index keys: ``k = k_norm(wk(latent))`` from its compressor's unrotated

@@ -333,7 +333,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         embed_indexing=False,  # plain nn.Embedding
     ),
     AotModel(
-        # CSA2 pools are packed byte rows written by the csa2 pack kernel, not store_cache;
+        # DSV41 pools are packed byte rows written by the dsv41 pack kernel, not store_cache;
         # the routed experts share DSV4's ds_fp4 bank layout (hidden 5120, intermediate 2304).
         name="deepseek-ai/DeepSeek-V4.1-Flash",
         architecture="DeepseekV41ForCausalLM",

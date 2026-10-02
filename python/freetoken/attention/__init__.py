@@ -103,13 +103,13 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
-    "csa2_sparse",
-    BackendInfo(supported_types=frozenset({AttnType.CSA2})),
+    "dsv41_sparse",
+    BackendInfo(supported_types=frozenset({AttnType.DSV41})),
 )
-def create_csa2_sparse_backend(config: ModelConfig):
-    from .csa2_sparse import CSA2SparseAttnBackend
+def create_dsv41_sparse_backend(config: ModelConfig):
+    from .dsv41_sparse import DSV41SparseAttnBackend
 
-    return CSA2SparseAttnBackend(config)
+    return DSV41SparseAttnBackend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(

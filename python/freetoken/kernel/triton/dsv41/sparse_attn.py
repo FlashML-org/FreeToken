@@ -1,4 +1,4 @@
-"""Sparse gathered-KV flash attention over PACKED pools (DeepSeek-V4.1 CSA2).
+"""Sparse gathered-KV flash attention over PACKED pools (DeepSeek-V4.1).
 
 Same contract as ``kernel/triton/dsv4/sparse_attn.py`` -- each query attends to a per-query list of
 GLOBAL slots laid out ``[window part | compressed part]`` plus a per-head attention sink, K == V is one

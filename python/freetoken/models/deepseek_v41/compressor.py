@@ -1,10 +1,10 @@
-"""CSA2 KV compressor: ``compress_ratio`` consecutive tokens -> one latent (reference ``Compressor``).
+"""DSV41 KV compressor: ``compress_ratio`` consecutive tokens -> one latent (reference ``Compressor``).
 
 * ratio 1 (the CED decoder source): a plain bf16 projection + RMSNorm, one latent per token.
 * ratio > 1 (the encoder sources): ``wkv`` / ``wgate`` promoted to fp32, a softmax over the group's
   gate scores pools the group's ``wkv`` rows; the trailing partial group is carried across chunks
   and decode steps in the pool's compress-state ring (per window page, so a page-aligned radix hit
-  resumes it by value -- see ``CSA2SparseAttnBackend`` for the addressing).
+  resumes it by value -- see ``DSV41SparseAttnBackend`` for the addressing).
 
 Returns the latent BEFORE RoPE: the indexer key is projected from the unrotated latent, the
 attention layer rotates and quantizes it afterwards.

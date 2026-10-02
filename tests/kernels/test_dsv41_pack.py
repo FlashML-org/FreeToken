@@ -1,4 +1,4 @@
-"""Packed KV row formats (``kvcache/row_format.py`` + ``kernel/triton/csa2/pack.py``) against a torch
+"""Packed KV row formats (``kvcache/row_format.py`` + ``kernel/triton/dsv41/pack.py``) against a torch
 transcription of the reference quantizers in DeepSeek-V4.1's ``inference/kernel.py``: the round-tripped
 value the pool hands back must equal what the reference bakes into its bf16 cache, bit for bit."""
 
@@ -55,7 +55,7 @@ def reference_roundtrip(x: torch.Tensor, fmt: RowFormat) -> torch.Tensor:
 @pytest.mark.parametrize("fmt", [BF16, FP8_E8M0_B32, FP4_E4M3_B16, FP4_E8M0_B32], ids=lambda f: f.name)
 @pytest.mark.parametrize("dim", [128, 512])
 def test_roundtrip_matches_the_reference_quantizer(fmt: RowFormat, dim: int):
-    from freetoken.kernel.triton.csa2.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
 
     torch.manual_seed(0)
     m = 300
@@ -74,7 +74,7 @@ def test_roundtrip_matches_the_reference_quantizer(fmt: RowFormat, dim: int):
 
 
 def test_scatter_into_pool_rows_and_gather_back():
-    from freetoken.kernel.triton.csa2.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
 
     torch.manual_seed(1)
     fmt, dim, rows = FP4_E4M3_B16, 512, 64

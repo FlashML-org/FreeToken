@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash: Causal Encoder-Decoder MoE with Compressed Sparse Attention 2.
 
 40 layers (20 encoder + 20 decoder), every layer a sliding window (128) plus -- from layer 2 -- global
-sparse attention over cross-layer-shared compressed KV in packed fp4 (CSA2: Full / Reindex / Reuse
+sparse attention over cross-layer-shared compressed KV in packed fp4 (Full / Reindex / Reuse
 modes, a hierarchical candidate pool in the decoder), single-pass mHC residual streams, Engram n-gram
 memory at layers 1 and 14 streamed from disk, one shared + 384 routed MXFP4 experts per layer served
 from the offload cache. Images use the DeepSeek ViT; DSpark speculative decoding is not served.

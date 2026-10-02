@@ -1,8 +1,8 @@
 """Engine-facing config for DeepSeek-V4.1-Flash.
 
 ``parse_config`` maps the standard transformer fields into :class:`ModelConfig`, carries the full
-:class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module, and declares the CSA2
-attention group whose :class:`CSA2Geometry` prices the KV pool. The engine reconciles the runtime
+:class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module, and declares the DSV41
+attention group whose :class:`DSV41Geometry` prices the KV pool. The engine reconciles the runtime
 knobs (``max_seq_len``, ``decoder_replay``) onto ``dsv41_args`` at config resolution.
 """
 
@@ -11,8 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-from freetoken.kvcache.csa2_geometry import CSA2Geometry
-from freetoken.models.config import CSA2AttentionGroupConfig, ModelConfig, RotaryConfig
+from freetoken.kvcache.dsv41_geometry import DSV41Geometry
+from freetoken.models.config import DSV41AttentionGroupConfig, ModelConfig, RotaryConfig
 
 from .args import DeepseekV41Args
 
@@ -31,8 +31,8 @@ class VisionConfig:
     max_wh_ratio: float | None = None
 
 
-def csa2_geometry(args: DeepseekV41Args) -> CSA2Geometry:
-    return CSA2Geometry(
+def dsv41_geometry(args: DeepseekV41Args) -> DSV41Geometry:
+    return DSV41Geometry(
         n_layers=args.n_layers,
         head_dim=args.head_dim,
         index_head_dim=args.index_head_dim,
@@ -96,16 +96,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
         vision_config=vision,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=(
-            CSA2AttentionGroupConfig(
-                name="csa2",
+            DSV41AttentionGroupConfig(
+                name="dsv41",
                 layer_ids=tuple(range(args.n_layers)),
                 num_kv_heads=1,
                 head_dim=args.head_dim,
                 sliding_window=args.window_size,
-                geometry=csa2_geometry(args),
+                geometry=dsv41_geometry(args),
             ),
         ),
     )
 
 
-__all__ = ["parse_config", "csa2_geometry"]
+__all__ = ["parse_config", "dsv41_geometry"]

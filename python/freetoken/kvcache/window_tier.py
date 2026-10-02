@@ -1,4 +1,4 @@
-"""Shared pieces of the sliding-window paged pools (DSV4, CSA2).
+"""Shared pieces of the sliding-window paged pools (DSV4, DSV41).
 
 * ``FreeListAllocator``   -- LIFO page allocator for the window tier (unit = one P-slot page).
 * ``CompressStateRing``   -- per-window-page fp32 ``kv | score`` carry ring with a scratch row.
@@ -9,7 +9,7 @@
   in-place rebuild, and the ABC glue every such pool shares. Subclasses allocate their own tiers
   (``_alloc_buffers`` / ``_drop_buffers``), size themselves (the ``kv_cost`` family) and write rows.
 
-``DSV4PagedKVCache`` (the origin of this code) and ``CSA2PagedKVCache`` both build on these, so a
+``DSV4PagedKVCache`` (the origin of this code) and ``DSV41PagedKVCache`` both build on these, so a
 fix to allocation, freeing or the mapping lands in one place.
 """
 
@@ -163,7 +163,7 @@ class WindowTierPagedPool(BaseKVCachePool):
     # the tier buffers are bound into per-forward model scratch, invalid after a realloc
     needs_rebind_on_rebuild = True
     # window pages of live history the cache manager keeps behind a resumable position (see
-    # CSA2Geometry.resume_windows); sized into the reserve below
+    # DSV41Geometry.resume_windows); sized into the reserve below
     resume_windows: int = 1
 
     P: int

@@ -1,4 +1,4 @@
-"""CSA2 attention layer (reference ``Attention``): latent MLA over a sliding window plus, on
+"""DSV41 attention layer (reference ``Attention``): latent MLA over a sliding window plus, on
 compressing layers, ``index_topk`` compressed positions -- one paged sparse-attention call.
 
 Per layer mode (``LayerRole``):
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-from freetoken.attention.csa2_sparse import PrefillSegment
+from freetoken.attention.dsv41_sparse import PrefillSegment
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.batch_invariant_linear import batch_invariant_grouped_linear
 from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
@@ -40,7 +40,7 @@ from .indexer import Indexer
 from .rope import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 
 
-class CSA2Attention(BaseOP):
+class DSV41Attention(BaseOP):
     def __init__(self, args: DeepseekV41Args, role: LayerRole, *, quant_config=None, prefix: str = ""):
         self.args = args
         self.role = role
@@ -312,4 +312,4 @@ class DecodeStepContext:
         return cls(window_slots, prev_window_slots, tier(window_slots, window_topk), private, tables)
 
 
-__all__ = ["CSA2Attention", "DecodeStepContext", "TierCandidates"]
+__all__ = ["DSV41Attention", "DecodeStepContext", "TierCandidates"]

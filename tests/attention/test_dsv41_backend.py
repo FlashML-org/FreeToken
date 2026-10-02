@@ -1,4 +1,4 @@
-"""CSA2 attention backend: addressing and selection contracts, CPU-only (kernels live in tests/kernels).
+"""DSV41 attention backend: addressing and selection contracts, CPU-only (kernels live in tests/kernels).
 
 * prefill metadata: encoder segments, the decoder pass under exact vs bounded replay;
 * window candidates with a floor (bounded replay truncates the window at the replay start);
@@ -15,9 +15,9 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
-from freetoken.kvcache.csa2_cost_model import csa2_pool_sizes
-from freetoken.kvcache.csa2_geometry import CSA2Geometry
-from freetoken.kvcache.csa2_paged_pool import CSA2PagedKVCache
+from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+from freetoken.kvcache.dsv41_geometry import DSV41Geometry
+from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 
 P, MRR, DEVICE = 128, 4, torch.device("cpu")
 RATIOS = (0, 2, 2, 1, 1)
@@ -35,12 +35,12 @@ def _ctx(pool):
 
 
 def _stack(decoder_replay="exact", num_pages=32, max_seq_len=8192):
-    from freetoken.attention.csa2_sparse import CSA2SparseAttnBackend
+    from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
     private = tuple(range(3, len(RATIOS))) if decoder_replay != "exact" else ()
-    geom = CSA2Geometry(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES,
+    geom = DSV41Geometry(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES,
                         resume_windows=1 if decoder_replay == "exact" else 2, private_window_layer_ids=private)
-    pool = CSA2PagedKVCache(csa2_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
+    pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
     pt[MRR].fill_(num_pages * P)
@@ -51,7 +51,7 @@ def _stack(decoder_replay="exact", num_pages=32, max_seq_len=8192):
     _ctx(pool)
     group = SimpleNamespace(geometry=geom)
     args = SimpleNamespace(decoder_replay=decoder_replay, decoder_start_layer=3)
-    backend = CSA2SparseAttnBackend(SimpleNamespace(attention_groups=(group,), dsv41_args=args))
+    backend = DSV41SparseAttnBackend(SimpleNamespace(attention_groups=(group,), dsv41_args=args))
     return backend, pool, pt
 
 
@@ -106,7 +106,7 @@ def test_private_window_layers_address_per_request_rings():
     """Under bounded replay the decoder layers keep their window KV in per-request rings (slot =
     table row * P + pos % P), never in the radix-shared window pages; the encoder layers stay on
     the shared pool."""
-    from freetoken.attention.csa2_sparse import PrefillSegment
+    from freetoken.attention.dsv41_sparse import PrefillSegment
 
     backend, pool, _ = _stack("bounded")
     geom = backend.geom
@@ -133,7 +133,7 @@ def test_bounded_extension_reads_only_the_resume_history():
     ``[start - P + 1, cached_len)``, stay inside the two windows the cache keeps live behind a
     page-aligned hit (KVCacheGroupSpec.swa_resume_history). ``replay_history`` bounds that read for
     admission, which turns a hit reading further back into a miss; the planner does not re-check."""
-    from freetoken.attention.csa2_sparse import replay_history
+    from freetoken.attention.dsv41_sparse import replay_history
 
     backend, _, _ = _stack("bounded")
     for cached, new in ((256, 44), (256, 1), (256, P - 1), (384, 10)):
@@ -147,7 +147,7 @@ def test_bounded_extension_reads_only_the_resume_history():
 
 
 def test_replay_start_rules():
-    from freetoken.attention.csa2_sparse import replay_start
+    from freetoken.attention.dsv41_sparse import replay_start
 
     assert replay_start(_req(0, 0, 50), P, True) == 0  # a cold prompt shorter than a window
     assert replay_start(_req(0, 256, 300), P, True) == 256  # a whole window of new tokens
@@ -157,7 +157,7 @@ def test_replay_start_rules():
 
 
 def test_window_candidates_honor_the_floor_and_the_retained_prefix():
-    from freetoken.attention.csa2_sparse import PrefillSegment
+    from freetoken.attention.dsv41_sparse import PrefillSegment
 
     backend, pool, _ = _stack()
     # a cold segment at positions [0, 10): query p sees [0, p]
@@ -225,14 +225,14 @@ def _reference_candidate_mask(logits, compress_lens, topk_blocks, block_size):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the selection kernels need CUDA")
 def test_candidate_blocks_match_the_reference_mask():
-    from freetoken.attention.csa2_sparse import CSA2SparseAttnBackend
+    from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
     torch.manual_seed(0)
     b, s, t, blk, kb = 2, 5, 61, 8, 3
     logits = torch.randn(b, s, t, device="cuda")
     live = torch.tensor([[61, 40, 17, 1, 0], [8, 9, 33, 61, 61]], device="cuda", dtype=torch.int32)
     logits = logits.masked_fill(torch.arange(t, device="cuda") >= live.unsqueeze(-1), -torch.inf)
-    cand = CSA2SparseAttnBackend.select_candidate_blocks(logits, live, kb, blk)
+    cand = DSV41SparseAttnBackend.select_candidate_blocks(logits, live, kb, blk)
     assert cand.shape == (b, s, kb * blk)
     want = _reference_candidate_mask(logits, live.unsqueeze(-1), kb, blk)
     for i in range(b):
@@ -247,7 +247,7 @@ def test_candidate_blocks_match_the_reference_mask():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the selection kernels need CUDA")
 def test_topk_helpers():
-    from freetoken.attention.csa2_sparse import CSA2SparseAttnBackend as B
+    from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend as B
 
     scores = torch.tensor([[[0.1, 5.0, 3.0, 7.0, 9.0]]], device="cuda")  # columns past live are never read
     live = torch.tensor([[3]], device="cuda", dtype=torch.int32)
