@@ -155,8 +155,9 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
-        # 动态重钉的一次检查。阻塞收包期间窗口仍可能封口，_recv_msg_* 会按
-        # _repin_wait_ms 醒过来再进这里。调度器此时无在途 batch。
+        # Blocking receive bypasses the main-loop drain. With no in-flight batch,
+        # flush completed routing counts before checking the repin window.
+        self._process_last_data(None)
         self._maybe_repin(None)
 
     def _repin_wait_ms(self) -> int | None:

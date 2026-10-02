@@ -84,6 +84,7 @@ def build_expert_banks(
     dummy: bool = False,
     pin_sets: dict[int, list[int]] | None = None,
     pin_sink=None,
+    defer_pins: bool = False,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -97,16 +98,22 @@ def build_expert_banks(
     冷压缩：bank 只有 ``[E - K_l, *row]`` 行，行号 = 冷行号（冷专家按 id 升序压缩）；钉住
     专家的权重改为 pack 进 ``[K_l, *row]`` 的 per-layer host 暂存。该层全部行读完后以
     ``pin_sink(layer_id, {role: 暂存})`` 一次性移交（sink 必须在返回前完成 H2D 或持有一份
-    拷贝——暂存随调用结束释放，host 峰值占用 ≤ 单层钉住字节）。钉住 piece 仍会被读盘
+    拷贝；乱序输入可同时持有多层未完成的暂存）。钉住 piece 仍会被读盘
     （reader 按范围整段吐出），这是 v1 接受的 IO 浪费，v2 可在读取层过滤。返回的
     ``ExpertBanks.cold_row`` 为 ``[L, E] int32``（pinned -> -1）。``layer_sink`` 与
     ``pin_sets`` 互斥（converter 不参与钉住）。
+
+    ``defer_pins`` keeps only a reusable single-expert scratch instead of emitting
+    stages. Packing still computes every resident alpha; after cache sizing the
+    engine rereads hot rows with ``reload_pinned_experts`` into their final slots.
     """
     from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
 
     if layer_sink is not None and pin_sets:
         raise ValueError("expert bank converter (layer_sink) 与显存钉住 (pin_sets) 互斥")
+    if defer_pins and pin_sink is not None:
+        raise ValueError("defer_pins cannot be combined with pin_sink")
 
     kernel = method.kernel
     layout = method.layout()
@@ -137,9 +144,10 @@ def build_expert_banks(
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
     }
-    # per-layer 钉住暂存：host 峰值 ≤ 单层钉住字节（每层移交 pin_sink 后即释放）
+    # Legacy sinks own completed stages; deferred startup never accumulates them.
     pin_stage: dict[int, dict[str, torch.Tensor]] = {}
     pin_read: dict[int, int] = {}
+    pin_scratch = None
 
     def _pin_stage_for(layer_id: int) -> dict[str, torch.Tensor]:
         """取（惰性建）该层的钉住暂存 {role: [K_l, *row]}，并清零其已读行计数。"""
@@ -155,7 +163,7 @@ def build_expert_banks(
         return stage
 
     def _release_pin_stage(layer_id: int) -> None:
-        """该层全部行读毕：把钉住暂存一次性移交 pin_sink 后丢弃（host 峰值 ≤ 单层钉住字节）。"""
+        """该层全部行读毕：把钉住暂存一次性移交 pin_sink 后丢弃。"""
         stage = pin_stage.pop(layer_id)
         if pin_sink is not None:
             pin_sink(layer_id, stage)
@@ -167,7 +175,7 @@ def build_expert_banks(
         for alpha in alphas.values():
             alpha.fill_(1.0)
         for layer_id in range(num_layers):
-            if pin_counts[layer_id]:
+            if pin_counts[layer_id] and not defer_pins:
                 stage = _pin_stage_for(layer_id)
                 for role, tensor in stage.items():
                     _dummy_fill(role, tensor)
@@ -181,6 +189,7 @@ def build_expert_banks(
         )
 
     def _fill(sink) -> None:
+        nonlocal pin_scratch
         tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
         # a reader that skips a layer or mislabels a piece must fail here, not serve uninitialized rows
         written = torch.zeros(num_layers, E, dtype=torch.int32)
@@ -198,14 +207,23 @@ def build_expert_banks(
             # 暂存行序 == pin list 顺序（slot 分配按同一序号）。
             runs = _split_cold_runs(e0, e1, layer_pins)
             for a, b in runs:
-                out, src_piece = _run_views(a, b, e0, piece, banks, layer_id, pin_list, _pin_stage_for)
+                if defer_pins and a in layer_pins:
+                    if pin_scratch is None:
+                        pin_scratch = {
+                            role: torch.empty((1, *shape[1:]), dtype=dtype)
+                            for role, (shape, dtype) in specs.items()
+                        }
+                    out = pin_scratch
+                    src_piece = {role: tensor[a - e0:b - e0] for role, tensor in piece.items()}
+                else:
+                    out, src_piece = _run_views(a, b, e0, piece, banks, layer_id, pin_list, _pin_stage_for)
                 got = method.pack(src_piece, out)
                 for role, values in got.items():
                     alphas[role][layer_id * E + a : layer_id * E + b] = values.to(alphas[role].dtype)
             if tracker is not None:
                 for _ in range(e1 - e0):
                     tracker.note(layer_id)
-            if pin_counts[layer_id]:
+            if pin_counts[layer_id] and not defer_pins:
                 pin_read[layer_id] = pin_read.get(layer_id, 0) + (e1 - e0)
                 if pin_read[layer_id] == E:
                     _release_pin_stage(layer_id)
@@ -230,6 +248,57 @@ def build_expert_banks(
         streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
         cold_row=cold_row,
     )
+
+
+def reload_pinned_experts(model_path, model_config, method, pin_sets, sink, *, dummy=False) -> None:
+    """Repack hot experts into one reusable row and synchronously install each row.
+
+    ``sink(layer_id, expert_id, row, alphas)`` must finish copying before returning.
+    A serial second checkpoint pass avoids retaining hot layers or allocating GPU
+    staging outside the resolved cache budget. Source-reader and quant-packer
+    transients are additional to the one-expert packed hot staging bound.
+    """
+    from freetoken.moe.expert_pieces import iter_expert_pieces
+
+    layout = method.layout()
+    row = {
+        role: torch.empty((1, *spec.shape), dtype=spec.dtype)
+        for role, spec in layout.items() if not spec.resident
+    }
+    if dummy:
+        alphas = {
+            role: torch.ones(1, dtype=spec.dtype)
+            for role, spec in layout.items() if spec.resident
+        }
+        for layer_id, experts in pin_sets.items():
+            for expert_id in experts:
+                for role, tensor in row.items():
+                    _dummy_fill(role, tensor)
+                sink(layer_id, expert_id, row, alphas)
+        return
+
+    num_layers, E = model_config.num_moe_layers, method.cfg.num_experts
+    written = torch.zeros(num_layers, E, dtype=torch.bool)
+    pieces = iter_expert_pieces(model_path, model_config, method.kind, parallel=False)
+    try:
+        for layer_id, e0, e1, piece in pieces:
+            if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
+                raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
+            if written[layer_id, e0:e1].any():
+                raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+            written[layer_id, e0:e1] = True
+            for expert_id in pin_sets.get(layer_id, ()):
+                if e0 <= expert_id < e1:
+                    src = {role: tensor[expert_id - e0:expert_id - e0 + 1] for role, tensor in piece.items()}
+                    alphas = method.pack(src, row)
+                    sink(layer_id, expert_id, row, alphas)
+        missing = (written == 0).nonzero().tolist()
+        if missing:
+            raise ValueError(f"expert reload was not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
+    finally:
+        close = getattr(pieces, "close", None)
+        if close is not None:
+            close()
 
 
 def _cold_row_from_pin_sets(pin_sets: dict[int, list[int]] | None, num_layers: int, num_experts: int) -> torch.Tensor:
@@ -348,16 +417,16 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, pin_sets=None, pin_sink=None) -> ExpertBanks:
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, pin_sets=None, pin_sink=None, defer_pins=False) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
     if dummy:
-        return build_expert_banks(method, num_layers, None, device=device, dummy=True, pin_sets=pin_sets, pin_sink=pin_sink)
+        return build_expert_banks(method, num_layers, None, device=device, dummy=True, pin_sets=pin_sets, pin_sink=pin_sink, defer_pins=defer_pins)
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, pin_sets=pin_sets, pin_sink=pin_sink)
+    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, pin_sets=pin_sets, pin_sink=pin_sink, defer_pins=defer_pins)
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -444,6 +513,7 @@ def load_expert_banks(
     layer_residency: list[str] | None = None,
     pin_sets: dict[int, list[int]] | None = None,
     pin_sink=None,
+    defer_pins: bool = False,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -472,6 +542,8 @@ def load_expert_banks(
     ``pin_sets`` / ``pin_sink``（显存钉住，v1）: 冷压缩构建参数，原样转发给
     ``build_expert_banks``（语义见其 docstring：钉住层 bank 冷压缩为 ``[E-K, *row]``，
     钉住权重经 per-layer 暂存移交给 ``pin_sink``，返回 ``ExpertBanks.cold_row``）。
+    ``defer_pins=True`` bounds packed hot scratch to one expert and requires a later
+    ``reload_pinned_experts`` call after the destination cache has been allocated.
     仅 method 慢路径支持：FTW 快路径遇到钉住时降级为慢路径并告警（否则 host 无法省下
     钉住字节）；GGUF q4_0 提供方不支持，直接报错。
     """
@@ -523,7 +595,7 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, pin_sets, pin_sink)
+            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, pin_sets, pin_sink, defer_pins)
         if pin_sets:
             raise ValueError(
                 "--hot-expert-list 需要走 quant method 的慢路径打包（当前 checkpoint 的专家"

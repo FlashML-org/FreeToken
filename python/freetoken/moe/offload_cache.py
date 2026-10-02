@@ -202,6 +202,7 @@ class OffloadMoeCache:
         # pin_base_dev（int32 设备标量，cache 持有永不重分配）是 hybrid 内核的按指针
         # 读取边界（捕获冻结的是指针而非值）。先于 validate_rebuild 初始化（后者
         # 读取 pin_capacity 做 rebuild 地板校验）。
+        self._rebuild_pinned_rows: list[dict[str, torch.Tensor]] | None = None
         self.pin_ids: torch.Tensor | None = None
         self.pin_counts: list[int] | None = None
         self.cold_row: torch.Tensor | None = None
@@ -1346,7 +1347,11 @@ class OffloadMoeCache:
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
-        pinned_rows = self._snapshot_pinned_rows()
+        # A failed free-before-alloc attempt leaves incomplete banks. Retries must
+        # reuse the last complete snapshot until every rebuild step succeeds.
+        if self._rebuild_pinned_rows is None:
+            self._rebuild_pinned_rows = self._snapshot_pinned_rows()
+        pinned_rows = self._rebuild_pinned_rows
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self._prefill_buffer_ptrs = []
@@ -1393,8 +1398,8 @@ class OffloadMoeCache:
         if self.pin_ids is not None:
             self._pin_query_buffers = {}
             self._init_pin_geometry()
-            self._fill_pin_maps()
             self._restore_pinned_rows(pinned_rows)
+            self._fill_pin_maps()
             # pin_slots 随 cache_size 变了，钉住行 gather 索引同步刷新
             self._build_pin_gather_buffers()
         self.stat_missing.zero_()
@@ -1420,6 +1425,7 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        self._rebuild_pinned_rows = None
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None

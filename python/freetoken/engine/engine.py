@@ -20,7 +20,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import load_expert_banks
+from freetoken.moe.expert_banks import load_expert_banks, reload_pinned_experts
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -673,27 +673,15 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
-        # 钉住装配：loader 冷压缩后把每层钉住暂存交给 sink。每层必须单独保住。
-        # 复用一块 GPU arena 再广播，后一层会覆盖前一层，所有层都装上最后一层的权重。
-        # 暂存留在 host，等自动 cache 按空闲显存划完再逐层 H2D，避免提前占掉那块预算。
-        pin_sets = pin_sink = None
-        pin_stages: list[dict[str, torch.Tensor] | None] | None = None
+        # Final slot geometry is resolved after cold loading. Reread hot experts
+        # afterward instead of retaining every layer's packed host stage.
+        pin_sets = None
         if pin_plan is not None:
             pin_sets = {
                 layer_id: experts
                 for layer_id, experts in enumerate(pin_plan.pins)
                 if experts
             }
-            pin_stages = [None] * num_moe_layers
-
-            def pin_sink(layer_id: int, stage: dict[str, torch.Tensor]) -> None:
-                """保住这一层 loader 已经物化的 host 暂存。调用方返回后会丢掉局部引用。"""
-                assert pin_stages is not None
-                if not 0 <= layer_id < len(pin_stages):
-                    raise RuntimeError(f"pin sink layer {layer_id} out of range")
-                if pin_stages[layer_id] is not None:
-                    raise RuntimeError(f"layer {layer_id} delivered a pin stage twice")
-                pin_stages[layer_id] = stage
 
         try:
             with _weight_load_context():
@@ -708,7 +696,7 @@ class Engine:
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
                     pin_sets=pin_sets,
-                    pin_sink=pin_sink,
+                    defer_pins=pin_plan is not None,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -786,14 +774,25 @@ class Engine:
                 pin_ids, counts, banks.cold_row, pin_capacity=pin_capacity,
                 lru_min_slots=config.hot_expert_lru_floor or None,
             )
-            if pin_stages is not None:
-                # 每层 host 暂存 H2D 进自己的 pin slots。清掉列表内容，sink 闭包
-                # 还指着这个 list 时字节也能马上放开。
-                cache.load_pinned_rows(pin_stages)
-                for index in range(len(pin_stages)):
-                    pin_stages[index] = None
-                pin_stages = None
-                pin_sink = None
+            pin_slots = cache.slot_for_id.cpu()
+
+            def install_pin(layer_id, expert_id, row, alphas):
+                slot = int(pin_slots[layer_id, expert_id])
+                for role, tensor in row.items():
+                    cache.bank_caches[role][slot:slot + 1].copy_(tensor)
+                offset = layer_id * num_experts + expert_id
+                for role, values in alphas.items():
+                    getattr(cache, role)[offset:offset + 1].copy_(values)
+
+            logger.info_rank0(
+                "hot experts: loading final slots with one expert of host scratch"
+                + ("" if config.use_dummy_weight else " (serial checkpoint reread)")
+            )
+            with _weight_load_context():
+                reload_pinned_experts(
+                    config.model_path, config.model_config, method, pin_sets, install_pin,
+                    dummy=config.use_dummy_weight,
+                )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         if config.tune_file:

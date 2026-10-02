@@ -28,7 +28,7 @@
 
 ```
 NVMe checkpoint（真源，只读）
-   │  加载期一次性分流
+   │  加载期分两遍
    ├─ 热专家（pin list，每层 top-K）──→ GPU slot cache 顶部固定区 [cache_size-P, cache_size)
    └─ 冷专家 ──────────────────────→ host bank（每层 [E-K, *row]，行号 = cold_row）
                                         │ 运行期按需 H2D（miss）
@@ -94,11 +94,15 @@ NVMe checkpoint（真源，只读）
 
 #### 3.3.2 初始化（`engine.py::_init_offload_moe_cache` 扩展）
 
-1. 读 pin list → `pin_ids [L, K] int32`（GPU）、`pin_slots [L, K] int32`（GPU，= 顶部区地址）。
-2. **预填映射**：`slot_for_id[l, e] = pin_slot`、`id_of_slot[pin_slot] = l*E + e`、`usage[pin_slot] = 0`。
-3. **钉住权重入显存**：从 checkpoint safetensors 直接读 pinned 行（复用 `nvfp4_expert_spec`/`Nvfp4DiskIndex` 的行读取器或 `expert_pieces` 流式读取）→ 临时 pinned 暂存 → H2D 写入 slot cache 对应槽 → 释放暂存。**不经过 host bank**。
-4. **冷压缩 host bank**：`build_expert_banks` 增加 `skip: dict[layer → set[int]]`；每层 bank 形状 `[E-K, *row]`，行号 = `cold_row`（按专家 id 升序压缩）。同时产出 `cold_row [L, E] int32` GPU 常驻表（pinned → -1）。
-5. **显存预算记账**：钉住字节 = `P × bytes_per_expert`，计入 moe cache 预算内（`resolve_moe_cache_auto` 不变，`cache_size` 含钉住区；LRU 区 = `cache_size - P` 自然变小）。日志打印：钉住字节数、host 节省字节数、LRU 区大小。
+1. 读 pin list，剥离 CPU decode 层的钉住项；以 `pin_sets` / `defer_pins=True` 加载冷压缩 host bank，每层 `[E-K, *row]`，同时生成 `cold_row [L, E]`（pinned → -1）。
+2. 依据冷 bank 行布局完成 auto cache 定容并分配最终 GPU slot cache；挂接完整 resident alpha。
+3. **预填映射**：`slot_for_id[l, e] = pin_slot`、`id_of_slot[pin_slot] = l*E + e`、`usage[pin_slot] = 0`。
+4. **钉住权重入显存**：串行重读 `expert_pieces`，每次将一个热专家 pack 到可复用的单行 host 暂存，同步拷入其最终 slot，并更新其 resident alpha。**不经过 host bank，也不保留各层热暂存**。
+5. **显存预算记账**：钉住字节计入 moe cache 预算内（`resolve_moe_cache_auto` 不变，`cache_size` 含钉住容量区；LRU 区相应变小）。日志打印 pinned bytes、host 节省字节数、LRU 槽数。
+
+当前启动实现分两遍：先加载冷压缩 bank，热行只 pack 到一个可复用的单专家暂存，保留完整的 resident alpha；auto cache 定容、分配最终 slot 后，再用同一 quant method 串行重读 checkpoint，将每个热专家直接装入其最终 slot。乱序或交错 layer pieces 不会积累 per-layer 热暂存，第二遍也检查重复、越界和缺失的专家行。dummy 模式直接逐行生成，不读 checkpoint。
+
+此内存上界只针对 **packed hot staging（一个专家）**，不包括 cold banks、checkpoint reader 和 quant packer 自身的临时内存；Marlin/b12x 的 pack 仍会使用 GPU 临时张量。代价是额外一次串行 checkpoint 扫描和热专家 repack，可能增加启动时间。不需要临时磁盘空间，也不改 auto cache 的 slots/KV 定容顺序。
 
 #### 3.3.3 hybrid kernel 改造（`moe/offload_kernels.py`）
 

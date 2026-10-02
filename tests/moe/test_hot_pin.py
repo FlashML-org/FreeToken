@@ -530,6 +530,156 @@ def test_reset_and_rebuild_restore_pin_maps():
         cache.validate_rebuild(4 + 100)
 
 
+@pytest.mark.parametrize("failure", [
+    "first_bank", "second_bank", "copy_plan", "bookkeeping", "geometry",
+    "restore", "gather", "overlap",
+])
+def test_rebuild_rollback_preserves_pinned_weights(monkeypatch, failure):
+    """A failed resize and the scheduler's retry must retain authoritative pin bytes."""
+    cache = _make_pinned_cache(num_layers=3, pins=(3, 7), k_per_layer=[1, 0, 2])
+    pins = _init_pins(cache, pins=(3, 7), k_per_layer=[1, 0, 2], pin_capacity=3)
+    _load_pinned_slot_contents(cache)
+    old_size = cache.cache_size
+    new_size = old_size + 16
+    expected = {
+        (layer, role): bank[cache.pin_slots[layer, :count].long()].clone()
+        for layer, count in enumerate(cache.pin_counts)
+        for role, bank in cache.bank_caches.items()
+    }
+    sources = cache.bank_sources
+    source_ptrs = {role: [t.data_ptr() for t in rows] for role, rows in sources.items()}
+    if failure == "overlap":
+        cache.prefill_overlap = True
+
+    def fail(*args, **kwargs):
+        raise torch.OutOfMemoryError("injected rebuild failure")
+
+    with monkeypatch.context() as fault:
+        if failure in {"first_bank", "second_bank", "bookkeeping"}:
+            allocator = "full" if failure == "bookkeeping" else "zeros"
+            original = getattr(torch, allocator)
+            calls = 0
+
+            def allocate(shape, *args, **kwargs):
+                nonlocal calls
+                if isinstance(shape, (tuple, list)) and shape[0] == new_size:
+                    calls += 1
+                    if calls == (2 if failure == "second_bank" else 1):
+                        fail()
+                return original(shape, *args, **kwargs)
+
+            fault.setattr(torch, allocator, allocate)
+        elif failure == "restore":
+            restore = cache._restore_pinned_rows
+
+            def partial_restore(rows):
+                restore(rows[:1])
+                fail()
+
+            fault.setattr(cache, "_restore_pinned_rows", partial_restore)
+        else:
+            method = {
+                "copy_plan": "_build_copy_plan", "geometry": "_init_pin_geometry",
+                "gather": "_build_pin_gather_buffers", "overlap": "_init_prefill_overlap_buffers",
+            }[failure]
+            fault.setattr(cache, method, fail)
+        with pytest.raises(torch.OutOfMemoryError, match="injected"):
+            cache.rebuild(new_size)
+
+    cache.rebuild(old_size)
+    assert cache.bank_sources is sources
+    assert source_ptrs == {role: [t.data_ptr() for t in rows] for role, rows in sources.items()}
+    assert cache.pinned_id_lists() == pins
+    for layer, count in enumerate(cache.pin_counts):
+        slots = cache.pin_slots[layer, :count].long()
+        for role, bank in cache.bank_caches.items():
+            assert torch.equal(bank[slots], expected[layer, role]), (failure, layer, role)
+        for j, expert in enumerate(pins[layer]):
+            slot = int(slots[j])
+            assert int(cache.slot_for_id[layer, expert]) == slot
+            assert int(cache.id_of_slot[slot]) == layer * cache.num_experts + expert
+            assert int(cache.pin_held[slot]) == 1
+
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.uint8, torch.int32])
+def test_rebuild_rollback_keeps_packed_bytes(monkeypatch, dtype):
+    """Recovery preserves packed bank storage, including dtypes without CPU gather ops."""
+    cache = _make_pinned_cache()
+    cache.set_bank_sources(
+        {role: [torch.zeros_like(t, dtype=dtype) for t in rows]
+         for role, rows in cache.bank_sources.items()},
+        per_layer_rows=[14, 14],
+    )
+    _init_pins(cache)
+    expected = {}
+    for role, bank in cache.bank_caches.items():
+        for layer, count in enumerate(cache.pin_counts):
+            for j in range(count):
+                row = bank[int(cache.pin_slots[layer, j])].view(torch.uint8)
+                row.copy_(torch.arange(row.numel()).reshape(row.shape).to(torch.uint8))
+                expected[layer, j, role] = row.clone()
+    old_size = cache.cache_size
+    with monkeypatch.context() as fault:
+        def fail():
+            raise torch.OutOfMemoryError("injected packed bank failure")
+
+        fault.setattr(cache, "_build_copy_plan", fail)
+        with pytest.raises(torch.OutOfMemoryError, match="injected"):
+            cache.rebuild(old_size + 16)
+    cache.rebuild(old_size)
+    for role, bank in cache.bank_caches.items():
+        for layer, count in enumerate(cache.pin_counts):
+            for j in range(count):
+                row = bank[int(cache.pin_slots[layer, j])].view(torch.uint8)
+                assert torch.equal(row, expected[layer, j, role])
+
+
+def test_rebuild_snapshot_survives_repeated_failures_and_is_released(monkeypatch):
+    """Retries reuse the last valid snapshot; successful rebuilds release it."""
+    import weakref
+
+    cache = _make_pinned_cache()
+    _init_pins(cache)
+    _load_pinned_slot_contents(cache)
+    old_size = cache.cache_size
+    original = cache._snapshot_pinned_rows
+    snapshots = []
+    calls = 0
+
+    def snapshot():
+        nonlocal calls
+        calls += 1
+        rows = original()
+        snapshots.extend(weakref.ref(t) for row in rows for t in row.values())
+        return rows
+
+    monkeypatch.setattr(cache, "_snapshot_pinned_rows", snapshot)
+    with monkeypatch.context() as fault:
+        def fail():
+            raise torch.OutOfMemoryError("injected repeated failure")
+
+        fault.setattr(cache, "_build_copy_plan", fail)
+        for size in (old_size + 16, old_size):
+            with pytest.raises(torch.OutOfMemoryError, match="injected"):
+                cache.rebuild(size)
+    cache.rebuild(old_size)
+    assert calls == 1
+    assert all(ref() is None for ref in snapshots)
+    # A later successful rebuild must snapshot the current weights, not stale bytes.
+    for bank in cache.bank_caches.values():
+        bank.add_(11)
+    cache.rebuild(old_size + 16)
+    assert calls == 2
+    assert all(ref() is None for ref in snapshots)
+    for layer, count in enumerate(cache.pin_counts):
+        for j in range(count):
+            expert = int(cache.pin_ids[layer, j])
+            slot = int(cache.pin_slots[layer, j])
+            for bank in cache.bank_caches.values():
+                assert torch.all(bank[slot] == layer * 100 + expert + 11)
+
+
 # ---------------------------------------------------------------------------
 # 合并查询 ensure（flashlib 路径，CPU oracle 驱动）
 # ---------------------------------------------------------------------------
