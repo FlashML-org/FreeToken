@@ -52,6 +52,9 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Bearer token required on the HTTP API (OpenAI/Anthropic/generate routes). None
+    # disables auth entirely (today's behavior); /health stays open either way.
+    api_key: str | None = None
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -363,6 +366,14 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.environ.get("FREETOKEN_API_KEY", ServerArgs.api_key),
+        help="Bearer token required on the HTTP API; unset disables auth (previous "
+        "behavior). Defaults to the FREETOKEN_API_KEY environment variable.",
     )
 
     parser.add_argument(
