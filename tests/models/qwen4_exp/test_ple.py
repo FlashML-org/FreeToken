@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 
+import freetoken.models.qwen4_exp.ple as ple_module
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.ple import (
@@ -171,6 +172,158 @@ def test_decode_hash_matches_prefill_hash():
         )
         for i in range(len(sequences)):
             assert torch.equal(got[i], prefill[i * len(sequences[0]) + step])
+
+
+_FUSED_HASH_SEQS = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14], [7]]
+_FUSED_HASH_CTX = [[EOS, EOS], [21, 22], [31, EOS]]
+
+
+def test_token_index_addresses_the_same_window_as_the_packed_build():
+    """``_token_index`` names the (request, column) the packed window would have used."""
+    layer = _make_layer(_config())
+    embedding = layer.ple_embedding
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    packed, select = embedding._window(meta)
+    req, local = embedding._token_index(meta)
+    ctx_len = embedding.ngram_size - 1
+    assert torch.equal(packed[req.long(), local.long() + ctx_len], meta.input_ids)
+    assert torch.equal(select(packed), meta.input_ids)
+
+
+def test_token_index_cache_is_keyed_by_shape():
+    """A repeat of the same shape reuses the buffers; a different one does not."""
+    layer = _make_layer(_config())
+    embedding = layer.ple_embedding
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    first = embedding._token_index(meta)
+    assert embedding._token_index(meta)[0] is first[0]
+    other = _meta([[3, 4]], [[EOS, EOS]])
+    assert embedding._token_index(other)[0] is not first[0]
+
+
+def test_token_index_does_not_confuse_a_decode_with_a_one_request_prefill():
+    """Same [T], opposite meaning: B decode rows at offset 0 vs B offsets in one request."""
+    layer = _make_layer(_config())
+    embedding = layer.ple_embedding
+    tokens = [5, 6, 7]
+    context = [[EOS, EOS], [21, 22], [31, EOS]]
+    decode_req, decode_local = embedding._token_index(
+        _meta([[t] for t in tokens], context, decode=True)
+    )
+    prefill_req, prefill_local = embedding._token_index(_meta([tokens], context[:1]))
+    assert decode_req.tolist() == [0, 1, 2] and decode_local.tolist() == [0, 0, 0]
+    assert prefill_req.tolist() == [0, 0, 0] and prefill_local.tolist() == [0, 1, 2]
+
+
+def test_token_index_cache_is_bounded():
+    """The memo is an LRU-ish ring, not an unbounded map keyed by every prefill shape."""
+    embedding = _make_layer(_config()).ple_embedding
+    for length in range(4 * ple_module._TOKEN_INDEX_CACHE_SIZE):
+        embedding._token_index(_meta([list(range(length + 1))], [[EOS, EOS]]))
+    assert len(embedding._token_index_cache) == ple_module._TOKEN_INDEX_CACHE_SIZE
+
+
+def test_fused_hash_is_off_on_cpu():
+    """The Triton path needs CUDA; a CPU meta stays on the torch reference."""
+    layer = _make_layer(_config())
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    assert not layer.ple_embedding._use_fused_row_ids(meta)
+    assert torch.equal(
+        layer.ple_embedding.row_ids(meta), layer.ple_embedding.row_ids_reference(meta)
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("decode", [False, True])
+def test_fused_hash_matches_the_torch_reference(decode):
+    """The fused kernel is byte-identical to the torch-op hash, prefill and decode."""
+    layer = _make_layer(_config(), device="cuda")
+    embedding = layer.ple_embedding
+    if decode:
+        meta = _meta(
+            [[s[0]] for s in _FUSED_HASH_SEQS], _FUSED_HASH_CTX, device="cuda", decode=True
+        )
+    else:
+        meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX, device="cuda")
+    assert embedding._use_fused_row_ids(meta)
+    assert torch.equal(embedding.row_ids(meta), embedding.row_ids_reference(meta))
+
+
+@requires_cuda
+def test_fused_hash_captures_and_replays_in_a_cuda_graph():
+    """Fixed shapes, no host reads: the hash is part of the captured decode step."""
+    layer = _make_layer(_config(), device="cuda")
+    embedding = layer.ple_embedding
+    ids = torch.randint(0, VOCAB, (4,), dtype=torch.int64, device="cuda")
+    context = torch.randint(0, VOCAB, (4, embedding.ngram_size - 1), dtype=torch.int64,
+                            device="cuda")
+    meta = PLEMetadata(
+        input_ids=ids,
+        cu_seqlens=torch.arange(5, dtype=torch.int32, device="cuda"),
+        seq_lens=(1,) * 4,
+        ngram_context=context,
+        state_slots=torch.arange(4, dtype=torch.int64, device="cuda"),
+        fresh_slots=None,
+        is_decode=True,
+    )
+    out = torch.zeros(4, embedding.num_heads, dtype=torch.int64, device="cuda")
+    embedding.row_ids(meta, out)  # prime the index cache and the JIT before capture
+
+    graph = torch.cuda.CUDAGraph()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        embedding.row_ids(meta, out)
+    torch.cuda.current_stream().wait_stream(side)
+    with torch.cuda.graph(graph):
+        embedding.row_ids(meta, out)
+
+    for seed in range(3):
+        torch.manual_seed(seed)
+        ids.copy_(torch.randint(0, VOCAB, (4,), dtype=torch.int64, device="cuda"))
+        context.copy_(
+            torch.randint(0, VOCAB, context.shape, dtype=torch.int64, device="cuda")
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, embedding.row_ids_reference(meta)), seed
+
+
+@requires_cuda
+def test_fused_hash_env_switch_restores_the_torch_path(monkeypatch):
+    """FREETOKEN_PLE_FUSED_HASH=0 takes the hash back to the reference ops."""
+    layer = _make_layer(_config(), device="cuda")
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX, device="cuda")
+    monkeypatch.setenv("FREETOKEN_PLE_FUSED_HASH", "0")
+    assert not layer.ple_embedding._use_fused_row_ids(meta)
+    assert torch.equal(
+        layer.ple_embedding.row_ids(meta), layer.ple_embedding.row_ids_reference(meta)
+    )
+
+
+@pytest.mark.parametrize(
+    "ctx_len, heads_per_ngram, message",
+    [(1, 8, "context"), (2, 5, "heads")],
+)
+def test_the_fused_hash_refuses_a_geometry_it_cannot_address(ctx_len, heads_per_ngram, message):
+    """The kernel's block layout (``heads_per_ngram`` heads per n-gram order, ``ngram_size-1``
+    context ids) is checked BEFORE anything is launched, as a sentence -- not as an ``assert``
+    that ``python -O`` strips, leaving the kernel to read past the context row."""
+    from freetoken.kernel.triton.ple_hash import ple_row_ids
+
+    tokens = 3
+    with pytest.raises(ValueError, match=message):
+        ple_row_ids(
+            torch.arange(tokens, dtype=torch.int64),
+            torch.zeros(1, ctx_len, dtype=torch.int64),
+            torch.zeros(tokens, dtype=torch.int32),
+            torch.arange(tokens, dtype=torch.int32),
+            torch.tensor([3, 5, 7], dtype=torch.int64),  # ngram_size 3
+            torch.full((16,), 11, dtype=torch.int64),  # 16 heads
+            torch.arange(16, dtype=torch.int64) * 11,
+            eos_token_id=EOS,
+            heads_per_ngram=heads_per_ngram,
+        )
 
 
 # --------------------------------------------------------------------------------------
