@@ -129,7 +129,7 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, mr.mamba_host
 
     def _add_one_req(
         self,
@@ -141,6 +141,9 @@ class PrefillAdder:
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
         restore_src: int | None = None,
+        restore_host: int | None = None,
+        last_track_seqlen: int | None = None,
+        host_tracks: list | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
@@ -224,6 +227,17 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
+        req.mamba_restore_host = restore_host
+        # A chunk too short to cross a x64 boundary writes no snapshot (the kernel skips the track),
+        # so the previous chunk's boundary and its `ping_pong` slot are still the deepest hit."
+
+        req.mamba_last_track_seqlen = last_track_seqlen
+        # Created AT ADMISSION and shared by identity: overlap scheduling builds the next chunk's Req
+        # before this drain archives, so a drain-created list would sit on an abandoned Req forever.
+        if host_tracks is not None:
+            req.mamba_host_tracks = host_tracks
+        elif self.cache_manager.mamba_host_enabled:
+            req.mamba_host_tracks = []
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -241,11 +255,13 @@ class PrefillAdder:
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
+                host_tracks=chunked_req.mamba_host_tracks,
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -255,6 +271,7 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                restore_host=restore_host,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its

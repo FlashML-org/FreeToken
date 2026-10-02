@@ -194,6 +194,9 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
+    # Same boundary in the host bank: costs no VRAM to keep, so it is what makes an
+    # intermediate-chunk boundary resumable at all. Restored only when there is no device slot.
+    mamba_host: int | None = None
     # TODO: support HiCache
 
 

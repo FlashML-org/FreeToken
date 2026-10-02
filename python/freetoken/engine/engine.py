@@ -428,6 +428,8 @@ class Engine:
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
+            # Naive caching has no tree to hang a checkpoint on, so the bank would be dead RAM.
+            host_slots = 0 if config.cache_type == "naive" else config.mamba_host_slots
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
                 num_slots=_linear_pool_num_slots(config),
@@ -435,7 +437,14 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                host_slots=host_slots,
             )
+            if host_slots > 1:
+                per_slot = self.linear_state_pool.host_bytes_per_slot()
+                logger.info_rank0(
+                    f"GDN host snapshot bank: {host_slots - 1} pinned host slots x "
+                    f"{mem_GB(per_slot)} = {mem_GB(host_slots * per_slot)} pinned in total (slot 0 "
+                    "is the padding sink; not charged against the GPU cache budget)")
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None

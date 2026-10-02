@@ -51,6 +51,12 @@ class Req:
     mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
+    # The same boundary one tier down: the checkpoint sits in the host bank and is copied up on
+    # the engine stream, before the first forward reads the live slot.
+    mamba_restore_host: int | None = None
+    # Intermediate chunks are never cache_req'd (their pages would double-free), but each freezes a
+    # x64 GDN checkpoint: the drain archives (boundary, bank slot) here, the final commit attaches.
+    mamba_host_tracks: list | None = None         # the last continuation owns it, else it is freed
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
