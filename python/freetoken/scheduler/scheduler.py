@@ -31,6 +31,7 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .interleave import DecodeInterleavePolicy
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -91,6 +92,14 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Bound how long a run of prefill steps may starve in-flight decodes. A long
+        # prompt chunked at the window budget is hundreds of consecutive prefill steps;
+        # measured on an 8xRTX4090 DSV4 deployment, that left an already-decoding
+        # request unscheduled for 267-317 s. Unset reproduces the historical
+        # prefill-first order exactly.
+        self._interleave = DecodeInterleavePolicy(
+            getattr(config, "decode_interleave_every", None)
+        )
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -868,11 +877,28 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Prefill keeps priority -- a request that never prefills never starts -- but a
+        # long run of prefill chunks must not starve in-flight decodes. When the policy
+        # says a decode is due, take one if a decode is actually runnable; otherwise stay
+        # with prefill (never spend a slot idle just to keep a promise).
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and interleaving must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it. A missing
+        # policy is the historical prefill-first order.
+        policy = getattr(self, "_interleave", None)
+        batch = None
+        if policy is not None and policy.wants_decode():
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                policy.note_decode()
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None and policy is not None:
+                policy.note_prefill()
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None and policy is not None:
+                policy.note_decode()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

@@ -419,6 +419,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--decode-interleave-every",
+        type=int,
+        default=ServerArgs.decode_interleave_every,
+        help=(
+            "Force one decode step after this many consecutive prefill steps. A long "
+            "prompt is prefilled in chunks, so it occupies that many consecutive "
+            "scheduler steps; measured on an 8xRTX4090 DSV4 deployment, a 300k-token "
+            "context left an already-decoding request unscheduled for 267-317 s. "
+            "Unset keeps the historical prefill-first order (the scheduler's own TODO "
+            "names this policy)."
+        ),
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,
