@@ -46,3 +46,22 @@ def test_combine_norm_matches_split_bitwise(seed: int, T: int) -> None:
     r2_fused, rn_fused = hc_combine_norm(R, y, s, w, EPS, HC)
     assert torch.equal(r2_fused, r2_split)
     assert torch.equal(rn_fused, rn_split)
+
+
+@pytest.mark.parametrize("T", [1, 8])
+@pytest.mark.parametrize("seed", range(6))
+def test_gated_combine_norm_matches_split_bitwise(seed: int, T: int) -> None:
+    # The MoE epilogue (routed + gate * shared, fp32 math, bf16 store) folded into
+    # the fused combine+norm: elementwise only, so it must agree with the split
+    # chain (shared_gate_mul_add -> hc_combine_norm) to the byte.
+    from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add
+
+    R, routed, s, w = _inputs(seed, T)
+    g = torch.Generator(device="cuda").manual_seed(seed + 1000)
+    shared = torch.randn((T, H), generator=g, device="cuda", dtype=torch.float32).to(torch.bfloat16)
+    gate = torch.rand(T, generator=g, device="cuda", dtype=torch.float32)
+    y_split = shared_gate_mul_add(routed, shared, gate)
+    r2_split, rn_split = hc_combine_norm(R, y_split, s, w, EPS, HC)
+    r2_fused, rn_fused = hc_combine_norm(R, routed, s, w, EPS, HC, shared=shared, gate=gate)
+    assert torch.equal(r2_fused, r2_split)
+    assert torch.equal(rn_fused, rn_split)
