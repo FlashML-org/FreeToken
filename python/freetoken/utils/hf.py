@@ -234,12 +234,12 @@ def _load_hf_config(model_path: str) -> Any:
     return config
 
 
-def _with_overrides(config: Any, data: dict, overrides: Mapping[str, Any]) -> dict:
+def _with_overrides(config: PretrainedConfig | RawConfigShim, data: dict, overrides: Mapping[str, Any]) -> dict:
     merged = dict(data)
     for key, value in overrides.items():
         section = getattr(config, key, None)
         if isinstance(value, Mapping) and isinstance(section, (PretrainedConfig, RawConfigShim)):
-            merged[key] = _with_overrides(section, merged.get(key) or {}, value)
+            merged[key] = _with_overrides(section, merged[key], value)
         else:
             merged[key] = copy.deepcopy(value)
     return merged
