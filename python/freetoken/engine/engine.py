@@ -723,6 +723,7 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            gguf_quant_types=banks.gguf_quant_types,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids

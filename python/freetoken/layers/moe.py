@@ -423,16 +423,33 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+        if fmt in ("q4_0", "gguf"):
+            # Native GGUF experts: dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.
+            from freetoken.models.gguf.dequant import GGML_Q4_0
             from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
 
             gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            gate_up_type, down_type = (
+                cache.gguf_quant_types[self.layer_id]
+                if cache.gguf_quant_types is not None
+                else (GGML_Q4_0, GGML_Q4_0)
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+            return fused_experts_gguf_q4_0(
+                hidden_states,
+                gate_up,
+                down,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                gate_up_quant_type=gate_up_type,
+                down_quant_type=down_type,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+        raise AssertionError(
+            f"offload experts without a quant method only serve native GGUF banks, got {fmt!r}"
+        )
 
 
 def make_moe_layer(
