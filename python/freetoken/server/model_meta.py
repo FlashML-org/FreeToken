@@ -91,7 +91,7 @@ _DISABLE_EFFORTS = ("none", "off")
 
 
 def effort_toggle_kwargs(
-    effort: str | int | None,
+    effort: str | None,
     chat_template_kwargs: dict | None,
     thinking_type: str | None = None,
 ) -> dict:
@@ -113,7 +113,7 @@ def effort_toggle_kwargs(
     elif thinking_type == "enabled":
         disabled = False
     mapped = thinking_toggle_kwargs(not disabled)
-    if effort is not None and effort != "" and not disabled and effort not in _DISABLE_EFFORTS:
+    if effort and not disabled and effort not in _DISABLE_EFFORTS:
         mapped.setdefault("reasoning_effort", effort)
     mapped.update(ctk)
     return mapped

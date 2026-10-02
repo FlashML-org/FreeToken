@@ -95,8 +95,8 @@ warning; pass `--moe-strategy offload` to use them.
   Image input uses the shared
   multimodal processor and encoder cache, including chunked prefill and prefix replay;
   `--text-model-only` skips the vision weights. DSpark speculative decoding is not served.
-  Reasoning effort accepts `low`, `high`,
-  `max`, or an integer from 1 to 100 through `reasoning_effort` or
-  `chat_template_kwargs.reasoning_effort`; integers are passed to the checkpoint's
-  encoder unchanged. Runtime window-cache controls use 128-token pages.
+  `reasoning_effort` takes `low`, `high` or `max`; the 1-100 integer budget goes through the
+  template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
+  "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
+  controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.

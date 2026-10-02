@@ -66,7 +66,7 @@ def chat_request_to_genspec(
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
-    if req.reasoning_effort or type(req.reasoning_effort) is int or thinking_type:
+    if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
