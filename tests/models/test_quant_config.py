@@ -55,43 +55,6 @@ HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
 BF16, FP8B, FP8T, MXFP8, NVFP4 = UnquantizedLinearMethod, Fp8BlockLinearMethod, Fp8TensorLinearMethod, Mxfp8LinearMethod, Nvfp4LinearMethod
 
 
-def test_linear_rejects_unsupported_batch_invariance(monkeypatch):
-    from freetoken.layers.quantization.linear.base import LinearConfig
-    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
-
-    monkeypatch.setattr(TorchLinearKernel, "supports_batch_invariant", False)
-    method = UnquantizedLinearMethod(LinearConfig(32, 32))
-    with pytest.raises(KernelSelectionError, match="batch-invariant"):
-        method.require_batch_invariant()
-
-
-def test_moe_rejects_unsupported_precision_contract(monkeypatch):
-    from freetoken.layers.quantization.moe.base import ExpertView, MoEConfig
-    from freetoken.layers.quantization.moe.unquantized import FusedMoEKernel
-
-    monkeypatch.setattr(FusedMoEKernel, "supports_fp32_routed_sum", False)
-    cfg = dict(num_experts=4, hidden=32, intermediate=32, top_k=2)
-    with pytest.raises(KernelSelectionError, match="FP32"):
-        UnquantizedMoEMethod(MoEConfig(**cfg, require_fp32_routed_sum=True))
-    method = UnquantizedMoEMethod(MoEConfig(**cfg))
-    with pytest.raises(NotImplementedError, match="unrounded"):
-        method.apply(torch.empty(1, 32, dtype=torch.bfloat16), None, None, ExpertView({}),
-                     layer=None, is_prefill=True, out_dtype=torch.float32)
-    monkeypatch.setattr(FusedMoEKernel, "supports_batch_invariant_prefill", False)
-    with pytest.raises(KernelSelectionError, match="batch-invariant"):
-        UnquantizedMoEMethod(MoEConfig(**cfg, batch_invariant_prefill=True))
-
-
-@pytest.mark.parametrize("requirement", ["batch_invariant_prefill", "require_fp32_routed_sum"])
-def test_legacy_offload_banks_reject_unsupported_contract(requirement):
-    from freetoken.layers.moe import OffloadMoELayer
-
-    if try_get_tp_info() is None:
-        set_tp_info(0, 1)
-    with pytest.raises(KernelSelectionError, match="q4_0"):
-        OffloadMoELayer(0, 4, 2, 32, 32, **{requirement: True})
-
-
 def model_dir(name: str) -> str | None:
     path = os.path.join(MODELS, name.split("/")[-1])
     if os.path.isfile(os.path.join(path, "config.json")):  # a download in progress has the dir but no config yet

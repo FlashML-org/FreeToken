@@ -27,19 +27,14 @@ class Dsv4Fp8BlockLinearKernel(LinearKernel):
     """DeepSeek-V4's reference path: activations quantized to fp8 with power-of-two block scales, e8m0 weight scales read as codes."""
 
     name = "dsv4"
-    supports_batch_invariant = True
-
-    def apply_batch_invariant(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        return self.apply(layer, x, gemv=False)
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
         return None if _e8m0(cfg) else "serves e8m0 block scales only"
 
-    def apply(self, layer: Any, x: torch.Tensor, *, gemv: bool | None = None) -> torch.Tensor:
-        """``gemv=None`` picks the kernel by shape; ``False`` forces the (M-independent) GEMM."""
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
 
-        return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias, block=layer_block_size(layer), gemv=gemv)
+        return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias, block=layer_block_size(layer))
 
 
 class TritonFp8BlockLinearKernel(LinearKernel):

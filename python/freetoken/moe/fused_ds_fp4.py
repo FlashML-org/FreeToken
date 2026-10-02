@@ -101,12 +101,8 @@ def routed_experts_fp4(
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
     act_block: int = 128,
-    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Full routed-expert output (summed over the top-k routes), excludes shared expert. Each route's
-    down output is rounded to the compute dtype (the reference's per-expert bf16 output) and the sum
-    over routes accumulates in fp32; ``out_dtype=torch.float32`` returns that sum unrounded -- the
-    reference keeps it in fp32 through the shared-expert merge -- else it is rounded once.
+    """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
     Precision matches the reference ``Expert.forward`` over ``fp4_gemm(act_quant(x, act_block),
     W_fp4)``: the gate_up and down activations are FP8-round-tripped (block ``act_block`` -- the
@@ -131,10 +127,15 @@ def routed_experts_fp4(
         act, down_packed, down_scale, slots, None,
         a_row_is_route=True, mul_routed_weight=False,
     )  # [T, top_k, H]
-    return down.sum(dim=1, dtype=out_dtype or x.dtype)  # [T, H]: fp32 accumulation over the bf16 route outputs
+    return down.sum(dim=1)  # [T, H]
 
 
-_GROUPED_MIN_ROUTES = 768  # existing short-prefill crossover; batch-invariant calls bypass it
+# Above this the grouped GEMM beats the per-route GEMV despite its padding;
+# below, the GEMV's exact routes*N work wins (short streaming chunks). The
+# grouped kernel sits on its dequant floor (~6.4-6.9ms/GEMM-pair at DSV4
+# geometry) for any chunk size, so the crossover is where the GEMV's
+# routes-proportional cost reaches that floor (H100 sweep).
+_GROUPED_MIN_ROUTES = 768
 
 
 def _grouped_prefill(
@@ -189,25 +190,22 @@ def routed_experts_fp4_prefill(
     swiglu_limit: float,
     num_rows: int,
     act_block: int = 128,
-    out_dtype: torch.dtype | None = None,
-    *,
-    batch_invariant: bool = False,
 ) -> torch.Tensor:
-    """Grouped prefill with optional batch-invariant dispatch for prefix recomputation.
-
-    Ordinary short prefills use GEMV below the established 768-route crossover.
-    Batch-invariant callers use one GEMM configuration for every prefill size.
-    """
+    """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
+    chunks: one moe_align sort shared by both GEMMs, each expert's weights
+    dequantized once per N-tile instead of once per route. Same FP8
+    round-tripped activations; differs from the GEMV only in fp32 accumulation
+    order (tl.dot tree vs sequential K-walk)."""
     T, top_k = slots.shape
+    if T * top_k < _GROUPED_MIN_ROUTES:
+        return routed_experts_fp4(
+            x, slots, topk_weights,
+            gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit, act_block=act_block,
+        )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
     routes = T * top_k
-    if not batch_invariant and routes < _GROUPED_MIN_ROUTES:
-        return routed_experts_fp4(
-            x, slots, topk_weights, gate_up_packed, gate_up_scale, down_packed, down_scale,
-            swiglu_limit, act_block=act_block, out_dtype=out_dtype,
-        )
     # One static config for every density (no autotune): the kernel is
     # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
     # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
@@ -231,7 +229,7 @@ def routed_experts_fp4_prefill(
         act, down_packed, down_scale, down, tw,
         sorted_ids, expert_ids, ntpp, routes, 1, False, cfg,
     )
-    return down.sum(dim=1, dtype=out_dtype or x.dtype)  # [T, H]
+    return down.sum(dim=1)  # [T, H]
 
 
 __all__ = ["routed_experts_fp4", "routed_experts_fp4_prefill", "_grouped_decode"]

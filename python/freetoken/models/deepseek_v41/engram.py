@@ -224,7 +224,7 @@ class EngramLayer(BaseOP):
         self.eps = args.norm_eps
         self.clamp_value = 1e-6
         self.width = args.engram_hash_cols * args.engram_head_dim
-        self.wkv = LinearReplicated(self.width, args.dim * (args.hc_mult + 1), has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wkv")
+        self.wkv = LinearReplicated(self.width, args.dim * (args.hc_mult + 1), has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.q_weight = torch.empty(args.hc_mult, args.dim, dtype=torch.float32)
         self.k_weight = torch.empty(args.hc_mult, args.dim, dtype=torch.float32)
         self._table: EngramTable | None = None
@@ -232,14 +232,13 @@ class EngramLayer(BaseOP):
     def attach_table(self, table: EngramTable) -> None:
         self._table = table
 
-    def forward(self, streams: torch.Tensor, rows: torch.Tensor | None = None, *, batch_invariant: bool = False, image_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """``streams [T, hc, dim]``; ``rows`` overrides the table lookup (tests / reference parity);
-        ``batch_invariant`` (prefill) takes the batch-independent projection."""
+    def forward(self, streams: torch.Tensor, rows: torch.Tensor | None = None, *, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """``streams [T, hc, dim]``; ``rows`` overrides the table lookup (tests / reference parity)."""
         T = streams.shape[0]
         if rows is None:
             assert self._table is not None, "Engram table was never attached"
             rows = self._table.lookup(T)
-        kv = self.wkv.forward(rows.to(streams.dtype), batch_invariant=batch_invariant)
+        kv = self.wkv.forward(rows.to(streams.dtype))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().view(T, self.hc_mult, self.dim)
         weight = self.q_weight * self.k_weight  # only ever used as a product

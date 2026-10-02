@@ -118,55 +118,13 @@ def test_full_chain_statistics(T):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("block", [32, 128])
-def test_prefill_rows_do_not_depend_on_the_chunk_size(block):
-    """Explicitly batch-invariant prefill takes the grouped GEMM, so a token's routed output is the same whether it
-    was prefilled alone, in a 43-token chunk (below the old 768-route GEMV crossover) or in a
-    129-token one; the GEMV (decode) reduces in another order and is not what prefill runs."""
+def test_sparse_chunk_falls_back_to_gemv():
     import freetoken.moe.fused_ds_fp4 as fmod
 
     device = "cuda"
-    banks = _banks(device)
-    x, slots, w = _routing(129, device)
-    full = fmod.routed_experts_fp4_prefill(x, slots.clone(), w, *banks, LIMIT, E, act_block=block, out_dtype=torch.float32, batch_invariant=True)
-    for t in (1, 43, 127, 128):
-        part = fmod.routed_experts_fp4_prefill(x[:t], slots[:t].clone(), w[:t], *banks, LIMIT, E, act_block=block, out_dtype=torch.float32, batch_invariant=True)
-        assert torch.equal(part, full[:t]), t
-    gemv = fmod.routed_experts_fp4(x[:1], slots[:1].clone(), w[:1], *banks, LIMIT, act_block=block, out_dtype=torch.float32)
-    torch.testing.assert_close(gemv, full[:1], atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_expert_kernel_honors_batch_invariant_prefill_policy():
-    """Through the quant method the model calls (``TritonMxfp4MoEKernel.apply`` with a materialized
-    layer view), a one-token prefill chunk and a 129-token one give the same row: the dispatch has no
-    size-dependent GEMV branch left in prefill. Decode (``is_prefill=False``) is the GEMV and may round
-    differently -- decode rows are not recomputed elsewhere."""
-    from types import SimpleNamespace
-
-    from freetoken.layers.quantization.moe.base import ExpertView
-    from freetoken.layers.quantization.moe.mxfp4 import TritonMxfp4MoEKernel
-
-    device = "cuda"
     gup, gus, dp, ds = _banks(device)
-    view = ExpertView(tensors={"gate_up": gup, "gate_up_scale": gus, "down": dp, "down_scale": ds}, n=E)
-    layer = SimpleNamespace(limit=LIMIT, quant_method=SimpleNamespace(scheme=SimpleNamespace(act_block=lambda default: 32), cfg=SimpleNamespace(batch_invariant_prefill=True)))
-    x, slots, w = _routing(129, device)
-    kernel = TritonMxfp4MoEKernel()
-    full = kernel.apply(layer, x, w, slots.clone(), view, is_prefill=True, out_dtype=torch.float32)
-    one = kernel.apply(layer, x[:1], w[:1], slots[:1].clone(), view, is_prefill=True, out_dtype=torch.float32)
-    forty = kernel.apply(layer, x[:43], w[:43], slots[:43].clone(), view, is_prefill=True, out_dtype=torch.float32)
-    assert torch.equal(one, full[:1]) and torch.equal(forty, full[:43])
-    decode = kernel.apply(layer, x[:1], w[:1], slots[:1].clone(), view, is_prefill=False, out_dtype=torch.float32)
-    torch.testing.assert_close(decode, full[:1], atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_default_short_prefill_keeps_gemv_dispatch():
-    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4, routed_experts_fp4_prefill
-
-    banks = _banks("cuda")
-    x, slots, w = _routing(43, "cuda")
-    want = routed_experts_fp4(x.clone(), slots, w, *banks, LIMIT)
-    got = routed_experts_fp4_prefill(x.clone(), slots, w, *banks, LIMIT, E)
-    assert torch.equal(got, want)
+    # 43 * 6 = 258 routes < _GROUPED_MIN_ROUTES: the wrapper IS the GEMV path
+    x, slots, w = _routing(43, device)
+    ref = fmod.routed_experts_fp4(x, slots.clone(), w, gup, gus, dp, ds, LIMIT)
+    out = fmod.routed_experts_fp4_prefill(x, slots.clone(), w, gup, gus, dp, ds, LIMIT, E)
+    assert torch.equal(ref, out)

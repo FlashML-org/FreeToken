@@ -39,43 +39,6 @@ def _make_layer_and_cache():
     return layer, cache
 
 
-@pytest.mark.parametrize("tokens, unpinned", [(1, False), (2, False), (1, True)])
-@pytest.mark.parametrize("out_dtype", [None, torch.float32])
-def test_dsv4_prefill_keeps_routed_output_contract(monkeypatch, tokens, unpinned, out_dtype):
-    from types import SimpleNamespace
-
-    from freetoken.layers.quantization import NoQuantConfig
-    from freetoken.models.deepseek_v4.moe import DSV4OffloadMoELayer
-
-    _init_tp()
-    args = SimpleNamespace(n_routed_experts=4, n_activated_experts=2, dim=8,
-                           moe_inter_dim=16, swiglu_limit=None)
-    layer = DSV4OffloadMoELayer(0, args, quant_config=NoQuantConfig())
-    calls = []
-    layer.offload_cache = SimpleNamespace(
-        prefill_overlap=False, collect_stats=False,
-        is_unpinned_layer=lambda _: unpinned,
-        materialize_layer=lambda _: calls.append("materialize"),
-        ensure_experts=lambda *_: calls.append("ensure"),
-        copy_missing=lambda: calls.append("copy"),
-        bank_views=lambda *a: (), alphas_for_slots=lambda _: None, alphas_for_layer=lambda _: None,
-    )
-    monkeypatch.setattr("freetoken.layers.moe.get_global_ctx",
-                        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True)))
-    def compute(cache, x, weights, ids, **kwargs):
-        assert kwargs["out_dtype"] == out_dtype
-        calls.append(kwargs["n"])
-        return x.to(out_dtype or x.dtype)
-    monkeypatch.setattr(layer, "_expert_gemm", compute)
-    x = torch.ones(tokens, 8, dtype=torch.bfloat16)
-    got = layer.routed_forward(x, torch.ones(tokens, 2), torch.zeros(tokens, 2, dtype=torch.int32),
-                               out_dtype=out_dtype)
-    assert got.dtype == (out_dtype or x.dtype)
-    assert torch.equal(got, x.to(got.dtype))
-    whole = tokens * 2 >= 4 or unpinned
-    assert calls == (["materialize", "copy", 4] if whole else ["ensure", "copy", None])
-
-
 def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
 
     from freetoken.kernel import backend

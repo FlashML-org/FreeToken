@@ -37,7 +37,6 @@ class LinearKernel(ABC):
     """One backend for one linear kind: says whether it can run a layer, then finalizes and applies it."""
 
     name: ClassVar[str]
-    supports_batch_invariant: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
         return None
@@ -51,10 +50,7 @@ class LinearKernel(ABC):
     @abstractmethod
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor: ...
 
-    def apply_batch_invariant(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(f"{self.name} does not support batch-invariant linear output")
-
-    def apply_out_dtype(self, layer: Any, x: torch.Tensor, out_dtype: torch.dtype, *, batch_invariant: bool) -> torch.Tensor:
+    def apply_out_dtype(self, layer: Any, x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         # Casting an already-rounded result does not satisfy an output-precision request.
         raise NotImplementedError(f"{self.name} does not support explicit linear output dtype {out_dtype}")
 
@@ -68,16 +64,7 @@ class LinearMethod(QuantMethod):
     def finalize(self, layer: Any) -> None:
         self.kernel.finalize(layer)
 
-    def require_batch_invariant(self) -> None:
-        """Check backend support at construction; each apply call still chooses its execution mode."""
-        if not self.kernel.supports_batch_invariant:
-            from ..method import KernelSelectionError
-
-            raise KernelSelectionError(f"{self.kernel.name} does not support batch-invariant linear output")
-
-    def apply(self, layer: Any, x: torch.Tensor, *, batch_invariant: bool = False, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def apply(self, layer: Any, x: torch.Tensor, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         if out_dtype is not None:
-            return self.kernel.apply_out_dtype(layer, x, out_dtype, batch_invariant=batch_invariant)
-        if batch_invariant:
-            return self.kernel.apply_batch_invariant(layer, x)
+            return self.kernel.apply_out_dtype(layer, x, out_dtype)
         return self.kernel.apply(layer, x)

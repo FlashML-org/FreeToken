@@ -183,7 +183,7 @@ def test_image_logits_and_decode_match_reference(tmp_path, quantized):
 @pytest.mark.parametrize('mode', ['exact', 'bounded'])
 def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):
     from .harness import TinyEngine
-    from .test_reference_parity import _engram_table_for
+    from .test_reference_parity import _compare, _engram_table_for
     tensors = _checkpoint(tmp_path)
     eng = TinyEngine(str(tmp_path), max_seq_len=1024, swa_decoder_replay=mode)
     _engram_table_for(eng, tensors, tiny_text_config())
@@ -202,9 +202,9 @@ def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):
     _prefill(eng, [b])
     b.cached_len, b.device_len = 128, len(chunk.input_ids)
     got = _prefill(eng, [b])
-    assert torch.equal(got, want)
+    _compare('chunked image prefill', got, want)
     prefix = inputs()
     # Replay [50,178) revisits a consumed image; the second image straddles the chunk/prefix boundary.
     hit = eng.new_request_on_prefix(1, a, prefix.input_ids.tolist())
     hit.mm_items = prefix.mm_items
-    assert torch.equal(_prefill(eng, [hit]), want)
+    _compare('image prefix hit', _prefill(eng, [hit]), want)

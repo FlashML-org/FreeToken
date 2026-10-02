@@ -467,17 +467,12 @@ def block_fp8_linear(
     bias: torch.Tensor | None = None,
     *,
     block: int = 128,
-    gemv: bool | None = None,
 ) -> torch.Tensor:
     """``y = act_quant(x) @ weight^T`` (reference FP8 path).
 
     ``x``: ``[..., K]`` bf16; ``weight``: ``[N, K]`` float8_e4m3fn; ``scale``:
     ``[N//block, K//block]`` float8_e8m0fnu (weight block scale). Activation is quantized
     to FP8 with a per-``block`` ue8m0 scale; the GEMM applies both scales per ``block``-K slab.
-
-    ``gemv`` picks the kernel: ``None`` uses GEMV for one row and GEMM otherwise, ``False`` always the GEMM (whose
-    result for a row does not depend on M -- prefill rows that become cached KV take it), ``True``
-    the GEMV (``M <= GEMV_MAX_M``).
     """
     assert weight.dtype == FP8
     *lead, K = x.shape
@@ -491,8 +486,7 @@ def block_fp8_linear(
     w = e4m3_kernel_view(weight)
 
     x2d = x.reshape(-1, K)
-    use_gemv = x2d.shape[0] == 1 if gemv is None else gemv
-    if use_gemv:
+    if x2d.shape[0] == 1:
         # decode: one kernel quantizes the activation rows and streams the weight once
         out = _fp8_gemv(x2d.contiguous(), w, sb, compute_dtype, block).reshape(*lead, N)
         if bias is not None:

@@ -70,24 +70,6 @@ def test_block_fp8_linear_matches_reference(block: int, m: int):
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2 * want.abs().max().item())
 
 
-@pytest.mark.parametrize("block", [32, 128])
-def test_forced_gemm_rows_do_not_depend_on_the_batch(block: int):
-    """``gemv=False`` (prefill) computes a row the same way at M = 1 and inside a batch, so a cached
-    row does not depend on how many tokens it was prefilled with; the shape-picked GEMV differs."""
-    from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
-
-    torch.manual_seed(1)
-    k, n = 40 * block, 512
-    x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16) * 3
-    w_fp8, w_scale = quantize_weight(torch.randn(n, k, device="cuda", dtype=torch.bfloat16), block)
-    full = block_fp8_linear(x, w_fp8, w_scale, block=block, gemv=False)
-    for m in (1, 2, 3):
-        part = block_fp8_linear(x[:m], w_fp8, w_scale, block=block, gemv=False)
-        assert torch.equal(part, full[:m]), m
-    torch.testing.assert_close(block_fp8_linear(x[:1], w_fp8, w_scale, block=block).float(), full[:1].float(), rtol=2e-2, atol=2e-2 * full.abs().max().item())
-
-
-
 def test_block_argument_must_match_the_scale_shape():
     from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
 

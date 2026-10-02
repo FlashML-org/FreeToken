@@ -255,13 +255,8 @@ def sparse_attn_packed(
     n_window: int,               # window columns (a multiple of BLOCK_T; pad with -1)
     softmax_scale: float,
     cmp_counts: torch.Tensor | None = None,  # [b, m] int32 live compressed columns per query
-    split: bool = True,
 ) -> torch.Tensor:
-    """Paged sparse MLA attention over packed KV pools; see the module docstring for the contract.
-
-    ``split`` allows the split-K decode kernel when ``m == 1`` (``split_count``); its merge sums the
-    candidate axis in another order than the single-program kernel, so a caller whose result must
-    not depend on the query count (a one-token prefill next to a long one) passes ``False``."""
+    """Paged sparse MLA attention over packed KV pools; see the module docstring for the contract."""
     b, m, h, d = q.shape
     topk = topk_idxs.shape[-1]
     assert n_window % BLOCK_T == 0 and 0 <= n_window <= topk, (n_window, topk)
@@ -284,7 +279,7 @@ def sparse_attn_packed(
         WIN_FMT=win_fmt.code, WIN_ROW_BYTES=win_fmt.row_bytes(d),
         CMP_FMT=cmp_fmt.code, CMP_ROW_BYTES=cmp_fmt.row_bytes(d),
     )
-    n_splits = split_count(b, m, h, topk, q.device) if split else 0
+    n_splits = split_count(b, m, h, topk, q.device)
     if n_splits:
         head_blocks = triton.cdiv(h, BLOCK_H)
         mid_o = torch.empty((b, m, h, n_splits, d), dtype=torch.float32, device=q.device)

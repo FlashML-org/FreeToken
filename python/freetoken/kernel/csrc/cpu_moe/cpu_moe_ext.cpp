@@ -1084,10 +1084,8 @@ struct MoeTask {
   const bf16_t* x;     // [num_tokens, H]
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
-  float* y;            // [num_tokens, H] the fp32 sum over routes; the caller rounds it
+  bf16_t* y;           // [num_tokens, H]
 };
-
-static inline void store_out(const MoeTask* t, size_t idx, float acc) { t->y[idx] = acc; }
 
 // Output-row tiling. Small enough to give every worker independent work even at
 // batch size 1; large enough to amortize the atomic work-grab.
@@ -1563,7 +1561,7 @@ struct CpuMoeExecutor {
                              reinterpret_cast<const bf16_t*>(x_ptr),
                              reinterpret_cast<const int32_t*>(ids_ptr),
                              reinterpret_cast<const float*>(w_ptr),
-                             reinterpret_cast<float*>(y_ptr)};
+                             reinterpret_cast<bf16_t*>(y_ptr)};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
   }
@@ -1660,7 +1658,7 @@ struct CpuMoeExecutor {
     const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
     const uint16_t* dn_global_l =
         reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
-    const size_t y_base = (size_t)tok * H;
+    bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
@@ -1678,7 +1676,7 @@ struct CpuMoeExecutor {
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
                          gas) * w_out;
       }
-      store_out(t, y_base + h, acc);
+      y_row[h] = f32_to_bf16(acc);
     }
   }
 
@@ -1754,8 +1752,8 @@ struct CpuMoeExecutor {
       const bf16_t* bias_e = dn_bias_l + (size_t)e * H + h0;
       for (int c = 0; c < nh; ++c) acc[c] += (part[c] + bf16_to_f32(bias_e[c])) * wt;
     }
-    const size_t y_base = (size_t)tok * H;
-    for (int c = 0; c < nh; ++c) store_out(t, y_base + h0 + c, acc[c]);
+    bf16_t* y_row = t->y + (size_t)tok * H;
+    for (int c = 0; c < nh; ++c) y_row[h0 + c] = f32_to_bf16(acc[c]);
   }
 
   // ----------------------------- ds_fp4 (DSV4) -------------------------------
@@ -1830,7 +1828,7 @@ struct CpuMoeExecutor {
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
     const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
-    const size_t y_base = (size_t)tok * H;
+    bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
@@ -1844,7 +1842,7 @@ struct CpuMoeExecutor {
         // rounded to bf16 before the fp32 sum over routes (down [T, top_k, H] bf16 -> .sum(dim=1)).
         acc += bf16_to_f32(f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut)));
       }
-      store_out(t, y_base + h, acc);
+      y_row[h] = f32_to_bf16(acc);
     }
   }
 

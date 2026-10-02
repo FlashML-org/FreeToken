@@ -55,8 +55,6 @@ class MoELayer(BaseOP):
         layer_id: int | None = None,
         strategy: str = "resident",
         decode_target: str = "gpu",
-        batch_invariant_prefill: bool = False,
-        require_fp32_routed_sum: bool = False,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -82,8 +80,6 @@ class MoELayer(BaseOP):
         self.layer_id = layer_id
         self.strategy = strategy
         self.decode_target = decode_target
-        self.batch_invariant_prefill = batch_invariant_prefill
-        self.require_fp32_routed_sum = require_fp32_routed_sum
         self.prefix = prefix
         # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
         self.quant_method = None
@@ -91,10 +87,6 @@ class MoELayer(BaseOP):
             self.quant_method = quant_method_for(quant_config, self, prefix)
             if allocate_experts:
                 self.quant_method.create_weights(self)
-        elif batch_invariant_prefill or require_fp32_routed_sum:
-            from .quantization import KernelSelectionError
-
-            raise KernelSelectionError("q4_0 banks do not support the requested MoE numerical contract")
 
     def finalize(self) -> None:
         if self.quant_method is not None:
@@ -110,12 +102,11 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         assert self.quant_method is not None
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
-            layer=self, is_prefill=get_global_ctx().batch.is_prefill, out_dtype=out_dtype,
+            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
         )
 
     def routed_forward(
@@ -123,8 +114,6 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        *,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -134,13 +123,12 @@ class MoELayer(BaseOP):
         one: ``topk_ids`` must be safe to mutate in place (the offload decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         The resident path does not mutate it today, but callers must not rely on
-        that. ``out_dtype=torch.float32`` asks for the sum over routes in fp32
-        (requires a kernel with ``fp32_routed_sum``; unsupported kernels raise).
+        that.
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
-        out = self._resident_gemm(hidden_states, topk_weights, topk_ids, out_dtype)
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def forward(
@@ -176,8 +164,6 @@ class OffloadMoELayer(MoELayer):
         has_bias: bool = False,
         strategy: str = "offload",
         decode_target: str = "gpu",
-        batch_invariant_prefill: bool = False,
-        require_fp32_routed_sum: bool = False,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -198,8 +184,6 @@ class OffloadMoELayer(MoELayer):
             layer_id=layer_id,
             strategy=strategy,
             decode_target=decode_target,
-            batch_invariant_prefill=batch_invariant_prefill,
-            require_fp32_routed_sum=require_fp32_routed_sum,
             quant_config=quant_config,
             prefix=prefix,
         )
@@ -222,8 +206,6 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        *,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -231,18 +213,15 @@ class OffloadMoELayer(MoELayer):
         scores, selection bias, group-limited top-k, ...); identical to ``forward``
         past the router. ``topk_ids`` must be safe to mutate in place (decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
-        ``out_dtype=torch.float32`` keeps the sum over routes in fp32 on every path
-        (GPU kernels, CPU executor, the hybrid partials and their merge); unsupported
-        kernels raise instead of casting an already rounded sum.
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids, out_dtype)
+            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
-            out = self._decode_routed(hidden_states, topk_weights, topk_ids, out_dtype)
+            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def decode_forward(
@@ -284,7 +263,6 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -301,9 +279,9 @@ class OffloadMoELayer(MoELayer):
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
-            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids, out_dtype)
+            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, out_dtype)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -315,7 +293,6 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
-            out_dtype=out_dtype,
         )
 
     def _decode_hybrid(
@@ -324,7 +301,6 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -347,7 +323,7 @@ class OffloadMoELayer(MoELayer):
         gpu_slots = topk_ids
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids, out_dtype)
+        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
@@ -369,17 +345,15 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
-            out_dtype=out_dtype,
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed  # both partials already in out_dtype: an fp32 merge stays fp32
+        return gpu_routed + cpu_routed
 
     def _prefill_routed(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Prefill movement: stream whole layers -- double-buffered behind the
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
@@ -398,7 +372,6 @@ class OffloadMoELayer(MoELayer):
                 n=self.num_experts,
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
-                out_dtype=out_dtype,
             )
             cache.release_prefill_layer(self.layer_id)
             return out
@@ -413,7 +386,6 @@ class OffloadMoELayer(MoELayer):
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
-            out_dtype=out_dtype,
         )
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
@@ -444,7 +416,6 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         if self.quant_method is not None:
             from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
@@ -454,12 +425,10 @@ class OffloadMoELayer(MoELayer):
                 slots=None if n is not None else topk_ids, n=n, alphas=alphas,
             )
             return self.quant_method.apply(
-                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill, out_dtype=out_dtype
+                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
         if fmt == "q4_0":
-            if out_dtype is not None and out_dtype != hidden_states.dtype:
-                raise NotImplementedError("q4_0 does not support an unrounded FP32 routed sum")
             # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.
             from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
@@ -502,8 +471,6 @@ def make_moe_layer(
     limit: float | None = None,
     interleaved: bool = False,
     has_bias: bool = False,
-    batch_invariant_prefill: bool = False,
-    require_fp32_routed_sum: bool = False,
     quant_config: QuantConfig | None = None,
     prefix: str = "",
 ) -> MoELayer:
@@ -536,10 +503,6 @@ def make_moe_layer(
         prefix=prefix,
         layer_id=layer_id,
     )
-    if batch_invariant_prefill:
-        kwargs["batch_invariant_prefill"] = True
-    if require_fp32_routed_sum:
-        kwargs["require_fp32_routed_sum"] = True
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
         kwargs["strategy"] = config.moe_strategy

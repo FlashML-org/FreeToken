@@ -29,7 +29,6 @@ class _LinearTPImpl(BaseOP):
         output_sizes: List[int] | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
-        require_batch_invariant: bool = False,
     ):
         self.full_input_size = full_isize
         self.full_output_size = full_osize
@@ -42,16 +41,14 @@ class _LinearTPImpl(BaseOP):
         self.out_features = local_osize
         self.output_sizes = tuple(output_sizes or (local_osize,))
         self.quant_method = quant_method_for(quant_config, self, prefix)
-        if require_batch_invariant:
-            self.quant_method.require_batch_invariant()
         self.quant_method.create_weights(self)
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def finalize(self) -> None:
         self.quant_method.finalize(self)
 
-    def forward(self, x: torch.Tensor, *, batch_invariant: bool = False) -> torch.Tensor:
-        return self.quant_method.apply(self, x, batch_invariant=batch_invariant)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply(self, x)
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -68,7 +65,6 @@ class LinearReplicated(_LinearTPImpl):
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
-        require_batch_invariant: bool = False,
     ):
         super().__init__(
             full_isize=input_size,
@@ -78,7 +74,6 @@ class LinearReplicated(_LinearTPImpl):
             has_bias=has_bias,
             quant_config=quant_config,
             prefix=prefix,
-            require_batch_invariant=require_batch_invariant,
         )
 
 

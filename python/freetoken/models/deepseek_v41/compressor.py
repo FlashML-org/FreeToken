@@ -15,7 +15,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.kernel.triton.batch_invariant_linear import batch_invariant_linear
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 
 from .args import DeepseekV41Args
@@ -34,19 +33,16 @@ class Compressor(BaseOP):
             self.wkv = torch.empty(args.head_dim, args.dim, dtype=torch.float32)
             self.wgate = torch.empty(args.head_dim, args.dim, dtype=torch.float32)
         else:
-            self.wkv = LinearReplicated(args.dim, args.head_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wkv")
+            self.wkv = LinearReplicated(args.dim, args.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.norm = RMSNorm(args.head_dim, args.norm_eps)
 
     @property
     def attn(self):
         return get_global_ctx().attn_backend
 
-    def _project(self, x: torch.Tensor, *, batch_invariant: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        """fp32 ``wkv`` / ``wgate`` projections. Prefill takes the fixed-walk GEMM so the cached rows
-        never depend on the batch that produced them; decode keeps the library GEMV."""
+    def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """fp32 ``wkv`` / ``wgate`` projections."""
         xf = x.float()
-        if batch_invariant:
-            return batch_invariant_linear(xf, self.wkv), batch_invariant_linear(xf, self.wgate)
         return F.linear(xf, self.wkv), F.linear(xf, self.wgate)
 
     # ----- prefill -----------------------------------------------------------------------
@@ -71,11 +67,11 @@ class Compressor(BaseOP):
         device = x.device
         write_from = start_pos if write_from is None else write_from
         if self.ratio == 1:
-            latent = self.norm.forward(self.wkv.forward(x, batch_invariant=True))
+            latent = self.norm.forward(self.wkv.forward(x))
             return latent, torch.arange(start_pos, start_pos + n, device=device)
 
         ratio, d = self.ratio, self.head_dim
-        kv, score = self._project(x, batch_invariant=True)
+        kv, score = self._project(x)
         # the partial group in progress at start_pos: its rows live in the previous token's ring block
         offset = start_pos % ratio
         if offset:
@@ -125,7 +121,7 @@ class Compressor(BaseOP):
         from freetoken.kernel.triton.dsv4.compress import gated_pool
 
         ratio, d = self.ratio, self.head_dim
-        kv, score = self._project(x, batch_invariant=False)
+        kv, score = self._project(x)
         idx = (pos % ratio).view(B, 1, 1).expand(B, 1, d)
         block = self.attn.read_carry_blocks(self.layer_id, prev_window_slots)  # [B, ratio, 2d]
         ks = block[..., :d].clone().scatter_(1, idx, kv.unsqueeze(1))

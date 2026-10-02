@@ -19,8 +19,6 @@ class TritonMxfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "ds_fp4"
-    supports_fp32_routed_sum = True
-    supports_batch_invariant_prefill = True
     supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
@@ -46,7 +44,7 @@ class TritonMxfp4MoEKernel(MoEKernel):
         out["down_scale"].copy_(pieces["down_scale"].view(E8M0))
         return {}
 
-    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool, out_dtype: torch.dtype | None = None):
+    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
@@ -55,14 +53,10 @@ class TritonMxfp4MoEKernel(MoEKernel):
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 
-            return routed_experts_fp4_prefill(
-                x, topk_ids, topk_weights, *banks, limit, view.n,
-                act_block=act_block, out_dtype=out_dtype,
-                batch_invariant=layer.quant_method.cfg.batch_invariant_prefill,
-            )
+            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n, act_block=act_block)
         from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
-        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block, out_dtype=out_dtype)
+        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block)
 
 
 class TritonGptossMxfp4MoEKernel(MoEKernel):

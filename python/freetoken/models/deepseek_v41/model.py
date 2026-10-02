@@ -95,31 +95,30 @@ class Block(BaseOP):
         )
         return residual, post, comb, pre_next, x
 
-    def attn_input(self, s: Streams, *, prefill: bool, image_mask: torch.Tensor | None = None):
+    def attn_input(self, s: Streams, *, image_mask: torch.Tensor | None = None):
         """Apply the pending post, predict the attention gates, mix and norm the attention input.
-        Returns ``(residual, post, comb, pre_next, x)``. ``prefill`` picks the batch-independent
-        projections: prefill rows become cached KV."""
+        Returns ``(residual, post, comb, pre_next, x)``."""
         if self.engram is not None:
-            s = Streams(None, self.engram.forward(s.materialize(), batch_invariant=prefill, image_mask=image_mask), None, None, s.pre)
+            s = Streams(None, self.engram.forward(s.materialize(), image_mask=image_mask), None, None, s.pre)
         residual, post, comb, pre_next, x = self._boundary(s, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         return residual, post, comb, pre_next, self.attn_norm.forward(x)
 
-    def ffn_step(self, y: torch.Tensor, residual, post, comb, pre, *, prefill: bool, image_mask: torch.Tensor | None = None) -> Streams:
+    def ffn_step(self, y: torch.Tensor, residual, post, comb, pre, *, image_mask: torch.Tensor | None = None) -> Streams:
         """The FFN sublayer after the attention output ``y``: boundary, norm, MoE; returns the chain state."""
         residual, post, comb, pre_next, x = self._boundary(Streams(y, residual, post, comb, pre), self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        return Streams(self.ffn.forward(self.ffn_norm.forward(x), batch_invariant=prefill, image_mask=image_mask), residual, post, comb, pre_next)
+        return Streams(self.ffn.forward(self.ffn_norm.forward(x), image_mask=image_mask), residual, post, comb, pre_next)
 
     def forward_prefill(self, s: Streams, segments: List[PrefillSegment], positions: torch.Tensor, image_mask: torch.Tensor | None = None) -> Streams:
-        residual, post, comb, pre_next, x = self.attn_input(s, prefill=True, image_mask=image_mask)
+        residual, post, comb, pre_next, x = self.attn_input(s, image_mask=image_mask)
         if self.attn.compressor is not None:
             self.attn.publish_prefill(x, segments)
         y = self.attn.forward_prefill(x, segments, positions)
-        return self.ffn_step(y, residual, post, comb, pre_next, prefill=True, image_mask=image_mask)
+        return self.ffn_step(y, residual, post, comb, pre_next, image_mask=image_mask)
 
     def forward_decode(self, s: Streams, pos: torch.Tensor, rows: torch.Tensor, dctx, cmp_stage_cap: int) -> Streams:
-        residual, post, comb, pre_next, x = self.attn_input(s, prefill=False)
+        residual, post, comb, pre_next, x = self.attn_input(s)
         y = self.attn.forward_decode(x, pos, rows, dctx, cmp_stage_cap)
-        return self.ffn_step(y, residual, post, comb, pre_next, prefill=False)
+        return self.ffn_step(y, residual, post, comb, pre_next)
 
 
 class Transformer(BaseOP):
@@ -156,14 +155,14 @@ class Transformer(BaseOP):
             if rows is not None and block.layer_id == decoder_start:
                 # CED source under bounded replay: publish global KV for EVERY prompt token, then
                 # continue on the replay tokens only
-                residual, post, comb, pre_next, x = block.attn_input(s, prefill=True, image_mask=image_mask)
+                residual, post, comb, pre_next, x = block.attn_input(s, image_mask=image_mask)
                 block.attn.publish_prefill(x, segments)
                 residual, post, comb, pre_next, x = residual[rows], post[rows], comb[rows], pre_next[rows], x[rows]
                 positions = positions[rows]
                 if image_mask is not None:
                     image_mask = image_mask[rows]
                 y = block.attn.forward_prefill(x, dec_segments, positions)
-                s = block.ffn_step(y, residual, post, comb, pre_next, prefill=True, image_mask=image_mask)
+                s = block.ffn_step(y, residual, post, comb, pre_next, image_mask=image_mask)
                 continue
             segs = segments if (rows is None or block.layer_id < decoder_start) else dec_segments
             s = block.forward_prefill(s, segs, positions, image_mask)

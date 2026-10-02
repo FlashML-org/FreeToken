@@ -35,10 +35,10 @@ class Indexer(BaseOP):
         self.weights_scale = args.index_softmax_scale * args.index_n_heads**-0.5
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
-        self.wq_b = LinearReplicated(args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wq_b")
-        self.weights_proj = LinearReplicated(args.dim, self.n_heads, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.weights_proj")
+        self.wq_b = LinearReplicated(args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.weights_proj = LinearReplicated(args.dim, self.n_heads, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.weights_proj")
         if role.mode is Mode.FULL:
-            self.wk = LinearReplicated(args.head_dim, self.head_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wk")
+            self.wk = LinearReplicated(args.head_dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wk")
             self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
 
     @property
@@ -47,19 +47,18 @@ class Indexer(BaseOP):
 
     # ----- keys (Full mode) ----------------------------------------------------------------
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """``[G, index_head_dim]`` keys from the unrotated latents, rotated at their group positions
-        (prefill: the fixed-walk projection, so the cached keys do not depend on the batch). The fp4
-        quantization is the pool's packing."""
-        k = self.k_norm.forward(self.wk.forward(latent, batch_invariant=True))
+        """``[G, index_head_dim]`` keys from the unrotated latents, rotated at their group positions. The
+        fp4 quantization is the pool's packing."""
+        k = self.k_norm.forward(self.wk.forward(latent))
         apply_rotary_emb(k[..., -self.rope_dim :], freqs)
         return k
 
     # ----- queries ---------------------------------------------------------------------------
-    def _queries(self, x: torch.Tensor, qr: torch.Tensor, rotate, *, batch_invariant: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.wq_b.forward(qr, batch_invariant=batch_invariant).unflatten(-1, (self.n_heads, self.head_dim))
+    def _queries(self, x: torch.Tensor, qr: torch.Tensor, rotate) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
         rotate(q[..., -self.rope_dim :])
         fp4_act_quant_inplace(q, 32)
-        weights = self.weights_proj.forward(x, batch_invariant=batch_invariant) * self.weights_scale
+        weights = self.weights_proj.forward(x) * self.weights_scale
         return q, weights
 
     # ----- selection -------------------------------------------------------------------------
@@ -82,7 +81,7 @@ class Indexer(BaseOP):
             if self.role.is_candidate_source:
                 pool = torch.full((1, n, self.candidate_topk_blocks * self.candidate_block_size), -1, dtype=torch.int32, device=x.device)
             return rows, pool
-        q, w = self._queries(x, qr, lambda t: apply_rotary_emb(t, freqs), batch_invariant=True)
+        q, w = self._queries(x, qr, lambda t: apply_rotary_emb(t, freqs))
         live = ((start_pos + torch.arange(1, n + 1, device=x.device)) // ratio).to(torch.int32).view(1, n)
         width = candidates.shape[-1] if candidates is not None else T
         qb = max(1, LOGITS_BUDGET_BYTES // max(1, width * 4))
@@ -110,7 +109,7 @@ class Indexer(BaseOP):
         ``T`` the staged compressed width, ``pos [B]``. Returns ``(rows [B, 1, topk] int32, counts [B, 1]
         int32 valid picks, candidates [B, 1, NC] | None)``."""
         B = x.shape[0]
-        q, w = self._queries(x, qr, lambda t: apply_rotary_emb_decode(t.unsqueeze(1), freqs), batch_invariant=False)
+        q, w = self._queries(x, qr, lambda t: apply_rotary_emb_decode(t.unsqueeze(1), freqs))
         live = ((pos + 1) // ratio).to(torch.int32).view(B, 1)
         logits = self.attn.indexer_logits(q.view(B, 1, self.n_heads, self.head_dim), w.view(B, 1, -1), self.role.kv_source, locs, ratio, live, T=T, candidates=candidates)
         pool = None

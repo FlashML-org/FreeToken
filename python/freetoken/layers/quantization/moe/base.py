@@ -33,8 +33,6 @@ class MoEConfig:
     strategy: str = "resident"
     decode_target: str = "gpu"
     dtype: torch.dtype = torch.bfloat16
-    batch_invariant_prefill: bool = False
-    require_fp32_routed_sum: bool = False
 
     @classmethod
     def from_layer(cls, layer: Any, scheme: QuantScheme | None) -> "MoEConfig":
@@ -56,8 +54,6 @@ class MoEConfig:
             strategy=layer.strategy,
             decode_target=layer.decode_target,
             dtype=torch.get_default_dtype(),
-            batch_invariant_prefill=getattr(layer, "batch_invariant_prefill", False),
-            require_fp32_routed_sum=getattr(layer, "require_fp32_routed_sum", False),
         )
 
     @property
@@ -142,11 +138,6 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
-    # Whether ``apply`` can hand back the sum over routes in fp32 (``out_dtype=torch.float32``) rather
-    # than rounded to the compute dtype -- the contract a model needs when its reference keeps that
-    # sum in fp32 through a later merge (DeepSeek: ``y (fp32) += expert; y += shared; y.type_as(x)``).
-    supports_fp32_routed_sum: ClassVar[bool] = False
-    supports_batch_invariant_prefill: ClassVar[bool] = False
     # Whether ``apply`` treats a slot of -1 as an inactive route (zero output, no read of any slot).
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
@@ -181,23 +172,11 @@ class MoEKernel(ABC):
         """Write one batch of expert pieces into ``out`` rows; returns the GPU-resident per-expert values, if any."""
 
     @abstractmethod
-    def apply(self, layer: Any, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, is_prefill: bool, out_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Routed expert output ``[T, H]``. ``out_dtype`` (only ``None`` / the compute dtype / fp32; fp32
-        requires ``supports_fp32_routed_sum``) selects the dtype of the returned sum over routes."""
-        ...
+    def apply(self, layer: Any, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, is_prefill: bool) -> torch.Tensor: ...
 
 
 class MoEMethod(QuantMethod):
     """Declares resident experts for its kind; layout, pack and apply go to the kernel."""
-
-    def __init__(self, cfg: MoEConfig, requested: str = "auto"):
-        super().__init__(cfg, requested)
-        from ..method import KernelSelectionError
-
-        if cfg.require_fp32_routed_sum and not self.kernel.supports_fp32_routed_sum:
-            raise KernelSelectionError(f"{self.kernel.name} does not support an unrounded FP32 routed sum")
-        if cfg.batch_invariant_prefill and not self.kernel.supports_batch_invariant_prefill:
-            raise KernelSelectionError(f"{self.kernel.name} does not support batch-invariant MoE prefill")
 
     def layout(self) -> dict[str, BankSpec]:
         return self.kernel.layout(self.cfg)
@@ -208,12 +187,8 @@ class MoEMethod(QuantMethod):
     def slot_limit(self) -> int | None:
         return self.kernel.slot_limit(self.cfg)
 
-    def apply(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, layer: Any, is_prefill: bool, out_dtype: torch.dtype | None = None) -> torch.Tensor:
-        if out_dtype is None or out_dtype == x.dtype:
-            return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)
-        if out_dtype == torch.float32 and self.kernel.supports_fp32_routed_sum:
-            return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill, out_dtype=out_dtype)
-        raise NotImplementedError(f"{self.kernel.name} cannot return an unrounded routed sum in {out_dtype}")
+    def apply(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, layer: Any, is_prefill: bool) -> torch.Tensor:
+        return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)
 
     @property
     def cpu_format(self) -> str | None:

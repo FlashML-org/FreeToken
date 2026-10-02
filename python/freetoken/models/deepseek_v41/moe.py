@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
-from freetoken.kernel.triton.batch_invariant_linear import batch_invariant_linear
 from freetoken.kernel.triton.dsv4.router import router_select
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
@@ -35,15 +34,10 @@ class Router(BaseOP):
         self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32)
         self._bias_vl = None  # bound to the visual stack's per-layer routing bias after loading
 
-    def forward(self, x: torch.Tensor, *, batch_invariant: bool = False, image_mask: torch.Tensor | None = None) -> TopK:
+    def forward(self, x: torch.Tensor, *, image_mask: torch.Tensor | None = None) -> TopK:
         if image_mask is not None:
             assert self._bias_vl is not None, "image routing bias was not loaded"
-        # Prefill routing must survive batch/chunk changes; one-row decode can use GEMV.
-        # Both paths produce FP32 scores directly from the BF16 weight.
-        if batch_invariant or x.shape[0] > 1:
-            scores = batch_invariant_linear(x, self.weight, out_dtype=torch.float32)
-        else:
-            scores = bf16_linear_fp32(x, self.weight)
+        scores = bf16_linear_fp32(x, self.weight)
         return router_select(
             scores.view(-1, scores.shape[-1]), self.bias, self.topk,
             score_func=self.score_func, normalize=self.norm_topk_prob, route_scale=self.route_scale,
@@ -55,14 +49,14 @@ class SharedExpert(BaseOP):
     """The dense clamped-SwiGLU expert every token passes through (fp8 block-32 linears)."""
 
     def __init__(self, args: DeepseekV41Args, *, quant_config=None, prefix: str = ""):
-        self.w1 = LinearReplicated(args.dim, args.moe_inter_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.w1")
-        self.w2 = LinearReplicated(args.moe_inter_dim, args.dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.w2")
-        self.w3 = LinearReplicated(args.dim, args.moe_inter_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.w3")
+        self.w1 = LinearReplicated(args.dim, args.moe_inter_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
+        self.w2 = LinearReplicated(args.moe_inter_dim, args.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
+        self.w3 = LinearReplicated(args.dim, args.moe_inter_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
         self.limit = args.swiglu_limit
 
-    def forward(self, x: torch.Tensor, *, batch_invariant: bool = False) -> torch.Tensor:
-        h = fused_swiglu(self.w1.forward(x, batch_invariant=batch_invariant), self.w3.forward(x, batch_invariant=batch_invariant), self.limit, x.dtype)
-        return self.w2.forward(h, batch_invariant=batch_invariant)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.limit, x.dtype)
+        return self.w2.forward(h)
 
 
 class MoE(BaseOP):
@@ -80,24 +74,17 @@ class MoE(BaseOP):
             limit=args.swiglu_limit,
             quant_config=config.quant,
             prefix=f"{prefix}.experts",
-            batch_invariant_prefill=True,
-            require_fp32_routed_sum=True,
         )
 
-    def forward(self, x: torch.Tensor, *, batch_invariant: bool = False, image_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """``batch_invariant`` (prefill): the router, shared expert and any unquantized projection take the
-        batch-independent GEMM so the prompt's cached rows do not depend on the prefill batch."""
+    def forward(self, x: torch.Tensor, *, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x = x.view(-1, self.dim)
-        weights, indices = self.gate.forward(x, batch_invariant=batch_invariant, image_mask=image_mask)
+        weights, indices = self.gate.forward(x, image_mask=image_mask)
         # the shared expert runs before the routed experts (same stream, so it does not overlap the
         # hybrid decode's CPU work, whose submit follows it -- reordering that is follow-up work)
-        shared = self.shared_experts.forward(x, batch_invariant=batch_invariant)
-        # The reference merge: ``y (fp32) += expert_r(x)`` (bf16 per route), ``y += shared`` (bf16),
-        # ``y.type_as(x)`` -- the sum over routes stays fp32 until the single rounding here. The MoE
-        # layer returns it in fp32 on every executor (GPU kernels, CPU executor, hybrid partials).
-        routed = self.experts.routed_forward(x, weights, indices, out_dtype=torch.float32)
-        return (routed + shared.float()).to(x.dtype).view(shape)
+        shared = self.shared_experts.forward(x)
+        routed = self.experts.routed_forward(x, weights, indices)
+        return (routed + shared).view(shape)
 
 
 __all__ = ["MoE", "Router", "SharedExpert"]

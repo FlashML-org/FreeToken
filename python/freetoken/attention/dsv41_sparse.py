@@ -481,11 +481,10 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
     # ----- attention -----------------------------------------------------------------------
     def attend(
         self, q: torch.Tensor, layer_id: int, topk_idxs: torch.Tensor, n_window: int, attn_sink: torch.Tensor,
-        softmax_scale: float, cmp_counts: torch.Tensor | None = None, split: bool = True,
+        softmax_scale: float, cmp_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Paged sparse attention over ``[window | compressed]`` global rows; the compressed half reads
-        the layer's kv source (window-only layers pass ``n_window == topk``). ``split=False`` keeps a
-        one-query call on the single-program kernel (prefill: the result must not depend on ``m``)."""
+        the layer's kv source (window-only layers pass ``n_window == topk``)."""
         from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
         pool, geom = self.pool, self.geom
@@ -493,7 +492,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         cmp = pool.main_pool[src] if src is not None else pool.main_pool[geom.kv_source_layer_ids[0]]
         return sparse_attn_packed(
             q, pool.window_pool[layer_id], geom.win_fmt, cmp, geom.main_fmt, attn_sink,
-            topk_idxs, n_window, softmax_scale, cmp_counts=cmp_counts, split=split,
+            topk_idxs, n_window, softmax_scale, cmp_counts=cmp_counts,
         )
 
 

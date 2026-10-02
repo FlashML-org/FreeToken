@@ -131,53 +131,6 @@ def test_grouped_prefill_path_follows_the_reference_weighting():
 
 
 @pytest.mark.parametrize("block", [32, 128])
-def test_fp32_routed_sum_contract_on_every_executor(block):
-    """``out_dtype=torch.float32`` returns the reference's fp32 ``y`` (bf16 per-route outputs summed in
-    fp32) from the GPU GEMV, the grouped GEMM and the CPU executor -- so the model can add the shared
-    expert and round once, as the reference does -- while the default output is that sum rounded."""
-    from types import SimpleNamespace
-
-    from freetoken.kernel.pinned import alloc_pinned_tensor
-    from freetoken.moe import fused_ds_fp4
-    from freetoken.moe.cpu_executor import CpuMoeExecutor
-    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4, routed_experts_fp4_prefill
-
-    banks = _banks("cuda")
-    x, slots, w = _inputs(2, "cuda")
-    want = reference(x, slots, w, banks, block)  # fp32
-    got32 = routed_experts_fp4(x, slots, w, *banks, LIMIT, act_block=block, out_dtype=torch.float32)
-    assert got32.dtype == torch.float32
-    torch.testing.assert_close(got32, want, atol=1e-2, rtol=1e-2)
-    got16 = routed_experts_fp4(x, slots, w, *banks, LIMIT, act_block=block)
-    assert got16.dtype == torch.bfloat16 and torch.equal(got16, got32.to(torch.bfloat16))
-    # the shared-expert merge: fp32 sum + shared, rounded once, differs from rounding the sum first
-    shared = torch.randn_like(x)
-    merged = (got32 + shared.float()).to(torch.bfloat16)
-    twice = got16 + shared
-    assert not torch.equal(merged, twice) and torch.equal(merged, (want + shared.float()).to(torch.bfloat16))
-    got32p = routed_experts_fp4_prefill(x, slots, w, *banks, LIMIT, E, act_block=block, out_dtype=torch.float32)
-    assert got32p.dtype == torch.float32
-    torch.testing.assert_close(got32p, want, atol=1e-2, rtol=1e-2)
-    # CPU executor
-    gu_p, gu_s, dn_p, dn_s = banks
-    pinned = {}
-    for name, t in (("gate_up_packed", gu_p), ("gate_up_scale", gu_s), ("down_packed", dn_p), ("down_scale", dn_s)):
-        buf = alloc_pinned_tensor(*t.shape, dtype=torch.uint8)
-        buf.copy_(t.cpu())
-        pinned[name] = buf
-    cache = SimpleNamespace(quant_format="ds_fp4", bank_sources={k: [v] for k, v in pinned.items()}, num_layers=1, num_experts=E)
-    dev = torch.device("cuda", 0)
-    ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=dev, swiglu_limit=LIMIT, act_block=block)
-    cpu32 = ex.decode(0, x, w, slots.clone(), torch.float32).clone()
-    cpu16 = ex.decode(0, x, w, slots.clone()).clone()
-    torch.cuda.synchronize()
-    del ex
-    assert cpu32.dtype == torch.float32 and cpu16.dtype == torch.bfloat16
-    torch.testing.assert_close(cpu32, want, atol=1e-2, rtol=1e-2)
-    assert torch.equal(cpu16, cpu32.to(torch.bfloat16))
-
-
-@pytest.mark.parametrize("block", [32, 128])
 def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     """Hybrid decode hands the GPU kernel slot -1 (weight 0) for the routes the CPU computes. The kernel
     must produce exactly zero for them without touching any slot: every slot the active routes do not
@@ -201,16 +154,14 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     poison = [e for e in range(E) if e not in used]
     for t in (gu_p, gu_s, dn_p, dn_s):
         t[poison] = 0xFF
-    got = routed_experts_fp4(x, gpu_slots, gpu_w, gu_p, gu_s, dn_p, dn_s, LIMIT, act_block=block, out_dtype=torch.float32)
+    got = routed_experts_fp4(x, gpu_slots, gpu_w, gu_p, gu_s, dn_p, dn_s, LIMIT, act_block=block)
     assert torch.isfinite(got).all()
     clean = _banks("cuda")
     # the poisoned-bank result equals the clean-bank result with the same holes (neither reads them),
-    # and the GPU share plus the reference's CPU share is the full reference
-    got_clean = routed_experts_fp4(x, gpu_slots, gpu_w, *clean, LIMIT, act_block=block, out_dtype=torch.float32)
+    # and each share matches the reference over its own routes (a zero weight drops a route)
+    got_clean = routed_experts_fp4(x, gpu_slots, gpu_w, *clean, LIMIT, act_block=block)
     assert torch.equal(got, got_clean)
-    full = reference(x, slots, w, clean, block)
-    cpu_share = reference(x, torch.where(on_gpu, slots[:, :1].expand_as(slots), slots), torch.where(on_gpu, 0.0, w), clean, block)
-    torch.testing.assert_close(got + cpu_share, full, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(got.float(), reference(x, slots, gpu_w, clean, block), atol=2e-2, rtol=2e-2)
     # the CPU executor computes the complementary split from the same raw ids (ids < 0 skipped)
     pinned = {}
     for name, t in (("gate_up_packed", clean[0]), ("gate_up_scale", clean[1]), ("down_packed", clean[2]), ("down_scale", clean[3])):
@@ -220,7 +171,7 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     cache = SimpleNamespace(quant_format="ds_fp4", bank_sources={k: [v] for k, v in pinned.items()}, num_layers=1, num_experts=E)
     ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=torch.device("cuda", 0), swiglu_limit=LIMIT, act_block=block)
     cpu_ids = torch.where(on_gpu, -1, slots)
-    cpu_out = ex.decode(0, x, w, cpu_ids.clone(), torch.float32).clone()
+    cpu_out = ex.decode(0, x, w, cpu_ids.clone()).clone()
     torch.cuda.synchronize()
     del ex
-    torch.testing.assert_close(got + cpu_out, full, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(cpu_out.float(), reference(x, slots, torch.where(on_gpu, 0.0, w), clean, block), atol=2e-2, rtol=2e-2)

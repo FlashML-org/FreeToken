@@ -28,7 +28,6 @@ from typing import List
 import torch
 from freetoken.attention.dsv41_sparse import PrefillSegment
 from freetoken.core import get_global_ctx
-from freetoken.kernel.triton.batch_invariant_linear import batch_invariant_grouped_linear
 from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.quantization import QuantKind
@@ -53,10 +52,10 @@ class DSV41Attention(BaseOP):
         self.window = args.window_size
         self.softmax_scale = args.head_dim**-0.5
 
-        self.wq_a = LinearReplicated(args.dim, args.q_lora_rank, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wq_a")
+        self.wq_a = LinearReplicated(args.dim, args.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(args.q_lora_rank, args.norm_eps)
-        self.wq_b = LinearReplicated(args.q_lora_rank, args.n_heads * args.head_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wq_b")
-        self.wkv = LinearReplicated(args.dim, args.head_dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wkv")
+        self.wq_b = LinearReplicated(args.q_lora_rank, args.n_heads * args.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wkv = LinearReplicated(args.dim, args.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(args.head_dim, args.norm_eps)
         # Block-diagonal over groups. The reference dequantizes it to bf16 and runs a grouped einsum
         # (the activation stays bf16); a quantized checkpoint keeps the e4m3 payload + e8m0 scale
@@ -70,7 +69,7 @@ class DSV41Attention(BaseOP):
             self.wo_a_scale = torch.empty(rows // self._wo_a_block, cols // self._wo_a_block, dtype=torch.float8_e8m0fnu)
         else:
             self.wo_a = torch.empty(rows, cols, dtype=torch.bfloat16)
-        self.wo_b = LinearReplicated(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, require_batch_invariant=True, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        self.wo_b = LinearReplicated(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
         self.attn_sink = torch.empty(args.n_heads, dtype=torch.float32)
 
         self.compressor = Compressor(args, self.layer_id, role.ratio, quant_config=quant_config, prefix=f"{prefix}.compressor") if role.mode is Mode.FULL else None
@@ -106,24 +105,22 @@ class DSV41Attention(BaseOP):
         return self._freqs
 
     # ----- shared pieces -------------------------------------------------------------------
-    def _q(self, x: torch.Tensor, *, batch_invariant: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        qr = self.q_norm.forward(self.wq_a.forward(x, batch_invariant=batch_invariant))
-        q = self.wq_b.forward(qr, batch_invariant=batch_invariant).unflatten(-1, (self.n_heads, self.head_dim))
+    def _q(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        qr = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
         return qr, q
 
-    def _kv(self, x: torch.Tensor, *, batch_invariant: bool) -> torch.Tensor:
-        return self.kv_norm.forward(self.wkv.forward(x, batch_invariant=batch_invariant))
+    def _kv(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kv_norm.forward(self.wkv.forward(x))
 
-    def _wo(self, o: torch.Tensor, *, batch_invariant: bool) -> torch.Tensor:
-        """``wo_b(wo_a(o))``; ``batch_invariant`` (prefill) takes the batch-independent grouped GEMM over the bf16
-        (or dequantized) ``wo_a``, decode the grouped W8A16 GEMV over the fp8 payload."""
+    def _wo(self, o: torch.Tensor) -> torch.Tensor:
+        """``wo_b(wo_a(o))``: up to ``GEMV_MAX_M`` rows the grouped W8A16 GEMV over the fp8 payload, else the
+        reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
         t = o.shape[0]
         o = o.reshape(t, self.n_groups, -1)
-        if self._wo_a_block is not None and not batch_invariant and t <= GEMV_MAX_M:
+        if self._wo_a_block is not None and t <= GEMV_MAX_M:
             return self.wo_b.forward(grouped_w8a16_gemv(o, self.wo_a, self.wo_a_scale, block=self._wo_a_block))
         wo_a = self.wo_a if self._wo_a_block is None else dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
-        if batch_invariant:
-            return self.wo_b.forward(batch_invariant_grouped_linear(o, wo_a), batch_invariant=True)
         return self.wo_b.forward(torch.einsum("tgd,grd->tgr", o, wo_a.view(self.n_groups, self.o_lora_rank, -1)).flatten(1))
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
@@ -173,9 +170,9 @@ class DSV41Attention(BaseOP):
         """Ragged prefill over ``x [T, dim]`` tiled by ``segments`` (``positions [T]`` absolute)."""
         attn, role = self.attn, self.role
         freqs = self.freqs.index_select(0, positions)
-        qr, q = self._q(x, batch_invariant=True)
+        qr, q = self._q(x)
         apply_rotary_emb(q[..., -self.rope_dim :], freqs)
-        kv = self._kv(x, batch_invariant=True)
+        kv = self._kv(x)
         apply_rotary_emb(kv[..., -self.rope_dim :], freqs)
 
         sel = attn.selection
@@ -206,9 +203,9 @@ class DSV41Attention(BaseOP):
         win = torch.cat(win_parts, dim=1)
         topk = torch.cat([win, torch.cat(cmp_parts, dim=1)], dim=-1) if role.compresses else win
 
-        o = attn.attend(q.unsqueeze(0), self.layer_id, topk.to(torch.int32), self.window, self.attn_sink, self.softmax_scale, split=False)[0]
+        o = attn.attend(q.unsqueeze(0), self.layer_id, topk.to(torch.int32), self.window, self.attn_sink, self.softmax_scale)[0]
         apply_rotary_emb(o[..., -self.rope_dim :], freqs, inverse=True)
-        return self._wo(o, batch_invariant=True)
+        return self._wo(o)
 
     # ----- decode ------------------------------------------------------------------------------
     def forward_decode(self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, dctx: "DecodeStepContext", cmp_stage_cap: int) -> torch.Tensor:
@@ -219,9 +216,9 @@ class DSV41Attention(BaseOP):
         attn, role = self.attn, self.role
         B = x.shape[0]
         freqs_t = dctx.freqs[self.freqs_key]
-        qr, q = self._q(x, batch_invariant=False)
+        qr, q = self._q(x)
         apply_rotary_emb_decode(q[..., -self.rope_dim :].unsqueeze(1), freqs_t)
-        kv = self._kv(x, batch_invariant=False)
+        kv = self._kv(x)
         apply_rotary_emb_decode(kv[..., -self.rope_dim :].unsqueeze(1), freqs_t)
         # the shared ring context feeds the compressor's carry ring on every layer; a request-private
         # window layer stores and reads its own KV through its ring context instead
@@ -263,7 +260,7 @@ class DSV41Attention(BaseOP):
 
         o = attn.attend(q.view(B, 1, self.n_heads, self.head_dim), self.layer_id, topk, self.window, self.attn_sink, self.softmax_scale, cmp_counts=cmp_counts)
         apply_rotary_emb_decode(o[..., -self.rope_dim :], freqs_t, inverse=True)
-        return self._wo(o.view(B, self.n_heads, self.head_dim), batch_invariant=False)
+        return self._wo(o.view(B, self.n_heads, self.head_dim))
 
 
 @dataclass

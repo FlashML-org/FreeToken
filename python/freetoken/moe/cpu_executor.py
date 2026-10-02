@@ -502,7 +502,7 @@ class CpuMoeExecutor:
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.float32),  # the unrounded sum over routes
+                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
             }
             self._io[bs] = io
         return io
@@ -536,16 +536,13 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        """One MoE layer of decode on the CPU. Returns a GPU [bs, H] tensor in ``out_dtype``
-        (the input dtype by default; ``torch.float32`` keeps the sum over routes in fp32 for
-        the caller's merge instead of rounding it here).
+        """One MoE layer of decode on the CPU. Returns a GPU [bs, H] tensor.
 
         All ops go on the current CUDA stream so the whole thing is captured into
         the active CUDA graph (the two host nodes carry the data dependency on the
         pinned buffers, which hold this step's real routing on replay)."""
-        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids, out_dtype)
+        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
         return self.decode_sync(pending)
 
     def decode_submit(
@@ -554,7 +551,6 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        out_dtype: torch.dtype | None = None,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node, then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -580,9 +576,8 @@ class CpuMoeExecutor:
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        out_dtype = out_dtype or hidden_states.dtype
         task = self._task_for(layer_id, bs)
-        out = torch.empty_like(hidden_states, dtype=torch.float32)
+        out = torch.empty_like(hidden_states)
         slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
@@ -594,13 +589,13 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
-        return (bs, task, out, slot, out_dtype)
+        return (bs, task, out, slot)
 
     def decode_sync(self, pending: tuple) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot, out_dtype = pending
+        bs, task, out, slot = pending
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
@@ -610,8 +605,9 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
-        out.copy_(self._io[bs]["y"], non_blocking=True)
-        return out if out_dtype == torch.float32 else out.to(out_dtype)
+        io = self._io[bs]
+        out.copy_(io["y"], non_blocking=True)
+        return out
 
     def _watchdog_tick(self, suspects: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).
