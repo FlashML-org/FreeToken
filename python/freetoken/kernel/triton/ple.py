@@ -29,9 +29,11 @@ def _ple_gather_kernel(
     ids_ptr,
     out_ptr,
     scale,
+    scale_ptr,
     num_rows,
     EMB_DIM: tl.constexpr,
     IS_FP8: tl.constexpr,
+    HAS_ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -52,7 +54,13 @@ def _ple_gather_kernel(
     else:
         base = table_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
         values = tl.load(base + idx * EMB_DIM + offsets, mask=mask, other=0.0).to(tl.float32)
-    values = tl.where(in_range, values * scale, 0.0)
+    if HAS_ROW_SCALE:
+        # per-row fp32 scales, host-resident next to the codes (community per_row_e4m3 exports)
+        sbase = scale_ptr.to(tl.int64).to(tl.pointer_type(tl.float32))
+        row_scale = tl.load(sbase + idx, mask=in_range, other=0.0)
+        values = tl.where(in_range, values * row_scale, 0.0)
+    else:
+        values = tl.where(in_range, values * scale, 0.0)
     tl.store(
         out_ptr + row * EMB_DIM + offsets,
         values.to(out_ptr.dtype.element_ty),
@@ -68,12 +76,15 @@ def ple_gather_rows(
     out: torch.Tensor,
     scale: float = 1.0,
     is_fp8: bool = True,
+    scale_ptr: int = 0,
 ) -> torch.Tensor:
     """Gather ``row_ids`` from the host-resident table at ``table_ptr`` into ``out``.
 
     ``row_ids`` is a flat device int tensor; ``out`` is ``[row_ids.numel(), embed_dim]``
     bf16 on the same device. ``table_ptr`` is the address the GPU must dereference
-    (``kernel/pinned.device_ptr``), not necessarily the host ``data_ptr``.
+    (``kernel/pinned.device_ptr``), not necessarily the host ``data_ptr``. ``scale_ptr``,
+    when nonzero, is the device-dereferenceable address of one fp32 scale per table row
+    and wins over the scalar ``scale``.
     """
     n = row_ids.numel()
     assert out.shape == (n, embed_dim) and out.is_contiguous(), out.shape
@@ -83,9 +94,11 @@ def ple_gather_rows(
             row_ids,
             out,
             float(scale),
+            scale_ptr,
             num_rows,
             EMB_DIM=embed_dim,
             IS_FP8=is_fp8,
+            HAS_ROW_SCALE=scale_ptr != 0,
             BLOCK_D=triton.next_power_of_2(embed_dim),
             num_warps=_NUM_WARPS,
         )
