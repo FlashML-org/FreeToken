@@ -15,8 +15,8 @@ Two layers of measurement:
 
 The rule, per (workload, format): recommend ``hybrid`` when the CPU MoE kernel
 bandwidth exceeds ``threshold`` x the PCIe gather bandwidth (default 2x), otherwise
-``offload``. Formats with no CPU MoE weight path (e.g. block-fp8) can't be computed on
-the CPU, so they always resolve to ``offload``.
+``offload``. Formats outside ``_CPU_MOE_FORMATS`` have no CPU MoE weight path and
+always resolve to ``offload``.
 
 The hybrid-vs-offload choice is dtype-dominated, so the default is a **per-dtype tuning bench**
 (``--dtype``): one bench per expert format against a canonical geometry -- the minimal set the
@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
@@ -375,6 +375,25 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         }
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
+        return b
+    if fmt == "fp8_block":
+        # 128x128 block-fp8（DeepSeek-V3 式，#534）：e4m3 行主序权重 + bf16 每块
+        # scale，scale 行宽经 fp8_block_scale_pad 填充到 16B —— 与
+        # CpuMoeExecutor._resolve_fp8_block_banks 的校验逐维一致。
+        from freetoken.kernel.aot_models import fp8_block_scale_pad
+
+        b = {
+            "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
+            "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
+            "gate_up_scale": pin(E, 2 * I // 128, fp8_block_scale_pad(2 * I // 128, H // 128),
+                                 dtype=torch.bfloat16),
+            "down_scale": pin(E, H // 128, fp8_block_scale_pad(H // 128, I // 128),
+                              dtype=torch.bfloat16),
+        }
+        b["gate_up"].view(torch.uint8).fill_(0x38)  # e4m3 0x38 = 0.0625（有限值，防 NaN）
+        b["down"].view(torch.uint8).fill_(0x38)
+        b["gate_up_scale"].fill_(1.0)  # 单位 scale：权重解码为正常 float
+        b["down_scale"].fill_(1.0)
         return b
     raise NotImplementedError(fmt)
 

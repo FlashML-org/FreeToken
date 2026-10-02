@@ -155,6 +155,32 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        # Blocking receive bypasses the main-loop drain. With no in-flight batch,
+        # flush completed routing counts before checking the repin window.
+        self._process_last_data(None)
+        self._maybe_repin(None)
+
+    def _repin_wait_ms(self) -> int | None:
+        """
+        Business Logic（为什么需要这个函数）:
+            空闲收包默认一直阻塞。开了 EMA 换血时，窗口可能在阻塞期间封口，
+            必须有超时把调度器叫醒，否则要等下一条请求才换血。
+
+        Code Logic（这个函数做什么）:
+            没有 repin 管理器，或管理器表示不用醒（目录模式），返回 None。
+            否则把 idle_wait_s 换成毫秒，至少 1ms。
+        """
+        repin = getattr(
+            getattr(getattr(self, "engine", None), "moe_offload_cache", None),
+            "repin_manager",
+            None,
+        )
+        if repin is None:
+            return None
+        wait_s = repin.idle_wait_s()
+        if wait_s is None:
+            return None
+        return max(1, int(wait_s * 1000.0))
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -232,6 +258,10 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
+        # 动态重钉：同一个 idle 安全点按滑动窗口热度调整钉住热集（设计文档 §10）。
+        # 管理器内部自判墙钟/窗口就绪，未到点是纯日期比较，热路径开销可忽略。
+        self._maybe_repin(last_data)
+
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
         # engine stream in ``_forward``). Without this, a request that reuses a just-freed
@@ -277,6 +307,9 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
+        # 动态重钉：同一个 idle 安全点（normal_loop 无未排空 batch，恒传 None）。
+        self._maybe_repin(None)
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -305,11 +338,29 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        # 退出落盘要在 CUDA 仍健康时做：atexit 阶段再做 D2H 可能因上下文失效丢掉
+        # 最后一个间隔的统计（周期排空已保底，此处只是收口）。
+        engine = getattr(self, "engine", None)
+        cache = getattr(engine, "moe_offload_cache", None)
+        if cache is not None and getattr(cache, "hotness", None) is not None:
+            try:
+                cache.hotness.save()
+            except Exception as exc:  # noqa: BLE001 -- 统计收口失败不阻断关停
+                logger.warning("expert hotness final save failed: %s", exc)
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        # Periodic drain of the expert-hotness collector, gated by wall time inside
+        # maybe_flush (cheap no-op between intervals). Runs before the early return so
+        # idle loops still flush; this stream is ordered after the engine stream here,
+        # so the D2H read never races the in-flight decode graph's index_add_.
+        # 双层 getattr：真实 Scheduler 恒有 engine；轻量测试桩可能两者皆无
+        engine = getattr(self, "engine", None)
+        cache = getattr(engine, "moe_offload_cache", None)
+        if cache is not None and cache.hotness is not None:
+            cache.hotness.maybe_flush()
         if last_data is None:
             return
 
@@ -657,6 +708,37 @@ class Scheduler(SchedulerIOMixin):
                 )
             ]
         )
+
+    def _maybe_repin(self, last_data: ForwardData | None) -> None:
+        """idle 安全点的动态重钉触发（设计文档 §10）：与 ``_execute_pending_rebuild``
+        同一位置、同一门控（无待排空 batch、无 pending prefill / running decode）。
+
+        Business Logic（为什么需要这个函数）:
+            重钉要改写钉住槽的字节与映射，必须发生在没有任何 MoE 读者的时刻；
+            rebuild 的执行点正是这样的安全点，重钉搭同一班车，不另设调度约定。
+
+        Code Logic（这个函数做什么）:
+            门控不过直接返回；否则经三层 getattr 取引擎 cache 上的 repin 管理器
+            （与 _process_last_data 的排空钩子同款防御：轻量测试桩可能没有 engine /
+            moe_offload_cache），管理器内部自判墙钟、窗口就绪与迁移必要性。
+        """
+        if last_data is not None or self.prefill_manager.runnable or self.decode_manager.runnable:
+            return
+        repin = getattr(
+            getattr(getattr(self, "engine", None), "moe_offload_cache", None),
+            "repin_manager",
+            None,
+        )
+        if repin is not None:
+            try:
+                repin.maybe_repin()
+            except Exception as exc:  # noqa: BLE001 — 重钉失败不能拖垮调度循环；记录后保当前钉住集继续服务
+                # 异常详情内联：logger.exception 的 traceback 在部分子进程日志管线下
+                # 不落盘，内联保证每次失败都可见
+                logger.error(
+                    "dynamic repin failed (%s: %s); keeping the current pin set",
+                    type(exc).__name__, exc,
+                )
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

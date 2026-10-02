@@ -729,9 +729,150 @@ def parse_args(
         help=(
             "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
-            "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
-            "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
-            "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+            "-1 (default) = auto: fetch 50% of each step's misses over PCIe and compute "
+            "the rest on the CPU. 0 = never fetch (all misses on CPU); a positive value "
+            "is a fixed per-step fetch cap."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-stats-out",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.hot_stats_out,
+        help=(
+            "Collect per-(MoE layer, expert) routing-hotness counts into this JSON file "
+            "(offload family only). Counters accumulate on-device (CUDA-graph safe); the "
+            "scheduler drains them to the host every --hot-stats-interval-s and at exit. "
+            "The file feeds the hot-expert pin-selection tool."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-stats-interval-s",
+        type=float,
+        default=ServerArgs.hot_stats_interval_s,
+        help=(
+            "Wall-clock seconds between host-side drains of the --hot-stats-out hotness "
+            "counters."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-list",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.hot_expert_list,
+        help=(
+            "Pin each MoE layer's top-K hot experts into the GPU slot cache (offload "
+            "family only). FILE is either a pin list JSON written by "
+            "`python -m freetoken.hotness select -o`, or -- with --hot-expert-slots -- "
+            "a hotness stats JSON (--hot-stats-out format) to pick from internally at "
+            "load time. Pinned experts stay single-copy resident in VRAM (never "
+            "LRU-evicted, never swapped over PCIe) and the host banks hold only the "
+            "remaining cold experts."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-lru-floor",
+        type=int,
+        metavar="N",
+        default=ServerArgs.hot_expert_lru_floor,
+        help=(
+            "LRU region floor in slots for the pin capacity guard. 1 (default) lets "
+            "the pin capacity shrink the LRU down to one slot; spare capacity slots "
+            "stay in the LRU. 0 = the built-in floor max(2*experts, 512)."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-slots",
+        type=int,
+        metavar="K",
+        default=ServerArgs.hot_expert_slots,
+        help=(
+            "Dual role. With --hot-expert-list pointing at a hotness stats JSON: pin "
+            "K experts per layer, selected internally at load time with the selection "
+            "tool's rule (count descending, ties to the lower id) -- K is then also "
+            "the pin capacity, so the pin count stays static. That load-time K must "
+            "be smaller than the expert count (the cold bank keeps at least one row). "
+            "With --hot-expert-list "
+            "being a pin list JSON: the list sets the initial per-layer pin count and "
+            "K becomes the pin CAPACITY, reserving per-layer headroom so runtime "
+            "pin_k (--tune-file) can grow the active pin count up to K (shrinking is "
+            "bounded below by the list's initial count). Rejected alone (without "
+            "--hot-expert-list)."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-active-k",
+        type=int,
+        metavar="N",
+        default=ServerArgs.hot_expert_active_k,
+        help=(
+            "With a pin list JSON: pin only the first N experts of each layer at load "
+            "(host-bank floor) and keep the list order up to --hot-expert-slots as the "
+            "catalog. Runtime pin_k then grows and shrinks along that fixed order. EMA "
+            "swaps are disabled. N must be <= the list length and <= --hot-expert-slots."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-repin-interval-s",
+        type=float,
+        metavar="T",
+        default=ServerArgs.hot_expert_repin_interval_s,
+        help=(
+            "Dynamic repinning, used when --hot-expert-list is set: every T seconds of "
+            "wall-clock, drain the expert-hotness counters into a sliding window, "
+            "smooth it with an EMA (half-life = window length) and swap pinned experts "
+            "whose EMA count no longer justifies their slot. Swaps run only at fully "
+            "idle safe points (no in-flight prefill/decode), move at most one bank row "
+            "per expert and are CUDA-graph safe (tensor values only, shapes fixed). "
+            "60 (default) enables that window; 0 disables it. Without a pin list the "
+            "value is unused."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-repin-gain",
+        type=float,
+        default=ServerArgs.hot_expert_repin_gain,
+        help=(
+            "Dynamic repinning hysteresis: a cold candidate replaces a pinned expert "
+            "only when its EMA count is >= gain times the incumbent's (default 1.5); "
+            "higher values make the hot set stickier."
+        ),
+    )
+
+    parser.add_argument(
+        "--hot-expert-repin-max-swaps",
+        type=int,
+        default=ServerArgs.hot_expert_repin_max_swaps,
+        help=(
+            "Dynamic repinning cap: at most this many expert swaps per layer per "
+            "window (default 8), bounding the PCIe traffic of one repin cycle."
+        ),
+    )
+
+    parser.add_argument(
+        "--tune-file",
+        type=str,
+        metavar="FILE",
+        default=ServerArgs.tune_file,
+        help=(
+            "Runtime tuning via a JSON file polled every 2 s (mtime-gated). Keys: "
+            "\"fetch_fraction\" (hybrid decode's PCIe fetch split, [0, 1]; applied "
+            "through cache.set_fetch_params with the fetch cap unchanged and takes "
+            "effect on already-captured decode graphs without recapture) and "
+            "\"pin_k\" (integer; global target for the per-layer active pin count, "
+            "recorded via the dynamic-repin manager and applied at the NEXT idle "
+            "safe point within the pin capacity set by --hot-expert-slots; needs "
+            "dynamic repinning enabled, otherwise ignored with a log). Invalid JSON "
+            "is silently skipped; out-of-range values are ignored with one warning. "
+            "Unset (default) disables polling."
         ),
     )
 

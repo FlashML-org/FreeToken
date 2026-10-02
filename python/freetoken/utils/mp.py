@@ -63,11 +63,15 @@ class ZmqPullQueue(Generic[T]):
         self.socket.bind(addr) if create else self.socket.connect(addr)
         self.decoder = decoder
 
-    def get(self) -> T:
-        event = self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+    def get(self, timeout_ms: int | None = None) -> T | None:
+        raw = self.get_raw(timeout_ms=timeout_ms)
+        if raw is None:
+            return None
+        return self.decode(raw)
 
-    def get_raw(self) -> bytes:
+    def get_raw(self, timeout_ms: int | None = None) -> bytes | None:
+        if timeout_ms is not None and self.socket.poll(timeout=timeout_ms) == 0:
+            return None
         return self.socket.recv()
 
     def decode(self, raw: bytes) -> T:
@@ -139,9 +143,19 @@ class ZmqSubQueue(Generic[T]):
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.decoder = decoder
 
-    def get(self) -> T:
-        event = self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+    def get(self, timeout_ms: int | None = None) -> T | None:
+        raw = self.get_raw(timeout_ms=timeout_ms)
+        if raw is None:
+            return None
+        return self.decode(raw)
+
+    def get_raw(self, timeout_ms: int | None = None) -> bytes | None:
+        if timeout_ms is not None and self.socket.poll(timeout=timeout_ms) == 0:
+            return None
+        return self.socket.recv()
+
+    def decode(self, raw: bytes) -> T:
+        return self.decoder(msgpack.unpackb(raw, raw=False))
 
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0

@@ -10,10 +10,10 @@
 // sync() blocks the host-func thread until the pool drains. The heavy GEMV runs
 // on the persistent worker threads, not the host-func thread.
 //
-// Weight formats: bf16, NVFP4, MXFP4, ds_fp4 and Q4_0 expert banks (see WFmt and
-// the per-format bank schemas). Compute is FP32-accumulate; the intermediate is
-// stored bf16 to match the GPU decode path. ISA is chosen once at construction
-// (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
+// Weight formats: bf16, NVFP4, MXFP4, ds_fp4, Q4_0 and fp8_block expert banks (see
+// WFmt and the per-format bank schemas). Compute is FP32-accumulate; the
+// intermediate is stored bf16 to match the GPU decode path. ISA is chosen once at
+// construction (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
 #include <algorithm>
 #include <atomic>
@@ -1220,7 +1220,144 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+// ------------------- fp8_block (DeepSeek-V3 128x128 block-fp8) -------------------
+// Row-major e4m3 weight bytes + bf16 per-128x128 block scales (weight_scale_inv),
+// one scale per (output row, 128-K block); the scale row width is padded to 16B
+// (fp8_block_scale_pad), so the caller advances scale rows by the padded stride.
+// Dequant matches the GPU decode kernel (kernel/triton/fp8_blockscale_moe): inside
+// the K-loop, per-128 block partial sums scaled by the row's block scale, fp32
+// accumulate, activations stay bf16 (W8A16).
+using fp8dot_fn = float (*)(const uint8_t*, const bf16_t*, const bf16_t*, int, const float*);
+
+float dot_fp8block_scalar(const uint8_t* w, const bf16_t* s, const bf16_t* x, int K,
+                          const float* e4m3) {
+  float total = 0.0f;
+  const int nb = K / 128;
+  for (int b = 0; b < nb; ++b) {
+    const float sc = bf16_to_f32(s[b]);
+    const uint8_t* wb = w + (size_t)b * 128;
+    const bf16_t* xb = x + (size_t)b * 128;
+    float acc = 0.0f;
+    for (int j = 0; j < 128; ++j) acc += e4m3[wb[j]] * bf16_to_f32(xb[j]);
+    total += acc * sc;
+  }
+  return total;
+}
+
+#if CPU_MOE_X86
+// e4m3 subnormal correction (the only value e4m3_decode's normal form gets wrong):
+// the bit construction below yields 2^-7 * (1 + m/8) for exp==0, but a subnormal is
+// m * 2^-9, so `corr[m] = (1 - m/8) * 2^-7` is subtracted when e == 0 (all fp32 ops
+// here are exact: both operands are multiples of 2^-10). Indexed by the 3-bit mantissa.
+const float kFp8SubCorr[8] = {0.0078125f, 0.0068359375f, 0.005859375f, 0.0048828125f,
+                              0.00390625f, 0.0029296875f, 0.001953125f, 0.0009765625f};
+
+// One 128-K block of 8-wide chunks. Weight decode is gather-free bit construction:
+// bits = ((w & 0x7F) << 20) + (120 << 23) places e in the fp32 exponent field and m
+// in the mantissa top; subtracting corr[m] when e == 0 folds the subnormals in, and
+// xoring the sign bit finishes the decode -- bit-identical to the e4m3 LUT for every
+// non-NaN code (verified exhaustively for all 254). Weights are the DRAM stream
+// (1 B/elem), so the decode stays ALU-only and the GEMV remains bandwidth-bound.
+__attribute__((target("avx2,fma")))
+float dot_fp8block_avx2(const uint8_t* w, const bf16_t* s, const bf16_t* x, int K,
+                        const float* e4m3) {
+  (void)e4m3;  // decode is pure bit arithmetic; the LUT is only for the scalar path
+  const __m256 corr8 = _mm256_loadu_ps(kFp8SubCorr);
+  const __m256i mask07F = _mm256_set1_epi32(0x7F);
+  const __m256i mask07 = _mm256_set1_epi32(7);
+  const __m256i bias120 = _mm256_set1_epi32(120 << 23);
+  const __m256i zero = _mm256_setzero_si256();
+  float total = 0.0f;
+  const int nb = K / 128;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* wb = w + (size_t)b * 128;
+    const bf16_t* xb = x + (size_t)b * 128;
+    _mm_prefetch(reinterpret_cast<const char*>(wb) + PF_AHEAD, _MM_HINT_T0);
+    __m256 acc = _mm256_setzero_ps();
+    for (int j = 0; j < 128; j += 8) {
+      __m256i w8 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(wb + j)));
+      // sign bit 7 -> fp32 sign bit 31 (mask first: w8<<24 alone would smear the
+      // low bits across the exponent field)
+      __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(w8, _mm256_set1_epi32(0x80)), 24);
+      __m256i me = _mm256_and_si256(w8, mask07F);
+      __m256i mant = _mm256_and_si256(me, mask07);
+      __m256i e = _mm256_srli_epi32(me, 3);
+      __m256i bits = _mm256_add_epi32(_mm256_slli_epi32(me, 20), bias120);
+      __m256 corr = _mm256_and_ps(_mm256_permutevar8x32_ps(corr8, mant),
+                                  _mm256_castsi256_ps(_mm256_cmpeq_epi32(e, zero)));
+      __m256 wf = _mm256_xor_ps(_mm256_sub_ps(_mm256_castsi256_ps(bits), corr),
+                                _mm256_castsi256_ps(sgn));
+      __m256 xf = _mm256_castsi256_ps(_mm256_slli_epi32(
+          _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xb + j))), 16));
+      acc = _mm256_fmadd_ps(wf, xf, acc);
+    }
+    total += hsum256(acc) * bf16_to_f32(s[b]);
+  }
+  return total;
+}
+
+// AVX-512 twin of the AVX2 kernel: 16 weights per chunk (vpermps LUTs 16-lane, masked
+// corr via an opmask instead of the bitwise and).
+__attribute__((target("avx512f")))
+float dot_fp8block_avx512(const uint8_t* w, const bf16_t* s, const bf16_t* x, int K,
+                          const float* e4m3) {
+  (void)e4m3;
+  alignas(64) float corr16[16];
+  for (int i = 0; i < 16; ++i) corr16[i] = kFp8SubCorr[i & 7];
+  const __m512 corr = _mm512_loadu_ps(corr16);
+  const __m512i mask07F = _mm512_set1_epi32(0x7F);
+  const __m512i mask07 = _mm512_set1_epi32(7);
+  const __m512i bias120 = _mm512_set1_epi32(120 << 23);
+  const __m512i zero = _mm512_setzero_si512();
+  float total = 0.0f;
+  const int nb = K / 128;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* wb = w + (size_t)b * 128;
+    const bf16_t* xb = x + (size_t)b * 128;
+    _mm_prefetch(reinterpret_cast<const char*>(wb) + PF_AHEAD, _MM_HINT_T0);
+    __m512 acc = _mm512_setzero_ps();
+    for (int j = 0; j < 128; j += 16) {
+      __m512i w16 = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + j)));
+      __m512i sgn = _mm512_slli_epi32(_mm512_and_si512(w16, _mm512_set1_epi32(0x80)), 24);
+      __m512i me = _mm512_and_si512(w16, mask07F);
+      __m512i mant = _mm512_and_si512(me, mask07);
+      __m512i e = _mm512_srli_epi32(me, 3);
+      __m512i bits = _mm512_add_epi32(_mm512_slli_epi32(me, 20), bias120);
+      __mmask16 is_sub = _mm512_cmpeq_epi32_mask(e, zero);
+      __m512 corr_v = _mm512_maskz_mov_ps(is_sub, _mm512_permutexvar_ps(mant, corr));
+      // xor_ps is AVX512DQ; the sign fold stays in the integer domain (AVX512F).
+      __m512 wf = _mm512_castsi512_ps(_mm512_xor_si512(
+          _mm512_castps_si512(_mm512_sub_ps(_mm512_castsi512_ps(bits), corr_v)), sgn));
+      __m512 xf = _mm512_castsi512_ps(_mm512_slli_epi32(
+          _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + j))), 16));
+      acc = _mm512_fmadd_ps(wf, xf, acc);
+    }
+    total += _mm512_reduce_add_ps(acc) * bf16_to_f32(s[b]);
+  }
+  return total;
+}
+#endif  // CPU_MOE_X86
+
+fp8dot_fn select_fp8dot() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (t >= ISA_AVX512) return dot_fp8block_avx512;
+  if (t >= ISA_AVX2) return dot_fp8block_avx2;
+#endif
+  (void)t;
+  return dot_fp8block_scalar;
+}
+
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_FP8_BLOCK = 5 };
+
+// Mirror kernel/aot_models.py fp8_block_scale_pad: pad a scale-bank row width until a
+// row's 2-byte elements are 16B-aligned (the fused multi-bank copy requirement). The
+// Python bank resolver asserts the same padding, so a drift fails loudly instead of
+// misreading scales.
+inline int fp8_scale_pad(int rows, int cols) {
+  while ((rows * cols * 2) % 16 != 0) ++cols;
+  return cols;
+}
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1260,6 +1397,7 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  fp8dot_fn fp8dot;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1269,6 +1407,9 @@ struct CpuMoeExecutor {
   bool input_prequant = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
+  // fp8_block bf16 scale strides (elements): padded row width (fp8_scale_pad) and the
+  // per-expert scale span (scale rows per expert x padded row width).
+  int fp8_gu_srow = 0, fp8_dn_srow = 0, fp8_gu_ese = 0, fp8_dn_ese = 0;
   float e2m1_lut[16];
   float e4m3_lut[256];
   float e8m0_lut[256];         // mxfp4 block scale: 2^(s-127), s clamped to [0,254]
@@ -1383,11 +1524,20 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    fp8dot = select_fp8dot();
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+    }
+    if (weight_format == WF_FP8_BLOCK) {
+      if (H % 128 != 0 || I % 128 != 0)
+        throw std::runtime_error("fp8_block CPU MoE requires H and I to be multiples of 128");
+      fp8_gu_srow = fp8_scale_pad(2 * I / 128, H / 128);
+      fp8_dn_srow = fp8_scale_pad(H / 128, I / 128);
+      fp8_gu_ese = (2 * I / 128) * fp8_gu_srow;
+      fp8_dn_ese = (H / 128) * fp8_dn_srow;
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
@@ -1494,6 +1644,14 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
+    if (fmt == WF_FP8_BLOCK) {
+      // Row-major e4m3 + one bf16 scale row per 128 output rows (per-128-K-block
+      // columns), at the padded scale row stride.
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * H;
+      const bf16_t* s = reinterpret_cast<const bf16_t*>(gu_scale_l) +
+                        (size_t)e * fp8_gu_ese + (size_t)(row / 128) * fp8_gu_srow;
+      return fp8dot(w, s, x, H, e4m3_lut);
+    }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
@@ -1515,6 +1673,12 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_FP8_BLOCK) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * I;
+      const bf16_t* s = reinterpret_cast<const bf16_t*>(dn_scale_l) +
+                        (size_t)e * fp8_dn_ese + (size_t)(row / 128) * fp8_dn_srow;
+      return fp8dot(w, s, g, I, e4m3_lut);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -2157,4 +2321,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  // ABI capability marker: the highest WFmt this build implements. A prebuilt .so
+  // from before WF_FP8_BLOCK accepts weight_format 5 without error and computes the
+  // nvfp4 fall-through (garbage); the Python ctor probes it the same way as
+  // max_generic_act_id so a stale extension is a loud rebuild instruction.
+  m.def("max_weight_format_id", []() { return static_cast<int>(WF_FP8_BLOCK); });
 }

@@ -353,7 +353,8 @@ CASES = [
     # hybrid decodes on the CPU executor too, so the expert kernel must have a CPU format
     Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {"model.layers.{lin}.mlp.experts": (Nvfp4MoEMethod, "triton")}, strategy="hybrid"),
     Case("Qwen3.6-35B-A3B", NoQuantConfig, {"model.layers.{lin}.mlp.experts": (UnquantizedMoEMethod, "fused")}, strategy="hybrid"),
-    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {}, strategy="hybrid", raises=KernelSelectionError),
+    # fp8_block experts have a CPU executor format now (#534): hybrid selects triton instead of raising
+    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {"model.layers.{lin}.mlp.experts": (Fp8BlockMoEMethod, "triton")}, strategy="hybrid"),
 ]
 
 

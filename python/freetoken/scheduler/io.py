@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# 多卡空闲换血的唤醒包。0x00 开头，不是 msgpack map，不会被当成一条请求。
+_REPIN_WAKE: Final[bytes] = b"\x00FT_REPIN_WAKE"
+
 
 class SchedulerIOMixin:
     """
@@ -67,6 +70,10 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def _repin_wait_ms(self) -> int | None:
+        """无动态换血时一直阻塞。Scheduler 覆盖为窗口剩余毫秒。"""
+        return None
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -80,7 +87,12 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            pending_msgs.append(self._recv_from_tokenizer.get())
+            while True:
+                msg = self._recv_from_tokenizer.get(timeout_ms=self._repin_wait_ms())
+                if msg is not None:
+                    pending_msgs.append(msg)
+                    break
+                self.run_when_idle()
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs
@@ -89,9 +101,19 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+            while True:
+                raw = self._recv_from_tokenizer.get_raw(timeout_ms=self._repin_wait_ms())
+                if raw is not None:
+                    self._send_into_ranks.put_raw(raw)
+                    pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+                    break
+                # 窗口到点：叫醒其他 rank 一起换血，再继续等请求。
+                self._send_into_ranks.put_raw(_REPIN_WAKE)
+                self.sync_all_ranks()
+                try:
+                    self.run_when_idle()
+                finally:
+                    self.sync_all_ranks()
 
         pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
@@ -110,7 +132,17 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
+            while True:
+                raw = self._recv_from_rank0.get_raw()
+                if raw == _REPIN_WAKE:
+                    self.sync_all_ranks()
+                    try:
+                        self.run_when_idle()
+                    finally:
+                        self.sync_all_ranks()
+                    continue
+                pending_msgs.append(self._recv_from_rank0.decode(raw))
+                break
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)

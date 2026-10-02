@@ -69,7 +69,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "fp8_block": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -143,7 +143,8 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or fp8_block — see ``_WFMT_IDS`` /
+    ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -175,6 +176,8 @@ class CpuMoeExecutor:
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
         # handles its act inside the kernel and predates the marker.)
+        # fp8_block 是新权重格式：旧 .so 会把 weight_format=5 落进 nvfp4 分支静默
+        # 算错，所以用同一套探针在构造期大声失败并给出重建指令。
         if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
@@ -184,6 +187,14 @@ class CpuMoeExecutor:
                     "with `python setup.py build_ext --inplace` (or reinstall the "
                     "wheel) before serving this model on the cpu/hybrid backend."
                 )
+        max_wfmt = getattr(_cpu_moe, "max_weight_format_id", lambda: 4)()
+        if _WFMT_IDS[fmt] > max_wfmt:
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates the {fmt!r} weight "
+                f"format (max weight-format id {max_wfmt}); rebuild it with "
+                "`python setup.py build_ext --inplace` (or reinstall the wheel) "
+                "before serving this model on the cpu/hybrid backend."
+            )
 
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)
@@ -192,6 +203,10 @@ class CpuMoeExecutor:
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        # 显存钉住的冷行映射（--hot-expert-list；None = 不钉住）：CPU GEMV 按专家 id
+        # 直读 bank 行，而冷压缩 bank 的行号是冷行号，所以发往 CPU 的专家 id 要先经
+        # cold_row 重映射（钉住层恒命中、不会发往 CPU；CPU 解码层无钉住、映射恒等）。
+        self.cold_row = getattr(cache, "cold_row", None)
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
@@ -378,6 +393,9 @@ class CpuMoeExecutor:
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
 
+        if fmt == "fp8_block":
+            return self._resolve_fp8_block_banks(banks)
+
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
@@ -490,6 +508,52 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
+    def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """
+        Business Logic（为什么需要这个函数）:
+            DeepSeek-V3 式 128x128 block-fp8 checkpoint（Qwen3.6/3.8-FP8）此前无法
+            走 cpu/hybrid 解码（#534）；CPU executor 要获得该格式的 weights/scales
+            指针与 (H, I)，才能让 fp8 也能以 hybrid 溢出分流。
+
+        Code Logic（这个函数做什么）:
+            校验四 bank（gate_up/down 为 e4m3 行主序，gate_up_scale/down_scale 为
+            bf16 每块 scale，行宽经 ``fp8_block_scale_pad`` 填充到 16B）并解出
+            H、I；返回四个 per-layer 指针表（其余指针置 0）。布局与 GPU offload
+            bank 逐字节一致，C++ GEMV 原地行读取、K 循环内解量化。
+        """
+        from freetoken.kernel.aot_models import fp8_block_scale_pad
+
+        gup, gus = banks["gate_up"], banks["gate_up_scale"]
+        dnp, dns = banks["down"], banks["down_scale"]
+        assert gup[0].dtype == torch.float8_e4m3fn and dnp[0].dtype == torch.float8_e4m3fn, (
+            gup[0].dtype, dnp[0].dtype,
+        )
+        assert gus[0].dtype == torch.bfloat16 and dns[0].dtype == torch.bfloat16, (
+            gus[0].dtype, dns[0].dtype,
+        )
+        H = int(gup[0].shape[2])
+        I = int(gup[0].shape[1] // 2)
+        assert gup[0].shape[1] == 2 * I
+        assert H % 128 == 0 and I % 128 == 0, (H, I)  # 128x128 weight scale blocks
+        assert tuple(dnp[0].shape[1:]) == (H, I), (dnp[0].shape, H, I)
+        assert tuple(gus[0].shape[1:]) == (
+            2 * I // 128, fp8_block_scale_pad(2 * I // 128, H // 128),
+        ), (gus[0].shape, I, H)
+        assert tuple(dns[0].shape[1:]) == (
+            H // 128, fp8_block_scale_pad(H // 128, I // 128),
+        ), (dns[0].shape, H, I)
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gup).data_ptr(),
+            down_ptr=self._make_table(dnp).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
+            gate_up_global_ptr=0,
+            down_scale_ptr=self._make_table(dns).data_ptr(),
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
@@ -567,8 +631,15 @@ class CpuMoeExecutor:
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
         # D2H: ship this step's activations + routing to pinned host memory.
+        # 显存钉住：先把专家 id 经 cold_row 重映射为冷压缩 bank 的行号（C++ GEMV 按
+        # id × 行宽直读行）。-1（GPU 负责的路由）原样保留；固定 shape、无 host 同步，
+        # CUDA graph 可捕获。CPU 解码层的 cold_row 行是恒等映射，此处无代价直通。
+        if self.cold_row is not None:
+            cold = self.cold_row[layer_id]
+            safe = topk_ids.clamp(min=0).long()
+            topk_ids = torch.where(topk_ids >= 0, cold[safe], topk_ids).to(torch.int32)
         io["x"].copy_(hidden_states, non_blocking=True)
-        io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
+        io["ids"].copy_(topk_ids, non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         task = self._task_for(layer_id, bs)

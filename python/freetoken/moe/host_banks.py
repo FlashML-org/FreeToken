@@ -13,6 +13,14 @@ contiguous cache) paths both rely on:
   device's queue-depth ceiling even for a single file).
 
 The mmaps are held for the process lifetime (the banks live as long as the offload cache).
+
+**并发约定（动态重钉）**：bank 行内容加载后只读，唯一例外是动态重钉（设计文档
+§10）在 idle 安全点的行级交换——``OffloadMoeCache.swap_pinned_experts`` 把被替换
+钉住专家的字节 host-to-host 写回候选专家的旧冷行。写回只发生在"所有流同步、无在途
+GEMM/CPU GEMV/未完成 prefill chunk"的重钉安全点（scheduler 的
+``_execute_pending_rebuild`` 同位置），此时 bank 的全部读者（copy_missing 的 H2D、
+prefill 组装、CPU executor 的 data_ptr 直读）都不在飞；交换只改"哪一行装哪个专家"
+（行内容整体替换、行数与行宽不变），bank 首址与行宽永不移动。
 """
 
 from __future__ import annotations
