@@ -94,6 +94,7 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
+    scheduler._prefill_start = {}
     events = []
 
     def prepare(value):
@@ -110,6 +111,8 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     assert events[0] == ("prepared", batch)
     sent = events[1][1]
     assert [(m.uid, m.prompt_tokens, m.cached_tokens) for m in sent] == [(1, 12, 4), (2, 34, 0)]
+    # Admission also opens each request's prefill span, closed at its first sampled token.
+    assert sorted(scheduler._prefill_start) == [1, 2]
 
 
 def test_prepare_failure_emits_no_prompt_admission():
@@ -128,6 +131,20 @@ def test_prepare_failure_emits_no_prompt_admission():
     with pytest.raises(RuntimeError, match="allocation failed"):
         Scheduler._schedule_next_batch(scheduler)
     assert sent == []
+
+
+def test_freeing_a_request_that_never_sampled_closes_its_prefill_span():
+    """The first sampled token is what normally pops the span. A request aborted mid-prefill
+    never reaches that point, so the free path has to pop it -- otherwise a long-lived server
+    leaks one entry per aborted request."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._prefill_start = {7: 100.0, 9: 200.0}
+    scheduler.cache_manager = SimpleNamespace(cache_req=lambda req, finished: None)
+    scheduler.table_manager = SimpleNamespace(free=lambda table_idx: None)
+
+    Scheduler._free_req_resources(scheduler, SimpleNamespace(uid=7, table_idx=3))
+
+    assert scheduler._prefill_start == {9: 200.0}  # only the freed request's span is dropped
 
 
 def test_scheduler_rejection_emits_error_but_no_admission():

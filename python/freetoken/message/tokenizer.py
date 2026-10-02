@@ -48,6 +48,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Scheduler-measured prefill span for this request: admission (the first prefill batch
+    # was prepared) to the token sampled off its last prefill chunk. Set on that first token
+    # only, 0.0 on every later one -- it is the one span a client cannot derive from HTTP
+    # timestamps, which is why it rides the wire instead of being re-estimated frontend-side.
+    prefill_ms: float = 0.0
 
 
 @dataclass

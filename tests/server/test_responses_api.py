@@ -338,10 +338,11 @@ def test_stream_tool_call_events():
 # Route smoke tests
 # --------------------------------------------------------------------------- #
 class FakeState:
-    def __init__(self, outputs, finish_reason=None, cached_tokens=0):
+    def __init__(self, outputs, finish_reason=None, cached_tokens=0, prefill_ms=0.0):
         self._outputs = outputs
         self._finish_reason = finish_reason  # stamped on the terminal ack
         self._cached_tokens = cached_tokens  # stamped on the first ack (admission reply)
+        self._prefill_ms = prefill_ms  # the scheduler stamps it on the first generated token
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
             mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
@@ -364,7 +365,8 @@ class FakeState:
             yield UserReply(uid=uid, incremental_output=text, finished=finished,
                             finish_reason=self._finish_reason if finished else None,
                             prompt_tokens_delta=pt, completion_tokens_delta=ct,
-                            cached_tokens=self._cached_tokens if i == 0 else 0)
+                            cached_tokens=self._cached_tokens if i == 0 else 0,
+                            prefill_ms=self._prefill_ms if i == 0 else 0.0)
 
     async def stream_with_cancellation(self, gen, request, uid):
         async for chunk in gen:
@@ -967,3 +969,38 @@ def test_convert_function_call_output_text_list_stays_a_plain_tool_message():
     spec = RP.convert_responses_to_genspec(req, {})
     assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool"]
     assert spec.messages[2]["content"] == "ab"
+
+
+# --------------------------------------------------------------------------- #
+# Per-request metrics (--enable-metrics-report)
+# --------------------------------------------------------------------------- #
+def test_route_nonstream_metrics_only_with_flag():
+    fake = FakeState([("Hello world", True, 5, 2)], cached_tokens=3, prefill_ms=6.0)
+    fake.config.enable_metrics_report = True
+    body = _client(fake).post("/v1/responses", json={"model": "gpt-x", "input": "hi"}).json()
+    assert body["metrics"]["prefill_time_ms"] == 6.0
+    assert body["metrics"]["prefill_tokens"] == 2 and body["metrics"]["cached_prompt_tokens"] == 3
+    assert body["metrics"]["total_time_ms"] > 0
+
+    off = _client(FakeState([("Hello world", True, 5, 2)])).post(
+        "/v1/responses", json={"model": "gpt-x", "input": "hi"}
+    ).json()
+    assert "metrics" not in off
+
+
+def test_route_stream_completed_event_carries_metrics():
+    fake = FakeState([("Hello world", True, 5, 2)], cached_tokens=3, prefill_ms=6.0)
+    fake.config.enable_metrics_report = True
+    r = _client(fake).post(
+        "/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": True}
+    )
+    completed = None
+    for block in r.text.split("\n\n"):
+        for line in block.split("\n"):
+            if line.startswith("data:"):
+                payload = json.loads(line[len("data:"):].strip())
+                if payload.get("type") == "response.completed":
+                    completed = payload
+    assert completed is not None
+    assert completed["response"]["metrics"]["prefill_time_ms"] == 6.0
+    assert completed["response"]["metrics"]["cached_prompt_tokens"] == 3
