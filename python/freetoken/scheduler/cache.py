@@ -50,11 +50,9 @@ class CacheManager:
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
         # SWARadixCache reuse machinery (tree match/insert/evict_swa/swa_uuid lock).
         self.swa_paged = swa_pool is not None and getattr(swa_pool, "swa_paged", False)
-        # Owned-pool capability pickup: a plugged-in swa pool may cap the prefill chunk (DSV4:
-        # ~half the window working set). Instance attrs shadow the class defaults; absent
-        # attributes leave the defaults untouched (Gemma4).
-        if swa_pool is not None:
-            self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
+        # Owned-pool capability pickup is a PROPERTY (below), not a snapshot taken here.
+        # This used to read `getattr(swa_pool, "prefill_chunk_budget", None)` into an
+        # instance attribute, which froze the cap at its construction-time value.
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
         self.num_pages = num_pages
@@ -64,7 +62,34 @@ class CacheManager:
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
-    prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
+
+    @property
+    def prefill_chunk_budget(self) -> int | None:
+        """Live prefill-chunk cap from the owned window pool, re-read on every access.
+
+        None for a generic shared page pool (no per-model cap) and for a pool that
+        does not publish one (Gemma4).
+
+        This MUST NOT be snapshotted. It used to be an int copied in ``__init__``,
+        so it kept its construction-time value for the life of the manager, and
+        ``rebuild`` never refreshed it. Two consequences, both real:
+
+        * ``Scheduler.rebuild_cache`` recomputes ``prefill_budget`` from this after a
+          runtime resize. Reading a frozen value meant it wrote back the number it
+          already had, so resizing the DSV4 window pool through
+          ``POST /v1/cache/rebuild`` moved the pool but left prefill chunking exactly
+          where it was. Measured on DSV4-Flash: the pool went 100 -> 215 window pages
+          and the chunk budget stayed at 4864, so an 11.7k prompt still took three
+          whole-layer expert streams (32.5s) instead of the one it was sized for.
+        * Worse in the shrink direction, and the hazard ``rebuild_cache``'s own comment
+          warns about: after shrinking the window pool the stale cap is too LARGE, so
+          the next long prompt is chunked past what the pool can hold and crashes
+          ``_alloc_window``.
+        """
+        pool = self.swa_pool
+        if pool is None:
+            return None
+        return getattr(pool, "prefill_chunk_budget", None)
 
     @property
     def prefill_chunk_align(self) -> int:
