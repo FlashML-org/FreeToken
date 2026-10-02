@@ -92,7 +92,9 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
         if _SHUTTING_DOWN.is_set():
             return  # an external stop got here first
         logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
-        os.kill(os.getpid(), signal.SIGTERM)
+        # Raised in-process so uvicorn's handler runs the lifespan shutdown that stops the workers;
+        # on Windows, os.kill on our own pid is TerminateProcess and runs no handler.
+        signal.raise_signal(signal.SIGTERM)
 
     timer = threading.Timer(grace_s, _stop)
     timer.daemon = True
