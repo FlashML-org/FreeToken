@@ -3,12 +3,70 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.kernel.triton.gemma4_fused import gemma_dual_rmsnorm_residual_scalar
-from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, make_moe_layer
+from freetoken.layers import (
+    BaseOP,
+    GemmaRMSNorm,
+    LinearReplicated,
+    MoELayer,
+    make_moe_layer,
+)
 from freetoken.models.blocks import GatedMLP
+from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+class Gemma4ResidentQ4MoELayer(MoELayer):
+    """Keep Gemma 4 GGUF Q4_0 expert banks resident and bypass the slot cache."""
+
+    def __init__(self, *args, **kwargs):
+        # Native packed Q4_0 banks own their storage, so suppress dense BF16 allocation.
+        kwargs["quant_config"] = None
+        # Construct the common routing metadata without allocating generic expert weights.
+        super().__init__(*args, allocate_experts=False, **kwargs)
+        if self.hidden_size % 32 or self.intermediate_size % 32:
+            raise ValueError(
+                "Gemma 4 resident Q4_0 experts require hidden and intermediate sizes "
+                "divisible by the 32-value GGUF block size"
+            )
+        # Hold the fused gate/up rows exactly as they are encoded in the GGUF checkpoint.
+        self.gate_up_q = torch.empty(
+            self.num_experts,
+            2 * self.intermediate_size,
+            row_bytes(self.hidden_size, GGML_Q4_0),
+            dtype=torch.uint8,
+        )
+        # Hold the down-projection rows in the same native Q4_0 block representation.
+        self.down_q = torch.empty(
+            self.num_experts,
+            self.hidden_size,
+            row_bytes(self.intermediate_size, GGML_Q4_0),
+            dtype=torch.uint8,
+        )
+
+    def routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Reuse the validated packed-Q4 expert kernel with original expert identifiers.
+        from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+
+        # Execute directly against resident banks, eliminating LRU and copy dispatches.
+        out = fused_experts_gguf_q4_0(
+            hidden_states,
+            self.gate_up_q,
+            self.down_q,
+            topk_weights,
+            topk_ids,
+            self.activation,
+        )
+        # Preserve the ordinary resident-MoE tensor-parallel reduction contract.
+        return self._maybe_all_reduce(out)
 
 
 class Gemma4Router(BaseOP):
@@ -45,6 +103,12 @@ class Gemma4MLP(BaseOP):
             config,
             layer_id=layer_id,
             activation="gelu_tanh",
+            # The custom resident class is selected only by the explicit fused strategy.
+            resident_cls=(
+                Gemma4ResidentQ4MoELayer
+                if getattr(config, "moe_weight_format", None) == "q4_0"
+                else None
+            ),
             quant_config=config.quant,
             prefix=f"{prefix}.experts",
         )
@@ -106,7 +170,8 @@ class Gemma4DenseMLP(BaseOP):
 
 
 __all__ = [
-    "Gemma4MLP",
     "Gemma4DenseMLP",
+    "Gemma4MLP",
+    "Gemma4ResidentQ4MoELayer",
     "Gemma4Router",
 ]

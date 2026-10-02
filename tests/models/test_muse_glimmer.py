@@ -377,6 +377,11 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, inclu
     from freetoken.models.muse_glimmer.weight import iter_weights
 
     hf = _hf_config(num_layers=4, vision=True)
+    # Keep the loader geometry realistic without serializing a production-size checkpoint.
+    text = hf.text_config
+    text.hidden_size, text.intermediate_size = 256, 384
+    text.num_attention_heads, text.num_key_value_heads, text.head_dim = 4, 2, 64
+    text.vocab_size = 128
     tensors = _bf16_checkpoint_tensors(hf)
     _write_shards(tmp_path, {"model-00001-of-00001.safetensors": tensors})
     import freetoken.models.muse_glimmer.weight as w

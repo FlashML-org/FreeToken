@@ -24,6 +24,8 @@ from triton.language import target_info
 
 from freetoken.utils.arch import is_rocm, is_sm90_supported
 
+# HIP uses portable libdevice math below because the fast inline assembly is NVIDIA PTX.
+
 SILU = 0
 GELU = 1
 GELU_TANH = 2
@@ -141,6 +143,7 @@ def _act_and_mul(
     M = x2.shape[0]
     grid = lambda meta: (M, triton.cdiv(d, meta["BLOCK_D"]))
     pdl = _pdl_supported()
+    # HIP rejects launch_pdl even when false, so the keyword is CUDA-only.
     # Fixed via H100 sweep (72-config grid; 512/w4/s3 within 11% everywhere,
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)

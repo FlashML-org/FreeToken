@@ -1,5 +1,6 @@
 from .arch import (
     is_arch_supported,
+    is_rocm_runtime,
     is_rocm,
     get_rocm_gfx_arch,
     is_sm90_family,
@@ -37,6 +38,7 @@ __all__ = [
     "load_toolcall_anchor_id",
     "init_logger",
     "is_arch_supported",
+    "is_rocm_runtime",
     "is_rocm",
     "get_rocm_gfx_arch",
     "is_sm90_family",

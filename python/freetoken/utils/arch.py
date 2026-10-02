@@ -54,14 +54,39 @@ def get_rocm_gfx_arch() -> str | None:
     return None
 
 
+def rocm_clang_flags() -> list[str]:  # Keep clangd target flags aligned with detected hardware.
+    """Return HIP flags without guessing when no ROCm architecture is known."""  # Explain the fallback contract.
+    flags = ["-xhip"]  # Always select HIP syntax for a ROCm translation unit.
+    arch = get_rocm_gfx_arch()  # Prefer the bound GPU or an explicit cross-compile target.
+    if arch is not None:  # Avoid targeting an unrelated architecture when detection fails.
+        flags.append(f"--offload-arch={arch}")  # Restrict clangd to the known AMD target.
+    return flags  # Leave the offload architecture unspecified if it is unknown.
+
+
+@functools.cache
+def is_rocm_runtime() -> bool:
+    """Return whether the active PyTorch build uses AMD's HIP runtime.
+
+    PyTorch intentionally preserves the ``torch.cuda`` namespace on ROCm for
+    source compatibility.  Consequently, a Radeon architecture such as
+    ``gfx1151`` can be reported as a numeric capability that superficially
+    resembles a newer NVIDIA SM version.  Architecture gates in this module
+    control NVIDIA-only features such as Programmatic Dependent Launch, so
+    they must reject HIP before comparing those numeric values.
+    """
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
 @functools.cache
 def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
-    if is_rocm():
-        return None
-    if not torch.cuda.is_available() or not torch.version.cuda:
+    # ROCm retains torch.cuda APIs, but neither CUDA SM feature checks nor the
+    # numeric capability ordering below are meaningful for an AMD GPU.
+    if is_rocm_runtime() or not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
 

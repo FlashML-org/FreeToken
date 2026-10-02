@@ -1,39 +1,48 @@
-# AMD ROCm installation (WIP)
+# AMD ROCm 10 installation and qualification
 
-AMD support is experimental and remains a work in progress. See the
-[AMD Support roadmap](https://github.com/FlashML-org/FreeToken/issues/541) for
-the current integration and qualification status.
+FreeToken's AMD path is being qualified on the ROCm 10 stack. The supported
+campaign environment uses ROCm `10.0.0` and a matching ROCm-enabled PyTorch
+distribution; this is separate from the CUDA `accel` extra and its NVIDIA
+packages.
 
-## Requirements
+## Runtime policy
 
-- Linux x86_64
-- AMD RDNA3/RDNA4 GPU (`gfx1100`-`gfx1103`, `gfx1200`, or `gfx1201`)
-- ROCm 7.14
-- Python >= 3.10
+- Use ROCm 10 only. Do not install ROCm 7.x packages, wheels, SDKs, or indexes.
+- On a qualified target, `/opt/rocm` selects `/opt/rocm-10.0`, the
+  version file reports `10.0.0`, and AMD ROCm packages are release `10.0.0-4`.
+- The validated Python environment uses PyTorch `2.13.0+rocm10.0.0`. Its HIP
+  component version string is `7.15.26333`; treat this as component metadata,
+  not evidence of a separately installed ROCm 7.x distribution.
+- Keep the system ROCm installation, FreeToken source, HIP Python environment,
+  test evidence, and model files separate. Do not replace the system runtime
+  or reuse a CUDA-enabled environment during candidate qualification.
 
-## Install from source
+AMD's [official ROCm installation guide](https://rocm.docs.amd.com/en/latest/install/rocm.html)
+documents supported system installation methods. Qualification targets with
+ROCm 10 already installed should use that installation and
+must not rerun a system installer unless a separately authorized remediation
+requires it.
 
-Use an official ROCm PyTorch image whose PyTorch version satisfies the project's
-`torch>=2.11,<2.12` constraint. For RDNA4, the matching ROCm 7.14 image is:
+## FreeToken source build
+
+Provision the matching ROCm 10 PyTorch/HIP/Triton environment before building
+FreeToken. Build the exact candidate from its isolated checkout with package
+resolution disabled for that step; this prevents PEP 517 isolation or pip from
+replacing the pre-provisioned ROCm 10 ABI. The repository's `rocm` extra is
+intentionally empty and does not install or choose an AMD toolchain version.
+
+The candidate build is not device qualification. Record the exact source SHA,
+system ROCm version and package release, PyTorch and HIP versions, `gfx` target,
+native build/import result, and the full focused-test accounting. A run with
+GPU visibility hidden only covers host-side behavior; HIP kernels, inference,
+and throughput require separate device-visible acceptance tests on each target.
 
 ```bash
-VIDEO_GID="$(getent group video | cut -d: -f3)"
-RENDER_GID="$(getent group render | cut -d: -f3)"
-docker run --rm -it \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add="$VIDEO_GID" --group-add="$RENDER_GID" --ipc=host \
-  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-  -e PYTORCH_ROCM_ARCH=gfx1201 -e FREETOKEN_ROCM_ARCH=gfx1201 \
-  -v "$PWD:/workspace/FreeToken" -w /workspace/FreeToken \
-  rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0 bash
+# Install the editable FreeToken source without replacing the pre-provisioned ROCm 10 packages.
+python -m pip install --no-deps --no-build-isolation -e .
 ```
 
-Inside the container, preserve the ROCm-enabled PyTorch already supplied by the
-image and disable build isolation so it is also used to compile the extensions:
-
-```bash
-python -m pip install --no-build-isolation -e .
-```
-
-Set both architecture variables to `gfx1200` for RX 9060 family GPUs, or to the
-actual target reported by `rocminfo`.
+See [ROCm 10 runtime and qualification notes](amd-rocm-gfx1151.md) for the
+campaign's tested environment layout and evidence boundaries. The current
+architecture targets are `gfx1151` and `gfx1150`; evidence
+for one target must not be generalized to another.

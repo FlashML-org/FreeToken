@@ -1968,13 +1968,19 @@ struct CpuMoeExecutor {
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::submit_cb,
-                       reinterpret_cast<void*>(task));
+    const auto err = cudaLaunchHostFunc(
+        reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::submit_cb,
+        reinterpret_cast<void*>(task));
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc submit callback failed: ",
+                cudaGetErrorString(err));
   }
 
   void sync_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::sync_cb,
-                       reinterpret_cast<void*>(task));
+    const auto err = cudaLaunchHostFunc(
+        reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::sync_cb,
+        reinterpret_cast<void*>(task));
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchHostFunc sync callback failed: ",
+                cudaGetErrorString(err));
   }
 
   // Register a (layer, batch-size) slot's task so the coordinator can dispatch it on a

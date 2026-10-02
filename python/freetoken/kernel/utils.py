@@ -42,7 +42,7 @@ def _cuda_arch_list() -> List[str]:
         return arch_list
     import torch
 
-    if not torch.cuda.is_available():
+    if torch.version.hip is not None or not torch.cuda.is_available():
         return []
     major, minor = torch.cuda.get_device_capability()
     return [f"{major}.{minor}"]
@@ -80,7 +80,13 @@ def _pin_tvm_ffi_arch_ctx(arch_list: List[str], env_var: str) -> Iterator[None]:
 
 def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
     """CUDA nvcc flags for a kernel build. tvm-ffi emits one SASS cubin per arch in ``arch_list`` and no PTX, so add the PTX of the highest arch: a GPU newer than every listed arch still runs through the driver's PTX JIT. This flag also carries the arch into tvm-ffi's build hash, which skips tvm-ffi's own -gencode, so GPUs of different archs never share a cached .so."""
-    flags = DEFAULT_CUDA_CFLAGS + extra
+    import torch
+
+    flags = list(DEFAULT_CUDA_CFLAGS)
+    if torch.version.hip is not None:
+        # nvcc-only: hipcc/clang rejects it outright.
+        flags = [f for f in flags if f != "--expt-relaxed-constexpr"]
+    flags = flags + extra
     if arch_list:
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")
@@ -102,9 +108,9 @@ def _rocm_link_flags() -> List[str]:
     """Make ROCm's runtime library discoverable to JIT link commands.
 
     Traditional ROCm installs provide ``libamdhip64.so`` under ``$ROCM_HOME/lib``.
-    ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
+    Some Python SDK layouts provide only the versioned soname, while TVM-FFI
     still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
-    an explicit linker search path without modifying the Python environment.
+    an explicit linker search path without modifying the selected ROCm environment.
     """
     candidates: list[pathlib.Path] = []
     if os.getenv("ROCM_HOME"):
@@ -121,25 +127,41 @@ def _rocm_link_flags() -> List[str]:
         candidates.append(pathlib.Path(next(iter(spec.submodule_search_locations))))
     candidates.append(pathlib.Path("/opt/rocm"))
 
-    for rocm_home in dict.fromkeys(candidates):
-        library_dir = rocm_home / "lib"
-        unversioned = library_dir / "libamdhip64.so"
-        link_dir = library_dir
-        if not unversioned.exists():
-            versioned = sorted(library_dir.glob("libamdhip64.so.*"))
-            if not versioned:
-                continue
-            link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib"
-            link_dir.mkdir(parents=True, exist_ok=True)
-            compat_link = link_dir / "libamdhip64.so"
-            if not compat_link.exists() and not compat_link.is_symlink():
-                try:
-                    compat_link.symlink_to(versioned[-1])
-                except FileExistsError:
-                    # Multiple tensor-parallel ranks may prepare the same cache.
-                    pass
+    def soname_version(path: pathlib.Path) -> tuple[int, ...]:  # Compare numeric SONAME components rather than lexical filenames.
+        suffix = path.name.partition(".so.")[2]  # Isolate the version suffix after the shared-library marker.
+        return tuple(int(part) if part.isdigit() else -1 for part in suffix.split("."))  # Rank each numeric component independently.
 
-        return [f"-L{link_dir}", f"-Wl,-rpath,{library_dir}"]
+    for rocm_home in dict.fromkeys(candidates):  # Preserve the explicit-root priority while removing duplicate paths.
+        for library_dir in (rocm_home / "lib64", rocm_home / "lib"):  # Support both standard ROCm library layouts.
+            unversioned = library_dir / "libamdhip64.so"  # Prefer the SDK-provided linker name when present.
+            link_dir = library_dir  # Link directly against a complete SDK layout by default.
+            if not unversioned.exists():  # Create a private compatibility name only for versioned-only SDK layouts.
+                versioned = list(library_dir.glob("libamdhip64.so.*"))  # Collect every runtime SONAME supplied by this root.
+                if not versioned:  # Try the next library layout when this directory has no HIP runtime.
+                    continue  # Keep discovery bounded to the declared ROCm roots.
+                cache_root = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"))  # Honor an explicit writable cache filesystem.
+                link_dir = cache_root / "freetoken" / "rocm-lib"  # Keep compatibility state outside the SDK and full home filesystems.
+                link_dir.mkdir(parents=True, exist_ok=True)  # Prepare the private linker directory idempotently.
+                compat_link = link_dir / "libamdhip64.so"  # Provide the unversioned name expected by TVM-FFI.
+                selected_runtime = max(versioned, key=soname_version).resolve()  # Select the greatest numeric SONAME from this SDK.
+                if compat_link.exists() and not compat_link.is_symlink():  # Never replace an unexpected user-created regular file.
+                    raise RuntimeError(f"Refusing to replace non-symlink ROCm compatibility file: {compat_link}")  # Fail with an actionable cache path.
+                current_runtime = None  # Treat a missing or broken compatibility link as stale.
+                if compat_link.is_symlink():  # Inspect both valid and broken links left by an earlier ROCm installation.
+                    try:  # Resolve the complete target so relative and absolute links compare consistently.
+                        current_runtime = compat_link.resolve(strict=True)  # Record the runtime currently selected by the cache.
+                    except FileNotFoundError:  # A removed ROCm stack leaves a broken link that must be refreshed.
+                        pass  # Keep the stale marker as None for the replacement branch.
+                if current_runtime != selected_runtime:  # Refresh links that point at a different or removed ROCm runtime.
+                    replacement = link_dir / f".libamdhip64.so.{os.getpid()}.tmp"  # Give each concurrent builder a process-local staging link.
+                    replacement.unlink(missing_ok=True)  # Remove only this process's abandoned staging path from an interrupted attempt.
+                    try:  # Publish the new link atomically so parallel ranks never observe a missing final path.
+                        replacement.symlink_to(selected_runtime)  # Prepare a link to the selected runtime without changing the shared name yet.
+                        replacement.replace(compat_link)  # Atomically replace the old or broken compatibility symlink.
+                    finally:  # Reclaim a staging link if publication failed before the atomic replacement.
+                        replacement.unlink(missing_ok=True)  # Leave no process-specific cache artifact behind.
+
+            return [f"-L{link_dir}", f"-Wl,-rpath,{library_dir}"]  # Bind this build to the selected SDK library directory.
 
     raise RuntimeError("Unable to locate libamdhip64 for ROCm JIT linking")
 
@@ -329,7 +351,7 @@ def load_aot(
 
     if is_rocm:
         cuda_cflags = _hip_cflags(extra_cuda_cflags, arch_list)
-        runtime_ldflags = _rocm_link_flags()
+        runtime_ldflags = _rocm_link_flags() if cuda_files else []  # Keep C++-only modules independent of HIP runtime discovery.
         arch_list_env = ROCM_ARCH_LIST_ENV
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags, arch_list)
@@ -400,7 +422,7 @@ def load_jit(
 
     if is_rocm:
         cuda_cflags = _hip_cflags(extra_cuda_cflags, arch_list)
-        runtime_ldflags = _rocm_link_flags()
+        runtime_ldflags = _rocm_link_flags() if (cuda_files or cuda_wrappers) else []  # Link HIP only when a GPU translation unit exists.
         arch_list_env = ROCM_ARCH_LIST_ENV
     else:
         cuda_cflags = _cuda_cflags(extra_cuda_cflags, arch_list)

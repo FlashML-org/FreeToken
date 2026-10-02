@@ -44,6 +44,13 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # Some GGUF recipes use one exceptional packed layout for a small subset of
+    # layers. It receives its own cache because cache banks must have a uniform
+    # row geometry. ``auxiliary_layer_ids`` maps a model-layer id to its index
+    # in the auxiliary source list.
+    auxiliary_quant_format: str | None = None
+    auxiliary_sources: dict[str, list[torch.Tensor]] | None = None
+    auxiliary_layer_ids: tuple[int, ...] = ()
     # the expert (kind, kernel) the banks were packed for; None for the legacy providers
     kind: QuantKind | None = None
     kernel: str | None = None
@@ -172,9 +179,86 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
-# expert formats that still load through their own provider (GGUF)
+# Expert formats that still load through their own provider (GGUF).
+def _q4_k_q5_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    """Load Qwen's mixed Q4_K gate/up and Q5_K down GGUF expert banks."""
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q4_k_q5_k: the source is one GGUF file"
+        )
+    from freetoken.models.qwen3_5_moe.gguf import (
+        dummy_q4_k_q5_k_expert_sources,
+        load_q4_k_q5_k_expert_sources,
+    )
+
+    sink = None if dummy else layer_sink
+    sources = (
+        dummy_q4_k_q5_k_expert_sources(model_config)
+        if dummy
+        else load_q4_k_q5_k_expert_sources(model_path, model_config, layer_sink=sink)
+    )
+    auxiliary_sources = None
+    auxiliary_format = None
+    if sources.q6_layer_ids:
+        auxiliary_format = "q6_k_down"
+        auxiliary_sources = {"down": sources.q6_down}
+    return ExpertBanks(
+        "q4_k_q5_k",
+        {name: sources.primary[name] for name in _BANK_SCHEMAS["q4_k_q5_k"]},
+        streamed=sink is not None,
+        auxiliary_quant_format=auxiliary_format,
+        auxiliary_sources=auxiliary_sources,
+        auxiliary_layer_ids=sources.q6_layer_ids,
+    )
+
+
+def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    args = model_config.dsv4_args
+    assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
+    # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
+    # no alphas. DeepSeek-V4's own grouped GEMV kernels read them via bank_views().
+    # Written as-loaded -> streamable (dummy fabricates in one shot; never streamed).
+    sink = None if dummy else layer_sink
+    if dummy:
+        from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
+
+        banks = dummy_dsfp4_expert_sources(args)
+    elif parallel:  # parallel: common chunked multi-threaded O_DIRECT reader
+        from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
+
+        banks = load_dsfp4_expert_sources_parallel(
+            model_path, args, workers=workers, chunk=chunk, layer_sink=sink
+        )
+    else:
+        from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
+
+        banks = load_dsfp4_expert_sources(model_path, args, layer_sink=sink)
+    return ExpertBanks(
+        "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]}, streamed=sink is not None
+    )
+
+
+def _model_setup_override(model_config):
+    architectures = getattr(model_config, "architectures", None)
+    if not architectures:
+        return None
+
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        spec = get_model_spec(architectures[0])
+    except ValueError:
+        return None
+    try:
+        return _load_attr(spec.module, "setup_offload_expert_banks")
+    except AttributeError:
+        return None
+
+
+# ModelConfig.expert_quant -> provider
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "q4_k_q5_k": _q4_k_q5_k_banks,
 }
 
 

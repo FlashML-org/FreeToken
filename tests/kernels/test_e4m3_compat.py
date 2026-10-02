@@ -38,7 +38,7 @@ _MMA_TOL = dict(rtol=5e-2, atol=0.5)
 
 
 def _native_cc() -> bool:
-    return torch.cuda.get_device_capability() >= (8, 9)
+    return torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 9)  # Reject AMD gfx tuples that only resemble CUDA capabilities.
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm")
@@ -315,6 +315,7 @@ def _gate_main(arch: int) -> None:
 
     tgt = GPUTarget("cuda", arch, 32)
     driver.active.get_current_target = lambda: tgt
+    torch.version.hip = None  # Keep the simulated host ABI consistent with the foreign CUDA compiler target.
     torch.cuda.get_device_capability = lambda device=None: (arch // 10, arch % 10)
 
     # flashinfer JIT-compiles its ops for the (patched) capability and then really
