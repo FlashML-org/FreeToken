@@ -142,6 +142,7 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        last_track_seqlen: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -223,6 +224,9 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        # A short continuation cannot make a new snapshot; retain the pending one
+        # together with its ping-pong cursor until the final prefill commit.
+        req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -240,6 +244,7 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
