@@ -225,9 +225,9 @@ def test_host_surfaces_a_failed_deferred_fill_at_dispatch_exit(tmp_path):
 
 
 def test_ftw_side_files_carry_the_tables_and_reopen(tmp_path):
-    """An FTW conversion keeps the Engram tables as ``engram-table-NN.safetensors`` side files (the
-    converter's ``ftw_side_files`` hook); the row source resolves them through the file headers
-    exactly like the HF shards, byte for byte."""
+    """An FTW conversion copies the shards holding the Engram tables next to it (the converter's
+    ``ftw_side_files`` hook, which skips the HF index); the row source resolves the copies through
+    their headers exactly like the HF shards, byte for byte."""
     from freetoken.kernel.row_store import RowStore
     from freetoken.models.deepseek_v41.engram_table import engram_row_source
     from freetoken.models.deepseek_v41.weight import ftw_side_files
@@ -236,9 +236,11 @@ def test_ftw_side_files_carry_the_tables_and_reopen(tmp_path):
     out.mkdir()
     tensors = write_tiny_checkpoint(str(src))
     (out / "config.json").write_bytes((src / "config.json").read_bytes())  # the converter copies the metadata
-    assert ftw_side_files(str(src), str(out)) == ["engram-table-01.safetensors"]
+    shard = "model-00001-of-00001.safetensors"  # the tiny checkpoint's single shard holds the table
+    assert ftw_side_files(str(src), str(out)) == [shard]
+    assert (out / shard).read_bytes() == (src / shard).read_bytes() and not (out / "model.safetensors.index.json").exists()
     source = engram_row_source(str(out), 1)
-    assert source.path.endswith("engram-table-01.safetensors") and source.num_rows == 4096 and source.head_dim == 32
+    assert source.path == str(out / shard) and source.num_rows == 4096 and source.head_dim == 32
     assert torch.equal(source.scales, tensors["layers.1.engram.embed.scale"].view(torch.uint8))
     store = RowStore(paths=[source.path], extent_file=[0], extent_base=[source.base], rows_per_extent=source.num_rows,
                      row_bytes=source.head_dim, row_stride=source.head_dim, use_io_uring=False)

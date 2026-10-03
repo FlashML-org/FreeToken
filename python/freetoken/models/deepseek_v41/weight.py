@@ -171,32 +171,27 @@ def iter_vision_weights(model_path: str, device):
 
 
 # ----- FTW side files: the Engram tables ----------------------------------------------------------
-ENGRAM_TABLE_FILE = "engram-table-{layer:02d}.safetensors"
-
-
 def engram_table_names(layer_id: int) -> tuple[str, str]:
     return f"layers.{layer_id}.engram.embed.weight", f"layers.{layer_id}.engram.embed.scale"
 
 
 def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
-    """Copy each Engram layer's table (fp8 rows + ue8m0 scales) into ``engram-table-NN.safetensors``
-    next to an FTW checkpoint. The tables are never FTW entries: ``load_host_tables`` maps them in place
-    from whatever safetensors files sit in the checkpoint directory (``engram_table.engram_row_source``),
-    so a converted directory reopens exactly like the HF one. Streams the 98 GiB tensors chunk by chunk."""
-    from freetoken.models.loader import copy_extents_to_safetensors, safetensors_tensor_extent
+    """Copy the checkpoint shards holding the Engram tables (fp8 rows + ue8m0 scales) next to an FTW
+    checkpoint. The tables are never FTW entries: ``load_host_tables`` maps them in place from whatever
+    safetensors file holds them (``engram_table.engram_row_source`` reads the headers), and the FTW
+    loader never reads ``.safetensors`` as weights, so the shard's other tensors ride along unused."""
+    import shutil
+
+    from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils import download_hf_weight
 
     folder = download_hf_weight(model_path)
     args = load_args(folder)
-    written: list[str] = []
-    for layer_id in args.engram_layer_ids:
-        if layer_id >= args.n_layers:
-            continue
-        name = ENGRAM_TABLE_FILE.format(layer=layer_id)
-        extents = {n: safetensors_tensor_extent(folder, n) for n in engram_table_names(layer_id)}
-        copy_extents_to_safetensors(os.path.join(out_dir, name), extents)
-        written.append(name)
-    return written
+    shard_of = safetensors_weight_map(folder)
+    shards = sorted({shard_of[n] for layer_id in args.engram_layer_ids if layer_id < args.n_layers for n in engram_table_names(layer_id)})
+    for shard in shards:
+        shutil.copyfile(os.path.join(folder, shard), os.path.join(out_dir, shard))
+    return shards
 
 
 # ----- routed MXFP4 expert pieces ---------------------------------------------------------------

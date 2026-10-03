@@ -78,8 +78,8 @@ warning; pass `--moe-strategy offload` to use them.
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
   demand (keep them on a fast NVMe; the 6 GiB of table scales stay in host RAM), using
-  bounded pinned staging buffers; an FTW conversion copies them next
-  to the checkpoint as `engram-table-NN.safetensors`.
+  bounded pinned staging buffers; an FTW conversion copies the shards that hold them next
+  to the checkpoint.
   SWA bounded replay (DeepSeek_V41_Tech_Report.pdf, shipped in the checkpoint, §3.2.2): a replayed
   segment recomputes only the SWA KV of its last `n_win` tokens and truncates each query's window to
   the segment. *Encoder* replay rebuilds the encoder SWA KV behind a prefix hit from the global KV

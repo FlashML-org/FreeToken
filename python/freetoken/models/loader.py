@@ -71,54 +71,6 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
     return weight_map
 
 
-@dataclass(frozen=True)
-class TensorExtent:
-    """Where a safetensors tensor's bytes sit in its shard: a contiguous ``[offset, offset + nbytes)``."""
-
-    path: str
-    offset: int
-    nbytes: int
-    shape: tuple[int, ...]
-    dtype: str  # the safetensors dtype string (e.g. "F8_E4M3")
-
-
-def safetensors_tensor_extent(folder: str, name: str) -> TensorExtent:
-    """Locate ``name`` in the checkpoint without reading it (for tables streamed from disk in place)."""
-    shard = safetensors_weight_map(folder)[name]
-    path = os.path.join(folder, shard)
-    with open(path, "rb") as fh:
-        n = struct.unpack("<Q", fh.read(8))[0]
-        header = json.loads(fh.read(n))
-    meta = header[name]
-    start, end = meta["data_offsets"]
-    return TensorExtent(path, 8 + n + start, end - start, tuple(meta["shape"]), meta["dtype"])
-
-
-def copy_extents_to_safetensors(dst_path: str, extents: dict[str, TensorExtent], chunk: int = 64 << 20) -> None:
-    """Write ``extents`` (name -> where its bytes live) as a fresh safetensors file, streaming the
-    payload in ``chunk`` byte pieces -- for tables far larger than host RAM (the Engram embeddings)."""
-    header: dict[str, dict] = {}
-    offset = 0
-    for name, ext in extents.items():
-        header[name] = {"dtype": ext.dtype, "shape": list(ext.shape), "data_offsets": [offset, offset + ext.nbytes]}
-        offset += ext.nbytes
-    blob = json.dumps(header, separators=(",", ":")).encode()
-    blob += b" " * (-len(blob) % 8)  # safetensors pads the header to 8 bytes
-    with open(dst_path, "wb") as dst:
-        dst.write(struct.pack("<Q", len(blob)))
-        dst.write(blob)
-        for ext in extents.values():
-            with open(ext.path, "rb") as src:
-                src.seek(ext.offset)
-                left = ext.nbytes
-                while left:
-                    piece = src.read(min(chunk, left))
-                    if not piece:
-                        raise IOError(f"{ext.path}: short read copying a {ext.nbytes}-byte tensor")
-                    dst.write(piece)
-                    left -= len(piece)
-
-
 def drop_page_cache(path: str) -> None:
     """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
     try:

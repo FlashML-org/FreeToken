@@ -21,6 +21,9 @@ the launch so its failure surfaces before the step's output is consumed.
 
 from __future__ import annotations
 
+import json
+import os
+import struct
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +41,30 @@ logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
+class _TensorExtent:
+    """Where a safetensors tensor's bytes sit in its shard: a contiguous ``[offset, offset + nbytes)``."""
+
+    path: str
+    offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: str  # the safetensors dtype string (e.g. "F8_E4M3")
+
+
+def _tensor_extent(folder: str, name: str) -> _TensorExtent:
+    """Locate ``name`` in the checkpoint directory without reading it (the table is streamed in place)."""
+    from freetoken.models.loader import safetensors_weight_map
+
+    path = os.path.join(folder, safetensors_weight_map(folder)[name])
+    with open(path, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        header = json.loads(fh.read(n))
+    meta = header[name]
+    start, end = meta["data_offsets"]
+    return _TensorExtent(path, 8 + n + start, end - start, tuple(meta["shape"]), meta["dtype"])
+
+
+@dataclass(frozen=True)
 class EngramRowSource:
     """The fp8 table tensor in its shard (one extent) and its host-resident scales."""
 
@@ -50,16 +77,14 @@ class EngramRowSource:
 
 def engram_row_source(folder: str, layer_id: int) -> EngramRowSource:
     """Locate a layer's table in whatever safetensors files the checkpoint directory holds: the HF
-    shards (through the index) or an FTW conversion's ``engram-table-NN.safetensors`` side files
-    (through their headers)."""
-    from freetoken.models.loader import safetensors_tensor_extent
+    shards (through the index) or the shards an FTW conversion copied next to it (through their headers)."""
     from safetensors import safe_open
 
-    weight = safetensors_tensor_extent(folder, f"layers.{layer_id}.engram.embed.weight")
+    weight = _tensor_extent(folder, f"layers.{layer_id}.engram.embed.weight")
     if weight.dtype != "F8_E4M3":
         raise ValueError(f"engram table of layer {layer_id} is {weight.dtype}, expected F8_E4M3")
     rows, head_dim = weight.shape
-    scale = safetensors_tensor_extent(folder, f"layers.{layer_id}.engram.embed.scale")
+    scale = _tensor_extent(folder, f"layers.{layer_id}.engram.embed.scale")
     with safe_open(scale.path, framework="pt", device="cpu") as f:
         scales = f.get_tensor(f"layers.{layer_id}.engram.embed.scale").view(torch.uint8).contiguous()
     if tuple(scales.shape) != (rows, head_dim // 32):
