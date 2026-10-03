@@ -13,6 +13,14 @@ and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 
+To check first whether a model fits your GPU, and which flags to change if it
+does not, run `ft info` with the same arguments; it takes seconds and reads no
+weights:
+
+```bash
+ft info ~/models/Qwen3.6-35B-A3B
+```
+
 ## Send a request
 
 Check what is being served:

@@ -112,6 +112,37 @@ def test_dsv4_kv_cost_and_floor_parity():
         DSV4PagedKVCache.solve_num_pages(_dsv4_config(num_page_override=1), 0)
 
 
+def test_plan_num_pages_is_solve_without_the_assert():
+    # the pre-load forecast reads the same page count the startup solve allocates, and a
+    # too-small budget as a number instead of an AssertionError
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    per_page = MHAKVCache.kv_cost(config)[0]
+    for available in (per_page * 2, per_page * 100 + 5, 10**9):
+        assert MHAKVCache.plan_num_pages(config, available) == MHAKVCache.solve_num_pages(config, available)
+    assert MHAKVCache.plan_num_pages(config, per_page) == 1
+    assert MHAKVCache.plan_num_pages(config, -per_page) == -1
+    with pytest.raises(AssertionError):
+        MHAKVCache.solve_num_pages(config, per_page)
+    assert MHAKVCache.plan_num_pages(_generic_config(num_page_override=7), 0) == 7
+
+
+def test_dsv4_plan_num_pages_matches_solve():
+    pytest.importorskip("freetoken.kvcache.dsv4_cost_model")
+    from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    floor = _dsv4_window_floor_pages(_dsv4_config(), 128)
+    config = _dsv4_config(num_page_override=floor + 3)
+    assert DSV4PagedKVCache.plan_num_pages(config, 0) == DSV4PagedKVCache.solve_num_pages(config, 0) == floor + 3
+    budget = 64 << 30
+    assert DSV4PagedKVCache.plan_num_pages(_dsv4_config(), budget) == DSV4PagedKVCache.solve_num_pages(
+        _dsv4_config(), budget)
+    with pytest.raises(ValueError, match="window working-set floor"):
+        DSV4PagedKVCache.plan_num_pages(_dsv4_config(num_page_override=1), 0)
+
+
 def test_startup_kv_budget_composition():
     # The engine-side budget must stay ratio*old - (old - new); a sign/order slip here
     # mis-sizes every model's startup KV pool with the whole CPU suite green.

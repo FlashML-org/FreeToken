@@ -252,24 +252,33 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     format-tag table sizes the GGUF format. ``None`` for unknown formats or missing dims
     (callers then skip the pre-load sizing)."""
     layers = getattr(model_config, "num_moe_layers", None)
+    per_expert = bank_bytes_per_expert(model_config, method)
     if method is not None and layers:
-        per_expert = sum(
+        return layers * method.cfg.num_experts * per_expert
+    experts = getattr(model_config, "num_experts", None)
+    if per_expert is None or not all((layers, experts)):
+        return None
+    return layers * experts * per_expert
+
+
+def bank_bytes_per_expert(model_config, method=None) -> int | None:
+    """Host bank bytes of one expert, which is also what one GPU slot of the offload cache holds
+    (``cache_budget.expert_bytes_per_slot`` over the loaded banks). ``None`` when unknown."""
+    if method is not None:
+        return sum(
             math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
             for spec in method.layout().values() if not spec.resident
         )
-        return layers * method.cfg.num_experts * per_expert
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
     )
     per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
-    layers = getattr(model_config, "num_moe_layers", None)
-    experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
-    if per_expert is None or not all((layers, experts, hidden, inter)):
+    if per_expert is None or not all((hidden, inter)):
         return None
-    return layers * experts * per_expert(hidden, inter)
+    return per_expert(hidden, inter)
 
 
 def load_expert_banks(

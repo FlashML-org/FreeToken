@@ -7,6 +7,7 @@ ft <command> [args]
 | Command | Purpose |
 |---|---|
 | `ft serve` | Start the API server (OpenAI `/v1/*`, Anthropic `/v1/messages`, Responses) |
+| `ft info` | Forecast a model's GPU memory for a serve configuration, without loading it |
 | `ft shell` | Chat with a server in the terminal |
 | `ft ctl` | Query and manage a running server over HTTP |
 | `ft launch` | Configure and launch a coding agent against a server |
@@ -69,6 +70,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--skip-preflight` | off | Load the weights even when the pre-load memory forecast says the configuration cannot fit; see [ft info](#ft-info) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
@@ -121,6 +123,65 @@ so a client can gate its attachment controls without reading the checkpoint conf
 | `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
 | `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
 | `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |
+
+## ft info
+
+```bash
+ft info <model> [ft serve flags] [--json] [--gpu-memory-gib N | --gpu-free-gib N]
+```
+
+Forecasts what `ft serve <model> [flags]` would put on the GPU, and whether it
+fits, without reading a single weight: it resolves the configuration the way the
+engine does, builds the model on PyTorch's meta device, and sizes every pool
+with the engine's own sizing code. It runs in a few seconds, needs no CUDA, and
+takes every `ft serve` flag, so "what if" combinations can be tried before a
+multi-minute load:
+
+```bash
+ft info ~/models/Qwen3.8-27B-NVFP4 --text-model-only
+ft info Qwen/Qwen3-30B-A3B --gpu-memory-gib 24 --max-running-requests 1
+```
+
+The report lists:
+
+- the architecture, the format each layer type is stored in on the GPU, and the
+  checkpoint's dtypes;
+- the weights resident on the GPU per category (attention, linear attention,
+  MLP, routed experts, embeddings / lm_head, vision encoder, MTP heads, rope
+  tables) next to what the checkpoint stores, so a skipped vision tower
+  (`--text-model-only`), MTP heads the engine does not load, or offloaded experts
+  living in host RAM are visible;
+- the budget: `--memory-ratio` x free memory, minus weights, the MoE expert slot
+  cache, the GDN state pool (slots x bytes), and the KV cache (bytes per token x
+  tokens);
+- what lives outside the budget: the attention backend's workspace, the page
+  table, the CUDA graphs, the prefill activations of one `--max-prefill-length`
+  chunk, and `--vram-reserve-mb`; the "free after init" line is the number the
+  engine logs as `Free memory after initialization`;
+- a verdict -- `fits`, `tight` or `does not fit` -- with the max context and the
+  number of concurrent requests, and tips: flag changes with their predicted
+  effect, plus the cheapest combination that fits.
+
+Free memory comes from NVML for the local GPU (`--gpu` picks the card), minus
+the CUDA context the engine creates first. `--gpu-memory-gib N` plans for an
+empty card of N GiB instead, `--gpu-free-gib N` for N GiB free as `nvidia-smi`
+reports it. Without a GPU and without these flags the weights and per-token
+costs are still reported. `--json` prints the same data for tools; the exit code
+is 1 when the configuration does not fit, else 0.
+
+Weights come from the meta-built model, whose parameters are exactly what the
+loader fills (tensors the family skips are absent, re-quantized ones already
+have their stored size); the checkpoint column reads only the safetensors
+headers -- from the local directory, the Hugging Face cache, or the Hub through
+HTTP range requests. The load overhead (kernel modules, library handles), the
+prefill activations and the CUDA graph memory are estimates and are labelled so.
+
+`ft serve` (and the offline `LLM` class) runs the same forecast right before it
+loads the weights, against the free memory it has just measured. A configuration
+whose KV cache cannot be sized even before those estimates is refused within
+seconds, with the forecast and the tips in the log, instead of failing with
+`Not enough memory for KV cache` after the load. A tight one only logs a warning
+and continues. `--skip-preflight` loads regardless.
 
 ## ft shell
 
