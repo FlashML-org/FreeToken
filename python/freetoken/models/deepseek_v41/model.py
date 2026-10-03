@@ -58,13 +58,6 @@ class Streams(NamedTuple):
             return self.residual
         return mhc_post(self.y, self.residual, self.post, self.comb)
 
-    def select(self, rows: torch.Tensor) -> "Streams":
-        """Narrow to a subset of tokens (the decoder pass under bounded replay)."""
-        return Streams(
-            None if self.y is None else self.y[rows], self.residual[rows],
-            None if self.post is None else self.post[rows], None if self.comb is None else self.comb[rows], self.pre[rows],
-        )
-
 
 class Block(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
@@ -115,6 +108,19 @@ class Block(BaseOP):
         y = self.attn.forward_prefill(x, segments, positions)
         return self.ffn_step(y, residual, post, comb, pre_next, image_mask=image_mask)
 
+    def forward_prefill_narrowed(
+        self, s: Streams, segments: List[PrefillSegment], rows: torch.Tensor, query_segments: List[PrefillSegment],
+        query_positions: torch.Tensor, image_mask: torch.Tensor | None = None, query_image_mask: torch.Tensor | None = None,
+    ) -> Streams:
+        """``forward_prefill`` with a row cut after the global KV is published: the attention input and
+        ``publish_prefill`` cover every token of ``segments``, the attention and the FFN only ``rows``
+        (tiled by ``query_segments``) -- the CED decoder's kv source under bounded replay."""
+        residual, post, comb, pre_next, x = self.attn_input(s, image_mask=image_mask)
+        if self.attn.compressor is not None:
+            self.attn.publish_prefill(x, segments)
+        y = self.attn.forward_prefill(x[rows], query_segments, query_positions)
+        return self.ffn_step(y, residual[rows], post[rows], comb[rows], pre_next[rows], image_mask=query_image_mask)
+
     def forward_decode(self, s: Streams, pos: torch.Tensor, rows: torch.Tensor, dctx, cmp_stage_cap: int) -> Streams:
         residual, post, comb, pre_next, x = self.attn_input(s)
         y = self.attn.forward_decode(x, pos, rows, dctx, cmp_stage_cap)
@@ -151,21 +157,16 @@ class Transformer(BaseOP):
         image_mask = input_ids >= self.args.vocab_size if get_global_ctx().batch.mm_embeds is not None else None
         segments, dec_segments, rows = md.segments, md.decoder_segments, md.decoder_rows
         decoder_start = self.args.decoder_start_layer
+        if rows is not None:
+            dec_positions = positions[rows]
+            dec_image_mask = None if image_mask is None else image_mask[rows]
         for block in self.layers.op_list:
-            if rows is not None and block.layer_id == decoder_start:
-                # CED source under bounded replay: publish global KV for EVERY prompt token, then
-                # continue on the replay tokens only
-                residual, post, comb, pre_next, x = block.attn_input(s, image_mask=image_mask)
-                block.attn.publish_prefill(x, segments)
-                residual, post, comb, pre_next, x = residual[rows], post[rows], comb[rows], pre_next[rows], x[rows]
-                positions = positions[rows]
-                if image_mask is not None:
-                    image_mask = image_mask[rows]
-                y = block.attn.forward_prefill(x, dec_segments, positions)
-                s = block.ffn_step(y, residual, post, comb, pre_next, image_mask=image_mask)
-                continue
-            segs = segments if (rows is None or block.layer_id < decoder_start) else dec_segments
-            s = block.forward_prefill(s, segs, positions, image_mask)
+            if rows is None or block.layer_id < decoder_start:
+                s = block.forward_prefill(s, segments, positions, image_mask)
+            elif block.layer_id == decoder_start:
+                s = block.forward_prefill_narrowed(s, segments, rows, dec_segments, dec_positions, image_mask, dec_image_mask)
+            else:
+                s = block.forward_prefill(s, dec_segments, dec_positions, dec_image_mask)
         return self._exit(s)
 
     def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, md: DSV41AttnMetadata, cmp_stage_cap: int) -> torch.Tensor:
