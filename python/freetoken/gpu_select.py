@@ -68,13 +68,8 @@ def single_gpu_arg(value: str) -> str:
     return entries[0]
 
 
-def _nvml_uuids() -> "list[str] | None":
-    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
-
-    Own ctypes loader instead of torch's _raw_device_uuid_nvml: that helper only knows the Linux library name, raises (not None) when the library is missing, and is private API.
-    NVML exports are cdecl on every platform, so CDLL is right on Windows too (same as nvidia-ml-py).
-    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
-    """
+def _load_nvml():
+    """The NVML library handle, or None when it cannot be loaded."""
     import ctypes
 
     if os.name == "nt":
@@ -85,16 +80,58 @@ def _nvml_uuids() -> "list[str] | None":
         ]
     else:
         candidates = ["libnvidia-ml.so.1"]
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def nvml_memory_info(spec: str = "0") -> "tuple[str, int, int] | None":
+    """(name, total bytes, free bytes) of the GPU ``spec`` names (nvidia-smi index or UUID) without
+    initializing CUDA, or None when NVML is unavailable or the GPU is not found."""
+    import ctypes
+
+    class _Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
     try:
-        for name in candidates:
-            try:
-                lib = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
-        else:
+        lib = _load_nvml()
+        if lib is None or lib.nvmlInit() != 0:
             return None
-        if lib.nvmlInit() != 0:
+        try:
+            handle = ctypes.c_void_p()
+            if is_gpu_uuid(spec):
+                rc = lib.nvmlDeviceGetHandleByUUID(spec.encode("ascii"), ctypes.byref(handle))
+            else:
+                rc = lib.nvmlDeviceGetHandleByIndex_v2(int(spec), ctypes.byref(handle))
+            if rc != 0:
+                return None
+            mem = _Memory()
+            if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) != 0:
+                return None
+            buf = ctypes.create_string_buffer(96)
+            name = buf.value.decode("utf-8", "replace") if lib.nvmlDeviceGetName(handle, buf, 96) == 0 else "GPU"
+            return name, int(mem.total), int(mem.free)
+        finally:
+            lib.nvmlShutdown()
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _nvml_uuids() -> "list[str] | None":
+    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+
+    Own ctypes loader instead of torch's _raw_device_uuid_nvml: that helper only knows the Linux library name, raises (not None) when the library is missing, and is private API.
+    NVML exports are cdecl on every platform, so CDLL is right on Windows too (same as nvidia-ml-py).
+    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
+    """
+    import ctypes
+
+    try:
+        lib = _load_nvml()
+        if lib is None or lib.nvmlInit() != 0:
             return None
         try:
             count = ctypes.c_int()

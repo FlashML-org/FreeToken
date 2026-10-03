@@ -11,6 +11,7 @@ def _print_help(file: TextIO) -> None:
 
 Commands:
   serve       Start the FreeToken API server
+  info        Forecast a model's GPU memory for a serve configuration, without loading it
   shell       Chat with a FreeToken server in the terminal
   ctl         Query and manage a running FreeToken server
   daemon      Run the FreeToken supervisor (persistent engine service)
@@ -29,6 +30,17 @@ def _run_serve(argv: list[str]) -> int:
 
     launch_server(argv=argv, prog="ft serve")
     return 0
+
+
+def _run_info(argv: list[str]) -> int:
+    import os
+
+    if "--verbose" not in argv:
+        # before the first freetoken logger exists: the level is read once
+        os.environ.setdefault("LOG_LEVEL", "WARNING")
+    from freetoken.server.info import main
+
+    return main(argv, prog="ft info")
 
 
 def _run_shell(argv: list[str]) -> int:
@@ -92,6 +104,7 @@ def _run_bench(argv: list[str]) -> int:
 
 COMMANDS = {
     "serve": "_run_serve",
+    "info": "_run_info",
     "shell": "_run_shell",
     "ctl": "_run_ctl",
     "daemon": "_run_daemon",
