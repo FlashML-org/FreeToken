@@ -177,10 +177,12 @@ def analyze(config, opts: argparse.Namespace) -> InfoReport:
         set_tp_info(rank=0, size=config.tp_info.size)
     elif tp.size != config.tp_info.size:
         raise RuntimeError(f"TP size {tp.size} is already set in this process, not {config.tp_info.size}")
+    # Read free memory first: _adjust_config's arch probe creates this process's CUDA context,
+    # which the reading would otherwise include on top of the context allowance it subtracts.
+    gpu = gpu_info(opts, config)
     set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
     _adjust_config(config)
     set_rope_device(torch.device("cpu"))
-    gpu = gpu_info(opts, config)
     found = checkpoint_tensors(config.model_path)
     try:
         with torch.device("meta"), torch_dtype(config.dtype):
