@@ -5,6 +5,7 @@ for the safetensors -> FTW converter (also exposed as ``ft checkpoint``).
 """
 
 from .ftw import (
+    FTWFormatError,
     FTWReader,
     FTWWriter,
     is_ftw_checkpoint,
@@ -14,6 +15,6 @@ from .ftw import (
 from .convert import convert_checkpoint
 
 __all__ = [
-    "FTWReader", "FTWWriter", "is_ftw_checkpoint",
+    "FTWFormatError", "FTWReader", "FTWWriter", "is_ftw_checkpoint",
     "iter_ftw_weights", "load_ftw_banks", "convert_checkpoint",
 ]
