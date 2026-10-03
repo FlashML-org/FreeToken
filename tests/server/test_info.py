@@ -105,6 +105,13 @@ def test_no_gpu_still_reports_weights(tiny_qwen3, monkeypatch, capsys):
     assert "GPU free memory unknown" in out and "attention" in out
 
 
+def test_skip_preflight_flag_parses(tiny_qwen3):
+    from freetoken.server.args import parse_args
+
+    assert parse_args(["--model", tiny_qwen3])[0].skip_preflight is False
+    assert parse_args(["--model", tiny_qwen3, "--skip-preflight"])[0].skip_preflight is True
+
+
 def test_header_fallback_when_the_meta_build_fails(tiny_qwen3, monkeypatch):
     import freetoken.models
 

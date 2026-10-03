@@ -385,6 +385,10 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if not config.skip_preflight:
+            from .forecast import run_preflight
+
+            run_preflight(config, self.model, init_free_memory)
         self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
