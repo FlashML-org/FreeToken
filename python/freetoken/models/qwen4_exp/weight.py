@@ -84,8 +84,11 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 
-def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+def _rename(raw_name: str, quant) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``quant`` is the checkpoint's QuantConfig when the file can carry quantized tensors;
+    ``None`` skips every scale, correct where weights are never quantized (the vision tower)."""
     if raw_name.startswith("mtp."):
         return None
     if _PLE_TABLE_INFIX in raw_name:
@@ -93,8 +96,24 @@ def _rename(raw_name: str) -> str | None:
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
-        return None
+        return _dialect_scale_rename(raw_name, quant) if quant is not None else None
     return rename_vl_prefix(raw_name)
+
+
+def _dialect_scale_rename(raw_name: str, quant) -> str | None:
+    """A scale the dialect stores under a name the state dict does not use, renamed per its storage table; None to skip.
+
+    ModelOpt exports MXFP8 block scales as ``.weight_scale`` while the module loads them as ``weight_scale_inv``."""
+    if not raw_name.endswith(".weight_scale"):
+        return None
+    module = rename_vl_prefix(raw_name[: -len(".weight_scale")])
+    scheme = quant.scheme_for(module)
+    if scheme is None:
+        return None
+    for role, stored in quant.storage(scheme).items():
+        if stored.name == "weight_scale" and role.endswith("_scale_inv"):
+            return module + "." + role
+    return None
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -199,7 +218,7 @@ def iter_weights(
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the model's state dict minus the routed experts.
-    A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
+    A dense projection is bf16, 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) or MXFP8 (e4m3 + e8m0 per 32, stored ``.weight_scale``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community requants quantize the attention / GDN projections.
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
@@ -218,7 +237,7 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, fuser.quant)
                 if name is None:
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
@@ -239,7 +258,7 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, None)
                 if name is not None and name.startswith(VISION_KEY_PREFIXES):
                     yield name, f.get_tensor(raw_name)
 
