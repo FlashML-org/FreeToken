@@ -45,7 +45,7 @@ def replay_start(req: Req, window: int, bounded: bool) -> int:
     leaves fewer than ``window`` new tokens, the pass re-runs the encoder over the cached tokens
     from the previous window-page boundary to produce their hidden states. That recompute is
     READ-ONLY on the cache (``PrefillSegment.write_from``) and reads SWA keys back to ``start -
-    window + 1`` -- live by the cache contract (``KVCacheGroupSpec.swa_resume_history`` is two
+    window + 1`` -- live by the cache contract (the pool's ``sliding_window_size`` is two
     windows in bounded mode: matched, locked and retained by the cache manager; admission turns a
     hit that would read further back into a miss, see ``replay_history``). Exact mode (or a chunk
     that already carries a window) starts at ``cached_len``.

@@ -92,6 +92,11 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         n += sum(r.buffer.numel() * r.buffer.element_size() for r in self.state_ring.values())
         return int(n)
 
+    @property
+    def sliding_window_size(self) -> int:
+        # the cache manager reads this as the window history to keep live behind a resumable position
+        return self.resume_windows * self.P
+
     # ----- private window rings -----
     def ring_slots(self, table_rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Ring slots of ``positions`` (int64, broadcastable with ``table_rows``) for private window layers;

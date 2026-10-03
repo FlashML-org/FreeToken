@@ -131,7 +131,7 @@ def test_private_window_layers_address_per_request_rings():
 def test_bounded_extension_reads_only_the_resume_history():
     """A bounded-mode extension recomputes from the previous window page, so the window keys it reads,
     ``[start - P + 1, cached_len)``, stay inside the two windows the cache keeps live behind a
-    page-aligned hit (KVCacheGroupSpec.swa_resume_history). ``replay_history`` bounds that read for
+    page-aligned hit (the pool's ``sliding_window_size``). ``replay_history`` bounds that read for
     admission, which turns a hit reading further back into a miss; the planner does not re-check."""
     from freetoken.attention.dsv41_sparse import replay_history
 

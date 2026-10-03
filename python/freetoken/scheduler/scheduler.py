@@ -86,10 +86,8 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
-            # the history the cache keeps behind a reusable position: the window, or more when the
-            # model's resume recomputes into it (KVCacheGroupSpec.swa_resume_history)
             sliding_window_size=next(
-                (g.resume_history for g in config.model_config.kv_cache_group_specs() if g.resume_history is not None),
+                (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )

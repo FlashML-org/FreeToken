@@ -127,15 +127,6 @@ class KVCacheGroupSpec:
     # (QSA groups, glm5_next kpool pools; 1 keeps the per-token BSA/DSA slab). The
     # pool factory and the KV cost model divide by the same value.
     index_ratio: int = 1
-    # Live window-tier history (tokens) the cache manager must keep behind a reusable
-    # position -- what prefix matching demands, locking pins and the eviction frontiers
-    # retain. None = ``sliding_window`` (a resume needs exactly its window); DSV41 under
-    # bounded replay needs two windows (the recompute of the window before the hit).
-    swa_resume_history: int | None = None
-
-    @property
-    def resume_history(self) -> int | None:
-        return self.swa_resume_history if self.swa_resume_history is not None else self.sliding_window
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
@@ -238,10 +229,6 @@ class DSV41AttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     sliding_window: int  # the P-token window page
     geometry: Any  # freetoken.kvcache.dsv41_geometry.DSV41Geometry
-
-    @property
-    def resume_history(self) -> int:
-        return self.geometry.resume_history
 
 
 AttentionGroupConfig: TypeAlias = (
@@ -548,7 +535,6 @@ class ModelConfig:
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
                         attn_type=AttnType.DSV41,
-                        swa_resume_history=group.resume_history,
                     )
                 )
         return tuple(specs)

@@ -39,11 +39,15 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     assert args.swa_decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
     # the cache contract follows the replay mode: a bounded-mode prefix hit recomputes the window before
-    # it, so the cache manager must match / lock / retain two windows of live history behind a hit
+    # it, so the cache manager must match / lock / retain two windows of live history behind a hit; the
+    # pool says so (the cache manager reads its sliding_window_size), the group spec carries the window only
+    from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+
     geom = config.model_config.attention_groups[0].geometry
-    spec = next(g for g in config.model_config.kv_cache_group_specs() if g.resume_history is not None)
+    spec = config.model_config.kv_cache_group_specs()[0]
     want = 256 if replay == "bounded" else 128
-    assert geom.resume_history == want and spec.resume_history == want and spec.sliding_window == 128
+    pool = DSV41PagedKVCache(dsv41_pool_sizes(16, geom, 1.0, 128), geom, torch.device("cpu"))
+    assert geom.resume_history == want and pool.sliding_window_size == want and spec.sliding_window == 128 and not spec.is_swa
     # bounded replay keeps the decoder's per-request window KV in private rings, off the shared pages
     assert geom.private_window_layer_ids == (tuple(range(args.decoder_start_layer, args.n_layers)) if replay == "bounded" else ())
     assert DSV41PagedKVCache.min_kv_tokens(config) // 128 == 8 + (2 * geom.resume_windows + 1) * config.max_running_req + 2 * (config.max_running_req + 1) + 1
@@ -62,7 +66,7 @@ def test_bounded_mode_cache_refuses_a_hit_with_one_live_window(tmp_path, monkeyp
     write_tiny_checkpoint(str(tmp_path))
     config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay="bounded", max_seq_len_override=2048)
     _adjust_config(config)
-    resume = next(g for g in config.model_config.kv_cache_group_specs() if g.resume_history is not None).resume_history
+    resume = config.model_config.attention_groups[0].geometry.resume_history
     assert resume == 256
     ids = torch.arange(768, dtype=torch.int32)
     # exact mode's contract (one window) still admits the hit below; bounded mode's does not
