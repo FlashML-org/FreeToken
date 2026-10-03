@@ -51,7 +51,6 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         self._device = device
         self._dtype = dtype  # the model's compute dtype; the tiers themselves are packed bytes
         self.P = geom.window
-        self.resume_windows = geom.resume_windows
         self.head_dim = geom.head_dim
         self.index_head_dim = geom.index_head_dim
         self.n_scratch = int(n_scratch)
@@ -93,9 +92,10 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         return int(n)
 
     @property
-    def sliding_window_size(self) -> int:
-        # the cache manager reads this as the window history to keep live behind a resumable position
-        return self.resume_windows * self.P
+    def prefix_replay_tokens(self) -> int:
+        """Prompt-tail tokens a prefix hit must leave to the prefill: bounded replay runs the decoder on
+        the prompt's last window from that window's encoder outputs, which no cache keeps."""
+        return self.P if self.geom.private_window_layer_ids else 0
 
     # ----- private window rings -----
     def ring_slots(self, table_rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

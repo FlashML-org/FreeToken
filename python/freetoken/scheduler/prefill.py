@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
@@ -55,8 +55,6 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
-    # the model's ReplaysPrefill.can_resume_at over this cache's live window history
-    can_resume_at: Callable[[int], bool] | None = None
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -73,14 +71,9 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
-        mr = self.cache_manager.match_req(req)
-        hit = mr.cuda_handle.cached_len
-        if hit and self.can_resume_at is not None and not self.can_resume_at(hit):
-            logger.warning_rank0(
-                f"request {req.uid}: the prefix hit at {hit} lacks the window history resuming there reads; prefilling from scratch"
-            )
-            mr = self.cache_manager.match_req(req, max_len=0)
+        # TODO: consider host cache match case (it needs the same replay cap)
+        replay = self.cache_manager.prefix_replay_tokens
+        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -222,6 +215,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            prompt_len=pending_req.input_len,
         )
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
@@ -283,7 +277,6 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
-    can_resume_at: Callable[[int], bool] | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -310,7 +303,6 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
-            can_resume_at=self.can_resume_at,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

@@ -144,7 +144,7 @@ class DSV41Attention(BaseOP):
     def publish_prefill(self, x: torch.Tensor, segments: List[PrefillSegment]) -> None:
         """Full mode: compress this layer's input for every segment into the source's main KV and
         index keys. Runs on EVERY new token (under bounded replay the decoder source publishes for
-        the whole prompt even though its attention runs on the replay tokens only)."""
+        the whole prompt even though its attention runs on the prompt's last window only)."""
         assert self.compressor is not None and self.indexer is not None
         attn, ratio, src = self.attn, self.role.ratio, self.layer_id
         for seg in segments:
@@ -152,14 +152,9 @@ class DSV41Attention(BaseOP):
             tail = None
             if self.compressor.needs_tail_carry(seg.start_pos):
                 tail = int(attn.window_slots_of(seg.table_idx, seg.start_pos - 1, seg.start_pos).item())
-            latent, starts = self.compressor.forward_prefill(
-                x[seg.offset : seg.offset + seg.n], seg.start_pos, slots, tail, write_from=seg.write_from,
-            )
-            # groups that begin inside recomputed history are cached already: publish the new ones only
-            new = starts >= seg.write_from
-            if not bool(new.any()):
+            latent, starts = self.compressor.forward_prefill(x[seg.offset : seg.offset + seg.n], seg.start_pos, slots, tail)
+            if not latent.shape[0]:
                 continue
-            latent, starts = latent[new], starts[new]
             rows = attn.compressed_rows_of(seg.table_idx, starts, ratio)
             freqs = self.freqs.index_select(0, starts)
             attn.store_index(self.indexer.index_keys(latent, freqs), src, rows)
@@ -179,8 +174,7 @@ class DSV41Attention(BaseOP):
         win_parts, cmp_parts, pools = [], [], []
         for seg in segments:
             lo, hi = seg.offset, seg.offset + seg.n
-            # recomputed history (a bounded-replay extension) keeps its cached window KV: write from write_from
-            attn.store_window(kv[seg.write_offset : hi], self.layer_id, attn.layer_window_slots_of(self.layer_id, seg.table_idx, seg.write_from, seg.end))
+            attn.store_window(kv[lo:hi], self.layer_id, attn.layer_window_slots_of(self.layer_id, seg.table_idx, seg.start_pos, seg.end))
             win_parts.append(attn.window_topk_prefill(seg, self.layer_id))
             if not role.compresses:
                 continue

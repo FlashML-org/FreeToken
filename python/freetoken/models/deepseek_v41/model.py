@@ -12,8 +12,9 @@ with a one-hot pre on stream 0 and no pending post.
 Causal Encoder-Decoder: the decoder's kv source (layer 20) compresses ITS INPUT -- the final encoder
 hidden state -- into the global KV every decoder layer reads. Under Decoder SWA Bounded Replay the
 decoder layers run on each request's last ``window_size`` prompt tokens only (their sliding window
-truncated at the replay start, see the backend); layer 20 still publishes global KV for every
-prompt token. ``--swa-decoder-replay exact`` runs the decoder on every token (the reference numerics).
+truncated at the start of that window, see the backend; a prefix hit stops before it, so those tokens
+are always prefilled); layer 20 still publishes global KV for every prompt token.
+``--swa-decoder-replay exact`` runs the decoder on every token (the reference numerics).
 
 KV addressing is the attention backend's; pool buffers are read off the live pool per access, so a
 runtime cache rebuild needs no unbind. Decode is batched and CUDA-graph safe (the DSV4 precedent).
@@ -111,13 +112,16 @@ class Block(BaseOP):
     def forward_prefill_narrowed(
         self, s: Streams, segments: List[PrefillSegment], rows: torch.Tensor, query_segments: List[PrefillSegment],
         query_positions: torch.Tensor, image_mask: torch.Tensor | None = None, query_image_mask: torch.Tensor | None = None,
-    ) -> Streams:
+    ) -> Streams | None:
         """``forward_prefill`` with a row cut after the global KV is published: the attention input and
         ``publish_prefill`` cover every token of ``segments``, the attention and the FFN only ``rows``
-        (tiled by ``query_segments``) -- the CED decoder's kv source under bounded replay."""
+        (tiled by ``query_segments``) -- the CED decoder's kv source under bounded replay. None when no
+        query segment is left (every chunk in the batch ends before its prompt's last window)."""
         residual, post, comb, pre_next, x = self.attn_input(s, image_mask=image_mask)
         if self.attn.compressor is not None:
             self.attn.publish_prefill(x, segments)
+        if not query_segments:
+            return None
         y = self.attn.forward_prefill(x[rows], query_segments, query_positions)
         return self.ffn_step(y, residual[rows], post[rows], comb[rows], pre_next[rows], image_mask=query_image_mask)
 
@@ -151,9 +155,11 @@ class Transformer(BaseOP):
         return self.norm.forward(mhc_mix_input(s.materialize(), s.pre))
 
     def prefill(self, input_ids: torch.Tensor, positions: torch.Tensor, md: DSV41AttnMetadata) -> torch.Tensor:
-        """Ragged prefill over the flat new-token stream; returns the hidden states the head reads
-        (the decoder stream under bounded replay, where ``md.last_indices`` also point)."""
+        """Ragged prefill over the flat new-token stream; returns the hidden states the head reads (the
+        decoder stream under bounded replay, where ``md.last_indices`` also point, plus the placeholder
+        row ``md.decoder_pad`` asks for)."""
         s = self._entry(input_ids)
+        dtype = s.residual.dtype
         image_mask = input_ids >= self.args.vocab_size if get_global_ctx().batch.mm_embeds is not None else None
         segments, dec_segments, rows = md.segments, md.decoder_segments, md.decoder_rows
         decoder_start = self.args.decoder_start_layer
@@ -165,9 +171,12 @@ class Transformer(BaseOP):
                 s = block.forward_prefill(s, segments, positions, image_mask)
             elif block.layer_id == decoder_start:
                 s = block.forward_prefill_narrowed(s, segments, rows, dec_segments, dec_positions, image_mask, dec_image_mask)
+                if s is None:
+                    break
             else:
                 s = block.forward_prefill(s, dec_segments, dec_positions, dec_image_mask)
-        return self._exit(s)
+        pad = [torch.zeros(1, self.args.dim, dtype=dtype, device=input_ids.device)] if md.decoder_pad else []
+        return torch.cat([self._exit(s)] + pad) if s is not None else pad[0]
 
     def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, md: DSV41AttnMetadata, cmp_stage_cap: int) -> torch.Tensor:
         B = input_ids.shape[0]
@@ -200,20 +209,6 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def place_encoder_weights(self, mode: str) -> None:
         self.visual.place_weights(mode)
-
-    @property
-    def replays_prefill(self) -> bool:
-        return self._args.swa_decoder_replay != "exact"
-
-    def prefill_start(self, req) -> int:
-        from freetoken.attention.dsv41_sparse import replay_start
-
-        return replay_start(req, self._args.window_size, self.replays_prefill)
-
-    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
-        from freetoken.attention.dsv41_sparse import replay_history
-
-        return not self.replays_prefill or replay_history(cached_len, self._args.window_size) <= live_history
 
     def _ensure_bound(self) -> None:
         if not self._bound:
@@ -257,13 +252,11 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         token_map, compressed_vocab = build_compressed_token_map(AutoTokenizer.from_pretrained(folder, trust_remote_code=True))
         hash = EngramHash(self._args, token_map, compressed_vocab)
         graph_rows = max(engine_config.max_running_req, engine_config.cuda_graph_max_bs or 0, 1)
-        # Bounded replay can prepend up to one window of cached tokens per request.
-        replay_rows = engine_config.max_running_req * (self._args.window_size - 1) if self.replays_prefill else 0
         tables = [
             EngramDiskTable(
                 engram_row_source(folder, layer.layer_id), hash.n_cols, device,
                 max_graph_rows=graph_rows,
-                max_extend_tokens=engine_config.max_extend_tokens + replay_rows,
+                max_extend_tokens=engine_config.max_extend_tokens,
                 use_io_uring=os.getenv("FREETOKEN_ENGRAM_IO_URING", "1") != "0",
             )
             for layer in layers
@@ -280,8 +273,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         md = batch.attn_metadata
         assert isinstance(md, DSV41AttnMetadata)
         if batch.is_prefill:
-            input_ids, positions = get_global_ctx().attn_backend.encoder_stream(batch)
-            hidden = self.model.prefill(input_ids, positions, md)
+            hidden = self.model.prefill(batch.input_ids, batch.positions.long(), md)
         else:
             input_ids = batch.input_ids
             B = batch.padded_size

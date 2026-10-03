@@ -67,6 +67,11 @@ class CacheManager:
     prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
 
     @property
+    def prefix_replay_tokens(self) -> int:
+        """Prompt-tail tokens a prefix hit must leave to the prefill (a pool whose model recomputes them)."""
+        return getattr(self.swa_pool, "prefix_replay_tokens", 0) if self.swa_pool is not None else 0
+
+    @property
     def prefill_chunk_align(self) -> int:
         """Granularity a non-final prefill chunk should end on. A hybrid snapshot is donated only
         at a page-aligned boundary, so at page_size>1 one unaligned chunk end costs every reuse
@@ -93,7 +98,7 @@ class CacheManager:
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1 if max_len is None else min(input_len - 1, max_len)]
+        ids = req.input_ids[: input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)

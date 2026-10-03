@@ -106,57 +106,47 @@ def test_bounded_replay_is_exact_within_one_window(checkpoint):
     _compare("bounded within one window", got, want)
 
 
-def test_bounded_replay_extends_a_short_final_chunk_back_over_the_window(checkpoint):
-    """A short final chunk (or prefix-hit suffix) re-runs the encoder from the previous window page so
-    the decoder still replays the prompt's whole last window: same logits as the single-shot bounded
-    prefill of the same prompt."""
+@pytest.mark.parametrize("cut", [128, 256])
+def test_bounded_chunked_prefill_matches_unchunked(checkpoint, cut):
+    """A chunked bounded prefill gives each chunk its part of the prompt's last window ``[172, 300)``:
+    a first chunk that ends before it (cut 128) runs no decoder row and hands the head a placeholder;
+    one that reaches into it (cut 256) leaves rows in the private ring for the last chunk, which is
+    shorter than the window (44 tokens). Both match the unchunked prefill."""
     from .harness import TinyEngine
     from .test_reference_parity import _compare
 
     eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
     toks = _tokens(300, 6)
-    whole = eng.new_request(0, toks)
-    ref = eng.prefill([whole])
+    ref = eng.prefill([eng.new_request(0, toks)])
     chunked = eng.new_request(1, toks)
-    chunked.device_len = 256
-    eng.prefill([chunked])
-    chunked.cached_len, chunked.device_len = 256, 300  # 44 new tokens: the replay needs [172, 300)
-    got = eng.prefill([chunked])
-    _compare("bounded short final chunk", got, ref)
+    chunked.device_len = cut
+    first = eng.prefill([chunked])
+    assert first.shape == (1, VOCAB) and torch.isfinite(first).all()
+    chunked.cached_len, chunked.device_len = cut, 300
+    _compare(f"bounded chunks cut at {cut}", eng.prefill([chunked]), ref)
 
 
-def test_bounded_extension_never_rewrites_cached_history(checkpoint):
-    """The recomputed history of a bounded-replay extension is read-only on the pools: cached window /
-    main / index rows (and ring carries) of positions before the hit keep whatever they held."""
+def test_bounded_batch_mixes_a_decoderless_chunk_with_a_whole_prompt(checkpoint):
+    """One batch: a chunk that ends before its prompt's last window (no decoder row, a placeholder for
+    the head) next to a whole prompt; the whole prompt's logits are those of its own prefill."""
     from .harness import TinyEngine
+    from .test_reference_parity import _compare
 
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
-    toks = _tokens(300, 7)
-    req = eng.new_request(0, toks)
-    req.device_len = 256
-    eng.prefill([req])
-    pool = eng.pool
-    # poison the cached rows of positions [128, 256) on an encoder layer and its kv source
-    win_slots = pool.translate_full_to_window(eng.page_table[0, 128:256].long())
-    src, ratio = 2, 2
-    main_rows = pool.cmp_rows(eng.page_table[0, 128:256:ratio].long(), ratio)
-    pool.window_pool[3][win_slots] = 0xAB
-    pool.main_pool[src][main_rows] = 0xCD
-    pool.idx_pool[src][main_rows] = 0xEF
-    ring = pool.state_ring[src].buffer.clone()
-    req.cached_len, req.device_len = 256, 300  # 44 new tokens: the encoder recomputes from 128
-    eng.prefill([req])
-    assert (pool.window_pool[3][win_slots] == 0xAB).all()
-    assert (pool.main_pool[src][main_rows] == 0xCD).all() and (pool.idx_pool[src][main_rows] == 0xEF).all()
-    assert torch.equal(pool.state_ring[src].buffer[: (win_slots.max() // 128 + 1) * 2], ring[: (win_slots.max() // 128 + 1) * 2])
-    # the new tokens' rows were written
-    new_slots = pool.translate_full_to_window(eng.page_table[0, 256:300].long())
-    assert not (pool.window_pool[3][new_slots] == 0).all()
+    eng = TinyEngine(checkpoint, max_seq_len=2048, max_running_req=2, swa_decoder_replay="bounded")
+    whole = _tokens(300, 8)
+    want = eng.prefill([eng.new_request(0, whole)])
+    chunk = eng.new_request(0, _tokens(600, 9))
+    chunk.device_len = 256
+    other = eng.new_request(1, whole)
+    got = eng.prefill([chunk, other])
+    assert got.shape == (2, VOCAB) and torch.isfinite(got).all()
+    _compare("whole prompt next to a decoderless chunk", got[1:], want)
 
 
 def test_bounded_prefix_hit_matches_cold_prefill(checkpoint):
-    """A bounded-mode prefix hit followed by a short suffix (the encoder recompute reads two windows of
-    the shared history, both live by the cache contract) produces the cold prefill's logits."""
+    """A prefix hit that would leave fewer than a window of new tokens (768 cached + 20 new) is capped
+    one window before the prompt end, so the request prefills ``[640, 788)`` -- the decoder's whole
+    window among it -- and produces the cold prefill's logits."""
     from .harness import TinyEngine
     from .test_reference_parity import _compare
 
@@ -166,15 +156,16 @@ def test_bounded_prefix_hit_matches_cold_prefill(checkpoint):
     cold = eng.prefill([donor])
     eng.finish_prefill([donor])
     hit = eng.new_request_on_prefix(1, donor, prefix + _tokens(20, 12))  # the same prompt over the shared pages
-    assert hit.cached_len == 768
+    assert hit.cached_len == 640 and hit.extend_len == 148
     got = eng.prefill([hit])
     _compare("bounded prefix hit", got, cold)
 
 
 def test_shared_prefix_replays_do_not_disturb_each_other(checkpoint):
-    """Two requests hitting the same 768-token prefix with different suffix lengths: B's replay writes
-    only B's private decoder rings and reads the shared encoder history, so A's pending decode sees the
-    logits it would have seen without B, and neither the shared pages nor A's rings change."""
+    """Two requests sharing a 768-token prefix with different suffix lengths: B's hit is capped at 640
+    (a window before its prompt end), its decoder writes only B's private ring and it reads the shared
+    encoder history, so A's pending decode sees the logits it would have seen without B, and neither
+    the shared pages nor A's ring change."""
     from .harness import TinyEngine
 
     prefix = _tokens(768, 13)

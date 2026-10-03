@@ -248,8 +248,7 @@ class EngramHost:
             runs = [(torch.tensor(hist, dtype=torch.int64), tokens[i : i + 1]) for i, hist in enumerate(histories)]
             self.fill(runs, graph=use_graph)
             return
-        # prefill: the encoder segments (start_pos may precede cached_len under a bounded-replay
-        # extension) are the token range every consumer of this forward executes
+        # prefill: the encoder segments are the token range every consumer of this forward executes
         segments = batch.attn_metadata.segments
         assert segments is not None and len(segments) == len(batch.reqs)
         runs = [(_context(r.input_ids, seg.start_pos, width), r.input_ids[seg.start_pos : seg.end]) for r, seg in zip(batch.reqs, segments)]

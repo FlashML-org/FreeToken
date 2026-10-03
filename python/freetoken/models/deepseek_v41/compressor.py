@@ -52,20 +52,16 @@ class Compressor(BaseOP):
 
     def forward_prefill(
         self, x: torch.Tensor, start_pos: int, window_slots: torch.Tensor, tail_window_slot: int | None = None,
-        *, write_from: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compress the tokens ``[start_pos, start_pos + n)`` of one request.
 
         ``window_slots`` are the tokens' window slots (the ring block of each window page carries the
         partial group); ``tail_window_slot`` is the previous token's slot, needed only when
-        ``needs_tail_carry(start_pos)``; ``write_from`` (default ``start_pos``) is the first position
-        whose ring carry may be written -- positions before it are recomputed cached history whose
-        carries are already in the ring. Returns ``(latent [G, head_dim] bf16 pre-RoPE, group_starts
-        [G] int64)`` for every group that completed in this call (the caller filters what it stores).
+        ``needs_tail_carry(start_pos)``. Returns ``(latent [G, head_dim] bf16 pre-RoPE, group_starts [G]
+        int64)`` for every group that completed in this call.
         """
         n = x.shape[0]
         device = x.device
-        write_from = start_pos if write_from is None else write_from
         if self.ratio == 1:
             latent = self.norm.forward(self.wkv.forward(x))
             return latent, torch.arange(start_pos, start_pos + n, device=device)
@@ -94,7 +90,7 @@ class Compressor(BaseOP):
         # ring: the reset block at every page boundary crossed (a page holds whole groups), and the
         # in-progress tail (the remainder rows) on the last page so decode / the next chunk resume
         end = start_pos + n
-        self.attn.write_boundary_carries(self.layer_id, lo=start_pos, hi=end, window_slots=window_slots, write_from=write_from)
+        self.attn.write_boundary_carries(self.layer_id, lo=start_pos, hi=end, window_slots=window_slots)
         if end % self.window != 0:
             block = self._carry_block(kv[cut:], score[cut:], remainder)
             self.attn.write_carry(self.layer_id, int(window_slots[-1].item()), block)

@@ -397,12 +397,9 @@ class Engine:
         if config.active_encoders:
             from freetoken.mm.encoder_cache import EncoderCache
             from freetoken.mm.processor import get_mm_processor
-            from freetoken.models.blocks import ReplaysPrefill
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
-            self.encoder_cache = EncoderCache(
-                storage=config.mm.embed_cache_device, retain_until_prefill_end=isinstance(self.model, ReplaysPrefill)
-            )
+            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
                 f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
@@ -1224,8 +1221,8 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
-    # the replay mode decides how much live window history a prefix hit needs (geometry.resume_windows):
-    # rebuild the attention group's geometry so the cache manager, the pool and its cost model agree
+    # the replay mode decides which window layers are request-private (geometry.private_window_layer_ids):
+    # rebuild the attention group's geometry so the pool, its cost model and the backend agree
     object.__setattr__(  # ModelConfig is frozen; this is the config-resolution step that owns it
         model_config, "attention_groups",
         tuple(dataclasses.replace(g, geometry=dsv41_geometry(args)) if getattr(g, "kind", None) == "dsv41" else g for g in model_config.attention_groups),
@@ -1233,8 +1230,8 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
-        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay} "
-        f"(prefix hits keep {dsv41_geometry(args).resume_history} tokens of window history)"
+        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay}"
+        + ("" if args.swa_decoder_replay == "exact" else f" (prefix hits stop {P} tokens before the prompt end)")
     )
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")

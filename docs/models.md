@@ -85,9 +85,10 @@ warning; pass `--moe-strategy offload` to use them.
   the segment. *Encoder* replay rebuilds the encoder SWA KV behind a prefix hit from the global KV
   alone (approximate; the report's fallback when the SWA KV of a hit has been evicted). *Decoder*
   replay runs the decoder layers on each prompt's last `n_win` tokens only; their SWA KV is never
-  prefix-cached and post-training simulated it. FreeToken keeps encoder SWA KV in the radix cache and
-  recomputes from it exactly (no encoder replay); `--swa-decoder-replay bounded` (default) is the
-  report's decoder replay, `exact` runs the decoder on every prompt token (reference numerics).
+  prefix-cached and post-training simulated it. FreeToken keeps encoder SWA KV in the radix cache (no
+  encoder replay); `--swa-decoder-replay bounded` (default) is the report's decoder replay, with a
+  prefix hit stopping at least `n_win` tokens before the prompt end so those tokens are prefilled;
+  `exact` runs the decoder on every prompt token (reference numerics).
   Bounded output differs from exact by construction and does not depend on the prefill chunk size.
   Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
   replay saves decoder-layer compute, not prefill time.

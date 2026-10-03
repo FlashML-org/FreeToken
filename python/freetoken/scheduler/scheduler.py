@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from functools import partial
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -93,18 +92,12 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
-        from freetoken.models.blocks import ReplaysPrefill
-
-        live_history = self.cache_manager.sliding_window_size
-        self._replays_prefill = isinstance(self.engine.model, ReplaysPrefill)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
-            can_resume_at=partial(self.engine.model.can_resume_at, live_history=live_history)
-            if self._replays_prefill and live_history is not None else None,
         )
 
         # some alias for easy access
@@ -336,9 +329,6 @@ class Scheduler(SchedulerIOMixin):
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
                     continue
-                if batch.is_prefill and req.mm_items and self.engine.encoder_cache is not None:
-                    # Only a final prefill chunk reaches this branch; replay no longer needs its images.
-                    self.engine.encoder_cache.release(req.uid, [item.hash for item in req.mm_items])
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
@@ -856,8 +846,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
-        starts = [self.engine.model.prefill_start(r) for r in batch.padded_reqs] if self._replays_prefill else None
-        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache, starts=starts)
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan

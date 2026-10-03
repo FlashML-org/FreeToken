@@ -14,8 +14,9 @@ What DSV41 adds on top of DSV4's vocabulary:
 * **packed rows** -- writes quantize into the pool (``pool.store_*``), reads dequantize in-kernel.
 * **prefill passes with a window floor** -- a ``PrefillSegment`` carries ``window_floor``: the
   absolute position a query's sliding window may not reach below (Decoder SWA Bounded Replay
-  truncates the decoder's window at the replay start). The metadata carries the encoder pass
-  (every new token) and the decoder pass (the replay tokens, or the same tokens in exact mode).
+  truncates the decoder's window at ``L - W``, the start of the prompt's last window). The metadata
+  carries the encoder pass (every new token) and the decoder pass (the new tokens inside the
+  prompt's last window, or every new token in exact mode).
 """
 
 from __future__ import annotations
@@ -24,8 +25,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
-import torch.nn.functional as F
-from freetoken.core import Batch, Req, get_global_ctx
+from freetoken.core import Batch, get_global_ctx
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 
@@ -33,47 +33,13 @@ if TYPE_CHECKING:
     from freetoken.models import ModelConfig
 
 
-def prompt_len(req: Req) -> int:
-    """The request's prompt length (its tokens before generation)."""
-    return req.max_device_len - req.output_len
-
-
-def replay_start(req: Req, window: int, bounded: bool) -> int:
-    """Where this request's encoder pass starts under Decoder SWA Bounded Replay.
-
-    The decoder replays the prompt's last ``window`` tokens; when a prefix hit or a chunk boundary
-    leaves fewer than ``window`` new tokens, the pass re-runs the encoder over the cached tokens
-    from the previous window-page boundary to produce their hidden states. That recompute is
-    READ-ONLY on the cache (``PrefillSegment.write_from``) and reads SWA keys back to ``start -
-    window + 1`` -- live by the cache contract (the pool's ``sliding_window_size`` is two
-    windows in bounded mode: matched, locked and retained by the cache manager; admission turns a
-    hit that would read further back into a miss, see ``replay_history``). Exact mode (or a chunk
-    that already carries a window) starts at ``cached_len``.
-    """
-    if not bounded or req.extend_len >= window or req.cached_len == 0:
-        return req.cached_len
-    return max(0, (req.device_len - window) // window * window)
-
-
-def replay_history(cached_len: int, window: int) -> int:
-    """The most window history behind ``cached_len`` a bounded-replay resume there reads: with one
-    new token the recompute starts furthest back, and its first query reads one window before that.
-    ``2 * window - 1`` for a hit on a window page."""
-    if cached_len == 0:
-        return 0
-    start = max(0, (cached_len + 1 - window) // window * window)
-    return cached_len - max(0, start - window + 1)
-
-
 @dataclass(frozen=True)
 class PrefillSegment:
     """One request's slice of a flat prefill token stream.
 
     ``offset``/``n`` tile the stream; ``start_pos`` is the absolute position of the first token;
-    ``window_floor`` bounds every query's sliding window from below (0 = the exact window; a bounded
-    replay sets it to the replay start); ``write_from`` is the first position whose KV / compressor
-    carry this pass WRITES -- positions before it are cached history recomputed for their hidden
-    states only (a bounded-replay extension), so their pool rows are never touched. None = ``start_pos``.
+    ``window_floor`` bounds every query's sliding window from below (0 = the exact window; bounded
+    replay sets it to the start of the prompt's last window).
     """
 
     offset: int
@@ -81,21 +47,10 @@ class PrefillSegment:
     table_idx: int
     start_pos: int
     window_floor: int = 0
-    write_from: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.write_from is None:
-            object.__setattr__(self, "write_from", self.start_pos)
-        assert self.start_pos <= self.write_from <= self.end, (self.start_pos, self.write_from, self.end)
 
     @property
     def end(self) -> int:
         return self.start_pos + self.n
-
-    @property
-    def write_offset(self) -> int:
-        """Stream offset of the first written token (``offset`` when nothing is recomputed)."""
-        return self.offset + (self.write_from - self.start_pos)
 
 
 @dataclass
@@ -118,14 +73,14 @@ class SharedSelection:
 @dataclass
 class DSV41AttnMetadata(BaseAttnMetadata):
     last_indices: torch.Tensor
-    # Prefill: the encoder pass tiles the encoder stream -- the new tokens, extended backwards
-    # over re-prefilled cached tokens under bounded replay (``extended``; the model builds that
-    # stream with ``encoder_stream``); the decoder pass tiles the tokens the decoder layers
-    # process (``decoder_rows`` gathers them out of the encoder stream; None = all of it).
+    # Prefill: the encoder pass tiles the batch's new tokens; the decoder pass tiles the tokens the
+    # decoder layers process (``decoder_rows`` gathers them out of the encoder stream; None = all of
+    # it). ``decoder_pad``: some request has no decoder row this chunk, and its ``last_indices`` entry
+    # points at one placeholder row the model appends after the decoder stream (its logits are unused).
     segments: List[PrefillSegment] | None = None
     decoder_segments: List[PrefillSegment] | None = None
     decoder_rows: torch.Tensor | None = None
-    extended: bool = False
+    decoder_pad: bool = False
     # Decode: the whole-history full-loc snapshot (captured buffer under a replay, lazy eager copy).
     full_snap: torch.Tensor | None = None
     table_rows: torch.Tensor | None = None
@@ -229,48 +184,38 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         batch.attn_metadata = DSV41AttnMetadata(last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar)
 
     def _prefill_metadata(self, batch: Batch) -> DSV41AttnMetadata:
-        """Exact mode: one stream of every new token, the decoder pass is that same stream.
-        Bounded replay: each request's encoder segment starts at ``replay_start`` (extended
-        backwards over cached tokens when the chunk is shorter than a window) and its decoder
-        segment is its last ``min(n_win, n)`` tokens with the window floored at the replay start."""
-        bounded = self.swa_decoder_replay != "exact"
-        win = self.window_size
+        """The encoder pass runs every request's new tokens ``[cached_len, device_len)``. Exact mode runs
+        the decoder on the same stream. Decoder SWA Bounded Replay runs it on the new tokens inside the
+        prompt's last window ``[L - W, L)`` (``L = prompt_len``) with every query's window floored at
+        ``L - W``: the chunks of a chunked prefill each take their part of that window (earlier rows
+        come from the request's private ring), and a chunk that ends before it runs no decoder row."""
         segments: List[PrefillSegment] = []
         off = 0
-        extended = False
         for r in batch.reqs:
-            start = replay_start(r, win, bounded)
-            extended |= start != r.cached_len
-            segments.append(PrefillSegment(off, r.device_len - start, r.table_idx, start, write_from=r.cached_len))
-            off += r.device_len - start
-        if not bounded:
+            segments.append(PrefillSegment(off, r.extend_len, r.table_idx, r.cached_len))
+            off += r.extend_len
+        if self.swa_decoder_replay == "exact":
             last = torch.tensor([s.n for s in segments], dtype=torch.int32, device=self.device).cumsum_(0) - 1
-            return DSV41AttnMetadata(last_indices=last, segments=segments, decoder_segments=segments, decoder_rows=None, extended=extended)
+            return DSV41AttnMetadata(last_indices=last, segments=segments, decoder_segments=segments)
+        win = self.window_size
         dec: List[PrefillSegment] = []
         rows: list[torch.Tensor] = []
+        last: list[int] = []
         doff = 0
-        for s in segments:
-            # the decoder replays the prompt's last window (the reference deployment): its KV goes to
-            # the request's private rings, so nothing here touches radix-shared pages
-            n_replay = min(win, s.n)
-            floor = s.end - n_replay
-            dec.append(PrefillSegment(doff, n_replay, s.table_idx, floor, window_floor=floor))
-            rows.append(torch.arange(s.offset + s.n - n_replay, s.offset + s.n))
-            doff += n_replay
-        last = torch.tensor([d.n for d in dec], dtype=torch.int32, device=self.device).cumsum_(0) - 1
+        for r, s in zip(batch.reqs, segments):
+            floor = max(0, r.prompt_len - win)
+            lo = max(s.start_pos, floor)
+            n = max(0, s.end - lo)
+            if n:
+                # the decoder's window KV goes to the request's private rings, never to radix-shared pages
+                dec.append(PrefillSegment(doff, n, s.table_idx, lo, window_floor=floor))
+                rows.append(torch.arange(s.offset + lo - s.start_pos, s.offset + s.n))
+                doff += n
+            last.append(doff - 1 if n else -1)
+        pad = -1 in last
+        last_indices = torch.tensor([doff if i < 0 else i for i in last], dtype=torch.int32, device=self.device)
         decoder_rows = torch.cat(rows).to(self.device, non_blocking=True) if rows else torch.empty(0, dtype=torch.int64, device=self.device)
-        return DSV41AttnMetadata(last_indices=last, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, extended=extended)
-
-    def encoder_stream(self, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
-        """The prefill encoder stream ``(input_ids [T], positions [T] int64)``: the batch's own tensors,
-        or -- when a bounded replay extended a segment backwards -- rebuilt from the requests' host
-        token ids over ``[start_pos, device_len)`` (the batch's tensors only carry the new tokens)."""
-        md = self.metadata
-        if not md.extended:
-            return batch.input_ids, batch.positions.long()
-        ids = torch.cat([r.input_ids[s.start_pos : r.device_len] for r, s in zip(batch.reqs, md.segments)])
-        pos = torch.cat([torch.arange(s.start_pos, s.end) for s in md.segments])
-        return ids.to(self.device, dtype=batch.input_ids.dtype, non_blocking=True), pos.to(self.device, non_blocking=True)
+        return DSV41AttnMetadata(last_indices=last_indices, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, decoder_pad=pad)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -401,17 +346,16 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         ring = self.pool.state_ring[source]
         ring.set_blocks(self.ring_page_base(window_slots, ring.ring_size), blocks)
 
-    def write_boundary_carries(self, source: int, *, lo: int, hi: int, window_slots: torch.Tensor, write_from: int | None = None) -> None:
-        """Persist the compressor carry at every window-page boundary ``B`` in ``(max(lo, write_from), hi]``
-        so a page-aligned radix match can resume by value. A page holds whole groups (``P % ratio == 0``),
+    def write_boundary_carries(self, source: int, *, lo: int, hi: int, window_slots: torch.Tensor) -> None:
+        """Persist the compressor carry at every window-page boundary ``B`` in ``(lo, hi]`` so a
+        page-aligned radix match can resume by value. A page holds whole groups (``P % ratio == 0``),
         so the carry at a boundary is the empty group -- the reset block is written so a resume never
-        reads a stale one. ``window_slots`` is indexed by ``pos - lo``; boundaries at or before
-        ``write_from`` belong to cached history and are left alone. One batched ring write, no host syncs."""
+        reads a stale one. ``window_slots`` is indexed by ``pos - lo``. One batched ring write, no host syncs."""
         ring = self.pool.state_ring.get(source)
         if ring is None:
             return
         P = self.window_size
-        first = (max(lo, lo if write_from is None else write_from) // P + 1) * P
+        first = (lo // P + 1) * P
         if first > hi:
             return
         bounds = torch.arange(first, hi + 1, P, device=self.device)
@@ -496,4 +440,4 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         )
 
 
-__all__ = ["DSV41SparseAttnBackend", "DSV41AttnMetadata", "PrefillSegment", "SharedSelection", "prompt_len", "replay_start"]
+__all__ = ["DSV41SparseAttnBackend", "DSV41AttnMetadata", "PrefillSegment", "SharedSelection"]

@@ -156,7 +156,7 @@ def _dsv41_window_floor_pages(config, geom: DSV41Geometry) -> int:
     P = geom.window
     prefill_reach_pages = (config.max_seq_len + P - 1) // P
     radix = config.cache_type != "naive"
-    return min(prefill_reach_pages, 8) + reserved_window_pages(config.max_running_req, radix, geom.resume_windows)
+    return min(prefill_reach_pages, 8) + reserved_window_pages(config.max_running_req, radix)
 
 
 def _dsv41_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None) -> DSV41PoolSizes:

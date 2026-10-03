@@ -128,10 +128,14 @@ class TinyEngine:
                    uid=table_idx, sampling_params=SamplingParams(), cache_handle=None)
 
     def new_request_on_prefix(self, table_idx: int, donor: Req, tokens: list[int], max_new: int = 64) -> Req:
-        """A request whose first ``align_down(len(donor prompt), P)`` positions alias ``donor``'s pages
-        (what a radix prefix hit does through the page table) and whose remaining positions get pages
-        of their own. ``cached_len`` is the hit; the caller prefills the suffix."""
-        hit = donor.device_len // P * P
+        """A request whose first ``hit`` positions alias ``donor``'s pages (what a radix prefix hit does
+        through the page table) and whose remaining positions get pages of their own. ``hit`` is what the
+        scheduler admits: the donor's prompt, capped by ``match_req`` (the last token, and the pool's
+        ``prefix_replay_tokens`` under bounded replay) and page-aligned. The caller prefills the rest."""
+        limit = len(tokens) - 1
+        if self.pool.prefix_replay_tokens:
+            limit = min(limit, max(0, len(tokens) - self.pool.prefix_replay_tokens))
+        hit = min(donor.device_len, limit) // P * P
         assert tokens[:hit] == donor.input_ids[:hit].tolist(), "the prefix must match the donor's prompt"
         self.page_table[table_idx, :hit] = self.page_table[donor.table_idx, :hit]
         n_pages = -(-(len(tokens) + max_new - hit) // P)

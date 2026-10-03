@@ -39,8 +39,6 @@ def dsv41_geometry(args: DeepseekV41Args) -> DSV41Geometry:
         window=args.window_size,
         compress_ratios=tuple(args.compress_ratios[: args.n_layers]),
         kv_source_layer_ids=args.backbone_kv_sources,
-        # bounded replay recomputes the window before a prefix hit, which reads the window before that
-        resume_windows=1 if args.swa_decoder_replay == "exact" else 2,
         # bounded replay computes the decoder only over each request's last window: that KV is
         # request-private and lives in per-request rings, never in radix-shared pages
         private_window_layer_ids=() if args.swa_decoder_replay == "exact" else tuple(range(args.decoder_start_layer, args.n_layers)),

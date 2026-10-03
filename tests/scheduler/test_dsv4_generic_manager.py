@@ -191,33 +191,30 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
     cm.check_integrity()
 
 
-@pytest.mark.parametrize("resumable", [True, False])
-def test_admission_turns_an_unresumable_hit_into_a_miss(resumable):
-    """A prefix hit the model cannot resume at (``ReplaysPrefill.can_resume_at``) is admitted as a
-    miss: that request prefills from scratch, nothing raises and the hit's lock is not taken."""
+@pytest.mark.parametrize("replay, new_tokens, cached", [(0, 2, 256), (P, 2, 128), (P, 200, 256)])
+def test_admission_caps_the_hit_by_the_pools_prefix_replay(replay, new_tokens, cached):
+    """A pool whose model recomputes the prompt's tail (DeepSeek-V4.1's bounded decoder replay) holds
+    back ``prefix_replay_tokens`` at admission: the match ends at or before ``L - replay`` (page-aligned
+    by the radix), a hit already that far from the prompt end is untouched, and the request's
+    ``prompt_len`` is the whole prompt."""
     from freetoken.scheduler.decode import DecodeManager
     from freetoken.scheduler.prefill import PrefillManager
     from freetoken.scheduler.table import TableManager
     from freetoken.scheduler.utils import PendingReq
 
-    cm, _, pt = _stack(num_pages=48)
+    cm, pool, pt = _stack(num_pages=48)
+    pool.prefix_replay_tokens = replay
     prompt = torch.arange(1, 301, dtype=torch.int32)
     _lifecycle(cm, _req(MRR - 1, prompt, n_decode=310), total_len=310)
-    asked = []
-
-    def can_resume_at(cached_len):
-        asked.append(cached_len)
-        return resumable
-
-    pm = PrefillManager(cm, TableManager(max_running_reqs=MRR, page_table=pt), DecodeManager(page_size=P), can_resume_at=can_resume_at)
-    pm.pending_list = [PendingReq(uid=1, input_ids=torch.cat([prompt, torch.tensor([7, 8], dtype=torch.int32)]),
-                                  sampling_params=SamplingParams(max_tokens=1))]
+    pm = PrefillManager(cm, TableManager(max_running_reqs=MRR, page_table=pt), DecodeManager(page_size=P))
+    tokens = torch.cat([prompt, torch.arange(1000, 1000 + new_tokens, dtype=torch.int32)])
+    pm.pending_list = [PendingReq(uid=1, input_ids=tokens, sampling_params=SamplingParams(max_tokens=1))]
     batch = pm.schedule_next_batch(1024)
-    assert asked == [256]
-    assert batch.reqs[0].cached_len == (256 if resumable else 0) and batch.reqs[0].extend_len == (46 if resumable else 302)
+    req = batch.reqs[0]
+    assert req.cached_len == cached and req.extend_len == len(tokens) - cached and req.prompt_len == len(tokens)
     cm.allocate_paged(batch.reqs)
-    batch.reqs[0].complete_one()
-    cm.cache_req(batch.reqs[0], finished=True)
+    req.complete_one()
+    cm.cache_req(req, finished=True)
     cm.check_integrity()
 
 

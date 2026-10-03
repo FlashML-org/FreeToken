@@ -1,7 +1,7 @@
 """DSV41 attention backend: addressing and selection contracts, CPU-only (kernels live in tests/kernels).
 
 * prefill metadata: encoder segments, the decoder pass under exact vs bounded replay;
-* window candidates with a floor (bounded replay truncates the window at the replay start);
+* window candidates with a floor (bounded replay truncates the window at the prompt's last window);
 * decode snapshot staging and the layer-invariant ring context;
 * the pure selection helpers against the reference ``select_candidate_blocks`` / top-k semantics.
 """
@@ -39,7 +39,7 @@ def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
 
     private = tuple(range(3, len(RATIOS))) if swa_decoder_replay != "exact" else ()
     geom = DSV41Geometry(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES,
-                        resume_windows=1 if swa_decoder_replay == "exact" else 2, private_window_layer_ids=private)
+                        private_window_layer_ids=private)
     pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
@@ -55,9 +55,9 @@ def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
     return backend, pool, pt
 
 
-def _req(table_idx, cached_len, n_new, output_len=16, uid=0):
+def _req(table_idx, cached_len, n_new, output_len=16, uid=0, prompt_len=0):
     return Req(input_ids=torch.zeros(cached_len + n_new, dtype=torch.int32), table_idx=table_idx, cached_len=cached_len,
-               output_len=output_len, uid=uid, sampling_params=SamplingParams(), cache_handle=None)
+               output_len=output_len, uid=uid, sampling_params=SamplingParams(), cache_handle=None, prompt_len=prompt_len)
 
 
 def _prefill_batch(reqs):
@@ -67,7 +67,8 @@ def _prefill_batch(reqs):
 
 
 def test_prefill_metadata_exact_mode_runs_the_decoder_on_every_token():
-    backend, _, _ = _stack("exact")
+    backend, pool, _ = _stack("exact")
+    assert pool.prefix_replay_tokens == 0
     batch = _prefill_batch([_req(0, 0, 300), _req(2, 256, 44, uid=1)])
     backend.prepare_metadata(batch)
     md = batch.attn_metadata
@@ -76,30 +77,41 @@ def test_prefill_metadata_exact_mode_runs_the_decoder_on_every_token():
     assert md.last_indices.tolist() == [299, 343]
 
 
-def test_prefill_metadata_bounded_mode_replays_the_last_window():
+def test_prefill_metadata_bounded_mode_runs_the_decoder_on_the_last_window():
+    """The encoder runs every new token; the decoder runs each request's part of its prompt's last
+    window ``[L - P, L)``, floored at ``L - P``. A chunk ending before that window runs no decoder row
+    and its ``last_indices`` entry points at the placeholder row the model appends."""
     backend, pool, _ = _stack("bounded")
-    r0, r1 = _req(0, 0, 300), _req(2, 256, 44, uid=1)
-    r1.input_ids = torch.arange(300, dtype=torch.int32)  # distinguishable ids for the stream check
-    batch = _prefill_batch([r0, r1])
-    batch.input_ids = torch.cat([r0.input_ids, r1.input_ids[256:]])
-    batch.positions = torch.cat([torch.arange(300), torch.arange(256, 300)])
+    assert pool.prefix_replay_tokens == P and pool.sliding_window_size == P
+    cold = _req(0, 0, 300)  # a whole prompt: L - P = 172
+    early = _req(1, 256, 128, uid=1, prompt_len=600)  # chunk [256, 384) of a 600-token prompt: before 472
+    straddle = _req(2, 384, 128, uid=2, prompt_len=600)  # chunk [384, 512): its rows [472, 512) are in the window
+    batch = _prefill_batch([cold, early, straddle])
     backend.prepare_metadata(batch)
     md = batch.attn_metadata
-    enc, dec = md.segments, md.decoder_segments
-    # request 0: the cold prompt is its own encoder stream; the decoder replays its last 128 tokens
-    assert (enc[0].offset, enc[0].n, enc[0].start_pos, enc[0].write_from) == (0, 300, 0, 0)
-    assert (dec[0].offset, dec[0].n, dec[0].start_pos, dec[0].window_floor) == (0, 128, 172, 172)
-    # request 1 brought 44 new tokens after a 256-token hit: the encoder pass re-runs from the previous
-    # window page (128) so the decoder can replay the prompt's whole last window [172, 300); the
-    # recomputed history [128, 256) is read-only -- writes start at the hit
-    assert (enc[1].offset, enc[1].n, enc[1].start_pos, enc[1].write_from, enc[1].write_offset) == (300, 172, 128, 256, 428) and md.extended
-    assert (dec[1].offset, dec[1].n, dec[1].start_pos, dec[1].window_floor) == (128, 128, 172, 172)
-    assert md.decoder_rows.tolist() == list(range(172, 300)) + list(range(300 + 44, 300 + 172))
-    assert md.last_indices.tolist() == [127, 255]  # into the decoder stream
-    with get_global_ctx().forward_batch(batch):
-        ids, pos = backend.encoder_stream(batch)
-    assert ids.shape == (472,) and torch.equal(ids[300:], torch.arange(128, 300, dtype=torch.int32))
-    assert torch.equal(pos[300:], torch.arange(128, 300))
+    assert [(s.offset, s.n, s.start_pos, s.window_floor) for s in md.segments] == [(0, 300, 0, 0), (300, 128, 256, 0), (428, 128, 384, 0)]
+    assert [(d.offset, d.n, d.table_idx, d.start_pos, d.window_floor) for d in md.decoder_segments] == [(0, 128, 0, 172, 172), (128, 40, 2, 472, 472)]
+    assert md.decoder_rows.tolist() == list(range(172, 300)) + list(range(428 + 88, 556))
+    assert md.decoder_pad and md.last_indices.tolist() == [127, 168, 167]  # 168: the placeholder after 168 decoder rows
+
+
+def test_prefill_metadata_bounded_mode_without_any_decoder_row():
+    backend, _, _ = _stack("bounded")
+    batch = _prefill_batch([_req(0, 0, 256, prompt_len=1024)])
+    backend.prepare_metadata(batch)
+    md = batch.attn_metadata
+    assert md.decoder_segments == [] and md.decoder_rows.numel() == 0
+    assert md.decoder_pad and md.last_indices.tolist() == [0]
+
+
+def test_prefill_metadata_short_prompt_runs_the_decoder_everywhere():
+    """A prompt shorter than the window floors the decoder's window at 0: it sees what exact mode sees."""
+    backend, _, _ = _stack("bounded")
+    batch = _prefill_batch([_req(0, 0, 50)])
+    backend.prepare_metadata(batch)
+    md = batch.attn_metadata
+    assert [(d.offset, d.n, d.start_pos, d.window_floor) for d in md.decoder_segments] == [(0, 50, 0, 0)]
+    assert not md.decoder_pad and md.last_indices.tolist() == [49]
 
 
 def test_private_window_layers_address_per_request_rings():
@@ -126,34 +138,6 @@ def test_private_window_layers_address_per_request_rings():
     slots, topk = md.private_window_ctx(torch.tensor([300]), torch.arange(1))
     assert slots.tolist() == [2 * P + 300 % P] and topk.shape == (1, 1, P)
     assert set(topk[0, 0].tolist()) == {2 * P + j for j in range(P)}  # every ring index holds a position <= 300
-
-
-def test_bounded_extension_reads_only_the_resume_history():
-    """A bounded-mode extension recomputes from the previous window page, so the window keys it reads,
-    ``[start - P + 1, cached_len)``, stay inside the two windows the cache keeps live behind a
-    page-aligned hit (the pool's ``sliding_window_size``). ``replay_history`` bounds that read for
-    admission, which turns a hit reading further back into a miss; the planner does not re-check."""
-    from freetoken.attention.dsv41_sparse import replay_history
-
-    backend, _, _ = _stack("bounded")
-    for cached, new in ((256, 44), (256, 1), (256, P - 1), (384, 10)):
-        batch = _prefill_batch([_req(2, cached, new, uid=1)])
-        backend.prepare_metadata(batch)
-        start = batch.attn_metadata.segments[0].start_pos
-        assert start == cached - P and batch.attn_metadata.extended
-        assert cached - (start - P + 1) <= replay_history(cached, P) == 2 * P - 1 <= backend.geom.resume_history
-    # off a window page the one-new-token recompute starts a page further back
-    assert replay_history(0, P) == 0 and replay_history(3 * P + 1, P) == 2 * P and replay_history(3 * P + 2, P) > backend.geom.resume_history
-
-
-def test_replay_start_rules():
-    from freetoken.attention.dsv41_sparse import replay_start
-
-    assert replay_start(_req(0, 0, 50), P, True) == 0  # a cold prompt shorter than a window
-    assert replay_start(_req(0, 256, 300), P, True) == 256  # a whole window of new tokens
-    assert replay_start(_req(0, 256, 44), P, True) == 128  # short suffix -> previous page boundary
-    assert replay_start(_req(0, 384, 10), P, True) == 256
-    assert replay_start(_req(0, 256, 44), P, False) == 256  # exact mode never extends
 
 
 def test_window_candidates_honor_the_floor_and_the_retained_prefix():

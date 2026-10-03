@@ -38,46 +38,18 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     args = config.model_config.dsv41_args
     assert args.swa_decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
-    # the cache contract follows the replay mode: a bounded-mode prefix hit recomputes the window before
-    # it, so the cache manager must match / lock / retain two windows of live history behind a hit; the
-    # pool says so (the cache manager reads its sliding_window_size), the group spec carries the window only
+    # the cache contract follows the replay mode: a bounded-mode prefix hit must leave the prompt's last
+    # window to the prefill (the pool's prefix_replay_tokens); the history a resume reads stays one window
     from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
 
     geom = config.model_config.attention_groups[0].geometry
     spec = config.model_config.kv_cache_group_specs()[0]
-    want = 256 if replay == "bounded" else 128
     pool = DSV41PagedKVCache(dsv41_pool_sizes(16, geom, 1.0, 128), geom, torch.device("cpu"))
-    assert geom.resume_history == want and pool.sliding_window_size == want and spec.sliding_window == 128 and not spec.is_swa
+    assert pool.prefix_replay_tokens == (128 if replay == "bounded" else 0)
+    assert pool.sliding_window_size == 128 and spec.sliding_window == 128 and not spec.is_swa
     # bounded replay keeps the decoder's per-request window KV in private rings, off the shared pages
     assert geom.private_window_layer_ids == (tuple(range(args.decoder_start_layer, args.n_layers)) if replay == "bounded" else ())
-    assert DSV41PagedKVCache.min_kv_tokens(config) // 128 == 8 + (2 * geom.resume_windows + 1) * config.max_running_req + 2 * (config.max_running_req + 1) + 1
-
-
-def test_bounded_mode_cache_refuses_a_hit_with_one_live_window(tmp_path, monkeypatch):
-    """SWARadixCache built from the resolved config demands two live windows behind a reusable
-    position in bounded mode: with the page before a prompt's last window tombstoned, the match
-    falls back to a shorter (safe) prefix instead of admitting a hit whose recompute has no keys."""
-    from freetoken.engine import engine
-    from freetoken.kvcache.swa_radix_cache import SWARadixCache
-    from freetoken.scheduler.cache import CacheManager
-
-    monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
-    monkeypatch.setattr(engine, "is_sm90_family", lambda: True)
-    write_tiny_checkpoint(str(tmp_path))
-    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay="bounded", max_seq_len_override=2048)
-    _adjust_config(config)
-    resume = config.model_config.attention_groups[0].geometry.resume_history
-    assert resume == 256
-    ids = torch.arange(768, dtype=torch.int32)
-    # exact mode's contract (one window) still admits the hit below; bounded mode's does not
-    for window, admits in ((128, True), (resume, False)):
-        cache = SWARadixCache(torch.device("cpu"), config.page_size, window)
-        cache.insert(ids, torch.arange(768, dtype=torch.int32))
-        assert cache.match_prefix(ids).cached_len == 768  # everything live: the whole prompt is reusable
-        cache.trim_head_swa(ids, 640)  # the finish-time head trim: only [640, 768) stays swa-live
-        got = cache.match_prefix(ids).cached_len
-        assert (got == 768) is admits, (window, got)
-        assert got % 128 == 0
+    assert DSV41PagedKVCache.min_kv_tokens(config) // 128 == 8 + 3 * config.max_running_req + 2 * (config.max_running_req + 1) + 1
 
 
 def test_fp8_block32_dialect_reaches_the_quant_layer(tmp_path):

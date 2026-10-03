@@ -126,13 +126,13 @@ class CompressStateRing:
         self._clear_scratch()
 
 
-def reserved_window_pages(max_running_req: int, radix: bool, resume_windows: int = 1) -> int:
+def reserved_window_pages(max_running_req: int, radix: bool) -> int:
     """Window pages the sliding pool must always keep for the concurrent working set: each
     running request's decode transients (2 per req + dummy) plus, in radix mode, PER concurrent
-    request its locked live tail (``resume_windows`` pages) AND a retained (soft-pinned) prompt-end
-    history (``resume_windows + 1`` pages, since the retention gap page-aligns to a whole extra
-    page at P == window)."""
-    return 2 * (max_running_req + 1) + ((2 * resume_windows + 1) * max_running_req if radix else 0) + 1
+    request one locked live-tail page AND a retained (soft-pinned) prompt-end window -- the
+    window is 2 pages here because the retention gap page-aligns to a whole extra page at
+    P == window."""
+    return 2 * (max_running_req + 1) + (3 * max_running_req if radix else 0) + 1
 
 
 def window_state_loc(window_slot: torch.Tensor, ring_size: int, P: int) -> torch.Tensor:
@@ -162,9 +162,6 @@ class WindowTierPagedPool(BaseKVCachePool):
     swa_paged = True
     # the tier buffers are bound into per-forward model scratch, invalid after a realloc
     needs_rebind_on_rebuild = True
-    # window pages of live history the cache manager keeps behind a resumable position (see
-    # DSV41Geometry.resume_windows); sized into the reserve below
-    resume_windows: int = 1
 
     P: int
     _device: torch.device
@@ -227,7 +224,7 @@ class WindowTierPagedPool(BaseKVCachePool):
         # only between chunks; peak ~2x the chunk), so reserve the concurrent working set and
         # halve the rest.
         n_win_pages = (self.sizes.n_win_slots // P) - 1
-        reserved = reserved_window_pages(max_running_req, radix, self.resume_windows)
+        reserved = reserved_window_pages(max_running_req, radix)
         self._chunk_budget = max(P, (n_win_pages - reserved) // 2 * P)
 
     @property

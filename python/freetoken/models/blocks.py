@@ -48,21 +48,6 @@ class SupportsMultimodal(Protocol):
         ...
 
 
-@runtime_checkable
-class ReplaysPrefill(Protocol):
-    """A model whose prefill can start before ``cached_len``, recomputing cached tokens (DeepSeek-V4.1's
-    bounded replay); the scheduler and the encoder cache follow that interval."""
-
-    def prefill_start(self, req) -> int:
-        """First token the prefill recomputes; multimodal gathering uses the same interval."""
-        ...
-
-    def can_resume_at(self, cached_len: int, live_history: int) -> bool:
-        """Whether a prefix hit ending at ``cached_len``, with ``live_history`` tokens of window KV
-        kept live behind it, holds everything the prefill resuming there reads."""
-        ...
-
-
 def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
     """Token embeddings of the batch; on a chunk with multimodal rows, batch.mm_embeds' leading columns replace the rows batch.mm_rows."""
     if batch.mm_embeds is None:

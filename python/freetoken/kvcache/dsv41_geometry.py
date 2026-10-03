@@ -29,11 +29,6 @@ class DSV41Geometry:
     win_fmt: RowFormat = FP8_E8M0_B32
     main_fmt: RowFormat = FP4_E4M3_B16
     idx_fmt: RowFormat = FP4_E8M0_B32
-    # Window pages of live history a resumable (cached, page-aligned) position needs behind it:
-    # 1 = the attention window itself; 2 under Decoder SWA Bounded Replay, whose recompute of the
-    # window before a prefix hit reads the window before that. The cache manager locks / retains /
-    # evicts against ``resume_windows * window`` tokens, the pool reserves that many pages per request.
-    resume_windows: int = 1
     # Layers whose window KV is REQUEST-PRIVATE: kept in a per-page-table-row ring of ``window``
     # slots (slot = row * window + pos % window) instead of the shared, page-bound window pool, so
     # it never lands in radix-shared pages. The decoder layers under Decoder SWA Bounded Replay:
@@ -43,10 +38,6 @@ class DSV41Geometry:
     private_window_layer_ids: tuple[int, ...] = ()
 
     @property
-    def resume_history(self) -> int:
-        return self.resume_windows * self.window
-
-    @property
     def shared_window_layer_ids(self) -> tuple[int, ...]:
         return tuple(l for l in range(self.n_layers) if l not in self.private_window_layer_ids)
 
@@ -54,8 +45,6 @@ class DSV41Geometry:
         return layer_id in self.private_window_layer_ids
 
     def __post_init__(self) -> None:
-        if self.resume_windows < 1:
-            raise ValueError(f"resume_windows must be >= 1, got {self.resume_windows}")
         for layer in self.private_window_layer_ids:
             if not (0 <= layer < self.n_layers):
                 raise ValueError(f"private window layer {layer} out of range")

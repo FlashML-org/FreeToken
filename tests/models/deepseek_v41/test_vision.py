@@ -18,9 +18,8 @@ from freetoken.engine.engine import Engine
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.encoder_cache import EncoderCache
 from freetoken.mm.processors.deepseek_v41 import DeepseekV41MMProcessor
-from freetoken.models.blocks import ReplaysPrefill
 from freetoken.models.deepseek_v41.config import VisionConfig
-from freetoken.scheduler.mm import plan_mm_batch
+from freetoken.scheduler.mm import mm_rows_after, plan_mm_batch
 from freetoken.utils.torch_utils import torch_dtype
 
 from .common import DIM, VOCAB, requires_cuda, tiny_text_config, write_tiny_checkpoint
@@ -71,19 +70,19 @@ def _inputs(length=151):
 
 def _prefill(eng, reqs):
     if not hasattr(eng, 'encoder_cache'):
-        eng.encoder_cache = EncoderCache(retain_until_prefill_end=isinstance(eng.model, ReplaysPrefill))
+        eng.encoder_cache = EncoderCache()
         eng.dtype = torch.bfloat16
         eng._mm_registered = set()
     for req in reqs:
         if id(req) not in eng._mm_registered:
-            for item in req.mm_items or ():
-                eng.encoder_cache.register(item.hash, req.uid, item.num_tokens)
+            for item in req.mm_items or ():  # what the scheduler claims at admission
+                eng.encoder_cache.register(item.hash, req.uid, mm_rows_after(item, req.cached_len))
             eng._mm_registered.add(id(req))
     batch = Batch(reqs=reqs, phase='prefill')
     batch.padded_reqs = reqs
     batch.input_ids = torch.cat([r.input_ids[r.cached_len:r.device_len] for r in reqs]).cuda()
     batch.positions = torch.cat([torch.arange(r.cached_len, r.device_len) for r in reqs]).cuda()
-    jobs, plan, rows, _ = plan_mm_batch(reqs, eng.encoder_cache, starts=[eng.model.prefill_start(r) for r in reqs])
+    jobs, plan, rows, _ = plan_mm_batch(reqs, eng.encoder_cache)
     batch.mm_encoder_jobs, batch.mm_gather_plan = jobs, plan
     if plan:
         batch.mm_rows = torch.tensor(rows, dtype=torch.long, device=eng.device)
@@ -186,10 +185,12 @@ def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):
     from .harness import TinyEngine
     from .test_reference_parity import _compare, _engram_table_for
     tensors = _checkpoint(tmp_path)
-    eng = TinyEngine(str(tmp_path), max_seq_len=1024, swa_decoder_replay=mode)
+    eng = TinyEngine(str(tmp_path), max_seq_len=2048, swa_decoder_replay=mode)
     _engram_table_for(eng, tensors, tiny_text_config())
+    # bounded mode caps a hit a window before the prompt end: trailing text keeps that cap at 128
+    tail = 150 if mode == 'bounded' else 0
     def inputs():
-        ids = [3] * 80 + [VOCAB - 1] + [4] * 37 + [VOCAB - 1] + [4] * 31 + [VOCAB - 1]
+        ids = [3] * 80 + [VOCAB - 1] + [4] * 37 + [VOCAB - 1] + [4] * 31 + [VOCAB - 1] + [4] * tail
         return _processor().apply(torch.tensor(ids, dtype=torch.int32), [_image(c) for c in ('red', 'blue', 'green')])
     whole = inputs()
     assert [i.offsets for i in whole.mm_items] == [[[80, 90]], [[127, 137]], [[168, 178]]]
@@ -205,7 +206,9 @@ def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):
     got = _prefill(eng, [b])
     _compare('chunked image prefill', got, want)
     prefix = inputs()
-    # Replay [50,178) revisits a consumed image; the second image straddles the chunk/prefix boundary.
+    # The second image straddles the chunk / prefix boundary at 128 (in bounded mode the first chunk
+    # also ends before the prompt's last window and runs no decoder row).
     hit = eng.new_request_on_prefix(1, a, prefix.input_ids.tolist())
+    assert hit.cached_len == 128
     hit.mm_items = prefix.mm_items
     _compare('image prefix hit', _prefill(eng, [hit]), want)
