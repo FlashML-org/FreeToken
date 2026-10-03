@@ -62,14 +62,22 @@ class BaseKVCachePool(ABC):
         is written)."""
 
     @classmethod
+    def plan_num_pages(cls, config, available_memory: int) -> int:
+        """The page count ``solve_num_pages`` would pick, without its checks or log line: may
+        be <= 1 when the budget is too small. The pre-load memory forecast calls this."""
+        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
+        num_pages = config.num_page_override
+        if num_pages is None:
+            num_pages = (available_memory - fixed_cache_size) // cache_per_page
+        return num_pages
+
+    @classmethod
     def solve_num_pages(cls, config, available_memory: int) -> int:
         """Largest usable page count fitting ``available_memory`` (bytes measured by the
         engine: memory_ratio x baseline free minus resident weights and any sibling pool's
         fixed cost), honoring ``config.num_page_override``."""
         cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
-        num_pages = config.num_page_override
-        if num_pages is None:
-            num_pages = (available_memory - fixed_cache_size) // cache_per_page
+        num_pages = cls.plan_num_pages(config, available_memory)
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         real_kv_size = num_pages * cache_per_page + fixed_cache_size
         logger.info(
