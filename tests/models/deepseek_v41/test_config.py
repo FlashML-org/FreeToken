@@ -58,10 +58,16 @@ def test_bad_layouts_are_rejected():
 def test_registry_and_geometry():
     spec = get_model_spec("DeepseekV41ForCausalLM")
     assert spec.module == "freetoken.models.deepseek_v41"
+    from freetoken.attention import AttnType
+    from freetoken.kvcache.dsv41_geometry import dsv41_geometry
+    from freetoken.models.config import DSV4AttentionGroupConfig
+
     mc = parse_config(tiny_hf_config())
-    geom = mc.attention_groups[0].geometry
+    geom = dsv41_geometry(mc.dsv41_args)
     assert geom.kv_source_layer_ids == (2, 4) and geom.compress_ratios == tuple(RATIOS[:N_LAYERS])
-    assert mc.kv_cache_group_specs()[0].attn_type.value == "dsv41"
+    (group,) = mc.attention_groups
+    assert type(group) is DSV4AttentionGroupConfig and group.variant == "v41"
+    assert mc.kv_cache_group_specs()[0].attn_type is AttnType.DSV41 and mc.attn_type_for_layer(0) is AttnType.DSV41
     assert mc.num_layers == N_LAYERS and mc.dsv41_args is not None
 
 

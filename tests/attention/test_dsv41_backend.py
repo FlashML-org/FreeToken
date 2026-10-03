@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
-from freetoken.kvcache.dsv41_geometry import DSV41Geometry
+from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 
 P, MRR, DEVICE = 128, 4, torch.device("cpu")
@@ -37,9 +37,9 @@ def _ctx(pool):
 def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
     from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
-    private = tuple(range(3, len(RATIOS))) if swa_decoder_replay != "exact" else ()
-    geom = DSV41Geometry(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES,
-                        private_window_layer_ids=private)
+    args = SimpleNamespace(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
+                           backbone_kv_sources=SOURCES, decoder_start_layer=3, swa_decoder_replay=swa_decoder_replay)
+    geom = dsv41_geometry(args)
     pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
@@ -49,9 +49,7 @@ def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
         pool.bind_window_pages(page * P, page * P)
     pool.full_loc_map = pt
     _ctx(pool)
-    group = SimpleNamespace(geometry=geom)
-    args = SimpleNamespace(swa_decoder_replay=swa_decoder_replay, decoder_start_layer=3)
-    backend = DSV41SparseAttnBackend(SimpleNamespace(attention_groups=(group,), dsv41_args=args))
+    backend = DSV41SparseAttnBackend(SimpleNamespace(dsv41_args=args))
     return backend, pool, pt
 
 

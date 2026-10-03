@@ -7,8 +7,8 @@ Every layer has a sliding window (``window`` tokens) of layer-local KV. Layers w
 projected from it); every other DSV41 layer reads the most recent source's pools. The pool
 therefore allocates the global tiers PER SOURCE and aliases consumers onto them.
 
-Built by the model's ``parse_config`` and carried on ``DSV41AttentionGroupConfig``; the kvcache
-side reads only this object (never the model args), so the two packages stay decoupled.
+Built by ``dsv41_geometry`` from ``ModelConfig.dsv41_args``, read by attribute like DSV4's pool reads
+``dsv4_args``: the kvcache package never imports the model package.
 """
 
 from __future__ import annotations
@@ -103,4 +103,20 @@ class DSV41Geometry:
         return 2 * self.head_dim * 4
 
 
-__all__ = ["DSV41Geometry"]
+def dsv41_geometry(args) -> DSV41Geometry:
+    """The geometry of a DeepSeek-V4.1 ``dsv41_args``. Decoder SWA Bounded Replay computes the decoder
+    only over each request's last window, so that KV is request-private: per-request rings, never
+    radix-shared pages."""
+    n = args.n_layers
+    return DSV41Geometry(
+        n_layers=n,
+        head_dim=args.head_dim,
+        index_head_dim=args.index_head_dim,
+        window=args.window_size,
+        compress_ratios=tuple(args.compress_ratios[:n]),
+        kv_source_layer_ids=tuple(args.backbone_kv_sources),
+        private_window_layer_ids=() if args.swa_decoder_replay == "exact" else tuple(range(args.decoder_start_layer, n)),
+    )
+
+
+__all__ = ["DSV41Geometry", "dsv41_geometry"]

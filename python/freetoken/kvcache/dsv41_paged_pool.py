@@ -31,7 +31,7 @@ from .dsv41_cost_model import (
     dsv41_kv_unit_bytes,
     dsv41_window_unit_bytes,
 )
-from .dsv41_geometry import DSV41Geometry
+from .dsv41_geometry import DSV41Geometry, dsv41_geometry
 from .window_tier import CompressStateRing, WindowTierPagedPool
 
 logger = init_logger(__name__)
@@ -122,9 +122,9 @@ class DSV41PagedKVCache(WindowTierPagedPool):
     # ----- engine-facing sizing / rebuild surface -----
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .dsv41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model, dsv41_geometry
+        from .dsv41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model
 
-        geom = dsv41_geometry(config)
+        geom = dsv41_geometry(config.model_config.dsv41_args)
         P = geom.window
         per_page, fixed, min_reserve = dsv41_auto_cost_model(
             geom, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, geom), P, n_scratch=config.max_running_req + 1
@@ -139,12 +139,11 @@ class DSV41PagedKVCache(WindowTierPagedPool):
             _dsv41_pool_sizes,
             _dsv41_swa_ratio,
             _dsv41_window_floor_pages,
-            dsv41_geometry,
             dsv41_pool_bytes,
             dsv41_solve_num_pages,
         )
 
-        geom = dsv41_geometry(config)
+        geom = dsv41_geometry(config.model_config.dsv41_args)
         P = geom.window
         num_pages = config.num_page_override
         if num_pages is None:
@@ -171,16 +170,16 @@ class DSV41PagedKVCache(WindowTierPagedPool):
     @classmethod
     def window_spec(cls, config):
         from .base import WindowPoolSpec
-        from .dsv41_cost_model import _dsv41_window_floor_pages, dsv41_geometry
+        from .dsv41_cost_model import _dsv41_window_floor_pages
 
-        geom = dsv41_geometry(config)
+        geom = dsv41_geometry(config.model_config.dsv41_args)
         return WindowPoolSpec(geom.window, _dsv41_window_floor_pages(config, geom) - 1)
 
     @classmethod
     def min_kv_tokens(cls, config) -> int:
-        from .dsv41_cost_model import _dsv41_window_floor_pages, dsv41_geometry
+        from .dsv41_cost_model import _dsv41_window_floor_pages
 
-        geom = dsv41_geometry(config)
+        geom = dsv41_geometry(config.model_config.dsv41_args)
         return _dsv41_window_floor_pages(config, geom) * geom.window
 
     def validate_rebuild(

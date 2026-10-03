@@ -25,6 +25,14 @@ RATIOS = (0, 0, 2, 2, 2, 2, 2, 1, 1, 1)
 SOURCES = (2, 5, 7)
 
 
+def _args():
+    """A ``dsv41_args`` stand-in whose geometry is ``_geom()`` (the pool reads the args by attribute)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(n_layers=10, head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
+                           backbone_kv_sources=SOURCES, decoder_start_layer=7, swa_decoder_replay="exact")
+
+
 def _geom(**over) -> DSV41Geometry:
     base = dict(n_layers=10, head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES)
     base.update(over)
@@ -54,8 +62,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
         page_size=P, max_running_req=1, max_seq_len=1024, cache_type="swa_radix",
         swa_full_tokens_ratio=0.5, swa_num_pages_override=None,
         model_config=SimpleNamespace(
-            dsv4_args=None, has_swa_attention=False,
-            attention_groups=[SimpleNamespace(geometry=geom)],
+            dsv4_args=None, dsv41_args=_args(), has_swa_attention=False,
             kv_cache_group_specs=lambda: [SimpleNamespace(attn_type=AttnType.DSV41)],
         ),
     )

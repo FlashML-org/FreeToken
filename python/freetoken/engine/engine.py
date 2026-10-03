@@ -1212,21 +1212,11 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     batches <= max_running_req. Unlike DSV4 the prefill chunk keeps ``max_extend_tokens`` (whole
     window pages): at a 1M ceiling the window pool alone would admit ~40K-token chunks whose
     activations (64 x 512 latent queries per token) do not fit next to the expert cache."""
-    import dataclasses
-
-    from freetoken.models.deepseek_v41.config import dsv41_geometry
-
     model_config = config.model_config
     args = model_config.dsv41_args
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
-    # the replay mode decides which window layers are request-private (geometry.private_window_layer_ids):
-    # rebuild the attention group's geometry so the pool, its cost model and the backend agree
-    object.__setattr__(  # ModelConfig is frozen; this is the config-resolution step that owns it
-        model_config, "attention_groups",
-        tuple(dataclasses.replace(g, geometry=dsv41_geometry(args)) if getattr(g, "kind", None) == "dsv41" else g for g in model_config.attention_groups),
-    )
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(

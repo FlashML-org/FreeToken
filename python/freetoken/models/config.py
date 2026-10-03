@@ -205,7 +205,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
     class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
     and reroute DSV4 through the SWA gates. Geometry beyond the latent width lives in
-    dsv4_args; the pool prices itself from there, not from this spec."""
+    dsv4_args (``dsv41_args`` for the ``v41`` variant); the pool prices itself from there,
+    not from this spec."""
 
     kind: ClassVar[Literal["dsv4"]] = "dsv4"
     cache_kind: ClassVar[Literal["dsv4_paged"]] = "dsv4_paged"
@@ -213,22 +214,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     num_kv_heads: int
     head_dim: int
     sliding_window: int  # the P-token window page
-
-
-@dataclass(frozen=True)
-class DSV41AttentionGroupConfig(BaseAttentionGroupConfig):
-    """DSV41 sparse attention (DeepSeek-V4.1: window + cross-layer-shared compressed KV in
-    packed rows + hierarchical indexer). Standalone like DSV4's group so no SWA/MLA gate
-    reroutes it. ``geometry`` is the kvcache-side description the pool and its cost model
-    price themselves from."""
-
-    kind: ClassVar[Literal["dsv41"]] = "dsv41"
-    cache_kind: ClassVar[Literal["dsv41_paged"]] = "dsv41_paged"
-
-    num_kv_heads: int
-    head_dim: int
-    sliding_window: int  # the P-token window page
-    geometry: Any  # freetoken.kvcache.dsv41_geometry.DSV41Geometry
+    # "v41": DeepSeek-V4.1's cross-layer-shared packed tiers (AttnType.DSV41, its own pool and backend)
+    variant: Literal["v4", "v41"] = "v4"
 
 
 AttentionGroupConfig: TypeAlias = (
@@ -236,7 +223,6 @@ AttentionGroupConfig: TypeAlias = (
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
-    | DSV41AttentionGroupConfig
 )
 
 
@@ -468,7 +454,7 @@ class ModelConfig:
         if isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
-            return AttnType.DSV4
+            return AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -522,19 +508,7 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV4,
-                    )
-                )
-            elif isinstance(group, DSV41AttentionGroupConfig):
-                # Taxonomy entry only, like DSV4: the pool prices itself from group.geometry.
-                specs.append(
-                    KVCacheGroupSpec(
-                        name=group.name,
-                        layer_ids=group.layer_ids,
-                        num_kv_heads=group.num_kv_heads,
-                        head_dim=group.head_dim,
-                        sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV41,
+                        attn_type=AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4,
                     )
                 )
         return tuple(specs)

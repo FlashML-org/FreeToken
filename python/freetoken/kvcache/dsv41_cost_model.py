@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .dsv41_geometry import DSV41Geometry
+from .dsv41_geometry import DSV41Geometry, dsv41_geometry
 from .window_tier import reserved_window_pages
 
 _INT64_BYTES = 8
@@ -137,15 +137,6 @@ def dsv41_auto_cost_model(geom: DSV41Geometry, swa_ratio: float, floor_win_pages
 # ---- config-facing sizing (EngineConfig in, sizes out) ----
 
 
-def dsv41_geometry(config) -> DSV41Geometry:
-    """The DSV41 geometry a serving config carries (on its attention group)."""
-    for group in config.model_config.attention_groups:
-        geom = getattr(group, "geometry", None)
-        if isinstance(geom, DSV41Geometry):
-            return geom
-    raise ValueError("model config has no DSV41 attention group")
-
-
 def _dsv41_swa_ratio(config) -> float:
     return float(config.swa_full_tokens_ratio)
 
@@ -162,7 +153,7 @@ def _dsv41_window_floor_pages(config, geom: DSV41Geometry) -> int:
 def _dsv41_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None) -> DSV41PoolSizes:
     """Sizes for ``num_pages`` PHYSICAL pages (dummy included). Window precedence: an explicit
     ``num_swa_pages`` > ``config.swa_num_pages_override`` > ``swa_ratio`` x full, floored ONCE in pages."""
-    geom = dsv41_geometry(config)
+    geom = dsv41_geometry(config.model_config.dsv41_args)
     P = geom.window
     swa_ratio = _dsv41_swa_ratio(config)
     floor_pages = _dsv41_window_floor_pages(config, geom)
@@ -178,7 +169,6 @@ __all__ = [
     "DSV41PoolSizes",
     "dsv41_auto_cost_model",
     "dsv41_cache_per_page",
-    "dsv41_geometry",
     "dsv41_kv_unit_bytes",
     "dsv41_pool_bytes",
     "dsv41_pool_sizes",

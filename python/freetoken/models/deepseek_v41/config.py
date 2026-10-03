@@ -1,9 +1,10 @@
 """Engine-facing config for DeepSeek-V4.1-Flash.
 
 ``parse_config`` maps the standard transformer fields into :class:`ModelConfig`, carries the full
-:class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module, and declares the DSV41
-attention group whose :class:`DSV41Geometry` prices the KV pool. The engine reconciles the runtime
-knobs (``max_seq_len``, ``swa_decoder_replay``) onto ``dsv41_args`` at config resolution.
+:class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module and the KV pool (which
+derives its ``DSV41Geometry`` from it), and declares the ``v41`` variant of the DSV4 attention group.
+The engine reconciles the runtime knobs (``max_seq_len``, ``swa_decoder_replay``) onto ``dsv41_args``
+at config resolution.
 """
 
 from __future__ import annotations
@@ -11,8 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-from freetoken.kvcache.dsv41_geometry import DSV41Geometry
-from freetoken.models.config import DSV41AttentionGroupConfig, ModelConfig, RotaryConfig
+from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
 
 from .args import DeepseekV41Args
 
@@ -29,20 +29,6 @@ class VisionConfig:
     max_image_tokens: int = 1024
     min_pixels: int = 544 * 544
     max_wh_ratio: float | None = None
-
-
-def dsv41_geometry(args: DeepseekV41Args) -> DSV41Geometry:
-    return DSV41Geometry(
-        n_layers=args.n_layers,
-        head_dim=args.head_dim,
-        index_head_dim=args.index_head_dim,
-        window=args.window_size,
-        compress_ratios=tuple(args.compress_ratios[: args.n_layers]),
-        kv_source_layer_ids=args.backbone_kv_sources,
-        # bounded replay computes the decoder only over each request's last window: that KV is
-        # request-private and lives in per-request rings, never in radix-shared pages
-        private_window_layer_ids=() if args.swa_decoder_replay == "exact" else tuple(range(args.decoder_start_layer, args.n_layers)),
-    )
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -94,16 +80,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
         vision_config=vision,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=(
-            DSV41AttentionGroupConfig(
+            DSV4AttentionGroupConfig(
                 name="dsv41",
                 layer_ids=tuple(range(args.n_layers)),
                 num_kv_heads=1,
                 head_dim=args.head_dim,
                 sliding_window=args.window_size,
-                geometry=dsv41_geometry(args),
+                variant="v41",
             ),
         ),
     )
 
 
-__all__ = ["parse_config", "dsv41_geometry"]
+__all__ = ["parse_config"]

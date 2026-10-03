@@ -2,7 +2,6 @@ from .blocks import BaseLLMModel
 from .config import (
     AttentionGroupConfig,
     BaseAttentionGroupConfig,
-    DSV41AttentionGroupConfig,
     DSV4AttentionGroupConfig,
     FullAttentionGroupConfig,
     KVCacheGroupSpec,
@@ -25,7 +24,6 @@ __all__ = [
     "load_weight",
     "AttentionGroupConfig",
     "BaseAttentionGroupConfig",
-    "DSV41AttentionGroupConfig",
     "DSV4AttentionGroupConfig",
     "FullAttentionGroupConfig",
     "LinearGatedDeltaGroupConfig",

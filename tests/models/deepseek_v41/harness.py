@@ -13,12 +13,13 @@ from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, 
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.engine import _materialize_loaded_weight_state_dict
 from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.layers.quantization.method import finalize_quant
 from freetoken.models import create_model
-from freetoken.models.deepseek_v41.config import dsv41_geometry, parse_config
+from freetoken.models.deepseek_v41.config import parse_config
 from freetoken.models.deepseek_v41.engram import ZeroEngramTable
 from freetoken.models.deepseek_v41.weight import iter_weights
 from freetoken.utils.hf import cached_load_hf_config
@@ -41,15 +42,12 @@ class TinyEngine:
         args.max_batch_size = max_running_req + 1
         args.swa_decoder_replay = swa_decoder_replay
         self.args = args
-        # the replay mode shapes the kvcache geometry (resume history, private decoder rings): rebuild
-        # the attention group the way engine._adjust_dsv41_config does
-        groups = tuple(replace(g, geometry=dsv41_geometry(args)) for g in mc.attention_groups)
         quant = NoQuantConfig()
         if quantized:
             from freetoken.models.register import checkpoint_quant_config, get_model_spec
 
             quant = checkpoint_quant_config(checkpoint, hf_config, get_model_spec("DeepseekV41ForCausalLM"))
-        self.config = replace(mc, attention_groups=groups, moe_strategy="offload" if quantized else "fused", decode_target="gpu", quant=quant)
+        self.config = replace(mc, moe_strategy="offload" if quantized else "fused", decode_target="gpu", quant=quant)
         mc = self.config
         with torch.device("meta"), torch_dtype(torch.bfloat16):
             self.model = create_model(self.config)
@@ -76,7 +74,7 @@ class TinyEngine:
         for layer in self.model.engram_layers():
             layer.attach_table(engram_table if engram_table is not None else ZeroEngramTable(layer.width, self.device))
 
-        geom = mc.attention_groups[0].geometry
+        geom = dsv41_geometry(args)
         self.max_running_req = max_running_req
         num_pages = max_seq_len // P
         self.pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, self.device, n_scratch=max_running_req + 1)

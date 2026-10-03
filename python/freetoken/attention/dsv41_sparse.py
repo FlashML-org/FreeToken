@@ -153,16 +153,14 @@ class DSV41CaptureData:
 
 class DSV41SparseAttnBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
-        from freetoken.kvcache.dsv41_geometry import DSV41Geometry
+        from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 
         self.config = config
         self.device = get_global_ctx().kv_cache.device
-        geom = next(g.geometry for g in config.attention_groups if isinstance(getattr(g, "geometry", None), DSV41Geometry))
-        self.geom: DSV41Geometry = geom
-        self.window_size = geom.window
         args = config.dsv41_args
-        self.swa_decoder_replay: str = getattr(args, "swa_decoder_replay", "exact")
-        self.decoder_start: int = getattr(args, "decoder_start_layer", geom.n_layers)
+        self.geom = dsv41_geometry(args)
+        self.window_size = self.geom.window
+        self.swa_decoder_replay: str = args.swa_decoder_replay
         self.capture: DSV41CaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0

@@ -41,8 +41,9 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     # the cache contract follows the replay mode: a bounded-mode prefix hit must leave the prompt's last
     # window to the prefill (the pool's prefix_replay_tokens); the history a resume reads stays one window
     from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+    from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 
-    geom = config.model_config.attention_groups[0].geometry
+    geom = dsv41_geometry(args)
     spec = config.model_config.kv_cache_group_specs()[0]
     pool = DSV41PagedKVCache(dsv41_pool_sizes(16, geom, 1.0, 128), geom, torch.device("cpu"))
     assert pool.prefix_replay_tokens == (128 if replay == "bounded" else 0)
