@@ -1,0 +1,42 @@
+{
+  "destination": "tekizai-glm53-full-freetoken-global",
+  "levels": [
+    {
+      "aggregate_output_tokens_per_s": 0.288,
+      "concurrency": 1,
+      "errors": {},
+      "failures": 0,
+      "final_output_responses": 1,
+      "latency_mean_s": 10.402,
+      "latency_p50_s": 10.402,
+      "latency_p95_s": 10.402,
+      "output_tokens": 3,
+      "per_request_end_to_end_tokens_per_s_mean": 0.288,
+      "per_request_end_to_end_tokens_per_s_min": 0.288,
+      "requests": [
+        {
+          "end_to_end_output_tokens_per_s": 0.28840918986416886,
+          "finish_reason": "stop",
+          "has_final_output": true,
+          "latency_s": 10.401887683998211,
+          "message": {
+            "content": "42",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 3,
+          "truncated": false
+        }
+      ],
+      "successes": 1,
+      "truncated_responses": 0,
+      "wall_s": 10.403
+    }
+  ],
+  "max_tokens": 24,
+  "measurement_mode": "nonstreaming_end_to_end_including_routing_queue_and_prefill",
+  "model": "glm-5.3-nvfp4",
+  "prompt": "What is 17 + 25? Reply with only the number.",
+  "reasoning_effort": "low",
+  "started_at_utc": "2026-09-07T05:12:03.652578+00:00"
+}
