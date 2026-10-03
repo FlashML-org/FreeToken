@@ -155,6 +155,7 @@ async def handle_responses(
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -190,6 +191,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -234,7 +236,11 @@ def convert_responses_to_genspec(
 
     from .model_meta import effort_toggle_kwargs
 
-    ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
+    from .openai_api import apply_default_thinking_mode
+
+    ctk = apply_default_thinking_mode(
+        dict(getattr(req, "chat_template_kwargs", None) or {}), default_thinking_mode
+    )
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
 
