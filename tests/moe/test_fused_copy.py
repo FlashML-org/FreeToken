@@ -5,9 +5,10 @@ zero-copy case), across banks of differing per-row sizes.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-
 from freetoken.moe.offload_cache import _BANK_SCHEMAS, OffloadMoeCache
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -17,6 +18,104 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 # kernel/aot_models.py must be listed in its TEST_FEATURE_SIZES so the per-bank kernels
 # stay prebuilt under FREETOKEN_DISABLE_JIT=1.
 FEATS = [8192, 512, 256, 4096, 512, 256]
+
+
+def test_rocm_graph_capture_uses_per_bank_copy(monkeypatch):
+    calls = []
+    tensor = torch.empty(1)
+    cache = SimpleNamespace(
+        banks=[([tensor], tensor)],
+        _pending_src_layer=0,
+        _pending_whole_layer=False,
+        _unpinned_layers=frozenset(),
+        _copy_fused_ok=True,
+        _copy_dst_ptrs=tensor,
+        _copy_src_ptrs=[tensor],
+        _copy_feat_bytes=tensor,
+        evict_slots=tensor,
+        src_indices=tensor,
+        num_indices=tensor,
+    )
+    monkeypatch.setattr(torch.version, "hip", "7.0", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        "freetoken.kernel.fast_index_copy.fast_index_copy_multi_jit",
+        lambda *args: calls.append("fused"),
+    )
+    monkeypatch.setattr(
+        "freetoken.kernel.fast_index_copy_jit",
+        lambda *args: calls.append("legacy"),
+    )
+
+    OffloadMoeCache.copy_missing(cache)
+
+    assert calls == ["legacy"]
+
+
+@CUDA
+@pytest.mark.slow
+def test_qwen36_sized_pinned_rows_survive_rocm_graph_replay():
+    if not torch.version.hip:
+        pytest.skip("ROCm regression")
+
+    layers, experts, cache_size, topk = 40, 256, 2117, 8
+    cache = OffloadMoeCache(
+        num_layers=layers,
+        num_experts=experts,
+        cache_size=cache_size,
+        device=torch.device("cuda"),
+        quant_format="q4_k_q5_k",
+    )
+    # Qwen3.6-35B-A3B: H=2048, I=512. Keep the real packed bytes per expert.
+    features = {"gate_up": 2 * 512 * (2048 // 256) * 144,
+                "down": 2048 * (512 // 256) * 176}
+    sources = {}
+    fingerprints = torch.arange(experts, dtype=torch.uint8)
+    for name, feature_bytes in features.items():
+        source = torch.empty((experts, feature_bytes), dtype=torch.uint8, pin_memory=True)
+        source[:, 0] = fingerprints
+        sources[name] = [source] * layers
+    cache.set_bank_sources(sources)
+    assert cache._copy_fused_ok
+
+    patterns = (
+        torch.arange(experts, dtype=torch.int32, device="cuda")[:, None]
+        + torch.arange(topk, dtype=torch.int32, device="cuda")[None, :]
+    ) % experts
+    routes = [patterns[layer * 13 % experts].clone() for layer in range(layers)]
+    slots = [torch.empty_like(route) for route in routes]
+
+    def body():
+        for layer, (route, layer_slots) in enumerate(zip(routes, slots)):
+            layer_slots.copy_(route)
+            cache.ensure_experts(layer, layer_slots)
+            cache.copy_missing()
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        body()
+    side.synchronize()
+    cache.reset()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        body()
+    cache.reset()
+    torch.cuda.synchronize()
+
+    for step in range(512):
+        for layer, route in enumerate(routes):
+            route.copy_(patterns[(step + layer * 13) % experts])
+        graph.replay()
+    torch.cuda.synchronize()
+
+    for route, layer_slots in zip(routes, slots):
+        expected = route.cpu().tolist()
+        resident = layer_slots.cpu().tolist()
+        for _, bank in cache.banks:
+            assert bank[resident, 0].cpu().tolist() == expected
 
 
 def _build_cache(num_layers, num_experts, cache_size):
