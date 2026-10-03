@@ -99,7 +99,6 @@ def test_forecast_matches_engine_sizing(tiny_qwen3):
 
     r = _analyze(tiny_qwen3)
     config, f = r.config, r.forecast
-    assert not torch.cuda.is_initialized()
     # weights: the meta model's parameters (bf16, untied lm_head) + the eager rope table
     params = sum(t.numel() * t.element_size() for t in _meta_model(config).state_dict().values())
     assert f.weights_bytes == params + r.inputs.weights.gpu["rope"]
@@ -153,7 +152,7 @@ def test_tips_price_flag_changes(tiny_qwen3):
 
 
 def test_tight_headroom_suggests_a_lower_memory_ratio(tiny_qwen3):
-    r = _analyze(tiny_qwen3, "--memory-ratio", "0.97", "--vram-reserve-mb", "512", free_gib=4)
+    r = _analyze(tiny_qwen3, "--memory-ratio", "0.97", free_gib=4)
     assert r.forecast.verdict == "tight"
     lower = [t for t in r.tips if t.flags[0] in ("--memory-ratio 0.95", "--memory-ratio 0.9")]
     assert lower and all(t.forecast.free_at_peak > r.forecast.free_at_peak for t in lower)
@@ -291,3 +290,17 @@ def test_moe_offload_slots_follow_the_auto_plan(tmp_path):
         max_slots=inp.max_slots,
     )
     assert (f.moe_slots, f.num_pages) == (size, pages)
+
+
+def test_free_memory_is_read_before_this_process_creates_a_cuda_context(tiny_qwen3, monkeypatch):
+    """The arch probe in _adjust_config initializes CUDA on a GPU machine; a reading taken after
+    it would count this process's own context twice."""
+    from freetoken.engine import engine
+    from freetoken.server import info
+
+    calls = []
+    real_gpu, real_adjust = info.gpu_info, engine._adjust_config
+    monkeypatch.setattr(info, "gpu_info", lambda *a, **k: calls.append("gpu_info") or real_gpu(*a, **k))
+    monkeypatch.setattr(engine, "_adjust_config", lambda *a, **k: calls.append("adjust") or real_adjust(*a, **k))
+    _analyze(tiny_qwen3)
+    assert calls[:2] == ["gpu_info", "adjust"]

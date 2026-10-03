@@ -4,7 +4,7 @@ Prices what Engine.__init__ will put on the device before any weight is read: th
 weights come from the meta-device model the engine builds anyway (its parameters are exactly
 the tensors the loader materializes), and every pool is sized by the engine's own functions
 (``_startup_kv_budget``, the pool family's ``kv_cost`` / ``plan_num_pages``, ``state_pool_bytes``,
-``plan_moe_cache_auto``, ``slots_to_free_for_reserve``). Only what the engine does not price up
+``plan_moe_cache_auto``). Only what the engine does not price up
 front -- load overhead, prefill activations, CUDA graphs -- is a heuristic here, and the verdict
 never refuses on a heuristic alone.
 """
@@ -293,6 +293,15 @@ def _solve(config, pool_cls, free_before: int, weights_bytes: int, per_expert: i
     return _Plan(True, "", slots, pages, overlap)
 
 
+def _fixed_workspace_bytes(backend: str) -> int:
+    """Fixed (non-paged) attention workspace the backend allocates after the pools, summed over
+    comma-separated prefill,decode parts: FlashInfer's float workspace floor (256 MiB,
+    attention/fi.py) and TRT-LLM's 128 MiB buffer (attention/trtllm.py). The engine does not
+    charge it to the pool budget, so it comes out of the memory left after init."""
+    sizes = {"fi": 256 * MiB, "trtllm": 128 * MiB}
+    return sum(sizes.get(p.strip(), 0) for p in backend.split(","))
+
+
 @dataclass
 class Forecast:
     free_before: int | None
@@ -317,7 +326,6 @@ class Forecast:
     graph_batch_sizes: list[int] = field(default_factory=list)
     prefill_chunk: int = 0
     prefill_activations: int = 0
-    vram_reserve: int = 0
     free_after_init: int | None = None
     free_at_peak: int | None = None
     verdict: str = "unknown"
@@ -380,8 +388,6 @@ def forecast_memory(config, weights_bytes: int, free_before: int | None, *, per_
     The verdict refuses ("does not fit") only when the engine's own solve fails with the
     parameters alone -- the startup assert it would hit after loading. The load overhead and the
     heuristic workspaces can only make it "tight"."""
-    from freetoken.attention import fixed_workspace_bytes
-    from freetoken.engine.cache_budget import slots_to_free_for_reserve
     from freetoken.engine.engine import _page_table_width
     from freetoken.engine.graph import _determine_cuda_graph_bs
     from freetoken.kvcache import resolve_pool_class
@@ -406,8 +412,7 @@ def forecast_memory(config, weights_bytes: int, free_before: int | None, *, per_
         per_expert_bytes=per_expert_bytes if _is_offload(config) else 0,
         max_running_req=config.max_running_req,
         max_seq_len=config.max_seq_len,
-        attention_workspace=fixed_workspace_bytes(config.attention_backend),
-        vram_reserve=config.vram_reserve_mb << 20,
+        attention_workspace=_fixed_workspace_bytes(config.attention_backend),
     )
     if free_before is None:
         return fc
@@ -439,22 +444,10 @@ def forecast_memory(config, weights_bytes: int, free_before: int | None, *, per_
     resident = weights_bytes + load_overhead + fc.moe_slot_bytes + fc.state_bytes + fc.kv_bytes
     fc.free_after_init = free_before - resident - fc.attention_workspace - fc.page_table
     fc.free_at_peak = fc.free_after_init - fc.cuda_graphs - fc.prefill_activations
-    if fc.vram_reserve and fc.free_at_peak < fc.vram_reserve and fc.moe_slots and fc.per_expert_bytes:
-        # the engine's _fit_prefill_peak shrinks the expert cache after the load
-        floor = mc.num_experts * (2 if plan.prefill_overlap else 1)
-        drop = slots_to_free_for_reserve(fc.free_at_peak, fc.vram_reserve, fc.per_expert_bytes)
-        kept = max(floor, fc.moe_slots - drop)
-        fc.free_at_peak += (fc.moe_slots - kept) * fc.per_expert_bytes
-        fc.free_after_init += (fc.moe_slots - kept) * fc.per_expert_bytes
-        fc.reasons.append(f"--vram-reserve-mb shrinks the expert cache to {kept} slots after the load")
-        fc.moe_slots = kept
-    spare = fc.free_at_peak - fc.vram_reserve
+    spare = fc.free_at_peak
     if spare < 0:
-        what = "prefill workspace not covered"
-        if fc.vram_reserve:
-            what += f" with --vram-reserve-mb {config.vram_reserve_mb} kept free"
         tight.append(
-            f"{what}: a {fc.prefill_chunk}-token prefill needs ~{_gib(fc.prefill_activations)} and the "
+            f"prefill workspace not covered: a {fc.prefill_chunk}-token prefill needs ~{_gib(fc.prefill_activations)} and the "
             f"CUDA graphs ~{_gib(fc.cuda_graphs)}, but only {_gib(fc.free_after_init)} is free after init"
         )
     elif spare < PEAK_MARGIN_BYTES:
@@ -809,8 +802,6 @@ def format_forecast(inp: ForecastInputs, fc: Forecast, tips: list[Tip], combo: T
         bs = ",".join(map(str, fc.graph_batch_sizes)) or "off"
         lines.append(_row(f"CUDA graphs (bs {bs}, estimate)", _gib(fc.cuda_graphs)))
         lines.append(_row(f"prefill activations ({fc.prefill_chunk} tokens, estimate)", _gib(fc.prefill_activations)))
-        if fc.vram_reserve:
-            lines.append(_row("--vram-reserve-mb", _gib(fc.vram_reserve)))
         lines.append(_row("free at prefill peak", _gib(fc.free_at_peak)))
     lines.append("")
     verdict = fc.verdict.upper()
