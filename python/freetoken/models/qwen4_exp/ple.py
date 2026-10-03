@@ -123,7 +123,9 @@ class PinnedUVATable:
     ``weight`` must be the filled and ``pin()``ed ``HostBank.tensor`` from
     ``weight.load_ple_table`` (``[num_rows, head_dim]``, fp8-e4m3 or bf16); an unregistered host
     buffer is not device-addressable and the kernel faults on it. ``scale`` is the checkpoint's
-    scalar ``weight_scale``. Gathers emit bf16 into a staging buffer, one per captured decode size
+    scalar ``weight_scale``. With ``scales`` (a pinned fp8 bank ``[num_rows, head_dim // 16]``)
+    ``weight`` is instead the packed NVFP4 bank ``[num_rows, head_dim // 2]`` uint8 and ``scale``
+    is its global scalar. Gathers emit bf16 into a staging buffer, one per captured decode size
     and one growable buffer for everything else.
 
     ``prefetch`` runs the gather on a private stream and the next ``lookup`` joins it. ``lookup``
@@ -135,21 +137,38 @@ class PinnedUVATable:
         weight: torch.Tensor,
         scale: float = 1.0,
         *,
+        scales: torch.Tensor | None = None,
         device: torch.device | None = None,
         prefetch: bool = True,
     ) -> None:
         assert weight.device.type == "cpu" and weight.is_contiguous()
-        assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
+        if scales is None:
+            assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
+            head_dim = weight.shape[1]
+        else:
+            assert weight.dtype is torch.uint8 and scales.dtype is torch.float8_e4m3fn
+            assert scales.device.type == "cpu" and scales.is_contiguous()
+            head_dim = weight.shape[1] * 2
+            assert tuple(scales.shape) == (weight.shape[0], head_dim // 16), scales.shape
         from freetoken.kernel.pinned import device_ptr
 
         self.weight = weight
+        self.scales = scales
         self.scale = float(scale)
-        self.num_rows, self.head_dim = weight.shape
+        self.num_rows, self.head_dim = weight.shape[0], head_dim
         self.dtype = torch.bfloat16
         self._is_fp8 = weight.dtype == torch.float8_e4m3fn
         self._device = device or torch.device("cuda", torch.cuda.current_device())
         # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
         self._table_ptr = device_ptr(weight)
+        if scales is not None:
+            from freetoken.kernel.triton.nvfp4_dequant import _e2m1_lut
+
+            self._scales_ptr: int | None = device_ptr(scales)
+            self._lut = _e2m1_lut(self._device.index)
+        else:
+            self._scales_ptr = None
+            self._lut = None
         self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
@@ -181,6 +200,8 @@ class PinnedUVATable:
             dst,
             self.scale,
             self._is_fp8,
+            self._scales_ptr,
+            self._lut,
         )
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
