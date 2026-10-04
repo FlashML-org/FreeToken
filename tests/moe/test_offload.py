@@ -78,6 +78,7 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
 
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
     layer, cache = _make_layer_and_cache()
+    layer.quant_method = None  # Exercise the legacy BF16 format-tag fallback rather than the quant-method path.
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
     topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
     hidden_states = torch.randn(1, 8)
@@ -428,7 +429,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",  # Keep this cache-sizing regression independent of CUDA-only FlashInfer availability.
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -530,6 +531,15 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
         "reset",
         "reset",
     ]
+
+
+def test_graph_progress_lock_does_not_allocate_a_multiprocessing_semaphore():  # Guard scheduler shutdown against tqdm's fork-oriented global RLock.
+    from freetoken.engine.graph import tqdm as graph_tqdm  # Inspect the exact progress class configured by the graph module.
+
+    progress_lock = graph_tqdm.get_lock()  # Retrieve the already configured process-local lock without creating a replacement.
+
+    assert type(progress_lock).__module__ == "_thread"  # A multiprocessing lock exposes a SemLock and leaks when a spawned scheduler is terminated.
+    assert not hasattr(progress_lock, "_semlock")  # Keep the regression tied to the resource-tracker failure mechanism.
 
 
 def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():

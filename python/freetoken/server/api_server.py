@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    CacheStatsMsg,
+    CacheStatsReply,
     TokenizeMsg,
     UserReply,
 )
@@ -107,6 +109,7 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             p.join(timeout=timeout)
             if p.is_alive():
                 p.kill()
+                p.join(timeout=timeout)  # Reap the force-killed process instead of leaving cleanup to interpreter exit.
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
             continue
 
@@ -143,6 +146,9 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Read-only cache-statistics requests use the same UUID correlation pattern
+    # but never engage the rebuild maintenance gate or modify a cache allocation.
+    cache_stats_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -181,6 +187,8 @@ class FrontendManager:
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
     # the shutdown flag before the ensuing deaths. See _terminate_backend_workers.
     backend_processes: List[Any] = field(default_factory=list)
+    backend_handle: Any = None  # Retain the queue-owning launch handle through orderly shutdown.
+    backend_supervisor_thread: Any = None  # Join the daemon supervisor before the frontend interpreter exits.
     # Event loop the listener runs on, captured when the listener starts (_create_listener_once).
     # Lets a cross-thread caller — the supervisor thread's failure callback — marshal rebuild
     # future resolution back onto the loop (asyncio Futures are not thread-safe). None until the
@@ -243,11 +251,28 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    async def cache_stats(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """Return a read-only backend cache-statistics snapshot through worker IPC."""
+
+        request_id = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.cache_stats_futures[request_id] = future
+        try:
+            await self.send_one(CacheStatsMsg(request_id=request_id))
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self.cache_stats_futures.pop(request_id, None)
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
+                continue
+            if isinstance(msg, CacheStatsReply):
+                future = self.cache_stats_futures.get(msg.request_id)
+                if future is not None and not future.done():
+                    future.set_result(msg.stats)
                 continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
@@ -386,6 +411,15 @@ class FrontendManager:
         # Tear the workers down ourselves (best-effort). _SHUTTING_DOWN is already set by the
         # time shutdown() runs, so the supervisor attributes the ensuing deaths to the stop.
         _terminate_backend_workers(self.backend_processes)
+        _reap_backend_workers(self.backend_processes)  # Reap workers while the parent still owns their shared queue.
+        supervisor = self.backend_supervisor_thread  # Snapshot the thread that owns normal queue cleanup.
+        self.backend_supervisor_thread = None  # Release the finished thread and its former target arguments.
+        if supervisor is not None and supervisor is not threading.current_thread():  # Avoid joining from its own callback.
+            supervisor.join(timeout=2.0)  # Let its bounded liveness poll reach the queue-cleanup finally block.
+        handle = self.backend_handle  # Snapshot the last frontend-owned reference to the semaphore wrappers.
+        self.backend_handle = None  # Let Queue finalizers unregister before Uvicorn re-raises SIGTERM.
+        if handle is not None:  # Cover shutdowns that outrun or precede supervisor startup.
+            handle.close_startup_queue()  # Deterministically close endpoints before releasing the final handle.
 
 
 @asynccontextmanager
@@ -820,6 +854,19 @@ async def cache_status():
     }
 
 
+@app.get("/v1/cache/stats")
+async def cache_stats():
+    """Read accumulated MoE cache hit and miss counters without modifying the cache."""
+
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse({"error": "server is not serving"}, status_code=503)
+    try:
+        return await state.cache_stats()
+    except TimeoutError:
+        return JSONResponse({"error": "backend cache-statistics request timed out"}, status_code=504)
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
@@ -982,6 +1029,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
+    _GLOBAL_STATE.backend_handle = handle  # Preserve the semaphore-owning handle until orderly shutdown completes.
 
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend
@@ -1022,7 +1070,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # immediately and /health can report loading progress. Shell mode wants exactly the same
     # thing -- its client waits on /health and renders that progress -- so both paths share
     # this supervisor; only who runs uvicorn differs.
-    threading.Thread(
+    supervisor_thread = threading.Thread(  # Retain the daemon thread so shutdown can wait for its cleanup path.
         target=run_backend_supervisor,
         args=(handle, _GLOBAL_STATE.load_progress, _on_ready),
         kwargs={
@@ -1034,7 +1082,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         },
         name="freetoken-backend-supervisor",
         daemon=True,
-    ).start()
+    )  # Construct supervision before publishing its handle to the frontend state.
+    _GLOBAL_STATE.backend_supervisor_thread = supervisor_thread  # Make shutdown coordination explicit and testable.
+    supervisor_thread.start()  # Begin readiness and liveness observation after ownership is recorded.
+    del handle  # Avoid retaining the Queue on this frame when Uvicorn re-raises a captured stop signal.
 
     if run_shell:
         _serve_and_run_shell(host, port)

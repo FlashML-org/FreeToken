@@ -20,6 +20,17 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+def test_qsa_stage_workaround_is_gfx1151_only(monkeypatch):  # Prevent one host's LDS workaround from becoming all-HIP behavior.
+    from freetoken.kernel.triton.qsa import attend  # Import the launch-policy helper without executing a kernel.
+    from freetoken.utils import arch  # Patch the architecture source used by the launch helper.
+
+    monkeypatch.setattr(torch.version, "hip", "7.15", raising=False)  # Model the HIP component inside ROCm 10.
+    monkeypatch.setattr(arch, "get_rocm_gfx_arch", lambda: "gfx1151")  # Select the architecture with measured evidence.
+    assert attend._qsa_sparse_num_stages() == 1  # Require the proven 64 KiB LDS workaround on gfx1151.
+    monkeypatch.setattr(arch, "get_rocm_gfx_arch", lambda: "gfx1150")  # Select an unqualified HIP architecture.
+    assert attend._qsa_sparse_num_stages() == 2  # Preserve the upstream pipeline until that target is measured.
+
+
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
     generator = torch.Generator(device=fixture.device).manual_seed(seed)
     return [
@@ -145,7 +156,12 @@ def test_chunked_prefill_matches_one_shot(cut: int):
     attn.forward(x[:cut], fixture.batch([head], "prefill"))
     tail = fixture.req(1, cut, length)
     got = attn.forward(x[cut:], fixture.batch([tail], "prefill"))
-    assert torch.equal(got, one_shot[cut:])
+    if torch.version.hip is not None:
+        # ROCm's one-stage LDS-safe launch can round one BF16 step across chunk geometry.
+        torch.testing.assert_close(got, one_shot[cut:], rtol=0.0, atol=2**-11)
+    else:
+        # CUDA retains bitwise equality under its two-stage launch profile.
+        assert torch.equal(got, one_shot[cut:])
 
 
 @requires_cuda

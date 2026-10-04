@@ -40,6 +40,8 @@ inline constexpr auto get_mem_package() {
     }
 }
 
+// ROCm uses Clang's nontemporal vector operations; CUDA retains its PTX cache-policy hints.
+
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
 #if FREETOKEN_USE_ROCM
     return uint1{__builtin_nontemporal_load(&src->x)};
@@ -174,8 +176,12 @@ inline bool host_ptr_identity() {
             return false;  // fail closed: translate (and surface errors), don't assume identity
         }
         int uva = 0, reg = 0;
-        cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-        cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+        const auto uva_err = cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
+        const auto reg_err =
+            cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+        if (uva_err != cudaSuccess || reg_err != cudaSuccess) {
+            return false;
+        }
         return uva == 1 && reg == 1;
     }();
     return identity;
@@ -558,6 +564,7 @@ struct MultiIndexCopyKernel {
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
+        device.set_options<kDLCUDA, kDLROCM>();
         auto B = SymbolicSize{"num_banks"};
         auto L = SymbolicSize{"indices length"};
         auto ptr_dtype = SymbolicDType{};

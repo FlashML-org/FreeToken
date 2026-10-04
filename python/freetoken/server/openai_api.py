@@ -409,9 +409,14 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],
+                sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                ),
+                add_special_tokens=req.add_special_tokens,
+            )
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -431,6 +436,7 @@ async def handle_completion(
                 sampling_params=_resolve_sampling(
                     req, model_sampling, default_max_tokens=default_max_tokens
                 ),
+                add_special_tokens=req.add_special_tokens,
             )
         )
         text = ""

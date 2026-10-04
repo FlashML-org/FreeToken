@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     from freetoken.models import ModelConfig
 
 
+def _use_hip_single_request_decode(hip_version: str | None, batch_size: int, sliding_window: int | None) -> bool:  # Keep the narrowed routing boundary independently testable.
+    return hip_version is not None and batch_size == 1 and sliding_window is None  # Restrict the fast path to HIP single-request full attention.
+
+
 @dataclass
 class TritonCaptureData(BaseCaptureData):
     q_to_req: torch.Tensor
@@ -164,6 +168,19 @@ class TritonAttentionBackend(BaseAttnBackend):
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
         if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
+            if _use_hip_single_request_decode(torch.version.hip, bs, spec.sliding_window):  # Use the qualified per-head ROCm path only for single-request full-attention decode.
+                return paged_attention(  # Avoid grouped WMMA padding and split-reduction overhead on gfx1151.
+                    q=q,  # Forward the unchanged one-token query tensor.
+                    k_cache=k_cache,  # Read the same paged key cache as the grouped implementation.
+                    v_cache=v_cache,  # Read the same paged value cache as the grouped implementation.
+                    indptr=metadata.indptr,  # Preserve the request's exact cache bounds.
+                    indices=indices,  # Preserve full or sliding cache-slot translation.
+                    q_to_req=metadata.q_to_req,  # Map the single query token to its request row.
+                    q_positions=metadata.q_positions,  # Preserve the exact causal query position.
+                    sm_scale=scale,  # Preserve the model's attention scaling constant.
+                    sliding_window=spec.sliding_window,  # Preserve sliding or full-attention semantics.
+                    sinks=spec.sinks,  # Preserve Gemma attention-sink semantics when present.
+                )  # Finish the guarded ROCm single-request fast path.
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
             assert metadata.attn_lse is not None
@@ -259,7 +276,6 @@ class TritonAttentionBackend(BaseAttnBackend):
         q_positions = getattr(batch, "positions", None)
         if q_positions is None:
             q_positions = torch.zeros(num_query_tokens, dtype=torch.int64, device=device)
-
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
             indptr=indptr,

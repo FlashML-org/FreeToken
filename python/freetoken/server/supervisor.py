@@ -10,6 +10,7 @@ watching on top of this.
 
 from __future__ import annotations
 
+import threading  # Serialize queue release across the supervisor and shutdown thread.
 import time
 from dataclasses import dataclass, field
 from queue import Empty
@@ -54,6 +55,20 @@ class BackendHandle:
     ack_queue: Any
     processes: List[Any] = field(default_factory=list)
     expected_acks: int = 0
+    _queue_closed: bool = field(default=False, init=False, repr=False)  # Make queue cleanup idempotent across owners.
+    _queue_close_lock: Any = field(default_factory=threading.Lock, init=False, repr=False)  # Prevent concurrent close/join calls.
+
+    def close_startup_queue(self) -> None:  # Release the parent-owned multiprocessing semaphores exactly once.
+        with self._queue_close_lock:  # Coordinate orderly shutdown with the daemon supervisor's finally block.
+            if self._queue_closed:  # Treat repeated cleanup requests as successful no-ops.
+                return  # Preserve the first completed ownership release.
+            close = getattr(self.ack_queue, "close", None)  # Support multiprocessing and in-memory test queues.
+            if callable(close):  # Skip queue implementations without explicit lifecycle ownership.
+                close()  # Close the parent pipe handles and schedule their finalizers.
+            join_thread = getattr(self.ack_queue, "join_thread", None)  # Locate the multiprocessing feeder cleanup hook.
+            if callable(join_thread):  # Standard queue.Queue intentionally has no feeder thread.
+                join_thread()  # Flush queued acknowledgements before interpreter resource tracking stops.
+            self._queue_closed = True  # Publish completion only after every owned cleanup operation succeeds.
 
 
 class WorkerDied(Exception):
@@ -164,23 +179,25 @@ def run_backend_supervisor(
     def _shutting_down() -> bool:
         return bool(is_shutting_down is not None and is_shutting_down())
 
-    try:
-        drain_ready(handle, progress, poll=poll, on_meta=on_meta)
-    except WorkerDied as exc:
-        # A worker dying mid-load during an orderly shutdown is expected, not a load failure.
-        if not _shutting_down() and on_failure is not None:
-            on_failure(exc.message)
-        return
+    try:  # Release the parent queue handle on every supervisor exit path.
+        try:  # Convert a startup worker death into the existing failure callback contract.
+            drain_ready(handle, progress, poll=poll, on_meta=on_meta)  # Consume readiness and progress acknowledgements.
+        except WorkerDied as exc:  # Handle a worker that exits before readiness completes.
+            # A worker dying mid-load during an orderly shutdown is expected, not a load failure.
+            if not _shutting_down() and on_failure is not None:  # Report only an unexpected startup death.
+                on_failure(exc.message)  # Preserve the worker's actionable error text.
+            return  # End supervision after the startup process set becomes invalid.
 
-    on_ready()
+        on_ready()  # Open serving admission only after every expected worker is ready.
 
-    while True:
-        dead = _first_dead(handle.processes)
-        if dead is not None:
-            if _shutting_down():
-                # Orderly stop in progress: the worker exit is expected — stay quiet.
-                return
-            if on_failure is not None:
-                on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
-            return
-        time.sleep(poll)
+        while True:  # Watch the ready backend until it fails or orderly shutdown begins.
+            dead = _first_dead(handle.processes)  # Observe the same process handles returned at launch.
+            if dead is not None:  # Treat the first worker exit as the terminal supervisor event.
+                if _shutting_down():  # Suppress expected worker deaths during normal shutdown.
+                    return  # Let the frontend finish its service teardown quietly.
+                if on_failure is not None:  # Surface an unexpected post-ready worker death.
+                    on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")  # Name the failed worker.
+                return  # Stop after latching the backend failure.
+            time.sleep(poll)  # Keep liveness polling bounded without a busy loop.
+    finally:  # Multiprocessing.Queue owns three named semaphores in the frontend process.
+        handle.close_startup_queue()  # Release them whether supervision ends during load, serving, or shutdown.

@@ -10,6 +10,14 @@ import triton
 import triton.language as tl
 
 
+def _qsa_sparse_num_stages() -> int:  # Select the LDS workaround only where revision-scoped evidence exists.
+    if torch.version.hip is None:  # Preserve the established CUDA launch configuration.
+        return 2  # CUDA uses the upstream two-stage pipeline.
+    from freetoken.utils.arch import get_rocm_gfx_arch  # Resolve the active AMD architecture without guessing from HIP presence.
+
+    return 1 if get_rocm_gfx_arch() == "gfx1151" else 2  # Restrict the 64 KiB LDS workaround to the qualified target.
+
+
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
@@ -335,7 +343,8 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        # gfx1151 has a 64 KiB LDS limit; two stages exceed it by 256 bytes for this kernel.
+        num_stages=_qsa_sparse_num_stages(),
     )
     if num_splits == 1:
         return out

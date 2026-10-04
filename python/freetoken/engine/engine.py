@@ -496,7 +496,22 @@ class Engine:
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+            # ROCm's HIP graph and large-prompt warmup path is exercised by the first
+            # real request just like CUDA.  Do not force that optional precompile on
+            # HIP at server construction: current AMD Triton releases can reject the
+            # synthetic 80/128-token NVFP4 MoE launch before the API becomes ready.
+            # Inference itself remains native HIP and eager prefill still compiles on
+            # demand.  Operators may set this explicit opt-in for targeted testing.
+            should_warmup_prefill = torch.version.hip is None or os.environ.get(
+                "FREETOKEN_ROCM_PREFILL_WARMUP", ""
+            ).lower() in ("1", "true", "yes", "on")
+            if should_warmup_prefill:
+                self._warmup_prefill()
+            else:
+                logger.info_rank0(
+                    "Skipping optional Triton prefill warmup on ROCm; "
+                    "set FREETOKEN_ROCM_PREFILL_WARMUP=1 to enable it."
+                )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -748,6 +763,32 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        auxiliary_cache = None
+        if banks.auxiliary_sources is not None:
+            if decode_target != "gpu":
+                raise NotImplementedError(
+                    "Qwen GGUF Q6_K down layers currently support only GPU offload decode"
+                )
+            if config.moe_prefill_overlap:
+                raise NotImplementedError(
+                    "Qwen GGUF Q6_K down layers require --disable-moe-prefill-overlap"
+                )
+            if not banks.auxiliary_layer_ids or banks.auxiliary_quant_format is None:
+                raise ValueError("auxiliary expert banks are missing layout or model-layer mapping")
+            # Each exceptional Qwen layer contains all experts, so a full-slot cache
+            # makes its prefill bank a direct expert-id mapping and avoids reloads.
+            auxiliary_cache = OffloadMoeCache(
+                num_layers=len(banks.auxiliary_layer_ids),
+                num_experts=config.model_config.num_experts,
+                cache_size=config.model_config.num_experts,
+                device=self.device,
+                cache_policy=config.moe_cache_policy,
+                prefill_overlap=False,
+                prefill_hit_d2d=False,
+                quant_format=banks.auxiliary_quant_format,
+                decode_target="gpu",
+            )
+            auxiliary_cache.set_bank_sources(banks.auxiliary_sources)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -755,6 +796,18 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if auxiliary_cache is not None:
+            layer_to_auxiliary = {
+                layer_id: index for index, layer_id in enumerate(banks.auxiliary_layer_ids)
+            }
+            for layer in layers:
+                auxiliary_layer_id = layer_to_auxiliary.get(layer.layer_id)
+                if auxiliary_layer_id is not None:
+                    layer.auxiliary_offload_cache = auxiliary_cache
+                    layer.auxiliary_layer_id = auxiliary_layer_id
+            # Keep an ownership reference for diagnostics and future cache rebuild
+            # work.  The main cache remains the scheduler's authoritative cache.
+            cache.auxiliary_caches = [auxiliary_cache]
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -1163,6 +1216,16 @@ def _fused_resident_ok(model_config) -> bool:
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
+
+
+def _explicit_q4_resident_ok(model_config) -> bool:
+    """Whether an explicit fused request can use the Gemma 4 packed-Q4 resident path."""
+    # Keep this capability model-specific until another loader supplies resident Q4 banks.
+    return (
+        getattr(model_config, "model_type", None) == "gemma4"
+        and getattr(model_config, "expert_quant", None) == "q4_0"
+        and getattr(model_config, "moe_weight_format", None) == "q4_0"
+    )
 
 
 def _ensure_expandable_segments() -> None:
@@ -1766,6 +1829,10 @@ def _adjust_config(config: EngineConfig):
         is_moe
         and expert_quant not in _RESIDENT_EXPERT_QUANTS
         and not is_offload_moe_strategy(config.moe_strategy)
+        # Gemma 4 alone supplies native packed Q4_0 banks to the explicit fused path.
+        and not (
+            config.moe_strategy == "fused" and _explicit_q4_resident_ok(model_config)
+        )
     ):
         raise ValueError(
             f"{expert_quant} experts require --moe-strategy offload or cpu, "

@@ -6,6 +6,40 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize(  # Cover the optimized HIP route and every adjacent fallback boundary.
+    ("hip_version", "batch_size", "sliding_window", "expected"),  # Name the runtime, request count, attention type, and expected route decision.
+    [  # Enumerate the exact qualified case and the cases that must retain grouped decode.
+        ("available", 1, None, True),  # Select per-head decode when HIP is present for one full-attention request.
+        ("future", 1, None, True),  # Keep the branch dependent on HIP presence rather than a component-version string.
+        (None, 1, None, False),  # Preserve the grouped path on CUDA even for single-request full attention.
+        ("available", 2, None, False),  # Preserve the grouped path for multi-request HIP full attention.
+        ("available", 1, 4096, False),  # Preserve the grouped path for HIP sliding-window attention.
+    ],  # Finish the routing-boundary matrix.
+)  # Finish the parameterization decorator.
+def test_hip_single_request_decode_route(hip_version: str | None, batch_size: int, sliding_window: int | None, expected: bool):  # Verify the fast path cannot leak beyond HIP single-request full attention.
+    from freetoken.attention.triton import _use_hip_single_request_decode  # Import the pure route helper without requiring a GPU.
+
+    assert _use_hip_single_request_decode(hip_version, batch_size, sliding_window) is expected  # Enforce the exact candidate routing boundary.
+
+
+@pytest.mark.parametrize(  # Cover the qualified HIP tile plus every boundary that must retain standard compiler defaults.
+    ("is_hip", "group", "head_dim", "expected_waves"),  # Name each launch-config input and the optional AMD occupancy result.
+    [  # Enumerate exact-shape enablement and neighboring non-target cases.
+        (True, 8, 512, 2),  # Enable two waves per EU only for Gemma 4 full attention on HIP.
+        (True, 8, 256, None),  # Preserve the standard compiler choice for smaller HIP head dimensions.
+        (True, 2, 512, None),  # Preserve the standard compiler choice for a different HIP GQA group.
+        (False, 8, 512, None),  # Preserve CUDA behavior even when tensor geometry matches the HIP target.
+    ],  # Finish the bounded launch-config matrix.
+)  # Finish the parameterization decorator.
+def test_decode_grouped_stage1_launch_config(is_hip: bool, group: int, head_dim: int, expected_waves: int | None):  # Verify the occupancy hint cannot leak beyond the qualified target.
+    from freetoken.kernel.triton.attention import _decode_grouped_stage1_launch_config  # Import the pure launch-config helper without requiring a device.
+
+    actual = _decode_grouped_stage1_launch_config(group, head_dim, 4, is_hip)  # Build the same launch controls used by grouped decode.
+
+    assert actual["num_warps"] == 4  # Preserve the existing four-warp launch default.
+    assert actual["num_stages"] == 2  # Preserve the existing two-stage pipeline default.
+    assert actual.get("waves_per_eu") == expected_waves  # Restrict the AMD occupancy hint to the exact qualified shape.
+
 def _reference_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,

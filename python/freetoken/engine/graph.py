@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import threading  # Use a process-local progress lock so graph capture does not allocate an unshared multiprocessing semaphore.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -10,6 +11,8 @@ from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
+
+tqdm.set_lock(threading.RLock())  # Spawned TP workers cannot share tqdm's default fork-oriented process lock, so retain only thread safety.
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
