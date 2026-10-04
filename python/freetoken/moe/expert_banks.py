@@ -93,6 +93,19 @@ def build_expert_banks(
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
     hb = alloc_layer_banks(specs, num_layers)
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
+    gpu_layers = set()
+    fit_host_ram = layer_sink is None and not dummy and device.type == "cuda" and method.kind is QuantKind.FP8_BLOCK
+    layer_bytes = sum(per_layer[0].nbytes for per_layer in hb.values())
+    if fit_host_ram:
+        available = _host_available_bytes()
+        if available is not None and layer_bytes:
+            # Keep one layer of host staging space while packing; CMA cannot back registered banks.
+            gpu_layers = set(range(min(num_layers, max(0, (layer_bytes * (num_layers + 1) - available + layer_bytes - 1) // layer_bytes))))
+        if gpu_layers:
+            for role, per_layer in banks.items():
+                for layer_id in gpu_layers:
+                    per_layer[layer_id] = torch.zeros_like(per_layer[layer_id], device=device)
+            logger.info(f"expert banks: keeping {len(gpu_layers)} FP8 layers ({len(gpu_layers) * layer_bytes / 2**30:.2f} GiB) on GPU to fit host RAM")
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
@@ -122,6 +135,14 @@ def build_expert_banks(
             # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
             if written[layer_id, e0:e1].any():
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+            if fit_host_ram and layer_id not in gpu_layers and not written[layer_id].any():
+                # Reclaim and host registration change usable RAM during a long load.
+                available = _host_available_bytes()
+                if available is not None and available < 2 * layer_bytes:
+                    for per_layer in banks.values():
+                        per_layer[layer_id] = torch.zeros_like(per_layer[layer_id], device=device)
+                    gpu_layers.add(layer_id)
+                    logger.info(f"expert banks: keeping FP8 layer {layer_id} on GPU after host RAM changed")
             written[layer_id, e0:e1] = 1
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
             got = method.pack(piece, out)
@@ -138,7 +159,7 @@ def build_expert_banks(
         _fill(layer_sink)
     elif torch.cuda.is_available():
         with PinPipeline() as pins:
-            _fill(pins)
+            _fill(lambda layer_id, layer_banks: pins(layer_id, layer_banks) if layer_id not in gpu_layers else None)
     else:
         _fill(None)
 
@@ -150,6 +171,15 @@ def build_expert_banks(
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+
+
+def _host_available_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {key: int(value.split()[0]) * 1024 for key, value in (line.split(":", 1) for line in f)}
+        return max(0, mem["MemAvailable"] - mem.get("CmaFree", 0))
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
@@ -209,15 +239,7 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
     extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
     i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
     largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
-    avail = None
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    avail = int(line.split()[1]) * 1024
-                    break
-    except OSError:
-        pass
+    avail = _host_available_bytes()
     if avail is None:
         return True
     try:  # resolve a hub id to its local cache dir (no-op for a local path) so glob sees the shards
