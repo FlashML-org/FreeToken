@@ -16,7 +16,7 @@ from freetoken.kvcache.cache_status import (
     compute_cache_status_meta,
     compute_cache_unit_bytes,
 )
-from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages
+from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_window_floor_pages
 
 
 def _init_tp() -> None:
@@ -204,7 +204,7 @@ def test_floors_dsv4_reports_real_window_floor():
             dsv4_args=SimpleNamespace(window_size=P), has_swa_attention=False
         ),
     )
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 
     eng = SimpleNamespace(config=cfg, moe_offload_cache=None, linear_state_pool=None)
     eng.kv_cache = object.__new__(DSV4PagedKVCache)  # min_kv_tokens is a classmethod

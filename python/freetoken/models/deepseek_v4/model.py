@@ -4,7 +4,7 @@ A faithful single-stream port of the reference (MLA attention with a sliding win
 + stateful KV compressors / Lightning Indexer, manifold-constrained Hyper-Connections,
 sqrtsoftplus / hash MoE), wired onto FreeToken's shared paged engine:
 
-  - KV lives in DSV4-owned paged pools (:class:`~freetoken.kvcache.dsv4_paged_pool.DSV4PagedKVCache`):
+  - KV lives in DSV4-owned paged pools (:class:`~freetoken.kvcache.dsv4.v4_pool.DSV4PagedKVCache`):
     each layer's window-ring + compressed KV is a region of a shared global pool, addressed by
     per-layer slot maps. Sparse attention is a PAGED physical-slot gather:
     ``sparse_attn_paged`` reads KV directly from the two global pools (window / compressed) at

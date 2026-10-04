@@ -20,7 +20,7 @@ from abc import abstractmethod
 
 import torch
 
-from .base import BaseKVCachePool
+from ..base import BaseKVCachePool
 
 
 class FreeListAllocator:

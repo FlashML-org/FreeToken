@@ -14,8 +14,8 @@ import pytest
 import torch
 
 from freetoken.core import Req, SamplingParams
-from freetoken.kvcache.dsv4_cost_model import dsv4_pool_sizes
-from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+from freetoken.kvcache.dsv4.v4_cost_model import dsv4_pool_sizes
+from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
 from freetoken.scheduler.cache import CacheManager
 

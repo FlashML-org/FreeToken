@@ -1,6 +1,6 @@
 """Cost model + per-tier sizing for the DSV41 paged KV pool (DeepSeek-V4.1).
 
-Same shape as ``dsv4_cost_model``: one bytes-per-P-token number for the budget division, and
+Same shape as ``dsv4.v4_cost_model``: one bytes-per-P-token number for the budget division, and
 independent per-tier sizing from the anchor ``full_token = num_pages * P``. The tiers:
 
 * window pool, every layer          -- ``swa_ratio`` of the full history, packed fp8 rows
@@ -8,7 +8,7 @@ independent per-tier sizing from the anchor ``full_token = num_pages * P``. The 
 * index-key pool, per kv source     -- ``full_token // ratio`` packed fp4 rows
 * compress-state ring, ratio>1 sources -- ``ring_size`` fp32 ``kv|score`` slots per WINDOW page
 
-Sizing reads ``ModelConfig.dsv41_args`` by attribute, like ``dsv4_cost_model`` reads ``dsv4_args``:
+Sizing reads ``ModelConfig.dsv41_args`` by attribute, like ``dsv4.v4_cost_model`` reads ``dsv4_args``:
 the kvcache package never imports the model package. All byte widths come from the tier row formats
 below, so there is exactly one place that knows what a row costs.
 """
@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
-from .window_tier import reserved_window_pages
+from .dsv4.window_tier import reserved_window_pages
 
 _INT64_BYTES = 8
 _FP32_BYTES = 4

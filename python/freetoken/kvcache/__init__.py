@@ -34,7 +34,7 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
-            from .dsv4_paged_pool import DSV4PagedKVCache
+            from .dsv4.v4_pool import DSV4PagedKVCache
 
             return DSV4PagedKVCache
         from .mha_pool import MHAKVCache
@@ -43,7 +43,7 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
     if AttnType.DSV4 in types:
-        from .dsv4_paged_pool import DSV4PagedKVCache
+        from .dsv4.v4_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
     if AttnType.DSV41 in types:
@@ -84,9 +84,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
-    from .dsv4_cost_model import _dsv4_pool_sizes
+    from .dsv4.v4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
-    from .dsv4_paged_pool import DSV4PagedKVCache
+    from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
     if resolve_pool_class(model_config) is DSV4PagedKVCache:

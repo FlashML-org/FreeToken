@@ -178,13 +178,13 @@ def test_dsv4_rebuild_from_config_builds_the_pool_sizes_and_attaches_the_table()
     the engine used to do -- and re-points full_loc_map at the shared page table."""
     from types import SimpleNamespace
 
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_pool_sizes
-    from freetoken.kvcache.dsv4_cost_model import (
+    from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_pool_sizes
+    from freetoken.kvcache.dsv4.v4_cost_model import (
         dsv4_kv_unit_bytes,
         dsv4_pool_sizes,
         dsv4_window_unit_bytes,
     )
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
     P, mrr = 128, 1
@@ -222,7 +222,7 @@ def test_dsv4_refresh_seq_state_tracks_page_table_width():
 
     from freetoken.engine.engine import Engine
     from freetoken.utils import align_ceil
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.scheduler.table import TableManager
 
     P, mrr = 128, 4
@@ -264,7 +264,7 @@ def test_every_kv_pool_answers_the_sizing_surface():
     the model resolved to. DSV4 must carry its OWN overrides (getattr would resolve to the
     base class and silently misprice the window floor if an override vanished)."""
     from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
 
@@ -279,7 +279,7 @@ def test_every_kv_pool_answers_the_rebuild_surface():
     """The engine drives every pool through this one surface; a pool that skips an
     implementation must fail loudly at import/instantiation, not at rebuild time."""
     from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
 

@@ -10,7 +10,7 @@ of experts is resident on the GPU (the framework's core acceleration).
 DeepSeek-V4-Flash is a first-class registered model on the shared paged-KV engine:
 its window / compressed-attention / compressed-index KV live in DSV4-owned pools
 addressed by page tables, and sparse attention is a physical-slot gather (see
-:mod:`freetoken.attention.dsv4_sparse` and :mod:`freetoken.kvcache.dsv4_paged_pool`).
+:mod:`freetoken.attention.dsv4_sparse` and :mod:`freetoken.kvcache.dsv4.v4_pool`).
 """
 
 from .args import DeepseekV4Args, load_args

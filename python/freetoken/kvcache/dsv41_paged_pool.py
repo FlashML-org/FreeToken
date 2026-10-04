@@ -9,7 +9,7 @@ Tiers, sized from a budget (``dsv41_cost_model``) not from ``num_requests``:
 
 Consumer layers (Reindex / Reuse modes) alias their source's pools: ``main_pool_of(layer)``.
 
-Addressing is the shared ``WindowTierPagedPool``'s (``kvcache/window_tier.py``, also under the DSV4
+Addressing is the shared ``WindowTierPagedPool``'s (``kvcache/dsv4/window_tier.py``, also under the DSV4
 pool): the page table maps ``(table_idx, pos)`` to a full-token loc; ``full_to_window`` maps that to a
 window slot (page-bound by the free list); the main / index rows are pure arithmetic ``full_loc //
 ratio``; the ring slot derives from the window slot. Scratch rows past every main / index pool's
@@ -38,7 +38,7 @@ from .dsv41_cost_model import (
     dsv41_window_unit_bytes,
     private_window_layer_ids,
 )
-from .window_tier import CompressStateRing, WindowTierPagedPool
+from .dsv4.window_tier import CompressStateRing, WindowTierPagedPool
 
 logger = init_logger(__name__)
 

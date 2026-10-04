@@ -23,7 +23,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .dsv4_cost_model import (
+from .v4_cost_model import (
     DSV4PoolSizes,
     dsv4_kv_unit_bytes,
     dsv4_window_unit_bytes,
@@ -163,8 +163,8 @@ class DSV4PagedKVCache(WindowTierPagedPool):
     # ----- engine-facing rebuild surface -----
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .dsv4_cost_model import _dsv4_swa_ratio, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_auto_cost_model
+        from .v4_cost_model import _dsv4_swa_ratio, _dsv4_window_floor_pages
+        from .v4_cost_model import dsv4_auto_cost_model
 
         dsv4_args = config.model_config.dsv4_args
         P = dsv4_args.window_size
@@ -183,8 +183,8 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         # graceful config error, not a late OOM.
         from freetoken.utils import mem_GB
 
-        from .dsv4_cost_model import _dsv4_pool_sizes, _dsv4_swa_ratio, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_pool_bytes, dsv4_solve_num_pages
+        from .v4_cost_model import _dsv4_pool_sizes, _dsv4_swa_ratio, _dsv4_window_floor_pages
+        from .v4_cost_model import dsv4_pool_bytes, dsv4_solve_num_pages
 
         dsv4_args = config.model_config.dsv4_args
         P = dsv4_args.window_size
@@ -219,8 +219,8 @@ class DSV4PagedKVCache(WindowTierPagedPool):
 
     @classmethod
     def window_spec(cls, config):
-        from .base import WindowPoolSpec
-        from .dsv4_cost_model import _dsv4_window_floor_pages
+        from ..base import WindowPoolSpec
+        from .v4_cost_model import _dsv4_window_floor_pages
 
         P = config.model_config.dsv4_args.window_size
         return WindowPoolSpec(P, _dsv4_window_floor_pages(config, P) - 1)
@@ -229,7 +229,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
     def min_kv_tokens(cls, config) -> int:
         # The full anchor must cover the window working-set floor (full >= window always), so
         # that floor -- the value validate_rebuild enforces -- is the pool's floor in tokens.
-        from .dsv4_cost_model import _dsv4_window_floor_pages
+        from .v4_cost_model import _dsv4_window_floor_pages
 
         P = config.model_config.dsv4_args.window_size
         return _dsv4_window_floor_pages(config, P) * P
@@ -243,9 +243,9 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
 
-        from .base import CacheRebuildRejected
-        from .dsv4_cost_model import _dsv4_pool_sizes, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_pool_bytes
+        from ..base import CacheRebuildRejected
+        from .v4_cost_model import _dsv4_pool_sizes, _dsv4_window_floor_pages
+        from .v4_cost_model import dsv4_pool_bytes
 
         dsv4_args = config.model_config.dsv4_args
         if num_pages is not None:
@@ -282,7 +282,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
     ) -> None:
-        from .dsv4_cost_model import _dsv4_pool_sizes
+        from .v4_cost_model import _dsv4_pool_sizes
 
         # +1 for the dummy page
         self.rebuild(_dsv4_pool_sizes(config, num_pages + 1, num_swa_pages=num_swa_pages))
