@@ -122,7 +122,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
@@ -132,11 +132,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         if self.tied_embedding is not None:
-            if out_dtype is not None:
-                raise NotImplementedError("explicit LM head output dtype requires untied weights")
             logits = F.linear(x, self.tied_embedding.weight, self.bias)
         else:
-            logits = self.quant_method.apply(self, x, out_dtype=out_dtype)
+            logits = self.quant_method.apply(self, x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

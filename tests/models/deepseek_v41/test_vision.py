@@ -90,7 +90,7 @@ def _prefill(eng, reqs):
     eng._bind()
     eng.backend.prepare_metadata(batch)
     with eng.ctx.forward_batch(batch), eng.model.forward_host_ctx(batch, False):
-        return eng.model.forward()
+        return eng.model.forward().float()
 
 
 def test_processor_patch_order_and_all_span_rows_are_embeddings():

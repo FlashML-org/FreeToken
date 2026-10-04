@@ -50,10 +50,6 @@ class LinearKernel(ABC):
     @abstractmethod
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor: ...
 
-    def apply_out_dtype(self, layer: Any, x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-        # Casting an already-rounded result does not satisfy an output-precision request.
-        raise NotImplementedError(f"{self.name} does not support explicit linear output dtype {out_dtype}")
-
 
 class LinearMethod(QuantMethod):
     """Declares a linear layer's weights for its kind; finalize and apply go to the kernel."""
@@ -64,7 +60,5 @@ class LinearMethod(QuantMethod):
     def finalize(self, layer: Any) -> None:
         self.kernel.finalize(layer)
 
-    def apply(self, layer: Any, x: torch.Tensor, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
-        if out_dtype is not None:
-            return self.kernel.apply_out_dtype(layer, x, out_dtype)
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         return self.kernel.apply(layer, x)

@@ -39,29 +39,6 @@ def test_prefill_and_decode(checkpoint):
         assert out.shape == (2, VOCAB) and torch.isfinite(out).all()
 
 
-def test_head_preserves_fp32_logit_margin(checkpoint, monkeypatch):
-    from .harness import TinyEngine
-
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=1)
-    assert eng.model.head.weight.dtype == torch.bfloat16
-    hidden = torch.zeros(2, eng.args.dim, device=eng.device, dtype=torch.bfloat16)
-    hidden[:, :2] = 1
-    eng.model.head.weight.zero_()
-    eng.model.head.weight[:2, 0] = 1
-    eng.model.head.weight[1, 1] = 2**-10
-    monkeypatch.setattr(eng.model.model, "prefill", lambda *args: hidden)
-    monkeypatch.setattr(eng.model.model, "decode", lambda *args: hidden[:1])
-
-    req = eng.new_request(0, [3, 4])
-    prefill = eng.prefill([req])
-    eng.finish_prefill([req])
-    decode = eng.decode([req], [5])
-    for logits in (prefill, decode):
-        # Both values round to 1 in bf16, which would make argmax pick token 0.
-        assert logits[0, :2].tolist() == [1.0, 1.0 + 2**-10]
-        assert logits.argmax(-1).item() == 1
-
-
 def test_chunked_prefill_matches_single_shot(checkpoint):
     """Two 128-aligned chunks must reproduce the single-shot prefill's last-token logits: the
     compressor carry, the window ring and the compressed rows are all resumed through the pool. The

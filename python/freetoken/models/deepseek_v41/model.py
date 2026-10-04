@@ -283,7 +283,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             else:
                 cmp_stage_cap = int(pos.max().item())
             hidden = self.model.decode(input_ids.view(B), pos, md, cmp_stage_cap)
-        return self.head.forward(hidden, out_dtype=torch.float32)
+        return self.head.forward(hidden)
 
 
 __all__ = ["DeepseekV41ForCausalLM", "Transformer", "Block", "Streams"]
