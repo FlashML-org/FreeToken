@@ -601,7 +601,7 @@ def parse_args(
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
             "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
-            "'fused' experts on unified-memory GPUs (GB10, Jetson)."
+            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 

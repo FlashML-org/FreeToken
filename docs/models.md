@@ -49,7 +49,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it. Unified-memory GPUs differ, see below.
 
-### Unified-memory GPUs (GB10 / DGX Spark, Jetson)
+### Unified-memory GPUs (GB10 / DGX Spark)
 
 The GPU and the CPU share one DRAM, so offload only copies experts between two
 names for the same memory. On these GPUs `auto` resolves every MoE model to
