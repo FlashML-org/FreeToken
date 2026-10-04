@@ -51,15 +51,16 @@ class TinyEngine:
         with torch.device("meta"), torch_dtype(torch.bfloat16):
             self.model = create_model(self.config)
         state = _materialize_loaded_weight_state_dict(
-            self.model.state_dict(), iter_weights(checkpoint, self.device, include_moe_experts=not quantized), device=self.device,
+            self.model.state_dict(), iter_weights(checkpoint, self.device, include_moe_experts=False), device=self.device,
         )
         self.model.load_state_dict(state)
         finalize_quant(self.model)
+        from freetoken.moe.expert_banks import load_expert_banks
+
+        method = self.model.model.layers.op_list[0].ffn.experts.quant_method
         if quantized:
-            from freetoken.moe.expert_banks import load_expert_banks
             from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 
-            method = self.model.model.layers.op_list[0].ffn.experts.quant_method
             self.banks = load_expert_banks(
                 checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False,
             )
@@ -70,6 +71,13 @@ class TinyEngine:
             )
             self.expert_cache.set_bank_sources(self.banks.sources, layer_residency=self.banks.layer_residency)
             attach_offload_moe_cache(self.model, self.expert_cache)
+        else:  # resident experts load as banks, not through the state dict (as in Engine._load_resident_experts)
+            from freetoken.layers import iter_moe_layers
+            from freetoken.moe.expert_banks import attach_resident_banks
+
+            attach_resident_banks(list(iter_moe_layers(self.model)), load_expert_banks(
+                checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False, resident=True,
+            ))
         for layer in self.model.engram_layers():
             layer.attach_table(engram_table if engram_table is not None else ZeroEngramTable(layer.width, self.device))
 
