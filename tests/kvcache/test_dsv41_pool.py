@@ -88,10 +88,6 @@ def test_pool_reads_sources_and_rings_from_args():
     pool, _, _ = _pool()
     assert [pool.source_of(l) for l in range(2, 10)] == [2, 2, 2, 5, 5, 7, 7, 7]
     assert set(pool.state_ring) == {2, 5} and pool.state_ring[2].ring_size == 2
-    with pytest.raises(ValueError):  # a compressing layer before its first source
-        _args(kv_source_layers=(5, 7))
-    with pytest.raises(ValueError):  # a consumer whose source has another ratio
-        _args(compress_ratios=(0, 0, 2, 2, 1, 2, 2, 1, 1, 1))
     with pytest.raises(ValueError):  # the window is not a multiple of a compress ratio
         _pool(window_size=P - 1)
     with pytest.raises(ValueError):  # an indexer key the fp4 row format cannot hold

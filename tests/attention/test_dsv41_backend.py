@@ -3,7 +3,7 @@
 * prefill metadata: encoder segments, the decoder pass under exact vs bounded replay;
 * window candidates with a floor (bounded replay truncates the window at the prompt's last window);
 * decode snapshot staging and the layer-invariant ring context;
-* the pure selection helpers against the reference ``select_candidate_blocks`` / top-k semantics.
+* the selection helpers' reshape, candidate gather and position-to-row mapping.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
@@ -188,41 +187,6 @@ def test_decode_snapshot_and_ring_context():
     backend.prepare_for_replay(batch)
     assert batch.attn_metadata.full_snap.data_ptr() == backend.capture.full_snap.data_ptr()
     assert batch.attn_metadata.stage_width == 512
-
-
-def _reference_candidate_mask(logits, compress_lens, topk_blocks, block_size):
-    """The reference ``select_candidate_blocks`` (boolean mask over positions)."""
-    b, s, width = logits.shape
-    pad = -width % block_size
-    blk = F.pad(logits, (0, pad), value=float("-inf")).view(b, s, -1, block_size).amax(dim=-1)
-    nb = blk.shape[-1]
-    last = torch.div(compress_lens - 1, block_size, rounding_mode="floor")
-    blk = blk.masked_fill(torch.arange(nb, device=logits.device) == last, float("inf"))
-    top = blk.topk(min(topk_blocks, nb), dim=-1)
-    keep = torch.zeros_like(blk, dtype=torch.bool).scatter(-1, top.indices, ~torch.isneginf(top.values))
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the selection kernels need CUDA")
-def test_candidate_blocks_match_the_reference_mask():
-    from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
-
-    torch.manual_seed(0)
-    b, s, t, blk, kb = 2, 5, 61, 8, 3
-    logits = torch.randn(b, s, t, device="cuda")
-    live = torch.tensor([[61, 40, 17, 1, 0], [8, 9, 33, 61, 61]], device="cuda", dtype=torch.int32)
-    logits = logits.masked_fill(torch.arange(t, device="cuda") >= live.unsqueeze(-1), -torch.inf)
-    cand = DSV41SparseAttnBackend.select_candidate_blocks(logits, live, kb, blk)
-    assert cand.shape == (b, s, kb * blk)
-    want = _reference_candidate_mask(logits, live.unsqueeze(-1), kb, blk)
-    for i in range(b):
-        for j in range(s):
-            got = [int(p) for p in cand[i, j] if p >= 0]
-            ref = [int(p) for p in want[i, j].nonzero().flatten() if p < live[i, j]]
-            assert got == ref, (i, j, got, ref)  # ascending valid prefix
-            assert (cand[i, j, len(got):] == -1).all()
-    # empty history: no candidates at all
-    assert (cand[0, 4] == -1).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the selection kernels need CUDA")

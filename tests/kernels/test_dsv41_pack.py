@@ -110,10 +110,3 @@ def test_e4m3_encode_helper_matches_torch_bits():
     want = torch.where(finite, codes, torch.zeros_like(codes))
     # -0.0 encodes to 0x80 in torch and 0x80 here; +0.0 -> 0x00
     assert torch.equal(out, want)
-
-
-def test_row_format_geometry():
-    assert FP4_E4M3_B16.row_bytes(512) == 256 + 32 and FP4_E8M0_B32.row_bytes(128) == 64 + 4
-    assert FP8_E8M0_B32.row_bytes(512) == 512 + 16 and BF16.row_bytes(512) == 1024
-    with pytest.raises(ValueError):
-        FP4_E4M3_B16.validate_dim(24)

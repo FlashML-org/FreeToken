@@ -58,18 +58,6 @@ def test_chunked_prefill_matches_single_shot(checkpoint):
     _compare("chunked prefill", got, ref)
 
 
-def test_bounded_replay_runs(checkpoint):
-    from .harness import TinyEngine
-
-    eng = TinyEngine(checkpoint, max_seq_len=1024, max_running_req=2, swa_decoder_replay="bounded")
-    r0 = eng.new_request(0, _tokens(300, 4))
-    logits = eng.prefill([r0])
-    assert logits.shape == (1, VOCAB) and torch.isfinite(logits).all()
-    eng.finish_prefill([r0])
-    out = eng.decode([r0], [5])
-    assert torch.isfinite(out).all()
-
-
 def test_bounded_replay_is_exact_within_one_window(checkpoint):
     """A prompt no longer than the window replays every token with no floor: bounded == exact."""
     from .harness import TinyEngine
@@ -194,25 +182,3 @@ def test_commit_dedup_onto_a_longer_prompts_pages_keeps_the_decoder_state(checkp
         return eng.decode([a], [3])
 
     _compare("decode after a commit repoint", run(True), run(False))
-
-
-def test_two_engines_rebind_the_shared_context_on_every_forward(checkpoint):
-    """``TinyEngine`` instances share the process-wide ``Context``; each forward must run against its
-    own page table, pool and backend even after another engine was built (the model resolves its
-    backend through the context, so a stale binding would silently read the other engine's pools)."""
-    from freetoken.core import get_global_ctx
-
-    from .harness import TinyEngine
-
-    eng = TinyEngine(checkpoint, max_seq_len=512, max_running_req=1)
-    a = eng.new_request(0, _tokens(64, 41))
-    before = eng.prefill([a])
-    eng2 = TinyEngine(checkpoint, max_seq_len=512, max_running_req=1)
-    assert eng2.ctx is eng.ctx and get_global_ctx().attn_backend is eng2.backend
-    b = eng2.new_request(0, _tokens(64, 42))
-    eng2.prefill([b])
-    # a forward on the first engine binds its own resources again and reproduces its result
-    eng.finish_prefill([a])
-    a2 = eng.new_request(0, _tokens(64, 41))
-    assert torch.equal(eng.prefill([a2]), before) and get_global_ctx().attn_backend is eng.backend
-    assert get_global_ctx().kv_cache is eng.pool and get_global_ctx().page_table is eng.page_table

@@ -51,6 +51,8 @@ def test_shipping_layout_roles():
 def test_bad_layouts_are_rejected():
     with pytest.raises(ValueError, match="no kv source"):
         DeepseekV41Args.from_hf(tiny_hf_config(kv_source_layer_ids=[4]))
+    with pytest.raises(ValueError, match="reads kv source"):
+        DeepseekV41Args.from_hf(tiny_hf_config(compress_ratios=[0, 0, 2, 1, 1, 1, 0]))
     with pytest.raises(ValueError, match="different kv source"):
         DeepseekV41Args.from_hf(tiny_hf_config(compress_ratios=[0, 0, 2, 2, 2, 2, 0], kv_source_layer_ids=[2, 4], candidate_source_layer_id=2, index_source_layer_ids=[2, 4, 5]))
 
