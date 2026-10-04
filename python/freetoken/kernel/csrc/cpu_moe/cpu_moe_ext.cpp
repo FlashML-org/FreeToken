@@ -676,15 +676,26 @@ static void cumemop_check(int rc, const char* what) {
 #include <hip/hiprtc.h>
 #include <vector>
 #include <string>
+#include <unordered_map>
 // hipGraph replays memcpy/kernel nodes but NOT stream-memop nodes (they no-op on
 // relaunch on ROCm 7.14 -- verified: memop write 0/50, memop wait ~1/20, kernel 50/50).
 // So drive the GPU<->CPU flag handshake with tiny kernels (runtime-compiled via hiprtc
 // so this host-only extension needs no device-source build step). Under capture these
 // become kernel nodes that replay correctly with the freshly written pinned flags.
-static hipFunction_t g_submit_fn = nullptr, g_wait_fn = nullptr;
-static bool g_flag_kfn_ready = false;
-static void ensure_flag_kernels() {
-  if (g_flag_kfn_ready) return;
+struct FlagKernels { hipFunction_t submit = nullptr, wait = nullptr; };
+// Compiled per device ordinal: the module is built for one GPU's gcnArchName, so a process that
+// touches two Radeons of different arch must not share one module. Guarded by a mutex because the
+// CPU-MoE submit/wait callbacks run on their own threads.
+static std::mutex g_flag_mu;
+static std::unordered_map<int, FlagKernels> g_flag_by_dev;
+// Returns the current device's handshake kernels, compiling+caching them on first use for that
+// device, or nullptr if any HIP/HIPRTC step fails (caller must not launch).
+static const FlagKernels* ensure_flag_kernels() {
+  int dev = -1;
+  if (hipGetDevice(&dev) != hipSuccess) return nullptr;
+  std::lock_guard<std::mutex> lk(g_flag_mu);
+  auto it = g_flag_by_dev.find(dev);
+  if (it != g_flag_by_dev.end()) return &it->second;  // cached (success only; failures aren't stored)
   static const char* src =
     "extern \"C\" __global__ void ft_flag_submit(long long* done, long long* ready, long long slot){\n"
     "  done[slot]=0; __threadfence_system(); ready[slot]=1; __threadfence_system();\n}\n"
@@ -692,40 +703,47 @@ static void ensure_flag_kernels() {
     "  volatile long long* d=done;\n"
     "  while(d[slot]<1){ __builtin_amdgcn_s_sleep(2); }\n"
     "  __threadfence_system();\n}\n";
+  hipDeviceProp_t props;
+  if (hipGetDeviceProperties(&props, dev) != hipSuccess) return nullptr;
   hiprtcProgram prog;
-  if (hiprtcCreateProgram(&prog, src, "ft_flags.hip", 0, nullptr, nullptr) != HIPRTC_SUCCESS) return;
-  hipDeviceProp_t props; hipGetDeviceProperties(&props, 0);
+  if (hiprtcCreateProgram(&prog, src, "ft_flags.hip", 0, nullptr, nullptr) != HIPRTC_SUCCESS) return nullptr;
   std::string archopt = std::string("--gpu-architecture=") + props.gcnArchName;
   const char* opts[] = { archopt.c_str() };
   hiprtcResult cr = hiprtcCompileProgram(prog, 1, opts);
   if (cr != HIPRTC_SUCCESS) {
     size_t lsz = 0; hiprtcGetProgramLogSize(prog, &lsz);
     std::vector<char> log(lsz + 1, 0); if (lsz) hiprtcGetProgramLog(prog, log.data());
-    std::fprintf(stderr, "[freetoken/cpu_moe] hiprtc compile failed: %s\n", log.data());
-    hiprtcDestroyProgram(&prog); return;
+    std::fprintf(stderr, "[freetoken/cpu_moe] hiprtc compile failed (dev %d, %s): %s\n", dev, props.gcnArchName, log.data());
+    hiprtcDestroyProgram(&prog); return nullptr;
   }
   size_t codeSize = 0; hiprtcGetCodeSize(prog, &codeSize);
   std::vector<char> code(codeSize); hiprtcGetCode(prog, code.data());
   hiprtcDestroyProgram(&prog);
   hipModule_t mod;
-  if (hipModuleLoadData(&mod, code.data()) != hipSuccess) return;
-  hipModuleGetFunction(&g_submit_fn, mod, "ft_flag_submit");
-  hipModuleGetFunction(&g_wait_fn, mod, "ft_flag_wait");
-  g_flag_kfn_ready = (g_submit_fn != nullptr && g_wait_fn != nullptr);
+  if (hipModuleLoadData(&mod, code.data()) != hipSuccess) return nullptr;
+  FlagKernels fk;
+  if (hipModuleGetFunction(&fk.submit, mod, "ft_flag_submit") != hipSuccess ||
+      hipModuleGetFunction(&fk.wait, mod, "ft_flag_wait") != hipSuccess) {
+    std::fprintf(stderr, "[freetoken/cpu_moe] hipModuleGetFunction failed (dev %d)\n", dev);
+    (void)hipModuleUnload(mod); return nullptr;
+  }
+  return &(g_flag_by_dev[dev] = fk);  // module intentionally kept for the process lifetime
 }
 static void kernel_flag_submit(void* stream, uintptr_t done_addr, uintptr_t ready_addr, long long slot) {
-  ensure_flag_kernels();
+  const FlagKernels* fk = ensure_flag_kernels();
+  if (!fk) { std::fprintf(stderr, "[freetoken/cpu_moe] ft_flag_submit: flag kernels unavailable on current device\n"); return; }
   struct { void* d; void* r; long long s; } args{(void*)done_addr, (void*)ready_addr, slot};
   size_t sz = sizeof(args);
   void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
-  cumemop_check(hipModuleLaunchKernel(g_submit_fn, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_submit");
+  cumemop_check(hipModuleLaunchKernel(fk->submit, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_submit");
 }
 static void kernel_flag_wait(void* stream, uintptr_t done_addr, long long slot) {
-  ensure_flag_kernels();
+  const FlagKernels* fk = ensure_flag_kernels();
+  if (!fk) { std::fprintf(stderr, "[freetoken/cpu_moe] ft_flag_wait: flag kernels unavailable on current device\n"); return; }
   struct { void* d; long long s; } args{(void*)done_addr, slot};
   size_t sz = sizeof(args);
   void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
-  cumemop_check(hipModuleLaunchKernel(g_wait_fn, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_wait");
+  cumemop_check(hipModuleLaunchKernel(fk->wait, 1,1,1, 1,1,1, 0, (hipStream_t)stream, nullptr, cfg), "ft_flag_wait");
 }
 // Do stream-memop nodes replay inside a hipGraph on THIS runtime? The no-op-on-replay bug is a
 // ROCm 7.14 issue, fixed on ROCm 10 (hipRuntimeGetVersion encodes major*1e7+minor*1e5+patch:
