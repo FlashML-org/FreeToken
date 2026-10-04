@@ -67,6 +67,11 @@ CALL_BLOCKS = {
         '<｜DSML｜parameter name="filePath" string="true">/tmp/test_calc.py</｜DSML｜parameter>'
         "</｜DSML｜invoke></｜DSML｜function_calls>"
     ),
+    "deepseekv41": (
+        '<｜DSML｜ calls>\n<｜DSML｜ invoke name="read">\n'
+        '<｜DSML｜ parameter name="filePath" string="true">/tmp/test_calc.py</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ),
     "qwen25": '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>',
     "qwen3_coder": (
         "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
@@ -104,6 +109,7 @@ CALL_BLOCKS = {
 # Substrings that must never leak into user-visible content.
 MARKUP_MARKERS = {
     "deepseekv32": ["｜DSML｜"],
+    "deepseekv41": ["｜DSML｜"],
     "qwen25": ["<tool_call>", "</tool_call>"],
     "qwen3_coder": ["<tool_call>", "<function="],
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
@@ -121,6 +127,7 @@ MARKUP_MARKERS = {
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
+    "dsv4.1": ("deepseekv41", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
     "qwen": ("qwen25", "qwen3", "", "</think>"),
     "glm4.7": ("glm47", "glm", "", "</think>"),

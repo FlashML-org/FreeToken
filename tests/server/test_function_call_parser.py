@@ -337,6 +337,34 @@ def test_dsv32_streaming_multi_param_args_prefix_stable():
     }
 
 
+V41_BLOCK = (
+    "<｜DSML｜ calls>\n"
+    '<｜DSML｜ invoke name="glob">\n'
+    '<｜DSML｜ parameter name="pattern" string="true">*.py</｜DSML｜ parameter>\n'
+    '<｜DSML｜ parameter name="path" string="true">/src</｜DSML｜ parameter>\n'
+    "</｜DSML｜ invoke>\n"
+    "</｜DSML｜ calls>"
+)
+
+
+def test_dsv41_dsml_tags_lead_with_a_space():
+    """DeepSeek-V4.1 leads every DSML tag name with a space (its encoder's ``<｜DSML｜ calls>``):
+    the V3.2 detector sees no tool call there, the V4.1 one parses it whole and streamed."""
+    text = "Let me look.\n\n" + V41_BLOCK
+    assert not FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv32").has_tool_call(text)
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv41")
+    assert parser.has_tool_call(text)
+    result = parser.parse_non_stream(text)
+    assert result.normal_text == "Let me look."
+    assert [(c.name, json.loads(c.parameters)) for c in result.calls] == [("glob", {"pattern": "*.py", "path": "/src"})]
+
+    streamed = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv41")
+    texts, calls = _feed(streamed, [text[i : i + 5] for i in range(0, len(text), 5)])
+    assert "".join(texts).strip() + streamed.finish_stream() == "Let me look."
+    assert [c.name for c in calls if c.name] == ["glob"]
+    assert json.loads("".join(c.parameters for c in calls if c.name is None)) == {"pattern": "*.py", "path": "/src"}
+
+
 def test_streaming_support_flags():
     # Every registered detector is incremental-safe (buffered fallback remains as
     # the escape hatch for future formats, exercised via monkeypatch in
