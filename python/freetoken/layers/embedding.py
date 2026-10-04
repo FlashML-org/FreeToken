@@ -8,7 +8,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, nvtx_annotate
 
-from .base import BaseOP
+from .base import BaseOP, OPList
 from .quantization import LayerKind, QuantConfig, quant_method_for
 
 
@@ -36,16 +36,39 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
+        # --embed-device cpu: device address of the pinned host copy of ``weight`` (0 = on the GPU)
+        self._host_ptr = 0
 
-    @nvtx_annotate("Embedding")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def move_to_host(self) -> int:
+        """Move the table into pinned host RAM, read in place by the GPU; returns the bytes pinned."""
+        from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+
+        assert self._host_ptr == 0, "embedding table is already host-resident"
+        host = alloc_pinned_tensor(*self.weight.shape, dtype=self.weight.dtype)
+        host.copy_(self.weight)
+        self.weight = host
+        self._host_ptr = device_ptr(host)
+        return host.numel() * host.element_size()
+
+    def _lookup(self, x: torch.Tensor) -> torch.Tensor:
+        if self._host_ptr:
+            from freetoken.kernel.triton.host_embedding import host_embedding_gather
+
+            start, length = self.vocab_range
+            out = torch.empty(x.numel(), self.weight.shape[1], dtype=self.weight.dtype, device=x.device)
+            return host_embedding_gather(self._host_ptr, length, self.weight.shape[1], x.view(-1), out, start)
+
         from freetoken.kernel import indexing
 
-        y = indexing(
+        return indexing(
             weights=self.weight,
             indices=x,
             vocab_range=self.vocab_range if self.tp_size > 1 else None,
         )
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self._lookup(x)
 
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
@@ -147,3 +170,35 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+
+def host_movable_embeddings(model: BaseOP) -> list[tuple[str, VocabParallelEmbedding]]:
+    """(module path, table) of every input-embedding table --embed-device cpu moves to host RAM.
+
+    A table tied to an LM head stays on the GPU (the head reads it every step), and so does a
+    quantized or packed one (the host gather reads plain float rows). Works on the meta build."""
+    tables: dict[int, tuple[str, VocabParallelEmbedding]] = {}
+    tied: set[int] = set()
+
+    def walk(op: BaseOP, path: str, seen: set[int]) -> None:
+        if id(op) in seen:
+            return
+        seen.add(id(op))
+        if isinstance(op, ParallelLMHead):
+            if op.tied_embedding is not None:
+                tied.add(id(op.tied_embedding))
+        elif type(op) is VocabParallelEmbedding and op.weight.dtype.is_floating_point:
+            tables.setdefault(id(op), (path, op))
+        children = enumerate(op.op_list) if isinstance(op, OPList) else op.__dict__.items()
+        for name, child in children:
+            if isinstance(child, BaseOP):
+                walk(child, f"{path}.{name}" if path else str(name), seen)
+
+    walk(model, "", set())
+    return [entry for key, entry in tables.items() if key not in tied]
+
+
+def move_input_embeddings_to_host(model: BaseOP) -> tuple[int, list[str]]:
+    """--embed-device cpu: move ``host_movable_embeddings`` to pinned host RAM; returns the bytes pinned and their paths."""
+    moved = host_movable_embeddings(model)
+    return sum(op.move_to_host() for _, op in moved), [path for path, _ in moved]

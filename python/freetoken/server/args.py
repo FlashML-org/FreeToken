@@ -637,6 +637,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--embed-device",
+        default=ServerArgs.embed_device,
+        choices=["gpu", "cpu"],
+        help=(
+            "Where the input-embedding table lives. 'cpu' keeps it in pinned host RAM and the "
+            "GPU reads the looked-up rows over PCIe, freeing its VRAM for the KV cache (e.g. "
+            "2.4 GiB on a 248k-vocab, 5120-wide model). Tables tied to the LM head stay on the GPU."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
