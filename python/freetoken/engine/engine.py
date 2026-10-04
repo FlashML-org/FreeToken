@@ -681,6 +681,9 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        resident_bytes = sum(t.nbytes for per_layer in banks.sources.values() for t in per_layer if t.is_cuda)
+        self._weights_bytes += resident_bytes
+        self._post_weights_free -= resident_bytes
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)
