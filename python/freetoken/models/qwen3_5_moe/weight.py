@@ -14,7 +14,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
 from freetoken.models.config import VISION_KEY_PREFIXES
-from freetoken.models.loader import ShardReader, iter_weight_files
+from freetoken.models.loader import ShardReader, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.models.register import ModelSpec, get_model_spec
 from freetoken.utils import cached_load_hf_config
@@ -233,6 +233,111 @@ class _DenseReader:
         return out
 
 
+class _TPShard:
+    """Per-rank tensor-parallel sharding for the dense pass. ``gdn`` is the GDN group's
+    ``(num_key_heads, num_value_heads, key_head_dim, value_head_dim)`` (full, pre-TP) or
+    None when the model has no linear-attention layers."""
+
+    def __init__(self, rank: int, world: int, num_kv_heads: int, gdn: tuple | None):
+        self.rank = rank
+        self.world = world
+        self.num_kv_heads = num_kv_heads
+        self.gdn = gdn
+
+    def __call__(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if self.world == 1:
+            return tensor
+        rank, world = self.rank, self.world
+        # Vision tower (Qwen3-VL) is fully TP-parallel: qkv/fc1 column-parallel (incl. bias),
+        # proj/fc2 row-parallel. No GQA, dims divide evenly, so plain chunk suffices. The
+        # patch-embed conv, norms and row-parallel biases replicate (default pass-through).
+        if name.startswith("visual."):
+            if name.endswith((".attn.qkv.weight", ".attn.qkv.bias")):
+                return torch.cat([x.chunk(world, 0)[rank] for x in tensor.chunk(3, 0)], 0).clone()
+            if name.endswith((".mlp.linear_fc1.weight", ".mlp.linear_fc1.bias",
+                              ".merger.linear_fc1.weight", ".merger.linear_fc1.bias")):
+                return tensor.chunk(world, 0)[rank].clone()
+            if name.endswith((".attn.proj.weight", ".mlp.linear_fc2.weight", ".merger.linear_fc2.weight")):
+                return tensor.chunk(world, 1)[rank].clone()
+            return tensor
+        g = self.gdn
+        if g is not None:
+            nk, nv = g[0], g[1]
+            # Match the GDN module regardless of role: an fp8_block checkpoint stores a
+            # .weight_scale_inv (128-block) companion next to each fp8 .weight, and it must be
+            # sharded the same way. The head helpers derive the per-head size from the tensor
+            # itself (head_dim for the weight, head_dim/128 for the scale), so one rule serves both.
+            leaf = _module_leaf(name)
+            # in_proj_qkv / conv1d rows are [q(nk heads) | k(nk heads) | v(nv heads)]
+            if leaf in ("in_proj_qkv", "conv1d"):
+                return _shard_head_segments(tensor, [nk, nk, nv], self.rank, self.world)
+            # z (nv heads), b / a / dt_bias / A_log (one unit per v-head) -> shard the v-heads
+            if leaf in ("in_proj_z", "in_proj_b", "in_proj_a", "A_log", "dt_bias"):
+                return _shard_by_heads(tensor, nv, self.rank, self.world, dim=0)
+            # out_proj is row-parallel: its input columns are the v-head value dim
+            if leaf == "out_proj":
+                return _shard_by_heads(tensor, nv, self.rank, self.world, dim=1)
+        # standard attention q/k/v/o, dense FFN gate/up/down, embed/lm_head vocab (shard_tensor
+        # keys on the module substring, so it shards the fp8 .weight_scale_inv companion too)
+        return shard_tensor(name, tensor, rank=self.rank, world_size=self.world, num_kv_heads=self.num_kv_heads)
+
+    def expert(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Shard a pre-stacked routed-expert tensor by the intermediate dim (column-parallel
+        experts, row-parallel down). gate_up is [E, 2*I, H] = [gate(I) | up(I)] on dim1 (qwen3_5
+        is non-interleaved), down is [E, H, I]. The same split works for the block-fp8 companions:
+        gate_up_scale_inv [E, 2*I//128, H//128] and down_scale_inv [E, H//128, I//128]."""
+        if self.world == 1:
+            return tensor
+        if name.endswith((".gate_up_proj", ".gate_up_scale_inv")):
+            gate, up = tensor.chunk(2, dim=1)
+            return torch.cat(
+                [gate.chunk(self.world, 1)[self.rank], up.chunk(self.world, 1)[self.rank]], dim=1
+            ).clone()
+        if name.endswith((".down_proj", ".down_scale_inv")):
+            return tensor.chunk(self.world, dim=2)[self.rank].clone()
+        return tensor
+
+
+def _module_leaf(name: str) -> str:
+    """The module name's leaf, with any quant-role suffix stripped (so ``...in_proj_qkv.weight``
+    and ``...in_proj_qkv.weight_scale_inv`` both resolve to ``in_proj_qkv``)."""
+    for suf in (".weight_scale_inv", ".weight_scale", ".weight", ".bias"):
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+            break
+    return name.rpartition(".")[2]
+
+
+def _shard_head_segments(t: torch.Tensor, head_counts, rank: int, world: int) -> torch.Tensor:
+    """Shard dim0 of a tensor whose rows are consecutive per-head segments (head counts in
+    ``head_counts``), by head. The per-head unit is derived from the tensor so one call serves
+    both the fp8 weight (unit=head_dim) and its 128-block scale (unit=head_dim/128); this needs
+    head_k_dim==head_v_dim (gdn.py asserts it). GDN requires every segment's head count to divide
+    evenly by tp (gdn.py enforces it), matching the in_proj layer's plain per-segment split."""
+    total_heads = sum(head_counts)
+    assert t.shape[0] % total_heads == 0, f"dim0 {t.shape[0]} not a multiple of {total_heads} heads"
+    unit = t.shape[0] // total_heads
+    out, off = [], 0
+    for num_heads in head_counts:
+        width = num_heads * unit
+        out.append(_shard_by_heads(t.narrow(0, off, width), num_heads, rank, world, dim=0))
+        off += width
+    return torch.cat(out, dim=0)
+
+
+def _shard_by_heads(t: torch.Tensor, num_heads: int, rank: int, world: int, *, dim: int) -> torch.Tensor:
+    """Slice ``dim`` (size ``num_heads * head_dim``) to this rank's heads; replicate one head
+    per rank when ``num_heads < world``."""
+    head_dim = t.shape[dim] // num_heads
+    if num_heads < world:
+        assert world % num_heads == 0, f"{world=} not a multiple of {num_heads=} for replication"
+        h0 = rank * num_heads // world
+        return t.narrow(dim, h0 * head_dim, head_dim).clone()
+    assert num_heads % world == 0, f"{num_heads=} not divisible by {world=}"
+    local = num_heads // world
+    return t.narrow(dim, rank * local * head_dim, local * head_dim).clone()
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -245,17 +350,23 @@ def iter_weights(
 
     Block-fp8 and NVFP4 experts always come from the expert-bank reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading supports TP=1 only")
+    tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
+    if tp.size > 1 and include_moe_experts and config.is_moe and config.expert_quant not in ("none", "fp8_block"):
+        raise NotImplementedError(
+            f"qwen3_5_moe TP expert sharding supports bf16 stacked + fp8_block experts; got {config.expert_quant}"
+        )
+    group = config.linear_attention_group()
+    gdn = (group.num_key_heads, group.num_value_heads, group.key_head_dim, group.value_head_dim) if group else None
+    shard = _TPShard(tp.rank, tp.size, config.num_kv_heads, gdn)
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision, shard=shard)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
+def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool, shard: _TPShard):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -266,11 +377,13 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:
-                        yield name, f.get_tensor(raw_name)
+                        yield name, shard.expert(name, f.get_tensor(raw_name))
                     continue
                 if reader is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                # Shard the raw part to this rank before the reader merges fused projections;
+                # the reader's per-role torch.cat of already-sharded parts yields the local fusion.
+                tensor = shard(name, f.get_tensor(raw_name))
                 emitted = reader.add(name, tensor)
                 if emitted is not None:
                     yield from emitted
@@ -346,11 +459,12 @@ def _moe_dims(model_config):
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
-    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
+    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers.
+
+    Yields WHOLE per-expert pieces (full intermediate); ``build_expert_banks`` shards them per
+    rank into the TP-local banks."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
