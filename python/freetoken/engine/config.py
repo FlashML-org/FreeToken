@@ -34,6 +34,9 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # --embed-device: "cpu" keeps the untied input-embedding table in pinned host RAM, read by
+    # the GPU in place over PCIe (a few rows per decode step); its VRAM goes to the KV pool.
+    embed_device: str = "gpu"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
