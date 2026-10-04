@@ -76,6 +76,63 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
     assert torch.all(banks.sources["gate_up_global"][0].float() > 0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("available_layers, gpu_layers", [(4, ()), (3, (0,)), (1, (0, 1, 2)), ((4, 4, 1, 1), (1, 2))])
+def test_fp8_banks_fit_host_ram_without_changing_weight_bytes(monkeypatch, available_layers, gpu_layers):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.fp8_block import Fp8BlockMoEMethod
+    from freetoken.moe import expert_banks
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    method = Fp8BlockMoEMethod(MoEConfig(4, 256, 128, 2, strategy="offload"))
+    specs = method.layout()
+    layer_bytes = sum(4 * torch.empty(s.shape, dtype=s.dtype).nbytes for s in specs.values())
+    if isinstance(available_layers, tuple):
+        availability = iter(available_layers)
+        monkeypatch.setattr(expert_banks, "_host_available_bytes", lambda: next(availability) * layer_bytes)
+    else:
+        monkeypatch.setattr(expert_banks, "_host_available_bytes", lambda: available_layers * layer_bytes)
+    pieces = []
+    for layer in range(3):
+        piece = {
+            "gate_up": torch.full((4, 256, 256), layer + 1, dtype=torch.float32).to(torch.float8_e4m3fn),
+            "down": torch.full((4, 256, 128), layer + 2, dtype=torch.float32).to(torch.float8_e4m3fn),
+            "gate_up_scale": torch.full((4, 2, 2), layer + 1, dtype=torch.bfloat16),
+            "down_scale": torch.full((4, 2, 1), layer + 2, dtype=torch.bfloat16),
+        }
+        pieces.append((layer, 0, 4, piece))
+    banks = expert_banks.build_expert_banks(method, 3, iter(pieces), device=torch.device("cuda"))
+    cache = OffloadMoeCache(3, 4, 8, device=torch.device("cuda"), quant_format="fp8_block", prefill_overlap=True)
+    cache.set_bank_sources(banks.sources)
+    cache.begin_prefill()
+    for layer, _, _, piece in pieces:
+        got = cache.wait_prefill_layer(layer)
+        for (name, per_layer), copied in zip(cache.bank_sources.items(), got):
+            source = per_layer[layer]
+            assert source.is_cuda == (layer in gpu_layers)
+            reference = torch.zeros(source.shape, dtype=source.dtype)
+            value = piece[name]
+            reference[..., :value.shape[-1]].copy_(value)
+            assert torch.equal(copied.cpu().view(torch.uint8), reference.view(torch.uint8))
+        cache.release_prefill_layer(layer)
+    cache.reset()
+    for layer, _, _, _ in pieces:
+        ids = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+        cache.ensure_experts(layer, ids)
+        cache.copy_missing()
+        for name, per_layer in cache.bank_sources.items():
+            got = cache.bank_caches[name][ids.long()].cpu().view(torch.uint8)
+            assert torch.equal(got, per_layer[layer].cpu()[[3, 1]].view(torch.uint8))
+
+
+def test_host_available_bytes_excludes_cma(monkeypatch):
+    from io import StringIO
+    from freetoken.moe.expert_banks import _host_available_bytes
+
+    monkeypatch.setattr("builtins.open", lambda *a, **kw: StringIO("MemAvailable: 2048 kB\nCmaFree: 1792 kB\n"))
+    assert _host_available_bytes() == 256 * 1024
+
+
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
     layer, cache = _make_layer_and_cache()
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
