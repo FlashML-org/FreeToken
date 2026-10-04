@@ -1,4 +1,4 @@
-"""DSV41 paged KV pool + cost model (CPU, no model): geometry validation, per-source tiers, sizing /
+"""DSV41 paged KV pool + cost model (CPU, no model): args validation, per-source tiers, sizing /
 byte accounting, the window free-list duck-type, full-loc translation; packed writes on CUDA."""
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ from freetoken.kvcache.dsv41_cost_model import (
     dsv41_solve_num_pages,
     dsv41_window_unit_bytes,
 )
-from freetoken.kvcache.dsv41_geometry import DSV41Geometry
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.kvcache.row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
+from freetoken.models.deepseek_v41.args import DeepseekV41Args
 
 DEVICE = torch.device("cpu")
 P = 128
@@ -25,24 +25,17 @@ RATIOS = (0, 0, 2, 2, 2, 2, 2, 1, 1, 1)
 SOURCES = (2, 5, 7)
 
 
-def _args():
-    """A ``dsv41_args`` stand-in whose geometry is ``_geom()`` (the pool reads the args by attribute)."""
-    from types import SimpleNamespace
-
-    return SimpleNamespace(n_layers=10, head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
-                           backbone_kv_sources=SOURCES, decoder_start_layer=7, swa_decoder_replay="exact")
-
-
-def _geom(**over) -> DSV41Geometry:
-    base = dict(n_layers=10, head_dim=512, index_head_dim=128, window=P, compress_ratios=RATIOS, kv_source_layer_ids=SOURCES)
+def _args(**over) -> DeepseekV41Args:
+    base = dict(n_layers=10, head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
+                kv_source_layers=SOURCES, swa_decoder_replay="exact")
     base.update(over)
-    return DSV41Geometry(**base)
+    return DeepseekV41Args(**base)
 
 
-def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
-    geom = _geom()
-    sizes = dsv41_pool_sizes(num_pages, geom, swa_ratio, P)
-    return DSV41PagedKVCache(sizes, geom, DEVICE, n_scratch=n_scratch), sizes, geom
+def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1, **over):
+    args = _args(**over)
+    sizes = dsv41_pool_sizes(num_pages, args, swa_ratio, P)
+    return DSV41PagedKVCache(sizes, args, DEVICE, n_scratch=n_scratch), sizes, args
 
 
 def test_window_control_uses_pool_units_and_restores_concrete_capacity():
@@ -57,7 +50,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
     from freetoken.server.api_server import CacheRebuildRequest, _resolve_num_swa_pages, cache_geometry
     from freetoken.server.stats import _swa_page_size
 
-    pool, _, geom = _pool(num_pages=64)
+    pool, _, args = _pool(num_pages=64)
     config = SimpleNamespace(
         page_size=P, max_running_req=1, max_seq_len=1024, cache_type="swa_radix",
         swa_full_tokens_ratio=0.5, swa_num_pages_override=None,
@@ -91,30 +84,37 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
     assert pool.window_pages == 31
 
 
-def test_geometry_derives_sources_and_rings():
-    g = _geom()
-    assert [g.kv_source_of(l) for l in range(10)] == [None, None, 2, 2, 2, 5, 5, 7, 7, 7]
-    assert g.ring_sources == (2, 5) and g.ring_size(2) == 2
-    assert g.win_row_bytes == 528 and g.main_row_bytes == 288 and g.idx_row_bytes == 68 and g.state_bytes == 4096
+def test_pool_reads_sources_and_rings_from_args():
+    pool, _, _ = _pool()
+    assert [pool.source_of(l) for l in range(2, 10)] == [2, 2, 2, 5, 5, 7, 7, 7]
+    assert set(pool.state_ring) == {2, 5} and pool.state_ring[2].ring_size == 2
     with pytest.raises(ValueError):  # a compressing layer before its first source
-        _geom(kv_source_layer_ids=(5, 7))
+        _args(kv_source_layers=(5, 7))
     with pytest.raises(ValueError):  # a consumer whose source has another ratio
-        _geom(compress_ratios=(0, 0, 2, 2, 1, 2, 2, 1, 1, 1))
-    with pytest.raises(ValueError):  # a window-only "source"
-        _geom(kv_source_layer_ids=(0, 2, 5, 7))
+        _args(compress_ratios=(0, 0, 2, 2, 1, 2, 2, 1, 1, 1))
+    with pytest.raises(ValueError):  # the window is not a multiple of a compress ratio
+        _pool(window_size=P - 1)
+    with pytest.raises(ValueError):  # an indexer key the fp4 row format cannot hold
+        _pool(index_head_dim=48)
 
 
-def test_v41_global_kv_is_890_bytes_per_token():
+@pytest.mark.parametrize("replay", ["bounded", "exact"])
+def test_v41_flash_row_bytes_and_private_window_layers(replay):
     """The tech report's headline: 3 ratio-2 encoder sources + 1 ratio-1 decoder source = 890 B/token."""
     ratios = (0, 0) + (2,) * 18 + (1,) * 20
-    g = DSV41Geometry(n_layers=40, head_dim=512, index_head_dim=128, window=128, compress_ratios=ratios, kv_source_layer_ids=(2, 8, 14, 20))
-    per_token_global = sum((g.main_row_bytes + g.idx_row_bytes) // g.ratio_of(s) for s in g.kv_source_layer_ids)
-    assert per_token_global == 890
-    assert dsv41_kv_unit_bytes(g, 128) == 890 + 8  # + the int64 full->window map slot
+    args = DeepseekV41Args(n_layers=40, head_dim=512, index_head_dim=128, window_size=128, compress_ratios=ratios,
+                           kv_source_layers=(2, 8, 14, 20), swa_decoder_replay=replay)
+    pool = DSV41PagedKVCache(dsv41_pool_sizes(4, args, 1.0, 128), args, DEVICE)
+    win, main, idx = pool.window_pool[0].shape[1], pool.main_pool[2].shape[1], pool.idx_pool[2].shape[1]
+    assert (win, main, idx) == (528, 288, 68)
+    assert pool.state_ring[2].buffer.shape[1] * 4 == 4096
+    assert sum((main + idx) // pool.ratio_of(s) for s in args.backbone_kv_sources) == 890
+    assert dsv41_kv_unit_bytes(args, 128) == 890 + 8  # + the int64 full->window map slot
+    assert pool.private_window_layer_ids == (tuple(range(20, 40)) if replay == "bounded" else ())
 
 
 def test_pool_tiers_per_source_and_aliasing():
-    pool, sizes, geom = _pool()
+    pool, sizes, args = _pool()
     assert len(pool.window_pool) == 10 and pool.window_pool[0].shape == (sizes.n_win_slots, 528)
     assert set(pool.main_pool) == set(SOURCES) == set(pool.idx_pool)
     assert set(pool.state_ring) == {2, 5}  # the ratio-1 decoder source carries no partial group
@@ -131,24 +131,24 @@ def test_pool_tiers_per_source_and_aliasing():
 
 
 def test_pool_bytes_match_allocation_and_solver_respects_budget():
-    pool, sizes, geom = _pool(num_pages=16, swa_ratio=0.25)
-    assert pool.total_bytes() == dsv41_pool_bytes(sizes, geom, n_scratch=1)
-    assert dsv41_cache_per_page(geom, 0.25, P) > 0
-    assert dsv41_window_unit_bytes(geom, P) == -(-(10 * P * 528 + 2 * 2 * 4096) // P)
+    pool, sizes, args = _pool(num_pages=16, swa_ratio=0.25)
+    assert pool.total_bytes() == dsv41_pool_bytes(sizes, args, n_scratch=1)
+    assert dsv41_cache_per_page(args, 0.25, P) > 0
+    assert dsv41_window_unit_bytes(args, P) == -(-(10 * P * 528 + 2 * 2 * 4096) // P)
     budget = 64 << 20
-    solved = dsv41_solve_num_pages(budget, geom, 0.25, floor_win_pages=4, P=P, n_scratch=3)
-    assert dsv41_pool_bytes(solved, geom, 3) <= budget
+    solved = dsv41_solve_num_pages(budget, args, 0.25, floor_win_pages=4, P=P, n_scratch=3)
+    assert dsv41_pool_bytes(solved, args, 3) <= budget
     # one more page, sized the way the solver sizes (window = max(floor, ceil(ratio * pages))), overflows
     more = solved.full_token // P + 1
-    bigger = dsv41_pool_sizes(more, geom, 0.25, P, n_win_pages=max(4, (round(0.25 * more * P) + P - 1) // P))
-    assert dsv41_pool_bytes(bigger, geom, 3) > budget
+    bigger = dsv41_pool_sizes(more, args, 0.25, P, n_win_pages=max(4, (round(0.25 * more * P) + P - 1) // P))
+    assert dsv41_pool_bytes(bigger, args, 3) > budget
     assert solved.n_win_pages >= 4
     with pytest.raises(ValueError):
-        dsv41_solve_num_pages(1 << 10, geom, 0.25, floor_win_pages=4, P=P)
+        dsv41_solve_num_pages(1 << 10, args, 0.25, floor_win_pages=4, P=P)
 
 
 def test_translation_state_loc_and_cmp_rows():
-    pool, sizes, geom = _pool(num_pages=16)
+    pool, sizes, args = _pool(num_pages=16)
     pool.bind_window_pages(full_page_base=0, window_page_base=2 * P)
     pool.bind_window_pages(full_page_base=3 * P, window_page_base=0)
     assert pool.translate_full_to_window(torch.tensor([0, 1, 127])).tolist() == [2 * P, 2 * P + 1, 2 * P + 127]
@@ -193,9 +193,9 @@ def test_swa_duck_type_alloc_free_and_dummy():
 def test_packed_writes_round_trip_on_cuda():
     from kernels.test_dsv41_pack import reference_roundtrip  # tests/ is on sys.path under pytest
 
-    geom = _geom()
-    sizes = dsv41_pool_sizes(4, geom, 0.5, P)
-    pool = DSV41PagedKVCache(sizes, geom, torch.device("cuda"), n_scratch=2)
+    args = _args()
+    sizes = dsv41_pool_sizes(4, args, 0.5, P)
+    pool = DSV41PagedKVCache(sizes, args, torch.device("cuda"), n_scratch=2)
     kv = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
     slots = torch.tensor([0, 130, 5], device="cuda")
     pool.store_window(kv, 4, slots)

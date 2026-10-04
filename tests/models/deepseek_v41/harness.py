@@ -13,7 +13,6 @@ from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, 
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.engine import _materialize_loaded_weight_state_dict
 from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
-from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import NoQuantConfig
@@ -74,10 +73,9 @@ class TinyEngine:
         for layer in self.model.engram_layers():
             layer.attach_table(engram_table if engram_table is not None else ZeroEngramTable(layer.width, self.device))
 
-        geom = dsv41_geometry(args)
         self.max_running_req = max_running_req
         num_pages = max_seq_len // P
-        self.pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, self.device, n_scratch=max_running_req + 1)
+        self.pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, args, 1.0, P), args, self.device, n_scratch=max_running_req + 1)
         self.pool._init_paged_state(max_running_req, radix=False)
         self.page_table = torch.zeros(max_running_req + 1, max_seq_len, dtype=torch.int32, device=self.device)
         self.page_table[max_running_req].fill_(num_pages * P)  # the dummy row -> the reserved tail page

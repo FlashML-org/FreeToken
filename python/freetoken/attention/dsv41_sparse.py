@@ -153,13 +153,10 @@ class DSV41CaptureData:
 
 class DSV41SparseAttnBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
-        from freetoken.kvcache.dsv41_geometry import dsv41_geometry
-
         self.config = config
         self.device = get_global_ctx().kv_cache.device
         args = config.dsv41_args
-        self.geom = dsv41_geometry(args)
-        self.window_size = self.geom.window
+        self.window_size = args.window_size
         self.swa_decoder_replay: str = args.swa_decoder_replay
         self.capture: DSV41CaptureData | None = None
         self.capture_bs: List[int] = []
@@ -270,7 +267,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
 
     def layer_window_slots_of(self, layer_id: int, ti: int, lo: int, hi: int) -> torch.Tensor:
         """Where ``layer_id`` keeps the window KV of positions ``[lo, hi)``: its private ring or the shared pool."""
-        if self.geom.is_private_window(layer_id):
+        if self.pool.is_private_window(layer_id):
             return self.ring_slots_of(ti, lo, hi)
         return self.window_slots_of(ti, lo, hi)
 
@@ -283,7 +280,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         absolute ``p`` sees ``[max(floor, first_retained, p - win + 1), p]``."""
         win, device = self.window_size, self.device
         lo = max(0, seg.start_pos - win + 1, seg.window_floor)
-        private = layer_id is not None and self.geom.is_private_window(layer_id)
+        private = layer_id is not None and self.pool.is_private_window(layer_id)
         ws_pool = (self.ring_slots_of if private else self.window_slots_of)(seg.table_idx, lo, seg.end)  # [end - lo]
         abs_p = seg.start_pos + torch.arange(seg.n, device=device).unsqueeze(1)
         cand = (abs_p - win + 1).clamp(min=lo) + torch.arange(win, device=device)
@@ -374,7 +371,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         row of compressed position ``t`` is ``locs[b, t * ratio] // ratio``."""
         from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
 
-        return indexer_logits_packed(q, weights, self.pool.idx_pool[source], self.geom.idx_fmt, locs, ratio, live, T=T, candidates=candidates)
+        return indexer_logits_packed(q, weights, self.pool.idx_pool[source], self.pool.idx_fmt, locs, ratio, live, T=T, candidates=candidates)
 
     @staticmethod
     def select_topk(scores: torch.Tensor, live: torch.Tensor, topk: int) -> torch.Tensor:
@@ -429,11 +426,11 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         the layer's kv source (window-only layers pass ``n_window == topk``)."""
         from freetoken.kernel.triton.dsv41.sparse_attn import sparse_attn_packed
 
-        pool, geom = self.pool, self.geom
-        src = geom.kv_source_of(layer_id)
-        cmp = pool.main_pool[src] if src is not None else pool.main_pool[geom.kv_source_layer_ids[0]]
+        pool, args = self.pool, self.config.dsv41_args
+        src = args.roles[layer_id].kv_source
+        cmp = pool.main_pool[src] if src is not None else pool.main_pool[args.backbone_kv_sources[0]]
         return sparse_attn_packed(
-            q, pool.window_pool[layer_id], geom.win_fmt, cmp, geom.main_fmt, attn_sink,
+            q, pool.window_pool[layer_id], pool.win_fmt, cmp, pool.main_fmt, attn_sink,
             topk_idxs, n_window, softmax_scale, cmp_counts=cmp_counts,
         )
 

@@ -2,9 +2,9 @@
 
 Tiers, sized from a budget (``dsv41_cost_model``) not from ``num_requests``:
 
-* ``window_pool[L]``      -- every layer; the P-sliding KV ring in ``geom.win_fmt`` (fp8) rows, page-granular.
-* ``main_pool[src]``      -- per kv-source layer; compressed KV latents in ``geom.main_fmt`` (fp4) rows.
-* ``idx_pool[src]``       -- per kv-source layer; indexer keys in ``geom.idx_fmt`` (fp4) rows.
+* ``window_pool[L]``      -- every layer; the P-sliding KV ring in ``win_fmt`` (fp8) rows, page-granular.
+* ``main_pool[src]``      -- per kv-source layer; compressed KV latents in ``main_fmt`` (fp4) rows.
+* ``idx_pool[src]``       -- per kv-source layer; indexer keys in ``idx_fmt`` (fp4) rows.
 * ``state_ring[src]``     -- ratio>1 sources; the per-window-page compress-state ring (fp32 ``kv|score``).
 
 Consumer layers (Reindex / Reuse modes) alias their source's pools: ``main_pool_of(layer)``.
@@ -27,32 +27,48 @@ import torch
 from freetoken.utils import init_logger
 
 from .dsv41_cost_model import (
+    IDX_FMT,
+    MAIN_FMT,
+    WIN_FMT,
     DSV41PoolSizes,
+    _idx_row_bytes,
+    _main_row_bytes,
+    _win_row_bytes,
     dsv41_kv_unit_bytes,
     dsv41_window_unit_bytes,
+    private_window_layer_ids,
 )
-from .dsv41_geometry import DSV41Geometry, dsv41_geometry
 from .window_tier import CompressStateRing, WindowTierPagedPool
 
 logger = init_logger(__name__)
 
 
 class DSV41PagedKVCache(WindowTierPagedPool):
+    win_fmt = WIN_FMT
+    main_fmt = MAIN_FMT
+    idx_fmt = IDX_FMT
+
     def __init__(
         self,
         sizes: DSV41PoolSizes,
-        geom: DSV41Geometry,
+        args,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         n_scratch: int = 1,
     ) -> None:
-        self.geom = geom
+        for fmt, dim in ((self.win_fmt, args.head_dim), (self.main_fmt, args.head_dim), (self.idx_fmt, args.index_head_dim)):
+            fmt.validate_dim(dim)
+        for src in args.backbone_kv_sources:
+            if args.window_size % args.compress_ratios[src]:
+                raise ValueError(f"window {args.window_size} must be a multiple of compress ratio {args.compress_ratios[src]}")
+        self.args = args
+        self.private_window_layer_ids = private_window_layer_ids(args)
         self.sizes = sizes
         self._device = device
         self._dtype = dtype  # the model's compute dtype; the tiers themselves are packed bytes
-        self.P = geom.window
-        self.head_dim = geom.head_dim
-        self.index_head_dim = geom.index_head_dim
+        self.P = args.window_size
+        self.head_dim = args.head_dim
+        self.index_head_dim = args.index_head_dim
         self.n_scratch = int(n_scratch)
         self._paged_params: tuple[int, bool] | None = None
         self.full_loc_map: torch.Tensor | None = None
@@ -60,27 +76,27 @@ class DSV41PagedKVCache(WindowTierPagedPool):
 
     # ----- buffers -----
     def _alloc_buffers(self) -> None:
-        sizes, geom, dev = self.sizes, self.geom, self._device
+        sizes, args, dev = self.sizes, self.args, self._device
         self.full_to_window = torch.full((sizes.full_token + 1,), -1, dtype=torch.int64, device=dev)
         # shared layers: the page-bound window pool; private layers: one ring of P slots per
         # page-table row (n_scratch rows, the dummy included), addressed row * P + pos % P
         self.window_pool: list[torch.Tensor] = [
-            torch.zeros(self.n_scratch * self.P if geom.is_private_window(l) else sizes.n_win_slots, geom.win_row_bytes, dtype=torch.uint8, device=dev)
-            for l in range(geom.n_layers)
+            torch.zeros(self.n_scratch * self.P if self.is_private_window(l) else sizes.n_win_slots, _win_row_bytes(args), dtype=torch.uint8, device=dev)
+            for l in range(args.n_layers)
         ]
         self.main_pool: dict[int, torch.Tensor] = {}
         self.idx_pool: dict[int, torch.Tensor] = {}
         self.state_ring: dict[int, CompressStateRing] = {}
         self.scratch_base: dict[int, int] = {}
-        for src in geom.kv_source_layer_ids:
+        for src in args.backbone_kv_sources:
             rows = sizes.main_rows[src]
             self.scratch_base[src] = rows
-            self.main_pool[src] = torch.zeros(rows + self.n_scratch, geom.main_row_bytes, dtype=torch.uint8, device=dev)
-            self.idx_pool[src] = torch.zeros(sizes.idx_rows[src] + self.n_scratch, geom.idx_row_bytes, dtype=torch.uint8, device=dev)
+            self.main_pool[src] = torch.zeros(rows + self.n_scratch, _main_row_bytes(args), dtype=torch.uint8, device=dev)
+            self.idx_pool[src] = torch.zeros(sizes.idx_rows[src] + self.n_scratch, _idx_row_bytes(args), dtype=torch.uint8, device=dev)
             if src in sizes.state_slots:
                 self.state_ring[src] = CompressStateRing(
-                    n_slots=sizes.state_slots[src], ring_size=geom.ring_size(src), overlap=False,
-                    head_dim=geom.head_dim, device=dev,
+                    n_slots=sizes.state_slots[src], ring_size=args.compress_ratios[src], overlap=False,
+                    head_dim=args.head_dim, device=dev,
                 )
 
     def total_bytes(self) -> int:
@@ -95,9 +111,12 @@ class DSV41PagedKVCache(WindowTierPagedPool):
     def prefix_replay_tokens(self) -> int:
         """Prompt-tail tokens a prefix hit must leave to the prefill: bounded replay runs the decoder on
         the prompt's last window from that window's encoder outputs, which no cache keeps."""
-        return self.P if self.geom.private_window_layer_ids else 0
+        return self.P if self.private_window_layer_ids else 0
 
     # ----- private window rings -----
+    def is_private_window(self, layer_id: int) -> bool:
+        return layer_id in self.private_window_layer_ids
+
     def ring_slots(self, table_rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Ring slots of ``positions`` (int64, broadcastable with ``table_rows``) for private window layers;
         negative positions map to ``-1``."""
@@ -106,7 +125,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
 
     # ----- source aliasing -----
     def source_of(self, layer_id: int) -> int:
-        src = self.geom.kv_source_of(layer_id)
+        src = self.args.roles[layer_id].kv_source
         assert src is not None, f"layer {layer_id} is window-only"
         return src
 
@@ -117,17 +136,17 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         return self.idx_pool[self.source_of(layer_id)]
 
     def ratio_of(self, layer_id: int) -> int:
-        return self.geom.ratio_of(layer_id)
+        return self.args.roles[layer_id].ratio
 
     # ----- engine-facing sizing / rebuild surface -----
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
         from .dsv41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model
 
-        geom = dsv41_geometry(config.model_config.dsv41_args)
-        P = geom.window
+        args = config.model_config.dsv41_args
+        P = args.window_size
         per_page, fixed, min_reserve = dsv41_auto_cost_model(
-            geom, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, geom), P, n_scratch=config.max_running_req + 1
+            args, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, args), P, n_scratch=config.max_running_req + 1
         )
         return per_page, fixed, config.page_size, min_reserve
 
@@ -143,17 +162,17 @@ class DSV41PagedKVCache(WindowTierPagedPool):
             dsv41_solve_num_pages,
         )
 
-        geom = dsv41_geometry(config.model_config.dsv41_args)
-        P = geom.window
+        args = config.model_config.dsv41_args
+        P = args.window_size
         num_pages = config.num_page_override
         if num_pages is None:
             sizes = dsv41_solve_num_pages(
-                available_memory, geom, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, geom), P,
+                available_memory, args, _dsv41_swa_ratio(config), _dsv41_window_floor_pages(config, args), P,
                 n_scratch=config.max_running_req + 1,
             )
             num_pages = sizes.full_token // P - 1  # one physical page is the dummy
         else:
-            floor = _dsv41_window_floor_pages(config, geom)
+            floor = _dsv41_window_floor_pages(config, args)
             if num_pages < floor:
                 raise ValueError(
                     f"--num-pages {num_pages} ({num_pages * P} tokens) is below the DSV41 window working-set "
@@ -161,7 +180,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
                 )
             sizes = _dsv41_pool_sizes(config, num_pages + 1)
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
-        real = dsv41_pool_bytes(sizes, geom, config.max_running_req + 1)
+        real = dsv41_pool_bytes(sizes, args, config.max_running_req + 1)
         logger.info(
             f"Allocating {num_pages * P} tokens for DSV41 KV cache ({sizes.n_win_pages} window pages), total = {mem_GB(real)}"
         )
@@ -172,15 +191,15 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         from .base import WindowPoolSpec
         from .dsv41_cost_model import _dsv41_window_floor_pages
 
-        geom = dsv41_geometry(config.model_config.dsv41_args)
-        return WindowPoolSpec(geom.window, _dsv41_window_floor_pages(config, geom) - 1)
+        args = config.model_config.dsv41_args
+        return WindowPoolSpec(args.window_size, _dsv41_window_floor_pages(config, args) - 1)
 
     @classmethod
     def min_kv_tokens(cls, config) -> int:
         from .dsv41_cost_model import _dsv41_window_floor_pages
 
-        geom = dsv41_geometry(config.model_config.dsv41_args)
-        return _dsv41_window_floor_pages(config, geom) * geom.window
+        args = config.model_config.dsv41_args
+        return _dsv41_window_floor_pages(config, args) * args.window_size
 
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
@@ -195,7 +214,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         from .dsv41_cost_model import _dsv41_pool_sizes, _dsv41_window_floor_pages, dsv41_pool_bytes
 
         if num_pages is not None:
-            floor = _dsv41_window_floor_pages(config, self.geom)
+            floor = _dsv41_window_floor_pages(config, self.args)
             if num_pages < floor:
                 raise CacheRebuildRejected(
                     f"num_pages {num_pages} is below the DSV41 window working-set floor {floor} "
@@ -207,7 +226,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         else:
             kv_sizes = self.sizes
         budget = net_cache_budget_bytes(config.memory_ratio, baseline_free, weights_bytes, 0)
-        need = target_moe * per_expert_bytes + dsv41_pool_bytes(kv_sizes, self.geom, config.max_running_req + 1)
+        need = target_moe * per_expert_bytes + dsv41_pool_bytes(kv_sizes, self.args, config.max_running_req + 1)
         if need > budget:
             kv_part = f"kv={num_pages} P-pages" if num_pages is not None else "kv=current pool"
             raise CacheRebuildRejected(
@@ -224,39 +243,39 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         self.window_pool = self.main_pool = self.idx_pool = self.state_ring = None  # type: ignore[assignment]
 
     def unit_bytes(self) -> tuple[int, int]:
-        return dsv41_kv_unit_bytes(self.geom, self.P), dsv41_window_unit_bytes(self.geom, self.P)
+        return dsv41_kv_unit_bytes(self.args, self.P), dsv41_window_unit_bytes(self.args, self.P)
 
     # ----- writes (quantize + scatter) -----
     def store_window(self, kv: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
         from freetoken.kernel.triton.dsv41.pack import pack_rows
 
-        pack_rows(kv, self.geom.win_fmt, pool=self.window_pool[layer_id], row_ids=window_slot)
+        pack_rows(kv, self.win_fmt, pool=self.window_pool[layer_id], row_ids=window_slot)
 
     def store_main(self, latent: torch.Tensor, source: int, rows: torch.Tensor) -> None:
         from freetoken.kernel.triton.dsv41.pack import pack_rows
 
-        pack_rows(latent, self.geom.main_fmt, pool=self.main_pool[source], row_ids=rows)
+        pack_rows(latent, self.main_fmt, pool=self.main_pool[source], row_ids=rows)
 
     def store_index(self, k: torch.Tensor, source: int, rows: torch.Tensor) -> None:
         from freetoken.kernel.triton.dsv41.pack import pack_rows
 
-        pack_rows(k, self.geom.idx_fmt, pool=self.idx_pool[source], row_ids=rows)
+        pack_rows(k, self.idx_fmt, pool=self.idx_pool[source], row_ids=rows)
 
     # ----- reads (gather + dequantize; tests and torch reference paths) -----
     def read_window(self, layer_id: int, window_slot: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
-        return unpack_rows(self.window_pool[layer_id], self.geom.win_fmt, self.head_dim, window_slot)
+        return unpack_rows(self.window_pool[layer_id], self.win_fmt, self.head_dim, window_slot)
 
     def read_main(self, source: int, rows: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
-        return unpack_rows(self.main_pool[source], self.geom.main_fmt, self.head_dim, rows)
+        return unpack_rows(self.main_pool[source], self.main_fmt, self.head_dim, rows)
 
     def read_index(self, source: int, rows: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.dsv41.pack import unpack_rows
 
-        return unpack_rows(self.idx_pool[source], self.geom.idx_fmt, self.index_head_dim, rows)
+        return unpack_rows(self.idx_pool[source], self.idx_fmt, self.index_head_dim, rows)
 
     # ----- compress-state ring accessors -----
     def get_state(self, source: int, state_loc: torch.Tensor) -> torch.Tensor:
@@ -267,7 +286,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
 
     @property
     def num_layers(self) -> int:
-        return self.geom.n_layers
+        return self.args.n_layers
 
 
 __all__ = ["DSV41PagedKVCache"]

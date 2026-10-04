@@ -16,8 +16,8 @@ import torch.nn.functional as F
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
-from freetoken.kvcache.dsv41_geometry import dsv41_geometry
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+from freetoken.models.deepseek_v41.args import DeepseekV41Args
 
 P, MRR, DEVICE = 128, 4, torch.device("cpu")
 RATIOS = (0, 2, 2, 1, 1)
@@ -37,10 +37,9 @@ def _ctx(pool):
 def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
     from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
-    args = SimpleNamespace(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
-                           backbone_kv_sources=SOURCES, decoder_start_layer=3, swa_decoder_replay=swa_decoder_replay)
-    geom = dsv41_geometry(args)
-    pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, geom, 1.0, P), geom, DEVICE, n_scratch=MRR + 1)
+    args = DeepseekV41Args(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
+                           kv_source_layers=SOURCES, swa_decoder_replay=swa_decoder_replay)
+    pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, args, 1.0, P), args, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
     pt[MRR].fill_(num_pages * P)
@@ -119,8 +118,7 @@ def test_private_window_layers_address_per_request_rings():
     from freetoken.attention.dsv41_sparse import PrefillSegment
 
     backend, pool, _ = _stack("bounded")
-    geom = backend.geom
-    assert geom.private_window_layer_ids == (3, 4) and geom.shared_window_layer_ids == (0, 1, 2)
+    assert pool.private_window_layer_ids == (3, 4) and not any(pool.is_private_window(l) for l in (0, 1, 2))
     assert pool.window_pool[3].shape[0] == (MRR + 1) * P and pool.window_pool[0].shape[0] == pool.sizes.n_win_slots
     # prefill: a decoder segment's slots are its ring row; an encoder segment's are page-bound
     seg = PrefillSegment(0, 44, 2, 256, window_floor=256)

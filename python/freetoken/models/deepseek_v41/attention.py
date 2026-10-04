@@ -217,7 +217,7 @@ class DSV41Attention(BaseOP):
         # the shared ring context feeds the compressor's carry ring on every layer; a request-private
         # window layer stores and reads its own KV through its ring context instead
         window_slots, prev_window_slots = dctx.window_slots, dctx.prev_window_slots
-        private = dctx.private is not None and attn.geom.is_private_window(self.layer_id)
+        private = dctx.private is not None and attn.pool.is_private_window(self.layer_id)
         tier = dctx.private if private else dctx.shared
         attn.store_window(kv, self.layer_id, tier.slots if private else window_slots)
 
@@ -290,10 +290,9 @@ class DecodeStepContext:
             buf[..., :window].copy_(window_topk)
             return TierCandidates(slots, win32, buf)
 
-        geom = get_global_ctx().attn_backend.geom
         window_slots, prev_window_slots, window_topk = md.window_ctx(pos, rows)
         private = None
-        if geom.private_window_layer_ids:
+        if get_global_ctx().kv_cache.private_window_layer_ids:
             private = tier(*md.private_window_ctx(pos, rows))
         tables: dict = {}
         for layer in layers:

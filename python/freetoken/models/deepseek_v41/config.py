@@ -2,7 +2,7 @@
 
 ``parse_config`` maps the standard transformer fields into :class:`ModelConfig`, carries the full
 :class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module and the KV pool (which
-derives its ``DSV41Geometry`` from it), and declares the ``v41`` variant of the DSV4 attention group.
+sizes its tiers from it), and declares the ``v41`` variant of the DSV4 attention group.
 The engine reconciles the runtime knobs (``max_seq_len``, ``swa_decoder_replay``) onto ``dsv41_args``
 at config resolution.
 """

@@ -105,14 +105,13 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         return pool
     if getattr(model_config, "dsv41_args", None) is not None:
         from .dsv41_cost_model import _dsv41_pool_sizes
-        from .dsv41_geometry import dsv41_geometry
         from .dsv41_paged_pool import DSV41PagedKVCache
 
         # Same route as DSV4: the generic CacheManager over the shared page table; the pool is the
         # swa_pool plug-in (window tier + per-source packed main / index pools + state rings).
         pool = DSV41PagedKVCache(
             sizes=_dsv41_pool_sizes(config, num_pages + 1),  # +1 for dummy page
-            geom=dsv41_geometry(model_config.dsv41_args),
+            args=model_config.dsv41_args,
             device=device,
             dtype=dtype,
             n_scratch=config.max_running_req + 1,

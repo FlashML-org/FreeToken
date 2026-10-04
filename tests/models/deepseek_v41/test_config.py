@@ -55,16 +55,15 @@ def test_bad_layouts_are_rejected():
         DeepseekV41Args.from_hf(tiny_hf_config(compress_ratios=[0, 0, 2, 2, 2, 2, 0], kv_source_layer_ids=[2, 4], candidate_source_layer_id=2, index_source_layer_ids=[2, 4, 5]))
 
 
-def test_registry_and_geometry():
+def test_registry_and_kv_sources():
     spec = get_model_spec("DeepseekV41ForCausalLM")
     assert spec.module == "freetoken.models.deepseek_v41"
     from freetoken.attention import AttnType
-    from freetoken.kvcache.dsv41_geometry import dsv41_geometry
     from freetoken.models.config import DSV4AttentionGroupConfig
 
     mc = parse_config(tiny_hf_config())
-    geom = dsv41_geometry(mc.dsv41_args)
-    assert geom.kv_source_layer_ids == (2, 4) and geom.compress_ratios == tuple(RATIOS[:N_LAYERS])
+    args = mc.dsv41_args
+    assert args.backbone_kv_sources == (2, 4) and tuple(r.ratio for r in args.roles) == tuple(RATIOS[:N_LAYERS])
     (group,) = mc.attention_groups
     assert type(group) is DSV4AttentionGroupConfig and group.variant == "v41"
     assert mc.kv_cache_group_specs()[0].attn_type is AttnType.DSV41 and mc.attn_type_for_layer(0) is AttnType.DSV41
