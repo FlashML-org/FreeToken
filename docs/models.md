@@ -38,7 +38,8 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
-- **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
+- **fused** — experts resident on GPU (needs the VRAM). Serves every expert
+  format except GGUF and DeepSeek-V4's.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
@@ -46,12 +47,24 @@ These families accept image input by default; pass `--text-model-only` to skip t
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
-  recommends it.
+  recommends it. Unified-memory GPUs differ, see below.
+
+### Unified-memory GPUs (GB10 / DGX Spark, Jetson)
+
+The GPU and the CPU share one DRAM, so offload only copies experts between two
+names for the same memory. On these GPUs `auto` resolves every MoE model to
+`fused`: the default is the resident path only. GGUF and DeepSeek-V4 experts
+have no resident path and stay on `offload`. Offload-only flags
+(`--moe-cpu-layers`, `--moe-cache-size` / `-rate` / `-auto`,
+`--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
+warning; pass `--moe-strategy offload` to use them.
 
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+- An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
+  its experts as dense weights and no longer loads; reconvert it with `ft checkpoint`.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`

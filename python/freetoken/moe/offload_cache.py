@@ -1054,20 +1054,9 @@ class OffloadMoeCache:
 
 
 def iter_offload_moe_layers(model) -> Iterator:
-    from freetoken.layers import BaseOP, OffloadMoELayer
+    from freetoken.layers import OffloadMoELayer, iter_moe_layers
 
-    if isinstance(model, OffloadMoELayer):
-        yield model
-
-    if not isinstance(model, BaseOP):
-        return
-
-    for value in model.__dict__.values():
-        if isinstance(value, BaseOP):
-            yield from iter_offload_moe_layers(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from iter_offload_moe_layers(item)
+    return (layer for layer in iter_moe_layers(model) if isinstance(layer, OffloadMoELayer))
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:

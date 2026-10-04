@@ -80,7 +80,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark-jetson). `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
@@ -179,9 +179,10 @@ ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend
 ```
 
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
-fast-load format; point `ft serve --model` at the output dir. `--moe-backend
-offload` (default) packs experts into offload banks; `--moe-backend triton`
-keeps them dense for resident serving. See the FTW caveats in
+fast-load format; point `ft serve --model` at the output dir. MoE experts are
+always packed into expert banks, which serve the fused and the offload
+strategies alike (GGUF and DeepSeek-V4 experts serve offload only);
+`--moe-backend` is kept for compatibility. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
 [scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
 

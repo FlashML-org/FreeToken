@@ -367,7 +367,7 @@ def _offload_engine_config(**overrides):
             num_layers=10,
             num_moe_layers=10,
             num_experts=8,
-            expert_quant="nvfp4",  # quantized experts -> must resolve to an offload backend
+            expert_quant="nvfp4",
             moe_strategy="auto",
         ),
     )
@@ -389,7 +389,7 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
-def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
+def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend(monkeypatch):
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
     args.py's parse-time default only fires when the backend is *already*
@@ -400,9 +400,12 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     moe_cache_auto=True, so _init_offload_moe_cache's _require_offload_cache_size guard is never
     reached with moe_cache_size still 0.
     """
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
     from freetoken.moe import is_offload_moe_strategy
 
+    # a unified-memory host (GB10) resolves auto to fused instead
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
     config = _offload_engine_config()
     _adjust_config(config)
 

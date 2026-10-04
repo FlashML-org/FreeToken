@@ -600,8 +600,8 @@ def parse_args(
         choices=["auto", *MOE_STRATEGIES],
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
-            "'fused' experts must be requested explicitly."
+            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
+            "'fused' experts on unified-memory GPUs (GB10, Jetson)."
         ),
     )
 

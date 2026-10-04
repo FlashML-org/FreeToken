@@ -22,7 +22,7 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.intermediate, cfg.hidden
@@ -106,37 +106,3 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
 @register_method(QuantKind.MXFP4, LayerKind.MOE)
 class Mxfp4MoEMethod(MoEMethod):
     candidates = (TritonMxfp4MoEKernel, TritonGptossMxfp4MoEKernel)
-
-    def create_weights(self, layer) -> None:
-        if not self.cfg.has_bias:
-            raise NotImplementedError("standard MXFP4 experts are served from the offload cache, not resident")
-        g = self.cfg
-        e, i, h = g.num_experts, g.local_intermediate, g.hidden
-        if h % GROUP:
-            raise ValueError(f"MXFP4 hidden size must be divisible by {GROUP}")
-        layer.gate_up_proj_blocks = torch.empty(e, 2 * i, h // GROUP, 16, dtype=torch.uint8)
-        layer.gate_up_proj_scales = torch.empty(e, 2 * i, h // GROUP, dtype=torch.uint8)
-        layer.gate_up_proj_bias = torch.empty(e, 2 * i, dtype=torch.bfloat16)
-        layer.down_proj_blocks = torch.empty(e, h, i // GROUP, 16, dtype=torch.uint8)
-        layer.down_proj_scales = torch.empty(e, h, i // GROUP, dtype=torch.uint8)
-        layer.down_proj_bias = torch.empty(e, h, dtype=torch.bfloat16)
-
-    def finalize(self, layer) -> None:
-        if getattr(layer, "gate_up_proj_blocks", None) is None:
-            return
-        from freetoken.moe.fused_mxfp4 import _transpose_mxfp4_for_decode
-
-        # one transposed copy serves prefill and decode; the HF blocks are freed so 120B fits
-        layer._gu_blocks_t, layer._gu_scales_t = _transpose_mxfp4_for_decode(layer.gate_up_proj_blocks, layer.gate_up_proj_scales)
-        layer._dn_blocks_t, layer._dn_scales_t = _transpose_mxfp4_for_decode(layer.down_proj_blocks, layer.down_proj_scales)
-        layer.gate_up_proj_blocks = None
-        layer.gate_up_proj_scales = None
-        layer.down_proj_blocks = None
-        layer.down_proj_scales = None
-        torch.cuda.empty_cache()
-
-    def resident_view(self, layer) -> ExpertView:
-        return ExpertView({
-            "gate_up": layer._gu_blocks_t, "gate_up_scale": layer._gu_scales_t, "gate_up_bias": layer.gate_up_proj_bias,
-            "down": layer._dn_blocks_t, "down_scale": layer._dn_scales_t, "down_bias": layer.down_proj_bias,
-        })

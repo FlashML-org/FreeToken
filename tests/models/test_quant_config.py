@@ -121,14 +121,6 @@ class Case:
     check: Callable[[Any, dict], None] | None = None  # family extras beyond the method table
 
 
-def _installed(module: str) -> bool:
-    try:
-        __import__(module)
-        return True
-    except ImportError:
-        return False
-
-
 def _qwen35_fp8(model, idx):
     assert model.model.layers.op_list[idx["lin"]].linear_attn._split_in_proj
 
@@ -162,13 +154,18 @@ def _dsv4(model, idx):
     assert "model.head.weight" in keys and not any(".ffn.experts." in k for k in keys)
 
 
+def _banked_experts(model, idx):
+    experts = op_at(model, f"model.layers.{idx['lin']}.mlp.experts")
+    assert not experts.state_dict()
+
+
 def _gpt_oss(cls):
     def check(model, idx):
         experts = op_at(model, "model.layers.0.mlp.experts")
         assert type(experts) is cls
         assert experts.interleaved and experts.alpha == pytest.approx(1.702) and experts.limit == 7.0
         if cls is GptOssMoELayer:
-            assert experts.gate_up_proj_blocks.dtype is torch.uint8 and experts.gate_up_proj_blocks.dim() == 4
+            assert not experts.state_dict()
 
     return check
 
@@ -198,9 +195,8 @@ CASES = [
         "model.layers.{lin}.mlp.shared_expert.down_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
         "lm_head": NVFP4,
     }, check=_qwen35_nvfp4),
-    # resident NVFP4 experts have no kernel without vLLM's Marlin
-    Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {}, strategy="fused", raises=KernelSelectionError,
-         skip_if=lambda: not _installed("flashinfer") or _installed("vllm")),
+    # resident NVFP4 experts load through the expert-bank loader, not the state dict
+    Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {"model.layers.{lin}.mlp.experts": (Nvfp4MoEMethod, "triton")}, strategy="fused", check=_banked_experts),
     Case("Qwen3.8-27B-NVFP4", ModelOptConfig, {
         "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{full}.self_attn.o_proj": FP8T,
         "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": NVFP4,

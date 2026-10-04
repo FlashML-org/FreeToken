@@ -200,7 +200,8 @@ def convert_checkpoint(
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
                        dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
     mc = cfg.model_config
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
+    # every MoE strategy reads the routed experts from the banks, fused included
+    offload = getattr(mc, "is_moe", False)
     include_moe_experts = not offload
     method = None
     if offload:
@@ -208,6 +209,7 @@ def convert_checkpoint(
         from freetoken.layers import set_rope_device
 
         set_rope_device(dev)
+        object.__setattr__(cfg, "moe_strategy", "offload")
         method = offload_expert_method(cfg)
 
     from freetoken.utils.progress import byte_bar, count_bar

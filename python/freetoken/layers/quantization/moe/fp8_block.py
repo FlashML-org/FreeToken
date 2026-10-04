@@ -21,7 +21,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
@@ -64,17 +64,3 @@ class TritonFp8BlockMoEKernel(MoEKernel):
 @register_method(QuantKind.FP8_BLOCK, LayerKind.MOE)
 class Fp8BlockMoEMethod(MoEMethod):
     candidates = (TritonFp8BlockMoEKernel,)
-
-    def create_weights(self, layer) -> None:
-        g = self.cfg
-        e, i, h, b = g.num_experts, g.intermediate, g.hidden, BLOCK
-        layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=FP8)
-        layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
-        layer.down_proj = torch.empty(e, h, i, dtype=FP8)
-        layer.down_scale_inv = torch.empty(e, h // b, i // b, dtype=torch.bfloat16)
-
-    def resident_view(self, layer) -> ExpertView:
-        return ExpertView({
-            "gate_up": layer.gate_up_proj, "gate_up_scale": layer.gate_up_scale_inv,
-            "down": layer.down_proj, "down_scale": layer.down_scale_inv,
-        })
