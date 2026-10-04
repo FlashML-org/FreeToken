@@ -33,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kvcache.row_format import RowFormat
+from freetoken.kvcache.dsv4.v41_row_format import RowFormat
 
 from .row_format import load_rows
 

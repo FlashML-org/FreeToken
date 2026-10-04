@@ -1,6 +1,6 @@
 """DSV41 paged KV pool (DeepSeek-V4.1): packed byte tiers over the shared page table.
 
-Tiers, sized from a budget (``dsv41_cost_model``) not from ``num_requests``:
+Tiers, sized from a budget (``v41_cost_model``) not from ``num_requests``:
 
 * ``window_pool[L]``      -- every layer; the P-sliding KV ring in ``win_fmt`` (fp8) rows, page-granular.
 * ``main_pool[src]``      -- per kv-source layer; compressed KV latents in ``main_fmt`` (fp4) rows.
@@ -26,7 +26,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .dsv41_cost_model import (
+from .v41_cost_model import (
     IDX_FMT,
     MAIN_FMT,
     WIN_FMT,
@@ -38,7 +38,7 @@ from .dsv41_cost_model import (
     dsv41_window_unit_bytes,
     private_window_layer_ids,
 )
-from .dsv4.window_tier import CompressStateRing, WindowTierPagedPool
+from .window_tier import CompressStateRing, WindowTierPagedPool
 
 logger = init_logger(__name__)
 
@@ -141,7 +141,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
     # ----- engine-facing sizing / rebuild surface -----
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .dsv41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model
+        from .v41_cost_model import _dsv41_swa_ratio, _dsv41_window_floor_pages, dsv41_auto_cost_model
 
         args = config.model_config.dsv41_args
         P = args.window_size
@@ -154,7 +154,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
     def solve_num_pages(cls, config, available_memory: int) -> int:
         from freetoken.utils import mem_GB
 
-        from .dsv41_cost_model import (
+        from .v41_cost_model import (
             _dsv41_pool_sizes,
             _dsv41_swa_ratio,
             _dsv41_window_floor_pages,
@@ -188,15 +188,15 @@ class DSV41PagedKVCache(WindowTierPagedPool):
 
     @classmethod
     def window_spec(cls, config):
-        from .base import WindowPoolSpec
-        from .dsv41_cost_model import _dsv41_window_floor_pages
+        from ..base import WindowPoolSpec
+        from .v41_cost_model import _dsv41_window_floor_pages
 
         args = config.model_config.dsv41_args
         return WindowPoolSpec(args.window_size, _dsv41_window_floor_pages(config, args) - 1)
 
     @classmethod
     def min_kv_tokens(cls, config) -> int:
-        from .dsv41_cost_model import _dsv41_window_floor_pages
+        from .v41_cost_model import _dsv41_window_floor_pages
 
         args = config.model_config.dsv41_args
         return _dsv41_window_floor_pages(config, args) * args.window_size
@@ -210,8 +210,8 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
 
-        from .base import CacheRebuildRejected
-        from .dsv41_cost_model import _dsv41_pool_sizes, _dsv41_window_floor_pages, dsv41_pool_bytes
+        from ..base import CacheRebuildRejected
+        from .v41_cost_model import _dsv41_pool_sizes, _dsv41_window_floor_pages, dsv41_pool_bytes
 
         if num_pages is not None:
             floor = _dsv41_window_floor_pages(config, self.args)
@@ -235,7 +235,7 @@ class DSV41PagedKVCache(WindowTierPagedPool):
             )
 
     def rebuild_from_config(self, config, num_pages: int, *, num_swa_pages: int | None = None) -> None:
-        from .dsv41_cost_model import _dsv41_pool_sizes
+        from .v41_cost_model import _dsv41_pool_sizes
 
         self.rebuild(_dsv41_pool_sizes(config, num_pages + 1, num_swa_pages=num_swa_pages))
 

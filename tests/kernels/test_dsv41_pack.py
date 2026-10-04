@@ -1,4 +1,4 @@
-"""Packed KV row formats (``kvcache/row_format.py`` + ``kernel/triton/dsv41/pack.py``) against a torch
+"""Packed KV row formats (``kvcache/dsv4/v41_row_format.py`` + ``kernel/triton/dsv41/pack.py``) against a torch
 transcription of the reference quantizers in DeepSeek-V4.1's ``inference/kernel.py``: the round-tripped
 value the pool hands back must equal what the reference bakes into its bf16 cache, bit for bit."""
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.row_format import BF16, FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32, RowFormat
+from freetoken.kvcache.dsv4.v41_row_format import BF16, FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32, RowFormat
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

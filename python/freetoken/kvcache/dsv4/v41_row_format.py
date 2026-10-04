@@ -1,4 +1,4 @@
-"""RowFormat: how one KV row (a head_dim-wide vector) is stored in a packed byte pool.
+"""RowFormat: how one DeepSeek-V4.1 KV row (a head_dim-wide vector) is stored in a packed byte pool.
 
 DeepSeek-V4.1 keeps three cache tiers in three storage formats (tech report sec. 2.4.4 and
 ``inference/model.py``):

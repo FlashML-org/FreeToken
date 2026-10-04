@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.dsv41_cost_model import (
+from freetoken.kvcache.dsv4.v41_cost_model import (
     dsv41_cache_per_page,
     dsv41_kv_unit_bytes,
     dsv41_pool_bytes,
@@ -14,8 +14,8 @@ from freetoken.kvcache.dsv41_cost_model import (
     dsv41_solve_num_pages,
     dsv41_window_unit_bytes,
 )
-from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
-from freetoken.kvcache.row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
+from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
+from freetoken.kvcache.dsv4.v41_row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 
 DEVICE = torch.device("cpu")
@@ -45,7 +45,7 @@ def test_window_control_uses_pool_units_and_restores_concrete_capacity():
     from freetoken.kvcache.cache_status import (
         _supports_swa_ratio, compute_cache_floors, compute_cache_pools,
     )
-    from freetoken.kvcache.dsv41_cost_model import _dsv41_pool_sizes
+    from freetoken.kvcache.dsv4.v41_cost_model import _dsv41_pool_sizes
     from freetoken.scheduler.scheduler import Scheduler
     from freetoken.server.api_server import CacheRebuildRequest, _resolve_num_swa_pages, cache_geometry
     from freetoken.server.stats import _swa_page_size

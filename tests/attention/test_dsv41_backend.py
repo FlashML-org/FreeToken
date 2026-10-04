@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
-from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
-from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
+from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 
 P, MRR, DEVICE = 128, 4, torch.device("cpu")

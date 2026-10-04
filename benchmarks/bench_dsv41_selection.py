@@ -25,7 +25,7 @@ import torch
 from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
 from freetoken.kernel.triton.dsv41.pack import pack_rows
 from freetoken.kernel.triton.dsv41.topk import dsv41_candidate_blocks, dsv41_topk
-from freetoken.kvcache.row_format import FP4_E8M0_B32
+from freetoken.kvcache.dsv4.v41_row_format import FP4_E8M0_B32
 
 H, D, TOPK, KB, BS = 32, 128, 512, 2048, 8
 

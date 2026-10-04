@@ -14,7 +14,7 @@ from freetoken.distributed import DistributedInfo
 from freetoken.scheduler.config import SchedulerConfig
 from freetoken.engine.engine import _adjust_config
 from freetoken.kvcache import resolve_pool_class
-from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
 
 from .common import write_tiny_checkpoint
 
@@ -40,7 +40,7 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
     # the cache contract follows the replay mode: a bounded-mode prefix hit must leave the prompt's last
     # window to the prefill (the pool's prefix_replay_tokens); the history a resume reads stays one window
-    from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+    from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
 
     spec = config.model_config.kv_cache_group_specs()[0]
     pool = DSV41PagedKVCache(dsv41_pool_sizes(16, args, 1.0, 128), args, torch.device("cpu"))

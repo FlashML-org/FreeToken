@@ -12,8 +12,8 @@ import torch
 from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, set_global_ctx
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.engine import _materialize_loaded_weight_state_dict
-from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
-from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
+from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.layers.quantization.method import finalize_quant

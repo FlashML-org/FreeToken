@@ -1,6 +1,6 @@
 """Device-side row-format helpers shared by the DSV41 kernels.
 
-The Python-side descriptors live in ``freetoken.kvcache.row_format``; the ``FMT`` constexpr a
+The Python-side descriptors live in ``freetoken.kvcache.dsv4.v41_row_format``; the ``FMT`` constexpr a
 kernel receives is ``RowFormat.code``:
 
   0  bf16          2 B / channel, no scale

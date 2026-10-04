@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.row_format import BF16, FP4_E4M3_B16, FP8_E8M0_B32
+from freetoken.kvcache.dsv4.v41_row_format import BF16, FP4_E4M3_B16, FP8_E8M0_B32
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

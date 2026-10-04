@@ -32,7 +32,7 @@ from typing import Sequence
 import torch
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
-from freetoken.kvcache.row_format import FP8_E8M0_B32
+from freetoken.kvcache.dsv4.v41_row_format import FP8_E8M0_B32
 from freetoken.utils import init_logger
 
 from .engram import EngramHash
