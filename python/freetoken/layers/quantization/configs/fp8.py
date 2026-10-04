@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, ClassVar
 
+from ..linear import LinearConfig
+from ..moe import MoEConfig
 from ..names import is_routed_expert, name_set, substr_set
-from ..registry import register_dialect
+from ..registry import LayerKind, register_dialect
 from ..scheme import QuantKind, QuantScheme
 from ..scheme import FP8_BLOCK_SIZES, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
 from .base import QuantConfig, Stored, cfg_get
@@ -51,8 +54,6 @@ class Fp8BlockConfig(QuantConfig):
         expert_dtype = q.get("expert_dtype") or cfg_get(hf_config, "expert_dtype")
         self.expert_fp4 = str(expert_dtype or "").lower() == "fp4"
         self.block_scheme = fp8_block_scheme("e8m0" if self.e8m0 else "float", self.block)
-        # the fp4 experts quantize their activations at the same block as the dense linears
-        self.expert_scheme = mxfp4_scheme(act_block=self.block)
 
     def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
         names = super().storage(scheme)
@@ -66,5 +67,12 @@ class Fp8BlockConfig(QuantConfig):
         if self.not_convert(name) or self.not_convert_substr(name):
             return None
         if self.expert_fp4 and is_routed_expert(name):
-            return self.expert_scheme
+            return self.SCHEMES["EXPERT_MXFP4"]
         return self.block_scheme
+
+    def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None) -> LinearConfig | MoEConfig:
+        cfg = super().layer_config(layer, layer_kind, scheme)
+        if layer_kind is LayerKind.MOE and scheme is not None and scheme.kind is QuantKind.MXFP4:
+            # the fp4 experts quantize their activations at the same block as the dense linears
+            cfg = dataclasses.replace(cfg, act_block=self.block)
+        return cfg

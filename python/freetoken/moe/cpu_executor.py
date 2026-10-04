@@ -158,7 +158,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
-        act_block: int = 128,
+        act_block: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -310,9 +310,10 @@ class CpuMoeExecutor:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
         self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
         # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
-        self._act_block = int(act_block)
+        self._act_block = act_block
         if fmt == "ds_fp4":
-            self._ext.set_act_block(self._act_block)
+            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
+            self._ext.set_act_block(act_block)
         if self._gpu_prequant:
             self._ext.set_input_prequant(True)
             logger.info_rank0(

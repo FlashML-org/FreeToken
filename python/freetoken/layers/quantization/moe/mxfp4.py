@@ -24,6 +24,8 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
+        if cfg.act_block is None:
+            return "W4A8 ds_fp4 experts need the fp8 activation quant block"
         return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
@@ -46,8 +48,7 @@ class TritonMxfp4MoEKernel(MoEKernel):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
-        # the W4A8 activation quant follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
-        act_block = layer.quant_method.scheme.act_block(128)
+        act_block = layer.quant_method.cfg.act_block
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 

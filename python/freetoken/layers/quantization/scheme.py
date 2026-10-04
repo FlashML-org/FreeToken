@@ -40,17 +40,6 @@ class WeightDesc:
 
 
 
-@dataclass(frozen=True)
-class ActDesc:
-    """How the kernel quantizes the layer's INPUT activation on the fly (``activation_scheme:
-    dynamic``): element format, group shape along K and scale format. None on a scheme means the
-    kernel's default (bf16 activations, or its own fixed group)."""
-
-    elem: str
-    group: GroupShape
-    scale: str | None
-
-
 @dataclass(frozen=True, eq=False)
 class QuantScheme:
     """``roles`` are the canonical tensor names the kind's Method declares; which checkpoint tensors feed them is the dialect Config's business."""
@@ -58,18 +47,16 @@ class QuantScheme:
     kind: QuantKind
     weight: WeightDesc
     roles: frozenset[str]
-    act: ActDesc | None
 
-    def __init__(self, kind: QuantKind, weight: WeightDesc, roles: Iterable[str], act: ActDesc | None = None):
+    def __init__(self, kind: QuantKind, weight: WeightDesc, roles: Iterable[str]):
         if not isinstance(kind, QuantKind):
             raise TypeError(f"kind must be a QuantKind, got {kind!r}")
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "roles", frozenset(roles))
-        object.__setattr__(self, "act", act)
 
     def _key(self):
-        return (self.kind, self.weight, self.roles, self.act)
+        return (self.kind, self.weight, self.roles)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, QuantScheme) and self._key() == other._key()
@@ -81,12 +68,7 @@ class QuantScheme:
         return role in self.roles
 
     def __repr__(self) -> str:
-        act = f", act={self.act}" if self.act is not None else ""
-        return f"QuantScheme({self.kind}, {self.weight}, roles={sorted(self.roles)}{act})"
-
-    def act_block(self, default: int) -> int:
-        """The K-group of the dynamic fp8 activation quant a kernel applies, or ``default``."""
-        return self.act.group[1] if self.act is not None else default
+        return f"QuantScheme({self.kind}, {self.weight}, roles={sorted(self.roles)})"
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +103,5 @@ def nvfp4_scheme(*, input_scale: bool) -> QuantScheme:
     return QuantScheme(QuantKind.NVFP4, WeightDesc("e2m1", (1, NVFP4_GROUP), "e4m3"), roles)
 
 
-def mxfp4_scheme(act_block: int | None = None) -> QuantScheme:
-    """``act_block``: the DeepSeek W4A8 experts quantize their input to fp8 with a ue8m0 scale per
-    ``act_block`` (the checkpoint's ``weight_block_size``: 128 on V4, 32 on V4.1); None = the
-    kernel's default."""
-    act = ActDesc("e4m3", (1, act_block), "e8m0") if act_block else None
-    return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"}, act)
+def mxfp4_scheme() -> QuantScheme:
+    return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"})

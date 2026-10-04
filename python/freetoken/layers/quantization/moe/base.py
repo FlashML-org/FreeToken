@@ -28,6 +28,8 @@ class MoEConfig:
     beta: float = 0.0
     limit: float | None = None
     interleaved: bool = False
+    # dynamic fp8 activation quant block of a W4A8 expert kernel, set by the quant dialect; None = no activation quant
+    act_block: int | None = None
     has_bias: bool = False
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"

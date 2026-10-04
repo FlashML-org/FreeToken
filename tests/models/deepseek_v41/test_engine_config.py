@@ -56,6 +56,8 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
 def test_fp8_block32_dialect_reaches_the_quant_layer(tmp_path):
     """A V4.1-style quantization_config on the tiny checkpoint: dense linears get the 32-block
     e8m0 scheme, routed experts the MXFP4 scheme with a 32-wide activation block."""
+    from freetoken.distributed.info import set_tp_info, try_get_tp_info
+    from freetoken.layers import OffloadMoELayer
     from freetoken.layers.quantization import Fp8BlockConfig, QuantKind
     from freetoken.layers.quantization.scheme import fp8_block_size
 
@@ -71,8 +73,10 @@ def test_fp8_block32_dialect_reaches_the_quant_layer(tmp_path):
     assert type(quant) is Fp8BlockConfig and quant.block == 32
     dense = quant.scheme_for("model.layers.3.attn.wq_a")
     assert dense.kind is QuantKind.FP8_BLOCK and fp8_block_size(dense) == 32
-    experts = quant.scheme_for("model.layers.3.ffn.experts")
-    assert experts.kind is QuantKind.MXFP4 and experts.act_block(128) == 32
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    experts = OffloadMoELayer(3, num_experts=4, top_k=2, hidden_size=64, intermediate_size=64, limit=10.0, quant_config=quant, prefix="model.layers.3.ffn.experts")
+    assert experts.quant_method.scheme.kind is QuantKind.MXFP4 and experts.quant_method.cfg.act_block == 32
     # the family's bf16 modules stay unquantized although the fp8 config lists no exceptions
     for name in ("model.layers.2.attn.compressor.wkv", "model.layers.2.attn.indexer.wk", "model.layers.5.attn.indexer.weights_proj", "head"):
         assert quant.scheme_for(name) is None, name

@@ -89,8 +89,12 @@ class QuantConfig(ABC):
         layer_kind = layer.quant_layer_kind
         kind = scheme.kind if scheme else QuantKind.NONE
         cls = method_class(kind, layer_kind)
-        cfg = LAYER_CONFIGS[layer_kind].from_layer(layer, scheme)
+        cfg = self.layer_config(layer, layer_kind, scheme)
         return cls(cfg, get_quant_backend().select(layer_kind, kind))
+
+    def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None) -> LinearConfig | MoEConfig:
+        """The layer's Linear / MoE config; a dialect overrides it to add what only its checkpoint knows."""
+        return LAYER_CONFIGS[layer_kind].from_layer(layer, scheme)
 
     @staticmethod
     def from_hf(

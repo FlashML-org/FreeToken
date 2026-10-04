@@ -815,7 +815,6 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
         method = sample.quant_method
-        scheme = method.scheme if method is not None else None
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -828,8 +827,7 @@ class Engine:
             swiglu_limit=sample.limit,
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=method.cpu_format if method is not None else None,
-            # the W4A8 activation block rides the expert scheme (DeepSeek-V4: 128, V4.1: 32)
-            act_block=scheme.act_block(128) if scheme is not None else 128,
+            act_block=method.cfg.act_block if method is not None else None,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
