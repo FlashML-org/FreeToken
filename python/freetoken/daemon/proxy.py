@@ -28,6 +28,16 @@ def _camel_key(key: str) -> str:
     return _SNAKE_RE.sub(lambda m: m.group(1).upper(), key)
 
 
+def _status_document(raw: bytes) -> dict | None:
+    """The JSON object of an error response that is an answer in its own right (it carries a
+    status), the way ``shell/client.py`` reads one."""
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("status") else None
+
+
 def to_camel(obj: Any) -> Any:
     """Recursively camelCase dict keys (uptime_s→uptimeS, done_bytes→doneBytes, …) so the daemon
     emits one casing convention everywhere."""
@@ -102,7 +112,10 @@ class ServeProbe:
         try:
             doc = self._opener(url, self._timeout)
         except urllib.error.HTTPError as exc:
-            return {"reachable": True, "status": "error", "httpStatus": exc.code}
+            # A serve that is not serving answers /health 503 with its lifecycle document.
+            doc = _status_document(exc.read())
+            if doc is None:
+                return {"reachable": True, "status": "error", "httpStatus": exc.code}
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return {"reachable": False, "status": "unreachable"}
         result = to_camel(doc) if isinstance(doc, dict) else {"value": doc}

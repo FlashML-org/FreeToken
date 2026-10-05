@@ -167,6 +167,14 @@ def get_json(url: str, timeout: float = 10) -> dict:
         return json.load(resp)
 
 
+def get_health(origin: str) -> dict:
+    """/health answers 503 until the model is serving, with the same lifecycle document."""
+    try:
+        return get_json(f"{origin}/health", timeout=5)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -207,7 +215,7 @@ def wait_ready(origin: str, proc: subprocess.Popen, log_path: str, timeout: floa
         if proc.poll() is not None:
             die_with_log(f"server exited with code {proc.returncode} during startup", log_path)
         try:
-            health = get_json(f"{origin}/health", timeout=5)
+            health = get_health(origin)
         except (OSError, ValueError):  # not bound yet / reset / partial response
             time.sleep(1.0)
             continue
