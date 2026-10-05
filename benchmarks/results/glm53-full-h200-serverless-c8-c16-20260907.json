@@ -1,0 +1,360 @@
+{
+  "destination": "tekizai-glm53-full-freetoken-global",
+  "levels": [
+    {
+      "aggregate_output_tokens_per_s": 17.782,
+      "concurrency": 8,
+      "errors": {},
+      "failures": 0,
+      "final_output_responses": 8,
+      "latency_mean_s": 57.133,
+      "latency_p50_s": 57.133,
+      "latency_p95_s": 57.135,
+      "output_tokens": 1016,
+      "per_request_end_to_end_tokens_per_s_mean": 2.223,
+      "per_request_end_to_end_tokens_per_s_min": 2.223,
+      "requests": [
+        {
+          "end_to_end_output_tokens_per_s": 2.222975528338122,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.130633414999465,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.2229172147416993,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.1321321180003,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.222921150056283,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.132030975000816,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.2228787940677743,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.133119600999635,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    try:\n        x, y = next(it_a), next(it_b)\n        while True:\n            if x <= y:\n                yield x\n                x = next(it_a)\n            else:\n                yield y\n                y = next(it_b)\n    except StopIteration:\n        # One iterable is exhausted; yield the rest of the other\n        rest = it_b if x > y else it_a\n        yield from (v for v in",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.2228412536012545,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.13408449399867,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.222889825115226,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.132836079006665,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.222857631502312,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.13366353299352,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.2227996822821874,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 57.13515302899759,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        }
+      ],
+      "successes": 8,
+      "truncated_responses": 8,
+      "wall_s": 57.136
+    },
+    {
+      "aggregate_output_tokens_per_s": 18.023,
+      "concurrency": 16,
+      "errors": {},
+      "failures": 0,
+      "final_output_responses": 16,
+      "latency_mean_s": 85.6,
+      "latency_p50_s": 112.734,
+      "latency_p95_s": 112.738,
+      "output_tokens": 2032,
+      "per_request_end_to_end_tokens_per_s_mean": 1.649,
+      "per_request_end_to_end_tokens_per_s_min": 1.126,
+      "requests": [
+        {
+          "end_to_end_output_tokens_per_s": 2.172408469480269,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.46046072099125,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.1724324592106656,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.459815153997624,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x =",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.1722434441530565,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.464901961997384,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.172184049077388,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.466500595997786,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x =",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.1724447804971736,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.45948359199974,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x =",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.1724077200685157,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.4604808879958,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x =",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.1721214444333463,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.468185711011756,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual two-pointer version:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 2.172187015718534,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 58.46642074600095,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x =",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265104131039854,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73752867500298,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265430686301972,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73426070999994,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation without imports:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result",
+            "reasoning_content": "Simple merge function.",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1264997696660435,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73859384600655,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    merged = []\n\n    x = next(it_a, None)\n    y = next(it_b, None)\n\n    while x is not None and y is not None:\n        if x <= y:\n            merged.append(x)\n            x = next(it_a, None)\n        else:\n            merged.append(y)\n            y = next(it_b, None)\n\n    # Append remaining items (one of these is empty)\n    merged.extend(v for v in (",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265211769831036,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.7364514709916,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265450088364997,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73406655200233,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265489183888535,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73367532200064,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation without imports:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.1265039731652107,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73817316698842,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)\n            x = next(it_a, None)\n        else:\n            result.append(y)\n            y = next(it_b, None)\n    result.extend([v for v in (x, y) if v is not None])",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        },
+        {
+          "end_to_end_output_tokens_per_s": 1.126531129999895,
+          "finish_reason": "length",
+          "has_final_output": true,
+          "latency_s": 112.73545543300861,
+          "message": {
+            "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    import heapq\n    return list(heapq.merge(a, b))\n```\n\nOr a manual implementation without imports:\n\n```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted iterables into one sorted list.\"\"\"\n    it_a, it_b = iter(a), iter(b)\n    x = next(it_a, None)\n    y = next(it_b, None)\n    result = []\n    while x is not None and y is not None:\n        if x <= y:\n            result.append(x)",
+            "role": "assistant"
+          },
+          "ok": true,
+          "output_tokens": 127,
+          "truncated": true
+        }
+      ],
+      "successes": 16,
+      "truncated_responses": 16,
+      "wall_s": 112.747
+    }
+  ],
+  "max_tokens": 128,
+  "measurement_mode": "nonstreaming_end_to_end_including_routing_queue_and_prefill",
+  "model": "glm-5.3-nvfp4",
+  "prompt": "Write a concise Python function that merges two sorted iterables.",
+  "reasoning_effort": "low",
+  "started_at_utc": "2026-09-07T05:13:12.980390+00:00"
+}
