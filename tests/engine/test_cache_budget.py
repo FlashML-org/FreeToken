@@ -508,6 +508,22 @@ def test_adjust_config_rope_gate_exempts_dsv4():
     _adjust_config(cfg)  # must not raise
 
 
+@pytest.mark.parametrize("platform, requested", [("win32", []), ("linux", ["expandable_segments:True"])])
+def test_expandable_segments_are_requested_only_where_torch_builds_them(monkeypatch, platform, requested):
+    import sys
+
+    from freetoken.engine.engine import _ensure_expandable_segments
+
+    settings: list[str] = []
+    # both the deprecated torch.cuda.memory wrapper and its replacement land here
+    monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", settings.append)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setattr(sys, "platform", platform)
+    _ensure_expandable_segments()
+    assert settings == requested
+
+
 # ---- _pin_budget_bytes: host bytes already pinned outside the expert banks ----
 
 
