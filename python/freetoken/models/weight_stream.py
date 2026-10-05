@@ -72,6 +72,11 @@ class BlockWeightStreamer:
     def device_bytes(self) -> int:
         return self.staging.numel()
 
+    @staticmethod
+    def staging_bytes(blocks: Sequence[BaseOP]) -> int:
+        """``device_bytes`` a streamer over ``blocks`` would hold, from the (possibly meta) tensors alone."""
+        return 2 * _slots(blocks[0])[1]
+
     def _bind_all_to_host(self) -> None:
         # between forwards the attributes point at the pinned bank, so state_dict() stays complete and correct
         for b, (slots, _) in enumerate(self._layouts):

@@ -77,6 +77,34 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def plan_moe_cache_auto(
+    config, pool_cls, *, baseline_free: int, weights_bytes: int, per_expert_bytes: int,
+    max_slots: int | None,
+) -> tuple[int, int, bool]:
+    """--moe-cache-auto's (moe_cache_size, num_pages, prefill_overlap) from the measured (or, for
+    the pre-load forecast, predicted) baseline and resident weights."""
+    from freetoken.engine.cache_budget import resolve_moe_cache_auto
+
+    cache_per_page, fixed_cache_size, page_tokens, min_reserve = pool_cls.kv_cost(config)
+    fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+    num_experts = config.model_config.num_experts
+    total_experts = config.model_config.num_moe_layers * num_experts
+    return resolve_moe_cache_auto(
+        baseline_free=baseline_free,
+        weights_bytes=weights_bytes,
+        memory_ratio=config.memory_ratio,
+        cache_per_page=cache_per_page,
+        fixed_cache_size=fixed_cache_size,
+        per_expert_bytes=per_expert_bytes,
+        num_experts=num_experts,
+        total_experts=total_experts,
+        prefill_overlap=config.moe_prefill_overlap,
+        kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+        page_size=page_tokens,
+        max_slots=max_slots,
+    )
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -358,6 +386,10 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if not config.skip_preflight:
+            from .forecast import run_preflight
+
+            run_preflight(config, self.model, init_free_memory)
         self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -612,24 +644,14 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
 
-        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
-        num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        return plan_moe_cache_auto(
+            config,
+            self._pool_cls,
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
-            memory_ratio=config.memory_ratio,
-            cache_per_page=cache_per_page,
-            fixed_cache_size=fixed_cache_size,
             per_expert_bytes=expert_bytes_per_slot(banks.sources),
-            num_experts=num_experts,
-            total_experts=total_experts,
-            prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
-            page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
 

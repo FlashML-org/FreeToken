@@ -54,6 +54,13 @@ def iter_weight_files(model_path: str) -> list[str]:
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
 
+def read_safetensors_header(path: str) -> dict:
+    """A shard's JSON header (8-byte little-endian length, then JSON); no tensor data is read."""
+    with open(path, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        return json.loads(fh.read(n))
+
+
 def safetensors_weight_map(folder: str) -> dict[str, str]:
     """Tensor name -> shard basename, from the index or from each shard's header when the checkpoint ships none."""
     index = os.path.join(folder, "model.safetensors.index.json")
@@ -62,9 +69,7 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
             return json.load(f)["weight_map"]
     weight_map: dict[str, str] = {}
     for path in sorted(iter_weight_files(folder)):
-        with open(path, "rb") as fh:
-            n = struct.unpack("<Q", fh.read(8))[0]
-            header = json.loads(fh.read(n))
+        header = read_safetensors_header(path)
         for name in header:
             if name != "__metadata__":
                 weight_map[name] = os.path.basename(path)

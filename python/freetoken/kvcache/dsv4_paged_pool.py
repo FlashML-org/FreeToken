@@ -327,16 +327,14 @@ class DSV4PagedKVCache(BaseKVCachePool):
         return per_page, fixed, config.page_size, min_reserve_tokens
 
     @classmethod
-    def solve_num_pages(cls, config, available_memory: int) -> int:
+    def _plan_sizes(cls, config, available_memory: int):
         # Solve the largest budget-respecting anchor with the exact per-tier byte model.
         # num_pages is in P (window) units and anchors full_token = num_pages*P (the FULL
         # cmp/idx tiers). The window working-set floor is honored in PAGES and the total is
         # byte-checked here. A budget too small for even the minimal working set raises a
         # graceful config error, not a late OOM.
-        from freetoken.utils import mem_GB
-
         from .dsv4_cost_model import _dsv4_pool_sizes, _dsv4_swa_ratio, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_pool_bytes, dsv4_solve_num_pages
+        from .dsv4_cost_model import dsv4_solve_num_pages
 
         dsv4_args = config.model_config.dsv4_args
         P = dsv4_args.window_size
@@ -361,6 +359,21 @@ class DSV4PagedKVCache(BaseKVCachePool):
                     f"--num-pages or lower max_running_req/max_seq_len"
                 )
             sizes = _dsv4_pool_sizes(config, num_pages + 1)  # +1 for dummy page
+        return num_pages, sizes
+
+    @classmethod
+    def plan_num_pages(cls, config, available_memory: int) -> int:
+        return cls._plan_sizes(config, available_memory)[0]
+
+    @classmethod
+    def solve_num_pages(cls, config, available_memory: int) -> int:
+        from freetoken.utils import mem_GB
+
+        from .dsv4_cost_model import dsv4_pool_bytes
+
+        num_pages, sizes = cls._plan_sizes(config, available_memory)
+        dsv4_args = config.model_config.dsv4_args
+        P = dsv4_args.window_size
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         real = dsv4_pool_bytes(sizes, dsv4_args, config.max_running_req + 1)
         logger.info(
