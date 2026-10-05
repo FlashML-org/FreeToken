@@ -67,6 +67,31 @@ def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
         tensor.normal_()
 
 
+def _shard_piece(piece, cfg):
+    """Shard one batch of expert pieces onto this TP rank along the intermediate dim, so full
+    checkpoint pieces land in the kernel's TP-local banks: gate/up families (weight, block scale,
+    per-output-row global) split the row axis; down weight + its block scale split the column axis;
+    down's per-output-row global is replicated. No-op at tp=1."""
+    tp, rank = cfg.tp_size, cfg.tp_rank
+    if tp == 1:
+        return piece
+    out = {}
+    for role, t in piece.items():
+        if role.startswith(("gate", "up")):
+            dim = 1
+        elif role in ("down", "down_scale"):
+            dim = 2
+        else:  # down_global (per-output-row) and anything else: replicated across ranks
+            out[role] = t
+            continue
+        size = t.shape[dim]
+        if size % tp:
+            raise NotImplementedError(f"expert piece {role!r} dim {dim} ({size}) is not divisible by tp={tp}")
+        local = size // tp
+        out[role] = t.narrow(dim, rank * local, local).contiguous()
+    return out
+
+
 def build_expert_banks(
     method,
     num_layers: int,
@@ -131,7 +156,7 @@ def build_expert_banks(
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
             written[layer_id, e0:e1] = 1
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
-            got = method.pack(piece, out)
+            got = method.pack(_shard_piece(piece, method.cfg), out)
             for role, values in got.items():
                 alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
             if tracker is not None:
