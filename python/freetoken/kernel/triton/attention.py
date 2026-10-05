@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.utils.arch import is_arch_supported
+
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -33,6 +35,15 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     def fits(block_m: int, block_n: int) -> bool:
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
+    if not is_arch_supported(7, 0) and head_dim <= 256:
+        # Pre-Volta: 48 KiB smem per block with no opt-in, so the generic picks do not
+        # fit ((128,64) and (64,32) both overflow even at head_dim 128). (32,16) fits
+        # ((32 + 2*16) * block_d * 2 = 32 KiB at head_dim 256) and halves the query-block
+        # count that re-reads the whole prefix K/V versus the (16,16) floor: 1.66x at a
+        # 120k prefix (4656 -> 2797 ms/layer, q=1536, 16Q/2KV GQA, D=256, GP102), with
+        # bit-identical outputs -- BLOCK_N is unchanged and M-blocking only partitions
+        # independent query rows. (32,32)+ or BLOCK_M >= 64 overflow the 48 KiB limit.
+        return 32, 16
     if head_dim <= 128:
         return 128, 64
     if head_dim <= 256:
