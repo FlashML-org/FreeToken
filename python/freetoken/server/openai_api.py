@@ -199,8 +199,10 @@ async def handle_chat_completion(
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
     if _response_format_unsupported(req.response_format):
+        rtype = (req.response_format or {}).get("type")
         return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)",
             param="response_format",
         )
     if req.n != 1:
@@ -704,7 +706,11 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if req.logit_bias is not None:
         return "logit_bias is not supported"
     if _response_format_unsupported(req.response_format):
-        return "response_format json_object/json_schema is not supported (no constrained decoding)"
+        rtype = (req.response_format or {}).get("type")
+        return (
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)"
+        )
     return None
 
 
