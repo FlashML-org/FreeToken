@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import threading
+from copy import deepcopy
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, List
 
@@ -22,6 +23,7 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
+from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
 
 logger = init_logger(__name__)
 
@@ -58,6 +60,8 @@ class TokenizeManager:
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        self._inline_system_lock = threading.Lock()
+        self._inline_system_modes: dict[str, str] = {}
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
         results: List[UserMsg] = []
@@ -103,9 +107,30 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
-        return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
-        )
+        kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+        messages = msg.text
+        if msg.inline_system_policy is not None:
+            if msg.inline_system_policy not in ("auto", "preserve", "fold"):
+                raise ValueError(f"invalid inline system policy: {msg.inline_system_policy}")
+            if has_inline_system(messages):
+                mode = msg.inline_system_policy
+                if mode == "auto":
+                    mode = self.inline_system_mode(msg.tools, kwargs)
+                messages = normalize_inline_system(messages, mode)
+        return self._render(messages, msg.tools, kwargs)
+
+    def inline_system_mode(self, tools: list[dict] | None, kwargs: dict[str, Any]) -> str:
+        key = json.dumps([tools, kwargs], sort_keys=True)
+        with self._inline_system_lock:
+            if key not in self._inline_system_modes:
+                mode, reason = probe_inline_system(
+                    lambda messages: self._render(messages, deepcopy(tools), deepcopy(kwargs)), self.tokenizer
+                )
+                if len(self._inline_system_modes) >= 128:
+                    self._inline_system_modes.pop(next(iter(self._inline_system_modes)))
+                self._inline_system_modes[key] = mode
+                logger.info("Anthropic inline system policy: %s (%s)", mode, reason)
+            return self._inline_system_modes[key]
 
     def _render(
         self,

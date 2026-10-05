@@ -231,10 +231,7 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_hoists_and_merges_system_messages():
-    # Claude Code interleaves system messages mid-array; strict chat templates
-    # (e.g. Qwen3.5: "System message must be at the beginning") require ONE system
-    # message at the front. Merge top-level system + in-array system, hoist to front.
+def test_convert_preserves_mid_conversation_system_reminders():
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
@@ -247,11 +244,69 @@ def test_convert_hoists_and_merges_system_messages():
             ],
         }
     )
+    original = req.model_dump()
     spec = A.convert_anthropic_to_genspec(req, {})
-    assert [m["role"] for m in spec.messages] == ["system", "user", "assistant"]
-    assert sum(1 for m in spec.messages if m["role"] == "system") == 1
-    assert "top-level sys" in spec.messages[0]["content"]
-    assert "mid-stream sys" in spec.messages[0]["content"]
+    assert spec.messages == [
+        {"role": "system", "content": "top-level sys"},
+        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "mid-stream sys"},
+        {"role": "assistant", "content": "hi"},
+    ]
+    assert req.model_dump() == original
+
+
+def test_convert_merges_only_leading_system_messages():
+    req = AnthropicMessagesRequest.model_validate({
+        "model": "claude-x", "max_tokens": 64,
+        "system": [{"type": "text", "text": "top-level sys"}],
+        "messages": [
+            {"role": "system", "content": "leading sys"},
+            {"role": "system", "content": [{"type": "text", "text": "second sys"}]},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": [{"type": "text", "text": "turn reminder"}]},
+            {"role": "assistant", "content": "hi"},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": "next reminder"},
+        ],
+    })
+    original = req.model_dump()
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert spec.messages == [
+        {"role": "system", "content": "top-level sys\n\nleading sys\n\nsecond sys"},
+        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "turn reminder"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "system", "content": "next reminder"},
+    ]
+    assert req.model_dump() == original
+
+
+@pytest.mark.parametrize("system", [None, "stable instructions"])
+@pytest.mark.parametrize("count_tokens", [False, True])
+def test_appending_system_reminder_preserves_converted_prefix(system, count_tokens):
+    from freetoken.server.anthropic_models import AnthropicCountTokensRequest
+
+    data = {
+        "model": "claude-x",
+        "messages": [
+            {"role": "user", "content": "inspect the source"},
+            {"role": "assistant", "content": "I found the function"},
+        ],
+        "tools": [{"name": "read", "input_schema": {"type": "object", "properties": {}}}],
+    }
+    if system is not None:
+        data["system"] = system
+    if not count_tokens:
+        data["max_tokens"] = 64
+    request_type = AnthropicCountTokensRequest if count_tokens else AnthropicMessagesRequest
+    first, first_tools, _, _ = A.convert_anthropic_prompt(request_type.model_validate(data))
+    data["messages"].append({"role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"})
+    second, second_tools, _, _ = A.convert_anthropic_prompt(request_type.model_validate(data))
+    assert second[:-1] == first
+    assert second[-1] == {
+        "role": "system", "content": "<total_tokens>1000 tokens left</total_tokens>"
+    }
+    assert second_tools == first_tools
 
 
 # --------------------------------------------------------------------------- #
@@ -664,6 +719,7 @@ def test_count_tokens_route():
     assert msg.text == spec.messages
     assert msg.tools == spec.template_tools
     assert msg.chat_template_kwargs == spec.chat_template_kwargs
+    assert msg.inline_system_policy == spec.inline_system_policy == "auto"
 
 
 def test_count_tokens_empty_messages_400():
@@ -671,6 +727,28 @@ def test_count_tokens_empty_messages_400():
     r = client.post("/v1/messages/count_tokens", json={"model": "claude-x", "messages": []})
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.parametrize("policy", ["auto", "preserve", "fold"])
+def test_inline_system_override_reaches_counting_and_generation(policy):
+    manager = _FakeTokenizeManager()
+    fake = FakeState([("ok", True, 3, 1)])
+    fake._count_manager = manager
+    fake.config.anthropic_inline_system = policy
+    submitted = []
+
+    async def record(msg):
+        submitted.append(msg)
+
+    fake.send_one = record
+    client = _client(fake)
+    body = {**_COUNT_BODY, "messages": [
+        {"role": "user", "content": "question"}, {"role": "system", "content": "instruction"}]}
+    assert client.post("/v1/messages/count_tokens", json=body).status_code == 200
+    assert client.post("/v1/messages", json={**body, "max_tokens": 32}).status_code == 200
+    assert manager.msgs[0].inline_system_policy == submitted[0].inline_system_policy == policy
+    assert manager.msgs[0].text == submitted[0].text
+    assert submitted[0].text[0]["content"] == body["system"]
 
 
 def test_count_tokens_works_while_not_serving():
@@ -716,6 +794,15 @@ def test_count_tokens_template_render_error_400():
         json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert r.status_code == 400, r.text
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_count_tokens_inline_system_placement_error_is_400():
+    from freetoken.tokenizer.inline_system import InlineSystemError
+
+    client, _ = _count_client(_RaisingManager(InlineSystemError("missing tool results")))
+    r = client.post("/v1/messages/count_tokens", json=_COUNT_BODY)
+    assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
