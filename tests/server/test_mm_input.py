@@ -140,3 +140,36 @@ def test_image_token_budget_flags_land_in_the_multimodal_config():
         assert parse_args(["--model", "/models/anon"])[0].mm.processor_kwargs == {}
         with pytest.raises(SystemExit):  # argparse reports the bad pair and exits
             parse_args(["--model", "/models/anon", "--image-min-tokens", "2048", "--image-max-tokens", "1024"])
+
+
+def test_render_messages_hoists_system_to_front():
+    """render_messages moves system messages to index 0 for templates that
+    require it (e.g. Qwen3.6 'System message must be at the beginning')."""
+    msgs = render_messages([
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "system", "content": "You are a math tutor."},
+        {"role": "user", "content": "Answer briefly."},
+    ])
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert msgs[2]["role"] == "user"
+
+
+def test_render_messages_preserves_system_first():
+    """When system is already first, no reordering happens."""
+    msgs = render_messages([
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ])
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+
+
+def test_render_messages_no_system_unchanged():
+    """No system message → order preserved."""
+    msgs = render_messages([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"},
+        {"role": "user", "content": "Bye"},
+    ])
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
