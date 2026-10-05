@@ -304,3 +304,20 @@ def test_free_memory_is_read_before_this_process_creates_a_cuda_context(tiny_qwe
     monkeypatch.setattr(engine, "_adjust_config", lambda *a, **k: calls.append("adjust") or real_adjust(*a, **k))
     _analyze(tiny_qwen3)
     assert calls[:2] == ["gpu_info", "adjust"]
+
+
+def test_df11_placeholders_are_priced_from_the_weight_count():
+    """DF11 buffers are empty until load, so the forecast estimates them instead of counting 0."""
+    from freetoken.layers.base import OPList
+    from freetoken.models.glm4_moe.df11_embedding import EmbeddingDF11
+    from freetoken.models.glm4_moe.df11_linear import LinearDF11
+
+    holder = OPList([])
+    holder.self_attn = LinearDF11(128, 256, has_bias=False)
+    holder.embed_tokens = EmbeddingDF11(512, 128)
+    loaded = LinearDF11(64, 64, has_bias=False)
+    loaded.low8 = torch.empty(64 * 64, dtype=torch.uint8)
+    holder.mlp = loaded
+    est = fc_mod._df11_estimate(holder)
+    bits = fc_mod._DF11_BITS_PER_WEIGHT
+    assert est == {"attention": int(128 * 256 * bits / 8), "embeddings": int(512 * 128 * bits / 8)}

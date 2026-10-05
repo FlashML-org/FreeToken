@@ -165,6 +165,21 @@ class WeightReport:
         return sum(self.gpu.values())
 
 
+# DF11 (lossless entropy-coded bf16) buffers are sized by the data at load and are empty in the meta
+# build; GLM-4.5-Air's attention and embedding measured 10.7-11.2 bits per weight.
+_DF11_BITS_PER_WEIGHT = 11.2
+
+
+def _df11_estimate(model) -> Counter[str]:
+    """Per category, the estimated bytes of DF11 weights whose buffers are still placeholders."""
+    found: Counter[str] = Counter()
+    for path, o in _walk(model):
+        low8 = getattr(o, "low8", None) if hasattr(o, "_DF11_KEYS") else None
+        if isinstance(low8, torch.Tensor) and low8.numel() == 0:
+            found[tensor_category(f"{path}.weight")] += int(o.n * _DF11_BITS_PER_WEIGHT / 8)
+    return found
+
+
 def resident_weights(model, config) -> WeightReport:
     """Per-category bytes the loaded model keeps on the GPU, from its meta-device build: the loader
     casts every checkpoint tensor into these parameters, so skipped tensors (a vision tower under
@@ -174,7 +189,12 @@ def resident_weights(model, config) -> WeightReport:
     gpu: Counter[str] = Counter()
     for name, t in state.items():
         gpu[tensor_category(name)] += _nbytes(t)
+    df11 = _df11_estimate(model)
+    gpu.update(df11)
     report = WeightReport(gpu=dict(gpu))
+    if df11:
+        report.notes.append(f"DF11-compressed weights are estimated at {_DF11_BITS_PER_WEIGHT} bits per weight; "
+                            "their real size depends on the data.")
     rope = _eager_tensor_bytes(model)
     if rope:
         report.gpu["rope"] = rope
