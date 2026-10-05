@@ -7,6 +7,10 @@ from copy import deepcopy
 from typing import Any, Callable
 
 
+# Allow small role-framing differences, not a repeated environment header.
+_INLINE_ROLE_SLACK_TOKENS = 8
+
+
 class InlineSystemError(ValueError):
     """An input instruction cannot be placed without corrupting tool ordering."""
 
@@ -132,6 +136,7 @@ def probe_inline_system(render: Callable[[list[dict]], str], tokenizer: Any) -> 
                 "function": {"name": "read", "arguments": {}}}]},
             {"role": "tool", "tool_call_id": "probe_call", "content": "Golf tool output"}], 4),
     ]
+    max_system_tokens = None
     try:
         special_ids = set(tokenizer.all_special_ids) | set(tokenizer.get_added_vocab().values())
         if not special_ids:
@@ -156,8 +161,13 @@ def probe_inline_system(render: Callable[[list[dict]], str], tokenizer: Any) -> 
                 as_user = messages[:index] + [{"role": "user", "content": note}] + messages[index:]
                 user_tokens = tokenizer.encode(render(deepcopy(as_user)), add_special_tokens=False)
                 user_segment = _insertion(base, user_tokens)
-                if user_segment is not None and user_segment[1] == segment:
+                if user_segment is None:
+                    return "fold", "middle: cannot isolate a user instruction"
+                if user_segment[1] == segment:
                     return "fold", "system instructions render as ordinary user turns"
+                max_system_tokens = len(user_segment[1]) + _INLINE_ROLE_SLACK_TOKENS
+            if max_system_tokens is not None and len(segment) > max_system_tokens:
+                return "fold", f"{name}: system insertion overhead ({len(segment)} > {max_system_tokens} tokens)"
     except Exception as exc:
         return "fold", f"probe could not render: {type(exc).__name__}"
     return "preserve", "renderer preserves distinct system turns and existing prompt tokens"

@@ -126,6 +126,52 @@ def test_renderer_probe_checks_more_than_template_acceptance(behavior, expected)
     assert probe_inline_system(render, ProbeTokenizer())[0] == expected
 
 
+@pytest.mark.parametrize("position", ["middle", "trailing", "tool result"])
+@pytest.mark.parametrize("metadata", ["Reasoning strength: high. Valid recipients: self, user.", "tool schema " * 1000],
+                         ids=["metadata", "tools"])
+def test_inline_probe_rejects_repeated_system_metadata(position, metadata):
+    def render(messages):
+        output = ""
+        for i, message in enumerate(messages):
+            role = message["role"]
+            content = message.get("content", "")
+            if role == "system" and i:
+                if i < len(messages)-1:
+                    location = "middle"
+                else:
+                    location = "tool result" if messages[i-1]["role"] == "tool" else "trailing"
+                if location == position:
+                    content += metadata
+            content = message.get("reasoning_content", "") + content
+            output += f"<{role}>{content}</{role}>"
+        return output + "<assistant>"
+
+    mode, reason = probe_inline_system(render, ProbeTokenizer())
+    assert mode == "fold"
+    assert "overhead" in reason
+
+
+def test_inline_probe_allows_small_role_framing_overhead():
+    def render(messages):
+        return "".join(f'<{m["role"]}>' + ("role: " if m["role"] == "system" else "")
+                       + m.get("reasoning_content", "") + m.get("content", "")
+                       + f'</{m["role"]}>' for m in messages) + "<assistant>"
+
+    assert probe_inline_system(render, ProbeTokenizer())[0] == "preserve"
+
+
+def test_inline_probe_folds_when_user_insertion_cannot_be_measured():
+    def render(messages):
+        rewrite = any(m["role"] == "user" and m.get("content") == "Echo inline instruction" for m in messages)
+        return ("changed head" if rewrite else "stable head") + "".join(
+            f'<{m["role"]}>' + m.get("reasoning_content", "") + m.get("content", "")
+            + f'</{m["role"]}>' for m in messages) + "<assistant>"
+
+    mode, reason = probe_inline_system(render, ProbeTokenizer())
+    assert mode == "fold"
+    assert "cannot isolate" in reason
+
+
 def test_inline_probe_cache_is_scoped_to_tools_and_render_kwargs(monkeypatch):
     import freetoken.tokenizer.tokenize as module
     calls = []
@@ -206,6 +252,51 @@ def test_native_model_inline_system_tool_history(variable, expected_mode):
     common = next((i for i, pair in enumerate(zip(*ids)) if pair[0] != pair[1]), min(map(len, ids)))
     assert common >= len(ids[0]) - 64
     assert common > 2048
+
+
+@pytest.mark.needs_weights
+@pytest.mark.parametrize("tool_count", [0, 20])
+def test_native_muse_inline_system_does_not_repeat_environment(tool_count):
+    from transformers import AutoTokenizer
+
+    path = os.environ.get("FREETOKEN_MUSE_MODEL")
+    if not path:
+        pytest.skip("set FREETOKEN_MUSE_MODEL to a local checkpoint")
+    manager = TokenizeManager(AutoTokenizer.from_pretrained(path, local_files_only=True))
+    tools = [{"type": "function", "function": {"name": f"read_{i}",
+              "description": "Inspect the repository source. " * 100,
+              "parameters": {"type": "object", "properties": {}}}} for i in range(tool_count)] or None
+    messages = [{"role": "system", "content": "Stable instructions."},
+                {"role": "user", "content": "Inspect this file.\n" + "value = 1\n" * 256}]
+    assert manager.inline_system_mode(tools, {}) == "fold"
+    for turn in range(3):
+        messages.extend([{"role": "assistant", "content": f"Answer {turn}."},
+                         {"role": "user", "content": f"Question {turn}."},
+                         {"role": "system", "content": f"Budget reminder {turn}."}])
+        original = deepcopy(messages)
+        msg = TokenizeMsg(uid=turn, text=messages, tools=tools, sampling_params=SamplingParams(),
+                          inline_system_policy="auto")
+        prompt = manager.render_prompt(msg)
+        assert prompt.count("Reasoning strength:") == 1
+        assert prompt.count("# Valid recipients:") == 1
+        assert prompt.count("// Function schemas") == bool(tools)
+        for previous in range(turn+1):
+            assert prompt.count(f"Budget reminder {previous}.") == 1
+        ids = manager.tokenize([msg])[0].input_ids.tolist()
+        msg.inline_system_policy = "fold"
+        assert ids == manager.tokenize([msg])[0].input_ids.tolist()
+        assert messages == original
+
+    latest = [m for i, m in enumerate(messages) if m["role"] != "system" or i in (0, len(messages)-1)]
+    updated = deepcopy(latest)
+    updated[-1]["content"] = "Budget reminder 900."
+    tokens = []
+    for conversation in (latest, updated):
+        msg = TokenizeMsg(uid=0, text=conversation, tools=tools, sampling_params=SamplingParams(),
+                          inline_system_policy="auto")
+        tokens.append(manager.tokenize([msg])[0].input_ids.tolist())
+    common = next((i for i, pair in enumerate(zip(*tokens)) if pair[0] != pair[1]), min(map(len, tokens)))
+    assert common >= min(map(len, tokens)) - 16
 
 
 class FakeTokenizer:
