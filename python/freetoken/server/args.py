@@ -289,7 +289,7 @@ def parse_args(
         "--tp-size",
         type=int,
         default=1,
-        help="The tensor parallelism size.",
+        help="The tensor parallelism size. Above 1, the ranks meet on --port + 1, which must be free.",
     )
 
     parser.add_argument(
