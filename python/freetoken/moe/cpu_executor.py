@@ -53,6 +53,8 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+# Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
+_SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
@@ -114,6 +116,17 @@ def physical_core_cpus() -> list[int]:
             seen.add(key)
             reps.append(cpu)
     return reps or allowed or [0]
+
+
+def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
+    """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
+    if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
+        return False
+    pool = list(core_ids) + ([coord_core] if coord_core >= 0 else [])
+    if len(set(pool)) != len(pool):
+        return False
+    spare = set(os.sched_getaffinity(0)) - set(pool)
+    return len(spare) >= 2
 
 
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
@@ -246,6 +259,8 @@ class CpuMoeExecutor:
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
+        self.spin_wait = _spin_wait_ok(core_ids, coord_core)
+        self._ext.set_spin_wait(self.spin_wait)
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
@@ -319,7 +334,8 @@ class CpuMoeExecutor:
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
-            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
+            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
+            f"spin_wait={self.spin_wait}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:

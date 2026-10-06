@@ -49,6 +49,14 @@
 
 namespace {
 
+inline void cpu_relax() {
+#if CPU_MOE_X86
+  _mm_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#endif
+}
+
 using bf16_t = uint16_t;
 
 inline float bf16_to_f32(bf16_t v) {
@@ -1290,13 +1298,19 @@ struct CpuMoeExecutor {
   std::mutex sync_mtx;
   std::condition_variable sync_cv;
 
-  bool stop = false;
+  std::atomic<bool> stop{false};  // spinning workers read it without the lock
   uint64_t cur_gen = 0;
   MoeTask* cur_task = nullptr;
-  std::atomic<uint64_t> submitted{0};
-  std::atomic<uint64_t> completed{0};
+  // Separate cache lines: idle workers poll `submitted` while busy workers hit p1_next/p2_next.
+  alignas(64) std::atomic<uint64_t> submitted{0};
+  alignas(64) std::atomic<uint64_t> completed{0};
 
-  std::atomic<int64_t> p1_next{0};
+  // Spin-then-park waits. Off unless the Python wrapper finds spare CPUs for the spinners.
+  static constexpr auto kSpinWindow = std::chrono::milliseconds(50);
+  std::atomic<bool> spin_wait{false};
+  bool coord_pinned = false;
+
+  alignas(64) std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
@@ -1866,19 +1880,34 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Tasks arrive once per MoE layer, sub-ms apart. Spinning skips a futex wakeup per worker per layer; parking after kSpinWindow keeps an idle server off the CPU.
   void worker_loop(int tid) {
     pin_self(tid);
     uint64_t my_gen = 0;
+    using wclk = std::chrono::steady_clock;
+    auto last_active = wclk::now();
     for (;;) {
-      MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
+      uint64_t gen = submitted.load(std::memory_order_acquire);
+      if (gen == my_gen && spin_wait.load(std::memory_order_relaxed)) {
+        unsigned polls = 0;
+        while (gen == my_gen) {
+          cpu_relax();
+          if (stop.load(std::memory_order_relaxed)) return;
+          if ((++polls & 1023u) == 0 && wclk::now() - last_active > kSpinWindow) break;
+          gen = submitted.load(std::memory_order_acquire);
+        }
       }
+      if (gen == my_gen) {
+        std::unique_lock<std::mutex> lk(task_mtx);
+        task_cv.wait(lk, [&] { return stop.load() || cur_gen != my_gen; });
+        if (stop.load()) return;
+        gen = cur_gen;
+      }
+      // submit() writes cur_task before the release store to `submitted`.
+      my_gen = gen;
+      MoeTask* t = cur_task;
       run_task_body(t);
+      last_active = wclk::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
@@ -1961,8 +1990,19 @@ struct CpuMoeExecutor {
     task_cv.notify_all();
   }
 
-  void sync() {
+  // Only a coordinator on its own core may spin: host-func callbacks and eager calls share cores with the workers.
+  void sync(bool spin = false) {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+    if (spin) {
+      using sclk = std::chrono::steady_clock;
+      const auto t0 = sclk::now();
+      unsigned polls = 0;
+      while (completed.load(std::memory_order_acquire) < target) {
+        cpu_relax();
+        if ((++polls & 1023u) == 0 && sclk::now() - t0 > kSpinWindow) break;
+      }
+      if (completed.load(std::memory_order_acquire) >= target) return;
+    }
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
   }
@@ -2003,6 +2043,7 @@ struct CpuMoeExecutor {
     }
     flag_served.assign(num_slots, 0);
     coord_stop.store(false);
+    coord_pinned = CPU_MOE_HAS_AFFINITY && pin_core >= 0;
     coord_thread = std::thread([this, pin_core] {
 #if CPU_MOE_HAS_AFFINITY
       if (pin_core >= 0) {
@@ -2050,7 +2091,7 @@ struct CpuMoeExecutor {
           }
           if (t != nullptr) {
             submit(t);
-            sync();
+            sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -2144,7 +2185,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
-      .def("isa_name", &CpuMoeExecutor::isa_name);
+      .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("set_spin_wait",
+           [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
+           py::arg("enabled"))
+      .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));
