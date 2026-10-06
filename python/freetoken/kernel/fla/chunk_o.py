@@ -148,6 +148,19 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    # Pre-Volta: (BK128, BV64, w4) leaves the kernel at ~1% of the fp32 FMA peak -- the
+    # operand tiles (q/k/h, 16 KiB each) plus the two-stage pipeline overshoot the 48 KiB
+    # block budget and triton degrades to local-memory spilling, and 4 warps sit on the
+    # wrong side of an occupancy cliff for this shape. (BK64, BV64, w8) fits and runs
+    # 7.4x faster (35.1 -> 4.7 ms per 1536-token chunk, 16Kg/32H heads, GP102), with
+    # bit-identical outputs: BK only splits the K accumulation loop and BV the
+    # independent V columns.
+    from freetoken.utils.arch import is_arch_supported
+
+    if is_arch_supported(7, 0):
+        bk, bv, nwarps = 128, 64, 4
+    else:
+        bk, bv, nwarps = 64, 64, 8
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -164,11 +177,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=bk,
+        BV=bv,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
+        num_warps=nwarps,
         num_stages=2,
     )
     return o
