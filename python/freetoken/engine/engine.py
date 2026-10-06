@@ -1188,7 +1188,8 @@ def _ensure_expandable_segments() -> None:
     if sys.platform == "win32":
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        # torch 2.11 deprecates torch.cuda.memory._set_allocator_settings, a wrapper of this binding
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
