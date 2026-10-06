@@ -149,6 +149,14 @@ def _jit_fast_index_copy_multi_module(*, num_threads: int, blocks_per_bank: int)
         cuda_wrappers=[("launch", f"&MultiIndexCopyKernel<{args}>::run")],
     )
 
+def _default_blocks_per_bank() -> int:
+    """H2D gather grid width per bank. The link's bandwidth-delay product sets how many
+    16B loads must be in flight: PCIe (~31 GB/s) saturates at ~4K threads/bank, NVLink-C2C
+    (GH200, ~450 GB/s) needs ~32K (measured: 8x1024 -> 222, 32x1024 -> 412 GB/s)."""
+    name = torch.cuda.get_device_name()
+    if any(k in name for k in ("GH200", "GB200", "GB300")):  # NVLink-C2C host link
+        return 32
+    return 8  # PCIe
 
 def fast_index_copy_multi_jit(
     dst_ptrs: torch.Tensor,
@@ -159,7 +167,7 @@ def fast_index_copy_multi_jit(
     num_indices: torch.Tensor | None = None,
     *,
     num_threads: int = 1024,
-    blocks_per_bank: int = 8,
+    blocks_per_bank: int = _default_blocks_per_bank(),
 ) -> None:
     """Fused multi-bank index copy: copy the same rows for every bank in ONE launch.
 
