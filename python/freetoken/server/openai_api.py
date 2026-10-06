@@ -21,6 +21,7 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
+from .maintenance import refusal_reason
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -91,18 +92,13 @@ def _all_tool_dicts(tools) -> list[dict[str, Any]]:
 
 
 def _maintenance_gate(state: Any) -> JSONResponse | None:
-    """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
-    runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
-    None when serving."""
-    mstate = getattr(state, "maintenance_state", "serving")
-    if mstate == "serving":
+    """503 naming the lifecycle stage while the engine is not serving, so clients (and the desktop)
+    get an actionable message. None when serving."""
+    reason = refusal_reason(state)
+    if reason is None:
         return None
-    if mstate == "loading":
-        msg = "model is still loading"
-    elif mstate == "failed":
-        msg = "server unavailable: maintenance failed (restart required)"
-    else:
-        msg = "server unavailable: cache rebuild in progress"
+    # the loading reason stays bare, as this API has always sent it
+    msg = reason if state.maintenance_state == "loading" else f"server unavailable: {reason}"
     return JSONResponse({"error": msg}, status_code=503)
 
 

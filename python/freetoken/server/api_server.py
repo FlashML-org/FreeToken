@@ -43,6 +43,7 @@ from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
+from .maintenance import refusal_reason
 from .responses_api import register_responses_routes
 from .stats import StatsTracker
 
@@ -825,9 +826,8 @@ async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     log_request("/generate", req, request)
     state = get_global_state()
-    if state.maintenance_state != "serving":
-        detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
-        return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
+    if (reason := refusal_reason(state)) is not None:
+        return JSONResponse({"error": f"server unavailable: {reason}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
     uid = state.new_user()
