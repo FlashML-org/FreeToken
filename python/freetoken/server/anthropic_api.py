@@ -53,6 +53,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .maintenance import refusal_reason
 from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
@@ -84,10 +85,8 @@ def register_anthropic_routes(
     async def v1_messages(req: AnthropicMessagesRequest, request: Request):
         log_request("/v1/messages", req, request)
         state = get_state()
-        mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
-            return _anthropic_error_response(503, "overloaded_error", detail)
+        if (reason := refusal_reason(state)) is not None:
+            return _anthropic_error_response(503, "overloaded_error", reason)
         return await handle_anthropic_messages(req, request, state, get_model_sampling())
 
     @app.post("/v1/messages/count_tokens")
