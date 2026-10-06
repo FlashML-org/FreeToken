@@ -59,6 +59,20 @@ have no resident path and stay on `offload`. Offload-only flags
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
 
+### NVLink-C2C hosts (GH200 / GB200)
+
+The host link is ~450 GB/s per direction instead of PCIe's ~32-64 GB/s. The
+offload expert gather reads host memory zero-copy and is latency-bound, so it
+needs a wider grid to keep enough loads in flight. Set
+`FREETOKEN_H2D_BLOCKS_PER_BANK=32` (default `8`, tuned for PCIe):
+
+    FREETOKEN_H2D_BLOCKS_PER_BANK=32 ft serve --model <model> --moe-strategy offload
+
+On GH200 this raises the gather from ~220 to ~410 GB/s (`PCIe-gather` in
+`ft bench bw`), matching the DMA ceiling. Run `ft bench bw` with the variable
+set so the hybrid split is calibrated against the faster gather. Leave it
+unset on PCIe GPUs: wider grids add no bandwidth there.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
