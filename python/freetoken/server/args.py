@@ -640,8 +640,9 @@ def parse_args(
         default=ServerArgs.ple_backend,
         choices=["pinned", "disk"],
         help=(
-            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+            "Where a PLE n-gram table lives. 'disk' (the default on Linux) reads rows straight "
+            "from the checkpoint files; 'pinned' (the default elsewhere, where the disk row store "
+            "is not built) preloads the whole table into page-locked host RAM."
         ),
     )
 

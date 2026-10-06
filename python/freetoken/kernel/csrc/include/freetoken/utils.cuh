@@ -16,7 +16,7 @@ namespace device {
 inline constexpr auto kWarpThreads = 32u;
 
 template <std::integral T, std::integral U>
-__always_inline __device__ constexpr auto div_ceil(T a, U b) {
+__device__ __forceinline__ constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
 
@@ -25,14 +25,14 @@ namespace pointer {
 // we only allow void * pointer arithmetic for safety
 
 template <typename T, std::integral... U>
-__always_inline __device__ auto offset(T *ptr, U... offset) -> void * {
+__device__ __forceinline__ auto offset(T *ptr, U... offset) -> void * {
   static_assert(std::is_same_v<T, void>,
                 "Pointer arithmetic is only allowed for void* pointers");
   return static_cast<char *>(ptr) + (... + offset);
 }
 
 template <typename T, std::integral... U>
-__always_inline __device__ auto offset(const T *ptr, U... offset) -> const
+__device__ __forceinline__ auto offset(const T *ptr, U... offset) -> const
     void * {
   static_assert(std::is_same_v<T, void>,
                 "Pointer arithmetic is only allowed for void* pointers");
@@ -43,13 +43,13 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
-template <bool kUsePDL> __always_inline __device__ void wait() {
+template <bool kUsePDL> __device__ __forceinline__ void wait() {
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
 }
 
-template <bool kUsePDL> __always_inline __device__ void launch() {
+template <bool kUsePDL> __device__ __forceinline__ void launch() {
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
