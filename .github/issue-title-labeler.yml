@@ -1,0 +1,2 @@
+amd:
+  - '/\b(ROCm|HIP|RCCL|RDNA\s?\d?|CDNA\s?\d?|gfx\d{3,4}[a-z]?|MI\d{3}X?|RX\s?\d{4}|Radeon(?!\s*(\d{3}M|Graphics|Vega))|AMD[\s-]*(GPUs?|graphics|cards?|Instinct))\b|\bAMD[\s-]*显卡|\(amd\)|(?<!\w)A卡/i'
