@@ -87,6 +87,13 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
 
 
+def test_deepseek_v41_is_not_shadowed_by_the_v4_branch():
+    """V4.1's DSML leads every tag name with a space; the V4 arm (``"v4"`` is a substring of
+    ``"v41"``) would hand it a tool parser that never sees a call."""
+    assert _inferred("DeepseekV41ForCausalLM") == ("deepseekv41", "deepseekv32")
+    assert _inferred("DeepseekV4ForCausalLM")[0] == "deepseekv32"
+
+
 def test_an_explicit_choice_beats_inference():
     config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):

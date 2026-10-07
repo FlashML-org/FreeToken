@@ -27,7 +27,7 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)
@@ -43,6 +43,8 @@ class Req:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None  # [3, prompt_len] int32, CPU
     mrope_delta: int = 0
+    # The whole prompt's length; 0 = this request's input_ids (a ChunkedReq's end at its chunk).
+    prompt_len: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -69,6 +71,7 @@ class Req:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
+        self.prompt_len = self.prompt_len or self.device_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
 

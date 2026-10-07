@@ -1,4 +1,4 @@
-"""NVFP4 experts: served from the offload cache through the Triton inline-dequant kernels, vLLM's Marlin or flashinfer's b12x.
+"""NVFP4 experts: served resident or from the offload cache through the Triton inline-dequant kernels, vLLM's Marlin or flashinfer's b12x.
 
 FreeToken stores MoE experts as ModelOpt NVFP4 (packed e2m1 codes + fp8-e4m3 per-16
 block scales + per-tensor global scale) in pinned host banks and gathers the routed
@@ -41,7 +41,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
@@ -230,7 +230,7 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
         if reason:
             return reason
         if not _marlin_symbols_ok():
@@ -496,7 +496,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
@@ -567,9 +567,3 @@ class B12xNvfp4MoEKernel(MoEKernel):
 @register_method(QuantKind.NVFP4, LayerKind.MOE)
 class Nvfp4MoEMethod(MoEMethod):
     candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
-
-    def create_weights(self, layer) -> None:
-        raise NotImplementedError("NVFP4 experts are served from the offload cache, not resident")
-
-    def resident_view(self, layer) -> ExpertView:
-        raise NotImplementedError("NVFP4 experts are not resident")

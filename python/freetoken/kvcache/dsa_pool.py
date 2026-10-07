@@ -2,7 +2,7 @@
 
 ``MLAKVCache`` is the MHA pool's sibling for latent-KV models: ONE slab holding the
 per-token latent ``ckv (kv_lora_rank) | kpe (qk_rope_head_dim)`` -- there is no
-separate V (``v_cache`` aliases ``k_cache``, same convention as dsv4_paged_pool's
+separate V (``v_cache`` aliases ``k_cache``, same convention as dsv4/v4_pool's
 single-latent tiers). ``DSAKVCache`` extends it with the DeepSeek-Sparse-Attention
 index-key slab: one ``index_head_dim``-wide bf16 row per token per full-indexer
 layer, addressed by the SAME physical rows as the latent slab (GLM-5.2, page 1;
@@ -75,7 +75,7 @@ class MLAKVCache(BaseKVCachePool):
         )
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
-        # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
+        # MLA: K == V (single latent); same buffer, dsv4/v4_pool precedent.
         return self.k_cache(layer_id)
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:

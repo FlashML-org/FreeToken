@@ -12,17 +12,21 @@ E8M0 = torch.float8_e8m0fnu
 
 
 class TritonMxfp4MoEKernel(MoEKernel):
-    """Standard OCP MXFP4 experts (DeepSeek-V4 ds_fp4): e2m1 pairs + e8m0 scales, no bias."""
+    """Standard OCP MXFP4 experts (DeepSeek-V4 / V4.1 ds_fp4): e2m1 pairs + e8m0 scales, no bias;
+    W4A8 with the fp8 activation round-trips at the checkpoint's block."""
 
     name = "triton"
     cpu_format = "ds_fp4"
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.interleaved:
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        if cfg.act_block is None:
+            return "W4A8 ds_fp4 experts need the fp8 activation quant block"
+        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.intermediate, cfg.hidden
@@ -44,13 +48,14 @@ class TritonMxfp4MoEKernel(MoEKernel):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
+        act_block = layer.quant_method.cfg.act_block
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 
-            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n)
+            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n, act_block=act_block)
         from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
-        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit)
+        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block)
 
 
 class TritonGptossMxfp4MoEKernel(MoEKernel):
@@ -106,37 +111,3 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
 @register_method(QuantKind.MXFP4, LayerKind.MOE)
 class Mxfp4MoEMethod(MoEMethod):
     candidates = (TritonMxfp4MoEKernel, TritonGptossMxfp4MoEKernel)
-
-    def create_weights(self, layer) -> None:
-        if not self.cfg.has_bias:
-            raise NotImplementedError("standard MXFP4 experts are served from the offload cache, not resident")
-        g = self.cfg
-        e, i, h = g.num_experts, g.local_intermediate, g.hidden
-        if h % GROUP:
-            raise ValueError(f"MXFP4 hidden size must be divisible by {GROUP}")
-        layer.gate_up_proj_blocks = torch.empty(e, 2 * i, h // GROUP, 16, dtype=torch.uint8)
-        layer.gate_up_proj_scales = torch.empty(e, 2 * i, h // GROUP, dtype=torch.uint8)
-        layer.gate_up_proj_bias = torch.empty(e, 2 * i, dtype=torch.bfloat16)
-        layer.down_proj_blocks = torch.empty(e, h, i // GROUP, 16, dtype=torch.uint8)
-        layer.down_proj_scales = torch.empty(e, h, i // GROUP, dtype=torch.uint8)
-        layer.down_proj_bias = torch.empty(e, h, dtype=torch.bfloat16)
-
-    def finalize(self, layer) -> None:
-        if getattr(layer, "gate_up_proj_blocks", None) is None:
-            return
-        from freetoken.moe.fused_mxfp4 import _transpose_mxfp4_for_decode
-
-        # one transposed copy serves prefill and decode; the HF blocks are freed so 120B fits
-        layer._gu_blocks_t, layer._gu_scales_t = _transpose_mxfp4_for_decode(layer.gate_up_proj_blocks, layer.gate_up_proj_scales)
-        layer._dn_blocks_t, layer._dn_scales_t = _transpose_mxfp4_for_decode(layer.down_proj_blocks, layer.down_proj_scales)
-        layer.gate_up_proj_blocks = None
-        layer.gate_up_proj_scales = None
-        layer.down_proj_blocks = None
-        layer.down_proj_scales = None
-        torch.cuda.empty_cache()
-
-    def resident_view(self, layer) -> ExpertView:
-        return ExpertView({
-            "gate_up": layer._gu_blocks_t, "gate_up_scale": layer._gu_scales_t, "gate_up_bias": layer.gate_up_proj_bias,
-            "down": layer._dn_blocks_t, "down_scale": layer._dn_scales_t, "down_bias": layer.down_proj_bias,
-        })

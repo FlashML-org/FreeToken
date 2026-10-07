@@ -16,7 +16,7 @@ from .linear import (
     LinearReplicated,
     LinearRowParallel,
 )
-from .moe import MoELayer, OffloadMoELayer, make_moe_layer
+from .moe import MoELayer, OffloadMoELayer, iter_moe_layers, make_moe_layer
 from .norm import (
     GatedRMSNorm,
     GemmaPlusOneRMSNorm,
@@ -57,5 +57,6 @@ __all__ = [
     "LinearReplicated",
     "MoELayer",
     "OffloadMoELayer",
+    "iter_moe_layers",
     "make_moe_layer",
 ]

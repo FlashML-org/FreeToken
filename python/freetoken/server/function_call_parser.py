@@ -78,6 +78,8 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜function_calls>",
     "<｜DSML｜tool_calls>",
     "<｜DSML｜invoke",
+    "<｜DSML｜ calls>",
+    "<｜DSML｜ invoke",
     "<atem:function_calls>",
 ]
 
@@ -1563,37 +1565,45 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.2
     """
 
+    # the DSML tag names: (block, alternative block), invoke, parameter
+    block_tags = ("function_calls", "tool_calls")
+    invoke_tag = "invoke"
+    param_tag = "parameter"
+
     def __init__(self):
         super().__init__()
         self.dsml_token = "｜DSML｜"
-        self.bot_token = f"<{self.dsml_token}function_calls>"
-        self.eot_token = f"</{self.dsml_token}function_calls>"
-        self.alt_bot_token = f"<{self.dsml_token}tool_calls>"
-        self.alt_eot_token = f"</{self.dsml_token}tool_calls>"
-        self.invoke_start_prefix = f"<{self.dsml_token}invoke"
-        self.invoke_end_token = f"</{self.dsml_token}invoke>"
-        self.param_end_token = f"</{self.dsml_token}parameter>"
+        block, alt_block = self.block_tags
+        self.bot_token = f"<{self.dsml_token}{block}>"
+        self.eot_token = f"</{self.dsml_token}{block}>"
+        self.alt_bot_token = f"<{self.dsml_token}{alt_block}>"
+        self.alt_eot_token = f"</{self.dsml_token}{alt_block}>"
+        self.invoke_start_prefix = f"<{self.dsml_token}{self.invoke_tag}"
+        self.invoke_end_token = f"</{self.dsml_token}{self.invoke_tag}>"
+        self.param_start_prefix = f"<{self.dsml_token}{self.param_tag}"
+        self.param_end_token = f"</{self.dsml_token}{self.param_tag}>"
 
         # Regex for complete invoke extraction
-        _de = re.escape(self.dsml_token)
+        _inv = re.escape(self.dsml_token + self.invoke_tag)
+        _par = re.escape(self.dsml_token + self.param_tag)
         self.invoke_regex = re.compile(
-            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*?)</{_de}invoke>',
+            rf'<{_inv}\s+name="([^"]+)"\s*>(.*?)</{_inv}>',
             re.DOTALL,
         )
         # Regex for parameter extraction
         self.param_regex = re.compile(
-            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</{_de}parameter>',
+            rf'<{_par}\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</{_par}>',
             re.DOTALL,
         )
         # Regex for partial invoke (name known, body still streaming)
         self.partial_invoke_regex = re.compile(
-            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*)',
+            rf'<{_inv}\s+name="([^"]+)"\s*>(.*)',
             re.DOTALL,
         )
         # Streaming state machine tag regexes (anchored matches over the buffer).
-        self.invoke_open_regex = re.compile(rf'<{_de}invoke\s+name="([^"]+)"\s*>')
+        self.invoke_open_regex = re.compile(rf'<{_inv}\s+name="([^"]+)"\s*>')
         self.param_open_regex = re.compile(
-            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>'
+            rf'<{_par}\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>'
         )
 
         self._last_arguments = ""
@@ -1687,7 +1697,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         normal_parts: List[str] = []
         calls: List[ToolCallItem] = []
-        param_open_token = f"<{self.dsml_token}parameter"
+        param_open_token = self.param_start_prefix
 
         def _emit_args(fragment: str) -> None:
             if fragment:
@@ -3512,6 +3522,16 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return StreamingParseResult(normal_text="".join(normal_parts).strip(), calls=calls)
 
 
+class DeepSeekV41Detector(DeepSeekV32Detector):
+    """DeepSeek-V4.1's DSML: the V3.2 grammar with every tag name led by a space and the block
+    named ``calls`` (``<｜DSML｜ calls>`` / ``<｜DSML｜ invoke name=...>`` / ``<｜DSML｜ parameter
+    ...>``, the checkpoint's ``encoding/encoding.py``)."""
+
+    block_tags = (" calls", " calls")
+    invoke_tag = " invoke"
+    param_tag = " parameter"
+
+
 class FunctionCallParser:
     """
     Parser for function/tool calls in model outputs.
@@ -3523,6 +3543,7 @@ class FunctionCallParser:
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "deepseekv32": DeepSeekV32Detector,
+        "deepseekv41": DeepSeekV41Detector,
         "gemma4": Gemma4Detector,
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,

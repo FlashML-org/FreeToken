@@ -17,9 +17,17 @@ workspace; phase 2 runs the same radix select over the union of those candidates
 top-k is a subset of that union -- a global winner beats at most k-1 columns, so it beats all
 but at most k-1 of its own slice -- so the answer stays exact. ``_split_plan`` derives the
 geometry from the buffer width alone, which is fixed when a graph is captured.
+
+A row wide enough to leave more candidates than one program holds resident (262,144 columns,
+a 1M-token window, leaves 32 x k) gets reduction levels between the two phases: each program
+of a level takes ``_MAX_RESIDENT`` consecutive candidates of the level before and writes their
+own top-k, until the survivors fit the merge. The same subset argument holds per level, and
+candidates stay in ascending column order throughout, so ties still go to the lowest column.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -126,6 +134,44 @@ def _compact(
 
 
 @triton.jit
+def _live_candidates(
+    visible,
+    CHUNK: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    LEVEL: tl.constexpr,
+    RESIDENT: tl.constexpr,
+):
+    """Candidate slots level ``LEVEL`` filled for a row: its splits past the row's visible tail
+    are one skipped suffix, so every later stage keeps costing what the live part costs."""
+    live = tl.minimum(tl.cdiv(visible, CHUNK), N_SPLITS) * TOP_K
+    for _ in tl.static_range(LEVEL):
+        live = tl.cdiv(live, RESIDENT) * TOP_K
+    return live
+
+
+@triton.jit
+def _emit_candidates(
+    key,
+    column,
+    k_eff,
+    key_out,
+    col_out,
+    TOP_K: tl.constexpr,
+    BINS: tl.constexpr,
+    RADIX: tl.constexpr,
+    PASSES: tl.constexpr,
+):
+    """Write a resident tile's own top-k as ranked (key, column) candidates; returns how many."""
+    prefix, ties = _resident_prefix(key, k_eff, BINS, RADIX, PASSES)
+    rank, take, above, equal = _tile_ranks(key, prefix, ties, 0, 0)
+    write = take & (rank < TOP_K)
+    tl.store(key_out + rank, key.to(tl.int32, bitcast=True), mask=write)
+    tl.store(col_out + rank, column, mask=write)
+    return above + tl.minimum(equal, ties)
+
+
+@triton.jit
 def _qsa_block_topk_kernel(
     logits_ptr,
     visible_ptr,
@@ -225,15 +271,93 @@ def _qsa_topk_split_kernel(
     if k_eff > 0:
         offsets = tl.arange(0, CHUNK)
         key = _load_keys(logits_ptr + row.to(tl.int64) * stride_logits_row + base, offsets, limit)
-        prefix, ties = _resident_prefix(key, k_eff, BINS, RADIX, PASSES)
-        rank, take, above, equal = _tile_ranks(key, prefix, ties, 0, 0)
-        write = take & (rank < TOP_K)
-        tl.store(key_ptr + slot + rank, key.to(tl.int32, bitcast=True), mask=write)
-        tl.store(col_ptr + slot + rank, (base + offsets).to(tl.int32), mask=write)
-        emitted = above + tl.minimum(equal, ties)
+        emitted = _emit_candidates(
+            key, (base + offsets).to(tl.int32), k_eff, key_ptr + slot, col_ptr + slot,
+            TOP_K, BINS, RADIX, PASSES,
+        )
     # A key of 0 is the dead-column sentinel, so the merge needs no separate count per slot.
     pad = tl.arange(0, PAD_K)
     tl.store(key_ptr + slot + pad, 0, mask=(pad >= emitted) & (pad < TOP_K))
+
+
+@triton.jit
+def _reduce_tile(
+    in_key,
+    in_col,
+    out_key,
+    out_col,
+    count,
+    k_eff,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BINS: tl.constexpr,
+    RADIX: tl.constexpr,
+    PASSES: tl.constexpr,
+):
+    """Top-k of ``count`` candidates held as one resident tile; returns how many it wrote."""
+    tl.static_assert(BLOCK <= 0xFFFF, "packed cumsum keeps 16 bits per half")
+    offsets = tl.arange(0, BLOCK)
+    inside = offsets < count
+    key = tl.load(in_key + offsets, mask=inside, other=0).to(tl.uint32, bitcast=True)
+    column = tl.load(in_col + offsets, mask=inside, other=-1)
+    return _emit_candidates(key, column, k_eff, out_key, out_col, TOP_K, BINS, RADIX, PASSES)
+
+
+@triton.jit
+def _qsa_topk_reduce_kernel(
+    visible_ptr,
+    in_key_ptr,
+    in_col_ptr,
+    out_key_ptr,
+    out_col_ptr,
+    stride_scratch_row,
+    num_columns,
+    TOP_K: tl.constexpr,
+    PAD_K: tl.constexpr,
+    CHUNK: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+    LEVEL: tl.constexpr,
+    RESIDENT: tl.constexpr,
+    BLOCK_SMALL: tl.constexpr,
+    BLOCK_MID: tl.constexpr,
+    BINS: tl.constexpr,
+    RADIX: tl.constexpr,
+    PASSES: tl.constexpr,
+) -> None:
+    """A reduction level: one program per (row, ``RESIDENT`` candidates of level ``LEVEL - 1``),
+    writing their own top-k as this level's candidates."""
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    visible = tl.maximum(tl.minimum(tl.load(visible_ptr + row), num_columns), 0)
+    k_eff = tl.minimum(visible, TOP_K)
+    live = _live_candidates(visible, CHUNK, N_SPLITS, TOP_K, LEVEL - 1, RESIDENT)
+    base = split * RESIDENT
+    count = tl.minimum(tl.maximum(live - base, 0), RESIDENT)
+    source = row.to(tl.int64) * stride_scratch_row + base
+    slot = row.to(tl.int64) * stride_scratch_row + split * TOP_K
+    in_key, in_col = in_key_ptr + source, in_col_ptr + source
+    out_key, out_col = out_key_ptr + slot, out_col_ptr + slot
+
+    emitted = 0
+    # As in the merge: residency costs the whole tile, so a short range takes a narrower one.
+    if count > 0:
+        if count <= BLOCK_SMALL:
+            emitted = _reduce_tile(
+                in_key, in_col, out_key, out_col, count, k_eff,
+                TOP_K, BLOCK_SMALL, BINS, RADIX, PASSES,
+            )
+        elif count <= BLOCK_MID:
+            emitted = _reduce_tile(
+                in_key, in_col, out_key, out_col, count, k_eff,
+                TOP_K, BLOCK_MID, BINS, RADIX, PASSES,
+            )
+        else:
+            emitted = _reduce_tile(
+                in_key, in_col, out_key, out_col, count, k_eff,
+                TOP_K, RESIDENT, BINS, RADIX, PASSES,
+            )
+    pad = tl.arange(0, PAD_K)
+    tl.store(out_key + pad, 0, mask=(pad >= emitted) & (pad < TOP_K))
 
 
 @triton.jit
@@ -274,6 +398,8 @@ def _qsa_topk_merge_kernel(
     PAD_K: tl.constexpr,
     CHUNK: tl.constexpr,
     N_SPLITS: tl.constexpr,
+    LEVEL: tl.constexpr,
+    RESIDENT: tl.constexpr,
     BLOCK_SMALL: tl.constexpr,
     BLOCK_MID: tl.constexpr,
     BLOCK_FULL: tl.constexpr,
@@ -281,13 +407,11 @@ def _qsa_topk_merge_kernel(
     RADIX: tl.constexpr,
     PASSES: tl.constexpr,
 ) -> None:
-    """Phase 2: one program per row over the candidates phase 1 left behind."""
+    """Phase 2: one program per row over the candidates the last level ``LEVEL`` left behind."""
     row = tl.program_id(0)
     limit = tl.maximum(tl.minimum(tl.load(visible_ptr + row), num_columns), 0)
     k_eff = tl.minimum(limit, TOP_K)
-    # Candidates sit chunk-major, so the splits past the visible tail are one skipped suffix
-    # and the merge keeps costing what the live part of the row costs.
-    candidates = tl.minimum(tl.cdiv(limit, CHUNK), N_SPLITS) * TOP_K
+    candidates = _live_candidates(limit, CHUNK, N_SPLITS, TOP_K, LEVEL, RESIDENT)
     key_row = key_ptr + row.to(tl.int64) * stride_scratch_row
     col_row = col_ptr + row.to(tl.int64) * stride_scratch_row
     out_row = out_ptr + row.to(tl.int64) * stride_out_row
@@ -325,27 +449,37 @@ def _qsa_topk_merge_kernel(
     tl.store(out_row + pad, -1, mask=(pad >= emitted) & (pad < TOP_K))
 
 
-def _split_plan(columns: int, top_k: int) -> tuple[int, int] | None:
-    """``(chunk, n_splits)`` for the split+merge path, or None to keep the one-program path."""
+@dataclass(frozen=True)
+class _SplitPlan:
+    """``chunk`` columns per first-level program, and the program count of every level: the
+    first splits the row, each later one reduces the candidates of the level before it."""
+
+    chunk: int
+    levels: tuple[int, ...]
+
+
+def _split_plan(columns: int, top_k: int) -> _SplitPlan | None:
+    """The split geometry of a ``columns``-wide buffer, or None to keep the one-program path."""
     if top_k <= 0 or columns <= _MIN_CHUNK:
         return None
     max_splits = _MAX_RESIDENT // triton.next_power_of_2(top_k)
     if max_splits < 2:
         return None
-    chunk = max(_MIN_CHUNK, triton.next_power_of_2(-(-columns // max_splits)))
-    if chunk > _MAX_RESIDENT:
-        return None
+    chunk = min(_MAX_RESIDENT, max(_MIN_CHUNK, triton.next_power_of_2(-(-columns // max_splits))))
     n_splits = -(-columns // chunk)
     # Merging n_splits*top_k candidates has to be cheaper than scanning the row once.
     if n_splits < 2 or n_splits * top_k >= columns:
         return None
-    return chunk, n_splits
+    levels = [n_splits]
+    while levels[-1] * top_k > _MAX_RESIDENT:
+        levels.append(-(-levels[-1] * top_k // _MAX_RESIDENT))
+    return _SplitPlan(chunk, tuple(levels))
 
 
 def qsa_block_topk_scratch_width(columns: int, top_k: int) -> int:
     """int32 columns of scratch ``qsa_block_topk`` wants per row; 0 when it needs none."""
     plan = _split_plan(columns, top_k)
-    return 0 if plan is None else 2 * plan[1] * top_k
+    return 0 if plan is None else 2 * top_k * sum(plan.levels)
 
 
 def qsa_block_topk(
@@ -396,24 +530,31 @@ def qsa_block_topk(
         )
         return out
 
-    chunk, n_splits = plan
-    half = n_splits * top_k
+    width = 2 * top_k * sum(plan.levels)
     if scratch is None:
-        scratch = torch.empty((rows, 2 * half), dtype=torch.int32, device=logits.device)
+        scratch = torch.empty((rows, width), dtype=torch.int32, device=logits.device)
     elif (
         scratch.ndim != 2
         or scratch.shape[0] < rows
-        or scratch.shape[1] < 2 * half
+        or scratch.shape[1] < width
         or scratch.dtype != torch.int32
         or scratch.stride(1) != 1
     ):
         raise ValueError(
             f"QSA block top-k needs a row-contiguous int32 scratch of at least "
-            f"[{rows}, {2 * half}], got {tuple(scratch.shape)} {scratch.dtype}"
+            f"[{rows}, {width}], got {tuple(scratch.shape)} {scratch.dtype}"
         )
-    keys = scratch[:rows, :half]
-    cols = scratch[:rows, half : 2 * half]
-    _qsa_topk_split_kernel[(rows, n_splits)](
+    # Each level's candidates: its keys, then their columns, level after level along the row.
+    candidates: list[tuple[torch.Tensor, torch.Tensor]] = []
+    offset = 0
+    for programs in plan.levels:
+        half = programs * top_k
+        candidates.append(
+            (scratch[:rows, offset : offset + half], scratch[:rows, offset + half : offset + 2 * half])
+        )
+        offset += 2 * half
+    keys, cols = candidates[0]
+    _qsa_topk_split_kernel[(rows, plan.levels[0])](
         logits,
         visible,
         keys,
@@ -423,14 +564,39 @@ def qsa_block_topk(
         columns,
         TOP_K=top_k,
         PAD_K=pad_k,
-        CHUNK=chunk,
+        CHUNK=plan.chunk,
         BINS=_BINS,
         RADIX=_RADIX,
         PASSES=_PASSES,
         num_warps=8,
         num_stages=1,
     )
-    merge_block = triton.next_power_of_2(half)
+    for level in range(1, len(plan.levels)):
+        (in_keys, in_cols), (out_keys, out_cols) = candidates[level - 1], candidates[level]
+        _qsa_topk_reduce_kernel[(rows, plan.levels[level])](
+            visible,
+            in_keys,
+            in_cols,
+            out_keys,
+            out_cols,
+            keys.stride(0),
+            columns,
+            TOP_K=top_k,
+            PAD_K=pad_k,
+            CHUNK=plan.chunk,
+            N_SPLITS=plan.levels[0],
+            LEVEL=level,
+            RESIDENT=_MAX_RESIDENT,
+            BLOCK_SMALL=min(1024, _MAX_RESIDENT),
+            BLOCK_MID=min(4096, _MAX_RESIDENT),
+            BINS=_BINS,
+            RADIX=_RADIX,
+            PASSES=_PASSES,
+            num_warps=8,
+            num_stages=1,
+        )
+    keys, cols = candidates[-1]
+    merge_block = triton.next_power_of_2(keys.shape[1])
     _qsa_topk_merge_kernel[(rows,)](
         visible,
         keys,
@@ -441,8 +607,10 @@ def qsa_block_topk(
         columns,
         TOP_K=top_k,
         PAD_K=pad_k,
-        CHUNK=chunk,
-        N_SPLITS=n_splits,
+        CHUNK=plan.chunk,
+        N_SPLITS=plan.levels[0],
+        LEVEL=len(plan.levels) - 1,
+        RESIDENT=_MAX_RESIDENT,
         BLOCK_SMALL=min(1024, merge_block),
         BLOCK_MID=min(4096, merge_block),
         BLOCK_FULL=merge_block,

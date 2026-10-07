@@ -159,6 +159,22 @@ def test_empty_effort_is_treated_as_absent():
     assert state.sent.chat_template_kwargs == {}
 
 
+def test_numeric_effort_rides_template_kwargs_not_the_wire_field():
+    # The wire field takes named tiers only (as vLLM and SGLang type it); a numeric budget goes
+    # through chat_template_kwargs, where the checkpoint's encoder validates it at render time.
+    from pydantic import ValidationError
+    import pytest
+
+    for effort in (37, True, 25.5):
+        with pytest.raises(ValidationError):
+            chat_request(reasoning_effort=effort)
+    ctk = {"enable_thinking": True, "reasoning_effort": 37}
+    state = FakeState(reasoning_parser="qwen3")
+    response = run(handle_chat_completion(chat_request(chat_template_kwargs=ctk), None, state, {}))
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == ctk
+
+
 def test_foreign_thinking_shapes_stay_ignored():
     # extra="allow" swallowed any thinking shape before the field existed;
     # a bare string, a bool, or a typeless dict must keep working unchanged.

@@ -19,7 +19,9 @@ class FusedMoEKernel(MoEKernel):
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i = cfg.local_intermediate
-        return {"gate_up": BankSpec((2 * i, cfg.hidden), torch.bfloat16), "down": BankSpec((cfg.hidden, i), torch.bfloat16)}
+        # resident experts compute in the model dtype; offload banks stay bf16, the FTW and CPU executor format
+        dt = cfg.dtype if cfg.strategy == "resident" else torch.bfloat16
+        return {"gate_up": BankSpec((2 * i, cfg.hidden), dt), "down": BankSpec((cfg.hidden, i), dt)}
 
     def pack(self, pieces, cfg: MoEConfig, out):
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
@@ -37,12 +39,3 @@ class FusedMoEKernel(MoEKernel):
 @register_method(QuantKind.NONE, LayerKind.MOE)
 class UnquantizedMoEMethod(MoEMethod):
     candidates = (FusedMoEKernel,)
-
-    def create_weights(self, layer) -> None:
-        g = self.cfg
-        i = g.local_intermediate
-        layer.gate_up_proj = torch.empty(g.num_experts, 2 * i, g.hidden)
-        layer.down_proj = torch.empty(g.num_experts, g.hidden, i)
-
-    def resident_view(self, layer) -> ExpertView:
-        return ExpertView({"gate_up": layer.gate_up_proj, "down": layer.down_proj})

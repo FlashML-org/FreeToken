@@ -367,7 +367,7 @@ def _offload_engine_config(**overrides):
             num_layers=10,
             num_moe_layers=10,
             num_experts=8,
-            expert_quant="nvfp4",  # quantized experts -> must resolve to an offload backend
+            expert_quant="nvfp4",
             moe_strategy="auto",
         ),
     )
@@ -389,7 +389,7 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
-def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
+def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend(monkeypatch):
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
     args.py's parse-time default only fires when the backend is *already*
@@ -400,9 +400,12 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     moe_cache_auto=True, so _init_offload_moe_cache's _require_offload_cache_size guard is never
     reached with moe_cache_size still 0.
     """
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
     from freetoken.moe import is_offload_moe_strategy
 
+    # a unified-memory host (GB10) resolves auto to fused instead
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
     config = _offload_engine_config()
     _adjust_config(config)
 
@@ -430,13 +433,17 @@ def test_page_table_width_covers_whole_trailing_pages():
             assert w > last_col and w % 32 == 0
 
 
-def _generic_rotary_cfg(max_position, override):
+def _generic_rotary_cfg(max_position, override, scaling=None):
     from types import SimpleNamespace
+
+    from freetoken.models.config import RotaryConfig
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
         has_swa_attention=False, has_linear_attention=False,
-        rotary_config=SimpleNamespace(max_position=max_position),
+        rotary_config=RotaryConfig(
+            head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
+        ),
     )
 
     class Cfg:
@@ -474,6 +481,19 @@ def test_adjust_config_allows_override_at_rope_table_boundary():
     from freetoken.engine.engine import _adjust_config
 
     _adjust_config(_generic_rotary_cfg(max_position=1024, override=1024))  # must not raise
+
+
+YARN_4X = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024}
+
+
+def test_adjust_config_allows_override_to_the_yarn_extended_table():
+    # A YaRN override that leaves max_position_embeddings at the trained length (Qwen3.8's 1M
+    # recipe) serves original * factor positions; the gate must follow the table, not the config.
+    from freetoken.engine.engine import _adjust_config
+
+    _adjust_config(_generic_rotary_cfg(max_position=1024, override=4096, scaling=YARN_4X))
+    with pytest.raises(ValueError, match=r"rope table \(4096 positions\)"):
+        _adjust_config(_generic_rotary_cfg(max_position=1024, override=4097, scaling=YARN_4X))
 
 
 def test_adjust_config_rope_gate_exempts_dsv4():

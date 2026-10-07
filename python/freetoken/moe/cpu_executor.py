@@ -53,6 +53,8 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+# Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
+_SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
@@ -116,6 +118,17 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
+    """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
+    if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
+        return False
+    pool = list(core_ids) + ([coord_core] if coord_core >= 0 else [])
+    if len(set(pool)) != len(pool):
+        return False
+    spare = set(os.sched_getaffinity(0)) - set(pool)
+    return len(spare) >= 2
+
+
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
@@ -158,6 +171,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        act_block: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -246,6 +260,8 @@ class CpuMoeExecutor:
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
+        self.spin_wait = _spin_wait_ok(core_ids, coord_core)
+        self._ext.set_spin_wait(self.spin_wait)
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
@@ -308,6 +324,11 @@ class CpuMoeExecutor:
         # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
         self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
+        # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
+        self._act_block = act_block
+        if fmt == "ds_fp4":
+            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
+            self._ext.set_act_block(act_block)
         if self._gpu_prequant:
             self._ext.set_input_prequant(True)
             logger.info_rank0(
@@ -319,7 +340,8 @@ class CpuMoeExecutor:
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
-            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
+            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
+            f"spin_wait={self.spin_wait}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
@@ -466,7 +488,7 @@ class CpuMoeExecutor:
         """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
-        activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
+        activations (the checkpoint's fp8 block) to match the DeepSeek W4A8 reference."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
@@ -474,7 +496,7 @@ class CpuMoeExecutor:
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        assert H % 32 == 0 and I % 32 == 0, (H, I)  # e8m0 scales per 32 along K
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
@@ -564,7 +586,7 @@ class CpuMoeExecutor:
             # pre-quantized activations and skips its serial scalar pass.
             from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 
-            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
+            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
 
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)

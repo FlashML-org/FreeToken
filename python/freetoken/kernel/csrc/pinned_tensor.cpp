@@ -1,5 +1,5 @@
 #include <cstdint>
-#include "hip_compat.h"
+#include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
 namespace {

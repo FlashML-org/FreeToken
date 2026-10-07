@@ -28,10 +28,13 @@ class MoEConfig:
     beta: float = 0.0
     limit: float | None = None
     interleaved: bool = False
+    # dynamic fp8 activation quant block of a W4A8 expert kernel, set by the quant dialect; None = no activation quant
+    act_block: int | None = None
     has_bias: bool = False
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"
     decode_target: str = "gpu"
+    dtype: torch.dtype = torch.bfloat16
 
     @classmethod
     def from_layer(cls, layer: Any, scheme: QuantScheme | None) -> "MoEConfig":
@@ -52,6 +55,7 @@ class MoEConfig:
             apply_router_weight_on_input=bool(layer.apply_router_weight_on_input),
             strategy=layer.strategy,
             decode_target=layer.decode_target,
+            dtype=torch.get_default_dtype(),
         )
 
     @property
@@ -136,6 +140,10 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # Whether ``apply`` treats a slot of -1 as an inactive route (zero output, no read of any slot).
+    # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
+    # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
+    supports_inactive_slots: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None
@@ -147,9 +155,7 @@ class MoEKernel(ABC):
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
 
-    def _common_reject(self, cfg: MoEConfig, *, resident_ok: bool, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
-        if not resident_ok and cfg.strategy == "resident":
-            return "not served resident; use --moe-strategy offload or cpu"
+    def _common_reject(self, cfg: MoEConfig, *, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
         if not tp_ok and cfg.tp_size > 1:
             return "TP > 1 is not supported for this expert format"
         if not cpu_ok and cfg.decode_target != "gpu":
@@ -190,12 +196,15 @@ class MoEMethod(QuantMethod):
     def cpu_format(self) -> str | None:
         return self.kernel.cpu_format
 
-    @abstractmethod
-    def create_weights(self, layer: Any) -> None: ...
+    def create_weights(self, layer: Any) -> None:
+        # resident experts stay out of the state dict; attach_resident_banks fills these after the dense weights load
+        layer._expert_banks = None
+        layer._expert_alphas = None
 
     def finalize(self, layer: Any) -> None:
         pass
 
-    @abstractmethod
     def resident_view(self, layer: Any) -> ExpertView:
         """Layout roles -> the resident layer's tensors, for apply()."""
+        assert layer._expert_banks is not None, "resident expert banks were never loaded"
+        return ExpertView(layer._expert_banks, n=self.cfg.num_experts, alphas=layer._expert_alphas)

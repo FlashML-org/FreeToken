@@ -168,11 +168,11 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 yield from _iter_nvfp4_resident(reader, f"{m}.{proj}", f"{m}.{proj}")
         else:
-            # router (bf16 gate + fp32 selection bias -> bf16) and shared expert.
+            # router (bf16 gate + fp32 selection bias) and shared expert.
             yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")
             yield (
                 f"{m}.e_score_correction_bias",
-                reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
+                reader.get(f"{m}.gate.e_score_correction_bias").to(torch.float32),
             )
             s = f"{m}.shared_experts"
             for proj in ("gate_proj", "up_proj", "down_proj"):

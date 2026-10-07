@@ -432,6 +432,43 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
         raise err[0]
 
 
+def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
+    """``(all, alphas, flat regions, {base: {layer: entry}})`` of the ``experts_bank`` entries; None when there are none."""
+    bank_entries = reader.entries("experts_bank")
+    if not bank_entries:
+        return None
+
+    alpha_entries = [e for e in bank_entries if e["name"] in _ALPHA_NAMES]
+    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
+
+    meta_layers = reader.meta("expert_bank_num_layers")
+    if meta_layers is not None and meta_layers != num_layers:
+        raise RuntimeError(
+            f"{path!r} was converted with {meta_layers} expert-bank layers but the "
+            f"model config says num_moe_layers={num_layers}; the checkpoint does not "
+            "match its config"
+        )
+
+    # Split row entries into the two layouts by name.
+    flat_entries: list[dict] = []
+    per_layer_groups: dict[str, dict[int, dict]] = {}
+    for e in row_entries:
+        m = _LAYER_ENTRY_RE.match(e["name"])
+        if m is None:
+            flat_entries.append(e)
+            continue
+        per_layer_groups.setdefault(m.group("base"), {})[int(m.group("layer"))] = e
+
+    mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
+    assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
+    for base, by_layer in per_layer_groups.items():
+        assert sorted(by_layer) == list(range(num_layers)), (
+            f"FTW bank {base!r} has per-layer entries for layers {sorted(by_layer)}, "
+            f"expected exactly range({num_layers})"
+        )
+    return bank_entries, alpha_entries, flat_entries, per_layer_groups
+
+
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
@@ -482,39 +519,19 @@ def load_ftw_banks(
         return "mmap"
 
     reader = FTWReader(path)
-    bank_entries = reader.entries("experts_bank")
-    if not bank_entries:
+    try:
+        split = _split_bank_entries(reader, path, num_layers)
+    except BaseException:
+        reader.close()
+        raise
+    if split is None:
         reader.close()
         return None
-
-    alpha_entries = [e for e in bank_entries if e["name"] in _ALPHA_NAMES]
-    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
-
-    meta_layers = reader.meta("expert_bank_num_layers")
-    if meta_layers is not None and meta_layers != num_layers:
-        reader.close()
-        raise RuntimeError(
-            f"{path!r} was converted with {meta_layers} expert-bank layers but the "
-            f"model config says num_moe_layers={num_layers}; the checkpoint does not "
-            "match its config"
-        )
+    bank_entries, alpha_entries, flat_entries, per_layer_groups = split
 
     # Alphas: unchanged, one flat HostBank per entry.
     alpha_specs = {e["name"]: (tuple(e["shape"]), _dtype_of(e["dtype"])) for e in alpha_entries}
     alpha_hb = alloc_banks(alpha_specs)
-
-    # Split row entries into the two layouts by name.
-    flat_entries: list[dict] = []
-    per_layer_groups: dict[str, dict[int, dict]] = {}
-    for e in row_entries:
-        m = _LAYER_ENTRY_RE.match(e["name"])
-        if m is None:
-            flat_entries.append(e)
-            continue
-        per_layer_groups.setdefault(m.group("base"), {})[int(m.group("layer"))] = e
-
-    mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
-    assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
 
     # Row banks: one padded-window HostBank per (name, layer_id) for the flat layout, plus
     # how to carve the real [num_experts, *row_shape] tensor out of its head; ``None`` marks
@@ -546,10 +563,6 @@ def load_ftw_banks(
             row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
 
     for base, by_layer in per_layer_groups.items():
-        assert sorted(by_layer) == list(range(num_layers)), (
-            f"FTW bank {base!r} has per-layer entries for layers {sorted(by_layer)}, "
-            f"expected exactly range({num_layers})"
-        )
         row_hb[base] = []
         row_view_args[base] = []
         for layer_id in range(num_layers):
@@ -659,8 +672,71 @@ def load_ftw_banks(
     )
 
 
+def load_ftw_banks_to_device(path: str, *, num_layers: int, device: torch.device, workers: int = 8, chunk: int = _DEFAULT_CHUNK):
+    """:func:`load_ftw_banks` for resident experts: every bank lands on ``device``, one (bank, layer) at a time through a transient host buffer."""
+    from freetoken.moe.expert_banks import ExpertBanks
+    from freetoken.moe.legacy_format import canonical_role, kind_kernel_for
+    from freetoken.utils.progress import byte_bar
+
+    reader = FTWReader(path)
+    try:
+        split = _split_bank_entries(reader, path, num_layers)
+        if split is None:
+            return None
+        bank_entries, alpha_entries, flat_entries, per_layer_groups = split
+
+        # (name, layer_id or None for an alpha, read offset, read length, head pad, shape, dtype)
+        jobs = [(e["name"], None, e["global_off"], e["nbytes"], 0, tuple(e["shape"]), _dtype_of(e["dtype"])) for e in alpha_entries]
+        for e in flat_entries:
+            total, *row_shape = e["shape"]
+            assert total % num_layers == 0, (e["name"], total, num_layers)
+            layer_bytes = total // num_layers * math.prod(row_shape) * _elsize(_dtype_of(e["dtype"]))
+            assert layer_bytes * num_layers == e["nbytes"], (e["name"], layer_bytes, num_layers, e["nbytes"])
+            for layer_id in range(num_layers):
+                off = e["global_off"] + layer_id * layer_bytes
+                win_off = (off // ALIGN) * ALIGN
+                jobs.append((e["name"], layer_id, win_off, _align_up(off + layer_bytes) - win_off, off - win_off, (total // num_layers, *row_shape), _dtype_of(e["dtype"])))
+        for base, by_layer in per_layer_groups.items():
+            for layer_id in range(num_layers):
+                e = by_layer[layer_id]
+                jobs.append((base, layer_id, e["global_off"], e["nbytes"], 0, tuple(e["shape"]), _dtype_of(e["dtype"])))
+
+        def _read(job) -> torch.Tensor:
+            _name, _layer, off, nbytes, head_pad, shape, dtype = job
+            buf = _transient_buffer(nbytes)
+            reader.read_into(memoryview(buf), {"global_off": off, "nbytes": nbytes}, workers=workers, chunk=chunk)
+            count = math.prod(shape) * _elsize(dtype)
+            return torch.frombuffer(buf, dtype=torch.uint8, count=head_pad + count)[head_pad:].view(dtype).view(shape)
+
+        sources: dict[str, list] = {}
+        alphas: dict[str, torch.Tensor] = {}
+        bar = byte_bar(sum(e["nbytes"] for e in bank_entries), "Loading expert banks (FTW)")
+        try:
+            # read the next (bank, layer) while the current one copies to the device
+            with ThreadPoolExecutor(1) as ex:
+                ahead = ex.submit(_read, jobs[0])
+                for k, (name, layer_id, *_rest) in enumerate(jobs):
+                    host = ahead.result()
+                    if k + 1 < len(jobs):
+                        ahead = ex.submit(_read, jobs[k + 1])
+                    if layer_id is None:
+                        alphas[name] = host.to(device)
+                    else:
+                        sources.setdefault(canonical_role(name), [None] * num_layers)[layer_id] = host.to(device)
+                    bar.update(host.numel() * host.element_size())
+                    del host
+        finally:
+            bar.close()
+        quant_format = reader.meta("quant_format")
+    finally:
+        reader.close()
+
+    kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
+    return ExpertBanks(quant_format, sources, **alphas, kind=kind, kernel=kernel)
+
+
 __all__ = [
     "INDEX_NAME", "FORMAT_TAG", "FORMAT_VERSION", "ALIGN", "DEFAULT_SHARD_LIMIT",
     "is_ftw_checkpoint", "ftw_tensor_names", "FTWWriter", "FTWReader",
-    "iter_ftw_weights", "load_ftw_banks", "layer_bank_entry_name",
+    "iter_ftw_weights", "load_ftw_banks", "load_ftw_banks_to_device", "layer_bank_entry_name",
 ]

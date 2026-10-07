@@ -71,8 +71,9 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
-        mr = self.cache_manager.match_req(req)
+        # TODO: consider host cache match case (it needs the same replay cap)
+        replay = self.cache_manager.prefix_replay_tokens
+        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -214,6 +215,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            prompt_len=pending_req.input_len,
         )
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full

@@ -332,6 +332,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
     ),
+    AotModel(
+        # DSV41 pools are packed byte rows written by the dsv41 pack kernel, not store_cache;
+        # the routed experts share DSV4's ds_fp4 bank layout (hidden 5120, intermediate 2304).
+        name="deepseek-ai/DeepSeek-V4.1-Flash",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("ds_fp4",),
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",

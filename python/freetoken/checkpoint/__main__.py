@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--out", required=True, help="output FTW checkpoint dir")
     p.add_argument("--dtype", choices=sorted(_DTYPES), default="bfloat16")
     p.add_argument("--moe-backend", default="offload",
-                   help="offload (experts -> banks) or e.g. triton (experts stay dense)")
+                   help="kept for compatibility: MoE experts always go to banks, which every strategy reads")
     p.add_argument("--quant-backend", type=_parse_quant_backend, default=None,
                    help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
                         "chosen MoE kernel and the server picks that kernel back up from the FTW")

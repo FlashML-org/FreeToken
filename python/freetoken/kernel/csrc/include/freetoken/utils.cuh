@@ -1,5 +1,6 @@
 #pragma once
 
+#include <freetoken/hip_compat.h>
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -9,50 +10,6 @@
 #include <cstddef>
 #include <source_location>
 #include <type_traits>
-
-// nvcc implicitly pulls in the CUDA runtime for .cu translation units; hipcc does
-// not do the equivalent for HIP, so it must be included explicitly here. On the
-// HIP path there is no cudaLaunchKernelEx/cudaLaunchConfig_t equivalent (that API
-// is Hopper PDL-specific), so LaunchKernel gets its own HIP-side definition below
-// instead of a name-aliasing shim -- see PDL below for why that also means
-// with_attr(true) is a no-op on this path.
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-
-using cudaError_t = hipError_t;
-constexpr hipError_t cudaSuccess = hipSuccess;
-using cudaStream_t = hipStream_t;
-
-inline const char *cudaGetErrorString(hipError_t e) { return hipGetErrorString(e); }
-inline hipError_t cudaGetLastError() { return hipGetLastError(); }
-inline hipError_t cudaFuncSetAttribute(const void *func, hipFuncAttribute attr,
-                                       int value) {
-  return hipFuncSetAttribute(func, attr, value);
-}
-constexpr hipFuncAttribute cudaFuncAttributeMaxDynamicSharedMemorySize =
-    hipFuncAttributeMaxDynamicSharedMemorySize;
-
-inline hipError_t cudaGetDevice(int *device) { return hipGetDevice(device); }
-inline hipError_t cudaDeviceGetAttribute(int *value, hipDeviceAttribute_t attr,
-                                         int device) {
-  return hipDeviceGetAttribute(value, attr, device);
-}
-inline hipError_t cudaHostGetDevicePointer(void **devPtr, void *hostPtr,
-                                           unsigned int flags) {
-  return hipHostGetDevicePointer(devPtr, hostPtr, flags);
-}
-constexpr hipDeviceAttribute_t cudaDevAttrUnifiedAddressing =
-    hipDeviceAttributeUnifiedAddressing;
-constexpr hipDeviceAttribute_t cudaDevAttrCanUseHostPointerForRegisteredMem =
-    hipDeviceAttributeCanUseHostPointerForRegisteredMem;
-
-// CUDA-only kernel-parameter annotation (passes large by-value params via constant
-// memory instead of copying them into local/generic memory first); HIP has no
-// equivalent attribute, so this just falls back to an ordinary by-value parameter.
-#define __grid_constant__
-#else
-#include <cuda_runtime.h>
-#endif
 
 namespace device {
 
@@ -86,24 +43,16 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
-// Programmatic Dependent Launch is a Hopper-only CUDA hardware feature; the PTX
-// below has no HIP/ROCm equivalent. Callers gate kUsePDL off for non-Hopper CUDA
-// targets already, and LaunchKernel::with_attr is a no-op on HIP (see below), so
-// this stays unconditionally a no-op there rather than a compile failure.
 template <bool kUsePDL> __always_inline __device__ void wait() {
-#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
-#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
-#endif
 }
 
 } // namespace PDL
@@ -140,50 +89,6 @@ template <auto F> inline void set_smem_once(std::size_t smem_size) {
       last_smem_size, " bytes");
 }
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-
-// HIP has no cudaLaunchKernelEx/cudaLaunchConfig_t analog (that API only exists to
-// carry Hopper PDL attributes, which ROCm hardware has no equivalent for), so this
-// launches via the plain triple-chevron form instead. with_attr(true) is therefore
-// a no-op here -- there is no attribute to carry.
-struct LaunchKernel {
-public:
-  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, DLDevice device,
-                        std::size_t dynamic_shared_mem_bytes = 0) noexcept
-      : m_grid_dim(grid_dim), m_block_dim(block_dim),
-        m_smem(dynamic_shared_mem_bytes), m_stream(resolve_device(device)) {}
-
-  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, cudaStream_t stream,
-                        std::size_t dynamic_shared_mem_bytes = 0) noexcept
-      : m_grid_dim(grid_dim), m_block_dim(block_dim),
-        m_smem(dynamic_shared_mem_bytes), m_stream(stream) {}
-
-  static auto resolve_device(DLDevice device) -> cudaStream_t {
-    return static_cast<cudaStream_t>(
-        ::TVMFFIEnvGetStream(device.device_type, device.device_id));
-  }
-
-  LaunchKernel(const LaunchKernel &) = delete;
-  LaunchKernel &operator=(const LaunchKernel &) = delete;
-
-  template <typename T, typename... Args>
-  auto operator()(T &&kernel, Args &&...args) const -> void {
-    kernel<<<m_grid_dim, m_block_dim, m_smem, m_stream>>>(
-        std::forward<Args>(args)...);
-    CUDA_CHECK(::cudaGetLastError());
-  }
-
-  auto with_attr(bool /*use_pdl*/) -> LaunchKernel & { return *this; }
-
-private:
-  dim3 m_grid_dim;
-  dim3 m_block_dim;
-  std::size_t m_smem;
-  cudaStream_t m_stream;
-};
-
-#else
-
 struct LaunchKernel {
 public:
   explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, DLDevice device,
@@ -211,6 +116,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if FREETOKEN_USE_ROCM
+    (void)use_pdl;
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -219,6 +128,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
@@ -236,7 +146,5 @@ private:
   cudaLaunchConfig_t m_config;
   cudaLaunchAttribute m_attr_cache;
 };
-
-#endif
 
 } // namespace host

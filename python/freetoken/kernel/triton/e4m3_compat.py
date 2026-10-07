@@ -60,12 +60,8 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         elif torch.version.hip is not None:
-            # torch.cuda.get_device_capability() on a HIP build returns the gfx/RDNA
-            # generation number (e.g. (11, 5) for gfx1150), not a CUDA compute
-            # capability -- comparing it against (8, 9) below is a tuple comparison
-            # over two unrelated numbering schemes and can false-positive (11 > 8).
-            # No AMD GPU has this fp8e4nv unit; e4m3_native_cx() (Triton's own,
-            # backend-aware check) already agrees this must be False.
+            # ROCm reports gfx1101 as capability (11, 0), which is not a CUDA
+            # compute capability and must not select the native fp8e4nv path.
             _native = False
         else:
             from freetoken.gpu_select import assigned_visible_gpu
@@ -111,6 +107,20 @@ def e4m3_u8_to_f16_x128(v):
     (max 448*128 = 57344) and is exact (power-of-two scaling)."""
     h = ((v & 0x80).to(tl.uint16) << 8) | ((v & 0x7F).to(tl.uint16) << 7)
     return h.to(tl.float16, bitcast=True) * 32768.0
+
+
+@jit
+def e4m3_f32_to_u8(x):
+    """Encode an fp32 value that already sits on the e4m3 grid (see :func:`round_e4m3`, |x| <= 448)
+    into its e4m3 bit pattern (uint8). Normals: fp32 exponent rebased 127 -> 7 with the top three
+    mantissa bits; subnormals (|x| < 2^-6, grid 2^-9): mantissa = |x| / 2^-9, exponent field 0."""
+    b = x.to(tl.uint32, bitcast=True)
+    sign = ((b >> 31) & 1).to(tl.uint8) << 7
+    exp = ((b >> 23) & 0xFF).to(tl.int32) - 127 + 7
+    man = ((b >> 20) & 0x7).to(tl.uint8)
+    normal = (exp.to(tl.uint8) << 3) | man
+    sub = (tl.abs(x) * 512.0).to(tl.uint8)  # 0..7 on the 2^-9 grid
+    return sign | tl.where(tl.abs(x) >= 0.015625, normal, sub)
 
 
 @jit

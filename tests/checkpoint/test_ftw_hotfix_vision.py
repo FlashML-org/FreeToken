@@ -14,7 +14,7 @@ _SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "ftw_hotfix.
 
 # env var -> local checkpoint, as tests/README.md lists them
 _CHECKPOINTS = ("FREETOKEN_QWEN3VL_MODEL", "FREETOKEN_GEMMA4_MODEL", "FREETOKEN_GEMMA4_UNIFIED_MODEL",
-                "FREETOKEN_GLM53_MODEL", "FREETOKEN_MUSE_MODEL", "FREETOKEN_MINIMAX_M3_MODEL")
+                "FREETOKEN_GLM53_MODEL", "FREETOKEN_MUSE_MODEL", "FREETOKEN_MINIMAX_M3_MODEL", "FREETOKEN_DSV41_MODEL")
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +34,10 @@ def hotfix():
     ("vision_tower.vision_model.embeddings.patch_embedding.weight", True),
     ("multi_modal_projector.linear_1.weight", True),
     ("patch_merge_mlp.linear_2.bias", True),
+    ("vision.blocks.0.norm1.weight", True),
+    ("aligner.w1.weight", True),
+    ("image_newline", True),
+    ("layers.3.ffn.gate.bias_vl", True),
     ("model.embed_audio.embedding_projection.weight", False),
     ("model.language_model.layers.0.self_attn.q_proj.weight", False),
     ("model.layers.3.mlp.experts.0.gate_proj.weight", False),

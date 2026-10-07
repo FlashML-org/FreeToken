@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.dsv4_paged_pool import FreeListAllocator
+from freetoken.kvcache.dsv4.v4_pool import FreeListAllocator
 
 DEVICE = torch.device("cpu")
 P = 128

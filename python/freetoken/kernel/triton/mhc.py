@@ -27,7 +27,7 @@ def _mhc_stage1_kernel(
     H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
     SPLIT: tl.constexpr,     # hidden elems per split (multiple of BLOCK_H)
     BLOCK_H: tl.constexpr,
-    NS: tl.constexpr,
+    NS: tl.constexpr,        # splits per token (the grid's second axis; need not be a power of two)
     HAS_POST: tl.constexpr,
 ):
     """Split-K stage of the fused mHC: each program owns one hidden slice of one
@@ -79,24 +79,24 @@ def _mhc_stage1_kernel(
 
 
 @triton.jit
-def _mhc_stage2_kernel(
-    sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr,
+def _mhc_gates(
+    t, sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr,
     post_out_ptr, comb_out_ptr, pre_out_ptr,
     rms_eps, hc_eps, post_mult,
     SINKHORN: tl.constexpr,
     H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
-    NS: tl.constexpr,
+    NS: tl.constexpr, BLK_NS: tl.constexpr,
 ):
-    """Reduce the split partials and run the tiny gate math (sigmoid gates,
-    row-softmax + in-register 4x4 Sinkhorn); emits pre gates for stage 3."""
-    t = tl.program_id(0).to(tl.int64)
+    """Reduce token ``t``'s split partials and run the tiny gate math (sigmoid gates,
+    row-softmax + in-register 4x4 Sinkhorn); writes post / comb / pre for the next sublayer."""
     offs_mix = tl.arange(0, BLK_MIX)
     mix_mask = offs_mix < MIX
-    offs_s = tl.arange(0, NS)
+    offs_s = tl.arange(0, BLK_NS)
+    s_mask = offs_s < NS
 
-    sqsum = tl.sum(tl.load(sq_part_ptr + t * NS + offs_s))
+    sqsum = tl.sum(tl.load(sq_part_ptr + t * NS + offs_s, mask=s_mask, other=0.0))
     acc = tl.sum(
-        tl.load(mix_part_ptr + (t * NS + offs_s)[:, None] * BLK_MIX + offs_mix[None, :]),
+        tl.load(mix_part_ptr + (t * NS + offs_s)[:, None] * BLK_MIX + offs_mix[None, :], mask=s_mask[:, None], other=0.0),
         axis=0,
     )
     inv_rms = tl.math.rsqrt(sqsum / (N * H) + rms_eps)
@@ -142,6 +142,23 @@ def _mhc_stage2_kernel(
     tl.store(comb_out_ptr + t * N * N + offs_n2[:, None] * N + offs_n2[None, :], comb)
 
 
+
+@triton.jit
+def _mhc_stage2_kernel(
+    sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr,
+    post_out_ptr, comb_out_ptr, pre_out_ptr,
+    rms_eps, hc_eps, post_mult,
+    SINKHORN: tl.constexpr,
+    H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
+    NS: tl.constexpr, BLK_NS: tl.constexpr,
+):
+    """Gate math alone (the two-pass variant, whose stage 3 consumes these pre gates)."""
+    _mhc_gates(
+        tl.program_id(0).to(tl.int64), sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr, post_out_ptr, comb_out_ptr, pre_out_ptr,
+        rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS,
+    )
+
+
 @triton.jit
 def _mhc_stage3_kernel(
     res_out_ptr, pre_ptr, li_out_ptr,
@@ -161,7 +178,46 @@ def _mhc_stage3_kernel(
     tl.store(li_out_ptr + t * H + offs_h, li.to(li_out_ptr.dtype.element_ty), mask=h_mask)
 
 
-def mhc_fused_post_pre_triton(
+@triton.jit
+def _mhc_stage23_kernel(
+    res_out_ptr, pre_ptr, li_out_ptr,
+    sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr,
+    post_out_ptr, comb_out_ptr, pre_out_ptr,
+    rms_eps, hc_eps, post_mult,
+    SINKHORN: tl.constexpr,
+    H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
+    NS: tl.constexpr, BLK_NS: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    """Single-pass mHC: the layer input mixes with the PREVIOUS sublayer's pre gates, so the
+    gate math for the next sublayer (stage 2) does not gate stage 3 -- one launch does both:
+    every program mixes one hidden chunk, program 0 of each token also reduces the split
+    partials and writes the next sublayer's gates."""
+    t = tl.program_id(0).to(tl.int64)
+    hb = tl.program_id(1)
+    offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = offs_h < H
+    offs_n = tl.arange(0, N)
+    pre = tl.load(pre_ptr + t * N + offs_n)
+    li = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for n in tl.static_range(N):
+        r = tl.load(res_out_ptr + (t * N + n) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+        li += tl.sum(tl.where(offs_n == n, pre, 0.0)) * r
+    tl.store(li_out_ptr + t * H + offs_h, li.to(li_out_ptr.dtype.element_ty), mask=h_mask)
+    if hb == 0:
+        _mhc_gates(
+            t, sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr, post_out_ptr, comb_out_ptr, pre_out_ptr,
+            rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS,
+        )
+
+
+def _stage1_hidden_tile(h: int) -> int:
+    """The stage-1 hidden split. It fixes the fp32 reduction order over the hidden width, so it
+    depends on the width alone and results reproduce across processes, machines and chunk sizes.
+    128 gives 32 / 40 programs per token at widths 4096 / 5120."""
+    return min(128, triton.next_power_of_2(h))
+
+
+def _mhc_fused_launch(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_mix: torch.Tensor | None,
@@ -173,11 +229,12 @@ def mhc_fused_post_pre_triton(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused hc_post (skipped when ``post_mix is None``) + hc_pre. Three-stage
-    split-K: the GEMV/sq-sum reduction fans out over NS hidden slices. Returns
-    (residual_new [T,N,H] bf16, post [T,N,1] fp32, comb [T,N,N] fp32,
-    layer_input [T,H] bf16)."""
+    pre_mix_in: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The three stages behind both variants. ``pre_mix_in`` selects single-pass: the
+    layer input is mixed with it instead of with the pre gates stage 2 just computed
+    (those are still returned, for the next sublayer). Returns (residual_new, post,
+    comb, pre_new [T,N] fp32, layer_input)."""
     t, n, h = residual.shape
     mix = 2 * n + n * n
     assert fn.shape == (mix, n * h) and fn.dtype == torch.float32
@@ -190,12 +247,7 @@ def mhc_fused_post_pre_triton(
     comb_out = torch.empty(t, n, n, dtype=torch.float32, device=dev)
     li_out = torch.empty(t, h, dtype=residual.dtype, device=dev)
 
-    block_h = min(512, triton.next_power_of_2(h))
-    # NS feeds a tl.arange in stage 2 -> keep it a power of two.
-    ns = 1
-    while ns * 2 <= min(16, h // block_h):
-        ns *= 2
-    split = triton.cdiv(triton.cdiv(h, ns), block_h) * block_h
+    block_h = split = _stage1_hidden_tile(h)
     ns = triton.cdiv(h, split)
     blk_mix = triton.next_power_of_2(mix)
     sq_part = torch.empty(t, ns, dtype=torch.float32, device=dev)
@@ -213,20 +265,83 @@ def mhc_fused_post_pre_triton(
         HAS_POST=has_post,
         num_warps=4, num_stages=2,
     )
-    _mhc_stage2_kernel[(t,)](
-        sq_part, mix_part, hc_scale, hc_base,
-        post_out, comb_out, pre_out,
-        rms_eps, hc_eps, post_mult,
-        SINKHORN=sinkhorn_repeat,
-        H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns,
-        num_warps=1,
-    )
-    _mhc_stage3_kernel[(t, triton.cdiv(h, 1024))](
-        res_out, pre_out, li_out,
-        H=h, N=n, BLOCK_H=min(1024, triton.next_power_of_2(h)),
-        num_warps=4,
-    )
-    return res_out, post_out.view(t, n, 1), comb_out, li_out
+    block_h3 = min(1024, triton.next_power_of_2(h))
+    if pre_mix_in is None:
+        # two-pass: stage 3 mixes with the gates stage 2 just produced
+        _mhc_stage2_kernel[(t,)](
+            sq_part, mix_part, hc_scale, hc_base,
+            post_out, comb_out, pre_out,
+            rms_eps, hc_eps, post_mult,
+            SINKHORN=sinkhorn_repeat,
+            H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns, BLK_NS=triton.next_power_of_2(ns),
+            num_warps=1,
+        )
+        _mhc_stage3_kernel[(t, triton.cdiv(h, block_h3))](
+            res_out, pre_out, li_out,
+            H=h, N=n, BLOCK_H=block_h3,
+            num_warps=4,
+        )
+    else:
+        # single-pass: the mix uses the previous sublayer's gates, so stages 2 and 3 share a launch
+        assert pre_mix_in.shape == (t, n), (pre_mix_in.shape, (t, n))
+        _mhc_stage23_kernel[(t, triton.cdiv(h, block_h3))](
+            res_out, pre_mix_in.to(torch.float32).contiguous(), li_out,
+            sq_part, mix_part, hc_scale, hc_base,
+            post_out, comb_out, pre_out,
+            rms_eps, hc_eps, post_mult,
+            SINKHORN=sinkhorn_repeat,
+            H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns, BLK_NS=triton.next_power_of_2(ns), BLOCK_H=block_h3,
+            num_warps=4,
+        )
+    return res_out, post_out.view(t, n, 1), comb_out, pre_out, li_out
 
 
-__all__ = ["mhc_fused_post_pre_triton"]
+def mhc_fused_post_pre_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor | None,
+    comb_mix: torch.Tensor | None,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    post_mult: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused hc_post (skipped when ``post_mix is None``) + hc_pre. Three-stage
+    split-K: the GEMV/sq-sum reduction fans out over NS hidden slices. Returns
+    (residual_new [T,N,H] bf16, post [T,N,1] fp32, comb [T,N,N] fp32,
+    layer_input [T,H] bf16)."""
+    res_out, post_out, comb_out, _pre_out, li_out = _mhc_fused_launch(
+        x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
+        rms_eps, hc_eps, post_mult, sinkhorn_repeat, pre_mix_in=None,
+    )
+    return res_out, post_out, comb_out, li_out
+
+
+def mhc_fused_post_pre_single_pass_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor | None,
+    comb_mix: torch.Tensor | None,
+    pre_mix_in: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    post_mult: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Single-pass mHC (DeepSeek-V4.1): same fused stages, but the layer input is mixed
+    with the PREVIOUS sublayer's ``pre_mix_in`` and this sublayer's pre gates come back
+    as ``pre_new`` for the next one. Returns (residual_new, post [T,N,1], comb [T,N,N],
+    pre_new [T,N] fp32, layer_input)."""
+    return _mhc_fused_launch(
+        x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
+        rms_eps, hc_eps, post_mult, sinkhorn_repeat, pre_mix_in=pre_mix_in,
+    )
+
+
+__all__ = ["mhc_fused_post_pre_triton", "mhc_fused_post_pre_single_pass_triton"]

@@ -25,6 +25,7 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -257,6 +258,7 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_blocks_per_bank = 8
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
@@ -354,7 +356,7 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
@@ -438,6 +440,7 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+        self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
     def validate_rebuild(self, cache_size: int) -> None:
@@ -492,7 +495,7 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -1038,6 +1041,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                blocks_per_bank=self._copy_blocks_per_bank,
             )
             return
 
@@ -1054,20 +1058,9 @@ class OffloadMoeCache:
 
 
 def iter_offload_moe_layers(model) -> Iterator:
-    from freetoken.layers import BaseOP, OffloadMoELayer
+    from freetoken.layers import OffloadMoELayer, iter_moe_layers
 
-    if isinstance(model, OffloadMoELayer):
-        yield model
-
-    if not isinstance(model, BaseOP):
-        return
-
-    for value in model.__dict__.values():
-        if isinstance(value, BaseOP):
-            yield from iter_offload_moe_layers(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from iter_offload_moe_layers(item)
+    return (layer for layer in iter_moe_layers(model) if isinstance(layer, OffloadMoELayer))
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:

@@ -563,8 +563,12 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
         or pools.get("num_pages", 0) or 0
     )
     page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
-    is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
-    swa_page_size = page_size if is_dsv4 else 1
+    from freetoken.kvcache.cache_status import window_pool_spec
+
+    spec = window_pool_spec(config)
+    if spec is None:
+        raise ValueError("swa_full_tokens_ratio requested but this model has no resizable window pool")
+    swa_page_size = spec.page_size
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
@@ -604,12 +608,16 @@ async def cache_rebuild(req: CacheRebuildRequest):
             {"status": "failed", "error": "swa_full_tokens_ratio must be in (0, 1]"},
             status_code=422,
         )
+    try:
+        num_swa_pages = _resolve_num_swa_pages(state, req)
+    except ValueError as exc:
+        return JSONResponse({"status": "failed", "error": str(exc)}, status_code=422)
     result = await dispatch_rebuild(
         state,
         moe_cache_size=req.moe_cache_size,
         num_pages=req.num_pages,
         num_mamba_slots=req.num_mamba_slots,
-        num_swa_pages=_resolve_num_swa_pages(state, req),
+        num_swa_pages=num_swa_pages,
         mode=req.mode,
         timeout=req.timeout,
     )
@@ -739,11 +747,11 @@ def cache_geometry(state: Any) -> dict:
     # the internal currency), else the load-time meta value. 0.0 for models without a window pool.
     swa_full_tokens_ratio = float(getattr(state, "swa_full_tokens_ratio", 0.0) or 0.0)
     last_swa_pages = last.get("num_swa_pages")
-    if last_swa_pages:
-        is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
-        full = num_pages if is_dsv4 else num_pages * page_size
+    swa_page_size = int(pools.get("swa_page_size", 0) or 0)
+    if last_swa_pages and swa_page_size:
+        full = num_pages * page_size
         if full > 0:
-            swa_full_tokens_ratio = min(1.0, last_swa_pages / full)
+            swa_full_tokens_ratio = min(1.0, last_swa_pages * swa_page_size / full)
     try:
         model_config = config.model_config
         num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -785,9 +793,8 @@ def cache_geometry(state: Any) -> dict:
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
         "unit_bytes": unit_bytes,
         "swa_full_tokens_ratio": swa_full_tokens_ratio,
-        # The window pool's page unit for num_swa_pages: DSV4 = P (== page_size), radix-SWA = 1
-        # token, 0 for models without a window pool. Lets a client denominate the swa control.
-        "swa_page_size": int(pools.get("swa_page_size", 0) or 0),
+        # The pool's window page unit; 0 for models without a resizable window pool.
+        "swa_page_size": swa_page_size,
         # Concrete current window size in that unit (usable pages): the last rebuild's value if it
         # pinned/derived one, else the load-time pool size. 0 for models without a window pool.
         "num_swa_pages": int(last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0),

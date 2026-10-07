@@ -35,6 +35,14 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
+@dataclass(frozen=True)
+class WindowPoolSpec:
+    """Window resize units and minimum usable capacity, excluding reserved pages."""
+
+    page_size: int
+    min_pages: int
+
+
 class BaseKVCachePool(ABC):
     """
     Base class for key-value caches.
@@ -44,6 +52,15 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+
+    @classmethod
+    def window_spec(cls, config) -> WindowPoolSpec | None:
+        return None
+
+    @property
+    def window_pages(self) -> int:
+        """Current usable window pages in the units declared by window_spec."""
+        return 0
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family

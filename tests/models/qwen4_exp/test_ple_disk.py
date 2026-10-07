@@ -13,7 +13,7 @@ from freetoken.models.qwen4_exp.ple import GpuResidentTable, NGramEmbedding
 from .common import EOS, hash_constants, requires_cuda, toy_hf_config
 from .test_ple import _meta
 
-_ple_store = pytest.importorskip("freetoken.kernel._ple_store")
+_row_store = pytest.importorskip("freetoken.kernel._row_store")
 
 _KEY_PREFIX = "model.layers.1.ple.ple_embedding.ngram_embedding"
 
@@ -43,7 +43,7 @@ def _make_store(tmp_path, *, write=True, use_io_uring=True):
     path = tmp_path / "ple-table.bin"
     if write:
         path.write_bytes(table.numpy().tobytes())
-    store = _ple_store.PleStore(
+    store = _row_store.PleStore(
         paths=[str(path)],
         extent_file=[0],
         extent_base=[0],
@@ -175,10 +175,10 @@ def test_layouts_readers_and_errors(tmp_path):
         multipliers=[3, 5, 7], head_vocab_sizes=sizes, head_offsets=offsets,
         eos_token_id=eos,
     )
-    ref = _ple_store.PleStore(
+    ref = _row_store.PleStore(
         paths=[str(flat)], extent_file=[0, 0, 0, 0], extent_base=[0, nb, 2 * nb, 3 * nb], **kwargs
     )
-    multi = _ple_store.PleStore(
+    multi = _row_store.PleStore(
         paths=[str(fa), str(fb)], extent_file=[0, 1, 0, 1],
         extent_base=[1231, 0, 1231 + nb + 77, nb + 4095], **kwargs,
     )
@@ -285,6 +285,24 @@ def test_disk_table_matches_oracle(tmp_path):
     disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
+
+
+@requires_cuda
+def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path):
+    """The overlap scheduler fills batch k+1 while batch k's lookup copy is still queued behind the
+    layers before it (a sleep kernel here): batch k must read its own rows."""
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+    steps = [(3, 4, 7), (4, 7, 9), (7, 9, 13), (9, 13, 5)]
+    ids = [emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda() for older, newer, token in steps]
+    got = []
+    for (older, newer, token), step_ids in zip(steps, ids):
+        disk.fill([torch.tensor([older, newer, token])], graph=False)
+        torch.cuda._sleep(50_000_000)
+        got.append(disk.lookup(step_ids))
+    torch.cuda.synchronize()
+    for i, (out, step_ids) in enumerate(zip(got, ids)):
+        assert _bitwise_equal(out, oracle.lookup(step_ids)), f"step {i} read another step's rows"
 
 
 @requires_cuda

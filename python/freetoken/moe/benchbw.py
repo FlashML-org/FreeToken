@@ -108,6 +108,7 @@ class Workload:
     activation: str = "silu"
     swiglu_alpha: float = 1.702
     swiglu_limit: float | None = None
+    act_block: int | None = None  # ds_fp4 W4A8 activation quant block
 
 
 # Preset workloads. Dims from the model configs / benchmarks/bench_offload_cache_copy.py.
@@ -120,7 +121,8 @@ WORKLOADS: dict[str, Workload] = {
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "gpt-oss-20b": Workload("gpt-oss-20b", 2880, 2880, 32, 4, ("mxfp4_triton",),
                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128),
+    "dsv4.1-flash": Workload("dsv4.1-flash", 5120, 2304, 384, 6, ("ds_fp4",), swiglu_limit=10.0, act_block=32),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "glm5.3-flash-nvfp4": Workload(
         "glm5.3-flash-nvfp4", 4096, 2048, 288, 8, ("nvfp4",),
@@ -142,7 +144,7 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "fp8_block": Workload("dtype:fp8", 2048, 512, 128, 8, ("fp8_block",)),
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128),
 }
 
 
@@ -460,7 +462,7 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
         cache, top_k=wl.top_k, activation=wl.activation,
         apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
-        swiglu_limit=wl.swiglu_limit,
+        swiglu_limit=wl.swiglu_limit, act_block=wl.act_block,
     )
 
 

@@ -32,6 +32,19 @@ def test_section_tables():
         build_section_table(SECTION, "diagonal")
 
 
+def test_refuses_a_table_wider_than_the_rotary_dims():
+    # A proportional rope's table spans the whole head; mrope takes its width from the table
+    # and indexes the rotary_dim // 2 section table with it, reading past the end.
+    from freetoken.layers.rotary import get_rope
+
+    get_rope.cache_clear()
+    with pytest.raises(AssertionError, match="rotary_dim"):
+        get_rope(
+            head_dim=HEAD, rotary_dim=ROT, max_position=8, base=1e7,
+            rope_scaling=(("rope_type", "proportional"),), mrope_section=SECTION,
+        )
+
+
 def _make(mrope: bool, layout: str = "interleaved"):
     from freetoken.layers.rotary import get_rope
 

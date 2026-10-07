@@ -156,6 +156,20 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
     ),
+    # DeepSeek-V4.1-Flash (model_type deepseek_v41): multimodal wrapper config (text tower in
+    # text_config). The checkpoint has no ``model.`` root; the compressors, the indexer's key projection /
+    # scorer, the head and the vision tower + aligner ship bf16 (the fp8 config has no modules_to_not_convert).
+    "DeepseekV41ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        mm_processor="freetoken.mm.processors.deepseek_v41:DeepseekV41MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
+        checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.norm", "norm")),
+        packed_modules_mapping=_EXPERTS_W123_PACKED,
+        unquantized_modules=(
+            "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
+        ),
+    ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoeForConditionalGeneration",

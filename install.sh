@@ -4,8 +4,8 @@
 #
 # Installs the `freetoken` runtime (the `ft` CLI) and its prebuilt kernel-cache
 # wheel into a managed venv, then wires it up so FreeToken Desktop can find it.
-# Dependencies come from PyPI via uv, except torch and sglang-kernel whose cu130
-# wheels live on dedicated indexes (see CU_INDEX_ARGS below).
+# Dependencies come from PyPI via uv, except torch whose cu130
+# wheels live on a dedicated index (see CU_INDEX_ARGS below).
 #
 # Typical use (once a release exists):
 #   curl -fsSL https://<host>/install.sh | bash
@@ -20,10 +20,13 @@
 #                                 Defaults to $DEFAULT_KERNEL_CACHE_WHEEL_URL; if
 #                                 unset and FREETOKEN_WHEEL is local, the script
 #                                 auto-detects a sibling freetoken_kernel_cache-*.whl.
-#   FREETOKEN_HOME                install root (default: ~/.freetoken); venv at $FREETOKEN_HOME/venv
+#   FREETOKEN_HOME                install root (default: ~/.freetoken); venv at $FREETOKEN_HOME/venv;
+#                                 a successful install writes it to environment.d
 #   FREETOKEN_PY_VERSION          python for the venv (default: 3.12 — must match the wheel tag)
 #   FREETOKEN_BIN_DIR             where to symlink `ft` (default: ~/.local/bin)
 #   FREETOKEN_ENV_DIR             environment.d dir (default: ~/.config/environment.d)
+#   FREETOKEN_FLASHINFER_VERSION  one version for flashinfer-python/-cubin/-jit-cache
+#                                 (default: $DEFAULT_FLASHINFER_VERSION)
 #
 # NOTE: common TVM FFI kernels come from the kernel-cache wheel. A working CUDA
 # toolkit (nvcc) is still needed when falling back to JIT for an uncovered kernel
@@ -32,6 +35,7 @@ set -euo pipefail
 
 DEFAULT_WHEEL_URL=""   # filled in once GitHub Releases are live
 DEFAULT_KERNEL_CACHE_WHEEL_URL=""   # filled in once GitHub Releases are live
+DEFAULT_FLASHINFER_VERSION="0.6.18.post1"
 
 FT_HOME="${FREETOKEN_HOME:-$HOME/.freetoken}"
 VENV="$FT_HOME/venv"
@@ -40,6 +44,7 @@ BIN_DIR="${FREETOKEN_BIN_DIR:-$HOME/.local/bin}"
 ENV_DIR="${FREETOKEN_ENV_DIR:-$HOME/.config/environment.d}"
 WHEEL="${FREETOKEN_WHEEL:-$DEFAULT_WHEEL_URL}"
 KERNEL_CACHE_WHEEL="${FREETOKEN_KERNEL_CACHE_WHEEL:-$DEFAULT_KERNEL_CACHE_WHEEL_URL}"
+FLASHINFER_VERSION="${FREETOKEN_FLASHINFER_VERSION:-$DEFAULT_FLASHINFER_VERSION}"
 
 # --yes / -y (or FREETOKEN_ASSUME_YES=1): run non-interactively — in particular, bootstrap uv
 # without asking. FreeToken Desktop's in-app installer passes --yes (its stdout is piped into a
@@ -201,26 +206,27 @@ mkdir -p "$FT_HOME"
 # re-install can't inherit a stale/mismatched torch (e.g. an old cu128 venv after a cu130 bump).
 "$UV" venv "$VENV" --python "$PY_VERSION" --clear
 
-# PyPI's torch 2.11.0 and sglang-kernel 0.4.5 are the same cu130 builds these indexes
-# serve; the explicit indexes pin provenance to the cu130 channels. `unsafe-best-match`
+# PyPI's torch 2.11.0 is the same cu130 build the pytorch index
+# serves; the explicit index pins provenance to the cu130 channel. `unsafe-best-match`
 # is needed because the pytorch index also mirrors stale copies of common deps (e.g.
 # packaging<=24.1) that would shadow PyPI under uv's first-index strategy; all indexes
 # here are trusted. [tool.uv.sources] does not survive into a built wheel, so the
-# indexes it names must be repeated below.
+# index it names must be repeated below.
 # flashinfer JIT-compiles its kernels on first use (e.g. sampling softmax), which needs nvcc --
 # breaking driver-only on a box with no CUDA toolkit. flashinfer-cubin + flashinfer-jit-cache ship
 # those kernels PREBUILT (multi-arch), so nothing compiles at runtime. They live on flashinfer's
 # own index (cubin arch-agnostic; jit-cache per-cuNNN). Large (~2 GiB) but downloaded once.
+# flashinfer refuses to import unless all three share one version, so pin them together.
 INSTALL_WHEELS=(
   "${WHEEL}[accel]"
-  flashinfer-cubin
-  flashinfer-jit-cache
+  "flashinfer-python==$FLASHINFER_VERSION"
+  "flashinfer-cubin==$FLASHINFER_VERSION"
+  "flashinfer-jit-cache==$FLASHINFER_VERSION"
   "$KERNEL_CACHE_WHEEL"
 )
 CU_INDEX_ARGS=(
   --index-strategy unsafe-best-match
   --extra-index-url https://download.pytorch.org/whl/cu130
-  --extra-index-url https://docs.sglang.io/whl/cu130
   --extra-index-url https://flashinfer.ai/whl
   --extra-index-url https://flashinfer.ai/whl/cu130
 )
@@ -243,8 +249,8 @@ ln -sf "$FT_BIN" "$BIN_DIR/ft"
 say "symlinked $BIN_DIR/ft -> $FT_BIN"
 
 mkdir -p "$ENV_DIR"
-printf 'FREETOKEN_FT_BIN=%s\n' "$FT_BIN" > "$ENV_DIR/50-freetoken.conf"
-say "wrote $ENV_DIR/50-freetoken.conf (FREETOKEN_FT_BIN) — GUI picks it up after next login"
+printf 'FREETOKEN_HOME=%s\n' "$(cd "$FT_HOME" && pwd)" >"$ENV_DIR/50-freetoken.conf"
+say "wrote $ENV_DIR/50-freetoken.conf (FREETOKEN_HOME) - FreeToken Desktop reads the file, other programs see the variable after next login"
 
 # --- 5. Self-check ---------------------------------------------------------
 if "$FT_BIN" --help >/dev/null 2>&1; then
@@ -259,10 +265,9 @@ ${C_GREEN}FreeToken engine installed.${C_RESET}
 
   ft binary        $FT_BIN
   on PATH as       $BIN_DIR/ft   (ensure $BIN_DIR is on PATH)
-  Desktop env      FREETOKEN_FT_BIN via environment.d (re-login to apply)
+  Desktop env      FREETOKEN_HOME in $ENV_DIR/50-freetoken.conf
 
-Run in this shell without re-login:
-  export FREETOKEN_FT_BIN="$FT_BIN"
+Run:
   ft serve --model <path> --port 1919
 
 EOF

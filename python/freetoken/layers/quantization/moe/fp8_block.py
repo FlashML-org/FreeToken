@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind
+from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 FP8 = torch.float8_e4m3fn
@@ -21,9 +21,11 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
+        if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
+            return f"fp8 block MoE kernel serves {BLOCK}x{BLOCK} expert blocks only"
         reason = gated_epilogue_reason(cfg)
         if reason:
             return f"fp8 block MoE kernel: {reason}"
@@ -64,17 +66,3 @@ class TritonFp8BlockMoEKernel(MoEKernel):
 @register_method(QuantKind.FP8_BLOCK, LayerKind.MOE)
 class Fp8BlockMoEMethod(MoEMethod):
     candidates = (TritonFp8BlockMoEKernel,)
-
-    def create_weights(self, layer) -> None:
-        g = self.cfg
-        e, i, h, b = g.num_experts, g.intermediate, g.hidden, BLOCK
-        layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=FP8)
-        layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
-        layer.down_proj = torch.empty(e, h, i, dtype=FP8)
-        layer.down_scale_inv = torch.empty(e, h // b, i // b, dtype=torch.bfloat16)
-
-    def resident_view(self, layer) -> ExpertView:
-        return ExpertView({
-            "gate_up": layer.gate_up_proj, "gate_up_scale": layer.gate_up_scale_inv,
-            "down": layer.down_proj, "down_scale": layer.down_scale_inv,
-        })
