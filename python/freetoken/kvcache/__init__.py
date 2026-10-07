@@ -76,10 +76,14 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype,
+                   num_index_pages: int | None = None):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
-    the pool). Single factory entry for all pool families, DSV4 included."""
+    the pool). Single factory entry for all pool families, DSV4 included.
+
+    ``num_index_pages`` (KV host offload only) sizes the QSA compressed-index slab in the
+    LOGICAL page space while the K/V slabs stay at ``num_pages`` physical pages."""
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
@@ -117,6 +121,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_index_pages=None if num_index_pages is None else num_index_pages + 1,
     )
 
 
@@ -128,6 +133,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    num_index_pages: int | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -205,6 +211,7 @@ def create_kvcache_pool(
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
+            num_index_pages=num_index_pages,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
