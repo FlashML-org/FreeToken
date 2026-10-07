@@ -21,7 +21,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class GgufConfigShim:
     architectures: list[str]
     model_path: str
