@@ -91,6 +91,19 @@ def _last_row() -> dict:
     return rows[-1]
 
 
+@pytest.mark.parametrize("pools, expected", [(None, 1), ({"page_size": 64}, 64)])
+def test_stats_reports_backend_page_size(pools, expected):
+    from freetoken.server.stats import StatsTracker, build_stats
+
+    tracker = StatsTracker()
+    tracker.kv_total_pages = 130
+    config = SimpleNamespace(served_model_name="unit-model", max_seq_len=262144,
+                             page_size=1, served_modalities=(), model_config=SimpleNamespace())
+    state = SimpleNamespace(stats=tracker, config=config, cache_pools=pools)
+    doc = build_stats(state, 0, 0)
+    assert doc["kv"] == {"used_pages": 0, "total_pages": 130, "page_size": expected}
+
+
 def test_non_stream_records_the_request_with_real_token_totals():
     request_ring.reset()
     st = FakeState([_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)])
