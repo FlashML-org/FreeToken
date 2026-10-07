@@ -369,6 +369,8 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        # before the residency snapshot, so the freed table goes to the KV pool
+        embed_host_bytes = self._move_embeddings_to_host() if config.embed_device == "cpu" else 0
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -379,13 +381,13 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
-        # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
+        # Host-side auxiliary stores (qwen4_exp's pinned PLE table, the --embed-device cpu table above): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = 0
+        self._host_tables_bytes = embed_host_bytes
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
-                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+                self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -540,6 +542,21 @@ class Engine:
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
+
+    def _move_embeddings_to_host(self) -> int:
+        from freetoken.layers.embedding import move_input_embeddings_to_host
+
+        moved_bytes, moved = move_input_embeddings_to_host(self.model)
+        if moved:
+            logger.info_rank0(
+                f"--embed-device cpu: {', '.join(moved)} in pinned host RAM ({mem_GB(moved_bytes)})"
+            )
+        else:
+            logger.warning_rank0(
+                "--embed-device cpu: no untied input embedding to move (tied to the LM head or a "
+                "quantized table); it stays on the GPU"
+            )
+        return moved_bytes
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
