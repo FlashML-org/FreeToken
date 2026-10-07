@@ -206,7 +206,7 @@ mkdir -p "$FT_HOME"
 # re-install can't inherit a stale/mismatched torch (e.g. an old cu128 venv after a cu130 bump).
 "$UV" venv "$VENV" --python "$PY_VERSION" --clear
 
-# PyPI's torch 2.11.0 is the same cu130 build the pytorch index
+# PyPI's torch 2.14.1 is the same cu130 build the pytorch index
 # serves; the explicit index pins provenance to the cu130 channel. `unsafe-best-match`
 # is needed because the pytorch index also mirrors stale copies of common deps (e.g.
 # packaging<=24.1) that would shadow PyPI under uv's first-index strategy; all indexes

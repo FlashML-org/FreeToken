@@ -80,12 +80,12 @@ if IS_ROCM:
     # These extensions contain host code only. BuildExtension supplies the ROCm
     # platform defines to the C++ compiler; offload architecture flags belong on
     # HIP device sources and would be rejected by the host compiler here.
-    extra_compile = ["-O3", "-std=c++17"]
+    extra_compile = ["-O3", "-std=c++20"]
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     runtime_link_args = []
-    extra_compile = ["-O3", "-std=c++17"]
+    extra_compile = ["-O3", "-std=c++20"]
 
 _check_toolchain()
 
@@ -126,7 +126,7 @@ setup(
                 sources=[
                     "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
                 ],
-                extra_compile_args=["-O3", "-std=c++17"],
+                extra_compile_args=["-O3", "-std=c++20"],
             )
         ] if sys.platform == "linux" else []),
     ],
