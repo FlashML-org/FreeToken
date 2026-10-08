@@ -71,6 +71,7 @@ class LaunchContext:
     extra_args: list[str]
     dry_run: bool
     assume_yes: bool = False
+    api_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,9 +172,11 @@ def resolve_api_key(api_key: str | None) -> str | None:
     return api_key or os.environ.get(API_KEY_ENV) or None
 
 
-def _get_json(url: str) -> object:
-    request = Request(url, headers={"Accept": "application/json"})
-    with urlopen(request, timeout=5) as response:
+def _get_json(url: str, api_key: str | None) -> object:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    with urlopen(Request(url, headers=headers), timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -181,10 +184,10 @@ def _positive_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _stats_model(server: ServerURL) -> dict[str, object]:
+def _stats_model(server: ServerURL, api_key: str | None) -> dict[str, object]:
     """The /v1/stats model card; empty when the server predates it."""
     try:
-        payload = _get_json(f"{server.origin}/v1/stats")
+        payload = _get_json(f"{server.origin}/v1/stats", api_key)
     except (HTTPError, URLError, HTTPException, OSError, TimeoutError, ValueError):
         return {}
     model = payload.get("model") if isinstance(payload, dict) else None
@@ -197,11 +200,16 @@ def _input_modalities(stats_model: dict[str, object]) -> tuple[str, ...]:
     return ("text", *extra)
 
 
-def discover_server_model(server: ServerURL) -> ServedModel:
+def discover_server_model(server: ServerURL, api_key: str | None) -> ServedModel:
     try:
-        _get_json(server.openai_base_url)
-        payload = _get_json(f"{server.openai_base_url}/models")
+        _get_json(server.openai_base_url, api_key)
+        payload = _get_json(f"{server.openai_base_url}/models", api_key)
     except (HTTPError, URLError, HTTPException, OSError, TimeoutError) as exc:
+        if isinstance(exc, HTTPError) and exc.code == 401:
+            raise RuntimeError(
+                f"FreeToken server at {server.origin} needs a valid API key: "
+                f"pass --api-key or set {API_KEY_ENV}"
+            ) from exc
         raise RuntimeError(f"Cannot connect to FreeToken server at {server.origin}: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -224,7 +232,7 @@ def discover_server_model(server: ServerURL) -> ServedModel:
     if not models:
         raise RuntimeError(f"FreeToken server at {server.origin} reported no models")
 
-    stats_model = _stats_model(server)
+    stats_model = _stats_model(server, api_key)
     if context_length is None:
         context_length = _positive_int(stats_model.get("ctx"))
 
@@ -412,7 +420,7 @@ def prepare_codex(ctx: LaunchContext) -> CommandSpec:
     ]
     return CommandSpec(
         argv=argv,
-        env={API_KEY_ENV: "freetoken"},
+        env={API_KEY_ENV: ctx.api_key or "freetoken"},
         unset_env=CODEX_CLEAR_ENV,
     )
 
@@ -427,7 +435,7 @@ def prepare_claude(ctx: LaunchContext) -> CommandSpec:
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(_max_output_tokens(ctx)),
             "ANTHROPIC_BASE_URL": ctx.server.origin,
             "ANTHROPIC_API_KEY": "",
-            "ANTHROPIC_AUTH_TOKEN": "freetoken",
+            "ANTHROPIC_AUTH_TOKEN": ctx.api_key or "freetoken",
             "ANTHROPIC_MODEL": model_id,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
@@ -460,13 +468,16 @@ def _opencode_model_entries(
 
 def _opencode_config(ctx: LaunchContext) -> str:
     model_ids = _ordered_model_ids(ctx)
+    options = {"baseURL": ctx.server.openai_base_url}
+    if ctx.api_key:
+        options["apiKey"] = ctx.api_key
     config = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
             OPENCODE_PROVIDER: {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": OPENCODE_PROVIDER_NAME,
-                "options": {"baseURL": ctx.server.openai_base_url},
+                "options": options,
                 "models": _opencode_model_entries(
                     model_ids, _context_window(ctx), _max_output_tokens(ctx), _accepts_images(ctx)
                 ),
@@ -618,7 +629,7 @@ def _patch_openclaw_config(
         new_models.append(entry)
 
     provider["baseUrl"] = ctx.server.openai_base_url
-    provider["apiKey"] = "freetoken-local"
+    provider["apiKey"] = ctx.api_key or "freetoken-local"
     provider["api"] = "openai-completions"
     provider["models"] = new_models
     providers[OPENCLAW_PROVIDER] = provider
@@ -701,8 +712,8 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
         model_section["default"] = ctx.model.model_id
         model_section["provider"] = "custom"
         model_section["base_url"] = ctx.server.openai_base_url
-        # A non-empty dummy: FreeToken is unauthenticated, but some clients reject an empty key.
-        model_section["api_key"] = HERMES_API_KEY
+        # Dummy for a server without --api-key; some clients reject an empty key.
+        model_section["api_key"] = ctx.api_key or HERMES_API_KEY
         # Hermes' name for the window (prompt + generation). Left unset it auto-detects, and a
         # miss lands on a 32k default that trips the floor below.
         window = _context_window(ctx)
@@ -756,9 +767,9 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     replays tool-call arguments byte-verbatim and reasoning as
     ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
     values and key order — drift that survives render canonicalization, cuts
-    the prefix cache, and shows the model a rewrite of its own output. The
-    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement; FreeToken
-    itself is unauthenticated."""
+    the prefix cache, and shows the model a rewrite of its own output. Without
+    an API key, the dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key
+    requirement."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -812,7 +823,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
         argv=argv,
         env={
             "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
-            "DEEPSEEK_API_KEY": DSH_API_KEY,
+            "DEEPSEEK_API_KEY": ctx.api_key or DSH_API_KEY,
             "DSH_TELEMETRY_DISABLED": "1",
         },
         unset_env=CLOUD_PROVIDER_API_KEY_ENV,
@@ -844,6 +855,10 @@ def parse_argv(argv: list[str], prog: str = "python -m freetoken.launch") -> arg
     )
     parser.add_argument("agent", choices=sorted(PREPARERS))
     parser.add_argument("--server", help="FreeToken server origin or /v1 URL")
+    parser.add_argument(
+        "--api-key",
+        help=f"API key of a server started with --api-key (default: ${API_KEY_ENV})",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1032,13 +1047,16 @@ def main(argv: list[str] | None = None, prog: str = "python -m freetoken.launch"
             return 0
 
         server = resolve_server_url(args.server)
-        model = discover_server_model(server)
+        api_key = resolve_api_key(args.api_key)
+        model = discover_server_model(server, api_key)
         plan_ctx = LaunchContext(
             server=server,
             model=model,
             extra_args=args.extra_args,
             dry_run=True,
             assume_yes=args.yes,
+            # the plan is printed by --dry-run, so it never holds the real key
+            api_key="<api-key>" if api_key else None,
         )
         spec = PREPARERS[args.agent](plan_ctx)
         if args.dry_run:
@@ -1056,6 +1074,7 @@ def main(argv: list[str] | None = None, prog: str = "python -m freetoken.launch"
             extra_args=args.extra_args,
             dry_run=False,
             assume_yes=args.yes,
+            api_key=api_key,
         )
         spec = PREPARERS[args.agent](ctx)
         if binary_path != spec.argv[0]:

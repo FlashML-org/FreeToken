@@ -170,6 +170,7 @@ Code and Hermes need no declaration.
 | Flag | Meaning |
 |---|---|
 | `--server URL` | Server to point the agent at (default `http://127.0.0.1:1919`) |
+| `--api-key KEY` | Key of a server started with `--api-key` (default `$FREETOKEN_API_KEY`). The agent gets it in its environment; Hermes and OpenClaw keep it in their config files |
 | `--dry-run` | Print the planned config changes and command, touch nothing |
 | `-y`, `--yes` | Approve install/config prompts |
 | `--config` | Configure without launching |

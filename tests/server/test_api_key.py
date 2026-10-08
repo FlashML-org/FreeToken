@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from freetoken import launch
 from freetoken.server.api_server import install_api_key, install_cors
 from freetoken.server.args import parse_args
 
@@ -86,3 +88,14 @@ def test_key_stays_out_of_the_logged_config(monkeypatch):
     monkeypatch.delenv("FREETOKEN_API_KEY", raising=False)
     assert KEY not in str(_parse("--api-key", KEY))
 
+
+@pytest.mark.parametrize("agent", sorted(launch.PREPARERS))
+def test_dry_run_prints_a_placeholder_instead_of_the_key(agent, monkeypatch, capsys):
+    key = 'p"w\\d\xe9'
+    model = launch.ServedModel(model_id="m", models=["m"], context_length=8192)
+    monkeypatch.setattr(launch, "discover_server_model", lambda _server, _key: model)
+    assert launch.main([agent, "--dry-run", "--api-key", key]) == 0
+    out = capsys.readouterr().out
+    assert key not in out and json.dumps(key)[1:-1] not in out
+    if agent in ("claude", "codex", "dsh", "opencode"):
+        assert "<api-key>" in out
