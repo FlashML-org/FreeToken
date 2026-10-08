@@ -113,18 +113,21 @@ struct IndexKernel {
     auto device_ = SymbolicDevice{};
     auto weights_dtype_ = SymbolicDType{};
     auto indices_dtype_ = SymbolicDType{};
+    // Bound TensorMatcher symbols must carry their own allowed options.
+    device_.set_options<kDLCUDA, kDLROCM>();
+    indices_dtype_.set_options<int32_t, int64_t>();
 
     TensorMatcher({-1, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA, kDLROCM>(device_)
+        .with_device(device_)
         .verify(weights);
     TensorMatcher({L, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA, kDLROCM>(device_)
+        .with_device(device_)
         .verify(output);
     TensorMatcher({L}) //
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .with_device<kDLCUDA, kDLROCM>(device_)
+        .with_dtype(indices_dtype_)
+        .with_device(device_)
         .verify(indices);
 
     const auto device = device_.unwrap();

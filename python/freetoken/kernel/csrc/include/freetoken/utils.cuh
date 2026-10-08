@@ -43,24 +43,21 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
+// HIP uses normal stream ordering; the host launch rejects a PDL request.
 template <bool kUsePDL> __always_inline __device__ void wait() {
+#if !FREETOKEN_USE_ROCM
   if constexpr (kUsePDL) {
-#if FREETOKEN_USE_ROCM
-    // Programmatic dependent launch is NVIDIA-specific.
-#else
     asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
   }
+#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
+#if !FREETOKEN_USE_ROCM
   if constexpr (kUsePDL) {
-#if FREETOKEN_USE_ROCM
-    // Programmatic dependent launch is NVIDIA-specific.
-#else
     asm volatile("griddepcontrol.launch_dependents;" :::);
-#endif
   }
+#endif
 }
 
 } // namespace PDL
