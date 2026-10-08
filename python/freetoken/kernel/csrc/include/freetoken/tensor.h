@@ -385,6 +385,10 @@ public:
   auto with_dtype(DTypeRef &&dtype) && -> TensorMatcher && {
     m_init_dtype();
     m_dtype.rebind(*dtype);
+    // no options given: keep the ones already set on the shared symbol
+    if constexpr (sizeof...(Ts) > 0) {
+      m_dtype->set_options<Ts...>();
+    }
     return std::move(*this);
   }
 
@@ -400,6 +404,9 @@ public:
   auto with_device(DeviceRef &&device) && -> TensorMatcher && {
     m_init_device();
     m_device.rebind(*device);
+    if constexpr (sizeof...(Codes) > 0) {
+      m_device->set_options<Codes...>();
+    }
     return std::move(*this);
   }
 

@@ -43,16 +43,21 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
+// griddepcontrol needs sm_90+; older archs and HIP keep normal stream ordering.
 template <bool kUsePDL> __always_inline __device__ void wait() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
+#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
+#endif
 }
 
 } // namespace PDL
@@ -144,7 +149,9 @@ private:
     return config;
   }
   cudaLaunchConfig_t m_config;
+#if !FREETOKEN_USE_ROCM
   cudaLaunchAttribute m_attr_cache;
+#endif
 };
 
 } // namespace host
