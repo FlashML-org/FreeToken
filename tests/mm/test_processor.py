@@ -47,7 +47,7 @@ class _Family(MMProcessor):
             for i, _ in enumerate(images)
         ]
 
-    def prompt_replacement(self, item, start=0):
+    def prompt_replacement(self, item):
         return PromptReplacement.select_token_id([BOI] + [SOFT] * self.n_soft + [EOI], SOFT)
 
     def dummy_items(self, dtype, device):
@@ -57,7 +57,7 @@ class _Family(MMProcessor):
 class _Tiled(_Family):
     """Rows of soft tokens separated by a break token, like a tiled image."""
 
-    def prompt_replacement(self, item, start=0):
+    def prompt_replacement(self, item):
         full = ([SOFT] * 2 + [BOI]) * 3
         return PromptReplacement.select_token_id(full, SOFT)
 
@@ -482,36 +482,29 @@ def test_a_text_only_checkpoint_config_has_no_dsv4_processor():
         proc(_dsv4_config(vision_n_layers=0), "/nonexistent", MultimodalConfig())
 
 
-def test_prompt_replacement_sees_the_offset_it_lands_at():
-    class _Offset(MMProcessor):
-        placeholder = [PLACEHOLDER]
+def test_dsv4_apply_passes_each_block_the_offset_it_lands_at():
+    """Only the DSV4 block depends on its position, so its own apply computes the offset."""
+    from freetoken.models.deepseek_v4.config import IMAGE_TOKEN_ID
+    from freetoken.models.deepseek_v4.vision import build_image_block
 
-        def process(self, images):
-            return [
-                MMItem(
-                    modality="image",
-                    hash=200 + i,
-                    pad_value=MM_PAD_SHIFT_VALUE + 200 + i,
-                    offsets=[],
-                    feature=torch.zeros(1),
-                )
-                for i in range(len(images))
-            ]
-
-        def prompt_replacement(self, item, start=0):
-            return PromptReplacement([PLACEHOLDER] * (1 + start % 2))
-
-        def dummy_items(self, dtype, device):
-            return []
-
-    proc = _Offset("/fake", MultimodalConfig())
-    ids = torch.tensor([1, PLACEHOLDER, 2, PLACEHOLDER, 3], dtype=torch.int32)
-    out = proc.apply(ids, [_png(), _png()])
-    # the first placeholder sits at offset 1 (odd: two tokens), the second at offset 4;
-    # apply fills the embedding slots with each item's content pad id, not the placeholder
-    pads = [item.pad_value for item in out.mm_items]
-    assert out.input_ids.tolist() == [1, pads[0], pads[0], 2, pads[1], 3]
-    assert [item.offsets for item in out.mm_items] == [[[1, 3]], [[4, 5]]]
+    proc = DSV4MMProcessor(_dsv4_config(), "/nonexistent", MultimodalConfig())
+    buf = io.BytesIO()
+    _dsv4_image(640, 480).save(buf, format="PNG")
+    raw = buf.getvalue()
+    ids = torch.tensor([1, IMAGE_TOKEN_ID, 2, IMAGE_TOKEN_ID, 3], dtype=torch.int32)
+    out = proc.apply(ids, [raw, raw])
+    first, second = out.mm_items
+    assert (first.n_llm_h, first.n_llm_w) == (12, 16)
+    # the first placeholder sits at 1, the second after the text between plus the first block
+    assert first.start == first.offsets[0][0] == 1
+    assert second.start == second.offsets[0][0]
+    assert first.num_tokens == len(build_image_block(12, 16, first.start)[0])
+    assert second.num_tokens == len(build_image_block(12, 16, second.start)[0])
+    # apply fills the embedding slots with each block's content pad id, not the placeholder
+    for item in (first, second):
+        lo, hi = item.offsets[0]
+        assert set(out.input_ids[lo:hi].tolist()) == {item.pad_value}
+    assert IMAGE_TOKEN_ID not in out.input_ids.tolist()
 
 
 def test_dsv4_image_max_tokens_lowers_the_checkpoints_block_cap():

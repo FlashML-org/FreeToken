@@ -6,6 +6,7 @@ content pad id and the block's embeddings -- sentinels included -- come from the
 
 from __future__ import annotations
 
+import io
 import struct
 from typing import Any
 
@@ -14,7 +15,7 @@ import torch
 from freetoken.message import MMItem
 from freetoken.mm import mm_pad_value
 from freetoken.mm.config import MultimodalConfig
-from freetoken.mm.processor import MMProcessor, PromptReplacement, content_hash
+from freetoken.mm.processor import MMResult, MMProcessor, PromptReplacement, _find_all, content_hash
 from freetoken.models.deepseek_v4.config import IMAGE_TOKEN_ID, DSV4VisionConfig, parse_vision_config
 from freetoken.models.deepseek_v4.image_processor import load_image
 from freetoken.models.deepseek_v4.vision import COMPRESS_PAD_TO, build_image_block
@@ -54,7 +55,8 @@ class DSV4MMProcessor(MMProcessor):
             )
         return items
 
-    def prompt_replacement(self, item: MMItem, start: int = 0) -> PromptReplacement:
+    def prompt_replacement(self, item: MMItem, start: int) -> PromptReplacement:
+        """The DSV4-only ``start`` is where the block lands in input_ids; only our apply below calls this."""
         n_llm_h, n_llm_w = item.n_llm_h, item.n_llm_w
         types, _perm = build_image_block(n_llm_h, n_llm_w, start)
         # the lead pads align the block, so the same image at another offset is another
@@ -64,6 +66,42 @@ class DSV4MMProcessor(MMProcessor):
         item.pad_value = mm_pad_value(item.hash)
         item.model_specific_data["start"] = start
         return PromptReplacement([self.image_token_id] * types.numel())
+
+    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
+        """MMProcessor.apply, save that each replacement is built knowing the offset it lands at."""
+        from PIL import Image
+
+        ids = input_ids.tolist()
+        target = self.placeholder
+        slots = _find_all(ids, target)
+        if len(slots) != len(images):
+            raise ValueError(
+                f"prompt renders {len(slots)} image placeholders but the request "
+                f"carries {len(images)} images"
+            )
+
+        pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
+        items = self.process(pils)
+        out: list[int] = []
+        cursor = 0
+        for slot, item in zip(slots, items):
+            out.extend(ids[cursor:slot])
+            base = len(out)
+            repl = self.prompt_replacement(item, base)
+            full = list(repl.full)
+            spans = repl.embed_spans()
+            # embedding slots carry the content pad id so radix keys and the model's scatter mask see the image
+            for lo, hi in spans:
+                full[lo:hi] = [item.pad_value] * (hi - lo)
+            out.extend(full)
+            item.offsets = [[base + lo, base + hi] for lo, hi in spans]
+            item.validate()
+            cursor = slot + len(target)
+        out.extend(ids[cursor:])
+        new_ids = torch.tensor(out, dtype=input_ids.dtype)
+
+        positions, delta = self.positions(len(out), items) or (None, 0)
+        return MMResult(new_ids, items, positions, delta)
 
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         # The smallest block the tower can run: one 2x2 merge grid out of a 6x6 patch grid.
