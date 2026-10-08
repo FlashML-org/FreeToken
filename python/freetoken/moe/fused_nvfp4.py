@@ -31,17 +31,15 @@ _DECODE_BLOCK_N = 64
 _DECODE_BLOCK_KB = 128
 _DECODE_WARPS = 4
 
-# Marlin-style decode config (int32 wide loads + deferred reduction). Offline sweep over
-# the qwen35/qwen3moe (I=512/768) decode shapes picked BLOCK_N=16, BLOCK_KW=16 (== 128
-# k-values/iter), 4 warps -- the wide load lifts the gate/up GEMM ~43%->~51% of peak BW.
+# Marlin-style decode: every K-loop load must keep the word tile's register layout, so BLOCK_N * BLOCK_KW <= 128 * num_warps and BLOCK_KW <= 32 at 4 warps.
+# Long K (gate_up) uses the narrow N tile for more programs at M=1; short K (down) uses the wide one.
 _DECODE_MARLIN_BLOCK_N = 16
 _DECODE_MARLIN_BLOCK_KW = 16
+_DECODE_MARLIN_UNROLL = 2
 _DECODE_MARLIN_WARPS = 4
-# Deep-K variant: at K > 2048 (qwen4_exp gate_up, K=2560) a narrower N tile with the whole
-# K strip in one program iteration measures ~13% faster (18.6 vs 21.0us); short-K shapes
-# regress under it, so the split is by K, not by gemm position.
 _DECODE_MARLIN_DEEPK_BLOCK_N = 8
-_DECODE_MARLIN_DEEPK_BLOCK_KW = 128
+_DECODE_MARLIN_DEEPK_BLOCK_KW = 32
+_DECODE_MARLIN_DEEPK_UNROLL = 2
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
 
 
@@ -111,13 +109,18 @@ def _decode_gemm_marlin(
     packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
     scale = e4m3_kernel_view(scale)
     total_routes = M * top_k
-    deep_k = K > _DECODE_MARLIN_DEEPK_THRESHOLD
+    deep_k = K >= _DECODE_MARLIN_DEEPK_THRESHOLD
     block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
     block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    unroll = _DECODE_MARLIN_DEEPK_UNROLL if deep_k else _DECODE_MARLIN_UNROLL
+    # int64 activation loads need contiguous 16-bit rows that start 16-byte aligned
+    a_wide = (
+        a.dtype in (torch.bfloat16, torch.float16)
+        and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
+    )
     grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
-        _e2m1_lut(a.device.index),
         total_routes, N, K,
         a.stride(0), a.stride(1),
         packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
@@ -128,8 +131,10 @@ def _decode_gemm_marlin(
         topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_KW=block_kw,
+        UNROLL=unroll,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
+        A_WIDE=a_wide,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
         num_warps=_DECODE_MARLIN_WARPS,
