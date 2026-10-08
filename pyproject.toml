@@ -3,7 +3,7 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = ["setuptools>=77", "torch>=2.11,<2.16", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -56,14 +56,17 @@ dependencies = [
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
-    "torchvision>=0.26,<0.27",
+    "torch>=2.11,<2.16",
+    # torchvision is pinned 1:1 to torch; widen it to span the whole torch range above
+    # (2.11->0.26, 2.12->0.27, 2.13->0.28, 2.14->0.29, 2.15->0.30) so a 0.26 pin does not
+    # drag torch back to 2.11. FreeToken does not import it directly.
+    "torchvision>=0.26,<0.31",
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
     # CUDA torch 2.11 resolves Triton 3.6; AMD's ROCm 7.14 image supplies its
     # gfx1201-enabled Triton 3.7 build. Keep both supported without replacing the
     # runtime-specific wheel selected by the PyTorch distribution.
-    "triton>=3.6,<3.8; platform_system == 'Linux'",
+    "triton>=3.6,<3.9; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 

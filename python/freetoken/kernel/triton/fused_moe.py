@@ -242,10 +242,15 @@ def fused_moe_kernel(
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
+    # Padded (sentinel) lanes carry offs_token == num_valid_tokens, whose pointer arithmetic lands
+    # one row past A / topk_weights / C. The loads/stores are masked, but on ROCm/Triton a masked
+    # load from an out-of-bounds page still faults, so clamp the index to a valid row for the
+    # dead lanes (their result is discarded by token_mask / c_mask).
+    offs_token_safe = tl.where(token_mask, offs_token, 0)
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    a_ptrs = a_ptr + (offs_token_safe[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     # int64: with large expert weights (E * N * K can exceed 2**31, e.g. 256 x 3072 x 3072)
     # the expert base offset ``off_experts * stride_be`` overflows int32 and wraps to a
@@ -290,13 +295,13 @@ def fused_moe_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        moe_weight = tl.load(topk_weights_ptr + offs_token_safe, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_token_safe[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
