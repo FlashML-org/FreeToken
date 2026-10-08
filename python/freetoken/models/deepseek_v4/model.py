@@ -36,7 +36,7 @@ from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from .args import DeepseekV4Args
 from .attention import Attention
 from .moe import MoE
-from .vision import DSV4Aligner, DSV4VisionTower, assemble_block, build_image_block
+from .vision import COMPRESS_PAD_TO, DSV4Aligner, DSV4VisionTower, assemble_block, build_image_block
 
 if TYPE_CHECKING:
     from freetoken.message import MMItem
@@ -99,8 +99,8 @@ class Block(BaseOP):
         # T queries (Attention.forward_ragged), with the stateful compressor/indexer looped per
         # request. ``segments`` = [(offset, extend_len, table_idx, start_pos)] off the attention
         # metadata; ``flat_positions`` [T] = per-token ABSOLUTE position (batch.positions).
-        # ``spans_by_ti`` (batch.mm_spans) maps a page-table row to its image spans: the sparse
-        # attention needs the pairs, the block-tiled backends read the flat ends instead.
+        # ``spans_by_ti`` maps a page-table row to its image spans: the sparse attention needs
+        # the pairs, the block-tiled backends read the flat ends (batch.mm_block_ends) instead.
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm.forward(x)
@@ -212,6 +212,26 @@ class Transformer(BaseOP):
         return self.head.forward(h[:, -1])
 
 
+def _image_spans_by_ti(reqs) -> dict | None:
+    """The batch's image spans as ``(IMAGE_START position, block end)`` pairs per page-table row.
+
+    Only this model reads the pairs (built here, not staged on the batch): its sparse
+    attention builds candidate lists per span. The reference ``get_image_visible`` counts
+    visibility within [IMAGE_START, IMAGE_END], so the span starts at the START sentinel
+    (after ``build_image_block``'s alignment lead pads), not at the block's first token.
+    """
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for req in reqs:
+        req_spans = [
+            (lo + COMPRESS_PAD_TO - 1 - lo % COMPRESS_PAD_TO, hi)
+            for item in req.mm_items or ()
+            for lo, hi in item.offsets
+        ]
+        if req_spans:
+            spans[req.table_idx] = req_spans
+    return spans or None
+
+
 class DeepseekV4ForCausalLM(BaseLLMModel):
     """Engine adapter: a registered :class:`BaseLLMModel` wrapping the DSV4 transformer.
 
@@ -284,7 +304,7 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             # cross requests.
             return self.model.prefill_batched(
                 input_ids.view(1, -1), md.segments, batch.positions.long(),
-                spans_by_ti=batch.mm_spans,
+                spans_by_ti=_image_spans_by_ti(batch.reqs),
             )
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1

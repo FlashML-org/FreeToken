@@ -18,6 +18,7 @@ from PIL import Image
 from freetoken.models.deepseek_v4.config import DSV4VisionConfig, parse_vision_config
 from freetoken.models.deepseek_v4.image_processor import load_image
 from freetoken.models.deepseek_v4.vision import (
+    COMPRESS_PAD_TO,
     DSV4Aligner,
     DSV4VisionTower,
     IMAGE,
@@ -199,3 +200,77 @@ def test_preprocessing_and_block_layout_match_the_reference():
             types, perm = build_image_block(mine[3], mine[4], start)
             ref_types, ref_perm = reference.build_image_block(theirs[3], theirs[4], start)
             assert torch.equal(types, ref_types) and torch.equal(perm, ref_perm)
+
+
+_WINDOW, _MAX_IMG = 128, 384
+
+
+def _ref_get_image_visible(input_ids: torch.Tensor, vocab_size: int, max_image_tokens: int):
+    """Verbatim port of the checkpoint's ``inference/model.py`` pair (not vendored in this
+    repo): ``get_image_visible`` derives spans from the virtual ids ``vocab + type``, so the
+    lead pads before IMAGE_START stay outside; only the START/END comparisons matter, our
+    type enum values index the same way."""
+    seqlen = input_ids.size(1)
+    idx = torch.arange(seqlen, dtype=torch.int32).unsqueeze(0)
+    is_start = input_ids == vocab_size + IMAGE_START
+    is_end = input_ids == vocab_size + IMAGE_END
+    valid = (is_start.cumsum(1) > is_end.cumsum(1)) | is_end
+    starts = torch.where(is_start, idx, 0).cummax(1)[0]
+    left = (idx - starts) * valid
+    ends = torch.where(is_end, idx, seqlen).flip(1).cummin(1)[0].flip(1)
+    right = (ends - idx) * valid
+    return left.clamp(max=max_image_tokens - 1), right.clamp(max=max_image_tokens)
+
+
+def _ref_get_window_topk_idxs_visible(window_size, seqlen, left, right, max_image_tokens):
+    width = min(seqlen, window_size + max_image_tokens)
+    idx = torch.arange(seqlen).unsqueeze(0)
+    left_add = (left - (window_size - 1)).clamp(min=0)
+    starts = (idx - (window_size - 1) - left_add).clamp(min=0)
+    matrix = starts.unsqueeze(-1) + torch.arange(width)
+    return torch.where(matrix > (idx + right).unsqueeze(-1), -1, matrix).int().contiguous()
+
+
+def _reference_candidates(prefix: int, n_llm_h: int, n_llm_w: int, vocab: int = 100_000):
+    """The reference pair's window candidates for a text prefix followed by one image block."""
+    types, _perm = build_image_block(n_llm_h, n_llm_w, prefix)
+    ids = torch.full((1, prefix + len(types)), vocab + 50, dtype=torch.int64)
+    ids[0, prefix:] = vocab + types
+    n = ids.size(1)
+    left, right = _ref_get_image_visible(ids, vocab, _MAX_IMG)
+    block = (prefix, prefix + len(types))
+    return block, types, _ref_get_window_topk_idxs_visible(_WINDOW, n, left, right, _MAX_IMG)[0]
+
+
+def test_model_spans_match_the_reference_visibility_pair():
+    from types import SimpleNamespace
+
+    from freetoken.models.deepseek_v4.attention import Attention
+    from freetoken.models.deepseek_v4.model import _image_spans_by_ti
+
+    for prefix, h, w in ((0, 3, 2), (1, 3, 2), (2, 3, 2), (3, 3, 2), (5, 4, 3), (201, 20, 16), (402, 2, 2)):
+        (lo, hi), types, ref = _reference_candidates(prefix, h, w)
+        req = SimpleNamespace(table_idx=7, mm_items=[SimpleNamespace(offsets=[[lo, hi]])])
+        spans = _image_spans_by_ti([req])
+        assert spans == {7: [(lo + types.tolist().index(IMAGE_START), hi)]}
+        cols = Attention.visible_window_cols(
+            spans[7], 0, hi, _WINDOW, _MAX_IMG, torch.device("cpu"),
+            addr_lo=0, width=min(hi, _WINDOW + _MAX_IMG),
+        )
+        assert torch.equal(cols, ref)
+    text = SimpleNamespace(table_idx=0, mm_items=None)
+    assert _image_spans_by_ti([text]) is None
+
+
+def test_a_span_started_at_the_first_lead_pad_breaks_reference_parity():
+    from freetoken.models.deepseek_v4.attention import Attention
+
+    # the maintainer's case: a 201-token prefix puts 2 lead pads in front of a 20x16 grid,
+    # and a span covering the whole block diverges from the reference on 218 rows
+    (lo, hi), _types, ref = _reference_candidates(201, 20, 16)
+    assert lo + COMPRESS_PAD_TO - 1 - lo % COMPRESS_PAD_TO - lo == 2  # the two lead pads
+    cols = Attention.visible_window_cols(
+        [(lo, hi)], 0, hi, _WINDOW, _MAX_IMG, torch.device("cpu"),
+        addr_lo=0, width=min(hi, _WINDOW + _MAX_IMG),
+    )
+    assert int((cols != ref).any(dim=1).sum()) == 218
