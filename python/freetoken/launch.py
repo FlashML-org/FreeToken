@@ -20,7 +20,7 @@ DEFAULT_SERVER = "http://127.0.0.1:1919"
 CODEX_PROFILE = "freetoken-launch"
 CODEX_PROVIDER_NAME = "FreeToken"
 CODEX_CATALOG_NAME = "freetoken-model.json"
-CODEX_PROVIDER_API_KEY_ENV = "FREETOKEN_API_KEY"
+API_KEY_ENV = "FREETOKEN_API_KEY"
 # Used when the server reports no context length. Guessing low only costs earlier compaction.
 FALLBACK_CONTEXT_WINDOW = 128_000
 MAX_OUTPUT_TOKENS_CAP = 32_768
@@ -165,6 +165,10 @@ def resolve_server_url(server: str | None) -> ServerURL:
     netloc = _format_netloc(host, parsed.port)
     origin = urlunsplit((parsed.scheme or "http", netloc, "", "", "")).rstrip("/")
     return ServerURL(origin=origin, openai_base_url=f"{origin}/v1")
+
+
+def resolve_api_key(api_key: str | None) -> str | None:
+    return api_key or os.environ.get(API_KEY_ENV) or None
 
 
 def _get_json(url: str) -> object:
@@ -371,7 +375,7 @@ def _codex_profile_text(ctx: LaunchContext, catalog_path: Path) -> str:
         + f"name = {_toml_string(CODEX_PROVIDER_NAME)}\n"
         + f"base_url = {_toml_string(ctx.server.openai_base_url)}\n"
         + 'wire_api = "responses"\n'
-        + f"env_key = {_toml_string(CODEX_PROVIDER_API_KEY_ENV)}\n"
+        + f"env_key = {_toml_string(API_KEY_ENV)}\n"
     )
 
 
@@ -408,7 +412,7 @@ def prepare_codex(ctx: LaunchContext) -> CommandSpec:
     ]
     return CommandSpec(
         argv=argv,
-        env={CODEX_PROVIDER_API_KEY_ENV: "freetoken"},
+        env={API_KEY_ENV: "freetoken"},
         unset_env=CODEX_CLEAR_ENV,
     )
 

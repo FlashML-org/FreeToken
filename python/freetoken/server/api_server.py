@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -34,6 +36,7 @@ from freetoken.utils import (
     load_generation_sampling,
 )
 from pydantic import BaseModel
+from starlette.datastructures import Headers
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
@@ -415,6 +418,43 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+class _ApiKeyMiddleware:
+    """Answer 401 unless the request carries the key, except /health and OPTIONS requests."""
+
+    def __init__(self, app, api_key: str) -> None:
+        self.app = app
+        self._digest = hashlib.sha256(api_key.encode()).digest()
+
+    def _matches(self, value: str | None) -> bool:
+        # compare digests so the time taken does not depend on the key length
+        return value is not None and hmac.compare_digest(
+            hashlib.sha256(value.encode()).digest(), self._digest
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        if (
+            scope["type"] not in ("http", "websocket")
+            or scope.get("method") == "OPTIONS"
+            or scope["path"] == "/health"
+        ):
+            return await self.app(scope, receive, send)
+        headers = Headers(scope=scope)
+        scheme, _, token = headers.get("authorization", "").partition(" ")
+        if (scheme.lower() == "bearer" and self._matches(token)) or self._matches(
+            headers.get("x-api-key")
+        ):
+            return await self.app(scope, receive, send)
+        await JSONResponse({"error": "Unauthorized"}, status_code=401)(scope, receive, send)
+
+
+def install_api_key(app: FastAPI, api_key: str | None) -> None:
+    """Require ``api_key`` on every route but /health; run before install_cors so 401s get CORS headers."""
+    if api_key is None:
+        return
+    app.add_middleware(_ApiKeyMiddleware, api_key=api_key)
+    logger.info("API key required on every route except /health")
 
 
 app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifespan)
@@ -958,6 +998,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     host = config.server_host
     port = config.server_port
 
+    install_api_key(app, config.api_key)
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
