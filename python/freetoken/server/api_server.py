@@ -923,7 +923,7 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int) -> None:
+def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -956,7 +956,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # /health and echoes the same load progress the desktop app polls for. A ^C during that
         # wait is a stop, not a crash -- exit through the teardown below, not a traceback.
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(run_shell(origin, connect_grace=30.0))
+            asyncio.run(run_shell(origin, connect_grace=30.0, api_key=api_key))
     finally:
         server.should_exit = True
         thread.join(timeout=15)
@@ -1085,7 +1085,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     ).start()
 
     if run_shell:
-        _serve_and_run_shell(host, port)
+        _serve_and_run_shell(host, port, config.api_key)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
     uvicorn.run(app, host=host, port=port)

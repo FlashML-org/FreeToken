@@ -45,6 +45,10 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         default=None,
         help="FreeToken server URL (default: $FREETOKEN_HOST, else http://127.0.0.1:1919)",
     )
+    parser.add_argument(
+        "--api-key",
+        help="API key of a server started with --api-key (default: $FREETOKEN_API_KEY)",
+    )
     return parser
 
 
@@ -63,7 +67,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft shell") -> int:
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
-    from freetoken.launch import resolve_server_url
+    from freetoken.launch import resolve_api_key, resolve_server_url
 
     try:
         server = resolve_server_url(parsed.server)
@@ -74,7 +78,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft shell") -> int:
     from .tui import run_shell
 
     try:
-        return asyncio.run(run_shell(server.origin))
+        return asyncio.run(run_shell(server.origin, api_key=resolve_api_key(parsed.api_key)))
     except KeyboardInterrupt:
         return 130
 

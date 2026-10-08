@@ -132,6 +132,7 @@ ft shell --model ~/models/Qwen3.6-35B-A3B   # serve + chat in one process
 ```
 
 - Attach mode talks to `--server URL` (default `http://127.0.0.1:1919`)
+- `--api-key KEY` (default `$FREETOKEN_API_KEY`) attaches to a server started with `--api-key`; with `--model` the shell uses that server's own key
 - `/help` inside the shell lists the commands (`/think`, `/cache`, `/reset`).
 
 ## ft ctl

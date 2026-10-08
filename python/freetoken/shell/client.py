@@ -27,7 +27,7 @@ from typing import Any
 import openai
 from openai import AsyncOpenAI
 
-# Any string is accepted by the server; sent so the SDK doesn't refuse to build a request.
+# Sent when no key is given: a server without --api-key accepts any string, and the SDK needs one.
 LOCAL_API_KEY = "freetoken-local"
 CONTROL_TIMEOUT = 10.0
 # Per-read timeout on the chat stream. Generous: it has to cover the gap before the first
@@ -97,14 +97,15 @@ class ShellClient:
         self,
         origin: str,
         *,
-        api_key: str = LOCAL_API_KEY,
+        api_key: str | None = None,
         timeout: float = CONTROL_TIMEOUT,
     ) -> None:
         self.origin = origin.rstrip("/")
         self.timeout = timeout
+        self._api_key = api_key or LOCAL_API_KEY
         self._openai = AsyncOpenAI(
             base_url=f"{self.origin}/v1",
-            api_key=api_key,
+            api_key=self._api_key,
             max_retries=0,  # a retried chat request would generate the turn twice
             timeout=openai.Timeout(CHAT_READ_TIMEOUT, connect=10.0),
         )
@@ -118,7 +119,7 @@ class ShellClient:
         self, method: str, path: str, body: dict[str, Any] | None, timeout: float
     ) -> dict[str, Any]:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._api_key}"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
