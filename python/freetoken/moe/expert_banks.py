@@ -77,6 +77,26 @@ def _shard_piece(piece, cfg):
         return piece
     out = {}
     for role, t in piece.items():
+        if role == "gate_up":
+            # fused [E, 2*I, H] = [gate(I) | up(I)] on dim1: take this rank's slice of each half
+            half = t.shape[1] // 2
+            if half % tp:
+                raise NotImplementedError(f"expert piece {role!r} half ({half}) is not divisible by tp={tp}")
+            loc = half // tp
+            g = t.narrow(1, rank * loc, loc)
+            u = t.narrow(1, half + rank * loc, loc)
+            out[role] = torch.cat([g, u], dim=1).contiguous()
+            continue
+        if role.endswith("_global"):
+            # a global rides the OUTPUT dim: gate/up output = the (sharded) intermediate, so a PER-ROW
+            # gate/up global [E, I] shards dim1; but a PER-TENSOR scalar (modelopt nvfp4 weight_scale_2,
+            # dim1==1) and down's per-output-row global (on the un-sharded H) REPLICATE.
+            if role.startswith(("gate", "up")) and t.dim() > 1 and t.shape[1] > 1 and t.shape[1] % tp == 0:
+                loc = t.shape[1] // tp
+                out[role] = t.narrow(1, rank * loc, loc).contiguous()
+            else:
+                out[role] = t
+            continue
         if role.startswith(("gate", "up")):
             dim = 1
         elif role in ("down", "down_scale"):
