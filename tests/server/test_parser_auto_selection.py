@@ -101,3 +101,57 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def _qwen3_moe(model_path: str, *extra: str):
+    """Parse ``model_path`` as ``Qwen3MoeForCausalLM``. The architecture is shared by
+    the Instruct-2507 and Thinking-2507 checkpoints, so the path is the only signal."""
+    config = _Config({"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        return parse_args(["--model", model_path, *extra])
+
+
+def test_qwen3_instruct_2507_does_not_get_a_reasoning_parser():
+    """Instruct-2507 emits plain answers. Auto must not select qwen3, or the whole
+    answer is labelled reasoning and message.content comes back empty."""
+    for model_path in (
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4",
+    ):
+        args, _ = _qwen3_moe(model_path)
+        assert args.reasoning_parser is None, model_path
+        assert args.tool_call_parser == "qwen25", model_path
+
+
+def test_qwen3_thinking_and_generic_checkpoints_still_select_qwen3():
+    for model_path in (
+        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-32B",
+    ):
+        args, _ = _qwen3_moe(model_path)
+        assert args.reasoning_parser == "qwen3", model_path
+        assert args.tool_call_parser == "qwen25", model_path
+
+
+def test_explicit_qwen3_overrides_instruct_2507():
+    args, _ = _qwen3_moe(
+        "Qwen/Qwen3-235B-A22B-Instruct-2507", "--reasoning-parser", "qwen3"
+    )
+    assert args.reasoning_parser == "qwen3"
+    assert args.tool_call_parser == "qwen25"
+
+
+def test_instruct_2507_text_stays_content_and_thinking_still_splits():
+    """None skips the parser, so a plain completion is content. The Thinking
+    checkpoint still opens inside a think block and splits on the closer."""
+    from types import SimpleNamespace
+
+    from freetoken.server.generation import _split_reasoning
+
+    spec = SimpleNamespace(chat_template_kwargs={}, template_tools=None)
+    plain = "Introduce yourself in three sentences."
+    no_parser = SimpleNamespace(config=SimpleNamespace(reasoning_parser=None))
+    assert _split_reasoning(plain, spec, no_parser) == ("", plain)
+
+    thinking = SimpleNamespace(config=SimpleNamespace(reasoning_parser="qwen3"))
+    assert _split_reasoning("reason</think>answer", spec, thinking) == ("reason", "answer")
