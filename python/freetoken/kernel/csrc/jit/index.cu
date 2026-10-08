@@ -134,6 +134,11 @@ struct IndexKernel {
     RuntimeCheck(entry_size == element_size,
                  "IndexKernel: element_size mismatch.");
 
+    // Empty batches are valid no-ops; do not launch a zero-sized grid.
+    if (num_indices == 0) {
+      return;
+    }
+
     constexpr auto kWarpPerBlock = num_threads / device::kWarpThreads;
     const auto num_warps = num_splits * num_indices;
     const auto num_blocks = div_ceil(num_warps, kWarpPerBlock);

@@ -96,6 +96,11 @@ struct StoreKernel {
     const auto kv_cache_stride = X.unwrap() * dtype_size;
     const auto kv_input_stride = Y.unwrap() * dtype_size;
 
+    // Empty batches are valid no-ops; do not launch a zero-sized grid.
+    if (length == 0) {
+      return;
+    }
+
     const auto params = StoreKernelParams{
         .k_cache = k_cache.data_ptr(),
         .v_cache = v_cache.data_ptr(),
