@@ -31,12 +31,13 @@ def _gated_pool_kernel(
     kv_base = kv_ptr + b * stride_kb + offs * stride_kd
     sc_base = score_ptr + b * stride_sb + offs * stride_sd
     maxv = tl.full((BLOCK_D,), float("-inf"), tl.float32)
-    for r in range(R):
+    # Explicit unroll: ptxas does not unroll the plain loop Triton 3.8 emits, which serializes these latency-bound loads.
+    for r in tl.range(R, loop_unroll_factor=2):
         s = tl.load(sc_base + r * stride_sr, mask=mask, other=float("-inf")).to(tl.float32)
         maxv = tl.maximum(maxv, s)
     denom = tl.zeros((BLOCK_D,), tl.float32)
     acc = tl.zeros((BLOCK_D,), tl.float32)
-    for r in range(R):
+    for r in tl.range(R, loop_unroll_factor=2):
         s = tl.load(sc_base + r * stride_sr, mask=mask, other=float("-inf")).to(tl.float32)
         w = tl.exp(s - maxv)
         denom += w
