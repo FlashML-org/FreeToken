@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import os
 import signal
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from fastapi.testclient import TestClient
 
+from freetoken.daemon import proxy
 from freetoken.daemon.accounting import (
     AccountingOutbox,
     AccountingOutboxError,
     AccountingPrepareError,
 )
+from freetoken.daemon.app import build_app
 from freetoken.daemon.logring import LogRing
 from freetoken.daemon.pidfile import ServeState, ServeStateStore
-from freetoken.daemon.serve_manager import Conflict, ExitInfo, ServeManager
+from freetoken.daemon.serve_manager import Conflict, ExitInfo, ServeManager, spawn_serve
 
 
 # --------------------------------------------------------------------------- test doubles
@@ -50,11 +56,13 @@ class Spawner:
     def __init__(self):
         self.children: list[FakeChild] = []
         self.calls: list[tuple] = []
+        self.api_keys: list[str | None] = []
         self._pid = 1000
         self.gate: threading.Event | None = None
 
-    def __call__(self, model, port, args) -> FakeChild:
+    def __call__(self, model, port, args, api_key=None) -> FakeChild:
         self.calls.append((model, port, list(args)))
+        self.api_keys.append(api_key)
         if self.gate is not None:
             self.gate.wait()
         self._pid += 1
@@ -741,6 +749,132 @@ def test_readopt_no_state_is_noop(tmp_path):
     mgr = ServeManager(ring, store, spawn_fn=Spawner(), tailer_factory=None,
                        signal_fn=lambda p, s: None, apply_oom=False)
     assert mgr.readopt() is False
+
+
+# --------------------------------------------------------------------------- API key
+
+
+def test_api_key_is_serve_config_kept_owner_only_and_readopted(tmp_path):
+    sp = Spawner()
+    mgr, store, _ = make_manager(tmp_path, sp)
+    # an older daemon left a world-readable state file and a stale tmp behind
+    for path in (store.path, f"{store.path}.tmp"):
+        with open(path, "w") as fh:
+            fh.write("{}")
+        os.chmod(path, 0o644)
+    mgr.start("m", 1919, [], "k1")
+    assert sp.api_keys == ["k1"] and mgr.serve_api_key() == "k1"
+    assert mgr.start("m", 1919, [], "k1")["idempotent"] is True
+    with pytest.raises(Conflict):
+        mgr.start("m", 1919, [], "k2")
+    assert store.load().api_key == "k1"
+    assert os.stat(store.path).st_mode & 0o777 == 0o600
+
+    adopted = FakeChild(4242, adopted=True)
+    fresh = ServeManager(
+        LogRing(), store, spawn_fn=Spawner(), adopt_fn=lambda state: adopted, tailer_factory=None,
+        signal_fn=lambda p, s: None, apply_oom=False,
+    )
+    assert fresh.readopt() is True and fresh.serve_api_key() == "k1"
+    adopted.die()
+    sp.children[0].die()
+
+
+def test_switch_replaces_the_api_key(tmp_path):
+    sp = Spawner()
+
+    def sig(pid, s):
+        if s == signal.SIGTERM:
+            sp.by_pid(pid).die(0)
+
+    mgr, store, _ = make_manager(tmp_path, sp, signal_fn=sig)
+    mgr.start("m", 1919, [], "k1")
+    mgr.switch("m", 1919, [], False, "k2")
+    assert sp.api_keys == ["k1", "k2"]
+    assert mgr.serve_api_key() == "k2" and store.load().api_key == "k2"
+    sp.children[1].die()
+
+
+def test_auto_restart_keeps_the_api_key(tmp_path):
+    sp = Spawner()
+    mgr, _, _ = make_manager(tmp_path, sp, auto_restart=True)
+    mgr.start("m", 1919, [], "k1")
+    sp.children[0].die(1)
+    assert wait_until(lambda: len(sp.children) == 2)
+    assert sp.api_keys == ["k1", "k1"]
+    sp.children[1].die()
+
+
+def test_spawned_serve_sees_only_the_requested_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_API_KEY", "from-daemon-env")
+    code = "import os; print(os.environ.get('FREETOKEN_API_KEY'))"
+    for api_key in (None, "k1"):
+        log = tmp_path / f"{api_key}.log"
+        child = spawn_serve([sys.executable, "-c", code], str(log), api_key)
+        child.wait()
+        child.close()
+        assert log.read_text().strip() == str(api_key)
+
+
+def test_probe_sends_the_running_serves_key(monkeypatch):
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        seen.append(req.get_header("Authorization"))
+        return Response()
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
+    key = None
+    probe = proxy.ServeProbe(api_key=lambda: key)
+    probe.fresh_stats(1919)
+    key = "k1"
+    probe.fresh_stats(1919)
+    probe.prepare_stop(1919)
+    assert seen == [None, "Bearer k1", "Bearer k1"]
+
+
+def test_start_and_switch_routes_hand_the_api_key_to_the_manager():
+    calls = []
+
+    class Manager:
+        def status(self):
+            return {"running": False}
+
+        def start(self, *args):
+            calls.append(args)
+            return {"pid": 1, "idempotent": False}
+
+        def switch(self, *args):
+            calls.append(args)
+            return {"pid": 1, "idempotent": False, "accounting": None}
+
+    with ThreadPoolExecutor(1) as lifecycle_pool, ThreadPoolExecutor(1) as proxy_pool:
+        app = build_app(
+            manager=Manager(), ring=LogRing(), probe=None, footprint_fn=lambda pid: {},
+            lifecycle_pool=lifecycle_pool, proxy_pool=proxy_pool,
+        )
+        with TestClient(app) as client:
+            client.post("/engine/start", json={"model": "m", "port": 1919, "apiKey": "k1"})
+            client.post("/engine/start", json={"model": "m", "port": 1919, "apiKey": ""})
+            client.post("/engine/start", json={"model": "m", "port": 1919})
+            client.post("/engine/switch", json={"model": "m", "port": 1919, "apiKey": "k2"})
+            # argparse also takes an unambiguous prefix of --api-key
+            for args in (["--api-key", "k3"], ["--api-key=k3"], ["--api", "k3"], ["--ap=k3"]):
+                rejected = client.post("/engine/start", json={"model": "m", "args": args})
+                assert rejected.status_code == 400
+            allowed = client.post("/engine/start", json={"model": "m", "args": ["--attn", "fa"]})
+            assert allowed.status_code == 200
+    assert [args[-1] for args in calls] == ["k1", None, None, "k2", None]
 
 
 # --------------------------------------------------------------------------- resource leak (L2)

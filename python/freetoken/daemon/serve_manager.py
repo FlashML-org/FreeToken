@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from freetoken.launch import API_KEY_ENV
+
 from . import osproc
 from .accounting import (
     AccountingOutbox,
@@ -37,7 +39,7 @@ from .accounting import (
 
 
 class Conflict(RuntimeError):
-    """A different serve (model/port/args) is already running; the client should switch()."""
+    """A different serve (model/port/args/key) is already running; the client should switch()."""
 
 
 @dataclass
@@ -128,7 +130,15 @@ def build_serve_command(
     return argv, log_path
 
 
-def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
+def serve_env(api_key: str | None) -> dict[str, str]:
+    """The serve's environment: the daemon's own, with the API key set only by the start request."""
+    env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
+    if api_key:
+        env[API_KEY_ENV] = api_key
+    return env
+
+
+def spawn_serve(argv: list[str], log_path: str, api_key: str | None = None) -> PopenChild:
     """Spawn the serve as a session leader with its stdout+stderr going to a real logfile fd (never
     a PIPE): the file survives daemon death, so a re-adopting daemon just resumes tailing it and
     the serve never writes to a dead pipe. ``start_new_session`` makes it a process
@@ -138,6 +148,7 @@ def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
     try:
         proc = subprocess.Popen(
             argv,
+            env=serve_env(api_key),
             stdout=logf,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -158,7 +169,7 @@ class ServeManager:
         ring,
         state_store,
         *,
-        spawn_fn: Callable[[str, int, list[str]], object] | None = None,
+        spawn_fn: Callable[[str, int, list[str], str | None], object] | None = None,
         adopt_fn: Callable[[object], object] | None = None,
         tailer_factory: Callable[[object], object] | None = None,
         signal_fn: Callable[[int, int], None] | None = None,
@@ -217,6 +228,7 @@ class ServeManager:
         self._model: str | None = None
         self._port: int | None = None
         self._args: list[str] = []
+        self._api_key: str | None = None
         self._started_at: float | None = None
         self._last_exit: ExitInfo | None = None
         self._adopted = False
@@ -232,11 +244,11 @@ class ServeManager:
 
     # ---- default factories (overridable for tests) ----
 
-    def _default_spawn(self, model: str, port: int, args: list[str]):
+    def _default_spawn(self, model: str, port: int, args: list[str], api_key: str | None):
         argv, log_path = build_serve_command(
             model, port, args, python=self._python, log_dir=self._log_dir
         )
-        return spawn_serve(argv, log_path)
+        return spawn_serve(argv, log_path, api_key)
 
     def _default_adopt(self, state):
         if not osproc.is_ft_serve_on_port(state.pid, state.port, starttime=state.starttime):
@@ -256,13 +268,25 @@ class ServeManager:
     # ---- lifecycle ----
 
     def start(
-        self, model: str, port: int, args: list[str] | None = None, *, _auto: bool = False
+        self,
+        model: str,
+        port: int,
+        args: list[str] | None = None,
+        api_key: str | None = None,
+        *,
+        _auto: bool = False,
     ) -> dict:
         with self._lifecycle:
-            return self._start(model, port, args, _auto=_auto)
+            return self._start(model, port, args, api_key, _auto=_auto)
 
     def _start(
-        self, model: str, port: int, args: list[str] | None = None, *, _auto: bool = False
+        self,
+        model: str,
+        port: int,
+        args: list[str] | None = None,
+        api_key: str | None = None,
+        *,
+        _auto: bool = False,
     ) -> dict:
         args = list(args or [])
         with self._cond:
@@ -278,10 +302,13 @@ class ServeManager:
                 self._stop_requested = False  # an explicit client start clears a prior stop intent
             while True:
                 if self._child is not None and not self._stopping:
-                    if (self._model, self._port, self._args) == (model, port, args):
+                    if (self._model, self._port, self._args, self._api_key) == (
+                        model, port, args, api_key
+                    ):
                         return {"pid": self._child.pid, "idempotent": True}
                     raise Conflict(
-                        f"serve already running (model={self._model!r} port={self._port}); "
+                        f"serve already running with a different config "
+                        f"(model={self._model!r} port={self._port}); "
                         f"use switch to replace it"
                     )
                 if self._starting:
@@ -299,7 +326,7 @@ class ServeManager:
 
         child = None
         try:
-            child = self._spawn_fn(model, port, args)
+            child = self._spawn_fn(model, port, args, api_key)
         finally:
             if child is None:
                 with self._cond:
@@ -311,6 +338,7 @@ class ServeManager:
             self._model = model
             self._port = port
             self._args = args
+            self._api_key = api_key
             self._started_at = self._now()
             self._last_exit = None
             self._adopted = getattr(child, "adopted", False)
@@ -318,7 +346,7 @@ class ServeManager:
             self._starting = False
             self._cond.notify_all()
 
-        self._persist(child, model, port, args)
+        self._persist(child, model, port, args, api_key)
         self._maybe_apply_oom(child.pid)
         self._begin_watch(child)
         self._emit(f"serve started (pid={child.pid} model={model} port={port})")
@@ -407,10 +435,11 @@ class ServeManager:
         port: int,
         args: list[str] | None = None,
         force: bool = False,
+        api_key: str | None = None,
     ) -> dict:
         with self._lifecycle:
             stopped = self._stop(force=force)
-            started = self._start(model, port, args)
+            started = self._start(model, port, args, api_key)
             return {**started, "accounting": stopped["accounting"]}
 
     def pending_accounting(self) -> list[dict[str, Any]]:
@@ -734,6 +763,7 @@ class ServeManager:
             self._model = state.model
             self._port = state.port
             self._args = list(state.args)
+            self._api_key = state.api_key
             self._started_at = self._now()  # unknown true start; report uptime since adoption
             self._last_exit = None
             self._adopted = True
@@ -824,13 +854,13 @@ class ServeManager:
         return f"serve exited with code {info.code} (pid={child.pid})"
 
     def _restart_async(self, dead_child) -> None:
-        model, port, args = self._model, self._port, list(self._args)
+        model, port, args, api_key = self._model, self._port, list(self._args), self._api_key
         if model is None or port is None:
             return
 
         def _run():
             try:
-                self.start(model, port, args, _auto=True)
+                self.start(model, port, args, api_key, _auto=True)
             except Exception as exc:  # noqa: BLE001
                 self._emit(f"auto-restart failed: {exc}")
 
@@ -867,6 +897,10 @@ class ServeManager:
         with self._cond:
             return list(self._args)
 
+    def serve_api_key(self) -> str | None:
+        with self._cond:
+            return self._api_key
+
     def status(self) -> dict:
         with self._cond:
             child = self._child
@@ -892,7 +926,9 @@ class ServeManager:
 
     # ---- helpers ----
 
-    def _persist(self, child, model: str, port: int, args: list[str]) -> None:
+    def _persist(
+        self, child, model: str, port: int, args: list[str], api_key: str | None
+    ) -> None:
         from .pidfile import ServeState
 
         self._store.save(
@@ -903,6 +939,7 @@ class ServeManager:
                 args=list(args),
                 starttime=getattr(child, "starttime", None),
                 log_path=getattr(child, "log_path", None),
+                api_key=api_key,
             )
         )
 

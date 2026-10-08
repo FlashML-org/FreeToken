@@ -49,6 +49,7 @@ class ServeProbe:
         now: Callable[[], float] = time.monotonic,
         opener: Callable[[str, float], dict] | None = None,
         prepare_opener: Callable[[str, float], dict] | None = None,
+        api_key: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._host = host
         self._ttl = ttl_s
@@ -57,6 +58,7 @@ class ServeProbe:
         self._now = now
         self._opener = opener or self._urlopen
         self._prepare_opener = prepare_opener or self._urlopen_prepare
+        self._api_key = api_key
         self._lock = threading.Lock()
         self._cache: dict[tuple[str, int], tuple[float, dict]] = {}
 
@@ -109,19 +111,23 @@ class ServeProbe:
         result["reachable"] = True
         return result
 
-    @staticmethod
-    def _urlopen(url: str, timeout: float) -> dict:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    def _headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if key := self._api_key():
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def _urlopen(self, url: str, timeout: float) -> dict:
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
         return json.loads(raw.decode("utf-8"))
 
-    @staticmethod
-    def _urlopen_prepare(url: str, timeout: float) -> dict:
+    def _urlopen_prepare(self, url: str, timeout: float) -> dict:
         req = urllib.request.Request(
             url,
             data=b"{}",
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers={**self._headers(), "Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
