@@ -15,7 +15,7 @@ import pytest
 import torch
 from PIL import Image
 
-from freetoken.models.deepseek_v4.config import DSV4VisionConfig, parse_vision_config
+from freetoken.models.deepseek_v4.config import DSV4VisionConfig, parse_config, parse_vision_config
 from freetoken.models.deepseek_v4.image_processor import load_image
 from freetoken.models.deepseek_v4.vision import (
     COMPRESS_PAD_TO,
@@ -274,3 +274,62 @@ def test_a_span_started_at_the_first_lead_pad_breaks_reference_parity():
         addr_lo=0, width=min(hi, _WINDOW + _MAX_IMG),
     )
     assert int((cols != ref).any(dim=1).sum()) == 218
+
+
+def test_a_vision_checkpoint_keeps_image_blocks_whole_across_chunk_boundaries(tmp_path):
+    """Image spans attend bidirectionally, so a vision checkpoint sets
+    bidirectional_mm_blocks on its attention group and the scheduler ends a chunk before a
+    block instead of splitting it; text-only defaults to False and keeps plain chunking."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Context, SamplingParams, get_global_ctx, set_global_ctx
+    from freetoken.message import MMItem
+    from freetoken.scheduler.cache import CacheManager
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.mm import cut_image_spans
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    # DeepseekV4Args defaults fill an empty inference/config.json; the hf namespace carries the tower
+    (tmp_path / "inference").mkdir()
+    (tmp_path / "inference" / "config.json").write_text("{}")
+    vision = parse_config(SimpleNamespace(_name_or_path=str(tmp_path), **_HF_CONFIG))
+    text = parse_config(SimpleNamespace(_name_or_path=str(tmp_path), **{**_HF_CONFIG, "vision_n_layers": None}))
+    assert vision.attention_groups[0].bidirectional_mm_blocks is True
+    assert text.attention_groups[0].bidirectional_mm_blocks is False
+
+    prefix = 10
+    types, _perm = build_image_block(2, 2, prefix)
+    lo, hi = prefix, prefix + len(types)
+    image = MMItem(modality="image", hash=1, pad_value=1, offsets=[[lo, hi]], feature=torch.zeros(1))
+    assert lo < 15 < hi  # a plain 15-token chunk budget ends inside the block
+
+    def chunk_lens(keep_images_whole):
+        try:
+            get_global_ctx()
+        except AssertionError:
+            set_global_ctx(Context(page_size=1))
+        pt = torch.zeros((5, 64), dtype=torch.int32)
+        cm = CacheManager(num_pages=64, page_size=1, page_table=pt, type="radix")
+        pm = PrefillManager(
+            cm, TableManager(max_running_reqs=4, page_table=pt), DecodeManager(1),
+            keep_images_whole=keep_images_whole,
+        )
+        pm.pending_list = [PendingReq(uid=7, input_ids=torch.arange(30, dtype=torch.int32),
+                                      sampling_params=SamplingParams(max_tokens=4), mm_items=[image])]
+        lens, cuts = [], []
+        while pm.runnable:
+            batch = pm.schedule_next_batch(15)
+            assert batch is not None
+            cm.allocate_paged(batch.reqs)
+            cuts.extend(cut_image_spans(batch.reqs))
+            for r in batch.reqs:
+                lens.append(r.extend_len)
+                r.complete_one()
+        return lens, cuts
+
+    lens, cuts = chunk_lens(vision.attention_groups[0].bidirectional_mm_blocks)
+    assert lens == [lo, 15, 30 - lo - 15] and cuts == []  # first chunk stops at the block, the next holds it whole
+    lens, cuts = chunk_lens(text.attention_groups[0].bidirectional_mm_blocks)
+    assert lens == [15, 15] and cuts == [(lo, hi)]  # the block is split into two spans; the cut warning would fire

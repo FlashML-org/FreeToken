@@ -162,7 +162,9 @@ class Attention(BaseOP):
         and concatenates.
 
         ``spans`` (VL requests) are the request's image-block ranges ``[(start, end)]`` inside
-        ``[start_pos, start_pos + n)`` -- chunking never splits one. Inside a span, every token
+        ``[start_pos, start_pos + n)``. Vision checkpoints set ``bidirectional_mm_blocks`` on the
+        attention group, which makes prefill end a chunk before a block instead of splitting it;
+        only a block longer than one chunk budget is still cut. Inside a span, every token
         sees the whole span (bidirectional, capped at ``vision_max_n_token``) instead of only its
         128-window, matching the reference's ``get_window_topk_idxs_visible``. All span-visible
         candidates are intra-segment, so the live full-page map covers them (the 128-slot ring

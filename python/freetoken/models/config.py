@@ -216,6 +216,9 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     sliding_window: int  # the P-token window page
     # "v41": DeepSeek-V4.1's cross-layer-shared packed tiers (AttnType.DSV41, its own pool and backend)
     variant: Literal["v4", "v41"] = "v4"
+    # image token spans attend to each other in both directions, so prefill chunks end
+    # before a block instead of splitting it (the scheduler's keep_images_whole gate)
+    bidirectional_mm_blocks: bool = False
 
 
 AttentionGroupConfig: TypeAlias = (

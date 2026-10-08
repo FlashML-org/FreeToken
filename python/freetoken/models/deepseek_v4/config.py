@@ -116,6 +116,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
                 num_kv_heads=1,  # MLA-style shared latent (K == V)
                 head_dim=args.head_dim,
                 sliding_window=args.window_size,
+                bidirectional_mm_blocks=vision_config is not None,
             ),
         ),
         vision_config=vision_config,
