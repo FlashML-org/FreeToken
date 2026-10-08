@@ -138,8 +138,10 @@ ft shell --model ~/models/Qwen3.6-35B-A3B   # serve + chat in one process
 ## ft ctl
 
 ```bash
-ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
+ft ctl [--base-url http://127.0.0.1:1919] [--api-key KEY] [--timeout 10] [--json] <subcommand>
 ```
+
+`--api-key` defaults to `$FREETOKEN_API_KEY`.
 
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
