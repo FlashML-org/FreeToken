@@ -85,8 +85,8 @@ def iter_weights(
     Routed MXFP4 experts come from the offload cache, so ``include_moe_experts`` must be
     False (DeepSeek-V4 only runs ``--moe-strategy offload``). Tensors yielded in checkpoint
     dtype (fp8 + e8m0 preserved); ``wo_a`` dequantized to bf16 to match the reference einsum.
-    ``include_vision`` (the engine's active-encoder set) drops the ``vision.*`` / ``aligner.*``
-    / ``image_*`` tower tensors; the router biases stay in either way, since the gate builds
+    ``include_vision`` (the engine's active-encoder set) drops the ``visual.*`` tower
+    tensors; the router biases stay in either way, since the gate builds
     them on any vision checkpoint.
     """
     if include_moe_experts:
@@ -177,8 +177,10 @@ def iter_weights(
 # --------------------------------------------------------------------------------------
 # Vision tower.
 # --------------------------------------------------------------------------------------
-# The wrapper keeps the tower unprefixed (``vision.*``, ``aligner.*``, ``image_*``), so the
-# checkpoint's own names are the model's names and nothing is renamed on either side.
+# The wrapper mounts the tower, the aligner and the sentinels under one ``visual``
+# container, so every engine-side name carries the ``visual.`` prefix the shared
+# VISION_KEY_PREFIXES filter matches; the checkpoint's unprefixed names
+# (``vision.*``, ``aligner.*``, ``image_*``) are renamed here on load.
 _VISION_BLOCK_SUFFIXES = (
     "norm1.weight",
     "attn.wqkv.weight",
@@ -209,9 +211,9 @@ def _iter_vision(reader, args: DeepseekV4Args):
         return
     for L in range(args.vision_n_layers):
         for suffix in _VISION_BLOCK_SUFFIXES:
-            yield f"vision.blocks.{L}.{suffix}", reader.get(f"vision.blocks.{L}.{suffix}")
+            yield f"visual.vision.blocks.{L}.{suffix}", reader.get(f"vision.blocks.{L}.{suffix}")
     for name in _VISION_TAIL:
-        yield name, reader.get(name)
+        yield f"visual.{name}", reader.get(name)
 
 
 def iter_vision_weights(model_path: str, device):

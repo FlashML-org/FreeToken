@@ -264,7 +264,7 @@ def is_checkpoint_tower_name(name: str) -> bool:
     if head[0] == "model" and len(head) > 1:
         head = head[1:]
     return ("vision" in head[0] or "visual" in head[0] or head[0] in _TOWER_SEGMENTS
-            or head[0] in ("aligner", "image_start", "image_end", "image_newline")
+            or head[0] in ("aligner", "image_start", "image_end", "image_newline", "image_pad")
             or name.endswith(".ffn.gate.bias_vl"))
 
 

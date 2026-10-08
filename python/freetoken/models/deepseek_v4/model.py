@@ -22,8 +22,6 @@ activation quant + Hadamard rotation re-introduced; see ``ops.py`` / the dsv4 ke
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn.functional as F
 
@@ -36,10 +34,7 @@ from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from .args import DeepseekV4Args
 from .attention import Attention
 from .moe import MoE
-from .vision import COMPRESS_PAD_TO, DSV4Aligner, DSV4VisionTower, assemble_block, build_image_block
-
-if TYPE_CHECKING:
-    from freetoken.message import MMItem
+from .vision import COMPRESS_PAD_TO, DSV4Vision
 
 # Re-exports: keep every class/helper previously defined here importable from .model
 # (external import stability; the moved definitions live in their own modules).
@@ -245,14 +240,10 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._bound = False
         # Vision (DeepSeek-V4-Flash-Vision-Exp). config.is_multimodal is the engine's
         # resolved gate, so a text-only process never builds weights the loader skips.
-        # The tower, the aligner and the sentinel vectors hang off the WRAPPER: their
-        # unprefixed checkpoint keys have to land at the model's top level.
-        self._vision = config.is_multimodal
-        if self._vision:
-            self.vision = DSV4VisionTower(config.vision_config)
-            self.aligner = DSV4Aligner(config.vision_config)
-            for name in ("image_start", "image_end", "image_newline", "image_pad"):
-                setattr(self, name, torch.empty(config.hidden_size, dtype=torch.bfloat16))
+        # The whole stack sits under one ``visual.`` mount, so the shared vision-key
+        # filter (VISION_KEY_PREFIXES) covers every image-only parameter.
+        if config.is_multimodal:
+            self.visual = DSV4Vision(config.vision_config, config.hidden_size)
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -269,26 +260,10 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._bound = False
 
     def place_encoder_weights(self, mode: str) -> None:
-        self.vision.place_weights(mode)
+        self.visual.place_weights(mode)
 
-    @torch.inference_mode()
-    def encode(self, item: MMItem) -> torch.Tensor:
-        """One image -> the embeddings of its whole token block, sentinels included.
-
-        The block's layout is a function of where it lands in the prompt, so the item
-        carries the grid and the offset; ``build_image_block`` re-derives the same
-        ``(types, perm)`` the processor tokenized with.
-        """
-        device = self.vision.patch_embed.proj.weight.device
-        patches = item.feature.to(device, non_blocking=True)
-        aligned = self.aligner.forward(
-            self.vision.forward(patches, item.n_vit_h, item.n_vit_w), item.n_vit_h, item.n_vit_w
-        )
-        types, perm = build_image_block(item.n_llm_h, item.n_llm_w, item.start)
-        sentinels = torch.stack(
-            [self.image_start, self.image_pad, self.image_pad, self.image_newline, self.image_end]
-        )
-        return assemble_block(aligned, types, perm, sentinels)
+    def encode(self, item):
+        return self.visual.forward(item)
 
     def forward(self) -> torch.Tensor:
         self._ensure_bound()

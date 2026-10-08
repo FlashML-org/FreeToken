@@ -37,6 +37,7 @@ def hotfix():
     ("vision.blocks.0.norm1.weight", True),
     ("aligner.w1.weight", True),
     ("image_newline", True),
+    ("image_pad", True),
     ("layers.3.ffn.gate.bias_vl", True),
     ("model.embed_audio.embedding_projection.weight", False),
     ("model.language_model.layers.0.self_attn.q_proj.weight", False),

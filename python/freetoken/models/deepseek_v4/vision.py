@@ -2,10 +2,11 @@
 
 Port of the reference ``inference/vision.py`` / ``inference/image_processor.py`` from
 deepseek-ai/DeepSeek-V4-Flash-Vision-Exp. The tower, the aligner and the four sentinel
-vectors are :class:`BaseOP` children of the model WRAPPER, so their unprefixed
-state-dict keys (``vision.patch_embed.proj.weight``, ``aligner.w1.weight``,
-``image_start``, ...) match the checkpoint tensor names verbatim with no renaming on
-either side; every tensor is bf16 exactly as stored.
+vectors hang under one :class:`DSV4Vision` container the wrapper mounts as ``visual``,
+so their state-dict keys sit behind the ``visual.`` prefix every VLM family filters on
+(the checkpoint's own unprefixed names, ``vision.patch_embed.proj.weight``,
+``aligner.w1.weight``, ``image_start``, ..., are renamed on load); every tensor is bf16
+exactly as stored.
 
 Image tokens occupy plain sequential positions: the 2-D structure lives inside the
 tower (2-D RoPE over the patch grid) and in the N-layout of the token block the
@@ -178,6 +179,38 @@ class DSV4Aligner(BaseOP):
         return self.w2.forward(F.gelu(self.w1.forward(x)))
 
 
+class DSV4Vision(BaseOP):
+    """The wrapper's whole vision stack under one ``visual.`` mount, like the V4.1 sibling."""
+
+    def __init__(self, vc: DSV4VisionConfig, text_dim: int):
+        self.vision = DSV4VisionTower(vc)
+        self.aligner = DSV4Aligner(vc)
+        for name in ("image_start", "image_end", "image_newline", "image_pad"):
+            setattr(self, name, torch.empty(text_dim, dtype=torch.bfloat16))
+
+    def place_weights(self, mode: str) -> None:
+        self.vision.place_weights(mode)
+
+    @torch.inference_mode()
+    def forward(self, item):
+        """One image -> the embeddings of its whole token block, sentinels included.
+
+        The block's layout is a function of where it lands in the prompt, so the item
+        carries the grid and the offset; ``build_image_block`` re-derives the same
+        ``(types, perm)`` the processor tokenized with.
+        """
+        device = self.vision.patch_embed.proj.weight.device
+        patches = item.feature.to(device, non_blocking=True)
+        aligned = self.aligner.forward(
+            self.vision.forward(patches, item.n_vit_h, item.n_vit_w), item.n_vit_h, item.n_vit_w
+        )
+        types, perm = build_image_block(item.n_llm_h, item.n_llm_w, item.start)
+        sentinels = torch.stack(
+            [self.image_start, self.image_pad, self.image_pad, self.image_newline, self.image_end]
+        )
+        return assemble_block(aligned, types, perm, sentinels)
+
+
 def grid_tokens(best_height: int, best_width: int, patch_size: int, downsample_ratio: int):
     """LLM-token footprint of a resized image: the N-layout row/align padding included."""
     n_llm_h = math.ceil((best_height // patch_size) / downsample_ratio)
@@ -288,6 +321,7 @@ def assemble_block(
 __all__ = [
     "COMPRESS_PAD_TO",
     "DSV4Aligner",
+    "DSV4Vision",
     "DSV4VisionTower",
     "IMAGE",
     "IMAGE_END",
