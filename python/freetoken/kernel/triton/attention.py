@@ -6,8 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.utils.arch import is_sm90_family
-
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -685,7 +683,6 @@ def _extend_attention_split_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
-    STAGES: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -733,7 +730,7 @@ def _extend_attention_split_kernel(
     lo, u0, u1 = _extend_tile_ranges(
         prefix_len + block_start, prefix_end // BLOCK_N * BLOCK_N, prefix_end, BLOCK_M, BLOCK_N, SLIDING_WINDOW
     )
-    for start_n in tl.range(u0, u1, BLOCK_N, num_stages=STAGES):
+    for start_n in tl.range(u0, u1, BLOCK_N):
         slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n)
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
@@ -766,7 +763,7 @@ def _extend_attention_split_kernel(
         block_start, tl.minimum(block_start // BLOCK_N * BLOCK_N, current_end), current_end, BLOCK_M, BLOCK_N,
         SLIDING_WINDOW,
     )
-    for start_n in tl.range(u0, u1, BLOCK_N, num_stages=STAGES):
+    for start_n in tl.range(u0, u1, BLOCK_N):
         rows = q_start + start_n + offs_n
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, ke_base, ve_base, rows * stride_ket, rows * stride_vet,
@@ -857,15 +854,6 @@ def extend_paged_attention(
         assert k_extend.shape[0] == num_q_tokens and v_extend.shape[0] == num_q_tokens
         assert k_extend.shape[1] == num_kv_heads and v_extend.shape[1] == num_kv_heads
         assert k_extend.shape[-1] == head_dim and v_extend.shape[-1] == head_dim
-        sm90 = is_sm90_family()
-        # Without the cap, sm_90 ptxas takes more than 128 registers here, which leaves one 8-warp CTA per SM instead of two.
-        launch_opts = {"maxnreg": 128} if block_d <= 64 and sm90 else {}
-        # Double-buffer K/V of the unmasked tiles when it fits. A window no wider than the block has no unmasked tiles, and pipelining it crashes sm_90 ptxas at head_dim 64.
-        pipeline = (
-            sm90
-            and (block_m + 4 * block_n) * block_d * 2 + 8192 <= _optin_smem_bytes(q.device.index)
-            and (not sliding_window or sliding_window > block_m)
-        )
         _extend_attention_split_kernel[grid](
             q,
             k_extend,
@@ -901,10 +889,8 @@ def extend_paged_attention(
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
             HAS_BLOCKS=block_ends is not None,
-            STAGES=2 if pipeline else 1,
             num_warps=8,
             num_stages=1,
-            **launch_opts,
         )
         return o
 
