@@ -41,6 +41,24 @@ BLOCK_T = 64
 
 
 @triton.jit
+def _load_fp4_e8m0_rows(pool_ptr, rows, valid, D: tl.constexpr, ROW_BYTES: tl.constexpr):
+    """``load_rows(..., FMT=3)`` as bf16 for ``D == 128``, with each row read as int32 words: 16 words of 8 e2m1 codes, then one word of 4 scales.
+    The contiguous word axis pins the gather layout; a per-channel byte gather has no contiguous axis, so its layout (and speed) follows the Triton version."""
+    W: tl.constexpr = D // 8
+    base = pool_ptr.to(tl.pointer_type(tl.int32)) + tl.maximum(rows, 0).to(tl.int64) * (ROW_BYTES // 4)
+    offs_w = tl.arange(0, W)
+    x = tl.load(base[:, None] + offs_w[None, :], mask=valid[:, None], other=0)
+    sw = tl.load(base + W, mask=valid, other=0)
+    s = tl.exp2(((sw[:, None] >> (8 * (offs_w // 4))[None, :]) & 0xFF).to(tl.float32) - 127.0)
+    x = tl.join(x, x >> 16)
+    x = tl.join(x, x >> 8)
+    x = tl.join(x, x >> 4)
+    # e2m1 code -> fp32 bits: magnitude to bits 22-24, sign to bit 31 (mask 0x81C00000). That is the value times 2**-126 (code 1 is subnormal), so the multiply is exact.
+    q = (((x << 28) >> 6) & -0x7E400000).to(tl.float32, bitcast=True) * 8.507059173023462e37
+    return tl.reshape((q * s[:, :, None, None, None]).to(tl.bfloat16), (rows.shape[0], D))
+
+
+@triton.jit
 def _score_tile(
     q, w, pool_ptr, locs_row, live, pos, store_mask, out_ptrs,
     n_locs, RATIO: tl.constexpr, D: tl.constexpr, ROW_BYTES: tl.constexpr, FMT: tl.constexpr,
@@ -52,8 +70,10 @@ def _score_tile(
     full = tl.load(locs_row + tl.maximum(full_idx, 0), mask=pos_ok & (full_idx < n_locs), other=-1)
     rows = tl.where(full >= 0, full // RATIO, -1).to(tl.int32)
     valid = pos_ok & (rows >= 0)
-    offs_d = tl.arange(0, D)
-    k = load_rows(pool_ptr, rows, valid, offs_d, D, ROW_BYTES, FMT).to(tl.bfloat16)  # [BLOCK_T, D]
+    if FMT == 3 and D == 128:
+        k = _load_fp4_e8m0_rows(pool_ptr, rows, valid, D, ROW_BYTES)
+    else:
+        k = load_rows(pool_ptr, rows, valid, tl.arange(0, D), D, ROW_BYTES, FMT).to(tl.bfloat16)  # [BLOCK_T, D]
     score = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32)
     score = (tl.maximum(score, 0.0) * w[:, None]).to(tl.bfloat16).to(tl.float32)
     logits = tl.sum(score, axis=0).to(tl.bfloat16).to(tl.float32)
@@ -130,7 +150,7 @@ def indexer_logits_packed(
     assert locs.ndim == 2 and locs.shape[0] == B and live.shape == (B, S), (locs.shape, live.shape, (B, S))
     assert weights.shape == (B, S, H), (weights.shape, (B, S, H))
     assert D == triton.next_power_of_2(D), f"index_head_dim must be pow2, got {D}"
-    assert k_pool.dtype == torch.uint8 and k_pool.shape[1] == fmt.row_bytes(D) and k_pool.is_contiguous()
+    assert k_pool.dtype == torch.uint8 and k_pool.shape[1] == fmt.row_bytes(D) and k_pool.is_contiguous() and k_pool.data_ptr() % 4 == 0
     assert locs.dtype in (torch.int32, torch.int64) and locs.stride(1) == 1, (locs.dtype, locs.stride())
     n_locs = locs.shape[1]
     if T is None:
