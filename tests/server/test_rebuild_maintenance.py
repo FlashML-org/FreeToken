@@ -226,19 +226,19 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
 
 
 def test_openai_gate_message_is_loading_aware():
-    from freetoken.server.openai_api import _maintenance_gate
+    from freetoken.server.maintenance import maintenance_gate
 
-    assert _maintenance_gate(SimpleNamespace(maintenance_state="serving")) is None
-    loading = _maintenance_gate(SimpleNamespace(maintenance_state="loading"))
+    assert maintenance_gate(SimpleNamespace(maintenance_state="serving")) is None
+    loading = maintenance_gate(SimpleNamespace(maintenance_state="loading"))
     assert loading is not None and loading.status_code == 503
     assert b"loading" in loading.body.lower()
-    rebuild = _maintenance_gate(SimpleNamespace(maintenance_state="rebuilding"))
+    rebuild = maintenance_gate(SimpleNamespace(maintenance_state="rebuilding"))
     assert rebuild is not None and rebuild.status_code == 503
     assert b"rebuild" in rebuild.body.lower()
-    failed = _maintenance_gate(SimpleNamespace(maintenance_state="failed"))
+    failed = maintenance_gate(SimpleNamespace(maintenance_state="failed"))
     assert failed is not None and failed.status_code == 503
     # A state object without the attribute defaults to serving (defensive, never blocks).
-    assert _maintenance_gate(SimpleNamespace()) is None
+    assert maintenance_gate(SimpleNamespace()) is None
 
 
 def test_cache_rebuild_guarded_during_loading():
