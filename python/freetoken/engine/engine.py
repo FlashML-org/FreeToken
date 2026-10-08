@@ -58,6 +58,10 @@ def _flashinfer_available() -> bool:
 
 
 def _sgl_flash_attn_available() -> bool:
+    from freetoken.kernel.backend import is_rocm
+
+    if is_rocm():
+        return False
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
@@ -167,6 +171,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     where a DSV4 or MLA checkpoint rejects a generic backend before weights load,
     and where a generic model rejects dsa/dsv4_sparse."""
     from freetoken.attention import validate_attn_backend
+    from freetoken.kernel.backend import is_rocm
 
     # Name membership first (ArgumentTypeError listing the supported names): the CLI already
     # ran this, but the programmatic EngineConfig path reaches here unvalidated and would
@@ -207,12 +212,22 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     for part in backend_parts:
         info = attention_backend_info(part)
         if info.requires_flashinfer and not _flashinfer_available():
+            if is_rocm():
+                raise RuntimeError(
+                    f"Attention backend {part!r} uses CUDA-only FlashInfer kernels "
+                    "unavailable on ROCm; use --attention-backend auto or triton."
+                )
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
                 "not installed. Install it with `pip install 'freetoken[fi]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
             )
         if info.requires_sgl_kernel and not _sgl_flash_attn_available():
+            if is_rocm():
+                raise RuntimeError(
+                    f"Attention backend {part!r} uses CUDA-only sgl_kernel kernels "
+                    "unavailable on ROCm; use --attention-backend auto or triton."
+                )
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
                 "not installed. Install it with `pip install 'freetoken[sgl]'` (or "

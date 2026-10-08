@@ -37,3 +37,18 @@ python -m pip install --no-build-isolation -e .
 
 Set both architecture variables to `gfx1200` for RX 9060 family GPUs, or to the
 actual target reported by `rocminfo`.
+
+## Optional kernel backends
+
+On ROCm, FreeToken does not probe or select its CUDA-only FlashInfer,
+`sgl_kernel`, or vLLM kernel integrations, even if those packages are installed.
+This restriction concerns the kernels FreeToken imports, not whether the
+packages offer other AMD implementations. Do not install the `[accel]`, `[fi]`,
+or `[sgl]` extras to enable these paths on AMD.
+
+Generic attention with `--attention-backend auto` selects Triton; activation and
+normalization use their Triton/PyTorch fallbacks. NVFP4 linear and MoE selection
+also supports the native Triton kernels. Explicitly requesting FlashInfer/SGL
+attention, NVFP4 Marlin, or NVFP4 b12x fails early with a ROCm-specific error.
+Model-specific attention requirements still apply; this does not make every
+checkpoint ROCm-compatible. CUDA discovery and kernel preferences are unchanged.

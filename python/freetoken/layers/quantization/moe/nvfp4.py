@@ -228,6 +228,8 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     max_slots = MARLIN_MAX_SLOTS
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        if backend.is_rocm():
+            return "Marlin is CUDA-only and unavailable on ROCm; use triton"
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
@@ -491,6 +493,8 @@ class B12xNvfp4MoEKernel(MoEKernel):
     name = "b12x"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        if backend.is_rocm():
+            return "b12x is CUDA-only and unavailable on ROCm; use triton"
         cc = backend.device_capability()
         if cc < (12, 0):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
