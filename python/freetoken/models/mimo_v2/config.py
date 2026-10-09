@@ -166,6 +166,17 @@ def _validate_config(hf_config: Any) -> None:
         raise ValueError("MiMo v2 requires 0 < num_experts_per_tok <= n_routed_experts")
     if n_group <= 0 or num_experts % n_group or not 0 < topk_group <= n_group:
         raise ValueError("MiMo v2 requires valid n_group/topk_group routing geometry")
+    if n_group > 1:
+        experts_per_group = num_experts // n_group
+        # _group_limited topk(2) inside width-1 groups crashes, and eligible experts
+        # (topk_group * width) below top_k make masked-out ids win with nonzero weights.
+        if experts_per_group < 2 or top_k > topk_group * experts_per_group:
+            raise ValueError(
+                "MiMo v2 grouped routing requires group width >= 2 and num_experts_per_tok "
+                f"<= topk_group * (n_routed_experts // n_group), got n_group={n_group}, "
+                f"topk_group={topk_group}, group width={experts_per_group}, "
+                f"num_experts_per_tok={top_k}"
+            )
 
     rope = _rope_params(hf_config)
     rope_type = rope.get("rope_type", rope.get("type", "default"))

@@ -186,6 +186,35 @@ def test_unsupported_topology_is_rejected_early(update, message):
         parse_config(RawConfigShim(data))
 
 
+# Admission must reject group geometry that moe.py's _group_limited cannot execute:
+# width-1 groups crash topk(2); eligible experts < top_k make a masked-out id win.
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (
+            {"n_routed_experts": 4, "n_group": 4, "topk_group": 1, "num_experts_per_tok": 1},
+            "group width=1",
+        ),
+        (
+            {"n_routed_experts": 8, "n_group": 4, "topk_group": 1, "num_experts_per_tok": 3},
+            "num_experts_per_tok=3",
+        ),
+    ],
+)
+def test_unsupported_grouped_routing_is_rejected(update, message):
+    data = _hf_config().to_dict()
+    data.update(update)
+    with pytest.raises(ValueError, match=message):
+        parse_config(RawConfigShim(data))
+
+
+def test_valid_grouped_routing_geometry_parses():
+    data = _hf_config().to_dict()
+    data.update({"n_routed_experts": 8, "n_group": 2, "topk_group": 1, "num_experts_per_tok": 2})
+    cfg = parse_config(RawConfigShim(data))
+    assert (cfg.n_group, cfg.topk_group, cfg.num_experts, cfg.num_experts_per_tok) == (2, 1, 8, 2)
+
+
 @pytest.mark.parametrize(
     ("update", "message"),
     [
