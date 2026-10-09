@@ -34,7 +34,9 @@ def test_activation_fallback_matches_torch(dtype, activation):
 
     gated_act_and_mul(activation, x, out)
 
-    rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-2, 1e-3)
+    # CUDA intentionally uses approximate math (notably tanh.approx.f32),
+    # while ROCm uses libdevice; allow for both against the Torch reference.
+    rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-3)
     torch.testing.assert_close(out, expected.to(dtype), rtol=rtol, atol=atol)
 
 
