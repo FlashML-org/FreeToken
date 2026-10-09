@@ -1,10 +1,10 @@
-"""Eligibility probes for the optional CUDA kernels used by FreeToken.
+"""Availability probes for the optional native kernel packages.
 
-On ROCm, flashinfer / sgl_kernel / vLLM donor paths are disabled before package
-discovery or imports. This describes FreeToken's CUDA integrations, not whether
-those packages have other AMD implementations. Callers use their Triton/PyTorch
-fallbacks instead. On CUDA, cached ``find_spec`` checks retain the existing
-package-discovery behavior; kernel-specific symbol checks happen at selection.
+When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
+ops; otherwise they fall back to the pure-Triton kernels in
+``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
+importable (no import side effects), and the result is cached.
+On ROCm, the optional-package probes return False so callers use the fallbacks.
 """
 from __future__ import annotations
 

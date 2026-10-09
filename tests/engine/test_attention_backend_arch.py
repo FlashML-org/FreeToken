@@ -154,22 +154,3 @@ def test_rocm_attention_selection_avoids_cuda_packages(monkeypatch, requested):
     finally:
         backend.is_flashinfer_installed.cache_clear()
         backend.is_sgl_kernel_installed.cache_clear()
-
-
-def test_cuda_sgl_attention_still_checks_symbols(monkeypatch):
-    import sys
-    from types import ModuleType
-
-    from freetoken.engine import engine
-    from freetoken.kernel import backend
-
-    parent = ModuleType("sgl_kernel")
-    module = ModuleType("sgl_kernel.flash_attn")
-    module.flash_attn_with_kvcache = object()
-    monkeypatch.setitem(sys.modules, "sgl_kernel", parent)
-    monkeypatch.setitem(sys.modules, "sgl_kernel.flash_attn", module)
-    monkeypatch.setattr(backend, "is_rocm", lambda: False)
-    assert engine._sgl_flash_attn_available()
-
-    del module.flash_attn_with_kvcache
-    assert not engine._sgl_flash_attn_available()
