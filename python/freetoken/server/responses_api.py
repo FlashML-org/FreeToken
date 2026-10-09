@@ -77,6 +77,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .maintenance import refusal_reason
 from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
@@ -117,10 +118,8 @@ def register_responses_routes(
     async def v1_responses(req: ResponsesRequest, request: Request):
         log_request("/v1/responses", req, request)
         state = get_state()
-        mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
-            return _error_response(503, detail)
+        if (reason := refusal_reason(state)) is not None:
+            return _error_response(503, reason)
         if req.background:
             return _error_response(400, "background mode is not supported")
         if req.previous_response_id:
