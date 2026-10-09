@@ -6,7 +6,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, Iterator, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -516,14 +516,16 @@ class Engine:
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        gloo_world = config.tp_info.size == 1 or config.use_pynccl
+        with _rendezvous(config) as rendezvous:
             torch.distributed.init_process_group(
-                backend="gloo",
+                backend="gloo" if gloo_world else "nccl",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
+                **rendezvous,
             )
+        if gloo_world:
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
@@ -531,13 +533,6 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
@@ -1182,6 +1177,25 @@ def _fused_resident_ok(model_config) -> bool:
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
+
+
+@contextlib.contextmanager
+def _rendezvous(config: EngineConfig) -> Iterator[Dict[str, Any]]:
+    """Where the TP ranks meet while their group forms. A single rank meets no other process, so it forms
+    over a store file of its own instead of the rendezvous port (``--port`` + 1 for a server), which another
+    process may hold."""
+    if config.tp_info.size > 1:
+        yield {"init_method": config.distributed_addr}
+        return
+    import tempfile
+
+    # torch builds no HashStore on Windows; a one-rank group reads its FileStore only while it forms
+    handle, path = tempfile.mkstemp(prefix="freetoken_store_")
+    os.close(handle)
+    try:
+        yield {"store": torch.distributed.FileStore(path, 1)}
+    finally:
+        os.remove(path)
 
 
 def _ensure_expandable_segments() -> None:
