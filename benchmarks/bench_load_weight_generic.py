@@ -41,6 +41,8 @@ import time
 
 import torch
 
+from freetoken.memory import effective_memory_available
+
 GiB = float(1 << 30)
 ALL_MODES = ("parallel", "ftw")
 
@@ -54,14 +56,6 @@ def _default_ftw_dir(model_path: str) -> str:
 
 
 # ---------------- memory sampling + checksum ----------------
-def _meminfo_available_bytes() -> int:
-    with open("/proc/meminfo") as f:
-        for line in f:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    return 0
-
-
 def _status_kb(key: str) -> int:
     with open("/proc/self/status") as f:
         for line in f:
@@ -71,7 +65,7 @@ def _status_kb(key: str) -> int:
 
 
 class MemSampler(threading.Thread):
-    """Background sampler: peak process RSS + system MemAvailable low-water-mark."""
+    """Background sampler: peak RSS + effective available-memory low-water-mark."""
 
     def __init__(self, interval: float = 0.2):
         super().__init__(daemon=True)
@@ -82,7 +76,9 @@ class MemSampler(threading.Thread):
 
     def run(self) -> None:
         while not self._stop_evt.wait(self.interval):
-            self.min_avail = min(self.min_avail, _meminfo_available_bytes())
+            available = effective_memory_available()
+            if available is not None:
+                self.min_avail = min(self.min_avail, available)
             self.max_rss = max(self.max_rss, _status_kb("VmRSS:"))
 
     def stop(self) -> None:
