@@ -241,6 +241,38 @@ def test_openai_gate_message_is_loading_aware():
     assert _maintenance_gate(SimpleNamespace()) is None
 
 
+def test_health_is_200_only_while_a_request_would_be_admitted():
+    """Readiness probes (llama-swap's checkEndpoint, load balancers) read only the status code,
+    so /health must not say 200 while the generation gate refuses; the lifecycle document stays."""
+    import freetoken.server.api_server as api
+    from freetoken.server.control_api import build_health
+    from freetoken.server.openai_api import _maintenance_gate
+
+    def lifecycle(maintenance_state, fatal_error=None):
+        return SimpleNamespace(
+            maintenance_state=maintenance_state,
+            fatal_error=fatal_error,
+            load_progress=LoadProgress(desc="Loading weights", done_bytes=1, total_bytes=2),
+            config=SimpleNamespace(served_model_name="health-test"),
+            instance_id="health-test-instance",
+            ready_at=None,
+        )
+
+    states = [lifecycle(name) for name in ("loading", "serving", "rebuilding", "stopping", "failed")]
+    states.append(lifecycle("failed", fatal_error="backend worker freetoken-TP0-scheduler exited"))
+    previous_state = api._GLOBAL_STATE
+    try:
+        client = TestClient(api.app)
+        for state in states:
+            api._GLOBAL_STATE = state
+            response = client.get("/health")
+            admitted = _maintenance_gate(state) is None
+            assert response.status_code == (200 if admitted else 503), state.maintenance_state
+            assert response.json() == build_health(state, api.app.version)
+    finally:
+        api._GLOBAL_STATE = previous_state
+
+
 def test_cache_rebuild_guarded_during_loading():
     import freetoken.server.api_server as api
 

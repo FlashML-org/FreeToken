@@ -144,8 +144,8 @@ class FrontendManager:
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
-    # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
-    # "rebuilding"/"failed" for runtime cache rebuilds.
+    # API adapters and /health 503 until this flips) -> "serving" once all workers ack
+    # ready -> "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
     last_rebuild: Dict[str, Any] | None = None
     load_progress: Any = None

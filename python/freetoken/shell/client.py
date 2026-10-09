@@ -129,8 +129,8 @@ class ShellClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
-            # A rebuild rejection (409/503) is a normal answer, not a transport failure: the
-            # body carries the status the caller wants to report, so hand it back as data.
+            # A refusal carrying a status (a rejected rebuild, /health while not serving) is a
+            # normal answer, not a transport failure, so hand the body back as data.
             raw = exc.read()
             try:
                 doc = json.loads(raw.decode("utf-8"))
