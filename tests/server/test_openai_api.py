@@ -442,17 +442,65 @@ def test_models_route_returns_served_model_name():
     assert card["max_model_len"] is None and card["context_length"] is None
 
 
+def _models_card(state):
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+    return TestClient(app).get("/v1/models").json()["data"][0]
+
+
 def test_models_route_publishes_the_model_context_length():
     """`ft launch` reads this to size each agent's context window."""
     state = FakeState([])
     state.config.max_seq_len = 262144
-    app = FastAPI()
-    register_openai_routes(app, lambda: state, lambda: {})
 
-    card = TestClient(app).get("/v1/models").json()["data"][0]
+    card = _models_card(state)
 
+    # No pool geometry resolved yet (still loading, or pre-("meta", …) ack): the model
+    # ceiling is the only answer available.
     assert card["max_model_len"] == 262144
     assert card["context_length"] == 262144
+
+
+def test_models_route_clamps_the_context_length_to_the_kv_pool():
+    """The engine clamps its own max_seq_len to the allocated pool and the scheduler admits
+    against that, so publishing the unclamped ceiling here made `ft launch` size each agent's
+    compaction window past what the server can actually hold (#448)."""
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    state.config.page_size = 1
+    state.cache_pools = {"num_pages": 178176, "page_size": 1}
+
+    card = _models_card(state)
+
+    assert card["max_model_len"] == 178176
+    assert card["context_length"] == 178176
+
+
+def test_models_route_keeps_the_ceiling_when_the_pool_exceeds_it():
+    """A pool larger than the model's positional ceiling does not extend the context."""
+    state = FakeState([])
+    state.config.max_seq_len = 32768
+    state.config.page_size = 1
+    state.cache_pools = {"num_pages": 178176, "page_size": 1}
+
+    card = _models_card(state)
+
+    assert card["max_model_len"] == 32768
+    assert card["context_length"] == 32768
+
+
+def test_models_route_prefers_the_last_rebuild_over_the_load_time_pool():
+    """A rebuild moves the pool; /v1/models must follow it rather than freeze the load-time
+    allocation (same most-recent-truth order /v1/cache/status reports)."""
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    state.config.page_size = 1
+    state.cache_pools = {"num_pages": 178176, "page_size": 1}
+    state.last_rebuild = {"num_pages": 40000}
+
+    card = _models_card(state)
+
+    assert card["max_model_len"] == 40000
 
 
 async def _collect(generator):
