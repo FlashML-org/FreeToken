@@ -767,9 +767,8 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     replays tool-call arguments byte-verbatim and reasoning as
     ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
     values and key order — drift that survives render canonicalization, cuts
-    the prefix cache, and shows the model a rewrite of its own output. Without
-    an API key, the dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key
-    requirement."""
+    the prefix cache, and shows the model a rewrite of its own output. The
+    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -789,7 +788,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
 
         window, output = _context_window(ctx), _max_output_tokens(ctx)
         modalities = ["text", "image"] if _accepts_images(ctx) else ["text"]
-        config["llm-deepseek"] = {
+        section: dict[str, object] = {
             "baseURL": ctx.server.openai_base_url,
             "models": [
                 {
@@ -802,6 +801,10 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
                 for model_id in _ordered_model_ids(ctx)
             ],
         }
+        if ctx.api_key:
+            # not DEEPSEEK_API_KEY: dsh's web search also reads it and sends it to api.deepseek.com
+            section["apiKeyEnv"] = API_KEY_ENV
+        config["llm-deepseek"] = section
         config["agent-default-model"] = {
             "provider": "deepseek-official",
             "model": ctx.model.model_id,
@@ -819,15 +822,14 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     elif len(app_args) >= 2 and app_args[0] == "--profile":
         profile, app_args = app_args[1], app_args[2:]
     argv = ["dsh", "--profile", profile, "--patch", str(patch_path), *app_args]
-    return CommandSpec(
-        argv=argv,
-        env={
-            "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
-            "DEEPSEEK_API_KEY": ctx.api_key or DSH_API_KEY,
-            "DSH_TELEMETRY_DISABLED": "1",
-        },
-        unset_env=CLOUD_PROVIDER_API_KEY_ENV,
-    )
+    env = {
+        "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
+        "DEEPSEEK_API_KEY": DSH_API_KEY,
+        "DSH_TELEMETRY_DISABLED": "1",
+    }
+    if ctx.api_key:
+        env[API_KEY_ENV] = ctx.api_key
+    return CommandSpec(argv=argv, env=env, unset_env=CLOUD_PROVIDER_API_KEY_ENV)
 
 
 PREPARERS = {

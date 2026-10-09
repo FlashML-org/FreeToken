@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken import launch
@@ -99,3 +100,19 @@ def test_dry_run_prints_a_placeholder_instead_of_the_key(agent, monkeypatch, cap
     assert key not in out and json.dumps(key)[1:-1] not in out
     if agent in ("claude", "codex", "dsh", "opencode"):
         assert "<api-key>" in out
+
+
+def test_dsh_keeps_the_key_out_of_the_variable_its_web_search_reads(monkeypatch, tmp_path):
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    monkeypatch.setattr(launch, "_warn_dsh_node_version", lambda: None)
+    ctx = launch.LaunchContext(
+        server=launch.resolve_server_url("http://127.0.0.1:1919"),
+        model=launch.ServedModel(model_id="m", models=["m"], context_length=8192),
+        extra_args=[],
+        dry_run=False,
+        api_key=KEY,
+    )
+    env = launch.prepare_dsh(ctx).env
+    settings = yaml.safe_load((tmp_path / launch.DSH_LAUNCH_SETTINGS_NAME).read_text())
+    assert env["DEEPSEEK_API_KEY"] != KEY
+    assert env[settings["llm-deepseek"]["apiKeyEnv"]] == KEY
