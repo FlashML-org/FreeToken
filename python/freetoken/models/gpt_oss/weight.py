@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Iterator
 
 import safetensors
@@ -10,8 +11,10 @@ from freetoken.models.loader import (
     MergeRule,
     iter_merged_tensors,
     iter_root_safetensor_files_from_index,
+    safetensors_weight_map,
     shard_tensor,
 )
+from freetoken.moe.expert_pieces import check_e8m0_scales
 from freetoken.utils import cached_load_hf_config
 
 from .config import parse_config
@@ -303,13 +306,21 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         info = _expert_layer_and_name(name)
         return info is not None and 0 <= info[0] < num_layers
 
+    def _checked(name: str, tensor: torch.Tensor, file: str) -> torch.Tensor:
+        # the e8m0 scales are scanned as they are read, before any piece is packed
+        if name.endswith("_scales"):
+            check_e8m0_scales(name, tensor, os.path.basename(file))
+        return tensor
+
     def _tensors():
         if parallel:
             from freetoken.models.weight import iter_expert_tensors_parallel
+            from freetoken.utils.hf import download_hf_weight
 
+            weight_map = safetensors_weight_map(download_hf_weight(model_path))
             for name, whole in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
                 _, source = _expert_layer_and_name(name)
-                yield name, whole[slices[source][1]]
+                yield name, _checked(name, whole[slices[source][1]], weight_map[name])
             return
         for file in iter_root_safetensor_files_from_index(model_path):
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
@@ -322,7 +333,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
                         raise ValueError(f"Unexpected GPT-OSS expert layer in checkpoint: {name}")
                     if source not in slices:
                         raise ValueError(f"Unexpected GPT-OSS expert source: {name}")
-                    yield name, _read_safetensor_slice(f, name, slices[source][1])
+                    yield name, _checked(name, _read_safetensor_slice(f, name, slices[source][1]), file)
 
     def _pieces():
         pending: dict[int, dict[str, torch.Tensor]] = {}
