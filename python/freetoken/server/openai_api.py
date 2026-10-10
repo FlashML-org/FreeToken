@@ -53,9 +53,6 @@ def _thinking_type(req: Any) -> str | None:
         if value in ("enabled", "disabled"):
             return value
     return None
-
-
-
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
@@ -158,8 +155,10 @@ async def handle_chat_completion(
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
     if _response_format_unsupported(req.response_format):
+        rtype = (req.response_format or {}).get("type")
         return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)",
             param="response_format",
         )
     if req.n != 1:
@@ -644,8 +643,12 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
 
 
 def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
-    return response_format is not None and response_format.get("type") not in (None, "text")
+    # Soft-accept OpenAI json_object/json_schema. FreeToken has no constrained
+    # decoding; clients that already ask for JSON in the prompt still need the
+    # wire field accepted (HTTP 200) instead of a hard 400. Unknown types 400.
+    if response_format is None:
+        return False
+    return response_format.get("type") not in (None, "text", "json_object", "json_schema")
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
@@ -660,7 +663,11 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if req.logit_bias is not None:
         return "logit_bias is not supported"
     if _response_format_unsupported(req.response_format):
-        return "response_format json_object/json_schema is not supported (no constrained decoding)"
+        rtype = (req.response_format or {}).get("type")
+        return (
+            f"response_format.type {rtype!r} is not supported "
+            "(supported: text, json_object, json_schema)"
+        )
     return None
 
 
