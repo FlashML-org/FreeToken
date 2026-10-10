@@ -21,7 +21,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
         if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
@@ -34,7 +34,9 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h, b = cfg.intermediate, cfg.hidden, BLOCK
+        # TP-local intermediate (like the unquantized method); build_expert_banks shards the
+        # fp8 pieces + 128-block scales per rank to match these local bank shapes.
+        i, h, b = cfg.local_intermediate, cfg.hidden, BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
             "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),
