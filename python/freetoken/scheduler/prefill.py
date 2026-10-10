@@ -76,6 +76,9 @@ class PrefillAdder:
         mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
+        # bounded encoder replay: the evicted hit keeps its full global-KV match and re-sends the
+        # last window of it through the encoder (cached_len stays the alloc/commit watermark)
+        enc_replay_lo = self.cache_manager.encoder_replay_start(handle)
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_size = self._kv_reservation_size(
@@ -108,6 +111,8 @@ class PrefillAdder:
             need_swa = div_ceil(
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
+            if enc_replay_lo < cached_len:
+                need_swa += ps  # the replay rebinds a fresh window page for the hit's dead top page
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
                 return self.cache_manager.unlock(handle)
 
@@ -130,7 +135,7 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, enc_replay_lo
 
     def _add_one_req(
         self,
@@ -143,8 +148,12 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        enc_replay_lo: int = -1,
     ) -> Req | None:
-        remain_len = pending_req.input_len - cached_len
+        # a replay chunk starts BELOW cached_len (the hit stays the page/commit watermark); its
+        # replayed tokens ride the first chunk through the encoder like new ones
+        lo = enc_replay_lo if 0 <= enc_replay_lo < cached_len else cached_len
+        remain_len = pending_req.input_len - lo
         chunk_size = min(self.token_budget, remain_len)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
@@ -163,18 +172,23 @@ class PrefillAdder:
             # (the extend [cached_len, cached_len+chunk) pulls div_ceil(end,ps)-div_ceil(start,ps)
             # fresh pages -- the partial head page was charged by the previous chunk), and reserve
             # that cost, not the raw token count. Degenerates to the token math at page_size==1.
-            max_end = (div_ceil(cached_len, ps) + max(swa_budget, 0) // ps) * ps
-            chunk_size = min(chunk_size, max(max_end - cached_len, 0))
+            max_end = (div_ceil(lo, ps) + max(swa_budget, 0) // ps) * ps
+            chunk_size = min(chunk_size, max(max_end - lo, 0))
             # A continuation resumes the compressor carry at its boundary, which must be
             # page-aligned; the token_budget leftover (unlike max_end) is not. Align the end
             # down when the chunk mints a continuation; no whole page -> retry next pass.
             # 0 <: a chunk the swa cap collapsed to 0 must NOT bail (undersized pool --
             # bailing would livelock; the floor tests pin the loud failure).
             if 0 < chunk_size < remain_len:
-                aligned = align_down(cached_len + chunk_size, ps) - cached_len
+                aligned = align_down(lo + chunk_size, ps) - lo
                 if aligned <= 0:
                     return None
                 chunk_size = aligned
+            if lo < cached_len and lo + chunk_size <= cached_len:
+                # a replay chunk must reach PAST the hit: a later chunk starting inside the
+                # replay region would allocate fresh pages over the tree's -- retry next pass
+                # (a non-replay chunk collapsed to 0 still falls through and fails loudly)
+                return None
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
@@ -185,15 +199,15 @@ class PrefillAdder:
         if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
             # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
             unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
-            end = mm_chunk_end(pending_req.mm_items, cached_len, cached_len + chunk_size, unit)
-            cut = next((hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi), None)
-            if cut is not None and self.token_budget < self.pass_budget and cut - cached_len <= self.pass_budget:
+            end = mm_chunk_end(pending_req.mm_items, lo, lo + chunk_size, unit)
+            cut = next((hi for item in pending_req.mm_items for lo_, hi in item.offsets if lo_ < end < hi), None)
+            if cut is not None and self.token_budget < self.pass_budget and cut - lo <= self.pass_budget:
                 # other requests took part of this pass; a pass of its own holds the image whole
                 return None
-            chunk_size = end - cached_len
+            chunk_size = end - lo
         if self.cache_manager.swa_paged:
             ps = self.cache_manager.page_size
-            self.reserved_swa += (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
+            self.reserved_swa += (div_ceil(lo + chunk_size, ps) - div_ceil(lo, ps)) * ps
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -204,11 +218,11 @@ class PrefillAdder:
             pending_req.input_len + pending_req.output_len, cached_len
         )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
-        _slice = slice(cached_len, cached_len + chunk_size)
+        _slice = slice(lo, lo + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
         req = CLS(
-            input_ids=pending_req.input_ids[: cached_len + chunk_size],
+            input_ids=pending_req.input_ids[: lo + chunk_size],
             table_idx=table_idx,
             cached_len=cached_len,
             output_len=pending_req.output_len,
@@ -217,6 +231,7 @@ class PrefillAdder:
             sampling_params=pending_req.sampling_params,
             prompt_len=pending_req.input_len,
         )
+        req.enc_replay_lo = lo if lo < cached_len else -1
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
         req.mrope_delta = pending_req.mrope_delta
@@ -247,7 +262,7 @@ class PrefillAdder:
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, enc_replay_lo = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -257,6 +272,7 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                enc_replay_lo=enc_replay_lo,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
@@ -329,9 +345,10 @@ class PrefillManager:
                     )
                     if pending_req.mm_items and self.encoder_cache is not None:
                         # claim the rows every chunk of this request will gather; the entry outlives the chunks
+                        # (a replay re-gathers the hit's dead image-span rows from this same item)
                         for item in pending_req.mm_items:
                             self.encoder_cache.register(
-                                item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
+                                item.hash, req.uid, mm_rows_after(item, req.chunk_lo)
                             )
                 log_new_tokens += req.extend_len
                 if not is_continuation:

@@ -101,6 +101,11 @@ class CacheManager:
         ids = req.input_ids[: input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
+            if getattr(self.swa_pool, "swa_encoder_replay", "exact") == "bounded":
+                # bounded encoder replay: keep the FULL global-tier match and carry the windowed-safe
+                # boundary alongside (the admission decides whether the last window is replayed)
+                m = self.prefix_cache.match_prefix_full(ids)
+                return MatchResult(SWACacheHandle(m.full_len, m.node, m.kv_indices, windowed_len=m.windowed_len))
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
@@ -109,6 +114,14 @@ class CacheManager:
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
+
+    def encoder_replay_start(self, handle: BaseCacheHandle) -> int:
+        """The first position a hit request's chunk must (re)send: the pool's bounded-encoder-replay
+        rule when the hit's window KV was evicted, else the hit itself."""
+        rule = getattr(self.swa_pool, "encoder_replay_start", None) if self.swa_pool is not None else None
+        if rule is None:
+            return handle.cached_len
+        return rule(handle.cached_len, getattr(handle, "windowed_len", -1))
 
     @property
     def available_size(self) -> int:
@@ -282,6 +295,29 @@ class CacheManager:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+        self._rebind_replay_windows(reqs)
+
+    def _rebind_replay_windows(self, reqs: List[Req]) -> None:
+        """Bounded encoder replay: the hit's dead tree pages get a FRESH window slot (their global
+        KV stays reachable through the same full locs, so only the window binding is redone). With
+        page == window the replay's single top page is always dead -- a live one would make the
+        run window-safe and no replay would have been scheduled -- so the dead check is a guard,
+        not a partial-page splitter."""
+        if not self.swa_paged:
+            return
+        ps = self.page_size
+        for req in reqs:
+            lo = req.enc_replay_lo
+            if lo < 0:
+                continue
+            hi = req.cache_handle.cached_len
+            pages = self.page_table[req.table_idx, lo:hi].view(-1, ps)
+            dead = self.swa_pool.translate_loc_from_full_to_swa(pages[:, 0]) < 0
+            if bool(dead.any()):
+                fresh = pages[dead].reshape(-1)
+                if self.is_swa:
+                    self.ensure_swa_slots(int(fresh.numel()))
+                self.swa_pool.alloc_swa(fresh)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
@@ -429,6 +465,16 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         insert_len = align_down(req.cached_len, self.page_size)
+        update_after = old_handle.cached_len
+        replay_lo = self.encoder_replay_start(old_handle)
+        replay_reused_tree_pages = replay_lo < update_after
+        if replay_reused_tree_pages:
+            # A bounded encoder replay rewrote the window KV of the tree's OWN pages below the hit,
+            # so those nodes must reconcile (revive in place); the "fresh" region starts at the
+            # replay start. Force a node boundary there first so no node straddles it (a straddling
+            # revive would claim window KV for positions below the replay that are still dead).
+            update_after = replay_lo
+            self.prefix_cache.match_prefix(req.input_ids[:replay_lo])
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
@@ -442,7 +488,8 @@ class CacheManager:
             _, freed = self.prefix_cache.insert(
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=update_after,
+                replay_reused_tree_pages=replay_reused_tree_pages)
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)

@@ -1230,11 +1230,14 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
+    args.swa_encoder_replay = config.swa_encoder_replay
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
         f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay}"
         + ("" if args.swa_decoder_replay == "exact" else f" (prefix hits stop {P} tokens before the prompt end)")
+        + f"; SWA encoder replay: {args.swa_encoder_replay}"
+        + ("" if args.swa_encoder_replay == "exact" else f" (an evicted hit replays the {P} tokens below the hit)")
     )
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")

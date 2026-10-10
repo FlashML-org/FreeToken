@@ -37,11 +37,15 @@ class SWACacheHandle(BaseCacheHandle):
     """Lock handle for a matched SWA prefix: the windowed-safe matched node (lock target) + the
     reusable full-pool KV page indices. ``swa_uuid`` is the window-boundary returned by
     ``inc_lock``; ``CacheManager.lock`` records it on the handle (via object.__setattr__ -- the
-    base handle is a frozen dataclass) and ``unlock``/``dec_lock`` consume it."""
+    base handle is a frozen dataclass) and ``unlock``/``dec_lock`` consume it. Under bounded
+    encoder replay the handle names the FULL match (``cached_len`` = its depth) and carries the
+    windowed-safe boundary in ``windowed_len`` (< cached_len -> the hit's window KV was evicted
+    and the last window is replayed); -1 otherwise."""
 
     node: RadixTreeNode
     kv_indices: torch.Tensor
     swa_uuid: Optional[int] = None
+    windowed_len: int = -1
 
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
@@ -56,6 +60,15 @@ class SWAMatch(NamedTuple):
     kv_indices: torch.Tensor   # reused full-pool KV page indices for [0:cached_len) (windowed-safe)
     cached_len: int            # truncated to the windowed-reuse boundary
     node: RadixTreeNode        # the matched windowed-safe node (lock target)
+
+
+class SWAFullMatch(NamedTuple):
+    """The full-tier match plus the windowed-safe boundary (bounded encoder replay): the global
+    tiers are live for [0, full_len), the window KV only up to windowed_len."""
+    kv_indices: torch.Tensor   # reused full-pool KV page indices for [0:full_len)
+    full_len: int
+    windowed_len: int          # <= full_len; < full_len -> the hit's window KV was evicted
+    node: RadixTreeNode        # the full-depth node (lock target)
 
 
 class SWAEvictResult(NamedTuple):
@@ -85,11 +98,9 @@ class SWARadixCache:
         self._revives = 0        # observability: # of insert-side tombstone revives (Branches 1/2)
 
     # ---------------------------------------------------------------- match / insert
-    def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
-        """Match the token prefix for the full layers, then truncate the reusable length to the
-        windowed-reuse boundary for the swa layers: the deepest node whose run of contiguous live
-        (non-tombstone) tokens back to the last tombstone is ``>= sliding_window_size`` (or the
-        path is tombstone-free to root). Mirrors sglang ``_match_prefix_helper``."""
+    def _walk_prefix(self, input_ids: torch.Tensor):
+        """The shared match walk: the full path's values and node, plus how many leading entries
+        are windowed-safe (the deepest boundary with a live run >= the window)."""
         node = self.root
         value: List[torch.Tensor] = []
         # path connected to root without a tombstone is always reusable -> start at +inf.
@@ -129,13 +140,31 @@ class SWARadixCache:
         if match_since_tomb >= self.sliding_window_size:
             best_value_len = len(value)
             best_node = node
+        return value, best_value_len, best_node, node
 
+    def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
+        """Match the token prefix for the full layers, then truncate the reusable length to the
+        windowed-reuse boundary for the swa layers: the deepest node whose run of contiguous live
+        (non-tombstone) tokens back to the last tombstone is ``>= sliding_window_size`` (or the
+        path is tombstone-free to root). Mirrors sglang ``_match_prefix_helper``."""
+        value, best_value_len, best_node, _ = self._walk_prefix(input_ids)
         self._stamp_path(best_node)
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
         return SWAMatch(kv, int(kv.numel()), best_node)
 
+    def match_prefix_full(self, input_ids: torch.Tensor) -> SWAFullMatch:
+        """The full-tier match WITHOUT the windowed truncation, plus the windowed-safe boundary:
+        what bounded encoder replay needs to keep the whole global-KV hit and replay only the
+        evicted window. Stamps the full path (the deeper match covers the boundary's path)."""
+        value, best_value_len, _, node = self._walk_prefix(input_ids)
+        self._stamp_path(node)
+        kv = torch.cat(value) if value else self.empty
+        windowed_len = sum(t.numel() for t in value[:best_value_len])
+        return SWAFullMatch(kv, int(kv.numel()), windowed_len, node)
+
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
+               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0,
+               replay_reused_tree_pages: bool = False
                ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
         indices (the swa rides along via the full->swa mapping, live where the request allocated
@@ -146,11 +175,15 @@ class SWARadixCache:
           it are tree-shared slots and are left untouched.
         - ``swa_evicted_seqlen`` (= positions whose swa the request itself freed during decode):
           below it the request's swa is the sentinel; at/above it it is live.
+        - ``replay_reused_tree_pages`` (a bounded encoder replay commit): the request's row for the
+          replay span IS the tree's own pages, so a matched tombstone there revives in place.
 
         A matched node that is ``swa_tombstone`` (swa freed by an earlier ``evict_swa``) and extends
         into the fresh region is REVIVED -- not by rewriting the mapping but by adopting the
         request's live-swa indices into ``node.value`` and clearing the tombstone (sglang Branches
-        1/2/3). Tokens of the new suffix before ``swa_evicted_seqlen`` are inserted as a tombstone;
+        1/2/3). A node whose value already IS the request's span (a bounded encoder replay rewrote
+        the window KV on the tree's own pages) revives in place, adopting nothing and freeing
+        nothing. Tokens of the new suffix before ``swa_evicted_seqlen`` are inserted as a tombstone;
         a live (non-tombstone) leaf is always added (the free_swa ``-page_size`` margin guarantees a
         live tail). Returns ``(matched_prefix_len, freed_full_indices)``: the full-pool slots the
         caller must return to BOTH pools (displaced old tree slots + non-adopted request dups;
@@ -172,9 +205,23 @@ class SWARadixCache:
                 child = child.split_at(match_len)
             seg_kv = kv_indices[total:total + match_len]   # request's fresh slots for this span
             if update_kv_after_len < total + match_len:
+                # An encoder bounded replay reused the tree's OWN pages for [replay_lo, hit) and
+                # rewrote their window KV in place, so the "request's slots" for that span ARE the
+                # node's value: never hand the node's own slots back as dups. Only a replay commit
+                # can alias, so the compare never runs on any other model's insert.
+                same_slots = replay_reused_tree_pages and torch.equal(child.value, seg_kv)
                 if child.swa_tombstone:
                     assert child.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
-                    if child.ref_count > 0:
+                    if same_slots:
+                        # In-place revive: safe even under a full lock (the inserter's own -- the
+                        # insert runs before unlock), because unlike Branch 1 it swaps no slots
+                        # and frees nothing: the window KV a replay rewrote on these pages is
+                        # live, which is all the flag and the accounting record.
+                        child.swa_tombstone = False
+                        child.timestamp = self._tick()
+                        self.swa_evictable += child.length
+                        self._revives += 1
+                    elif child.ref_count > 0:
                         # A full-locked reader still gathers the node's CURRENT slots through its
                         # own row; freeing them on revive would hand live KV to the next alloc.
                         # Keep the tombstone + the tree's value, drop the request's dup (Branch 3
@@ -206,7 +253,9 @@ class SWARadixCache:
                         freed.append(seg_kv.clone())
                 else:
                     # Matched a live node -> tree slots are canonical; drop the request's dup.
-                    freed.append(seg_kv.clone())
+                    # (same_slots is only set by a replay commit re-inserting the tree's own row.)
+                    if not same_slots:
+                        freed.append(seg_kv.clone())
             total += match_len
             node = child
             if partial:
@@ -452,4 +501,4 @@ class SWARadixCache:
             stack.extend(n.children.values())
         return out
 
-__all__ = ["SWARadixCache", "SWAMatch", "SWAEvictResult", "SWACacheHandle"]
+__all__ = ["SWARadixCache", "SWAMatch", "SWAFullMatch", "SWAEvictResult", "SWACacheHandle"]

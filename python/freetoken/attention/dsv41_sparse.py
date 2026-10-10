@@ -39,7 +39,9 @@ class PrefillSegment:
 
     ``offset``/``n`` tile the stream; ``start_pos`` is the absolute position of the first token;
     ``window_floor`` bounds every query's sliding window from below (0 = the exact window; bounded
-    replay sets it to the start of the prompt's last window).
+    replay sets it to the start of the prompt's last window). ``publish_floor`` is the first
+    position whose GLOBAL tiers this segment may publish (0 = every token); an encoder bounded
+    replay re-sends the hit's last window but must leave the hit's already-published tiers alone.
     """
 
     offset: int
@@ -47,6 +49,7 @@ class PrefillSegment:
     table_idx: int
     start_pos: int
     window_floor: int = 0
+    publish_floor: int = 0
 
     @property
     def end(self) -> int:
@@ -158,6 +161,7 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         args = config.dsv41_args
         self.window_size = args.window_size
         self.swa_decoder_replay: str = args.swa_decoder_replay
+        self.swa_encoder_replay: str = args.swa_encoder_replay
         self.capture: DSV41CaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
@@ -183,11 +187,18 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         the decoder on the same stream. Decoder SWA Bounded Replay runs it on the new tokens inside the
         prompt's last window ``[L - W, L)`` (``L = prompt_len``) with every query's window floored at
         ``L - W``: the chunks of a chunked prefill each take their part of that window (earlier rows
-        come from the request's private ring), and a chunk that ends before it runs no decoder row."""
+        come from the request's private ring), and a chunk that ends before it runs no decoder row.
+        An Encoder SWA Bounded Replay (``enc_replay_lo``) extends the ENCODER pass down to the replay
+        start with the window floored there and the hit itself as the publish floor."""
         segments: List[PrefillSegment] = []
         off = 0
         for r in batch.reqs:
-            segments.append(PrefillSegment(off, r.extend_len, r.table_idx, r.cached_len))
+            replay_lo = r.enc_replay_lo
+            if self.swa_encoder_replay == "bounded" and 0 <= replay_lo < r.cached_len:
+                segments.append(PrefillSegment(off, r.extend_len, r.table_idx, replay_lo,
+                                               window_floor=replay_lo, publish_floor=r.cached_len))
+            else:
+                segments.append(PrefillSegment(off, r.extend_len, r.table_idx, r.cached_len))
             off += r.extend_len
         if self.swa_decoder_replay == "exact":
             last = torch.tensor([s.n for s in segments], dtype=torch.int32, device=self.device).cumsum_(0) - 1
