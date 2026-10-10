@@ -92,7 +92,9 @@ def _sm_partial(
         x = tl.load(logits_ptr + base + offs, mask=mask, other=-float("inf")).to(tl.float32) * inv_t
         blk_max = tl.max(x, 0)
         new_m = tl.maximum(m, blk_max)
-        d = d * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), 0)
+        # While every logit so far is -inf, shift by 0: exp(-inf - -inf) would be NaN.
+        shift = tl.where(new_m == -float("inf"), 0.0, new_m)
+        d = d * tl.exp(m - shift) + tl.sum(tl.exp(x - shift), 0)
         m = new_m
     tl.store(pm_ptr + pid, m)
     tl.store(pl_ptr + pid, d)

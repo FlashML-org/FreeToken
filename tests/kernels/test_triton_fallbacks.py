@@ -55,3 +55,22 @@ def test_norm_fallback_matches_torch(dtype, kind):
 
     rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-2, 1e-3)
     torch.testing.assert_close(norm.forward(x), expected.to(dtype), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("mask", ["prefix", "allowed_ids"])
+def test_sampling_softmax_fallback_with_masked_logits(mask):
+    from freetoken.kernel.triton.sampling import softmax
+
+    torch.manual_seed(0)
+    logits = torch.randn((3, 151936), device="cuda") * 4
+    if mask == "prefix":
+        # Long enough that some column chunk starts with an all -inf block.
+        logits[:2, :16384] = float("-inf")
+    else:
+        allowed = torch.tensor([5, 70000, 151000], device="cuda")
+        logits[:2] = torch.full_like(logits[:2], float("-inf")).index_copy(
+            1, allowed, logits[:2, allowed])
+    temperature = torch.tensor([1.0, 0.7, 1.3], device="cuda")
+    expected = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    torch.testing.assert_close(softmax(logits, temperature), expected, rtol=1e-5, atol=1e-7)
