@@ -1011,29 +1011,54 @@ class Engine:
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
-        # 2. Resize caches in place (each frees its old GPU tensors before allocating).
+        # 2. Resize caches in place (each frees its old GPU tensors before allocating),
+        # shrinking resizes before growing ones: a pool's grow must not run while a
+        # still-large sibling is resident, or a target that passed the fit check above can
+        # OOM mid-rebuild (#643). With shrinks first the transient peak never exceeds
+        # max(current, target) totals. Footprints are compared BEFORE the window-override
+        # write below (the old side must price the pre-override config).
+        kv_old_bytes = type(self.kv_cache).rebuild_footprint(config, self.num_pages, None)
+        kv_new_bytes = type(self.kv_cache).rebuild_footprint(
+            config, num_pages if num_pages is not None else self.num_pages, num_swa_pages
+        )
+
+        def _resize_moe() -> None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            self.moe_offload_cache.rebuild(moe_cache_size)
+
+        def _resize_kv() -> None:
+            # sets self.num_pages (rebuilds KV + window); a window-only change passes the
+            # CURRENT page count so only the window pool is re-derived
+            self._resize_kv_pool(
+                config, num_pages if num_pages is not None else self.num_pages, num_swa_pages
+            )
+
+        def _resize_mamba() -> None:
+            # Like every resize here it must sit between graph teardown and re-capture so
+            # the recaptured graphs bind the new state tensors. +1 for the reserved
+            # padding sink: num_mamba_slots is the usable count.
+            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+
+        resize_ops = [
+            (moe_cache_size is not None,
+             moe_cache_size is None or moe_cache_size <= self.moe_offload_cache.cache_size,
+             _resize_moe),
+            (num_pages is not None or num_swa_pages is not None,
+             kv_new_bytes <= kv_old_bytes, _resize_kv),
+            (num_mamba_slots is not None,
+             num_mamba_slots is None or num_mamba_slots + 1 <= self.linear_state_pool.num_slots,
+             _resize_mamba),
+        ]
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
         # frozen EngineConfig — mutate in place like the moe_cache_size path; `config.x = y` raises
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        if moe_cache_size is not None:
-            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild(moe_cache_size)
-        if num_pages is not None:
-            # sets self.num_pages (rebuilds KV + window)
-            self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
-            # Window-only change: no page-count change, but re-derive the window pool at the new
-            # pin against the CURRENT page count. This re-allocs the same-size full pool and
-            # the resized window, both inside the pool's own rebuild_from_config.
-            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
-        if num_mamba_slots is not None:
-            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
-            # teardown and re-capture so the recaptured graphs bind the new state tensors.
-            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+        for shrinking_phase in (True, False):
+            for requested, shrinks, op in resize_ops:
+                if requested and shrinks == shrinking_phase:
+                    op()
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)

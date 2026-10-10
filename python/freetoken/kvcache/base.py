@@ -136,6 +136,24 @@ class BaseKVCachePool(ABC):
                 f"needs {mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
             )
 
+    @classmethod
+    def rebuild_footprint(
+        cls, config, num_pages: int, num_swa_pages: int | None
+    ) -> int:
+        """Whole-family GPU bytes at ``(num_pages, num_swa_pages)`` -- the pool's own
+        tiers priced together, same kv_cost plumbing validate_rebuild uses. The engine
+        compares old-vs-new footprints to order a live rebuild's resizes
+        shrinking-first (#643); ``num_swa_pages=None`` prices the config's current
+        window pin."""
+        import inspect
+
+        cost_params = inspect.signature(cls.kv_cost).parameters
+        cost_kwargs = (
+            {"num_swa_pages": num_swa_pages} if "num_swa_pages" in cost_params else {}
+        )
+        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config, **cost_kwargs)
+        return num_pages * cache_per_page + fixed_cache_size
+
     @abstractmethod
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
