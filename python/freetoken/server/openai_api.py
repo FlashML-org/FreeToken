@@ -18,6 +18,8 @@ from .api_models import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    TokenizeRequest,
+    TokenizeResponse,
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
@@ -32,6 +34,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    count_prompt_tokens,
     generate_events,
     generate_full,
     prerender_error,
@@ -122,6 +125,48 @@ def register_openai_routes(
         if (gate := _maintenance_gate(state)) is not None:
             return gate
         return await handle_chat_completion(req, request, state, get_model_sampling())
+
+    @app.post("/v1/tokenize")
+    async def v1_tokenize(req: TokenizeRequest):
+        """Count tokens without generating. Raw text or chat messages.
+
+        llama.cpp exposes the same endpoint (POST /tokenize) so OpenAI-compatible
+        clients can pre-validate prompt size against max_model_len before sending.
+        The messages path renders through the SAME chat template a generation
+        would use (via count_prompt_tokens), so the count matches the
+        usage.prompt_tokens a real request would report.
+        """
+        state = get_state()
+        if req.input is None and req.messages is None:
+            return create_error_response(
+                "either 'input' (raw text or list of texts) or 'messages' is required"
+            )
+        try:
+            if req.messages is not None:
+                # Messages path: render via the chat template, matching a real generation.
+                if not req.messages:
+                    return create_error_response("messages: at least one message is required")
+                spec_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
+                n_tokens = await count_prompt_tokens(
+                    render_messages(spec_msgs), None, {}, state
+                )
+                return TokenizeResponse(tokens=n_tokens)
+            # Raw text path: direct tokenizer encode, no chat template.
+            tokenizer = await asyncio.to_thread(state.frontend_tokenizer)
+            texts = req.input if isinstance(req.input, list) else [req.input]
+            token_ids: list[int] = []
+            for text in texts:
+                ids = await asyncio.to_thread(
+                    tokenizer.tokenizer.encode,
+                    text,
+                    add_special_tokens=req.add_special_tokens,
+                )
+                token_ids.extend(ids)
+            return TokenizeResponse(tokens=len(token_ids), token_ids=token_ids)
+        except GenerationError as exc:
+            return create_error_response(str(exc), code=exc.code)
+        except Exception as exc:  # noqa: BLE001 -- tokenizer init/load failure -> server error
+            return create_error_response(f"tokenization failed: {exc}", status_code=500)
 
     @app.post("/v1/completions")
     async def v1_completions(req: CompletionRequest, request: Request):
