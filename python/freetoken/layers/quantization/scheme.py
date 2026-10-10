@@ -17,6 +17,8 @@ class QuantKind(Enum):
     NONE = "none"
     FP8_TENSOR = "fp8_tensor"
     FP8_BLOCK = "fp8_block"
+    # like FP8_BLOCK but the checkpoint ships the weight in bf16; it is block-quantized at load
+    FP8_BLOCK_QAT = "fp8_block_qat"
     MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
@@ -92,6 +94,11 @@ def fp8_block_size(scheme: QuantScheme) -> int:
     """The square block edge of an FP8_BLOCK scheme (128 for DeepSeek-V3 style exports, 32 for DeepSeek-V4.1)."""
     assert scheme.kind is QuantKind.FP8_BLOCK, scheme
     return scheme.weight.group[0]
+
+
+def fp8_block_qat_scheme(scale: str) -> QuantScheme:
+    # checkpoint provides only the bf16 ``weight``; ``weight_scale_inv`` is synthesized at load (finalize)
+    return QuantScheme(QuantKind.FP8_BLOCK_QAT, WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale), {"weight"})
 
 
 def mxfp8_scheme() -> QuantScheme:
