@@ -38,6 +38,21 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+# A rebuild re-captures the CUDA graphs and returns less than its slots held (1.24 of 1.26 GiB
+# measured), so a drop sized to the shortfall alone creeps toward the reserve without reaching it.
+_RESERVE_FIT_MARGIN = 128 << 20
+
+
+def slots_to_free_for_reserve(free_at_peak: int, reserve: int, per_expert_bytes: int) -> int:
+    """Expert slots to drop so the engine's measured peak leaves ``reserve`` bytes of the device
+    free, rounded up to whole slots past a margin for what the rebuild itself costs."""
+    assert per_expert_bytes > 0, "per_expert_bytes must be positive"
+    shortfall = reserve - free_at_peak
+    if shortfall <= 0:
+        return 0
+    return div_ceil(shortfall + max(shortfall // 16, _RESERVE_FIT_MARGIN), per_expert_bytes)
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:
