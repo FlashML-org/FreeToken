@@ -114,7 +114,7 @@ def _quantization_config() -> dict:
     }
 
 
-def _config_json(quantized: bool = True) -> dict:
+def _config_json(quantized: bool = True, *, tie: bool = False) -> dict:
     return {
         "architectures": ["MiMoV2ForCausalLM"],
         "model_type": "mimo_v2",
@@ -130,10 +130,10 @@ def _config_json(quantized: bool = True) -> dict:
         "v_head_dim": VHD,
         "swa_v_head_dim": VHD,
         "vocab_size": V,
+        "tie_word_embeddings": tie,
         "hidden_act": "silu",
         "layernorm_epsilon": 1e-6,
         "max_position_embeddings": 256,
-        "tie_word_embeddings": False,
         "attention_bias": False,
         "attention_value_scale": 0.707,
         "sliding_window": 128,
@@ -157,13 +157,15 @@ def _config_json(quantized: bool = True) -> dict:
     }
 
 
-def _write(folder, raw: dict[str, torch.Tensor], quantized: bool = True, *, indexed: bool = True) -> str:
+def _write(
+    folder, raw: dict[str, torch.Tensor], quantized: bool = True, *, indexed: bool = True, tie: bool = False
+) -> str:
     save_file({k: v.clone() for k, v in raw.items()}, str(folder / "model.safetensors"))
     if indexed:
         (folder / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {}, "weight_map": {k: "model.safetensors" for k in raw}})
         )
-    (folder / "config.json").write_text(json.dumps(_config_json(quantized)))
+    (folder / "config.json").write_text(json.dumps(_config_json(quantized, tie=tie)))
     return str(folder)
 
 
@@ -174,8 +176,8 @@ def _load(folder: str) -> dict[str, torch.Tensor]:
     }
 
 
-def _meta_state_dict(folder: str, strategy: str = "offload") -> dict[str, torch.Tensor]:
-    """State dict of the model the engine builds for ``folder`` (experts per ``strategy``), on the meta device."""
+def _build_model(folder: str, strategy: str = "offload", *, device: torch.device | None = None):
+    """The engine model for ``folder`` (experts per ``strategy``); meta unless a real build is needed."""
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
@@ -196,11 +198,16 @@ def _meta_state_dict(folder: str, strategy: str = "offload") -> dict[str, torch.
     rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
     rotary.get_rope.cache_clear()
     try:
-        with torch.device("meta"), torch_dtype(torch.bfloat16):
-            return create_model(config.model_config).state_dict()
+        with torch.device(device or torch.device("meta")), torch_dtype(torch.bfloat16):
+            return create_model(config.model_config)
     finally:
         rotary.set_rope_device(saved)
         rotary.get_rope.cache_clear()
+
+
+def _meta_state_dict(folder: str, strategy: str = "offload") -> dict[str, torch.Tensor]:
+    """State dict of the model the engine builds for ``folder`` (experts per ``strategy``), on the meta device."""
+    return _build_model(folder, strategy).state_dict()
 
 
 @pytest.fixture(scope="module")
@@ -593,3 +600,101 @@ def test_bf16_layout_dense_only_load_still_skips_experts(bf16_checkpoint):
         for layer in MOE_LAYERS
         for proj in ("gate_up_proj", "down_proj")
     }
+
+
+# ---------------------------------------------------------------- tied lm head selection (DR-06)
+
+
+def test_tied_checkpoint_without_lm_head_loads_the_embedding_as_head(tmp_path, monkeypatch):
+    """tie_word_embeddings=true checkpoints omit the redundant head tensor: the dense reader
+    must select the embedding for the head, and that tensor must drive the actual logits."""
+    import contextlib
+    import types
+
+    import torch.cuda.nvtx
+    import torch.nn.functional as F
+    from freetoken.layers import embedding as embedding_mod
+
+    raw = _raw(nvfp4_experts=False)
+    raw.pop("lm_head.weight")
+    folder = _write(tmp_path, raw, quantized=False, indexed=False, tie=True)
+    loaded = {
+        n: t.clone()
+        for n, t in iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        )
+    }
+    # state tree: exactly the engine's buffers (the tied head's state_dict is empty)
+    assert set(loaded) == set(_meta_state_dict(folder, strategy="fused"))
+    assert torch.equal(loaded["model.embed_tokens.weight"], raw["model.embed_tokens.weight"])
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda _name: contextlib.nullcontext())
+    # the head reads the engine batch ctx to slice prefill rows; a decode batch passes through
+    monkeypatch.setattr(
+        embedding_mod,
+        "get_global_ctx",
+        lambda: types.SimpleNamespace(batch=types.SimpleNamespace(is_prefill=False, size=1)),
+    )
+
+    model = _build_model(folder, strategy="fused", device=torch.device("cpu"))
+    embed = loaded["model.embed_tokens.weight"]
+    model.load_state_dict(loaded)  # strict load: BaseOP pops every declared key (and empties the dict)
+    assert model.lm_head.tied_embedding is model.model.embed_tokens
+    assert model.model.embed_tokens.weight is embed
+    torch.manual_seed(3)
+    x = torch.randn(2, H, dtype=torch.bfloat16)
+    assert torch.equal(model.lm_head.forward(x), F.linear(x, raw["model.embed_tokens.weight"]))
+
+
+def test_tied_nvfp4_offload_checkpoint_without_lm_head_loads_dense(tmp_path):
+    """Same tied selection on the NVFP4 dialect: the offload dense reader (experts are never
+    include_moe_experts there) must not require lm_head.weight either."""
+    raw = _raw()
+    raw.pop("lm_head.weight")
+    folder = _write(tmp_path, raw, tie=True)
+    assert parse_config(cached_load_hf_config(folder)).expert_quant == "nvfp4"
+    loaded = _load(folder)  # KeyError('lm_head.weight') before the fix
+    assert set(loaded) == set(_meta_state_dict(folder, strategy="offload"))
+    assert torch.equal(loaded["model.embed_tokens.weight"], raw["model.embed_tokens.weight"])
+
+
+def test_tied_checkpoint_with_redundant_lm_head_ignores_it(tmp_path):
+    """A tied checkpoint that still serializes lm_head.weight loads with the embedding as the
+    selected head; the redundant tensor is neither yielded nor loadable into the head."""
+    raw = _raw(nvfp4_experts=False)
+    # unmistakable non-embed payload: if it ever reached the head, logits would be all zeros
+    raw["lm_head.weight"] = torch.zeros(V, H, dtype=torch.bfloat16)
+    folder = _write(tmp_path, raw, quantized=False, indexed=False, tie=True)
+    loaded = dict(
+        iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True)
+    )
+    assert "lm_head.weight" not in loaded
+    assert set(loaded) == set(_meta_state_dict(folder, strategy="fused"))
+    assert torch.equal(loaded["model.embed_tokens.weight"], raw["model.embed_tokens.weight"])
+    assert loaded["model.embed_tokens.weight"].count_nonzero() > 0
+    model = _build_model(folder, strategy="fused", device=torch.device("cpu"))
+    model.load_state_dict(loaded)  # strict load: the redundant tensor must not be an extra key
+
+
+def test_untied_checkpoint_missing_lm_head_still_fails(tmp_path):
+    """Guard the other direction: an untied config declares lm_head.weight (head load_state_dict
+    pops a tensor, BaseOP raises on the missing key), so the reader must keep requiring it."""
+    raw = _raw()
+    raw.pop("lm_head.weight")
+    offload_dir = tmp_path / "offload"
+    offload_dir.mkdir()
+    with pytest.raises(KeyError, match="lm_head.weight"):
+        _load(_write(offload_dir, raw))
+    resident_raw = _raw(nvfp4_experts=False)
+    resident_raw.pop("lm_head.weight")
+    resident_dir = tmp_path / "resident"
+    resident_dir.mkdir()
+    with pytest.raises(KeyError, match="lm_head.weight"):
+        dict(
+            iter_weights(
+                _write(resident_dir, resident_raw, quantized=False, indexed=False),
+                torch.device("cpu"),
+                include_moe_experts=True,
+                include_non_moe=True,
+            )
+        )

@@ -249,7 +249,10 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 
     yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight")
     yield "model.norm.weight", reader.get("model.norm.weight")
-    yield "lm_head.weight", reader.get("lm_head.weight")
+    # tied heads reuse embed_tokens as the output head (ParallelLMHead.state_dict omits
+    # lm_head.weight when tied): never require or yield the redundant tensor, even if stored
+    if not config.tie_word_embeddings:
+        yield "lm_head.weight", reader.get("lm_head.weight")
 
 
 # --------------------------------------------------------------------------------------
