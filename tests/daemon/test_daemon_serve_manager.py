@@ -868,7 +868,6 @@ def test_start_and_switch_routes_hand_the_api_key_to_the_manager():
             client.post("/engine/start", json={"model": "m", "port": 1919, "apiKey": ""})
             client.post("/engine/start", json={"model": "m", "port": 1919})
             client.post("/engine/switch", json={"model": "m", "port": 1919, "apiKey": "k2"})
-            # argparse also takes an unambiguous prefix of --api-key
             for args in (["--api-key", "k3"], ["--api-key=k3"], ["--api", "k3"], ["--ap=k3"]):
                 rejected = client.post("/engine/start", json={"model": "m", "args": args})
                 assert rejected.status_code == 400

@@ -4,10 +4,10 @@
 open for the daemon's whole life. flock (not a bare port-bind) avoids TIME_WAIT races and is
 released automatically if the daemon dies, so a crashed daemon never wedges its own restart.
 
-``ServeStateStore`` persists ``{model, port, pid, args, starttime, log_path, api_key}`` as JSON on
-every lifecycle change, so a restarted daemon can re-adopt a still-running serve. ``starttime`` +
-``args`` are what make re-adoption PID-reuse-safe and config-exact. The file is owner-only
-because it holds the serve's API key."""
+``ServeStateStore`` persists ``{model, port, pid, args, starttime, log_path, api_key}`` as JSON on every
+lifecycle change, so a restarted daemon can re-adopt a still-running serve. ``starttime`` +
+``args`` are what make re-adoption PID-reuse-safe and config-exact.
+The file is owner-only because it holds the serve's API key."""
 
 from __future__ import annotations
 

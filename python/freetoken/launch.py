@@ -253,7 +253,7 @@ def _write_text_with_backup(path: Path, text: str, *, private: bool = False) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text() != text:
         backup = _backup_path(path)
-        # copy2 sets the mode only after copying the content, so create the backup with it first
+        # copy2 sets the mode only after it copies the content, so create the backup with the source mode first
         backup.touch(mode=stat.S_IMODE(path.stat().st_mode))
         shutil.copy2(path, backup)
     if private:

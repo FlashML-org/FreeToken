@@ -38,7 +38,7 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
-    # None serves without authentication; kept out of repr so a logged config never shows it
+    # kept out of repr: parse_args logs the whole ServerArgs
     api_key: str | None = field(default=None, repr=False)
     num_tokenizer: int = 0
     silent_output: bool = False

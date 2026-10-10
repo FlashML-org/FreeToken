@@ -421,8 +421,6 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
 
 
 class _ApiKeyMiddleware:
-    """Answer 401 unless the request carries the key, except /health."""
-
     def __init__(self, app, api_key: str) -> None:
         self.app = app
         self._digest = hashlib.sha256(api_key.encode()).digest()

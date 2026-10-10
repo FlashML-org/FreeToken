@@ -30,7 +30,6 @@ class StartBody(BaseModel):
     model: str
     port: int | None = None
     args: list[str] = []
-    # Handed to the serve as FREETOKEN_API_KEY, never on its command line; absent = no auth.
     apiKey: str | None = None
 
 

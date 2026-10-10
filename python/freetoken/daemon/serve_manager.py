@@ -131,7 +131,6 @@ def build_serve_command(
 
 
 def serve_env(api_key: str | None) -> dict[str, str]:
-    """The serve's environment: the daemon's own, with the API key set only by the start request."""
     env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
     if api_key:
         env[API_KEY_ENV] = api_key
