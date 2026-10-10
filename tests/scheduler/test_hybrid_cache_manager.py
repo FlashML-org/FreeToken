@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from freetoken.core import Req, SamplingParams
 from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -153,6 +154,83 @@ def test_naive_cache_does_not_align_prefill_chunks():
     assert adder.try_add_one(pending).extend_len == 100
 
 
+@pytest.mark.parametrize("full_chunks", [2, 3])
+@pytest.mark.parametrize("tail", [1, 59, 64, 65])
+@pytest.mark.parametrize("finish_early", [False, True])
+def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, tail, finish_early):
+    """A short final extend must retain the prior state; a longer one must replace it."""
+    import freetoken.core as core
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    pt = torch.zeros(2, 1024, dtype=torch.int32)
+    cm = CacheManager(32, 64, pt, "hybrid_radix", linear_state_pool=pool)
+    tm = TableManager(max_running_reqs=1, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=64))
+    monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=64, linear_state_pool=pool))
+    prompt = torch.arange(full_chunks * 128 + tail, dtype=torch.int32)
+    pm.pending_list = [PendingReq(0, prompt, SamplingParams(max_tokens=8))]
+    last_batch = None
+    states = {}
+    final = None
+
+    while pm.runnable or last_batch is not None:
+        # Match overlap ordering: prepare the continuation before draining the prior chunk.
+        batch = pm.schedule_next_batch(128)
+        if batch is not None:
+            batch.padded_reqs = batch.reqs
+            cm.allocate_paged(batch.reqs)
+            req = batch.reqs[0]
+            meta = build_fla_metadata(batch, torch.device("cpu"))
+            if meta.track_dst is not None:
+                slot = meta.track_dst.item()
+                value = len(states) + 1
+                states[req.mamba_last_track_seqlen] = value
+                pool.recurrent_states[:, slot].fill_(value)
+                pool.conv_states[:, slot].fill_(value)
+            pool.recurrent_states[:, req.linear_slot_idx].fill_(-9)
+            pool.conv_states[:, req.linear_slot_idx].fill_(-9)
+            req.complete_one()
+        if last_batch is not None:
+            previous = last_batch.reqs[0]
+            if not isinstance(previous, ChunkedReq):
+                final = previous
+                if not finish_early:
+                    cm.cache_req(final, finished=False)
+        last_batch = batch
+
+    # Before the finish path can donate an aligned live state, require the frozen checkpoint.
+    expected = full_chunks * 128 - 64 if tail <= 64 else full_chunks * 128 + 64
+    if not finish_early:
+        match = cm.match_req(_pend(prompt.tolist() + [999]))
+        assert match.cuda_handle.cached_len == expected
+        assert torch.all(pool.recurrent_states[:, match.mamba_value] == states[expected])
+        assert torch.all(pool.conv_states[:, match.mamba_value] == states[expected])
+
+    # Finish/abort may occur before the prefill commit; use the real idempotent cleanup path.
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm)
+    Scheduler._free_req_resources(stub, final)
+    Scheduler._free_req_resources(stub, final)
+    match = cm.match_req(_pend(prompt.tolist() + [999]))
+    expected_finish = len(prompt) if tail == 64 else expected
+    assert match.cuda_handle.cached_len == expected_finish
+    value = -9 if tail == 64 else states[expected]
+    assert torch.all(pool.recurrent_states[:, match.mamba_value] == value)
+    assert torch.all(pool.conv_states[:, match.mamba_value] == value)
+    assert tm.available_size == 1
+    cm.check_integrity()
+    assert pool.num_free_slots + cm.prefix_cache.mamba_evictable_size == pool.num_slots - 1
+    cm.ensure_mamba_slots(pool.num_slots - 1)
+    cm.check_integrity()
+    assert pool.num_free_slots == pool.num_slots - 1
+    assert len(cm.free_slots) == cm.num_pages
+
+
 def test_pool_sizing_covers_4mr_floor():
     """C6: pool must reserve the 4-slot-per-request non-evictable floor even at a tiny ratio."""
     from types import SimpleNamespace
@@ -164,7 +242,4 @@ def test_pool_sizing_covers_4mr_floor():
 
 
 if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"{name}: PASS")
+    raise SystemExit(pytest.main([__file__]))
