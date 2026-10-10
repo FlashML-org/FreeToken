@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -25,6 +26,19 @@ logger = init_logger(__name__)
 
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+
+
+@contextmanager
+def _single_threaded_host_copies():
+    """Keep small NVFP4 bank placements off PyTorch's intra-op worker pool."""
+    previous = torch.get_num_threads()
+    if previous > 1:
+        torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        if previous > 1:
+            torch.set_num_threads(previous)
 
 
 @dataclass(frozen=True)
@@ -141,13 +155,22 @@ def build_expert_banks(
         if missing:
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
-    if layer_sink is not None:
-        _fill(layer_sink)
-    elif torch.cuda.is_available() and not resident:
-        with PinPipeline() as pins:
-            _fill(pins)
-    else:
-        _fill(None)
+    # Per-expert NVFP4 pieces produce thousands of small CPU copies. On high-core
+    # hosts the intra-op pool costs more than the copies and contends with the
+    # checkpoint reader. Restore its setting even if packing or pinning fails.
+    copy_threads = (
+        _single_threaded_host_copies()
+        if method.kind is QuantKind.NVFP4 and not resident
+        else nullcontext()
+    )
+    with copy_threads:
+        if layer_sink is not None:
+            _fill(layer_sink)
+        elif torch.cuda.is_available() and not resident:
+            with PinPipeline() as pins:
+                _fill(pins)
+        else:
+            _fill(None)
 
     return ExpertBanks(
         legacy_format_for(method.kind, kernel.name), banks,
