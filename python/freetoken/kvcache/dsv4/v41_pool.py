@@ -113,6 +113,19 @@ class DSV41PagedKVCache(WindowTierPagedPool):
         the prompt's last window from that window's encoder outputs, which no cache keeps."""
         return self.P if self.private_window_layer_ids else 0
 
+    @property
+    def swa_encoder_replay(self) -> str:
+        return self.args.swa_encoder_replay
+
+    def encoder_replay_start(self, cached_len: int, windowed_len: int) -> int:
+        """The single source of truth for the bounded encoder replay's extent: a hit of
+        ``cached_len`` whose windowed-safe boundary ``windowed_len`` fell short of it replays
+        exactly the last P tokens of the hit (uniform: never a partial span, never deeper), else
+        there is no replay and the prefill starts at the hit as usual."""
+        if self.args.swa_encoder_replay != "bounded" or windowed_len < 0 or windowed_len >= cached_len:
+            return cached_len
+        return max(0, cached_len - self.P)
+
     # ----- private window rings -----
     def is_private_window(self, layer_id: int) -> bool:
         return layer_id in self.private_window_layer_ids

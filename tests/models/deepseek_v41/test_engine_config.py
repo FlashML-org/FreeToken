@@ -30,13 +30,15 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: True)
     write_tiny_checkpoint(str(tmp_path))
-    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay=replay, max_seq_len_override=2048)
+    config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload", swa_decoder_replay=replay,
+                            swa_encoder_replay=replay, max_seq_len_override=2048)
     _adjust_config(config)
     assert config.attention_backend == "dsv41_sparse"
     assert config.page_size == 128 and config.cache_type == "swa_radix"
     assert resolve_pool_class(config.model_config) is DSV41PagedKVCache
     args = config.model_config.dsv41_args
     assert args.swa_decoder_replay == replay and args.max_seq_len == 2048 and args.max_batch_size == config.max_running_req + 1
+    assert args.swa_encoder_replay == replay
     assert config.max_extend_tokens == 8192  # the prefill chunk stays bounded (whole window pages)
     # the cache contract follows the replay mode: a bounded-mode prefix hit must leave the prompt's last
     # window to the prefill (the pool's prefix_replay_tokens); the history a resume reads stays one window
@@ -49,6 +51,35 @@ def test_resolution_picks_dsv41_and_the_replay_knob(tmp_path, monkeypatch, repla
     # bounded replay keeps the decoder's per-request window KV in private rings, off the shared pages
     assert pool.private_window_layer_ids == (tuple(range(args.decoder_start_layer, args.n_layers)) if replay == "bounded" else ())
     assert DSV41PagedKVCache.min_kv_tokens(config) // 128 == 8 + 3 * config.max_running_req + 2 * (config.max_running_req + 1) + 1
+
+
+def test_the_encoder_replay_knob_is_independent_of_the_decoder_knob(tmp_path, monkeypatch):
+    """--swa-encoder-replay resolves onto the args on its own: it never changes the decoder-driven
+    cache contract (prefix_replay_tokens, private rings) or the window-pool sizing, and its rule is
+    the uniform last-window replay of an evicted hit."""
+    from freetoken.engine import engine
+
+    monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
+    monkeypatch.setattr(engine, "is_sm90_family", lambda: True)
+    write_tiny_checkpoint(str(tmp_path))
+    from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
+
+    for dec in ("bounded", "exact"):
+        for enc in ("bounded", "exact"):
+            config = _engine_config(str(tmp_path), attention_backend="auto", moe_strategy="offload",
+                                    swa_decoder_replay=dec, swa_encoder_replay=enc, max_seq_len_override=2048)
+            _adjust_config(config)
+            args = config.model_config.dsv41_args
+            assert args.swa_encoder_replay == enc and args.swa_decoder_replay == dec
+            pool = DSV41PagedKVCache(dsv41_pool_sizes(16, args, 1.0, 128), args, torch.device("cpu"))
+            assert pool.prefix_replay_tokens == (128 if dec == "bounded" else 0)  # the DECODER knob owns it
+            assert pool.private_window_layer_ids == (tuple(range(args.decoder_start_layer, args.n_layers)) if dec == "bounded" else ())
+            if enc == "bounded":
+                assert pool.encoder_replay_start(640, 640) == 640      # nothing evicted: no replay
+                assert pool.encoder_replay_start(640, 512) == 640 - 128  # evicted: the uniform last window
+                assert pool.encoder_replay_start(64, 0) == 0           # a hit below one window replays it all
+            else:
+                assert pool.encoder_replay_start(640, 512) == 640      # exact mode never replays
 
 
 def test_fp8_block32_dialect_reaches_the_quant_layer(tmp_path):

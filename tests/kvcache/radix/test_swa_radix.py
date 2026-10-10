@@ -556,6 +556,68 @@ def test_swa_pressure_drains_every_slot_exactly_once(sess):
     assert sess.kv.in_use() == set()                      # no leak, no double free (ledger-checked)
 
 
+# --------------------------------------------------------------------------- bounded encoder replay
+def test_match_prefix_full_serves_the_whole_depth_with_the_windowed_boundary(swa_spec):
+    """``match_prefix_full`` (the bounded-encoder-replay match): the full-tier depth and its page
+    indices WITHOUT the windowed truncation, plus the windowed-safe boundary the truncating match
+    would have returned -- the two agree exactly when the path is fully live."""
+    import torch
+
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    P, wp, W = swa_spec.page_size, _window_pages(swa_spec), swa_spec.window
+    dev = torch.device("cpu")
+    ids = torch.tensor(_seq(swa_spec, wp + 1), dtype=torch.int64)
+    slots = torch.arange((wp + 1) * P, dtype=torch.int32)
+
+    live = SWARadixCache(dev, P, W)
+    live.insert(ids, slots)
+    m = live.match_prefix_full(ids)
+    assert m.full_len == len(ids) and m.windowed_len == m.full_len
+    assert m.kv_indices.tolist() == slots.tolist()
+    t = live.match_prefix(ids)
+    assert (t.cached_len, t.kv_indices.tolist()) == (m.windowed_len, m.kv_indices.tolist())
+
+    if wp == 1:
+        pytest.skip("page == window: a live run shorter than the window is below one whole page, "
+                    "which the suffix clamp never leaves -- the DSV4 shape is covered end-to-end "
+                    "by the reference-parity replay test")
+    evicted = SWARadixCache(dev, P, W)
+    evicted.insert(ids, slots, swa_evicted_seqlen=wp * P)   # one live page on top of a tombstoned head
+    m = evicted.match_prefix_full(ids)
+    assert m.full_len == len(ids) and m.windowed_len == 0    # the run is short -> nothing windowed-safe
+    assert m.kv_indices.tolist() == slots.tolist()           # ... yet the FULL indices are all served
+    assert evicted.match_prefix(ids).cached_len == m.windowed_len
+
+
+def test_insert_revives_in_place_when_the_request_reused_the_trees_pages(swa_spec):
+    """The bounded-encoder-replay commit: the request's row for the replayed span IS the tree's own
+    value (the window KV was rewritten in place on those pages), so insert must revive a tombstone
+    there WITHOUT adopting or freeing anything -- freeing would hand the tree's live pages to the
+    next allocation, and adopting is a no-op."""
+    import torch
+
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    P, W = swa_spec.page_size, swa_spec.window
+    dev = torch.device("cpu")
+    cache = SWARadixCache(dev, P, W)
+    ids = torch.tensor(_seq(swa_spec, 3), dtype=torch.int64)
+    slots = torch.arange(3 * P, dtype=torch.int32)
+    cache.insert(ids, slots, swa_evicted_seqlen=P)          # page 0 tombstone, pages 1-2 live
+    assert cache.swa_evictable_size == 2 * P
+
+    # the fresh region starts at the replay start (inside the tombstone); the row == the tree.
+    # The flag marks the commit as a replay's (the cache never probes for the alias otherwise).
+    matched, freed = cache.insert(ids, slots, swa_evicted_seqlen=0, update_kv_after_len=0,
+                                  replay_reused_tree_pages=True)
+    assert matched == 3 * P and freed.numel() == 0    # the tree's own slots are never "dups"
+    assert cache.swa_evictable_size == 3 * P         # the tombstone revived in place
+    cache.check_integrity()
+    m = cache.match_prefix(ids)                      # the windowed boundary now reaches the full depth
+    assert m.cached_len == 3 * P and m.kv_indices.tolist() == slots.tolist()
+
+
 # --------------------------------------------------------------------------- retention
 def test_finish_time_restamp_soft_pins_the_prompt_window(swa_spec, make_session):
     """Decode never re-matches the prompt, so at finish the prompt window carries the stamp of the
@@ -628,3 +690,37 @@ def test_trim_head_swa_skips_locked_leaf_and_tombstoned_nodes(sess):
 
     sess.do_unlock(held)
     sess.check()
+
+
+def test_evict_swa_keeps_full_kv_for_replay_when_flagged(swa_spec):
+    """Bounded encoder replay retention: with ``keep_full_on_swa_evict`` a free leaf's swa
+    eviction tombstones it in place (full KV stays walkable for ``match_prefix_full``); the
+    default keeps main's behavior -- free both pools, unlink -- so only replay mode retains."""
+    import torch
+
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    P, W = swa_spec.page_size, swa_spec.window
+    wp = _window_pages(swa_spec)
+    dev = torch.device("cpu")
+    ids = torch.tensor(_seq(swa_spec, wp + 1), dtype=torch.int64)
+    slots = torch.arange((wp + 1) * P, dtype=torch.int32)
+
+    keep = SWARadixCache(dev, P, W, keep_full_on_swa_evict=True)
+    keep.insert(ids, slots)
+    r = keep.evict_swa(keep.swa_evictable)
+    assert r.kv_indices.numel() == 0, "replay retention must not surrender full-pool pages"
+    m = keep.match_prefix_full(ids)
+    assert m.full_len == len(ids)
+    assert m.kv_indices.tolist() == slots.tolist()
+    assert m.windowed_len == 0
+    assert keep.match_prefix(ids).cached_len == 0
+    r2 = keep.evict_full(keep.full_evictable)
+    assert sorted(r2.kv_indices.tolist()) == sorted(slots.tolist()), \
+        "the full pool's own LRU must still reclaim the tombstoned leaf"
+
+    default = SWARadixCache(dev, P, W)
+    default.insert(ids, slots)
+    r3 = default.evict_swa(default.swa_evictable)
+    assert sorted(r3.kv_indices.tolist()) == sorted(slots.tolist()), "main frees both pools"
+    assert default.match_prefix_full(ids).full_len == 0

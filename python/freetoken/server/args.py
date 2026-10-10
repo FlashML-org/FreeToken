@@ -671,6 +671,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-encoder-replay",
+        default=ServerArgs.swa_encoder_replay,
+        choices=["bounded", "exact"],
+        help=(
+            "DeepSeek-V4.1 Encoder SWA Bounded Replay. 'bounded' (default) lets a radix prefix hit keep "
+            "the full global-KV match and rerun the encoder over the hit's last 128 tokens when that "
+            "window KV was evicted; 'exact' truncates the hit to the live window and re-prefills the "
+            "tail exactly (the reference numerics)."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         action=_DeprecatedAlias,
         new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",

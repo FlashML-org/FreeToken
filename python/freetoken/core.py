@@ -55,6 +55,11 @@ class Req:
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
+    # Encoder SWA bounded replay (DSV41): a prefix hit deeper than its live encoder window KV
+    # re-sends the hit's last window through the encoder. The chunk starts there while cached_len
+    # (the page/commit watermark) stays at the hit; -1 = no replay. Cleared by complete_one, so a
+    # continuation chunk or a decode step never sees it.
+    enc_replay_lo: int = -1
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
     # length just after that token (its index + 1). A client-side rewrite of the echoed tool
     # call diverges strictly after this point, so it is the deepest reuse boundary that
@@ -85,12 +90,18 @@ class Req:
         return self.max_device_len - self.device_len
 
     @property
+    def chunk_lo(self) -> int:
+        """Where the current chunk starts: the replay start when an encoder replay is attached."""
+        return self.enc_replay_lo if self.enc_replay_lo >= 0 else self.cached_len
+
+    @property
     def extend_len(self) -> int:
-        return self.device_len - self.cached_len
+        return self.device_len - self.chunk_lo
 
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+        self.enc_replay_lo = -1
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
