@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -20,7 +21,7 @@ DEFAULT_SERVER = "http://127.0.0.1:1919"
 CODEX_PROFILE = "freetoken-launch"
 CODEX_PROVIDER_NAME = "FreeToken"
 CODEX_CATALOG_NAME = "freetoken-model.json"
-CODEX_PROVIDER_API_KEY_ENV = "FREETOKEN_API_KEY"
+API_KEY_ENV = "FREETOKEN_API_KEY"
 # Used when the server reports no context length. Guessing low only costs earlier compaction.
 FALLBACK_CONTEXT_WINDOW = 128_000
 MAX_OUTPUT_TOKENS_CAP = 32_768
@@ -71,6 +72,7 @@ class LaunchContext:
     extra_args: list[str]
     dry_run: bool
     assume_yes: bool = False
+    api_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,9 +169,15 @@ def resolve_server_url(server: str | None) -> ServerURL:
     return ServerURL(origin=origin, openai_base_url=f"{origin}/v1")
 
 
-def _get_json(url: str) -> object:
-    request = Request(url, headers={"Accept": "application/json"})
-    with urlopen(request, timeout=5) as response:
+def resolve_api_key(api_key: str | None) -> str | None:
+    return api_key or os.environ.get(API_KEY_ENV) or None
+
+
+def _get_json(url: str, api_key: str | None) -> object:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    with urlopen(Request(url, headers=headers), timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -177,10 +185,10 @@ def _positive_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _stats_model(server: ServerURL) -> dict[str, object]:
+def _stats_model(server: ServerURL, api_key: str | None) -> dict[str, object]:
     """The /v1/stats model card; empty when the server predates it."""
     try:
-        payload = _get_json(f"{server.origin}/v1/stats")
+        payload = _get_json(f"{server.origin}/v1/stats", api_key)
     except (HTTPError, URLError, HTTPException, OSError, TimeoutError, ValueError):
         return {}
     model = payload.get("model") if isinstance(payload, dict) else None
@@ -193,11 +201,16 @@ def _input_modalities(stats_model: dict[str, object]) -> tuple[str, ...]:
     return ("text", *extra)
 
 
-def discover_server_model(server: ServerURL) -> ServedModel:
+def discover_server_model(server: ServerURL, api_key: str | None) -> ServedModel:
     try:
-        _get_json(server.openai_base_url)
-        payload = _get_json(f"{server.openai_base_url}/models")
+        _get_json(server.openai_base_url, api_key)
+        payload = _get_json(f"{server.openai_base_url}/models", api_key)
     except (HTTPError, URLError, HTTPException, OSError, TimeoutError) as exc:
+        if isinstance(exc, HTTPError) and exc.code == 401:
+            raise RuntimeError(
+                f"FreeToken server at {server.origin} needs a valid API key: "
+                f"pass --api-key or set {API_KEY_ENV}"
+            ) from exc
         raise RuntimeError(f"Cannot connect to FreeToken server at {server.origin}: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -220,7 +233,7 @@ def discover_server_model(server: ServerURL) -> ServedModel:
     if not models:
         raise RuntimeError(f"FreeToken server at {server.origin} reported no models")
 
-    stats_model = _stats_model(server)
+    stats_model = _stats_model(server, api_key)
     if context_length is None:
         context_length = _positive_int(stats_model.get("ctx"))
 
@@ -236,15 +249,22 @@ def _backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{time.time_ns()}.bak")
 
 
-def _write_text_with_backup(path: Path, text: str) -> None:
+def _write_text_with_backup(path: Path, text: str, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text() != text:
-        shutil.copy2(path, _backup_path(path))
+        backup = _backup_path(path)
+        # copy2 sets the mode only after it copies the content, so create the backup with the source mode first
+        backup.touch(mode=stat.S_IMODE(path.stat().st_mode))
+        shutil.copy2(path, backup)
+    if private:
+        # before the write, so the key never sits in a file others can read
+        path.touch(mode=0o600)
+        path.chmod(0o600)
     path.write_text(text)
 
 
-def _write_json_with_backup(path: Path, value: object) -> None:
-    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n")
+def _write_json_with_backup(path: Path, value: object, *, private: bool = False) -> None:
+    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n", private=private)
 
 
 def _toml_string(value: str) -> str:
@@ -371,7 +391,7 @@ def _codex_profile_text(ctx: LaunchContext, catalog_path: Path) -> str:
         + f"name = {_toml_string(CODEX_PROVIDER_NAME)}\n"
         + f"base_url = {_toml_string(ctx.server.openai_base_url)}\n"
         + 'wire_api = "responses"\n'
-        + f"env_key = {_toml_string(CODEX_PROVIDER_API_KEY_ENV)}\n"
+        + f"env_key = {_toml_string(API_KEY_ENV)}\n"
     )
 
 
@@ -408,7 +428,7 @@ def prepare_codex(ctx: LaunchContext) -> CommandSpec:
     ]
     return CommandSpec(
         argv=argv,
-        env={CODEX_PROVIDER_API_KEY_ENV: "freetoken"},
+        env={API_KEY_ENV: ctx.api_key or "freetoken"},
         unset_env=CODEX_CLEAR_ENV,
     )
 
@@ -423,7 +443,7 @@ def prepare_claude(ctx: LaunchContext) -> CommandSpec:
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(_max_output_tokens(ctx)),
             "ANTHROPIC_BASE_URL": ctx.server.origin,
             "ANTHROPIC_API_KEY": "",
-            "ANTHROPIC_AUTH_TOKEN": "freetoken",
+            "ANTHROPIC_AUTH_TOKEN": ctx.api_key or "freetoken",
             "ANTHROPIC_MODEL": model_id,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
@@ -456,13 +476,16 @@ def _opencode_model_entries(
 
 def _opencode_config(ctx: LaunchContext) -> str:
     model_ids = _ordered_model_ids(ctx)
+    options = {"baseURL": ctx.server.openai_base_url}
+    if ctx.api_key:
+        options["apiKey"] = ctx.api_key
     config = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
             OPENCODE_PROVIDER: {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": OPENCODE_PROVIDER_NAME,
-                "options": {"baseURL": ctx.server.openai_base_url},
+                "options": options,
                 "models": _opencode_model_entries(
                     model_ids, _context_window(ctx), _max_output_tokens(ctx), _accepts_images(ctx)
                 ),
@@ -614,7 +637,7 @@ def _patch_openclaw_config(
         new_models.append(entry)
 
     provider["baseUrl"] = ctx.server.openai_base_url
-    provider["apiKey"] = "freetoken-local"
+    provider["apiKey"] = ctx.api_key or "freetoken-local"
     provider["api"] = "openai-completions"
     provider["models"] = new_models
     providers[OPENCLAW_PROVIDER] = provider
@@ -661,7 +684,9 @@ def prepare_openclaw(ctx: LaunchContext) -> CommandSpec:
         if not _openclaw_has_freetoken_provider(config):
             if not ctx.assume_yes and not _confirm_openclaw_first_patch(ctx, config_path):
                 raise RuntimeError("OpenClaw config patch cancelled")
-        _write_json_with_backup(config_path, _patch_openclaw_config(ctx, config))
+        _write_json_with_backup(
+            config_path, _patch_openclaw_config(ctx, config), private=bool(ctx.api_key)
+        )
         _clear_openclaw_session_overrides(ctx.model.model_id)
 
     argv = ["openclaw", *ctx.extra_args] if ctx.extra_args else ["openclaw", "chat"]
@@ -697,8 +722,8 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
         model_section["default"] = ctx.model.model_id
         model_section["provider"] = "custom"
         model_section["base_url"] = ctx.server.openai_base_url
-        # A non-empty dummy: FreeToken is unauthenticated, but some clients reject an empty key.
-        model_section["api_key"] = HERMES_API_KEY
+        # Dummy for a server without --api-key; some clients reject an empty key.
+        model_section["api_key"] = ctx.api_key or HERMES_API_KEY
         # Hermes' name for the window (prompt + generation). Left unset it auto-detects, and a
         # miss lands on a 32k default that trips the floor below.
         window = _context_window(ctx)
@@ -712,7 +737,9 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
                 file=sys.stderr,
             )
 
-        _write_text_with_backup(config_path, yaml.safe_dump(config, sort_keys=False))
+        _write_text_with_backup(
+            config_path, yaml.safe_dump(config, sort_keys=False), private=bool(ctx.api_key)
+        )
 
     argv = ["hermes", *ctx.extra_args] if ctx.extra_args else ["hermes", "chat"]
     return CommandSpec(argv=argv, env={})
@@ -753,8 +780,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
     values and key order — drift that survives render canonicalization, cuts
     the prefix cache, and shows the model a rewrite of its own output. The
-    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement; FreeToken
-    itself is unauthenticated."""
+    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -774,7 +800,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
 
         window, output = _context_window(ctx), _max_output_tokens(ctx)
         modalities = ["text", "image"] if _accepts_images(ctx) else ["text"]
-        config["llm-deepseek"] = {
+        section: dict[str, object] = {
             "baseURL": ctx.server.openai_base_url,
             "models": [
                 {
@@ -787,6 +813,10 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
                 for model_id in _ordered_model_ids(ctx)
             ],
         }
+        if ctx.api_key:
+            # not DEEPSEEK_API_KEY: dsh's web search also reads it and sends it to api.deepseek.com
+            section["apiKeyEnv"] = API_KEY_ENV
+        config["llm-deepseek"] = section
         config["agent-default-model"] = {
             "provider": "deepseek-official",
             "model": ctx.model.model_id,
@@ -804,15 +834,14 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     elif len(app_args) >= 2 and app_args[0] == "--profile":
         profile, app_args = app_args[1], app_args[2:]
     argv = ["dsh", "--profile", profile, "--patch", str(patch_path), *app_args]
-    return CommandSpec(
-        argv=argv,
-        env={
-            "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
-            "DEEPSEEK_API_KEY": DSH_API_KEY,
-            "DSH_TELEMETRY_DISABLED": "1",
-        },
-        unset_env=CLOUD_PROVIDER_API_KEY_ENV,
-    )
+    env = {
+        "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
+        "DEEPSEEK_API_KEY": DSH_API_KEY,
+        "DSH_TELEMETRY_DISABLED": "1",
+    }
+    if ctx.api_key:
+        env[API_KEY_ENV] = ctx.api_key
+    return CommandSpec(argv=argv, env=env, unset_env=CLOUD_PROVIDER_API_KEY_ENV)
 
 
 PREPARERS = {
@@ -840,6 +869,10 @@ def parse_argv(argv: list[str], prog: str = "python -m freetoken.launch") -> arg
     )
     parser.add_argument("agent", choices=sorted(PREPARERS))
     parser.add_argument("--server", help="FreeToken server origin or /v1 URL")
+    parser.add_argument(
+        "--api-key",
+        help=f"API key of a server started with --api-key (default: ${API_KEY_ENV})",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1028,13 +1061,16 @@ def main(argv: list[str] | None = None, prog: str = "python -m freetoken.launch"
             return 0
 
         server = resolve_server_url(args.server)
-        model = discover_server_model(server)
+        api_key = resolve_api_key(args.api_key)
+        model = discover_server_model(server, api_key)
         plan_ctx = LaunchContext(
             server=server,
             model=model,
             extra_args=args.extra_args,
             dry_run=True,
             assume_yes=args.yes,
+            # the plan is printed by --dry-run, so it never holds the real key
+            api_key="<api-key>" if api_key else None,
         )
         spec = PREPARERS[args.agent](plan_ctx)
         if args.dry_run:
@@ -1052,6 +1088,7 @@ def main(argv: list[str] | None = None, prog: str = "python -m freetoken.launch"
             extra_args=args.extra_args,
             dry_run=False,
             assume_yes=args.yes,
+            api_key=api_key,
         )
         spec = PREPARERS[args.agent](ctx)
         if binary_path != spec.argv[0]:

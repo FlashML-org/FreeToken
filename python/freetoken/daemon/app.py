@@ -30,6 +30,7 @@ class StartBody(BaseModel):
     model: str
     port: int | None = None
     args: list[str] = []
+    apiKey: str | None = None
 
 
 class StopBody(BaseModel):
@@ -161,6 +162,15 @@ def build_app(
         st = manager.status()
         return st.get("port") or default_serve_port
 
+    def reject_api_key_arg(args: list[str]) -> None:
+        # the daemon must know the key to reach the serve, so the key only travels as apiKey
+        # argparse also accepts any unambiguous prefix, and no other serve flag starts with --ap
+        flags = (a.split("=", 1)[0] for a in args)
+        if any(len(f) >= 4 and "--api-key".startswith(f) for f in flags):
+            raise HTTPException(
+                status_code=400, detail="pass the serve's API key as apiKey, not in args"
+            )
+
     def accounting_error(exc: Exception) -> JSONResponse:
         code = (
             "accounting_outbox_failed"
@@ -192,9 +202,17 @@ def build_app(
 
     @app.post("/engine/start", dependencies=auth)
     async def engine_start(body: StartBody):
+        reject_api_key_arg(body.args)
         port = resolve_port(body.port)
         try:
-            return await run(lifecycle_pool, manager.start, body.model, port, list(body.args))
+            return await run(
+                lifecycle_pool,
+                manager.start,
+                body.model,
+                port,
+                list(body.args),
+                body.apiKey or None,
+            )
         except Conflict as exc:
             st = manager.status()
             return JSONResponse(
@@ -236,6 +254,7 @@ def build_app(
 
     @app.post("/engine/switch", dependencies=auth)
     async def engine_switch(body: SwitchBody):
+        reject_api_key_arg(body.args)
         port = resolve_port(body.port)
         try:
             return await run(
@@ -245,6 +264,7 @@ def build_app(
                 port,
                 list(body.args),
                 body.force,
+                body.apiKey or None,
             )
         except (AccountingPrepareError, AccountingOutboxError) as exc:
             return accounting_error(exc)

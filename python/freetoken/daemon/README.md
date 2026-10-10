@@ -60,9 +60,9 @@ Target a non-default daemon with `--url http://host:1900` (or `$FREETOKEN_DAEMON
 | Method / path | Notes |
 | --- | --- |
 | `GET /health` | Daemon self-health; always answers, never gated by `--token`. |
-| `POST /engine/start` `{model,port,args[]}` | Idempotent on the full `(model,port,args)`; a differing config on the same port → `409`. |
+| `POST /engine/start` `{model,port,args[],apiKey?}` | Idempotent on the full `(model,port,args,apiKey)`; a differing config on the same port → `409`. |
 | `POST /engine/stop` `{force?:false}` | Close admission, drain/abort, durably enqueue the final-accounting receipt, then `SIGTERM`→grace→`SIGKILL`. A prepare/outbox failure preserves the engine. |
-| `POST /engine/switch` `{model,port,args[],force?:false}` | One serialized stop-accounting-start transaction. |
+| `POST /engine/switch` `{model,port,args[],apiKey?,force?:false}` | One serialized stop-accounting-start transaction. |
 | `GET /engine/status` | `{running,pid,model,port,uptimeS,lastExitCode,…}`; outlives any single serve. |
 | `GET /engine/logs?since=` | SSE, ANSI-stripped, tqdm-`\r` collapsed, ring replay, `id:<seq>`, `Last-Event-ID` resume. |
 | `GET /engine/metrics` | `{ramBytes,vramBytes}` — the serve tree's own footprint only. |
@@ -74,6 +74,13 @@ Target a non-default daemon with `--url http://host:1900` (or `$FREETOKEN_DAEMON
 
 Set `--token` (or `$FREETOKEN_DAEMON_TOKEN`) to require an `X-FT-Token` header on everything
 except `/health`.
+
+`apiKey` is the serve's own `--api-key`. The daemon hands it to the serve as `FREETOKEN_API_KEY` in
+its environment (never on its command line), sends it on its own calls to the serve, and keeps it in
+the owner-only state file so a re-adopted serve stays reachable. The daemon's own
+`FREETOKEN_API_KEY` is never passed down: a serve requires a key only when its start request carries
+one, and an `--api-key` inside `args` is rejected with a 400 because the daemon would not know it.
+`ft daemon start|switch --api-key KEY` (default `$FREETOKEN_API_KEY`) sets it.
 
 The daemon reaches the serve's destructive `POST /v1/admin/prepare-stop` endpoint only over
 loopback; the serve rejects non-loopback callers even when its inference API is bound to

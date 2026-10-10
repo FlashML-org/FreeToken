@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -38,6 +38,8 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # kept out of repr: parse_args logs the whole ServerArgs
+    api_key: str | None = field(default=None, repr=False)
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -366,6 +368,15 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=ServerArgs.api_key,
+        help="Require this key on every route except /health, sent as "
+        "'Authorization: Bearer <key>' or 'x-api-key: <key>'. Defaults to $FREETOKEN_API_KEY; "
+        "unset serves without authentication.",
     )
 
     parser.add_argument(
@@ -841,6 +852,13 @@ def parse_args(
             parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
         if entry:
             kwargs["quant_backend"] = entry
+
+    # an empty flag usually means an unset shell variable; refuse it rather than serve open
+    if kwargs["api_key"] == "":
+        parser.error("--api-key is empty; omit it to serve without authentication")
+    from freetoken.launch import resolve_api_key
+
+    kwargs["api_key"] = resolve_api_key(kwargs["api_key"])
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
