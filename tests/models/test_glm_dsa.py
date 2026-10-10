@@ -352,3 +352,87 @@ def test_backend_ragged_prefill_identity_and_selection():
         live = ctx_d.page_table[1, : 89 + j]
         ref = _ref_attend(q_cat[8 + j], slab_d, live, scale, dv)
         assert (od[8 + j].float() - ref).abs().max().item() < 3e-2, f"dense B q{j}"
+
+
+def test_moe_route_matches_hf_with_fp32_selection_bias(monkeypatch, tmp_path):
+    """Expert selection through the real load path (loader -> engine materialize) matches
+    HF's router, which keeps the bias fp32. GLM-5.2's biases sit near 15-35 and differ by
+    ~0.1 within a layer, under bf16's 0.125-0.25 step there, so a bf16 copy ties experts."""
+    import freetoken.models.glm_moe_dsa.weight as glm_weight
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.engine import _materialize_loaded_weight_state_dict
+    from freetoken.models.glm_moe_dsa.config import parse_config
+    from freetoken.models.glm_moe_dsa.moe import GlmMoeDsaSparseBlock
+    from freetoken.utils.hf import RawConfigShim
+    from freetoken.utils.torch_utils import torch_dtype
+    from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as tr
+
+    n_exp, top_k, hidden = 16, 4, 64
+    hf = RawConfigShim({
+        "architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa",
+        "hidden_size": hidden, "intermediate_size": 96, "num_hidden_layers": 2,
+        "num_attention_heads": 2, "vocab_size": 128, "hidden_act": "silu",
+        "rms_norm_eps": 1e-5, "max_position_embeddings": 4096, "q_lora_rank": 48,
+        "kv_lora_rank": 32, "qk_nope_head_dim": 32, "qk_rope_head_dim": 16, "v_head_dim": 32,
+        "index_n_heads": 4, "index_head_dim": 32, "index_topk": 32,
+        "indexer_types": ["full", "full"], "n_routed_experts": n_exp,
+        "num_experts_per_tok": top_k, "n_shared_experts": 1, "moe_intermediate_size": 32,
+        "norm_topk_prob": True, "routed_scaling_factor": 2.5, "n_group": 1, "topk_group": 1,
+        "first_k_dense_replace": 1,
+    })
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+
+    # experts 0-3 win on bias by 0.12, experts 4-7 win on score by ~0.05; bf16 rounds
+    # 34.12 and 34.0 to the same value, which hands the top-4 to experts 4-7
+    bias = torch.full((n_exp,), 33.0)
+    bias[:4], bias[4:8] = 34.12, 34.0
+    gate = torch.zeros(n_exp, hidden, dtype=torch.bfloat16)
+    gate[4:8, 0] = 0.2
+
+    class Reader:
+        def __init__(self, *args):
+            pass
+
+        def get(self, name):
+            if name.endswith("gate.e_score_correction_bias"):
+                return bias.clone()
+            return gate if name.endswith("mlp.gate.weight") else torch.zeros(1)
+
+        def close(self):
+            pass
+
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    monkeypatch.setattr(glm_weight, "cached_load_hf_config", lambda path: hf)
+    monkeypatch.setattr(glm_weight, "download_hf_weight", lambda path: str(tmp_path))
+    monkeypatch.setattr(glm_weight, "_ShardReader", Reader)
+    loaded = dict(glm_weight.iter_weights(str(tmp_path), torch.device("cpu"),
+                                          include_moe_experts=False, include_non_moe=True))
+
+    prefix = "model.layers.1.mlp"
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        block = GlmMoeDsaSparseBlock(parse_config(hf), layer_id=1, prefix=prefix)
+    keys = [f"{prefix}.gate.weight", f"{prefix}.e_score_correction_bias"]
+    state = block.state_dict(prefix=prefix)
+    weights = _materialize_loaded_weight_state_dict(
+        {k: state[k] for k in keys}, [(k, loaded[k]) for k in keys], device=torch.device("cuda"))
+    block.gate.weight, block.e_score_correction_bias = weights[keys[0]], weights[keys[1]]
+
+    class Cfg:  # minimal duck-typed config for GlmMoeDsaTopkRouter
+        num_experts_per_tok = top_k
+        num_local_experts = n_exp
+        hidden_size = hidden
+        routed_scaling_factor = 2.5
+        n_group = 1
+        topk_group = 1
+        norm_topk_prob = True
+
+    router = tr.GlmMoeDsaTopkRouter(Cfg()).cuda()
+    router.weight.data.copy_(gate.float())
+    router.e_score_correction_bias.copy_(bias)
+    x = torch.ones(3, hidden, device="cuda", dtype=torch.bfloat16)
+    _, ref_w, ref_ids = router(x)
+    w, ids = block._route(x)
+    assert ids.sort(-1).values.tolist() == ref_ids.sort(-1).values.tolist() == [[0, 1, 2, 3]] * 3
+    order, ref_order = ids.argsort(-1), ref_ids.argsort(-1)
+    torch.testing.assert_close(w.gather(-1, order), ref_w.gather(-1, ref_order))

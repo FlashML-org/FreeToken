@@ -1,7 +1,7 @@
 """Weight loading for GLM-5.2 (``glm_moe_dsa``).
 
 Resident (non routed-expert) weights stream through verbatim in the checkpoint's precision (bf16). The
-router selection bias is remapped ``mlp.gate.e_score_correction_bias ->
+router selection bias stays fp32 and is remapped ``mlp.gate.e_score_correction_bias ->
 mlp.e_score_correction_bias``; the DSA indexer tensors load bf16 on "full" indexer
 layers (serving runs faithful DSA top-k sparse attention; see attention.py); only the
 trailing MTP layer is skipped. Routed experts are NVFP4
@@ -110,7 +110,7 @@ def iter_weights(
                 yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")
                 yield (
                     f"{m}.e_score_correction_bias",
-                    reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
+                    reader.get(f"{m}.gate.e_score_correction_bias").to(torch.float32),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield f"{m}.shared_experts.{proj}.weight", reader.get(f"{m}.shared_experts.{proj}.weight")
