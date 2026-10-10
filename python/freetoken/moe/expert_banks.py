@@ -23,9 +23,6 @@ from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
-# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
-_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
-
 
 @dataclass(frozen=True)
 class ExpertBanks:
@@ -299,9 +296,9 @@ def load_expert_banks(
     the same normalized ``ExpertBanks`` and both pinning after fill:
 
     * **Fast path (FTW)**: if ``model_path`` is a converted FTW checkpoint, read its
-      repacked banks directly (contiguous chunked O_DIRECT). No auto-conversion.
+      repacked banks directly (contiguous chunked O_DIRECT, or mmap where it is unavailable). No auto-conversion.
     * **Slow path** (the original checkpoint): auto-pick **parallel** (the common parallel chunked
-      O_DIRECT reader) when experts are stored as many small tensors -- the serial read is
+      reader, O_DIRECT where the platform has it) when experts are stored as many small tensors -- the serial read is
       slow there -- else the **serial baseline** (packed experts: serial already saturates,
       parallel only adds read amplification). parallel unavailable for a quant falls back to serial.
 
@@ -337,18 +334,11 @@ def load_expert_banks(
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
 
-    if parallel and not _PARALLEL_READER_SUPPORTED:
-        logger.warning_rank0(
-            "expert banks: parallel O_DIRECT reader unsupported on this platform "
-            "(no os.O_DIRECT/preadv) -> serial build"
-        )
-        parallel = False
-
     auto = parallel is None
     if auto:
         from freetoken.models.weight import experts_scattered
 
-        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
+        parallel = not dummy and experts_scattered(model_path)
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
