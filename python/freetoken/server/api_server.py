@@ -421,7 +421,7 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
 
 
 class _ApiKeyMiddleware:
-    """Answer 401 unless the request carries the key, except /health and OPTIONS requests."""
+    """Answer 401 unless the request carries the key, except /health."""
 
     def __init__(self, app, api_key: str) -> None:
         self.app = app
@@ -434,11 +434,7 @@ class _ApiKeyMiddleware:
         )
 
     async def __call__(self, scope, receive, send) -> None:
-        if (
-            scope["type"] not in ("http", "websocket")
-            or scope.get("method") == "OPTIONS"
-            or scope["path"] == "/health"
-        ):
+        if scope["type"] not in ("http", "websocket") or scope["path"] == "/health":
             return await self.app(scope, receive, send)
         headers = Headers(scope=scope)
         scheme, _, token = headers.get("authorization", "").partition(" ")
@@ -450,7 +446,9 @@ class _ApiKeyMiddleware:
 
 
 def install_api_key(app: FastAPI, api_key: str | None) -> None:
-    """Require ``api_key`` on every route but /health; run before install_cors so 401s get CORS headers."""
+    """Require ``api_key`` on every route but /health.
+
+    Run it before install_cors, so CORS answers preflights and adds its headers to 401s."""
     if api_key is None:
         return
     app.add_middleware(_ApiKeyMiddleware, api_key=api_key)

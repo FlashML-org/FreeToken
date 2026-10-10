@@ -73,6 +73,10 @@ def test_cors_preflight_passes_and_401_carries_cors_headers():
     assert denied.headers["access-control-allow-origin"] == ORIGIN
 
 
+def test_options_outside_a_cors_preflight_needs_the_key():
+    assert _client(KEY).options("/v1/models").status_code == 401
+
+
 def test_flag_wins_over_env_and_empty_values_do_not_enable_auth(monkeypatch):
     monkeypatch.delenv("FREETOKEN_API_KEY", raising=False)
     assert _parse().api_key is None
@@ -116,3 +120,4 @@ def test_dsh_keeps_the_key_out_of_the_variable_its_web_search_reads(monkeypatch,
     settings = yaml.safe_load((tmp_path / launch.DSH_LAUNCH_SETTINGS_NAME).read_text())
     assert env["DEEPSEEK_API_KEY"] != KEY
     assert env[settings["llm-deepseek"]["apiKeyEnv"]] == KEY
+
