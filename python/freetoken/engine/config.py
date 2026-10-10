@@ -76,6 +76,9 @@ class EngineConfig:
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
+    # GDN checkpoints in PINNED host RAM instead of VRAM (hybrid GDN + radix only). ~110 MB each, so
+    # a bank costs host RAM and keeps every prefill-chunk boundary resumable. 0 = off: one per prompt.
+    mamba_host_slots: int = 0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
