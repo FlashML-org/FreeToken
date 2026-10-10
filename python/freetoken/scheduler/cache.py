@@ -92,7 +92,9 @@ class CacheManager:
             return HybridRadixCache(device, page_size)
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
-            return SWARadixCache(device, page_size, self.sliding_window_size)
+            keep_full = getattr(self.swa_pool, "swa_encoder_replay", "exact") == "bounded"
+            return SWARadixCache(device, page_size, self.sliding_window_size,
+                                 keep_full_on_swa_evict=keep_full)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:

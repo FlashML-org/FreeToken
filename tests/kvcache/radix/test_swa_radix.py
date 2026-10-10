@@ -690,3 +690,37 @@ def test_trim_head_swa_skips_locked_leaf_and_tombstoned_nodes(sess):
 
     sess.do_unlock(held)
     sess.check()
+
+
+def test_evict_swa_keeps_full_kv_for_replay_when_flagged(swa_spec):
+    """Bounded encoder replay retention: with ``keep_full_on_swa_evict`` a free leaf's swa
+    eviction tombstones it in place (full KV stays walkable for ``match_prefix_full``); the
+    default keeps main's behavior -- free both pools, unlink -- so only replay mode retains."""
+    import torch
+
+    from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
+    P, W = swa_spec.page_size, swa_spec.window
+    wp = _window_pages(swa_spec)
+    dev = torch.device("cpu")
+    ids = torch.tensor(_seq(swa_spec, wp + 1), dtype=torch.int64)
+    slots = torch.arange((wp + 1) * P, dtype=torch.int32)
+
+    keep = SWARadixCache(dev, P, W, keep_full_on_swa_evict=True)
+    keep.insert(ids, slots)
+    r = keep.evict_swa(keep.swa_evictable)
+    assert r.kv_indices.numel() == 0, "replay retention must not surrender full-pool pages"
+    m = keep.match_prefix_full(ids)
+    assert m.full_len == len(ids)
+    assert m.kv_indices.tolist() == slots.tolist()
+    assert m.windowed_len == 0
+    assert keep.match_prefix(ids).cached_len == 0
+    r2 = keep.evict_full(keep.full_evictable)
+    assert sorted(r2.kv_indices.tolist()) == sorted(slots.tolist()), \
+        "the full pool's own LRU must still reclaim the tombstoned leaf"
+
+    default = SWARadixCache(dev, P, W)
+    default.insert(ids, slots)
+    r3 = default.evict_swa(default.swa_evictable)
+    assert sorted(r3.kv_indices.tolist()) == sorted(slots.tolist()), "main frees both pools"
+    assert default.match_prefix_full(ids).full_len == 0

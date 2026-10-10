@@ -77,11 +77,17 @@ class SWAEvictResult(NamedTuple):
 
 
 class SWARadixCache:
-    def __init__(self, device: torch.device, page_size: int, sliding_window_size: int) -> None:
+    def __init__(self, device: torch.device, page_size: int, sliding_window_size: int,
+                 keep_full_on_swa_evict: bool = False) -> None:
         assert sliding_window_size > 0, "SWARadixCache requires a positive sliding window"
         self.device = device
         self.page_size = page_size
         self.sliding_window_size = sliding_window_size
+        # bounded encoder replay: evicting a free leaf's swa KV tombstones it in place (full KV
+        # kept) instead of freeing both pools and unlinking, so the full-depth match can still
+        # walk it and replay only the window KV (#643 lane; evict_full still reclaims it by the
+        # full pool's own LRU).
+        self.keep_full_on_swa_evict = keep_full_on_swa_evict
         self.key_fn = _get_key_fn(page_size)
         # Page-index dtype: matches the engine's int32 page_table / free_slots so an empty result
         # (returned by insert/evict/match) never promotes them to int64 when concatenated.
@@ -375,6 +381,12 @@ class SWARadixCache:
             if node.swa_tombstone or node.swa_ref_count != 0 or node.is_root():
                 continue
             if node.is_leaf() and node.ref_count == 0:
+                if self.keep_full_on_swa_evict:
+                    swa.append(node.value)          # tombstone in place: full KV kept for replay
+                    self.swa_evictable -= node.length
+                    freed += node.length
+                    node.swa_tombstone = True
+                    continue
                 kv.append(node.value)
                 swa.append(node.value)
                 self.full_evictable -= node.length
