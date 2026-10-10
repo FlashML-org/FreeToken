@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,3 +123,24 @@ def test_dsh_keeps_the_key_out_of_the_variable_its_web_search_reads(monkeypatch,
     assert env["DEEPSEEK_API_KEY"] != KEY
     assert env[settings["llm-deepseek"]["apiKeyEnv"]] == KEY
 
+
+@pytest.mark.parametrize("agent", ["hermes", "openclaw"])
+def test_config_files_holding_the_key_are_owner_only(agent, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old_umask = os.umask(0o022)
+    try:
+        for key in ("sk-first", "sk-second"):
+            ctx = launch.LaunchContext(
+                server=launch.resolve_server_url("http://127.0.0.1:1919"),
+                model=launch.ServedModel(model_id="m", models=["m"], context_length=65536),
+                extra_args=[],
+                dry_run=False,
+                assume_yes=True,
+                api_key=key,
+            )
+            launch.PREPARERS[agent](ctx)
+    finally:
+        os.umask(old_umask)
+    written = [p for p in tmp_path.rglob("*") if p.is_file() and "sk-" in p.read_text()]
+    assert len(written) == 2
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in written)

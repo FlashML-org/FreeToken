@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -248,15 +249,22 @@ def _backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{time.time_ns()}.bak")
 
 
-def _write_text_with_backup(path: Path, text: str) -> None:
+def _write_text_with_backup(path: Path, text: str, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text() != text:
-        shutil.copy2(path, _backup_path(path))
+        backup = _backup_path(path)
+        # copy2 sets the mode only after copying the content, so create the backup with it first
+        backup.touch(mode=stat.S_IMODE(path.stat().st_mode))
+        shutil.copy2(path, backup)
+    if private:
+        # before the write, so the key never sits in a file others can read
+        path.touch(mode=0o600)
+        path.chmod(0o600)
     path.write_text(text)
 
 
-def _write_json_with_backup(path: Path, value: object) -> None:
-    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n")
+def _write_json_with_backup(path: Path, value: object, *, private: bool = False) -> None:
+    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n", private=private)
 
 
 def _toml_string(value: str) -> str:
@@ -676,7 +684,9 @@ def prepare_openclaw(ctx: LaunchContext) -> CommandSpec:
         if not _openclaw_has_freetoken_provider(config):
             if not ctx.assume_yes and not _confirm_openclaw_first_patch(ctx, config_path):
                 raise RuntimeError("OpenClaw config patch cancelled")
-        _write_json_with_backup(config_path, _patch_openclaw_config(ctx, config))
+        _write_json_with_backup(
+            config_path, _patch_openclaw_config(ctx, config), private=bool(ctx.api_key)
+        )
         _clear_openclaw_session_overrides(ctx.model.model_id)
 
     argv = ["openclaw", *ctx.extra_args] if ctx.extra_args else ["openclaw", "chat"]
@@ -727,7 +737,9 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
                 file=sys.stderr,
             )
 
-        _write_text_with_backup(config_path, yaml.safe_dump(config, sort_keys=False))
+        _write_text_with_backup(
+            config_path, yaml.safe_dump(config, sort_keys=False), private=bool(ctx.api_key)
+        )
 
     argv = ["hermes", *ctx.extra_args] if ctx.extra_args else ["hermes", "chat"]
     return CommandSpec(argv=argv, env={})
