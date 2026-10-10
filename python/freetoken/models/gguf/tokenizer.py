@@ -13,7 +13,7 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "llama4": "llama"}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -39,10 +39,14 @@ def load_gguf_tokenizer(model_path: str):
     # gemma4 chat turns end with <turn|>; prefer it as eos so chat generation halts
     # (the formal <eos> is also a stop id, see gguf_eos_token_ids).
     turn_end = "<turn|>" if "<turn|>" in tokens else None
+    
+    # LLaMA 4 uses <|eot|> as the formal turn end
+    llama_eot = "<|eot|>" if "<|eot|>" in tokens else ("<|eot_id|>" if "<|eot_id|>" in tokens else None)
+    
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=fast,
         bos_token=tok_for("bos_token_id", "<bos>"),
-        eos_token=turn_end or tok_for("eos_token_id", "<eos>"),
+        eos_token=llama_eot or turn_end or tok_for("eos_token_id", "<eos>"),
         unk_token=tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
@@ -64,7 +68,7 @@ def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
         ids.add(int(eid))
     # Look the stop tokens up in the vocab directly (convert_tokens_to_ids would map an
     # absent name to <unk>, wrongly adding it as a stop id).
-    for name in ("<eos>", "<turn|>"):
+    for name in ("<eos>", "<turn|>", "<|eot_id|>", "<|eot|>"):
         try:
             ids.add(tokens.index(name))
         except ValueError:
