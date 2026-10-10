@@ -9,6 +9,7 @@ The parent resolves --gpu entries to full UUIDs via NVML (resolve_gpu_uuids) and
 Each worker publishes its own entry (set_assigned_gpu / assign_gpu) and binds it when CUDA comes up (bind_assigned_gpu) by matching the UUID against CUDA's visible devices.
 One process runs on one GPU. Binding is unconditional: a process that publishes nothing binds a default ordinal and records it, so assigned_visible_gpu() names that card in every case.
 No process mutates CUDA_VISIBLE_DEVICES, and the UUID match holds under any CUDA_DEVICE_ORDER.
+NVML also reports a GPU's free memory across every process (nvml_free_bytes), which WDDM's cudaMemGetInfo does not.
 
 Stdlib only (torch is imported lazily); not under freetoken.utils, which imports transformers.
 """
@@ -68,12 +69,11 @@ def single_gpu_arg(value: str) -> str:
     return entries[0]
 
 
-def _nvml_uuids() -> "list[str] | None":
-    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+def _load_nvml():
+    """The NVML library, or None when no candidate loads.
 
     Own ctypes loader instead of torch's _raw_device_uuid_nvml: that helper only knows the Linux library name, raises (not None) when the library is missing, and is private API.
     NVML exports are cdecl on every platform, so CDLL is right on Windows too (same as nvidia-ml-py).
-    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
     """
     import ctypes
 
@@ -85,14 +85,24 @@ def _nvml_uuids() -> "list[str] | None":
         ]
     else:
         candidates = ["libnvidia-ml.so.1"]
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _nvml_uuids() -> "list[str] | None":
+    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+
+    None on any failure -- no library, a stub library without the _v2 symbols, WSL, a dead device -- and callers fall back.
+    """
+    import ctypes
+
     try:
-        for name in candidates:
-            try:
-                lib = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
-        else:
+        lib = _load_nvml()
+        if lib is None:
             return None
         if lib.nvmlInit() != 0:
             return None
@@ -110,6 +120,36 @@ def _nvml_uuids() -> "list[str] | None":
                     return None
                 uuids.append(buf.value.decode("ascii", "replace"))
             return uuids
+        finally:
+            lib.nvmlShutdown()
+    except (OSError, AttributeError):
+        return None
+
+
+def nvml_free_bytes(uuid: "str | None") -> "int | None":
+    """Free memory of GPU ``uuid`` across every process, as nvidia-smi reports it; None when NVML cannot say.
+
+    Under WDDM, cudaMemGetInfo leaves out what other processes hold; this does not.
+    """
+    import ctypes
+
+    class Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    if uuid is None:
+        return None
+    try:
+        lib = _load_nvml()
+        if lib is None or lib.nvmlInit() != 0:
+            return None
+        try:
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByUUID(uuid.encode("ascii"), ctypes.byref(handle)) != 0:
+                return None
+            memory = Memory()
+            if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != 0:
+                return None
+            return int(memory.free)
         finally:
             lib.nvmlShutdown()
     except (OSError, AttributeError):
@@ -223,7 +263,7 @@ def _visible_of_physical(uuid: str) -> int:
     seen: list[str] = []
     hits: list[int] = []
     for v in range(torch.cuda.device_count()):
-        u = format_gpu_uuid(getattr(torch.cuda.get_device_properties(v), "uuid", None))
+        u = gpu_uuid(v)
         seen.append(u or "?")
         if u is not None and u.upper().startswith(uuid.upper()):
             hits.append(v)
@@ -274,6 +314,13 @@ def format_gpu_uuid(raw) -> str | None:
     return None if raw is None else f"{UUID_PREFIX}{raw}"
 
 
+def gpu_uuid(index: int) -> str | None:
+    """nvidia-smi form GPU-<uuid> of visible device ``index``; None where torch reports no uuid."""
+    import torch
+
+    return format_gpu_uuid(getattr(torch.cuda.get_device_properties(index), "uuid", None))
+
+
 def gpu_identity(index: int) -> dict:
     """{index, name, uuid, total_bytes} of visible device ``index``."""
     import torch
@@ -282,6 +329,6 @@ def gpu_identity(index: int) -> dict:
     return {
         "index": index,
         "name": props.name,
-        "uuid": format_gpu_uuid(getattr(props, "uuid", None)),
+        "uuid": gpu_uuid(index),
         "total_bytes": int(props.total_memory),
     }
