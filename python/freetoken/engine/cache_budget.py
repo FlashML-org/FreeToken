@@ -29,13 +29,23 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
 
 
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float,
+    baseline_free: int,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    attention_workspace_bytes: int = 0,
 ) -> int:
     """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    baseline minus weights, fixed (non-paged) cache, and the attention backend's known
+    fixed workspace. The ``(1-memory_ratio)`` remainder is the CUDA-graph/activation
+    headroom. Single source of truth for startup auto-sizing and the runtime-rebuild
+    fit check.
+
+    ``attention_workspace_bytes`` is a plan-time lower bound (see
+    ``attention.fixed_workspace_bytes``): the workspace is allocated after the pools,
+    so without charging it a tight memory_ratio plans pools that leave the workspace
+    allocation to die in a CUDA OOM (issue #303)."""
+    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size - attention_workspace_bytes
 
 
 def required_bytes(
@@ -109,16 +119,22 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    attention_workspace_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
+    ``attention_workspace_bytes`` is the attention backend's plan-time fixed workspace
+    floor (see ``attention.fixed_workspace_bytes``); it is charged against the budget
+    before the split so the pools leave room for the backend's own allocation (issue #303).
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
     CUDA-graph/activation headroom (not subtracted here).
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    budget_bytes = net_cache_budget_bytes(
+        memory_ratio, baseline_free, weights_bytes, fixed_cache_size, attention_workspace_bytes
+    )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(

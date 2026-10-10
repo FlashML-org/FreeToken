@@ -629,6 +629,7 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
+        from freetoken.attention import fixed_workspace_bytes
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
@@ -641,6 +642,7 @@ class Engine:
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
+            attention_workspace_bytes=fixed_workspace_bytes(config.attention_backend),
             per_expert_bytes=expert_bytes_per_slot(banks.sources),
             num_experts=num_experts,
             total_experts=total_experts,
