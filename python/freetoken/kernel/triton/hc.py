@@ -282,16 +282,20 @@ def _hc_combine_norm_kernel(
     w_ptr,
     out_ptr,
     y_ptr,
+    shared_ptr,
+    gate_ptr,
     stride_block,
     stride_res,
     stride_inj,
     stride_out,
     stride_y,
+    stride_shared,
     HC_DIM: tl.constexpr,
     HC: tl.constexpr,
     W_SHARED: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    GATED: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     HC_PAD: tl.constexpr = triton.next_power_of_2(HC)
@@ -318,6 +322,13 @@ def _hc_combine_norm_kernel(
     res = tl.load(res_ptr + row * stride_res + offs, mask_inner, other=0.0)
     inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
     block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
+    if GATED:
+        # Fold the shared-expert gate epilogue in: same fp32 ops and the
+        # same bf16 store boundary as the standalone gate kernel, so the
+        # combine below sees the identical block row.
+        g = tl.load(gate_ptr + row)
+        sh = tl.load(shared_ptr + row * stride_shared + offs_inner, mask_inner, other=0.0)
+        block = (block.to(tl.float32) + g * sh.to(tl.float32)).to(block_ptr.dtype.element_ty)
     inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
     inj = tl.sum(tl.where(offs_hc == stream, inj, 0.0))
     # Round the materialized combine result before normalization. This matches
@@ -326,9 +337,11 @@ def _hc_combine_norm_kernel(
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
 
     out = out.to(tl.float32)
-    # Keep the two-axis reduction: flattening the padded tile is ~40% slower
-    # at decode sizes.
-    sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
+    # The standalone grouped RMSNorm reduces one padded [next_pow2(HC_DIM)]
+    # vector; reshape keeps the identical tree (same element
+    # order, same masked zeros), so the fused statistic is bit-exact vs the split.
+    flat = tl.reshape(out * out, [NUM_TILES_PAD * BLOCK_SIZE])
+    sum_sq = tl.sum(flat)
     rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
 
     if launch_pdl:
@@ -349,7 +362,11 @@ def hc_combine_norm(
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    shared: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """combine + grouped RMSNorm; with ``shared``/``gate`` the shared-expert gate
+    epilogue (``block_output + gate * shared``) is folded in bit-exactly."""
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
@@ -360,6 +377,9 @@ def hc_combine_norm(
     assert injection_logits.stride(1) == 1
     assert norm_weight.is_contiguous()
     assert norm_weight.numel() in (hc_dim, DIM)
+    if shared is not None:
+        assert shared.shape == block_output.shape and shared.stride(1) == 1
+        assert gate is not None and gate.shape == (N,) and gate.dtype == torch.float32
 
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
@@ -371,16 +391,20 @@ def hc_combine_norm(
         norm_weight,
         out,
         y,
+        block_output if shared is None else shared,
+        block_output if gate is None else gate,
         block_output.stride(0),
         residual.stride(0),
         injection_logits.stride(0),
         out.stride(0),
         y.stride(0),
+        0 if shared is None else shared.stride(0),
         hc_dim,
         hc_count,
         W_SHARED=norm_weight.numel() == hc_dim,
         EPS=eps,
         BLOCK_SIZE=BLOCK_SIZE,
+        GATED=shared is not None,
         launch_pdl=_pdl_supported(),
     )
     return out, y
