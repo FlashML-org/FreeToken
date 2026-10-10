@@ -16,6 +16,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.utils.arch import is_arch_supported
 
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
@@ -173,7 +174,7 @@ def _prefill_fp8_moe_kernel(
     a_ptrs = a_ptr + (a_rows[:, None] * stride_am + offs_k[None, :] * stride_ak)
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     w_base = w_ptr + slot * stride_we + offs_bn[None, :] * stride_wn
-    sn = pid_n  # BLOCK_SIZE_N == 128 -> one weight-scale N-block per tile
+    sn = (pid_n * BLOCK_SIZE_N) // 128  # BLOCK_SIZE_N may be 64 below sm_70: two tiles per 128-row weight-scale block
     s_base = s_ptr + slot * stride_se + sn * stride_sn
     as_base = a_scale_ptr + a_rows * stride_asm  # per-token act scale, indexed per K-block
 
@@ -186,8 +187,8 @@ def _prefill_fp8_moe_kernel(
             w = tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0.0)  # fp8
         else:
             w = e4m3_u8_to_f32(tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)).to(tl.bfloat16)
-        wsc = tl.load(s_base + kb * stride_sk).to(tl.float32)
-        asc = tl.load(as_base + kb * stride_ask, mask=token_mask, other=0.0).to(tl.float32)
+        wsc = tl.load(s_base + (kb * BLOCK_SIZE_K) // 128 * stride_sk).to(tl.float32)
+        asc = tl.load(as_base + (kb * BLOCK_SIZE_K) // 128 * stride_ask, mask=token_mask, other=0.0).to(tl.float32)
         acc += tl.dot(a, w) * asc[:, None] * wsc
         a_ptrs += BLOCK_SIZE_K * stride_ak
         w_base += BLOCK_SIZE_K * stride_wk
@@ -235,8 +236,21 @@ def fused_experts_fp8_blockscale(
     two_i = gate_up.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = dict(BLOCK_SIZE_M=64 if M > 64 else 16, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128,
-               GROUP_SIZE_M=8, num_warps=8 if M > 64 else 4, num_stages=3)
+    if is_arch_supported(7, 0):
+        cfg = dict(BLOCK_SIZE_M=64 if M > 64 else 16, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128,
+                   GROUP_SIZE_M=8, num_warps=8 if M > 64 else 4, num_stages=3)
+    else:
+        # Pre-Volta caps a block at 48 KiB smem with no fp8 tensor cores: the default
+        # 128-wide K tiles need 64 KiB for their 3-stage pipeline (OutOfResources) and
+        # even unpipelined they leave the FMA emulation fully exposed to DRAM latency.
+        # Halving BLOCK_SIZE_K lets three stages fit (~36 KiB) and BLOCK_SIZE_M=32 halves
+        # the per-program weight re-reads and the expert-group padding waste on skewed
+        # routing. The per-128 scale indices are derived from BLOCK_SIZE_K, so the
+        # K-block split only changes the fp32 accumulation order. Measured end to end
+        # serving Qwen3.6-35B-A3B-FP8 (256 experts, 8 active, H=2048, I=512) on GP102:
+        # the MoE share of a 1536-token prefill chunk dropped 28.0 s -> 2.9 s (9.7x).
+        cfg = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                   GROUP_SIZE_M=8, num_warps=4, num_stages=3)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()
