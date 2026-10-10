@@ -5,6 +5,7 @@ import errno
 import gc
 import math
 import os
+import sys
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -1193,7 +1194,7 @@ def _ensure_expandable_segments() -> None:
     allocator fragments badly -- reserved memory can balloon far past the actual peak
     allocation (observed ~78GiB reserved for a <30GiB working set).
     ``expandable_segments`` lets freed regions of any size be reused, keeping
-    reserved ~= allocated, so it is applied to every run, not just offload ones.
+    reserved ~= allocated, so it is applied to every run that can use it, not just offload ones.
 
     Env vars are parsed once at import and ignored if set afterwards, so we apply the
     setting via the runtime API instead. Must run before the first CUDA allocation (the
@@ -1202,8 +1203,12 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
+    # torch compiles expandable segments only off Windows (c10/cuda/CMakeLists.txt); there the request is ignored with a warning
+    if sys.platform == "win32":
+        return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        # torch 2.11 deprecates torch.cuda.memory._set_allocator_settings, a wrapper of this binding
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
