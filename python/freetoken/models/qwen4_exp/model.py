@@ -171,6 +171,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             from freetoken.utils import download_hf_weight
 
             from .ple_disk import DiskRowTable, resolve_row_source
+            from .weight import ple_table_is_packed
+
+            if ple_table_is_packed(engine_config.model_path):
+                raise NotImplementedError("NVFP4 PLE rows are only served by the pinned backend")
 
             folder = download_hf_weight(engine_config.model_path)
             # one WAIT node per captured graph: the flag protocol supports a single consume
@@ -202,11 +206,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
+        packed = table.bank.tensor.dtype is torch.uint8
+        uva = PinnedUVATable(
+            table.bank.tensor,
+            float(table.weight_scale),
+            scales=table.scale_bank.tensor if packed else None,
+        )
         for ple in ple_layers:
-            ple.ple_embedding.attach_table(
-                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
-            )
-        return table.bank.nbytes
+            ple.ple_embedding.attach_table(uva)
+        return table.bank.nbytes + (table.scale_bank.nbytes if table.scale_bank is not None else 0)
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
