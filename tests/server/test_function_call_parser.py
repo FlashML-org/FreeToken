@@ -556,6 +556,176 @@ def test_minimax_m2_literal_invoke_closer_is_preserved_in_parameter():
 
 
 # --------------------------------------------------------------------------- #
+# DR-01: literal closers inside a string value must survive chunk boundaries
+# --------------------------------------------------------------------------- #
+_DR01_OPENER = "<tool_call>"
+_DR01_INVOKE_CLOSE = "</function>"
+_DR01_OUTER_CLOSE = "</tool_call>"
+_DR01_PARAM_CLOSE = "</parameter>"
+_DR01_CLOSER = _DR01_INVOKE_CLOSE + _DR01_OUTER_CLOSE
+_DR01_PREFIX = _DR01_OPENER + "<function=echo><parameter=text>"
+_DR01_SUFFIX = _DR01_PARAM_CLOSE + _DR01_INVOKE_CLOSE + _DR01_OUTER_CLOSE
+
+
+def _dr01_echo_tools():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "echo",
+            "parameters": {"properties": {"text": {"type": "string"}}},
+        },
+    }]
+
+
+def _dr01_wire(tail_len):
+    return _DR01_PREFIX + _DR01_CLOSER + "a" * tail_len + _DR01_SUFFIX
+
+
+def _dr01_stream(parser, chunks):
+    fragments, normal = [], []
+    for chunk in chunks:
+        text, emitted = parser.parse_stream_chunk(chunk)
+        normal.append(text)
+        fragments.extend(call.parameters for call in emitted if call.name is None)
+    return "".join(fragments), "".join(normal)
+
+
+@pytest.mark.parametrize("parser_name", ["mimo_v2", "qwen3_coder"])
+def test_dr01_literal_closer_pair_inside_value_survives_chunking(parser_name):
+    # Chunk 3 buffers >128 chars after a literal closer pair with no parameter
+    # closer yet: the value must keep the pair, never close at it.
+    chunks = [_DR01_PREFIX, _DR01_CLOSER, "a" * 129, _DR01_SUFFIX]
+    parser = FunctionCallParser(_dr01_echo_tools(), parser_name)
+    args, normal = _dr01_stream(parser, chunks)
+    assert json.loads(args) == {"text": _DR01_CLOSER + "a" * 129}
+    assert normal == ""  # value bytes must not leak out as ordinary content
+    assert parser.finish_stream() == ""
+
+
+@pytest.mark.parametrize("parser_name", ["mimo_v2", "qwen3_coder"])
+def test_dr01_literal_closer_chunked_matches_whole_input(parser_name):
+    wire = _dr01_wire(129)
+    tools = _dr01_echo_tools()
+    whole_args, _ = _dr01_stream(FunctionCallParser(tools, parser_name), [wire])
+    chunked_args, _ = _dr01_stream(
+        FunctionCallParser(tools, parser_name),
+        [wire[i : i + 40] for i in range(0, len(wire), 40)],
+    )
+    assert json.loads(chunked_args) == json.loads(whole_args)
+    if parser_name == "mimo_v2":  # its one-shot IS a whole-input streaming replay
+        one_shot = FunctionCallParser(tools, parser_name).parse_non_stream(wire)
+        assert json.loads(one_shot.calls[0].parameters) == json.loads(chunked_args)
+
+
+@pytest.mark.parametrize("tail_len", [127, 128, 129, 200])
+def test_dr01_literal_closer_value_survives_tail_lengths(tail_len):
+    chunks = [_DR01_PREFIX, _DR01_CLOSER, "a" * tail_len, _DR01_SUFFIX]
+    args, _ = _dr01_stream(FunctionCallParser(_dr01_echo_tools(), "mimo_v2"), chunks)
+    assert json.loads(args) == {"text": _DR01_CLOSER + "a" * tail_len}
+
+
+def _dr01_marker_cuts(tail_len):
+    """Mid-marker split points: the literal invoke/outer closers in the value,
+    then the real parameter closer, final invoke closer, final outer closer."""
+    prefix_end = len(_DR01_PREFIX)
+    invoke_len = len(_DR01_INVOKE_CLOSE)
+    outer_len = len(_DR01_OUTER_CLOSE)
+    param_len = len(_DR01_PARAM_CLOSE)
+    pair_end = prefix_end + len(_DR01_CLOSER)
+    pc_start = pair_end + tail_len
+    pc_end = pc_start + param_len
+    ic_end = pc_end + invoke_len
+    return {
+        "literal-invoke-closer": prefix_end + invoke_len // 2,
+        "literal-outer-closer": pair_end - outer_len // 2,
+        "parameter-closer": pc_start + param_len // 2,
+        "final-invoke-closer": pc_end + invoke_len // 2,
+        "final-outer-closer": ic_end + outer_len // 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "literal-invoke-closer",
+        "literal-outer-closer",
+        "parameter-closer",
+        "final-invoke-closer",
+        "final-outer-closer",
+    ],
+)
+def test_dr01_cut_inside_markers_preserves_value(label):
+    tail = 129
+    wire = _dr01_wire(tail)
+    cut = _dr01_marker_cuts(tail)[label]
+    # A later chunk must leave the buffer holding the complete literal pair
+    # plus >128 tail chars before the parameter closer completes: the trigger.
+    pair_tail_end = len(_DR01_PREFIX) + len(_DR01_CLOSER) + tail
+    pc_end = pair_tail_end + len(_DR01_PARAM_CLOSE)
+    ic_end = pc_end + len(_DR01_INVOKE_CLOSE)
+    chunks = [wire[:cut]] + [
+        piece
+        for piece in (
+            wire[cut:pair_tail_end],
+            wire[max(cut, pair_tail_end):pc_end],
+            wire[max(cut, pc_end):ic_end],
+            wire[max(cut, ic_end):],
+        )
+        if piece
+    ]
+    args, _ = _dr01_stream(FunctionCallParser(_dr01_echo_tools(), "mimo_v2"), chunks)
+    assert json.loads(args) == {"text": _DR01_CLOSER + "a" * tail}
+
+
+def test_dr01_literal_closer_in_value_then_real_second_call():
+    second = (
+        _DR01_OPENER + "<function=echo><parameter=text>second</parameter>"
+        + _DR01_INVOKE_CLOSE + _DR01_OUTER_CLOSE
+    )
+    parser = FunctionCallParser(_dr01_echo_tools(), "mimo_v2")
+    calls, args_by_tool = [], {}
+    for chunk in [_DR01_PREFIX, _DR01_CLOSER, "a" * 129, _DR01_SUFFIX, second]:
+        _, emitted = parser.parse_stream_chunk(chunk)
+        calls.extend(emitted)
+        for call in emitted:
+            if call.name is None:
+                args_by_tool[call.tool_index] = args_by_tool.get(call.tool_index, "") + call.parameters
+    named = [call for call in calls if call.name is not None]
+    assert [call.name for call in named] == ["echo", "echo"]
+    assert [call.tool_index for call in named] == [0, 1]
+    assert json.loads(args_by_tool[0]) == {"text": _DR01_CLOSER + "a" * 129}
+    assert json.loads(args_by_tool[1]) == {"text": "second"}
+
+
+def test_dr01_unterminated_value_end_of_stream_recovery_unchanged():
+    # Pins current EOS policy: finalize_stream closes an unterminated string
+    # value so the client's concatenated fragments stay valid JSON.
+    parser = FunctionCallParser(_dr01_echo_tools(), "mimo_v2")
+    wire = _DR01_PREFIX + "partial value"
+    fragments = []
+    for i in range(0, len(wire), 3):
+        _, emitted = parser.parse_stream_chunk(wire[i : i + 3])
+        fragments.extend(call.parameters for call in emitted if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"text": "partial value"}
+    assert parser.finish_stream() == ""
+
+
+def test_dr01_real_closer_pair_without_parameter_close_eos_recovery_unchanged():
+    # Pins current EOS policy: a missing parameter closer (malformed output)
+    # still ends the value at the real invoke closer at end of stream.
+    parser = FunctionCallParser(_dr01_echo_tools(), "mimo_v2")
+    wire = _DR01_PREFIX + "value" + _DR01_CLOSER
+    fragments = []
+    for i in range(0, len(wire), 3):
+        _, emitted = parser.parse_stream_chunk(wire[i : i + 3])
+        fragments.extend(call.parameters for call in emitted if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"text": "value"}
+    assert parser.finish_stream() == ""
+
+
+# --------------------------------------------------------------------------- #
 # Streaming incremental parsing (parse_stream_chunk)
 # --------------------------------------------------------------------------- #
 def _feed(parser, chunks):

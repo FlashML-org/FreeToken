@@ -714,7 +714,6 @@ class InvokeParamStreamMixin:
     _ps_trim: str = "\n"
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
-    _ps_boundary_lookahead: int = 128
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
@@ -789,16 +788,6 @@ class InvokeParamStreamMixin:
         match = self._ps_invoke_open_re.search(text, invoke_pos)
         return open_pos if match is not None else -1
 
-    def _ps_closer_pair_end(self, text: str, pos: int, boundary: str) -> int:
-        if boundary == self._ps_outer_close:
-            return pos + len(boundary)
-        if boundary != self._ps_invoke_close:
-            return -1
-        outer_pos = text.find(self._ps_outer_close, pos + len(boundary))
-        if outer_pos == -1 or text[pos + len(boundary):outer_pos].strip():
-            return -1
-        return outer_pos + len(self._ps_outer_close)
-
     def _ps_boundary_resolution(
         self, text: str, *, end_of_stream: bool = False
     ) -> tuple[int, str | None, str | None]:
@@ -815,11 +804,9 @@ class InvokeParamStreamMixin:
             return pos, boundary, "structural"
         if parameter_close != -1:
             return parameter_close, self._ps_param_close, "parameter"
-        closer_pair_end = self._ps_closer_pair_end(text, pos, boundary)
-        if end_of_stream or (
-            closer_pair_end != -1
-            and len(text) - closer_pair_end > self._ps_boundary_lookahead
-        ):
+        # Buffered volume after a closer pair proves nothing across chunk
+        # boundaries; only end of stream may promote it to structural.
+        if end_of_stream:
             return pos, boundary, "structural"
         return pos, boundary, "pending"
 
@@ -1007,11 +994,9 @@ class InvokeParamStreamMixin:
                     self._ps_mode = "block"
                     continue
                 if resolution == "pending":
-                    if len(buf) - end > self._ps_boundary_lookahead:
-                        hold = self._ps_partial_boundary_len(buf)
-                        safe = buf[: len(buf) - hold] if hold else buf
-                    else:
-                        safe = buf[:end]
+                    # Hold from the unconfirmed boundary (as pbuf does): buffered
+                    # volume cannot decide literal-vs-structural mid-stream.
+                    safe = buf[:end]
                     keep = len(safe) - len(safe.rstrip(self._ps_trim))
                     emit_now = safe[: len(safe) - keep]
                     if emit_now:
