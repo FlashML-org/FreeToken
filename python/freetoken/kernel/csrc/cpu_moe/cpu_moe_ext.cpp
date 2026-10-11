@@ -316,6 +316,7 @@ float dot_fp8_block_scalar(const uint8_t* w, const bf16_t* x, const bf16_t* s, i
 }
 
 #if CPU_MOE_X86
+#ifdef CPU_MOE_HAS_AVX512BF16
 __attribute__((target("avx512f,avx512bw")))
 static inline __m512i e4m3_to_bf16_x32(__m256i raw, __m512i subtab) {
   const __m512i b = _mm512_cvtepu8_epi16(raw);
@@ -362,6 +363,7 @@ float dot_fp8_block_avx512bf16(const uint8_t* w, const bf16_t* x, const bf16_t* 
   }
   return acc;
 }
+#endif  // CPU_MOE_HAS_AVX512BF16
 
 // AVX-512F fallback for CPUs without AVX-512-BF16. Decode directly to fp32 and widen
 // bf16 activations with a zero-extend + shift; the normal e4m3 range includes 0x7f/0xff
@@ -1210,7 +1212,9 @@ fp8dot_fn select_fp8dot() {
 #if CPU_MOE_X86
   // The bf16 tier is the one that matters here: e4m3 widens to bf16 exactly, so
   // dpbf16_ps does the whole dot with no fp32 materialization of the weights.
+#ifdef CPU_MOE_HAS_AVX512BF16
   if (t >= ISA_AVX512BF16) return dot_fp8_block_avx512bf16;
+#endif
   if (t >= ISA_AVX512) return dot_fp8_block_avx512f;
   if (t >= ISA_AVX2) return dot_fp8_block_avx2;
 #endif
