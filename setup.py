@@ -119,16 +119,16 @@ setup(
             extra_compile_args=extra_compile + ["-pthread"],
             extra_link_args=runtime_link_args,
         ),
-        # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        # disk-backed row store (PLE / Engram tables)
         *([
             CppExtension(
                 name="freetoken.kernel._row_store",
                 sources=[
                     "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
                 ],
-                extra_compile_args=["-O3", "-std=c++20"],
+                extra_compile_args=["/O2", "/std:c++20"] if sys.platform == "win32" else ["-O3", "-std=c++20"],
             )
-        ] if sys.platform == "linux" else []),
+        ] if sys.platform in ("linux", "win32") else []),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
