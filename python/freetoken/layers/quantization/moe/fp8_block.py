@@ -19,9 +19,10 @@ def _pad_scale(rows: int, cols: int) -> int:
 
 class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
+    cpu_format = "fp8_block"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
