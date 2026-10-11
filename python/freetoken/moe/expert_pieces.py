@@ -48,6 +48,10 @@ def iter_expert_pieces(
     ``nvfp4_expert_spec``. The reader is resolved here, before any bank is allocated, so a
     missing parallel reader raises ``NotImplementedError`` while a serial fallback is still cheap.
     """
+    if kind is QuantKind.Q2_0:
+        from freetoken.models.qwen4_exp.q2_source import iter_q2_expert_pieces
+
+        return iter_q2_expert_pieces(model_path, config, chunk=chunk)
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:

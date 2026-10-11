@@ -1,5 +1,5 @@
 from .base import BankSpec, ExpertView, MoEConfig, MoEKernel, MoEMethod
-from . import fp8_block, mxfp4, mxfp8, nvfp4, unquantized
+from . import fp8_block, mxfp4, mxfp8, nvfp4, unquantized, q2_0
 from .fp8_block import Fp8BlockMoEMethod
 from .mxfp4 import Mxfp4MoEMethod
 from .mxfp8 import Mxfp8MoEMethod

@@ -256,6 +256,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
+        expert_source=getattr(hf_config, "freetoken_expert_source", None),
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )

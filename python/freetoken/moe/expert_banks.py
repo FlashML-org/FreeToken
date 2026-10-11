@@ -108,7 +108,13 @@ def build_expert_banks(
     if dummy:
         for role, per_layer in banks.items():
             for tensor in per_layer:
-                _dummy_fill(role, tensor)
+                if method.kind is QuantKind.Q2_0:
+                    tensor.fill_(0x55)
+                    blocks = tensor.reshape(-1, 18)
+                    blocks[:, 0] = 0
+                    blocks[:, 1] = 0x3c  # FP16 scale=1, every code=1 -> exact finite zero
+                else:
+                    _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
         if hb is not None and torch.cuda.is_available():

@@ -120,3 +120,5 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+  [GSQ Q2_0 routed experts](gsq-q2-experts.md) can use a separate verified expert
+  source with an HF trunk; this does not enable full GSQ GGUF model loading.

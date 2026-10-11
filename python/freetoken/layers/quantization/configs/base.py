@@ -108,10 +108,10 @@ class QuantConfig(ABC):
         ``hf_config`` comes from ``cached_load_hf_config``, which folds an old ModelOpt ``hf_quant_config.json`` into ``quantization_config``."""
         q = quantization_config_of(hf_config)
         if q is None:
-            return NoQuantConfig(name_map, unquantized)
+            return _expert_override(hf_config, NoQuantConfig(name_map, unquantized))
         for cls in dialects():
             if cls.claims(q):
-                return cls(q, hf_config, name_map=name_map, unquantized=unquantized)
+                return _expert_override(hf_config, cls(q, hf_config, name_map=name_map, unquantized=unquantized))
         raise NotImplementedError(f"quantization method {q.get('quant_method')!r} is not supported")
 
 
@@ -128,3 +128,53 @@ class NoQuantConfig(QuantConfig):
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         return None
+
+
+class ExpertSourceConfig(QuantConfig):
+    """Independent routed-expert storage; all other schemes come from the HF dialect."""
+
+    dialect = "expert_source"
+    STORAGE = {}
+
+    def __init__(self, base: QuantConfig):
+        super().__init__(base.name_map)
+        self.base = base
+
+    def scheme_for_name(self, name: str) -> QuantScheme | None:
+        from ..names import is_routed_expert
+        from ..scheme import WeightDesc
+
+        # Override routed experts only; preserve the HF trunk and shared-expert schemes.
+        if is_routed_expert(name):
+            return QuantScheme(QuantKind.Q2_0, WeightDesc("q2_0", (1, 64), "f16"), {"weight"})
+        return self.base.scheme_for_name(name)
+
+    def scheme_for(self, prefix: str) -> QuantScheme | None:
+        from ..names import is_routed_expert
+
+        if is_routed_expert(prefix):
+            return self.scheme_for_name(prefix)
+        return self.base.scheme_for(prefix)
+
+    def stored_tensors(self, kind: QuantKind) -> dict[str, Stored]:
+        if kind is QuantKind.Q2_0:
+            raise ValueError("Q2_0 experts are read from the explicit GGUF expert source")
+        return self.base.stored_tensors(kind)
+
+    def layer_config(self, layer, layer_kind, scheme):
+        if scheme is not None and scheme.kind is QuantKind.Q2_0:
+            if layer_kind is not LayerKind.MOE:
+                raise ValueError("Q2_0 expert override may only bind a routed MoE layer")
+            return super().layer_config(layer, layer_kind, scheme)
+        return self.base.layer_config(layer, layer_kind, scheme)
+
+
+def _expert_override(hf_config, base: QuantConfig) -> QuantConfig:
+    source = cfg_get(hf_config, "freetoken_expert_source")
+    if source is None:
+        return base
+    if not isinstance(source, dict) or source.get("format") != "q2_0":
+        raise ValueError("unsupported freetoken_expert_source contract")
+    if cfg_get(hf_config, "model_type") != "qwen4_exp":
+        raise ValueError("Q2_0 external experts currently require qwen4_exp")
+    return ExpertSourceConfig(base)
