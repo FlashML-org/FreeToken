@@ -369,38 +369,17 @@ class CpuMoeExecutor:
         return table
 
     def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """DeepSeek-V3-style block-fp8: fp8-e4m3 rows + one bf16 scale per 128x128 block.
-
-        ``gate_up`` [E, 2I, H] / ``down`` [E, H, I] are row-major with K contiguous, and
-        ``*_scale`` is [E, ceil(rows/128), padded(ceil(K/128))] -- so output row ``r``
-        reads the scale row ``r // 128`` with the tensor's actual trailing stride. The
-        scale tensor is named ``weight_scale_inv`` upstream but multiplies, matching the
-        Triton reference.
-        """
+        """Block-FP8 schema: row-major e4m3 + one bf16 scale per 128x128 block; the scale banks pad their last dim, so C++ gets the real row stride."""
         gu, gus = banks["gate_up"], banks["gate_up_scale"]
         dn, dns = banks["down"], banks["down_scale"]
-        # torch exposes fp8 as float8_e4m3fn; the kernel reads raw bytes either way.
-        for t in (gu[0], dn[0]):
-            if t.element_size() != 1:
-                raise NotImplementedError(
-                    f"block-fp8 CPU MoE expects 1-byte e4m3 weights, got {t.dtype}"
-                )
-        if gus[0].dtype != torch.bfloat16 or dns[0].dtype != torch.bfloat16:
-            raise NotImplementedError(
-                f"block-fp8 CPU MoE expects bf16 block scales, got "
-                f"{gus[0].dtype}/{dns[0].dtype}"
-            )
+        assert gu[0].element_size() == 1 and dn[0].element_size() == 1, (gu[0].dtype, dn[0].dtype)
+        assert gus[0].dtype == torch.bfloat16 and dns[0].dtype == torch.bfloat16, (gus[0].dtype, dns[0].dtype)
         I = int(gu[0].shape[1] // 2)
         H = int(gu[0].shape[2])
         assert gu[0].shape[1] == 2 * I
         assert tuple(dn[0].shape[1:]) == (H, I), (dn[0].shape, H, I)
-        def nb(n):  # block count along one axis
-            return (n + 127) // 128
-
-        gu_rows, gu_cols = nb(2 * I), nb(H)
-        dn_rows, dn_cols = nb(H), nb(I)
-        assert gus[0].shape[1] == gu_rows and gus[0].shape[2] >= gu_cols
-        assert dns[0].shape[1] == dn_rows and dns[0].shape[2] >= dn_cols
+        assert gus[0].shape[1] == (2 * I + 127) // 128 and gus[0].shape[2] >= (H + 127) // 128, (gus[0].shape, H, I)
+        assert dns[0].shape[1] == (H + 127) // 128 and dns[0].shape[2] >= (I + 127) // 128, (dns[0].shape, H, I)
         ptrs = dict(
             gate_up_ptr=self._make_table(gu).data_ptr(),
             down_ptr=self._make_table(dn).data_ptr(),
