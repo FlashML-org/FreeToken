@@ -11,7 +11,7 @@ import os
 import pytest
 import torch
 
-from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
+from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
@@ -42,6 +42,7 @@ def test_balanced_fetch_tracks_fraction():
 
 def test_load_hybrid_fetch_fraction(tmp_path):
     prof = {
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtype_kernels": {
             "bf16": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
@@ -64,6 +65,9 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) is None
     # a profile from different hardware is ignored
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
+    # so is one written before the current set of CPU formats
+    path.write_text(json.dumps({**prof, "version": PROFILE_VERSION - 1}))
+    assert load_hybrid_fetch_fraction("bf16", path=str(path)) is None
 
 
 def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
@@ -74,7 +78,7 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
     def write(path, name, verdict):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump({"gpu": {"name": name}, "dtypes": {"bf16": verdict}}, f)
+            json.dump({"version": PROFILE_VERSION, "gpu": {"name": name}, "dtypes": {"bf16": verdict}}, f)
 
     # legacy single file only: used when the name matches, ignored otherwise
     write(default_profile_path(), "FAKE GPU", "hybrid")

@@ -56,6 +56,7 @@ from freetoken.gpu_select import (
     single_gpu_arg,
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.moe.bench_profile import PROFILE_VERSION
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
 from freetoken.utils import init_logger
 
@@ -797,7 +798,7 @@ def run_benchbw(
     _prog("done")
 
     result = {
-        "version": 4,
+        "version": PROFILE_VERSION,
         "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
         "host": socket.gethostname(),

@@ -18,6 +18,9 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+# Bump when a format gains or loses a CPU MoE path: verdicts and fetch fractions from an older profile are stale.
+PROFILE_VERSION = 5
+
 # Engine ``expert_quant`` (models/config.py) -> benchbw format key (offload_cache._BANK_SCHEMAS
 # / benchbw._offload_bank_specs). Only the offload-family formats with a CPU MoE weight path can
 # ever resolve to hybrid; anything not listed falls through unmapped and finds no profile entry
@@ -100,6 +103,12 @@ def _usable_profile(
             # unreadable profile for this card: stay on the safe default, do not borrow the legacy file
             return None
     if not isinstance(prof, dict):
+        return None
+    if not isinstance(prof.get("version"), int) or prof["version"] < PROFILE_VERSION:
+        logger.warning(
+            f"benchbw profile {src} predates this engine (version {prof.get('version')}, "
+            f"need {PROFILE_VERSION}); ignoring it, rerun `ft bench bw`"
+        )
         return None
     prof_gpu = (prof.get("gpu") or {}).get("name")
     if gpu_name and prof_gpu and prof_gpu != gpu_name:
