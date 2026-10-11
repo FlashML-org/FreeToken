@@ -30,6 +30,8 @@ def shard_tensor(
     world_size: int,
     num_kv_heads: int,
 ) -> torch.Tensor:
+    if value.dim() == 0:
+        return value  # per-tensor scalar (e.g. nvfp4 global weight_scale_2) -> replicated across ranks
     if any(key.count(sub) for sub in SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < world_size:
@@ -38,6 +40,10 @@ def shard_tensor(
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
         return value.chunk(world_size, dim=0)[rank].clone()
     if any(key.count(sub) for sub in SPLIT_DIM_1):
+        # row-parallel: a 1-d per-output-row companion (e.g. nvfp4 weight_scale_2 global) rides the
+        # UN-sharded output dim -> replicate, not col-chunk (chunk(dim=1) on <2-d would crash).
+        if value.dim() < 2:
+            return value
         return value.chunk(world_size, dim=1)[rank].clone()
     if key.count("lm_head") or key.count("embed_tokens"):
         num_embeddings = value.shape[0]
