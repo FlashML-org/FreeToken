@@ -100,6 +100,11 @@ class BaseReasoningParser:
             it is buffered until the closing marker.
         tool_start_token: Optional marker that ends reasoning without a closing
             ``think_end_token`` (the block is preserved in ``normal_text``).
+        tool_end_token: Optional closer closing a region opened by
+            ``tool_start_token``. When both are set, tool regions are opaque:
+            bytes from the opener to the closer (or end of stream) pass through
+            to ``normal_text`` verbatim and no think marker inside them is
+            recognized -- verbatim tool arguments survive think-marker quoting.
     """
 
     # Max bytes a suspected tool block is held while waiting for a possible later
@@ -114,19 +119,24 @@ class BaseReasoningParser:
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         tool_start_token: Optional[str] = None,
+        tool_end_token: Optional[str] = None,
     ) -> None:
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.tool_start_token = tool_start_token
+        self.tool_end_token = tool_end_token
         self.force_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
         self._in_reasoning = force_reasoning
         self._buffer = ""
         self._stripped_think_start = False
+        self._in_tool_region = False
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         """One-shot parse of a complete completion."""
+        if self.tool_start_token and self.tool_end_token:
+            return self._detect_and_parse_tool_opaque(text)
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning:
             return ReasoningParseResult(normal_text=text)
@@ -153,6 +163,95 @@ class BaseReasoningParser:
             reasoning_text=reasoning_text, normal_text=normal_text.strip()
         )
 
+    def _detect_and_parse_tool_opaque(self, text: str) -> ReasoningParseResult:
+        """One-shot parse with tool regions opaque to think-marker scans.
+
+        Positional scan instead of the legacy global ``replace``/``split``:
+        think openers/closers are recognized only OUTSIDE tool regions, so
+        marker bytes inside a verbatim tool argument are never rewritten and
+        the argument reaches the tool-call parser byte-identical."""
+        if not self._in_reasoning and not self._has_opener_outside_tool_regions(text):
+            return ReasoningParseResult(normal_text=text)
+        text = text.strip()
+        reasoning_parts: List[str] = []
+        normal_parts: List[str] = []
+        in_reasoning = self._in_reasoning
+        # Only the first think opener outside tool regions starts reasoning;
+        # later ones are ordinary content (streaming's _stripped_think_start rule).
+        first_opener_seen = self._in_reasoning
+        i = 0
+        while i < len(text):
+            if in_reasoning:
+                end_idx = text.find(self.think_end_token, i)
+                tool_idx = text.find(self.tool_start_token, i)
+                if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+                    reasoning_parts.append(text[i:tool_idx])
+                    i = self._consume_tool_region(text, tool_idx, normal_parts)
+                    in_reasoning = False
+                    continue
+                if end_idx != -1:
+                    reasoning_parts.append(text[i:end_idx])
+                    i = end_idx + len(self.think_end_token)
+                    in_reasoning = False
+                    continue
+                reasoning_parts.append(text[i:])
+                break
+            start_idx = (
+                -1 if first_opener_seen else text.find(self.think_start_token, i)
+            )
+            tool_idx = text.find(self.tool_start_token, i)
+            if start_idx != -1 and (tool_idx == -1 or start_idx < tool_idx):
+                normal_parts.append(text[i:start_idx])
+                i = start_idx + len(self.think_start_token)
+                in_reasoning = True
+                first_opener_seen = True
+                continue
+            if tool_idx != -1:
+                # Prose between the last marker and the opener stays content;
+                # once an envelope has been seen, later think openers are
+                # quoted data, never a new reasoning block (turn boundary).
+                normal_parts.append(text[i:tool_idx])
+                i = self._consume_tool_region(text, tool_idx, normal_parts)
+                first_opener_seen = True
+                continue
+            normal_parts.append(text[i:])
+            break
+        return ReasoningParseResult(
+            "".join(reasoning_parts), "".join(normal_parts)
+        )
+
+    def _has_opener_outside_tool_regions(self, text: str) -> bool:
+        """True when a think opener occurs outside any tool region."""
+        pos = 0
+        while True:
+            start_idx = text.find(self.think_start_token, pos)
+            if start_idx == -1:
+                return False
+            tool_idx = text.find(self.tool_start_token, pos)
+            if tool_idx == -1 or start_idx < tool_idx:
+                return True
+            close_idx = text.find(
+                self.tool_end_token, tool_idx + len(self.tool_start_token)
+            )
+            if close_idx == -1:
+                return False  # region runs to end of text: later openers are inside
+            pos = close_idx + len(self.tool_end_token)
+
+    def _consume_tool_region(
+        self, text: str, open_idx: int, normal_parts: List[str]
+    ) -> int:
+        """Move the verbatim tool region starting at ``open_idx`` into
+        ``normal_parts``; return the index just past it (end of text when the
+        closer never arrives -- the truncated-envelope fallback)."""
+        close_idx = text.find(
+            self.tool_end_token, open_idx + len(self.tool_start_token)
+        )
+        if close_idx == -1:
+            normal_parts.append(text[open_idx:])
+            return len(text)
+        normal_parts.append(text[open_idx : close_idx + len(self.tool_end_token)])
+        return close_idx + len(self.tool_end_token)
+
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         """Incremental parse.
 
@@ -162,6 +261,8 @@ class BaseReasoningParser:
         tracked token (see ``_split_trailing_partial``) and reassemble it on the
         next chunk rather than streaming it out and losing the marker boundary.
         """
+        if self.tool_start_token and self.tool_end_token:
+            return self._tool_opaque_stream_increment(new_text)
         self._buffer += new_text
         current_text = self._buffer
 
@@ -214,16 +315,95 @@ class BaseReasoningParser:
             return ReasoningParseResult(reasoning_text=safe)
         return ReasoningParseResult(normal_text=safe)
 
-    def _split_trailing_partial(self, text: str) -> tuple[str, str]:
+    def _tool_opaque_stream_increment(self, new_text: str) -> ReasoningParseResult:
+        """Streaming with tool regions opaque to think-marker scans: from a
+        complete tool opener to its closer (or end of stream) every byte passes
+        through verbatim as content for the tool-call parser, and no think
+        opener/closer inside the region is recognized (DR-02: argument bytes
+        survive think-marker quoting in every chunk split)."""
+        self._buffer += new_text
+        reasoning_parts: List[str] = []
+        normal_parts: List[str] = []
+        while True:
+            buf = self._buffer
+            if self._in_tool_region:
+                close_idx = buf.find(self.tool_end_token)
+                if close_idx == -1:
+                    # Hold back a partial tool closer so a region-closer split
+                    # across chunks reassembles; everything else streams live.
+                    safe, held = self._split_trailing_partial(
+                        buf, tokens=[self.tool_end_token]
+                    )
+                    normal_parts.append(safe)
+                    self._buffer = held
+                    break
+                normal_parts.append(buf[: close_idx + len(self.tool_end_token)])
+                self._buffer = buf[close_idx + len(self.tool_end_token) :]
+                self._in_tool_region = False
+                # Turn boundary: think openers after a tool envelope are
+                # quoted data, never a new reasoning block.
+                self._stripped_think_start = True
+                continue
+            if self._in_reasoning:
+                end_idx = buf.find(self.think_end_token)
+                tool_idx = buf.find(self.tool_start_token)
+                if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+                    # Tool envelope wins over a later closer: reasoning ends at
+                    # the opener, the region streams verbatim from here.
+                    reasoning_parts.append(buf[:tool_idx])
+                    self._buffer = buf[tool_idx:]
+                    self._in_reasoning = False
+                    self._in_tool_region = True
+                    continue
+                if end_idx != -1:
+                    reasoning_parts.append(buf[:end_idx])
+                    self._buffer = buf[end_idx + len(self.think_end_token) :]
+                    self._in_reasoning = False
+                    continue
+                if not self.stream_reasoning:
+                    break  # accumulate until the closing marker
+                safe, held = self._split_trailing_partial(buf)
+                reasoning_parts.append(safe)
+                self._buffer = held
+                break
+            start_idx = (
+                -1 if self._stripped_think_start else buf.find(self.think_start_token)
+            )
+            tool_idx = buf.find(self.tool_start_token)
+            if start_idx != -1 and (tool_idx == -1 or start_idx < tool_idx):
+                normal_parts.append(buf[:start_idx])
+                self._buffer = buf[start_idx + len(self.think_start_token) :]
+                self._stripped_think_start = True
+                self._in_reasoning = True
+                continue
+            if tool_idx != -1:
+                normal_parts.append(buf[:tool_idx])
+                self._buffer = buf[tool_idx:]
+                self._in_tool_region = True
+                continue
+            safe, held = self._split_trailing_partial(buf)
+            normal_parts.append(safe)
+            self._buffer = held
+            break
+        return ReasoningParseResult(
+            "".join(reasoning_parts), "".join(normal_parts)
+        )
+
+    def _split_trailing_partial(
+        self, text: str, tokens: Optional[List[str]] = None
+    ) -> tuple[str, str]:
         """Split off the longest suffix of ``text`` that is a *proper* prefix of a
         tracked token, returning ``(safe, held)``. Lets a marker whose leading
         characters are glued to preceding text reassemble on the next chunk
-        instead of being streamed out and breaking marker detection."""
-        tokens = [self.think_end_token]
-        if not self._stripped_think_start:
-            tokens.append(self.think_start_token)
-        if self.tool_start_token:
-            tokens.append(self.tool_start_token)
+        instead of being streamed out and breaking marker detection. ``tokens``
+        overrides the tracked set (the tool-region scanner tracks only the tool
+        closer while inside a region)."""
+        if tokens is None:
+            tokens = [self.think_end_token]
+            if not self._stripped_think_start:
+                tokens.append(self.think_start_token)
+            if self.tool_start_token:
+                tokens.append(self.tool_start_token)
         best = 0
         for tok in tokens:
             for k in range(min(len(tok) - 1, len(text)), best, -1):
@@ -405,6 +585,7 @@ class ThinkReasoningParser(BaseReasoningParser):
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         tool_start_token: Optional[str] = None,
+        tool_end_token: Optional[str] = None,
     ) -> None:
         super().__init__(
             think_start_token=THINK_START_TOKEN,
@@ -412,6 +593,7 @@ class ThinkReasoningParser(BaseReasoningParser):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token=tool_start_token,
+            tool_end_token=tool_end_token,
         )
 
 
@@ -900,6 +1082,8 @@ class ReasoningParser:
         parser_kwargs = {}
         if reasoning_parser == "mimo_v2":
             parser_kwargs["tool_start_token"] = "<tool_call>"
+            # Paired envelope close: argument bytes become opaque to think scans.
+            parser_kwargs["tool_end_token"] = "</" + "tool_call" + ">"
         self.detector = parser_class(
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,

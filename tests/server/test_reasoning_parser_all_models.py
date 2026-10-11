@@ -142,6 +142,65 @@ def test_mimo_truncated_reasoning_flushes_to_reasoning():
     )
 
 
+# --------------------------------------------- DR-02: tool args are opaque
+from freetoken.server.reasoning_parser import (  # noqa: E402
+    THINK_END_TOKEN as _T_CLOSE,
+    THINK_START_TOKEN as _T_OPEN,
+)
+
+_DR02_ARG = f"a{_T_CLOSE}b{_T_OPEN}c"
+_DR02_ENVELOPE = (
+    "<tool_call><function=echo><parameter=text>" + _DR02_ARG + "</parameter></function>ing"
+)
+
+
+def test_mimo_tool_arg_think_markers_stay_verbatim():
+    # DR-02: think markers inside a verbatim string argument are data, not
+    # protocol -- the envelope must reach the tool parser byte-identical.
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert parser.parse_non_stream(_DR02_ENVELOPE) == ("", _DR02_ENVELOPE)
+
+
+def test_mimo_tool_arg_think_markers_streaming():
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    chunks = [_DR02_ENVELOPE[i : i + 7] for i in range(0, len(_DR02_ENVELOPE), 7)]
+    assert _stream(parser, chunks) == ("", _DR02_ENVELOPE)
+
+
+def test_mimo_reasoning_then_tool_arg_think_markers():
+    text = f"{_T_OPEN}I'll echo it verbatim{_T_CLOSE}" + _DR02_ENVELOPE
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert parser.parse_non_stream(text) == ("I'll echo it verbatim", _DR02_ENVELOPE)
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    chunks = [text[i : i + 9] for i in range(0, len(text), 9)]
+    assert _stream(parser, chunks) == ("I'll echo it verbatim", _DR02_ENVELOPE)
+
+
+def test_mimo_unclosed_reasoning_arg_closer_does_not_reclaim():
+    # Malformed turn: reasoning never closes before the tool call, and the
+    # argument itself carries a closer -- the held block must not be split at it.
+    text = f"{_T_OPEN}the tag " + _DR02_ENVELOPE
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert parser.parse_non_stream(text) == ("the tag ", _DR02_ENVELOPE)
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    chunks = [text[i : i + 9] for i in range(0, len(text), 9)]
+    assert _stream(parser, chunks) == ("the tag ", _DR02_ENVELOPE)
+
+
+def test_mimo_tool_arg_chunk_cuts_inside_think_markers():
+    # Chunk cuts land before/inside the think markers INSIDE the argument value.
+    cuts = sorted(
+        [
+            _DR02_ENVELOPE.index(_T_OPEN) + 3,  # inside the opener
+            _DR02_ENVELOPE.index(_T_CLOSE) + len(_T_CLOSE) // 2,  # inside closer
+        ]
+    )
+    bounds = [0] + cuts + [len(_DR02_ENVELOPE)]
+    chunks = [_DR02_ENVELOPE[a:b] for a, b in zip(bounds, bounds[1:])]
+    parser = ReasoningParser("mimo_v2", force_reasoning=False)
+    assert _stream(parser, chunks) == ("", _DR02_ENVELOPE)
+
+
 # ----------------------------------------------------------------------- gemma
 def test_gemma_thought_split():
     parser = ReasoningParser("gemma4", force_reasoning=True)

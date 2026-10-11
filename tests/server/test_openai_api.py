@@ -708,6 +708,94 @@ def test_mimo_history_renders_verbatim_arguments_in_reference_template():
     assert expected_envelope in rendered
 
 
+# --------------------------------------------------------------------------- #
+# DR-02: think markers inside verbatim tool arguments (MiMo)                   #
+# --------------------------------------------------------------------------- #
+from freetoken.server.reasoning_parser import (  # noqa: E402
+    THINK_END_TOKEN as _DR02_CLOSE,
+    THINK_START_TOKEN as _DR02_OPEN,
+)
+
+_DR02_ARG = f"a{_DR02_CLOSE}b{_DR02_OPEN}c"
+_DR02_BLOCK = (
+    "<tool_call><function=get_weather><parameter=city>" + _DR02_ARG + "</parameter></function>ing"
+)
+
+
+def test_mimo_dr02_tool_arg_markers_non_stream_reasoning_channel_clean():
+    output = f"{_DR02_OPEN}Checking the weather{_DR02_CLOSE}" + _DR02_BLOCK
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+
+    choice = response["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["reasoning_content"] == "Checking the weather"
+    assert choice["message"]["content"] == ""
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": _DR02_ARG}
+
+
+def test_mimo_dr02_zero_reasoning_tool_arg_markers_non_stream():
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=_DR02_BLOCK, finished=True)],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+
+    choice = response["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"].get("reasoning_content") is None
+    assert choice["message"]["content"] == ""
+    tool_call = choice["message"]["tool_calls"][0]
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": _DR02_ARG}
+
+
+def test_mimo_dr02_zero_reasoning_tool_arg_markers_stream():
+    pieces = [_DR02_BLOCK[i : i + 5] for i in range(0, len(_DR02_BLOCK), 5)]
+    state = FakeState(
+        [
+            UserReply(uid=42, incremental_output=piece, finished=(i == len(pieces) - 1))
+            for i, piece in enumerate(pieces)
+        ],
+        tool_call_parser="mimo_v2",
+        reasoning_parser="mimo_v2",
+    )
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+
+    reasoning = "".join(
+        choice["delta"]["reasoning_content"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if "reasoning_content" in choice.get("delta", {})
+    )
+    assert reasoning == ""
+    content = "".join(
+        choice["delta"]["content"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if choice["delta"].get("content")
+    )
+    assert content == ""
+    args = "".join(
+        tc["function"].get("arguments", "")
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        for tc in choice.get("delta", {}).get("tool_calls", [])
+    )
+    assert json.loads(args) == {"city": _DR02_ARG}
+
+
 def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState(

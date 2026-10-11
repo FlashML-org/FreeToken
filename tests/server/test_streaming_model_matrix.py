@@ -594,6 +594,111 @@ def test_mimo_missing_think_closer_preserves_truncated_tool_call():
     assert events[-1].finish_reason == "length"
 
 
+# ---------------------------------------------------------------------------- #
+# DR-02: think markers inside verbatim tool arguments (MiMo reasoning+tools)   #
+# ---------------------------------------------------------------------------- #
+from freetoken.server.reasoning_parser import (  # noqa: E402
+    THINK_END_TOKEN as _DR02_CLOSE,
+    THINK_START_TOKEN as _DR02_OPEN,
+)
+
+_DR02_ARG = f"a{_DR02_CLOSE}b{_DR02_OPEN}c"
+_DR02_BLOCK = (
+    "<tool_call><function=read><parameter=filePath>" + _DR02_ARG + "</parameter></function>ing"
+)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_mimo_dr02_tool_arg_markers_stream_verbatim(seed):
+    # Zero-real-reasoning turn: the whole output is the tool envelope and the
+    # argument quotes both think markers. Reasoning stays empty, no marker
+    # leaks into content, and the call carries the argument verbatim.
+    events = _stream_events(_random_chunks(_DR02_BLOCK, seed), "mimo_v2", "mimo_v2")
+    _assert_stream_invariants(events, "mimo_v2")
+    assert _reasoning(events) == ""
+    assert _content(events) == ""
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == {"filePath": _DR02_ARG}
+    assert events[-1].finish_reason == "tool_calls"
+
+
+def test_mimo_dr02_tool_arg_markers_non_stream():
+    full = _full_result(_DR02_BLOCK, "mimo_v2", "mimo_v2")
+    assert full.reasoning == ""
+    assert full.content == ""
+    assert [c.name for c in full.tool_calls] == ["read"]
+    assert json.loads(full.tool_calls[0].parameters) == {"filePath": _DR02_ARG}
+
+
+def test_mimo_dr02_arg_chunk_cuts_inside_think_markers():
+    # Cuts land before/inside the think markers INSIDE the argument value.
+    cuts = sorted(
+        [
+            _DR02_BLOCK.index(_DR02_OPEN) + 3,  # inside the opener
+            _DR02_BLOCK.index(_DR02_CLOSE) + len(_DR02_CLOSE) // 2,  # inside closer
+        ]
+    )
+    bounds = [0] + cuts + [len(_DR02_BLOCK)]
+    chunks = [_DR02_BLOCK[a:b] for a, b in zip(bounds, bounds[1:])]
+    events = _stream_events(chunks, "mimo_v2", "mimo_v2")
+    _assert_stream_invariants(events, "mimo_v2")
+    assert _reasoning(events) == ""
+    assert _content(events) == ""
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == {"filePath": _DR02_ARG}
+
+
+def test_mimo_dr02_reasoning_then_tool_arg_markers():
+    # Real reasoning ends before the tool call; the argument keeps its markers
+    # in both delivery modes.
+    text = f"{_DR02_OPEN}I need to echo it verbatim{_DR02_CLOSE}" + _DR02_BLOCK
+    events = _stream_events(_random_chunks(text, 5), "mimo_v2", "mimo_v2")
+    assert _reasoning(events).strip() == "I need to echo it verbatim"
+    assert _content(events).strip() == ""
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == {"filePath": _DR02_ARG}
+    full = _full_result(text, "mimo_v2", "mimo_v2")
+    assert full.reasoning.strip() == "I need to echo it verbatim"
+    assert json.loads(full.tool_calls[0].parameters) == {"filePath": _DR02_ARG}
+
+
+def test_mimo_dr02_think_markers_in_prose_and_tool_arg():
+    # Think markers in post-reasoning prose AND inside the verbatim argument,
+    # in the same generation; prose bytes stay in content.
+    text = (
+        f"{_DR02_OPEN}Working on it{_DR02_CLOSE}"
+        f"The user quoted {_DR02_OPEN} and{_DR02_CLOSE} in prose. "
+        + _DR02_BLOCK
+    )
+    events = _stream_events(_random_chunks(text, 8), "mimo_v2", "mimo_v2")
+    assert _reasoning(events).strip() == "Working on it"
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == {"filePath": _DR02_ARG}
+    full = _full_result(text, "mimo_v2", "mimo_v2")
+    assert json.loads(full.tool_calls[0].parameters) == {"filePath": _DR02_ARG}
+    assert "quoted" in full.content and "prose" in full.content
+    assert _DR02_CLOSE in full.content  # prose markers survive verbatim
+
+
+def test_qwen35_reasoning_unchanged_with_markers_in_tool_arg():
+    # Non-MiMo guard: the qwen3.5 family (qwen3 reasoning + qwen3_coder tools)
+    # keeps its legacy contract -- implicit-open reasoning still splits at the
+    # legit closer and argument markers after it pass through verbatim.
+    text = (
+        f"Need the file{_DR02_CLOSE}"
+        "<tool_call><function=read><parameter=filePath>a" + _DR02_CLOSE + "b</parameter></function>ing"
+    )
+    events = _stream_events(_random_chunks(text, 13), "qwen3_coder", "qwen3")
+    assert _reasoning(events).strip() == "Need the file"
+    calls = _calls(events)
+    assert len(calls) == 1 and calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == {"filePath": f"a{_DR02_CLOSE}b"}
+
+
 def test_dsv4_reasoning_then_tool_block_streams_and_orders_correctly():
     # Bounded-hold regression: with reasoning_parser=deepseekv32 a tool block used
     # to be swallowed into the reasoning parser's buffer until flush, then arrive
