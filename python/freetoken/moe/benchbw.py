@@ -666,7 +666,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 if fmt == "nvfp4":  # WF_NVFP4 is the only use_vnni format
                     _note(entry, "isa tier labels are nominal: this W4A8 kernel rides AVX-VNNI "
                                  "regardless of the forced tier")
-                elif fmt in ("mxfp4_triton", "ds_fp4"):
+                elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
             entry["expert_bytes"] = entry["expert_bytes"] or c["expert_bytes"]

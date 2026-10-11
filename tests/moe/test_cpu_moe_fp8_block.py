@@ -1,16 +1,8 @@
-"""Block-FP8 CPU MoE GEMV vs FreeToken's Triton block-fp8 decode kernel.
-
-The CPU path widens e4m3 to bf16 in-register and reduces with `dpbf16`, where the
-reference dequantizes to fp32 and reduces in fp32. e4m3 -> bf16 is exact (3 mantissa
-bits into 7, and bf16's exponent range covers e4m3's whole span), so the products are
-identical and only the summation order differs -- same latitude the bf16 path takes.
+"""Block-FP8 CPU MoE GEMV vs a float64 reference and FreeToken's Triton block-fp8 decode kernel.
 
 Two things this is really guarding:
-  * the scale is indexed [row // 128][k // 128] and *multiplies*, despite upstream
-    naming it ``weight_scale_inv``. Inverting it, or transposing the two axes, still
-    produces plausible-looking output.
-  * exp == 0 is subnormal (m * 2^-9) and does not follow the exponent-rebias bit trick
-    the normal range uses, so it is blended in from a table.
+  * the scale is indexed [row // 128][k // 128] and *multiplies*, despite upstream naming it ``weight_scale_inv``. Inverting it, or transposing the two axes, still produces plausible-looking output.
+  * the SIMD kernels decode e4m3 by reading each byte as fp16 bits. Subnormals carry too little weight in a full-range GEMV to show a decode error, so they get their own case.
 """
 
 from __future__ import annotations
@@ -96,7 +88,12 @@ def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
     assert rel < 5e-3, f"max relative error {rel.item()}"
 
 
-def _make_full_range_fp8_block_cache(H, I, seed=0):
+# every finite e4m3 code, and the subnormal ones (exp == 0) with both signs
+_FINITE_CODES = [c for c in range(256) if c not in (0x7F, 0xFF)]
+_SUBNORMAL_CODES = [c for c in range(256) if c & 0x78 == 0]
+
+
+def _make_coded_fp8_block_cache(H, I, codes, seed=0):
     from freetoken.kernel.aot_models import fp8_block_scale_pad
 
     if torch.cuda.is_available():
@@ -106,14 +103,14 @@ def _make_full_range_fp8_block_cache(H, I, seed=0):
             return torch.empty(*shape, dtype=dtype)
 
     torch.manual_seed(seed)
-    finite_codes = torch.tensor([c for c in range(256) if c not in (0x7F, 0xFF)], dtype=torch.uint8)
+    pool = torch.tensor(codes, dtype=torch.uint8)
 
     def rows(OUT, IN):
         count = OUT * IN
-        codes = finite_codes.repeat((count + finite_codes.numel() - 1) // finite_codes.numel())[:count]
-        codes = codes[torch.randperm(count)].reshape(1, OUT, IN)
+        picked = pool.repeat((count + pool.numel() - 1) // pool.numel())[:count]
+        picked = picked[torch.randperm(count)].reshape(1, OUT, IN)
         weights = alloc_pinned_tensor(1, OUT, IN, dtype=torch.float8_e4m3fn)
-        weights.copy_(codes.view(torch.float8_e4m3fn))
+        weights.copy_(picked.view(torch.float8_e4m3fn))
         scales = alloc_pinned_tensor(
             1, _nb(OUT), fp8_block_scale_pad(_nb(OUT), _nb(IN)), dtype=torch.bfloat16
         )
@@ -142,16 +139,16 @@ def _reference_fp8_gemv(weights, scales, x):
     return (weights[0].to(torch.float64) * scale) @ x.to(torch.float64)
 
 
+@pytest.mark.parametrize("codes", ["finite", "subnormal"])
 @pytest.mark.parametrize(
     "isa, expected_isa",
-    [("scalar", "scalar"), ("avx2", "avx2"), ("avx512", "avx512f"),
-     ("avx512bf16", "avx512bf16")],
+    [("scalar", "scalar"), ("avx2", "avx2"), ("avx512", "avx512f"), ("avx512bf16", "avx512f")],
 )
-def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa):
+def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa, codes):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     H, I = 259, 257  # ragged K for both GEMVs; 257 down rows exercise many reductions
-    cache = _make_full_range_fp8_block_cache(H, I, seed=20260904)
+    cache = _make_coded_fp8_block_cache(H, I, _FINITE_CODES if codes == "finite" else _SUBNORMAL_CODES, seed=20260904)
     monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
     ex = CpuMoeExecutor(
         cache,
@@ -162,9 +159,9 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa)
         max_tokens=1,
         device=torch.device("cpu"),
     )
-    names = ("scalar", "avx2", "avx512f", "avx512bf16")
-    if names.index(expected_isa) > names.index(ex.isa):
-        pytest.skip(f"requested {expected_isa}, host/build selected {ex.isa}")
+    tiers = {"scalar": 0, "avx2": 1, "avx512": 2, "avx512bf16": 3}
+    if tiers[isa] > ("scalar", "avx2", "avx512f", "avx512bf16").index(ex.isa):
+        pytest.skip(f"requested {isa}, host/build selected {ex.isa}")
     assert ex._ext.fp8_isa_name() == expected_isa
 
     hidden = torch.randn(1, H, dtype=torch.bfloat16)
@@ -180,9 +177,8 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa)
     intermediate = (torch.nn.functional.silu(gate_up[:I]) * gate_up[I:])
     expected = _reference_fp8_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
     rel = (cpu_out - expected).abs().max() / (expected.abs().max() + 1e-6)
-    # The executor stores its result as bf16. Across 257 output rows, the measured
-    # max relative error was 2.674e-3; this margin leaves room for reduction order
-    # without accepting the materially larger error from a narrow accumulator.
+    # The executor stores bf16; measured max relative error is 3.3e-3 (finite codes) and 1.2e-3 (subnormal codes).
+    # The bound leaves room for reduction order, not for a narrow accumulator.
     assert rel < 5e-3, f"max relative error {rel.item()}"
 
 
@@ -209,12 +205,9 @@ def test_cpu_fp8_block_isa_override(monkeypatch, isa):
     }[isa]), auto_rank)
 
 
-# FREETOKEN_CPU_MOE_ISA tier -> the name select_dot() reports for it. The env var
-# caps *down* only, so asking for a tier the CPU or the build lacks silently gives a
-# lower one; comparing against executor.isa is what turns that into a skip instead of
-# a pass that tested the same kernel four times.
-_ISA_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f",
-              "avx512bf16": "avx512bf16"}
+# FREETOKEN_CPU_MOE_ISA tier -> the fp8 kernel it selects; the avx512bf16 tier selects the avx512f kernel, so it is not repeated here.
+# The env var caps *down* only, so a tier the CPU or the build lacks selects a lower kernel, which turns into a skip instead of testing the same kernel twice.
+_ISA_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -240,9 +233,7 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
         max_tokens=bs,
         device=dev,
     )
-    # fp8_block adds no "+vnni"/"+q4_0" tag, but split anyway so a future one does not
-    # turn every tier into a skip.
-    got = ex.isa.split("+")[0]
+    got = ex._ext.fp8_isa_name()
     if got != _ISA_TIERS[isa]:
         pytest.skip(f"asked for {isa}, kernel selected {got}: not supported here")
 
@@ -266,18 +257,12 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
     assert rel < 2e-2, f"bs={bs} isa={got} rel err {rel.item()}"
 
 
-def test_bf16_carries_every_e4m3_byte():
-    """bf16 holds every e4m3 code exactly, which the CPU widening relies on.
-
-    This checks the premise, not the kernel. ``test_cpu_fp8_block_matches_float64_reference`` covers the C++ decoder.
-    """
-
-    codes = torch.arange(256, dtype=torch.uint8)
-    ref = codes.view(torch.float8_e4m3fn).float()
+def test_fp16_bits_carry_every_e4m3_byte():
+    """A byte b read as fp16 bits (b & 0x80) << 8 | (b & 0x7F) << 7 is its e4m3 value times 2^-8, which the SIMD kernels rely on."""
+    codes = torch.arange(256, dtype=torch.int32)
+    ref = codes.to(torch.uint8).view(torch.float8_e4m3fn).float()
+    bits = ((codes & 0x80) << 8) | ((codes & 0x7F) << 7)
+    got = torch.where(bits >= 0x8000, bits - 0x10000, bits).to(torch.int16).view(torch.float16).float() * 256
     finite = torch.isfinite(ref)
-    # bf16 is exact for e4m3, so a round-trip through it must be lossless.
-    got = ref.to(torch.bfloat16).float()
-    assert torch.equal(got[finite], ref[finite]), "e4m3 does not round-trip through bf16"
-    # subnormals (exp == 0, m != 0) are the values the bit trick cannot produce
-    sub = (codes & 0x78) == 0
-    assert finite[sub].all() and (ref[sub].abs().max() < 2.0 ** -6)
+    assert torch.equal(got[finite], ref[finite])
+    assert torch.equal(got[~finite].abs(), torch.full((2,), 480.0))  # 0x7F / 0xFF, as e4m3_decode
