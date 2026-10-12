@@ -322,11 +322,11 @@ def test_mimo_openai_stream_cutoffs_keep_argument_deltas_valid_json():
         ),
         (
             "<tool_call><function=demo><parameter=enabled>tru",
-            {},
+            {"enabled": "tru"},
         ),
         (
             "<tool_call><function=demo><parameter=items>[1,",
-            {},
+            {"items": "[1,"},
         ),
     )
     for tool_parser in ("qwen3_coder", "mimo_v2"):
@@ -549,8 +549,148 @@ def test_rejected_typed_argument_keeps_following_call_valid_in_shared_stream_par
                     current["name"] = delta.get("function", {}).get("name") or current["name"]
                     current["arguments"] += delta.get("function", {}).get("arguments", "")
         assert [calls[index]["name"] for index in sorted(calls)] == ["demo", "next"], tool_parser
-        assert json.loads(calls[0]["arguments"]) == {"count": 2}, tool_parser
+        # DR-03 preserve-raw policy: the rejected boolean streams through as its
+        # raw value, exactly like the non-streaming path.
+        assert json.loads(calls[0]["arguments"]) == {"enabled": "perhaps", "count": 2}, tool_parser
         assert json.loads(calls[1]["arguments"]) == {"count": 3}, tool_parser
+
+
+def _dr03_typed_tools():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "demo",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "count": {"type": "integer"},
+                },
+            },
+        },
+    }]
+
+
+_DR03_REJECTED_WIRE = (
+    "<tool_call><function=demo><parameter=enabled>perhaps</parameter>"
+    "<parameter=count>2</parameter></function></tool_call>"
+)
+
+
+def test_dr03_openai_adapter_non_stream_preserves_raw_rejected_value():
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=_DR03_REJECTED_WIRE, finished=True)],
+        tool_call_parser="qwen3_coder",
+    )
+    request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run demo"}],
+        tools=_dr03_typed_tools(),
+        max_tokens=8,
+    )
+    response = run(handle_chat_completion(request, request=None, state=state, model_sampling={}))
+    tool_calls = response["choices"][0]["message"]["tool_calls"]
+    assert [
+        (call["function"]["name"], json.loads(call["function"]["arguments"]))
+        for call in tool_calls
+    ] == [("demo", {"enabled": "perhaps", "count": 2})]
+
+
+def test_dr03_openai_adapter_stream_preserves_raw_rejected_value():
+    pieces = [
+        _DR03_REJECTED_WIRE[i : i + 3] for i in range(0, len(_DR03_REJECTED_WIRE), 3)
+    ]
+    state = FakeState(
+        [
+            UserReply(
+                uid=42,
+                incremental_output=piece,
+                finished=(i == len(pieces) - 1),
+            )
+            for i, piece in enumerate(pieces)
+        ],
+        tool_call_parser="qwen3_coder",
+    )
+    request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run demo"}],
+        tools=_dr03_typed_tools(),
+        stream=True,
+        max_tokens=8,
+    )
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, request, state))))
+    calls = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for choice in event.get("choices", []):
+            for delta in choice.get("delta", {}).get("tool_calls", []) or []:
+                current = calls.setdefault(delta["index"], {"name": None, "arguments": ""})
+                current["name"] = delta.get("function", {}).get("name") or current["name"]
+                current["arguments"] += delta.get("function", {}).get("arguments", "")
+    assert [
+        (calls[index]["name"], json.loads(calls[index]["arguments"]))
+        for index in sorted(calls)
+    ] == [("demo", {"enabled": "perhaps", "count": 2})]
+
+
+def test_dr03_openai_adapter_delivery_modes_agree():
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=_DR03_REJECTED_WIRE, finished=True)],
+        tool_call_parser="qwen3_coder",
+    )
+    nonstream_request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run demo"}],
+        tools=_dr03_typed_tools(),
+        max_tokens=8,
+    )
+    response = run(
+        handle_chat_completion(nonstream_request, request=None, state=state, model_sampling={})
+    )
+    nonstream_calls = [
+        (call["function"]["name"], json.loads(call["function"]["arguments"]))
+        for call in response["choices"][0]["message"]["tool_calls"]
+    ]
+    pieces = [
+        _DR03_REJECTED_WIRE[i : i + 3] for i in range(0, len(_DR03_REJECTED_WIRE), 3)
+    ]
+    stream_state = FakeState(
+        [
+            UserReply(
+                uid=42,
+                incremental_output=piece,
+                finished=(i == len(pieces) - 1),
+            )
+            for i, piece in enumerate(pieces)
+        ],
+        tool_call_parser="qwen3_coder",
+    )
+    stream_request = ChatCompletionRequest(
+        model="client-model",
+        messages=[{"role": "user", "content": "run demo"}],
+        tools=_dr03_typed_tools(),
+        stream=True,
+        max_tokens=8,
+    )
+    events = parse_sse(
+        run(_collect(stream_chat_completion_chunks(42, stream_request, stream_state)))
+    )
+    stream_calls = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for choice in event.get("choices", []):
+            for delta in choice.get("delta", {}).get("tool_calls", []) or []:
+                current = stream_calls.setdefault(
+                    delta["index"], {"name": None, "arguments": ""}
+                )
+                current["name"] = delta.get("function", {}).get("name") or current["name"]
+                current["arguments"] += delta.get("function", {}).get("arguments", "")
+    assert [
+        (stream_calls[index]["name"], json.loads(stream_calls[index]["arguments"]))
+        for index in sorted(stream_calls)
+    ] == nonstream_calls
 
 
 def test_mimo_nonstream_and_stream_preserve_text_between_tool_calls():

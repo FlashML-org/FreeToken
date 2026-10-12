@@ -729,6 +729,15 @@ class InvokeParamStreamMixin:
             return self._convert_param_value(raw, key, self._ps_param_config, "")
         return _parse_loose_json_value(raw)
 
+    def _ps_typed_fragment(self, value: Any) -> str:
+        """Complete JSON fragment for a buffered typed value: lead + "key" + value."""
+        return (
+            self._ps_lead
+            + json.dumps(self._ps_key, ensure_ascii=False)
+            + ":"
+            + json.dumps(value, ensure_ascii=False)
+        )
+
     def _ps_canonical_name(self, name: str) -> str:
         """Hook: normalize an invoke's function name before validation (identity by
         default; muse_glimmer collapses template-doubled ``name.name`` recipients)."""
@@ -1021,16 +1030,12 @@ class InvokeParamStreamMixin:
                     if mode == "pbuf":
                         raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
                         valid, converted = self._ps_resolve_value(self._ps_key, raw)
-                        if valid:
-                            self._ps_json_started = True
-                            self._args_started = True
-                            _emit(
-                                self._ps_lead
-                                + json.dumps(self._ps_key, ensure_ascii=False)
-                                + ":"
-                                + json.dumps(converted, ensure_ascii=False)
-                            )
-                            _update_prev()
+                        # DR-03: a failed typed conversion is preserved raw in
+                        # every delivery mode, matching the one-shot paths.
+                        self._ps_json_started = True
+                        self._args_started = True
+                        _emit(self._ps_typed_fragment(converted if valid else raw))
+                        _update_prev()
                     self._buffer = buf[end + len(self._ps_param_close):]
                     self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                     continue
@@ -1039,16 +1044,10 @@ class InvokeParamStreamMixin:
                     if mode == "pbuf":
                         raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
                         valid, converted = self._ps_resolve_value(self._ps_key, raw)
-                        if valid:
-                            self._ps_json_started = True
-                            self._args_started = True
-                            _emit(
-                                self._ps_lead
-                                + json.dumps(self._ps_key, ensure_ascii=False)
-                                + ":"
-                                + json.dumps(converted, ensure_ascii=False)
-                            )
-                            _update_prev()
+                        self._ps_json_started = True
+                        self._args_started = True
+                        _emit(self._ps_typed_fragment(converted if valid else raw))
+                        _update_prev()
                     self._buffer = buf[end:]
                     self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                     continue
@@ -1057,16 +1056,10 @@ class InvokeParamStreamMixin:
                     if mode == "pbuf":
                         raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
                         valid, converted = self._ps_resolve_value(self._ps_key, raw)
-                        if valid:
-                            self._ps_json_started = True
-                            self._args_started = True
-                            _emit(
-                                self._ps_lead
-                                + json.dumps(self._ps_key, ensure_ascii=False)
-                                + ":"
-                                + json.dumps(converted, ensure_ascii=False)
-                            )
-                            _update_prev()
+                        self._ps_json_started = True
+                        self._args_started = True
+                        _emit(self._ps_typed_fragment(converted if valid else raw))
+                        _update_prev()
                         _close_invoke()
                     self._buffer = buf[end:]
                     self._ps_mode = "block"
@@ -1130,15 +1123,10 @@ class InvokeParamStreamMixin:
                 raw = buf[: len(buf) - hold] if hold else buf
             raw = self._ps_trim_trailing(self._ps_trim_leading(raw))
             valid, converted = self._ps_resolve_value(self._ps_key, raw)
-            if valid:
-                self._ps_json_started = True
-                self._args_started = True
-                emit(
-                    self._ps_lead
-                    + json.dumps(self._ps_key, ensure_ascii=False)
-                    + ":"
-                    + json.dumps(converted, ensure_ascii=False)
-                )
+            # DR-03: preserve the raw value at end-of-stream truncation too.
+            self._ps_json_started = True
+            self._args_started = True
+            emit(self._ps_typed_fragment(converted if valid else raw))
 
         emit("}" if self._ps_json_started else "{}")
         self._update_streamed_arguments()

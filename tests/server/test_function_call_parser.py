@@ -478,8 +478,10 @@ def test_mimo_unknown_tool_with_missing_parameter_close_does_not_swallow_next_ca
         ("limit", "42", {"limit": 42}),
         ("enabled", "true", {"enabled": True}),
         ("nullable", "null", {"nullable": None}),
-        ("enabled", "tru", {}),
-        ("items", "[1,", {}),
+        # DR-03 preserve-raw: an invalid partial value keeps its raw text at EOS
+        # (streaming finalize matches the one-shot $-anchor path).
+        ("enabled", "tru", {"enabled": "tru"}),
+        ("items", "[1,", {"items": "[1,"}),
         ("text", 'quote " slash\\ 雪', {"text": 'quote " slash\\ 雪'}),
     ],
 )
@@ -806,3 +808,236 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+# --------------------------------------------------------------------------- #
+# DR-03: typed rejection is preserved raw in BOTH delivery modes
+#
+# Streaming used to silently omit a parameter whose typed conversion failed,
+# while the one-shot regex paths kept the raw value (_convert_param_value).
+# Approved policy (Option A): the streaming emit sites always emit - the
+# converted value on success, the raw text on failure - so both modes agree
+# for every InvokeParamStreamMixin family (qwen3_coder, minimax), and the
+# replay one-shot detectors (mimo_v2, muse_glimmer) inherit it automatically.
+# --------------------------------------------------------------------------- #
+DR03_FAMILIES = ("qwen3_coder", "minimax", "mimo_v2", "muse_glimmer")
+
+
+def _dr03_tools(properties, required=None):
+    schema = {"type": "object", "properties": properties}
+    if required is not None:
+        schema["required"] = required
+    return [{"type": "function", "function": {"name": "demo", "parameters": schema}}]
+
+
+def _dr03_wire(family, calls):
+    """Build a wire input; ``calls`` is a list of tool calls, each a list of
+    ``(parameter_name, raw_value)`` pairs."""
+    if family in ("qwen3_coder", "mimo_v2"):
+        return "".join(
+            "<tool_call><function=demo>"
+            + "".join(f"<parameter={key}>{value}</parameter>" for key, value in call)
+            + "</function></tool_call>"
+            for call in calls
+        )
+    if family == "minimax":
+        return "".join(
+            '<minimax:tool_call><invoke name="demo">'
+            + "".join(f'<parameter name="{key}">{value}</parameter>' for key, value in call)
+            + "</invoke></minimax:tool_call>"
+            for call in calls
+        )
+    if family == "muse_glimmer":
+        invokes = "".join(
+            '<atem:invoke name="demo">'
+            + "".join(
+                f'<atem:parameter name="{key}">{value}</atem:parameter>'
+                for key, value in call
+            )
+            + "</atem:invoke>"
+            for call in calls
+        )
+        return (
+            "<|start|>assistant to=demo.demo<|message|><atem:function_calls>"
+            + invokes
+            + "</atem:function_calls><|eot|>"
+        )
+    raise AssertionError(f"unknown family {family}")
+
+
+def _dr03_stream(tools, family, wire, chunk_size=3):
+    """Stream ``wire``; return [(name, parsed_arguments), ...] per emitted call."""
+    parser = FunctionCallParser(tools, family)
+    named, fragments = [], []
+    for i in range(0, len(wire), chunk_size):
+        _, emitted = parser.parse_stream_chunk(wire[i : i + chunk_size])
+        for item in emitted:
+            (named if item.name is not None else fragments).append(item)
+    for item in parser.finalize_stream():
+        (named if item.name is not None else fragments).append(item)
+    order = [item.tool_index for item in named]
+    args = {}
+    for item in fragments:
+        args[item.tool_index] = args.get(item.tool_index, "") + item.parameters
+    return [
+        (item.name, json.loads(args.get(index) or "{}"))
+        for index, item in zip(order, named)
+    ]
+
+
+def _dr03_oneshot(tools, family, wire):
+    result = FunctionCallParser(tools, family).parse_non_stream(wire)
+    return [(item.name, json.loads(item.parameters)) for item in result.calls]
+
+
+_DR03_BOOL_INT_TOOLS = _dr03_tools(
+    {"enabled": {"type": "boolean"}, "count": {"type": "integer"}}
+)
+_DR03_REQUIRED_TOOLS = _dr03_tools(
+    {"enabled": {"type": "boolean"}, "count": {"type": "integer"}},
+    required=["enabled"],
+)
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "minimax"])
+def test_dr03_rejected_typed_value_preserved_raw_in_both_modes(family):
+    # Exact finding example: demo(enabled="perhaps", count=2). Regression pin
+    # of the preserve-raw policy: streaming delivers the raw value exactly
+    # like the one-shot path.
+    wire = _dr03_wire(family, [[("enabled", "perhaps"), ("count", "2")]])
+    expected = [("demo", {"enabled": "perhaps", "count": 2})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "minimax"])
+def test_dr03_streaming_matches_oneshot_for_rejected_typed_value(family):
+    wire = _dr03_wire(family, [[("enabled", "perhaps"), ("count", "2")]])
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == _dr03_oneshot(
+        _DR03_BOOL_INT_TOOLS, family, wire
+    )
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "muse_glimmer"])
+def test_dr03_replay_families_preserve_raw_in_both_modes(family):
+    # One-shot IS a streaming replay for these families: both modes must carry
+    # the raw value (previously both silently omitted it).
+    wire = _dr03_wire(family, [[("enabled", "perhaps"), ("count", "2")]])
+    expected = [("demo", {"enabled": "perhaps", "count": 2})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "minimax"])
+def test_dr03_required_field_rejection_preserved_raw_requiredness_ignored(family):
+    # ``required`` is never consulted by the parser (only the properties map
+    # reaches _get_param_config), so a rejected REQUIRED field is preserved
+    # raw exactly like an optional one; validation stays client-side.
+    wire = _dr03_wire(family, [[("enabled", "perhaps"), ("count", "2")]])
+    expected = [("demo", {"enabled": "perhaps", "count": 2})]
+    assert _dr03_stream(_DR03_REQUIRED_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_REQUIRED_TOOLS, family, wire) == expected
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "minimax"])
+def test_dr03_optional_field_rejection_preserved_raw(family):
+    wire = _dr03_wire(family, [[("enabled", "perhaps"), ("count", "2")]])
+    expected = [("demo", {"enabled": "perhaps", "count": 2})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+def test_dr03_rejected_first_field_then_valid_comma_bookkeeping(family):
+    # Rejected FIRST field: streaming must re-open the object with "{" for the
+    # later valid field (the rejected key is emitted raw, then a comma joins
+    # the next key) and stay equivalent to one-shot declaration order.
+    wire = _dr03_wire(family, [[("count", "abc"), ("enabled", "true")]])
+    expected = [("demo", {"count": "abc", "enabled": True})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+def test_dr03_valid_call_after_rejected_call_preserves_raw(family):
+    wire = _dr03_wire(family, [[("enabled", "perhaps")], [("enabled", "true")]])
+    expected = [("demo", {"enabled": "perhaps"}), ("demo", {"enabled": True})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, family, wire) == expected
+
+
+DR03_MISMATCH_CASES = [
+    ("boolean", {"type": "boolean"}, "perhaps"),
+    ("integer", {"type": "integer"}, "abc"),
+    ("integer_float_text", {"type": "integer"}, "3.5"),
+    ("number", {"type": "number"}, "abc"),
+    ("object", {"type": "object"}, "not json"),
+    ("array_comma_text", {"type": "array"}, "1,2"),
+    ("nullable_int", {"type": "integer", "nullable": True}, "perhaps"),
+    ("anyof_int_null", {"anyOf": [{"type": "integer"}, {"type": "null"}]}, "perhaps"),
+]
+
+
+@pytest.mark.parametrize(("label", "prop", "value"), DR03_MISMATCH_CASES)
+def test_dr03_mismatched_typed_value_preserved_raw_both_modes(label, prop, value):
+    # Dossier matrix: every mismatched shape (plain type, nullable, anyOf) is
+    # preserved raw in both modes.
+    tools = _dr03_tools({"value": prop})
+    wire = _dr03_wire("qwen3_coder", [[("value", value)]])
+    expected = [("demo", {"value": value})]
+    assert _dr03_stream(tools, "qwen3_coder", wire) == expected
+    assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
+
+
+@pytest.mark.parametrize(("label", "prop", "value"), DR03_MISMATCH_CASES[:6])
+def test_dr03_mismatched_typed_value_minimax_matches(label, prop, value):
+    tools = _dr03_tools({"value": prop})
+    wire = _dr03_wire("minimax", [[("value", value)]])
+    expected = [("demo", {"value": value})]
+    assert _dr03_stream(tools, "minimax", wire) == expected
+    assert _dr03_oneshot(tools, "minimax", wire) == expected
+
+
+def test_dr03_nullable_null_text_resolves_in_both_modes():
+    # Parity that already held before DR-03: "null" for a nullable integer
+    # resolves to None in both modes.
+    tools = _dr03_tools({"value": {"type": "integer", "nullable": True}})
+    wire = _dr03_wire("qwen3_coder", [[("value", "null")]])
+    expected = [("demo", {"value": None})]
+    assert _dr03_stream(tools, "qwen3_coder", wire) == expected
+    assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
+
+
+def test_dr03_declared_string_never_rejected():
+    # Control: declared strings accept any text in both modes.
+    tools = _dr03_tools({"value": {"type": "string"}})
+    wire = _dr03_wire("qwen3_coder", [[("value", "perhaps")]])
+    expected = [("demo", {"value": "perhaps"})]
+    assert _dr03_stream(tools, "qwen3_coder", wire) == expected
+    assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
+
+
+def test_dr03_truncated_valid_partial_converges():
+    # A truncation whose partial text is already schema-valid converges; the
+    # streamed value closes via finalize_streaming's pbuf branch.
+    wire = "<tool_call><function=demo><parameter=count>12"
+    expected = [("demo", {"count": 12})]
+    assert _dr03_stream(_DR03_BOOL_INT_TOOLS, "qwen3_coder", wire) == expected
+    assert _dr03_oneshot(_DR03_BOOL_INT_TOOLS, "qwen3_coder", wire) == expected
+
+
+@pytest.mark.parametrize(
+    ("prop", "partial"),
+    [
+        ({"type": "boolean"}, "perha"),
+        ({"type": "array"}, "[1,2"),
+    ],
+)
+def test_dr03_truncated_invalid_partial_preserved_raw_both_modes(prop, partial):
+    # A truncation whose partial text is NOT schema-valid preserves the raw
+    # partial in both modes (streaming via the finalize always-emit).
+    tools = _dr03_tools({"value": prop})
+    wire = "<tool_call><function=demo><parameter=value>" + partial
+    expected = [("demo", {"value": partial})]
+    assert _dr03_stream(tools, "qwen3_coder", wire) == expected
+    assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
