@@ -47,8 +47,8 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     validate_weight_map=lambda weight_map, config: _validate_weight_map(weight_map, config),
 )
 
-# unquantized checkpoints: per-expert bf16 tensors merge (gate|up) and stack (E) into the
-# resident MoELayer's experts.gate_up_proj / experts.down_proj (qwen3_moe's format).
+# unquantized checkpoints: per-expert tensors (source dtype) merge (gate|up) and stack (E)
+# into the resident MoELayer's experts.gate_up_proj / experts.down_proj (qwen3_moe's format).
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 _EXPERT_MERGE_RULES = {
     ".gate_proj": MergeRule(".gate_up_proj", "gate", ("gate", "up")),
@@ -101,8 +101,10 @@ def iter_weights(
     """Yield the resident weights for MiMo v2, expert form chosen by the checkpoint's quant dialect.
 
     - fused qkv_proj (ONE checkpoint tensor/layer, kept fused on the merged layer) and the
-      layer-0 dense MLP are F32 in the checkpoint -> cast to bf16 (the model dtype);
-      o_proj / embed / norms / router gate / lm_head are already bf16 and pass through.
+      layer-0 dense MLP are F32 in the checkpoint and pass through in source dtype;
+      o_proj / embed / norms / router gate / lm_head pass through. Tensors are yielded
+      UNCONVERTED -- the engine's single conversion to EngineConfig.dtype
+      (``_materialize_loaded_weight_state_dict``) is the only dtype decision.
     - attention sinks: SWA-only BF16 ``attention_sink_bias`` -> engine ``sinks`` cast to fp32.
     - ``model.mtp.*``, ``visual.*``, ``audio_encoder.*`` and ``speech_embeddings.*`` are
       never yielded; the strict loader would reject them.
@@ -128,7 +130,7 @@ def iter_weights(
             if include_non_moe:
                 yield from _iter_resident_weights(reader, config, primary)
             if include_moe_experts:
-                yield from _iter_stacked_bf16_experts(reader, config, primary)
+                yield from _iter_stacked_unquantized_experts(reader, config, primary)
         finally:
             reader.close()
         return
@@ -179,8 +181,8 @@ def _validate_weight_map(weight_map: dict[str, str], config) -> None:
             )
 
 
-def _iter_stacked_bf16_experts(reader, config, primary) -> Iterator[tuple[str, torch.Tensor]]:
-    """Per-expert bf16 experts -> TP-sharded, gate|up-merged, expert-stacked resident tensors."""
+def _iter_stacked_unquantized_experts(reader, config, primary) -> Iterator[tuple[str, torch.Tensor]]:
+    """Per-expert tensors in source dtype -> TP-sharded, gate|up-merged, expert-stacked resident tensors."""
     tp_info = get_tp_info()
 
     def sharded() -> Iterator[tuple[str, torch.Tensor]]:
@@ -189,7 +191,7 @@ def _iter_stacked_bf16_experts(reader, config, primary) -> Iterator[tuple[str, t
             for e in range(config.num_experts):
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     name = f"{m}.experts.{e}.{proj}.weight"
-                    raw = reader.get(name).to(torch.bfloat16)
+                    raw = reader.get(name)
                     yield name, shard_tensor(
                         name,
                         raw,
@@ -215,8 +217,9 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 
     for layer in tqdm(range(L), desc="Loading MiMo dense weights", disable=not primary):
         a = f"model.layers.{layer}.self_attn"
-        # fused [Q | K | V] qkv stays one fused tensor; the checkpoint stores it F32.
-        yield f"{a}.qkv_proj.weight", reader.get(f"{a}.qkv_proj.weight").to(torch.bfloat16)
+        # fused [Q | K | V] qkv stays one fused tensor; the checkpoint stores it F32 and it
+        # is yielded verbatim (the engine casts once to the engine dtype).
+        yield f"{a}.qkv_proj.weight", reader.get(f"{a}.qkv_proj.weight")
         yield f"{a}.o_proj.weight", reader.get(f"{a}.o_proj.weight")
         sink = f"{a}.attention_sink_bias"
         if reader.has(sink):
@@ -236,9 +239,9 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 
         m = f"model.layers.{layer}.mlp"
         if layer < dense:
-            # dense SwiGLU MLP, separate gate/up/down; F32 in the checkpoint -> bf16.
+            # dense SwiGLU MLP, separate gate/up/down; F32 in the checkpoint, yielded verbatim.
             for proj in ("gate_proj", "up_proj", "down_proj"):
-                yield f"{m}.{proj}.weight", reader.get(f"{m}.{proj}.weight").to(torch.bfloat16)
+                yield f"{m}.{proj}.weight", reader.get(f"{m}.{proj}.weight")
         else:
             # router (bf16 gate + fp32 selection bias); no shared experts.
             yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")

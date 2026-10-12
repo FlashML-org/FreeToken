@@ -4,7 +4,10 @@ Model-agnostic: it drives the *existing* per-model loaders once and stores their
 no per-model conversion code is needed.
 
 * dense weights = exactly what ``load_weight(include_moe_experts=...)`` yields (post
-  fusion/TP-shard) -> ``kind="weight"``; at load they feed ``model.load_state_dict``.
+  fusion/TP-shard), converted once to the dtype each model parameter declares (the
+  engine's load-time materialization: per-tensor fp32 -- attention sinks, router
+  selection bias -- is preserved; everything else lands on ``dtype``) -> ``kind="weight"``;
+  at load they feed ``model.load_state_dict``.
 * offload experts = exactly what ``load_expert_banks(parallel=True)`` produces (post
   backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
   told apart at load by their reserved names, so they need no separate kind).
@@ -210,6 +213,24 @@ def convert_checkpoint(
         set_rope_device(dev)
         method = offload_expert_method(cfg)
 
+    # Dense tensors are converted ONCE to the dtype their model parameter declares -- the
+    # engine's load-time materialization -- NOT blanket EngineConfig.dtype: per-tensor fp32
+    # stalwarts (attention sinks, router selection bias) must survive every --dtype. Mirror
+    # the engine's construction (set_rope_device + meta device under torch_dtype,
+    # engine.py:362-364) to learn the declared dtypes from a meta model.
+    from freetoken.engine.engine import _decode_target
+    from freetoken.layers import set_rope_device
+    from freetoken.models import create_model
+    from freetoken.utils.torch_utils import torch_dtype
+
+    set_rope_device(dev)  # get_rope refuses to build on meta
+    object.__setattr__(mc, "moe_strategy", moe_backend)
+    object.__setattr__(mc, "decode_target", _decode_target(cfg))
+    with torch.device("meta"), torch_dtype(dtype):
+        meta_model = create_model(mc)
+    param_dtypes = {name: t.dtype for name, t in meta_model.state_dict().items()}
+    del meta_model
+
     from freetoken.utils.progress import byte_bar, count_bar
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
@@ -221,6 +242,13 @@ def convert_checkpoint(
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
                                               include_moe_experts=include_moe_experts),
                                   "Converting dense weights"):
+        # one conversion per tensor, to the dtype THIS parameter declares (mirrors the
+        # engine's load-time ``weight.to(device, dtype=expected.dtype)``): per-tensor fp32
+        # (sinks, router selection bias) passes through; keys the model doesn't declare
+        # (e.g. a stale .input_scale) store verbatim, like _materialize_loaded_weight_state_dict.
+        target = param_dtypes.get(name)
+        if target is not None and tensor.dtype != target:
+            tensor = tensor.to(target)
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()

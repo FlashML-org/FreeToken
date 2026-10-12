@@ -1,9 +1,10 @@
 """mimo_v2 weight loading against a synthetic checkpoint shaped like the release.
 
-Real key names and dtypes: F32 fused qkv + F32 dense layer-0 MLP (cast to bf16 by the
-reader), bf16 o_proj/embed/norms/router gate/lm_head, BF16 SWA-only sinks (cast to
-fp32), F32 selection bias, and modelopt NVFP4 experts (packed u8 + fp8-e4m3 block-16
-scales + F32 scalar weight_scale_2) read through the offload-cache expert spec.
+Real key names and dtypes: F32 fused qkv + F32 dense layer-0 MLP (yielded in source dtype;
+the engine's single conversion to EngineConfig.dtype is the only cast -- DR-04), bf16
+o_proj/embed/norms/router gate/lm_head, BF16 SWA-only sinks (cast to fp32), F32 selection
+bias, and modelopt NVFP4 experts (packed u8 + fp8-e4m3 block-16 scales + F32 scalar
+weight_scale_2) read through the offload-cache expert spec.
 """
 
 from __future__ import annotations
@@ -176,7 +177,8 @@ def _load(folder: str) -> dict[str, torch.Tensor]:
     }
 
 
-def _build_model(folder: str, strategy: str = "offload", *, device: torch.device | None = None):
+def _build_model(folder: str, strategy: str = "offload", *, device: torch.device | None = None,
+                 dtype: torch.dtype = torch.bfloat16):
     """The engine model for ``folder`` (experts per ``strategy``); meta unless a real build is needed."""
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
@@ -188,7 +190,7 @@ def _build_model(folder: str, strategy: str = "offload", *, device: torch.device
     config = EngineConfig(
         model_path=folder,
         tp_info=try_get_tp_info(),
-        dtype=torch.bfloat16,
+        dtype=dtype,
         moe_strategy=strategy,
         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
     )
@@ -198,7 +200,7 @@ def _build_model(folder: str, strategy: str = "offload", *, device: torch.device
     rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
     rotary.get_rope.cache_clear()
     try:
-        with torch.device(device or torch.device("meta")), torch_dtype(torch.bfloat16):
+        with torch.device(device or torch.device("meta")), torch_dtype(dtype):
             return create_model(config.model_config)
     finally:
         rotary.set_rope_device(saved)
@@ -226,33 +228,53 @@ def bf16_checkpoint(tmp_path_factory):
 
 
 def test_emitted_tensors_are_the_model_state_dict(checkpoint):
-    """The reader fills exactly the buffers the engine builds, with their shapes and dtypes."""
+    """The reader fills exactly the buffers the engine builds, with their shapes; the engine's
+    single conversion (DR-04) lands every emitted tensor on the buffer dtype."""
     folder, _raw_w = checkpoint
     loaded, state = _load(folder), _meta_state_dict(folder)
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():
         assert tensor.shape == state[key].shape, key
+    materialized = _engine_state(folder, torch.bfloat16, "offload")
+    assert set(materialized) == set(state)
+    for key, tensor in materialized.items():
         assert tensor.dtype is state[key].dtype, key
 
 
-def test_f32_linears_land_bf16_and_sinks_land_fp32(checkpoint):
+def test_f32_linears_pass_through_and_sinks_land_fp32(checkpoint):
+    """DR-04 re-anchor: the F32 qkv / layer-0 MLP are emitted verbatim in source dtype (no
+    pre-rounding); the engine's single conversion equals the direct cast to the model dtype,
+    and sinks still land fp32."""
     folder, raw = checkpoint
     loaded = _load(folder)
     for layer in (0, 1, 2):
-        qkv = loaded[f"model.layers.{layer}.self_attn.qkv_proj.weight"]
-        assert qkv.dtype is torch.bfloat16  # checkpoint F32 -> model dtype
-        assert torch.equal(qkv, raw[f"model.layers.{layer}.self_attn.qkv_proj.weight"].to(torch.bfloat16))
+        key = f"model.layers.{layer}.self_attn.qkv_proj.weight"
+        assert loaded[key].dtype is torch.float32
+        assert torch.equal(loaded[key], raw[key])  # value-identical source pass-through
         assert torch.equal(
             loaded[f"model.layers.{layer}.self_attn.o_proj.weight"],
             raw[f"model.layers.{layer}.self_attn.o_proj.weight"],
         )
     assert loaded["model.layers.0.self_attn.qkv_proj.weight"].shape == (FULL_KV_ROWS, H)
     assert loaded["model.layers.1.self_attn.qkv_proj.weight"].shape == (SWA_KV_ROWS, H)
-    # layer-0 dense MLP: F32 in the checkpoint, bf16 in the engine
+    # layer-0 dense MLP: F32 in the checkpoint, emitted verbatim
     for proj in ("gate_proj", "up_proj", "down_proj"):
-        got = loaded[f"model.layers.0.mlp.{proj}.weight"]
-        assert got.dtype is torch.bfloat16
-        assert torch.equal(got, raw[f"model.layers.0.mlp.{proj}.weight"].to(torch.bfloat16))
+        key = f"model.layers.0.mlp.{proj}.weight"
+        assert loaded[key].dtype is torch.float32
+        assert torch.equal(loaded[key], raw[key])
+    # engine path: materialized state == the direct single cast to the target dtype
+    state = _engine_state(folder, torch.bfloat16, "offload")
+    for layer in (0, 1, 2):
+        key = f"model.layers.{layer}.self_attn.qkv_proj.weight"
+        assert state[key].dtype is torch.bfloat16
+        assert torch.equal(state[key], raw[key].to(torch.bfloat16))
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        key = f"model.layers.0.mlp.{proj}.weight"
+        assert state[key].dtype is torch.bfloat16
+        assert torch.equal(state[key], raw[key].to(torch.bfloat16))
+    sinks = state["model.layers.1.self_attn.sinks"]
+    assert sinks.dtype is torch.float32
+    assert torch.equal(sinks, raw["model.layers.1.self_attn.attention_sink_bias"].to(torch.float32))
 
 
 def test_sinks_are_swa_only_and_selection_bias_is_fp32(checkpoint):
@@ -412,7 +434,8 @@ def test_bf16_experts_yield_stacked_resident_names(bf16_checkpoint):
 
 
 def test_bf16_resident_load_fills_the_resident_model_state_dict(bf16_checkpoint):
-    """Full load (experts + dense) == the state dict of the resident engine model, keys/shapes/dtypes."""
+    """Full load (experts + dense) == the state dict of the resident engine model, keys/shapes;
+    the engine's single conversion (DR-04) lands every emitted tensor on the buffer dtype."""
     folder, _raw_w = bf16_checkpoint
     loaded = {
         n: t.clone()
@@ -424,6 +447,9 @@ def test_bf16_resident_load_fills_the_resident_model_state_dict(bf16_checkpoint)
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():
         assert tensor.shape == state[key].shape, key
+    materialized = _engine_state(folder, torch.bfloat16, "fused")
+    assert set(materialized) == set(state)
+    for key, tensor in materialized.items():
         assert tensor.dtype is state[key].dtype, key
     assert any(k.endswith("mlp.experts.gate_up_proj") for k in loaded)  # experts are resident here
 
@@ -637,8 +663,10 @@ def test_tied_checkpoint_without_lm_head_loads_the_embedding_as_head(tmp_path, m
     )
 
     model = _build_model(folder, strategy="fused", device=torch.device("cpu"))
-    embed = loaded["model.embed_tokens.weight"]
-    model.load_state_dict(loaded)  # strict load: BaseOP pops every declared key (and empties the dict)
+    # engine path (DR-04 re-anchor): materialize to the buffer dtype before the strict mount,
+    # exactly as engine.py does -- the reader no longer pre-casts to the model dtype
+    state = _engine_state(folder, torch.bfloat16, "fused", model=model)
+    embed = state["model.embed_tokens.weight"]
     assert model.lm_head.tied_embedding is model.model.embed_tokens
     assert model.model.embed_tokens.weight is embed
     torch.manual_seed(3)
@@ -673,7 +701,9 @@ def test_tied_checkpoint_with_redundant_lm_head_ignores_it(tmp_path):
     assert torch.equal(loaded["model.embed_tokens.weight"], raw["model.embed_tokens.weight"])
     assert loaded["model.embed_tokens.weight"].count_nonzero() > 0
     model = _build_model(folder, strategy="fused", device=torch.device("cpu"))
-    model.load_state_dict(loaded)  # strict load: the redundant tensor must not be an extra key
+    # strict load via the engine path (DR-04 re-anchor): the redundant tensor must not be an
+    # extra key, and every loaded tensor is materialized to the buffer dtype first
+    _engine_state(folder, torch.bfloat16, "fused", model=model)
 
 
 def test_untied_checkpoint_missing_lm_head_still_fails(tmp_path):
@@ -698,3 +728,175 @@ def test_untied_checkpoint_missing_lm_head_still_fails(tmp_path):
                 include_non_moe=True,
             )
         )
+
+
+# ---------------------------------------------------------------- DR-04: no BF16 pre-rounding (folded from tests/models/test_dr04_bf16_pre_rounding.py)
+#
+# The reader used to cast the F32 source projections (fused qkv, dense-layer MLP) and the
+# unquantized stacked experts to BF16 BEFORE the engine converted to the requested parameter
+# dtype (engine.py ``_materialize_loaded_weight_state_dict`` -> ``weight.to(device,
+# dtype=expected.dtype)``; the model is built under ``torch_dtype(config.dtype)``, so the
+# target is EngineConfig.dtype -- admitted as float16/bfloat16/float32). Admitted executions
+# therefore double-rounded through BF16: FP16 saw an F32 65504.0 become inf (65504 -> BF16
+# 65536 -> FP16 inf) and FP32 saw an F32 1.001953125 become 1.0. These tests pin the
+# single-rounding contract on both the NVFP4 offload dialect and the unquantized
+# resident-expert dialect, driven through the engine's own load path. The NVFP4 quantized
+# experts themselves are not asserted here: their packed u8 codes / fp8 scales / F32
+# ``weight_scale_2`` never traverse the removed cast sites (models/nvfp4_banks.py reads them
+# verbatim, with its own independent fp16 global-scale cast).
+
+# sentinel source values: 65504 is FP16's max finite; 1.001953125 == 1 + 2**-9 exists in
+# F32 only (BF16 rounds it to 1.0).
+_DR04_F16_SENTINEL = 65504.0
+_DR04_F32_SENTINEL = 1.001953125
+_DR04_ROW_F16, _DR04_COL_F16 = 32, 17
+_DR04_ROW_F32, _DR04_COL_F32 = 50, 11
+
+# the cast-site tensors: F32 in the release checkpoint (qkv + dense-layer MLP) and F32
+# fixtures here for the unquantized stacked experts
+_DR04_QKV_KEY = "model.layers.0.self_attn.qkv_proj.weight"
+_DR04_DENSE_KEYS = tuple(f"model.layers.0.mlp.{p}.weight" for p in ("gate_proj", "up_proj", "down_proj"))
+_DR04_EXPERT_KEY = "model.layers.1.mlp.experts.0.gate_proj.weight"
+_DR04_EXPERT_STACK_KEY = "model.layers.1.mlp.experts.gate_up_proj"  # gate rows [0, MI) of expert 0
+
+
+def _raw_dr04(nvfp4: bool) -> dict[str, torch.Tensor]:
+    """The release layout with F32 payloads in the cast-site tensors."""
+    raw = _raw(nvfp4_experts=nvfp4)
+    keys = (_DR04_QKV_KEY, *_DR04_DENSE_KEYS)
+    if not nvfp4:
+        # the unquantized dialect's per-expert projections: make them F32 so the
+        # stacked-expert site is exercised on F32 sources too
+        raw[_DR04_EXPERT_KEY] = torch.randn(MI, H)
+        keys = (*keys, _DR04_EXPERT_KEY)
+    for key in keys:
+        raw[key][_DR04_ROW_F16, _DR04_COL_F16] = _DR04_F16_SENTINEL
+        raw[key][_DR04_ROW_F32, _DR04_COL_F32] = _DR04_F32_SENTINEL
+    return raw
+
+
+@pytest.fixture(scope="module")
+def dr04_nvfp4_checkpoint(tmp_path_factory):
+    """Release NVFP4 dialect: the qkv + dense-MLP sites apply (experts are packed pieces)."""
+    torch.manual_seed(13)
+    raw = _raw_dr04(nvfp4=True)
+    return _write(tmp_path_factory.mktemp("dr04_nvfp4"), raw), raw
+
+
+@pytest.fixture(scope="module")
+def dr04_bf16_experts_checkpoint(tmp_path_factory):
+    """Tiny-validation dialect: same layout, quantization_config dropped (resident experts)."""
+    torch.manual_seed(19)
+    raw = _raw_dr04(nvfp4=False)
+    folder = _write(tmp_path_factory.mktemp("dr04_bf16"), raw, quantized=False, indexed=False)
+    return folder, raw
+
+
+def _engine_state(folder: str, dtype: torch.dtype, strategy: str, *, model=None) -> dict[str, torch.Tensor]:
+    """The engine's exact load sequence on CPU (engine.py:318 + :540): reader tensors run
+    through ``_materialize_loaded_weight_state_dict`` (the dtype=expected.dtype conversion)
+    and are strict-mounted onto the real-dtype model."""
+    from freetoken.engine.engine import _materialize_loaded_weight_state_dict
+    from freetoken.models.weight import load_weight
+
+    if model is None:
+        model = _build_model(folder, strategy, device=torch.device("cpu"), dtype=dtype)
+    include_experts = strategy != "offload"  # engine.py:555 (is_offload_moe_strategy mirror)
+    state = _materialize_loaded_weight_state_dict(
+        model.state_dict(),
+        load_weight(folder, torch.device("cpu"), include_moe_experts=include_experts, include_vision=False),
+        device=torch.device("cpu"),
+    )
+    model.load_state_dict(dict(state))  # BaseOP.load_state_dict pops from its argument
+    return state
+
+
+# ---------------------------------------------------------------- folded repro (fp16)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "strategy"),
+    [("dr04_nvfp4_checkpoint", "offload"), ("dr04_bf16_experts_checkpoint", "fused")],
+)
+def test_dr04_fp16_fused_qkv_converts_directly_from_f32(fixture, strategy, request):
+    """65504.0 F32 must reach FP16 execution as 65504.0 (the removed BF16 stopover made it inf)."""
+    folder, raw = request.getfixturevalue(fixture)
+    state = _engine_state(folder, torch.float16, strategy)
+    qkv = state[_DR04_QKV_KEY]
+    assert qkv.dtype is torch.float16
+    assert torch.isfinite(qkv[_DR04_ROW_F16, _DR04_COL_F16]), "admitted fp16 execution read inf from a finite F32 source"
+    assert qkv[_DR04_ROW_F16, _DR04_COL_F16].item() == _DR04_F16_SENTINEL
+    # full-tensor fidelity: engine value == direct F32->FP16 conversion, element-exact
+    assert torch.equal(qkv, raw[_DR04_QKV_KEY].to(torch.float16))
+    assert tuple(qkv.shape) == (FULL_KV_ROWS, H)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "strategy"),
+    [("dr04_nvfp4_checkpoint", "offload"), ("dr04_bf16_experts_checkpoint", "fused")],
+)
+def test_dr04_fp16_dense_mlp_converts_directly_from_f32(fixture, strategy, request):
+    folder, raw = request.getfixturevalue(fixture)
+    state = _engine_state(folder, torch.float16, strategy)
+    for key in _DR04_DENSE_KEYS:
+        got = state[key]
+        assert got.dtype is torch.float16
+        assert torch.isfinite(got[_DR04_ROW_F16, _DR04_COL_F16]), f"{key}: fp16 read inf from a finite F32 source"
+        assert got[_DR04_ROW_F16, _DR04_COL_F16].item() == _DR04_F16_SENTINEL
+        assert torch.equal(got, raw[key].to(torch.float16))
+
+
+def test_dr04_fp16_unquantized_expert_converts_directly_from_f32(dr04_bf16_experts_checkpoint):
+    """The stacked-expert site hits unquantized experts: an F32 gate projection with 65504.0
+    must survive fp16 execution (gate rows [0, MI) of expert 0's stack)."""
+    folder, raw = dr04_bf16_experts_checkpoint
+    state = _engine_state(folder, torch.float16, "fused")
+    stack = state[_DR04_EXPERT_STACK_KEY]
+    assert stack.dtype is torch.float16
+    gate = stack[0, :MI]  # expert 0's merged gate piece
+    assert torch.isfinite(gate[_DR04_ROW_F16, _DR04_COL_F16]), "fp16 execution read inf from a finite F32 expert source"
+    assert gate[_DR04_ROW_F16, _DR04_COL_F16].tolist() == _DR04_F16_SENTINEL
+    assert torch.equal(gate, raw[_DR04_EXPERT_KEY].to(torch.float16))
+    for layer in MOE_LAYERS:  # every stacked expert lands for the fused strategy
+        assert f"model.layers.{layer}.mlp.experts.gate_up_proj" in state
+
+
+# ---------------------------------------------------------------- folded repro (fp32)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "strategy"),
+    [("dr04_nvfp4_checkpoint", "offload"), ("dr04_bf16_experts_checkpoint", "fused")],
+)
+def test_dr04_fp32_fused_qkv_keeps_full_f32_precision(fixture, strategy, request):
+    """1.001953125 F32 must reach FP32 execution unchanged (the removed BF16 stopover rounded it to 1.0)."""
+    folder, raw = request.getfixturevalue(fixture)
+    state = _engine_state(folder, torch.float32, strategy)
+    qkv = state[_DR04_QKV_KEY]
+    assert qkv.dtype is torch.float32
+    assert qkv[_DR04_ROW_F32, _DR04_COL_F32].item() == _DR04_F32_SENTINEL
+    assert torch.equal(qkv, raw[_DR04_QKV_KEY])  # F32 source == FP32 parameter, element-exact
+
+
+@pytest.mark.parametrize(
+    ("fixture", "strategy"),
+    [("dr04_nvfp4_checkpoint", "offload"), ("dr04_bf16_experts_checkpoint", "fused")],
+)
+def test_dr04_fp32_dense_mlp_keeps_full_f32_precision(fixture, strategy, request):
+    folder, raw = request.getfixturevalue(fixture)
+    state = _engine_state(folder, torch.float32, strategy)
+    for key in _DR04_DENSE_KEYS:
+        got = state[key]
+        assert got.dtype is torch.float32
+        assert got[_DR04_ROW_F32, _DR04_COL_F32].item() == _DR04_F32_SENTINEL
+        assert torch.equal(got, raw[key])
+
+
+def test_dr04_fp32_unquantized_expert_keeps_full_f32_precision(dr04_bf16_experts_checkpoint):
+    folder, raw = dr04_bf16_experts_checkpoint
+    state = _engine_state(folder, torch.float32, "fused")
+    stack = state[_DR04_EXPERT_STACK_KEY]
+    assert stack.dtype is torch.float32
+    gate = stack[0, :MI]
+    assert gate[_DR04_ROW_F32, _DR04_COL_F32].tolist() == _DR04_F32_SENTINEL
+    assert torch.equal(gate, raw[_DR04_EXPERT_KEY])
