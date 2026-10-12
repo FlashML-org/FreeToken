@@ -46,6 +46,11 @@ def _decode_fp8_moe_kernel(
     sn = offs_n // 128  # weight-scale N-block per output row
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tidm + route_k * stride_tidk).to(tl.int64)
+    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    if slot < 0:
+        # Both GEMMs must clear inactive routes before activation/reduction, including graph replay.
+        tl.store(c_ptrs, 0, mask=(route_id < total_routes) & n_mask)
+        return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
     w_slot = w_ptr + slot * stride_we
@@ -76,7 +81,6 @@ def _decode_fp8_moe_kernel(
 
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
-    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
@@ -106,7 +110,7 @@ def fused_experts_decode_fp8_blockscale(
     topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
-    banks (resident: expert id; offload: cache slot)."""
+    banks (resident: expert id; offload: cache slot); negative slots produce zero."""
     from freetoken.kernel import moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
 

@@ -20,6 +20,7 @@ def _pad_scale(rows: int, cols: int) -> int:
 class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "fp8_block"
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
