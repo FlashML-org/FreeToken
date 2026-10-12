@@ -81,9 +81,9 @@ def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
     ex._ext.run_task(ex._task_for(0, 1))
     cpu_out = io["y"][0].float().to(torch.float64)
     banks = cache.bank_sources
-    gate_up = _reference_fp8_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
+    gate_up = _reference_fp8_block_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
     intermediate = torch.nn.functional.silu(gate_up[:I]) * gate_up[I:]
-    expected = _reference_fp8_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
+    expected = _reference_fp8_block_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
     rel = (cpu_out - expected).abs().max() / (expected.abs().max() + 1e-6)
     assert rel < 5e-3, f"max relative error {rel.item()}"
 
@@ -132,7 +132,7 @@ def _make_coded_fp8_block_cache(H, I, codes, seed=0):
     )
 
 
-def _reference_fp8_gemv(weights, scales, x):
+def _reference_fp8_block_gemv(weights, scales, x):
     rows, cols = weights.shape[-2:]
     scale = scales[0, :_nb(rows), :_nb(cols)].to(torch.float64)
     scale = scale.repeat_interleave(BLK, 0).repeat_interleave(BLK, 1)[:rows, :cols]
@@ -162,7 +162,7 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa,
     tiers = {"scalar": 0, "avx2": 1, "avx512": 2, "avx512bf16": 3}
     if tiers[isa] > ("scalar", "avx2", "avx512f", "avx512bf16").index(ex.isa):
         pytest.skip(f"requested {isa}, host/build selected {ex.isa}")
-    assert ex._ext.fp8_isa_name() == expected_isa
+    assert ex._ext.fp8_block_isa_name() == expected_isa
 
     hidden = torch.randn(1, H, dtype=torch.bfloat16)
     io = ex._io_for(1)
@@ -173,9 +173,9 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa,
     cpu_out = io["y"][0].float().to(torch.float64)
 
     banks = cache.bank_sources
-    gate_up = _reference_fp8_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
+    gate_up = _reference_fp8_block_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
     intermediate = (torch.nn.functional.silu(gate_up[:I]) * gate_up[I:])
-    expected = _reference_fp8_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
+    expected = _reference_fp8_block_gemv(banks["down"][0], banks["down_scale"][0], intermediate)
     rel = (cpu_out - expected).abs().max() / (expected.abs().max() + 1e-6)
     # The executor stores bf16; measured max relative error is 3.3e-3 (finite codes) and 1.2e-3 (subnormal codes).
     # The bound leaves room for reduction order, not for a narrow accumulator.
@@ -205,7 +205,7 @@ def test_cpu_fp8_block_isa_override(monkeypatch, isa):
     }[isa]), auto_rank)
 
 
-# FREETOKEN_CPU_MOE_ISA tier -> the fp8 kernel it selects; the avx512bf16 tier selects the avx512f kernel, so it is not repeated here.
+# FREETOKEN_CPU_MOE_ISA tier -> the fp8_block kernel it selects; the avx512bf16 tier selects the avx512f kernel, so it is not repeated here.
 # The env var caps *down* only, so a tier the CPU or the build lacks selects a lower kernel, which turns into a skip instead of testing the same kernel twice.
 _ISA_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 
@@ -233,7 +233,7 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
         max_tokens=bs,
         device=dev,
     )
-    got = ex._ext.fp8_isa_name()
+    got = ex._ext.fp8_block_isa_name()
     if got != _ISA_TIERS[isa]:
         pytest.skip(f"asked for {isa}, kernel selected {got}: not supported here")
 

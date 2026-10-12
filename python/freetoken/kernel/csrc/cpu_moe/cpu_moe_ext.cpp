@@ -275,12 +275,12 @@ inline float e4m3_decode(uint8_t v) {
 // fp8-e4m3 weights row-major [rows, K] plus one bf16 scale per 128x128 block. The scale tensor is named weight_scale_inv but multiplies, as in kernel/triton/fp8_blockscale_moe.py.
 // Whole 128-blocks read the activations as fp32 even/odd halves (xe[m] = x[2m], xo[m] = x[2m+1]); a ragged tail reads the bf16 row x.
 // 0x7F/0xFF (NaN in torch float8_e4m3fn) decode to +-480 in every kernel, as e4m3_decode does.
-using fp8dot_fn = float (*)(const uint8_t*, const float*, const float*, const bf16_t*, const bf16_t*,
-                            int, const float*);
+using fp8_block_dot_fn = float (*)(const uint8_t*, const float*, const float*, const bf16_t*,
+                                   const bf16_t*, int, const float*);
 
 constexpr int FP8_BLK = 128;  // K elements covered by one weight scale
 
-inline float fp8_tail(const uint8_t* w, const bf16_t* x, int k0, int K, const float* e4m3) {
+inline float fp8_block_tail(const uint8_t* w, const bf16_t* x, int k0, int K, const float* e4m3) {
   float blk = 0.0f;
   for (int k = k0; k < K; ++k) blk += e4m3[w[k]] * bf16_to_f32(x[k]);
   return blk;
@@ -304,7 +304,7 @@ float dot_fp8_block_scalar(const uint8_t* w, const float* xe, const float* xo, c
     acc += (((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))) *
            bf16_to_f32(s[b]);
   }
-  if (k0 < K) acc += fp8_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
+  if (k0 < K) acc += fp8_block_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
   return acc;
 }
 
@@ -336,7 +336,7 @@ float dot_fp8_block_avx2(const uint8_t* w, const float* xe, const float* xo, con
     total = _mm256_fmadd_ps(blk, _mm256_set1_ps(bf16_to_f32(s[b]) * 256.0f), total);
   }
   float acc = hsum256(total);
-  if (k0 < K) acc += fp8_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
+  if (k0 < K) acc += fp8_block_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
   return acc;
 }
 
@@ -368,7 +368,7 @@ float dot_fp8_block_avx512f(const uint8_t* w, const float* xe, const float* xo, 
     total = _mm512_fmadd_ps(blk, _mm512_set1_ps(bf16_to_f32(s[b]) * 256.0f), total);
   }
   float acc = _mm512_reduce_add_ps(total);
-  if (k0 < K) acc += fp8_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
+  if (k0 < K) acc += fp8_block_tail(w, x, k0, K, e4m3) * bf16_to_f32(s[b]);
   return acc;
 }
 #endif  // CPU_MOE_X86
@@ -779,7 +779,7 @@ struct DotChoice {
 };
 
 // SIMD tiers, ascending. Each format picks the highest tier <= the one chosen by
-// pick_isa() that it implements (fp4 and fp8 formats have no bf16-specific tier, so the
+// pick_isa() that it implements (fp4 and fp8_block formats have no bf16-specific tier, so the
 // avx512bf16 tier maps to their avx512 kernel).
 enum IsaTier { ISA_SCALAR = 0, ISA_AVX2 = 1, ISA_AVX512 = 2, ISA_AVX512BF16 = 3 };
 
@@ -1119,7 +1119,7 @@ void mxfp4_gemv_avx2(float* out, const uint8_t* blk, const uint8_t* scl, const b
 }
 #endif
 
-fp8dot_fn select_fp8dot() {
+fp8_block_dot_fn select_fp8_block_dot() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
   // the avx512bf16 tier keeps the fp32 kernel: on Sapphire Rapids it is faster than widening to bf16 for dpbf16
@@ -1383,10 +1383,10 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
-  fp8dot_fn fp8dot;
+  fp8_block_dot_fn fp8_block_dot;
   // fp8_block: bf16 scale per 128x128 weight block. These are the scale tensor's
   // trailing strides, including any padding used by the host bank layout.
-  int fp8_gu_scale_row = 0, fp8_dn_scale_row = 0;
+  int fp8_block_gu_scale_row = 0, fp8_block_dn_scale_row = 0;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1491,8 +1491,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_, int fp8_gu_scale_stride_,
-                 int fp8_dn_scale_stride_)
+                 std::vector<int> core_ids_, int fp8_block_gu_scale_stride_,
+                 int fp8_block_dn_scale_stride_)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1512,8 +1512,8 @@ struct CpuMoeExecutor {
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
-        fp8_gu_scale_row(fp8_gu_scale_stride_),
-        fp8_dn_scale_row(fp8_dn_scale_stride_),
+        fp8_block_gu_scale_row(fp8_block_gu_scale_stride_),
+        fp8_block_dn_scale_row(fp8_block_dn_scale_stride_),
         core_ids(std::move(core_ids_)) {
     DotChoice c = select_dot();
     dot = c.fn;
@@ -1521,7 +1521,7 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
-    fp8dot = select_fp8dot();
+    fp8_block_dot = select_fp8_block_dot();
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -1638,8 +1638,8 @@ struct CpuMoeExecutor {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)H;
       const bf16_t* sc = reinterpret_cast<const bf16_t*>(gu_scale_l) +
                          ((size_t)e * ((2 * I + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
-                             (size_t)fp8_gu_scale_row;
-      return fp8dot(w, xe, xo, x, sc, H, e4m3_lut);
+                             (size_t)fp8_block_gu_scale_row;
+      return fp8_block_dot(w, xe, xo, x, sc, H, e4m3_lut);
     }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
@@ -1667,8 +1667,8 @@ struct CpuMoeExecutor {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)I;
       const bf16_t* sc = reinterpret_cast<const bf16_t*>(dn_scale_l) +
                          ((size_t)e * ((H + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
-                             (size_t)fp8_dn_scale_row;
-      return fp8dot(w, ge, go, g, sc, I, e4m3_lut);
+                             (size_t)fp8_block_dn_scale_row;
+      return fp8_block_dot(w, ge, go, g, sc, I, e4m3_lut);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -1719,10 +1719,10 @@ struct CpuMoeExecutor {
 
   const char* isa_name() const { return isa; }
 
-  const char* fp8_isa_name() const {
+  const char* fp8_block_isa_name() const {
 #if CPU_MOE_X86
-    if (fp8dot == dot_fp8_block_avx512f) return "avx512f";
-    if (fp8dot == dot_fp8_block_avx2) return "avx2";
+    if (fp8_block_dot == dot_fp8_block_avx512f) return "avx512f";
+    if (fp8_block_dot == dot_fp8_block_avx2) return "avx2";
 #endif
     return "scalar";
   }
@@ -2312,8 +2312,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"), py::arg("fp8_gu_scale_stride") = 0,
-           py::arg("fp8_dn_scale_stride") = 0)
+           py::arg("core_ids"), py::arg("fp8_block_gu_scale_stride") = 0,
+           py::arg("fp8_block_dn_scale_stride") = 0)
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
@@ -2336,7 +2336,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](CpuMoeExecutor& e, int v) { e.act_block = v; },
            py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name)
-      .def("fp8_isa_name", &CpuMoeExecutor::fp8_isa_name)
+      .def("fp8_block_isa_name", &CpuMoeExecutor::fp8_block_isa_name)
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))

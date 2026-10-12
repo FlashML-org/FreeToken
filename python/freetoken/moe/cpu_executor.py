@@ -389,8 +389,8 @@ class CpuMoeExecutor:
             down_global_ptr=0,
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
-            fp8_gu_scale_stride=int(gus[0].stride(1)),
-            fp8_dn_scale_stride=int(dns[0].stride(1)),
+            fp8_block_gu_scale_stride=int(gus[0].stride(1)),
+            fp8_block_dn_scale_stride=int(dns[0].stride(1)),
         )
         return ptrs, (H, I)
 
