@@ -14,10 +14,16 @@ grouped GEMM (prefill) and the CPU executor all follow this transcription.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+needs_cpu_moe = pytest.mark.skipif(
+    importlib.util.find_spec("freetoken.kernel._cpu_moe") is None,
+    reason="the CPU MoE executor is not built on this platform (setup.py)",
+)
 
 E, H, I, TOP_K, LIMIT = 16, 512, 256, 4, 7.0
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -88,6 +94,7 @@ def test_gemv_path_matches_the_transcription(block):
     torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
 
 
+@needs_cpu_moe
 @pytest.mark.parametrize("block", [32, 128])
 def test_cpu_executor_matches_the_transcription(block):
     """The ``ds_fp4`` CPU executor (cpu / hybrid decode) implements the same contract as the GPU path."""
@@ -123,6 +130,7 @@ def test_grouped_prefill_path_matches_the_transcription():
     torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
 
 
+@needs_cpu_moe
 @pytest.mark.parametrize("block", [32, 128])
 def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     """Hybrid decode hands the GPU kernel slot -1 (weight 0) for the routes the CPU computes. The kernel
