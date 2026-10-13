@@ -76,6 +76,20 @@ On GH200 this raises the gather from ~220 to ~410 GB/s (`PCIe-gather` in
 set so the hybrid split is calibrated against the faster gather. Leave it
 unset on PCIe GPUs: wider grids add no bandwidth there.
 
+### CPU/Hybrid MoE Graph on ROCm 10
+
+CPU and hybrid decode use native `hipStreamWriteValue64` / `hipStreamWaitValue64`
+with executor-owned HIP signal memory. ROCm 10 captures these operations into
+Graph nodes, so replay waits for the CPU experts to compute the current input
+and routing. Startup verifies the handshake with actual capture and replay.
+CUDA retains its existing mapped-pinned, per-slot handshake.
+
+If the probe fails or `FREETOKEN_CPU_MOE_FLAG_SYNC=0` disables it, eager execution
+remains available, but Graph capture raises a clear error. Use
+`--cuda-graph-max-bs 0` (and remove explicit `--cuda-graph-bs` sizes) for that
+configuration. The same guard applies to hybrid and offload with CPU layers.
+This path targets ROCm 10; older ROCm versions are outside its support scope.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

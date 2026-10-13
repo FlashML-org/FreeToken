@@ -41,6 +41,9 @@ Two paths, mirroring the sgl CUDA kernel's small/large split:
 No triton.autotune anywhere in this module: all launch configs below are fixed,
 chosen from a one-time H100 sweep (see comments at each launch site), matching
 the upstream (vLLM/sglang) style of hardcoding/heuristics instead of autotuning.
+
+ROCm uses the staged path with direct atomic counts. This avoids incorrect
+histograms and unfilled expert block IDs observed with Triton 3.8 on gfx1201.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
+
+from freetoken.kernel.backend import is_rocm
 
 _SMALL_CAP = 1024  # fused single-CTA path for numel <= this (covers all decode shapes)
 
@@ -116,6 +121,7 @@ def _fill_and_count(
     sentinel,          # == numel
     effective_E: tl.constexpr,
     HIST: tl.constexpr,
+    USE_HIST: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -125,14 +131,17 @@ def _fill_and_count(
     tl.store(sorted_token_ids_ptr + offs, sentinel, mask=offs < sorted_numel)
     # (b) zero the scatter fill-counter (read in the scatter kernel after a barrier)
     tl.store(fill_counter_ptr + offs, 0, mask=offs < effective_E)
-    # (c) per-program register histogram, then one merged atomic per touched bin
-    #     (vs one scattered atomic per element -- far fewer, conflict-free atomics)
     e = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1)
     valid = (offs < numel) & (e >= 0) & (e < effective_E)
-    e_h = tl.where(valid, e, HIST - 1)  # invalid -> spare top bin (>= effective_E)
-    h = tl.histogram(e_h, HIST)
-    le = tl.arange(0, HIST)
-    tl.atomic_add(counts_ptr + le, h, mask=(le < effective_E) & (h > 0))
+    if USE_HIST:
+        # Merge atomics per bin on CUDA; direct atomics avoid the empty counts
+        # observed with the ROCm histogram lowering.
+        e_h = tl.where(valid, e, HIST - 1)
+        h = tl.histogram(e_h, HIST)
+        le = tl.arange(0, HIST)
+        tl.atomic_add(counts_ptr + le, h, mask=(le < effective_E) & (h > 0))
+    else:
+        tl.atomic_add(counts_ptr + e, 1, mask=valid)
 
 
 @triton.jit
@@ -238,7 +247,8 @@ def moe_align_block_size(
     fill_counter = torch.empty((effective_E,), dtype=torch.int32, device=device)
     cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
 
-    if 0 < numel <= _SMALL_CAP:
+    rocm = is_rocm()
+    if 0 < numel <= _SMALL_CAP and not rocm:
         # Fixed via H100 sweep (9-config grid; this num_warps ladder -- w2 at
         # numel<=64, w4@128, w8@256, w16@1024 -- won every decode shape, within 5%
         # of a live tuned search; forced-fixed beat live-tuned by 25-38% on the
@@ -280,6 +290,7 @@ def moe_align_block_size(
         numel,          # sentinel
         effective_E,
         triton.next_power_of_2(effective_E + 1),
+        USE_HIST=not rocm,
         BLOCK_SIZE=256,
         num_warps=8,
         num_stages=3,

@@ -2,9 +2,8 @@
 //
 // Decode ships activations to the CPU, computes the routed experts here (reading
 // the pinned host expert banks at full RAM bandwidth), and ships the results
-// back. To keep the whole decode path inside a single CUDA graph we expose
-// submit/sync as host nodes via cudaLaunchHostFunc -- the callbacks only touch a
-// CPU worker pool + pinned host buffers and never call any CUDA API.
+// back. ROCm 10 uses native HIP stream memops for graph-safe CPU/GPU ordering;
+// host-function callbacks remain the eager fallback on ROCm.
 //
 // One task is in flight at a time (per MoE layer): submit() wakes the pool,
 // sync() blocks the host-func thread until the pool drains. The heavy GEMV runs
@@ -684,7 +683,102 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // which laptop CPU/GPU dynamic power schedulers answered by clamping the CPU's max
 // frequency (GEMV workers -1.5x: the reported edge regression). Availability is
 // probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
-// vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
+// vGPU, old drivers) falls back to cudaLaunchHostFunc, eager-only on ROCm.
+#if FREETOKEN_USE_ROCM
+
+static hipError_t hip_alloc_signal(uint64_t** out) {
+  void* allocation = nullptr;
+  hipError_t rc = hipExtMallocWithFlags(&allocation, sizeof(uint64_t), hipMallocSignalMemory);
+  if (rc == hipSuccess) {
+    *out = static_cast<uint64_t*>(allocation);
+    __atomic_store_n(*out, 0ULL, __ATOMIC_RELEASE);
+  }
+  return rc;
+}
+
+static void hip_free_signal(uint64_t* signal) {
+  if (signal != nullptr) (void)hipFree(signal);
+}
+
+static bool cumemops_probe(uintptr_t, uintptr_t) {
+  int device = 0, can_wait = 0;
+  if (hipGetDevice(&device) != hipSuccess ||
+      hipDeviceGetAttribute(&can_wait, hipDeviceAttributeCanUseStreamWaitValue, device) !=
+          hipSuccess || !can_wait)
+    return false;
+
+  uint64_t* ready = nullptr;
+  uint64_t* done = nullptr;
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t executable = nullptr;
+  hipError_t rc = hip_alloc_signal(&ready);
+  if (rc == hipSuccess) rc = hip_alloc_signal(&done);
+  if (rc == hipSuccess) rc = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  // Keep capture nonblocking even if a runtime enqueues rather than records memops.
+  if (rc == hipSuccess) __atomic_store_n(done, 1ULL, __ATOMIC_RELEASE);
+  if (rc == hipSuccess) rc = hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed);
+  const bool capturing = rc == hipSuccess;
+  if (rc == hipSuccess) rc = hipStreamWriteValue64(stream, ready, 1, hipStreamWriteValueDefault);
+  if (rc == hipSuccess) rc = hipStreamWaitValue64(stream, done, 1, hipStreamWaitValueGte, UINT64_MAX);
+  if (capturing) {
+    hipError_t end_rc = hipStreamEndCapture(stream, &graph);
+    if (rc == hipSuccess) rc = end_rc;
+  }
+  if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+  size_t nodes = 0;
+  if (rc == hipSuccess) rc = hipGraphGetNodes(graph, nullptr, &nodes);
+  if (rc == hipSuccess && nodes != 2) rc = hipErrorNotSupported;
+  if (rc == hipSuccess) rc = hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0);
+
+  bool served = false;
+  if (rc == hipSuccess) {
+    __atomic_store_n(ready, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(done, 0ULL, __ATOMIC_RELEASE);
+    std::thread responder([&] {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0 &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      served = __atomic_load_n(ready, __ATOMIC_ACQUIRE) == 1;
+      // The probe graph never resets done, so this also releases a delayed launch.
+      __atomic_store_n(done, 1ULL, __ATOMIC_RELEASE);
+    });
+    rc = hipGraphLaunch(executable, stream);
+    if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+    responder.join();
+  }
+  const bool ok = rc == hipSuccess && served;
+  if (executable != nullptr) (void)hipGraphExecDestroy(executable);
+  if (graph != nullptr) (void)hipGraphDestroy(graph);
+  if (stream != nullptr) (void)hipStreamDestroy(stream);
+  hip_free_signal(ready);
+  hip_free_signal(done);
+  return ok;
+}
+
+static void hipmemop_check(hipError_t rc) {
+  if (rc != hipSuccess)
+    throw std::runtime_error(std::string("CPU MoE HIP stream memop failed: ") + hipGetErrorString(rc));
+}
+
+static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t ready_addr,
+                           int64_t slot) {
+  auto s = reinterpret_cast<hipStream_t>(stream);
+  hipmemop_check(hipStreamWriteValue64(s, reinterpret_cast<void*>(done_addr), 0,
+                                     hipStreamWriteValueDefault));
+  hipmemop_check(hipStreamWriteValue64(s, reinterpret_cast<void*>(ready_addr), slot + 1,
+                                     hipStreamWriteValueDefault));
+}
+
+static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t) {
+  hipmemop_check(hipStreamWaitValue64(reinterpret_cast<hipStream_t>(stream),
+                                    reinterpret_cast<void*>(done_addr), 1,
+                                    hipStreamWaitValueGte, UINT64_MAX));
+}
+
+#else
+
 #if defined(_WIN32)
 #include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
@@ -772,6 +866,8 @@ static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
                             kCuWaitValueGeq),
                 "cuStreamWaitValue64(done)");
 }
+
+#endif  // FREETOKEN_USE_ROCM
 
 struct DotChoice {
   dot_fn fn;
@@ -1444,17 +1540,19 @@ struct CpuMoeExecutor {
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
-  // A tiny GPU kernel bumps ready_flags[slot] at submit; this coordinator thread busy-polls
-  // it, runs the slot's task on the worker pool, and sets done_flags[slot], which a GPU
-  // spin-wait kernel polls at sync. This removes the ~2x30-50us host-func dispatch round
-  // trips per MoE layer per decode step that otherwise idle the GPU (~6 ms/step on a
-  // 75-layer model). One slot per (layer, decode batch size) pair -- the Python side
-  // allocates slots as tasks are created. Flags live in mapped-pinned host memory (UVA:
-  // the same pointers are used by the GPU kernels and by this thread).
+  // CUDA uses mapped-pinned per-slot flags; HIP uses one signal pair with ready=slot+1.
+  // Stream memops notify this coordinator and wait for its CPU result without a kernel.
   std::thread coord_thread;
   std::atomic<bool> coord_stop{false};
   volatile int64_t* ready_flags = nullptr;  // GPU increments, this thread polls
   volatile int64_t* done_flags = nullptr;   // this thread sets, GPU spin-waits
+  // HIP signals hold one word each. Submit/sync pairs must remain stream-serialized,
+  // as the executor also shares its IO buffers and worker pool across layers.
+  bool shared_flag_signal = false;
+#if FREETOKEN_USE_ROCM
+  uint64_t* owned_ready_signal = nullptr;
+  uint64_t* owned_done_signal = nullptr;
+#endif
   int coord_num_slots = 0;
   std::vector<MoeTask*> flag_task;           // slot -> task (registered lazily)
   std::vector<int64_t> flag_served;          // slot -> completed dispatch count (tests/debug)
@@ -1702,6 +1800,10 @@ struct CpuMoeExecutor {
     for (auto& th : workers)
       if (th.joinable()) th.join();
     for (MoeTask* t : owned_tasks) delete t;
+#if FREETOKEN_USE_ROCM
+    hip_free_signal(owned_ready_signal);
+    hip_free_signal(owned_done_signal);
+#endif
   }
 
   uintptr_t create_task(int layer_id, int num_tokens, uintptr_t x_ptr,
@@ -2175,6 +2277,39 @@ struct CpuMoeExecutor {
     return (slot >= 0 && slot < static_cast<int>(flag_served.size())) ? flag_served[slot] : 0;
   }
 
+  uintptr_t flag_ready_address() const { return reinterpret_cast<uintptr_t>(ready_flags); }
+  uintptr_t flag_done_address() const { return reinterpret_cast<uintptr_t>(done_flags); }
+  int64_t flag_done_value() const { return flag_load_acquire(done_flags); }
+
+  std::vector<int> pending_flag_slots() const {
+    const int64_t command = flag_load_acquire(ready_flags);
+    if (command > 0 && command <= coord_num_slots && flag_load_acquire(done_flags) == 0)
+      return {static_cast<int>(command - 1)};
+    return {};
+  }
+
+  void poison_flag(int) { flag_store_release(done_flags, 1); }
+
+  void start_shared_signal_coordinator(int num_slots, int pin_core) {
+#if FREETOKEN_USE_ROCM
+    if (num_slots <= 0 || owned_ready_signal != nullptr || owned_done_signal != nullptr)
+      throw std::invalid_argument("CPU MoE HIP coordinator requires fresh signals and positive slots");
+    hipError_t rc = hip_alloc_signal(&owned_ready_signal);
+    if (rc == hipSuccess) rc = hip_alloc_signal(&owned_done_signal);
+    if (rc != hipSuccess) {
+      hip_free_signal(owned_ready_signal);
+      hip_free_signal(owned_done_signal);
+      owned_ready_signal = owned_done_signal = nullptr;
+      hipmemop_check(rc);
+    }
+    shared_flag_signal = true;
+    start_flag_coordinator(reinterpret_cast<uintptr_t>(owned_ready_signal),
+                           reinterpret_cast<uintptr_t>(owned_done_signal), num_slots, pin_core);
+#else
+    throw std::runtime_error("HIP signal memory requires a ROCm build");
+#endif
+  }
+
   // Start the busy-poll coordinator over the mapped-pinned flag arrays. ``pin_core`` >= 0
   // pins the coordinator to that logical CPU (the worker auto-sizing reserves it), so its
   // polling never migrates onto / contends with a GEMV worker's core.
@@ -2223,13 +2358,14 @@ struct CpuMoeExecutor {
     bool dozing = false;
     while (!coord_stop.load(std::memory_order_relaxed)) {
       bool any = false;
-      for (int L = 0; L < coord_num_slots; ++L) {
+      const int first_slot = shared_flag_signal ? static_cast<int>(flag_load_acquire(ready_flags)) - 1 : 0;
+      for (int L = first_slot; L >= 0 && L < coord_num_slots; ++L) {
         // Binary handshake (memop-compatible: the GPU-side WAIT compares against an
         // immediate baked at graph capture, so the protocol resets per step instead of
         // counting). Acquire: everything the GPU made visible before setting ready --
         // the D2H input copies -- is visible to the worker pool after this read.
-        if (flag_load_acquire(&ready_flags[L]) != 0) {
-          flag_store_release(&ready_flags[L], 0);  // consume this step's doorbell
+        if (flag_load_acquire(&ready_flags[shared_flag_signal ? 0 : L]) != 0) {
+          flag_store_release(&ready_flags[shared_flag_signal ? 0 : L], 0);
           MoeTask* t;
           {
             std::lock_guard<std::mutex> lk(flag_task_mtx);
@@ -2240,10 +2376,11 @@ struct CpuMoeExecutor {
             sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
           }
           // Release: the workers' y stores are visible before the GPU sees done.
-          flag_store_release(&done_flags[L], 1);
+          flag_store_release(&done_flags[shared_flag_signal ? 0 : L], 1);
           if (L < static_cast<int>(flag_served.size())) ++flag_served[L];
           any = true;
         }
+        if (shared_flag_signal) break;
       }
       if (any) {
         last_active = coord_clock::now();
@@ -2274,7 +2411,7 @@ struct CpuMoeExecutor {
     // caught mid-shutdown exits its sync kernel now instead of owning the watchdog
     // stall. Runs before the destructor's join() returns, while the flag arrays are
     // still alive on the Python side.
-    for (int L = 0; L < coord_num_slots; ++L) {
+    for (int L = 0; L < (shared_flag_signal ? 1 : coord_num_slots); ++L) {
       flag_store_release(&done_flags[L], INT64_MAX);
     }
   }
@@ -2329,6 +2466,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
+      .def("start_shared_signal_coordinator", &CpuMoeExecutor::start_shared_signal_coordinator,
+           py::arg("num_slots"), py::arg("pin_core"))
+      .def("flag_ready_address", &CpuMoeExecutor::flag_ready_address)
+      .def("flag_done_address", &CpuMoeExecutor::flag_done_address)
+      .def("flag_done_value", &CpuMoeExecutor::flag_done_value)
+      .def("pending_flag_slots", &CpuMoeExecutor::pending_flag_slots)
+      .def("poison_flag", &CpuMoeExecutor::poison_flag)
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
