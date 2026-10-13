@@ -39,13 +39,12 @@ dependencies = [
     "einops>=0.8,<1",
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.
-    "flashlib==0.3.0", # pin it
+    "flashlib==0.4.0", # pin it
     "gguf>=0.19,<1",
     "huggingface_hub>=1.5,<2",
     "msgpack>=1.1,<2",
     "modelscope>=1.37,<2",
-    # ceiling: numba (via flashlib) needs numpy<2.5
-    "numpy>=2.0,<2.5",
+    "numpy>=2.0,<3",
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
     "pillow>=10,<13",
