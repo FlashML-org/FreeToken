@@ -65,7 +65,8 @@ class MiMoV2Attention(BaseOP):
 
     Fused ``qkv_proj`` splits into ``[Q(kv*head_dim) | K | V]`` with V heads 128-dim;
     V is scaled by ``attention_value_scale`` then zero-padded to the group ``head_dim``
-    192 (Option B, contract DEC-3) so both groups share the 192-wide KV pool, and the
+    192 (Option B, an upstream design decision; the contract this port was checked
+    against is not distributed with the repository) so both groups share the 192-wide KV pool, and the
     attention output is sliced back to ``[..., :128]`` before ``o_proj``. Partial NeoX
     rope (first 64 of 192) runs with the group's own theta; SWA layers add fp32 softmax
     ``sinks`` and the 128-token sliding window.

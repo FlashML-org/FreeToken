@@ -1,7 +1,8 @@
 # Supported models
 
 FreeToken loads HF safetensors checkpoints directly. The checkpoints below are known-good — the prebuilt kernels are tuned
-for them; other checkpoints of the same architectures work too.
+for them; other checkpoints of the same architectures work too. The MiMo v2.6 Flash row is a recent port and is not yet
+covered by that validation; its capabilities section below states exactly what has and has not been verified.
 
 | Model | HF checkpoints |
 |---|---|
@@ -31,6 +32,33 @@ experts explicitly listed as `W4A16_NVFP4` with group size 16. The NVFP4 expert
 path uses the ModelOpt `weight_scale_2` global-scale layout and the offload backend;
 other quantization dialects, quantized dense projections, shared experts, and TP>1
 are not supported by this family loader.
+
+Validation status: unlike the families above, this port has not been validated end
+to end on real hardware. What was verified: config parsing and weight plumbing
+against synthetic weights, eager vs cached-attention numerics comparisons, and the
+release NVFP4 checkpoint's own provenance files (`config.json`,
+`model.safetensors.index.json`). What was not verified: loading the full release
+checkpoint on a GPU, quantized expert numerics through the offload backend with
+real weights, scheduler reuse, graph replay, and performance. The upstream modeling
+code and design notes this port was derived from are not distributed with the
+repository; code comments cite them only as provenance for ported behavior.
+
+Checkpoint facts, read directly from the NVFP4 release files (not executed):
+`config.json` declares `architectures: ["MiMoV2ForCausalLM"]`, `model_type: "mimo_v2"`,
+`dtype: "bfloat16"`, 48 layers split by `hybrid_layer_pattern` into 9 full-attention
+and 39 SWA layers (`sliding_window` 128), a dense layer 0 followed by 47 MoE layers
+with 256 routed experts, top-8 sigmoid `noaux_tc` routing, no shared experts,
+`head_dim` 192 with `v_head_dim` 128, dual RoPE (`rope_theta` 10000000.0,
+`swa_rope_theta` 10000.0, `partial_rotary_factor` 0.334), `attention_value_scale`
+0.707, and a `quantization_config` (`quant_method: "modelopt"`,
+`quant_algo: "MIXED_PRECISION"`, `group_size: 16`) whose `quantized_layers` map
+lists exactly 36096 modules (47 layers x 256 experts x 3 projections), each
+`W4A16_NVFP4`. `model.safetensors.index.json` maps 109114 tensors across 65 shard
+files (`metadata.total_size` 193964338432, about 181 GiB); every routed-expert
+projection ships `weight`, `weight_scale`, and `weight_scale_2` tensors, and the
+index also carries the MTP, vision, audio, and speech-embedding tensors the loader
+drops. The checkpoint's own `conversion_metadata.source_revision` is
+`3b38d063180c3e4aed9691fdc735f3d10b266ee4`.
 
 ### Image input
 

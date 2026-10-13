@@ -15,7 +15,9 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 class MiMoV2SparseBlock(BaseOP):
     """MiMo v2 sparse MoE block: top-k routed experts only (``n_shared_experts`` is None).
 
-    Routing matches HF ``MiMoV2TopKRouter`` exactly (contract SECTION 3.4): fp32 gate GEMM
+    Routing matches the upstream HF ``MiMoV2TopKRouter`` exactly, per the upstream
+    modeling code this port was derived from (not distributed with the repository):
+    fp32 gate GEMM
     (``moe_router_dtype`` is ignored by the modeling code), sigmoid scores, add the
     ``e_score_correction_bias`` for *selection only* (``n_group`` 1 keeps the noaux_tc
     grouping degenerate), gather the unbiased sigmoid scores, renormalize with +1e-20,
