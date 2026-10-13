@@ -369,3 +369,47 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     torch.cuda.synchronize()
     assert (ids[:3] != -1).all()
     assert (ids[3:] == -1).all()
+
+
+def test_moe_align_leaves_sgl_kernel_past_its_one_block_of_experts(monkeypatch):
+    """sgl_kernel's align counts experts in one 1024-thread block, and every call hands it a
+    sentinel expert past the real ones: 1023 experts fit, 1024 align on Triton."""
+    import sys
+    import types
+
+    from freetoken.kernel import backend
+    from freetoken.kernel.triton import moe_align
+    from freetoken.moe.fused import moe_align_block_size
+
+    calls = []
+    sgl_kernel = types.ModuleType("sgl_kernel")
+    sgl_kernel.moe_align_block_size = lambda topk_ids, num_experts, *_: calls.append(("sgl_kernel", num_experts))
+    monkeypatch.setitem(sys.modules, "sgl_kernel", sgl_kernel)
+    monkeypatch.setattr(backend, "is_sgl_kernel_installed", lambda: True)
+    monkeypatch.setattr(
+        moe_align, "moe_align_block_size",
+        lambda topk_ids, block_size, num_experts: calls.append(("triton", num_experts)),
+    )
+
+    for num_experts in (1023, 1024, 2100):
+        moe_align_block_size(torch.zeros((4, 2), dtype=torch.int32), 16, num_experts)
+
+    assert calls == [("sgl_kernel", 1024), ("triton", 1024), ("triton", 2100)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_experts", [1023, 2100])
+def test_moe_align_sorts_every_route_into_its_expert_blocks_past_1024_experts(num_experts):
+    """A prefill over the offload slot cache aligns against its slot count."""
+    from freetoken.moe.fused import moe_align_block_size
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, num_experts, (300, 10), device="cuda", dtype=torch.int32)
+    sorted_ids, expert_ids, padded = moe_align_block_size(ids, 16, num_experts)
+    n = int(padded)
+    flat = ids.flatten()
+    rows = sorted_ids[:n] < flat.numel()
+    real = sorted_ids[:n][rows]
+    assert sorted(real.tolist()) == list(range(flat.numel()))
+    block_of = torch.arange(n, device="cuda") // 16
+    assert torch.equal(flat[real.long()], expert_ids[block_of[rows]])

@@ -44,6 +44,11 @@ def fused_topk(
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
 
+# sgl_kernel's moe_align_block_size counts experts in one 1024-thread block and reads out of
+# bounds past it; a prefill over the offload slot cache aligns against the slot count.
+_SGL_ALIGN_MAX_EXPERTS = 1024
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -86,7 +91,7 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed():
+    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )
