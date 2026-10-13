@@ -2,6 +2,63 @@ import pytest
 import torch
 
 
+def _check_moe_alignment(topk_ids, sorted_ids, expert_ids, num_padded, block_size, num_experts):
+    routes = topk_ids.cpu().reshape(-1).long()
+    counts = torch.bincount(routes, minlength=num_experts)
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    expected_experts = torch.repeat_interleave(
+        torch.arange(num_experts, dtype=torch.int32), padded_counts // block_size
+    )
+    length = int(num_padded.item())
+    assert length == int(padded_counts.sum())
+    torch.testing.assert_close(expert_ids[: length // block_size].cpu(), expected_experts)
+    sorted_live = sorted_ids[:length].cpu().long()
+    assert bool(((sorted_live >= 0) & (sorted_live <= routes.numel())).all())
+    valid = sorted_live < routes.numel()
+    torch.testing.assert_close(torch.sort(sorted_live[valid]).values, torch.arange(routes.numel()))
+    owners = torch.repeat_interleave(expected_experts.long(), block_size)
+    torch.testing.assert_close(routes[sorted_live[valid]], owners[valid])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
+@pytest.mark.parametrize("batch_size", [1, 52, 80, 128, 129, 256])
+@pytest.mark.parametrize("pattern", ["skewed", "spread"])
+def test_moe_alignment_preserves_route_ownership(batch_size, pattern):
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    num_experts, top_k, block_size = 128, 8, 16
+    if pattern == "skewed":
+        ids = torch.tensor([114, 45, 99, 46, 98, 74, 102, 65], dtype=torch.int32).repeat(batch_size, 1)
+    else:
+        ids = (torch.arange(batch_size * top_k, dtype=torch.int32) % num_experts).view(batch_size, top_k)
+    ids = ids.cuda()
+    _check_moe_alignment(
+        ids, *moe_align_block_size(ids, block_size, num_experts), block_size, num_experts
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
+def test_moe_alignment_graph_replay_tracks_changed_experts():
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    ids = torch.tensor(
+        [114, 45, 99, 46, 98, 74, 102, 65], dtype=torch.int32, device="cuda"
+    ).repeat(80, 1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        moe_align_block_size(ids, 16, 128)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = moe_align_block_size(ids, 16, 128)
+        for step in range(5):
+            routes = torch.arange(ids.numel(), dtype=torch.int32, device="cuda")
+            ids.copy_(((routes + step * 17) % 128).view_as(ids))
+            graph.replay()
+            _check_moe_alignment(ids, *result, 16, 128)
+    stream.synchronize()
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
