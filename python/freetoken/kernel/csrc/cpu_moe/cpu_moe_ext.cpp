@@ -217,6 +217,14 @@ struct CpuMoeExecutor {
 
   std::string isa_name() const { return fmt->isa_name(); }
 
+  // Whether any route of the task names an expert; do_pass1 and do_pass2 skip the others.
+  bool has_routes(const MoeTask& t) const {
+    const int64_t n = static_cast<int64_t>(t.num_tokens) * params.top_k;
+    for (int64_t i = 0; i < n; ++i)
+      if (io_ids[i] >= 0 && io_ids[i] < num_experts) return true;
+    return false;
+  }
+
   void barrier(int& local_sense) {
     local_sense ^= 1;
     if (bar_count.fetch_add(1) + 1 == num_threads) {
@@ -430,8 +438,14 @@ struct CpuMoeExecutor {
     while (!coord_stop.load(std::memory_order_relaxed)) {
       const uint64_t word = gpu_sync->cpu_poll();
       if (word != 0) {
-        submit(from_word(word));
-        sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
+        const MoeTask t = from_word(word);
+        if (has_routes(t)) {
+          submit(t);
+          sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
+        } else {
+          // What the pool would write for a task without routes, minus its fork and join.
+          std::memset(io_y, 0, sizeof(bf16_t) * t.num_tokens * params.H);
+        }
         // Release: the workers' y stores are visible before the GPU sees done.
         gpu_sync->cpu_done();
         flag_served.fetch_add(1, std::memory_order_relaxed);
