@@ -428,7 +428,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -614,11 +614,18 @@ def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
     assert [fingerprint(s) for s in ids3.tolist()] == [E + 1, E + 2]
 
 
-def test_offload_cache_rebuild_resizes_and_preserves_sources():
+@pytest.mark.parametrize("decode_target", ["gpu", "hybrid"])
+def test_offload_cache_rebuild_resizes_and_preserves_sources(decode_target):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"),
+        decode_target=decode_target,
+    )
+    if decode_target == "hybrid":
+        cache.set_cpu_executor(object())
+    scheduler = cache.hybrid_decode_executor
     gate_up = torch.randn(4, 32, 8)
     down = torch.randn(4, 8, 16)
     cache.set_bank_sources({"gate_up": [gate_up], "down": [down]})
@@ -632,6 +639,9 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
     # GPU slot caches resized to the new cache_size, row shape unchanged
     assert cache.bank_caches["gate_up"].shape == (10, 32, 8)
     assert cache.bank_caches["down"].shape == (10, 8, 16)
+    assert cache.hybrid_decode_executor is scheduler
+    if scheduler is not None:
+        assert scheduler.cache.bank_caches["gate_up"] is cache.bank_caches["gate_up"]
     # bookkeeping resized + reset
     assert cache.id_of_slot.shape == (10,)
     assert cache.usage.shape == (10,)
