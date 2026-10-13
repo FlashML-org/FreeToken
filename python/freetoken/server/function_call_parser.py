@@ -753,14 +753,49 @@ class InvokeParamStreamMixin:
             return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
         return text.rstrip(self._ps_trim)
 
+    def _ps_pos_inside_invoke_header(self, text: str, pos: int, boundary_pos: int) -> bool:
+        """True when ``pos`` falls inside an invoke opener header that begins
+        after ``boundary_pos`` (the earliest structural boundary in the
+        buffer), complete or still streaming. Block consumption takes such a
+        header atomically, so structural tokens inside it are name data, never
+        boundaries. An opener at or before ``boundary_pos`` is value data: a
+        genuine next-call header can only follow a closer, so its span must
+        never suppress a boundary."""
+        prefix = self._ps_invoke_open_prefix
+        if not prefix:
+            return False
+        start = text.rfind(prefix, 0, pos + 1)
+        while start != -1:
+            if start <= boundary_pos:
+                return False
+            if start + len(prefix) <= pos:
+                match = self._ps_invoke_open_re.match(text, start)
+                if match is None or pos < match.end():
+                    return True
+            start = text.rfind(prefix, 0, start)
+        return False
+
     def _ps_find_boundary(self, text: str) -> tuple[int, str | None]:
         pos, token = -1, None
-        for candidate in dict.fromkeys(
-            (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
-        ):
-            if not candidate:
-                continue
+        candidates = [
+            candidate
+            for candidate in dict.fromkeys(
+                (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
+            )
+            if candidate
+        ]
+        # Earliest raw boundary: opener prefixes before it are value data and
+        # their spans must never suppress a boundary (phantom header spans).
+        boundary_pos = min(
+            (p for p in (text.find(candidate) for candidate in candidates) if p != -1),
+            default=-1,
+        )
+        for candidate in candidates:
             candidate_pos = text.find(candidate)
+            while candidate_pos != -1 and self._ps_pos_inside_invoke_header(
+                text, candidate_pos, boundary_pos
+            ):
+                candidate_pos = text.find(candidate, candidate_pos + 1)
             if candidate_pos != -1 and (pos == -1 or candidate_pos < pos):
                 pos, token = candidate_pos, candidate
         return pos, token
@@ -777,30 +812,52 @@ class InvokeParamStreamMixin:
             default=0,
         )
 
-    def _ps_following_call_pos(self, text: str, pos: int, boundary: str) -> int:
-        if boundary == self._ps_invoke_close:
-            outer_pos = text.find(self._ps_outer_close, pos + len(boundary))
-            if outer_pos == -1:
-                return -1
-            after_outer = outer_pos + len(self._ps_outer_close)
-        elif boundary == self._ps_outer_close:
-            after_outer = pos + len(boundary)
-        else:
-            return -1
+    def _ps_skip_ws(self, text: str, cursor: int) -> int:
+        return cursor + len(text[cursor:]) - len(text[cursor:].lstrip())
 
-        open_pos = text.find(self._ps_outer_open, after_outer)
-        if open_pos == -1:
+    def _ps_following_call_pos(self, text: str, pos: int, boundary: str) -> int:
+        """Confirm recovery only for arrangements the block scanner can actually
+        consume without truncating the value or leaking the next call.
+
+        After an invoke closer the scanner sits in the block state, which
+        accepts an invoke opener directly, after outer-open debris, or after
+        one outer close plus a new outer open. After an outer closer the
+        scanner ends idle and requires a new outer opener first. Any other
+        arrangement must not confirm, so the resolution stays pending or
+        value data instead of truncating-and-losing the call."""
+        if boundary not in (self._ps_invoke_close, self._ps_outer_close):
             return -1
-        invoke_pos = text.find(self._ps_invoke_open_prefix, open_pos + len(self._ps_outer_open))
-        if invoke_pos == -1:
-            return -1
-        match = self._ps_invoke_open_re.search(text, invoke_pos)
-        return open_pos if match is not None else -1
+        cursor = self._ps_skip_ws(text, pos + len(boundary))
+        if boundary == self._ps_outer_close:
+            # Idle state: only a new outer opener followed by an invoke
+            # opener is reachable; a bare invoke opener would leak.
+            if not (
+                self._ps_outer_open and text.startswith(self._ps_outer_open, cursor)
+            ):
+                return -1
+            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
+        elif self._ps_outer_close and text.startswith(self._ps_outer_close, cursor):
+            # Block state: one outer close may hand over to a new envelope.
+            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_close))
+            if not (
+                self._ps_outer_open and text.startswith(self._ps_outer_open, cursor)
+            ):
+                return -1
+            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
+        while self._ps_outer_open and text.startswith(self._ps_outer_open, cursor):
+            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
+        # Only an adjacent invoke opener confirms recovery; quoted prose does not.
+        return cursor if self._ps_invoke_open_re.match(text, cursor) else -1
 
     def _ps_boundary_resolution(
         self, text: str, *, end_of_stream: bool = False
     ) -> tuple[int, str | None, str | None]:
-        """Prefer a later parameter close; a complete following call confirms recovery."""
+        """Prefer a later parameter close unless an adjacent invoke opens first.
+
+        Structural tokens inside an invoke opener header that begins after the
+        boundary (quoted names may embed them) are name data: the search skips
+        them and the resolution holds pending until the header completes or
+        the stream ends, so whole and split delivery agree on the boundary."""
         pos, boundary = self._ps_find_boundary(text)
         if boundary is None:
             return pos, boundary, None
@@ -809,6 +866,10 @@ class InvokeParamStreamMixin:
 
         next_call = self._ps_following_call_pos(text, pos, boundary)
         parameter_close = text.find(self._ps_param_close, pos + len(boundary))
+        while parameter_close != -1 and self._ps_pos_inside_invoke_header(
+            text, parameter_close, pos
+        ):
+            parameter_close = text.find(self._ps_param_close, parameter_close + 1)
         if next_call != -1 and (parameter_close == -1 or next_call < parameter_close):
             return pos, boundary, "structural"
         if parameter_close != -1:
