@@ -19,11 +19,13 @@ Two tiers ride alongside the shadow slab and are NOT per-token:
 The slab is amortized into the per-token KV price (``unit_bytes``); the ring and scratch are
 fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
 
-Placed on the host (``--kv-placement host``), the K/V slabs live in pinned host memory and only
-the index tiers stay on the device, so the context is bounded by host RAM. Decode reads its
+Placed on the host (``--kv-placement host``), the K/V slabs live in pinned host memory and the
+index tiers stay on the device, so the context is bounded by host RAM. Decode reads its
 selection in place over PCIe. A prefill cannot: every query row reads its own selection, so a
 chunk would move each cached token over the bus hundreds of times. It stages the batch's pages
-into a device window once per layer instead (``staging_window``), a fixed device cost.
+into a device window once per layer instead (``staging_window``) and folds the passes of a
+context wider than one window in a float32 accumulator (``fold_workspace``): both are fixed
+device costs.
 """
 
 from __future__ import annotations
@@ -239,8 +241,8 @@ class QSAKVCache(MHAKVCache):
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
-        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring, the
-        # scratch rows and a host pool's staging window are the fixed term kv_cost reports.
+        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring, the scratch
+        # rows and a host pool's staging window and fold accumulator are the fixed term kv_cost reports.
         kv, swa = super().unit_bytes()
         tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
         slab = (

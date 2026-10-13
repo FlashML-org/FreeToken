@@ -1535,8 +1535,8 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
-    # Before any weight is read: a placement the pool cannot serve would otherwise fail
-    # minutes later, after the expert banks are loaded.
+    # Before any weight is read: a placement the pool cannot serve would otherwise fail only
+    # after the expert banks are loaded.
     check_kv_placement(model_config, config.kv_placement)
 
     if not is_moe:
