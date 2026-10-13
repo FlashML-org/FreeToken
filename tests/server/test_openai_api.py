@@ -848,6 +848,100 @@ def test_mimo_history_renders_verbatim_arguments_in_reference_template():
     assert expected_envelope in rendered
 
 
+def test_mimo_reference_template_generation_position_matrix():
+    """DR-09: the reference template must leave the generation slot outside the
+    think block in every mode (thinking on/off x tools present/absent, plus the
+    kwargs pass-through default). This is
+    the premise behind the unconditional force_reasoning=False for the mimo_v2
+    reasoning parser in generation.py."""
+    import os
+    from pathlib import Path
+
+    from jinja2 import Environment
+
+    from freetoken.server.reasoning_parser import THINK_END_TOKEN, THINK_START_TOKEN
+
+    root = Path(__file__).resolve().parents[2]
+    template_path = Path(
+        os.environ.get(
+            "FREETOKEN_MIMO_CHAT_TEMPLATE",
+            root / "validation" / "real_ckpt_ref" / "chat_template.jinja",
+        )
+    )
+    if not template_path.is_file():
+        pytest.skip("MiMo validation chat template is not available")
+    template = template_path.read_text()
+    environment = Environment()
+    environment.filters["tojson"] = lambda value, ensure_ascii=True: json.dumps(
+        value, ensure_ascii=ensure_ascii
+    )
+    jinja_template = environment.from_string(template)
+
+    # The kwargs the server actually sends: the reasoning-effort mapping
+    # broadcasts every toggle spelling; this template reads enable_thinking.
+    on_spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
+    assert on_spec.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    }
+    off_spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
+    assert off_spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
+
+    # Genuinely tool-free specs: chat_request defaults to tools=tool_schema(),
+    # so the absence legs must be built with tools=None explicitly.
+    on_no_tools_spec = chat_request_to_genspec(
+        chat_request(reasoning_effort="high", tools=None), {}
+    )
+    assert on_no_tools_spec.template_tools is None
+    off_no_tools_spec = chat_request_to_genspec(
+        chat_request(reasoning_effort="none", tools=None), {}
+    )
+    assert off_no_tools_spec.template_tools is None
+
+    # A client sending neither reasoning_effort nor a thinking key passes no
+    # template kwargs at all (the most common real-world path).
+    default_spec = chat_request_to_genspec(chat_request(), {})
+    assert default_spec.chat_template_kwargs == {}
+
+    # Template-structural literals, quoted from the reference template's own
+    # rendered output (it never reads thinking_mode; only enable_thinking
+    # is false opens the empty block).
+    assistant_header = "<|im_start|>assistant\n"
+    tools_header = "You are provided with the following tools:\n\n<tools>"
+
+    for label, spec, with_tools, thinking_on in (
+        ("thinking-on+tools", on_spec, True, True),
+        ("thinking-on", on_no_tools_spec, False, True),
+        ("thinking-off+tools", off_spec, True, False),
+        ("thinking-off", off_no_tools_spec, False, False),
+        ("kwargs-passthrough", default_spec, True, True),
+    ):
+        rendered = jinja_template.render(
+            messages=spec.messages,
+            tools=spec.template_tools,
+            add_generation_prompt=True,
+            **spec.chat_template_kwargs,
+        )
+        if with_tools:
+            assert tools_header in rendered, label
+        else:
+            # Genuinely tool-free render: the absence axis must not silently
+            # degenerate into a duplicate of the tools leg.
+            assert tools_header not in rendered, label
+        markers = 0 if thinking_on else 1
+        assert rendered.count(THINK_START_TOKEN) == markers, label
+        assert rendered.count(THINK_END_TOKEN) == markers, label
+        if thinking_on:
+            # No opener is pre-emitted in any thinking-on mode, with or without
+            # tools: the slot is bare and the model opens the block itself when
+            # it reasons, so the parser must not be forced.
+            expected_suffix = assistant_header
+        else:
+            # Thinking off pre-emits an empty, already-closed think block, so
+            # generation continues after the closer, outside reasoning.
+            expected_suffix = assistant_header + THINK_START_TOKEN + THINK_END_TOKEN
+        assert rendered.endswith(expected_suffix), label
+
+
 # --------------------------------------------------------------------------- #
 # DR-02: think markers inside verbatim tool arguments (MiMo)                   #
 # --------------------------------------------------------------------------- #
