@@ -1,7 +1,7 @@
 """CPU MoE executor -- native GGUF Q4_0 experts (``--moe-backend cpu``/``hybrid`` for
 the gemma4 GGUF checkpoint).
 
-The CPU W4A16 GEMV (``q4_0_dot`` in csrc/cpu_moe/cpu_moe_ext.cpp) reads the *same*
+The CPU W4A16 GEMV (``q4_0_dot`` in csrc/cpu_moe/kernels/q4_0.cpp) reads the *same*
 packed Q4_0 banks the GPU offload path streams and dequantizes weights inside the
 K-loop. We check it against the reference dequant (models/gguf/dequant.py) + the
 production bf16 GPU decode kernel on byte-identical banks: both are W4A16, so the

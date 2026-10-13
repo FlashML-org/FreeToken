@@ -467,7 +467,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
     ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
 
-    # Eager forward: also materializes the per-bs pinned buffers + per-(layer,bs) task.
+    # Eager forward.
     out_eager = ex.decode(layer, hidden, w, ids)
     torch.cuda.synchronize()
     ref_eager = _reference(cache, layer, hidden, ids.cpu(), w.cpu())
@@ -500,11 +500,9 @@ def test_cpu_moe_decode_cuda_graph_replay():
     # must actually have exercised it -- guard against a silent fallback to the
     # host-func path making this test vacuous for the capture-embedded memops.
     if ex._flag_sync:
-        assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
-        slot = ex._flag_slots[(layer, bs)]
-        assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
-        assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
+        assert ex._ext.flag_served() >= 4, "1 eager + 3 replay dispatches expected"
+        assert not ex._ext.flag_pending(), "handshake at rest"
+        assert not ex._unhealthy, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")

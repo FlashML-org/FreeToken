@@ -17,8 +17,9 @@ H, I, E, TOPK = 1024, 512, 16, 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_dsfp4_gpu_prequant_bit_parity():
+def test_dsfp4_gpu_prequant_bit_parity(monkeypatch):
     from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.moe import cpu_executor
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     torch.manual_seed(0)
@@ -44,14 +45,13 @@ def test_dsfp4_gpu_prequant_bit_parity():
     wts = torch.rand(2, TOPK, device=dev)
 
     def run(cpu_roundtrip: bool) -> torch.Tensor:
+        # control: the original CPU-side scalar round-trip
+        monkeypatch.setattr(cpu_executor, "_DSFP4_GPU_PREQUANT", not cpu_roundtrip)
         ex = CpuMoeExecutor(
             cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
             num_threads=4, max_tokens=2, device=dev, swiglu_limit=10.0, act_block=128,
         )
-        assert ex._gpu_prequant, "ds_fp4 on CUDA should enable GPU prequant"
-        if cpu_roundtrip:  # control: the original CPU-side scalar round-trip
-            ex._gpu_prequant = False
-            ex._ext.set_input_prequant(False)
+        assert ex._gpu_prequant != cpu_roundtrip, "ds_fp4 on CUDA should enable GPU prequant"
         out = ex.decode(0, x, wts, ids.clone()).clone()
         torch.cuda.synchronize()
         del ex

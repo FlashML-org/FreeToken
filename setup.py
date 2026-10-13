@@ -112,6 +112,11 @@ setup(
             name="freetoken.kernel._cpu_moe",
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+                f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
+                *sorted(
+                    str(p.relative_to(ROOT))
+                    for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
+                ),
             ],
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
