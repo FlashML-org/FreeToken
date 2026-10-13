@@ -76,6 +76,26 @@ On GH200 this raises the gather from ~220 to ~410 GB/s (`PCIe-gather` in
 set so the hybrid split is calibrated against the faster gather. Leave it
 unset on PCIe GPUs: wider grids add no bandwidth there.
 
+### CPU/Hybrid MoE graph compatibility
+
+CPU and hybrid MoE have the same execution semantics on CUDA and ROCm, but use
+backend-specific GPU/CPU synchronization. CUDA retains its mapped-pinned,
+per-slot flag handshake. ROCm 7.14 uses HIP signal memory and explicit Graph
+batch-memory-op nodes whose storage follows the CPU executor's lifetime.
+
+At startup, FreeToken verifies the ROCm path with a real graph capture,
+instantiate, and replay probe. If that probe fails, FreeToken disables CUDA
+Graph for CPU/hybrid MoE and continues on the correct eager path. Set
+`FREETOKEN_CPU_MOE_FLAG_SYNC=0` to explicitly disable the native flag handshake;
+on ROCm this also selects the graph-off eager path.
+
+The same safety check covers `--moe-strategy offload --moe-cpu-layers ...`.
+For tensor parallelism, a failed probe on any rank disables Graph on every rank.
+On ROCm, `auto` does not upgrade offload to hybrid while Graph is enabled,
+because backend selection happens before the executor can run its probe.
+ROCm versions without the graph batch-memory-op APIs use the eager fallback;
+a version number alone does not enable graph replay.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

@@ -266,3 +266,45 @@ def test_fp16_bits_carry_every_e4m3_byte():
     finite = torch.isfinite(ref)
     assert torch.equal(got[finite], ref[finite])
     assert torch.equal(got[~finite].abs(), torch.full((2,), 480.0))  # 0x7F / 0xFF, as e4m3_decode
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA or ROCm")
+def test_cpu_fp8_block_graph_replay_tracks_new_routing():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block
+
+    L, E, H, I, top_k, bs = 1, 4, 256, 128, 2, 3
+    cache = _make_fp8_block_cache(L, E, H, I, seed=37)
+    executor = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=bs, device=torch.device("cuda"),
+    )
+    if torch.version.hip and not executor.graph_capture_safe:
+        pytest.skip("native ROCm graph handshake unavailable")
+    banks = [cache.bank_sources[name][0].cuda() for name in (
+        "gate_up", "gate_up_scale", "down", "down_scale",
+    )]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        hidden = torch.randn(bs, H, device="cuda", dtype=torch.bfloat16)
+        ids = torch.randint(0, E, (bs, top_k), device="cuda", dtype=torch.int32)
+        weights = torch.rand(bs, top_k, device="cuda")
+        executor.decode(0, hidden, weights, ids)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = executor.decode(0, hidden, weights, ids)
+        for replay in range(8):
+            torch.manual_seed(900 + replay)
+            hidden.copy_(torch.randn_like(hidden))
+            ids.copy_(torch.randint_like(ids, 0, E))
+            weights.copy_(torch.rand_like(weights))
+            graph.replay()
+            expected = fused_experts_decode_fp8_block(
+                hidden, *banks, weights, ids.clone(), "silu", False,
+            ).float()
+            stream.synchronize()
+            rel = (output.float() - expected).abs().max() / (expected.abs().max() + 1e-6)
+            assert rel < 2e-2, f"replay={replay}: {rel}"
+        executor.raise_if_unhealthy()
