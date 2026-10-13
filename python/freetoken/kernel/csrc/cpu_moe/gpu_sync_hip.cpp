@@ -28,6 +28,12 @@ void hip_check(hipError_t rc, const char* what) {
     throw std::runtime_error(std::string("CPU MoE HIP flag sync: ") + what + " failed: " + hipGetErrorString(rc));
 }
 
+// Capability failures must not poison eager fallback or hide a caller's earlier error.
+struct ProbeErrorScope {
+  ProbeErrorScope() { hip_check(hipPeekAtLastError(), "pending error before probe"); }
+  ~ProbeErrorScope() { (void)hipGetLastError(); }
+};
+
 hipError_t alloc_signal(uint64_t** out) {
   void* storage = nullptr;
   const hipError_t rc = hipExtMallocWithFlags(&storage, sizeof(uint64_t), hipMallocSignalMemory);
@@ -53,6 +59,7 @@ bool capturing(hipStream_t stream) {
 // Whether this runtime records a native hipStreamWriteValue64 issued under capture as a graph node.
 bool records_native_memops() {
   static const bool native = [] {
+    ProbeErrorScope errors;
     uint64_t* word = nullptr;
     hipStream_t stream = nullptr;
     hipGraph_t graph = nullptr;
@@ -106,7 +113,10 @@ hipError_t add_capture_memop_node(hipStream_t stream, hipStreamBatchMemOpParams*
   hipGraphNode_t node = nullptr;
   rc = hipGraphAddBatchMemOpNode(&node, graph, dependencies, dependency_count, &params);
   if (rc != hipSuccess) return rc;
-  return hipStreamUpdateCaptureDependencies(stream, &node, 1, hipStreamSetCaptureDependencies);
+  rc = hipStreamUpdateCaptureDependencies(stream, &node, 1, hipStreamSetCaptureDependencies);
+  // EndCapture rejects a node that was added but never joined to the stream.
+  if (rc != hipSuccess && node != nullptr) (void)hipGraphDestroyNode(node);
+  return rc;
 }
 
 hipStreamBatchMemOpParams write_op(uint64_t* address, uint64_t value) {
@@ -170,6 +180,7 @@ GpuSync::~GpuSync() {
 }
 
 bool GpuSync::probe(uintptr_t /*stream*/) {
+  ProbeErrorScope errors;
   int device = 0;
   int can_wait = 0;
   if (hipGetDevice(&device) != hipSuccess ||
