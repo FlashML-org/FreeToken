@@ -439,6 +439,92 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
 
 
+def _streamed_decode(device, hidden, topk_weights, topk_ids):
+    """The decode GEMV over layer 1 materialized whole, where position == expert id."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    cache, _ = _triton_cache(device)
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    return fused_experts_decode_nvfp4_marlin(
+        hidden, *cache.bank_views(E), topk_weights, topk_ids.clone(), "silu", False
+    )
+
+
+@cuda
+@pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
+def test_triton_wide_decode_step_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width):
+    """A decode step routing more often than one admission query compiles for loads its distinct
+    experts a query at a time: the GEMV over the slots must equal the one over the streamed layer
+    exactly, and the statistics must count the step once. The cache of one layer's experts,
+    filled three at a time, must keep every query's experts until the GEMV."""
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    if query_width is not None:
+        monkeypatch.setattr(offload_kernels, "ENSURE_QUERY_WIDTH", query_width)
+    device = torch.device("cuda")
+    torch.manual_seed(16)
+    M = 600
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    streamed = _streamed_decode(device, hidden, topk_weights, topk_ids)
+
+    cache, _ = _triton_cache(device, cache_size=cache_size)
+    cache.collect_stats = True
+    # earlier steps left the other layer's experts and one of this layer's resident, so slots are not expert ids
+    for layer_id, resident in ((0, [7, 6]), (1, [2])):
+        cache.load_experts(layer_id, torch.tensor([resident], dtype=torch.int32, device=device))
+    stats = cache.lru_stats[1].clone()
+    slots = cache.load_experts(1, topk_ids)
+    decoded = fused_experts_decode_nvfp4_marlin(
+        hidden, *cache.bank_views(), topk_weights, slots, "silu", False
+    )
+
+    assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
+    assert torch.equal(decoded, streamed)
+    # one step that met all E experts and missed every one but the resident expert 2
+    assert (cache.lru_stats[1] - stats).tolist() == [E, E - 1, 1]
+
+
+@cuda
+def test_triton_wide_decode_step_replays_as_a_cuda_graph(monkeypatch):
+    """Decode runs as a CUDA graph, so a wide step's admission must capture: no host sync and fixed
+    shapes, and a replay on a cold cache admits and copies every expert itself."""
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    monkeypatch.setattr(offload_kernels, "ENSURE_ONE_CALL_WIDTH", 3)
+    monkeypatch.setattr(offload_kernels, "ENSURE_QUERY_WIDTH", 3)
+    device = torch.device("cuda")
+    torch.manual_seed(17)
+    M = 8
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    streamed = _streamed_decode(device, hidden, topk_weights, topk_ids)
+
+    cache, _ = _triton_cache(device, cache_size=2 * S)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        warm = cache.load_experts(1, topk_ids.clone())
+        fused_experts_decode_nvfp4_marlin(hidden, *cache.bank_views(), topk_weights, warm, "silu", False)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        slots = cache.load_experts(1, topk_ids.clone())
+        decoded = fused_experts_decode_nvfp4_marlin(
+            hidden, *cache.bank_views(), topk_weights, slots, "silu", False
+        )
+    cache.reset()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(decoded, streamed)
+
+
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache

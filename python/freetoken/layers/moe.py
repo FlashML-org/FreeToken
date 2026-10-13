@@ -264,10 +264,10 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
-        ids in place (loading missing experts), then the GEMM reads the full slot
-        cache. All device-side with fixed shapes, so the decode call is CUDA-graph
-        capturable.
+        """On-demand load: ``load_experts`` makes the routed experts resident and maps
+        ``topk_ids`` to their cache slots (in place when one admission takes the step),
+        then the GEMM reads the full slot cache. All device-side with fixed shapes, so
+        the decode call is CUDA-graph capturable.
 
         For ``decode_target == "cpu"`` the experts are instead computed on the CPU
         (high RAM bandwidth) straight from the host banks: ship hidden/routing to
@@ -282,13 +282,12 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        slots = cache.load_experts(self.layer_id, topk_ids)
         return self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
-            topk_ids,
+            slots,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),

@@ -224,8 +224,9 @@ class OffloadMoeCache:
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
-        # the kernel, which accumulates in the same launch. The stat_* tensors below stay
-        # for the hybrid path, whose kernel is still ours.
+        # the kernel, which accumulates in the same launch; load_experts adds a wider step's
+        # counts itself, once per step. The stat_* tensors below stay for the hybrid path,
+        # whose kernel is still ours.
         self.lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
@@ -843,17 +844,56 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def load_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make the experts ``topk_ids`` routes to resident, copying in the missing ones, and return
+        ``topk_ids`` as slot ids. A step of at most ``ENSURE_ONE_CALL_WIDTH`` routes is one
+        admission that rewrites ``topk_ids`` in place. A wider one goes to the slot cache as its
+        distinct experts, ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the
+        next query evicts: LRU evicts an earlier query's slots last, and a layer never routes to
+        more experts than the cache holds. The statistics count either step once."""
+        from freetoken.moe.offload_kernels import ENSURE_ONE_CALL_WIDTH, ENSURE_QUERY_WIDTH, ensure_experts
+
+        if topk_ids.numel() <= ENSURE_ONE_CALL_WIDTH:
+            self.ensure_experts(layer_id, topk_ids)
+            self.copy_missing()
+            return topk_ids
+        self._count_routing(layer_id, topk_ids)
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a step's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        missed = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            missed += self.num_indices[0]
+            self.copy_missing()
+        if self.collect_stats:
+            stats = self.lru_stats[layer_id]
+            stats[Stat.ACTIVE] += routed.sum()
+            stats[Stat.MISS] += missed
+            stats[Stat.CALLS] += 1
+        return self.slot_for_id[layer_id][topk_ids.long()]
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to slot ids in
+        # place), so snapshot the routing histogram before that happens.
+        self._count_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+
+    def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        if self.collect_decode_freq:
+            ids = expert_ids.reshape(-1).long()
+            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -905,7 +945,7 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
 
     def record_decode_stats(self, layer_id: int) -> None:
-        """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
+        """No-op: ``load_experts`` accumulates into ``lru_stats`` as it admits.
 
         Kept so the hybrid and non-hybrid call sites stay symmetric. The previous version
         was eight torch ops per layer per step, all captured into the decode graph.
