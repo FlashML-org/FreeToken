@@ -7,7 +7,7 @@ K-loop. We check it against the reference dequant (models/gguf/dequant.py) + the
 production bf16 GPU decode kernel on byte-identical banks: both are W4A16, so the
 only spread is weight bf16-rounding + reduction order -> tight relative tolerance.
 
-Part 2 covers CUDA-graph capture/replay (the cudaLaunchHostFunc submit/sync nodes
+Part 2 covers GPU graph capture/replay (the CPU/GPU submit/sync handshake
 must recompute from the freshly written pinned routing on each replay).
 """
 
@@ -148,9 +148,12 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
 
 
 def test_cpu_moe_decode_q4_0_cuda_graph_replay():
-    """Q4_0 CPU path under capture/replay: the host nodes must recompute the GEMV from
+    """Q4_0 CPU path under capture/replay: the handshake must recompute the GEMV from
     the freshly written pinned routing on each replay (dep flows through pinned buffers)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.cpu_executor import _FLAG_SYNC
+    if torch.version.hip and not _FLAG_SYNC:
+        pytest.skip("native HIP handshake explicitly disabled")
     from freetoken.moe.fused import fused_experts_decode_impl
 
     torch.manual_seed(9)

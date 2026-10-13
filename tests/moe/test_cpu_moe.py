@@ -4,13 +4,14 @@ Part 1 -- numerical alignment: the CPU SwiGLU MoE GEMV vs FreeToken's production
 GPU decode kernels (bf16/nvfp4/mxfp4/ds_fp4) on identical banks and routing across
 batch sizes (fp32-accumulate, so the only spread is reduction order -> tight tol).
 
-Part 2 -- CUDA-graph capture/replay: the cudaLaunchHostFunc submit/sync host nodes
-end to end (eager decode, capture, replay with *new* data -> result tracks the new
+Part 2 -- GPU graph capture/replay: the CPU/GPU handshake end to end
+(eager decode, capture, replay with *new* data -> result tracks the new
 routing, i.e. the dependency flows through the pinned buffers, not baked-in).
 """
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -441,6 +442,8 @@ def _reference(cache, layer, hidden, ids, w, act="silu", apply_in=False):
 
 
 def test_cpu_moe_decode_cuda_graph_replay():
+    if torch.version.hip and os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC") == "0":
+        pytest.skip("native HIP handshake explicitly disabled")
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     torch.manual_seed(0)
@@ -503,17 +506,234 @@ def test_cpu_moe_decode_cuda_graph_replay():
         assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
         slot = ex._flag_slots[(layer, bs)]
         assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
+        if torch.version.hip:
+            assert ex._ext.flag_done_value() == 1
+            assert not ex._ext.pending_flag_slots()
+        else:
+            assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
         assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")
 
 
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm native handshake")
+@pytest.mark.parametrize("failure", ["disabled", "probe_failed", "slots_exhausted"])
+def test_rocm_graph_rejects_host_callback_fallback(monkeypatch, failure):
+    import freetoken.moe.cpu_executor as cpu_executor
+    from freetoken.kernel import _cpu_moe
+
+    monkeypatch.setattr(cpu_executor, "_FLAG_SYNC", failure != "disabled")
+    if failure == "probe_failed":
+        monkeypatch.setattr(_cpu_moe, "memops_probe", lambda *args: False)
+    cache = _make_cache(1, 4, 64, 32)
+    executor = cpu_executor.CpuMoeExecutor(
+        cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=1, device=torch.device("cuda"),
+    )
+    if failure == "slots_exhausted":
+        assert executor._flag_sync
+        executor._flag_capacity = 0
+    else:
+        assert not executor._flag_sync
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        x = torch.randn(1, 64, device="cuda", dtype=torch.bfloat16)
+        ids = torch.randint(4, (1, 2), device="cuda", dtype=torch.int32)
+        w = torch.rand(1, 2, device="cuda")
+        eager = executor.decode(0, x, w, ids)
+        stream.synchronize()
+        ref = _reference(cache, 0, x, ids.cpu(), w.cpu())
+        assert (eager.float().cpu() - ref).abs().max() < 0.02 * ref.abs().max()
+        message = "flag slots" if failure == "slots_exhausted" else "requires the native HIP handshake"
+        with pytest.raises(RuntimeError, match=message):
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+                x.add_(0)
+                executor.decode(0, x, w, ids)
+
+
+def test_cuda_flag_memops_keep_existing_module_api(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    class TensorStub:
+        shape = (1, 8)
+
+        def copy_(self, *args, **kwargs):
+            return self
+
+        def to(self, *args):
+            return self
+
+    calls = []
+    executor = object.__new__(cpu_executor.CpuMoeExecutor)
+    executor._flag_sync = True
+    executor._gpu_prequant = False
+    executor._flag_slots = {(0, 1): 3}
+    executor._cpu_moe = SimpleNamespace(
+        memop_submit=lambda *args: calls.append(("submit", args)),
+        memop_sync=lambda *args: calls.append(("sync", args)),
+    )
+    executor._ext = SimpleNamespace()
+    executor._ready = SimpleNamespace(data_ptr=lambda: 101)
+    executor._done = SimpleNamespace(data_ptr=lambda: 202)
+    io = {name: TensorStub() for name in ("x", "ids", "w", "y")}
+    executor._io_for = lambda bs: io
+    executor._task_for = lambda layer, bs: 303
+    executor._io = {1: io}
+    monkeypatch.setattr(cpu_executor, "_IS_ROCM", False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=404))
+    monkeypatch.setattr(torch, "empty_like", lambda tensor: TensorStub())
+    tensor = TensorStub()
+    executor.decode_sync(executor.decode_submit(0, tensor, tensor, tensor))
+    assert calls == [("submit", (404, 202, 101, 3)), ("sync", (404, 202, 3))]
+
+
+def test_rocm_watchdog_releases_shared_signal(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    monkeypatch.setattr(cpu_executor, "_IS_ROCM", True)
+    poisoned = []
+    executor = object.__new__(cpu_executor.CpuMoeExecutor)
+    executor._ext = SimpleNamespace(
+        pending_flag_slots=lambda: [0], flag_served_count=lambda slot: 0,
+        poison_flag=poisoned.append,
+    )
+    executor._err = torch.zeros(1, dtype=torch.int64)
+    suspects = {}
+    monkeypatch.setattr(cpu_executor.time, "monotonic", lambda: 1)
+    executor._watchdog_tick(suspects)
+    assert not poisoned
+    monkeypatch.setattr(cpu_executor.time, "monotonic", lambda: 12)
+    executor._watchdog_tick(suspects)
+    assert poisoned == [0]
+    with pytest.raises(RuntimeError, match="watchdog fired"):
+        executor.raise_if_unhealthy()
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm native handshake")
+def test_rocm10_graph_replay_with_nineteen_sizes_and_rebuilds():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, _FLAG_SYNC
+
+    if not _FLAG_SYNC:
+        pytest.skip("native HIP handshake explicitly disabled")
+    torch.manual_seed(350)
+    cache = _make_cache(2, 4, 64, 32)
+    executor = CpuMoeExecutor(
+        cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=19, device=torch.device("cuda"),
+    )
+    assert executor._flag_sync
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        captured = []
+        for bs in range(1, 20):
+            x = torch.randn(bs, 64, device="cuda", dtype=torch.bfloat16)
+            ids = torch.randint(4, (bs, 2), device="cuda", dtype=torch.int32)
+            w = torch.rand(bs, 2, device="cuda")
+            for layer in range(2):
+                executor.decode(layer, x, w, ids)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = [executor.decode(layer, x, w, ids) for layer in range(2)]
+            captured.append((graph, outputs, x, ids, w))
+
+        for rebuild in range(4):
+            for index, (graph, outputs, x, ids, w) in enumerate(captured):
+                if rebuild and index == 0:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        outputs = [executor.decode(layer, x, w, ids) for layer in range(2)]
+                    captured[index] = graph, outputs, x, ids, w
+                x.copy_(torch.randn_like(x))
+                ids.copy_(torch.randint_like(ids, 0, 4))
+                w.copy_(torch.rand_like(w))
+                graph.replay()
+                stream.synchronize()
+                for layer, output in enumerate(outputs):
+                    ref = _reference(cache, layer, x, ids.cpu(), w.cpu())
+                    rel = (output.float().cpu() - ref).abs().max() / ref.abs().max()
+                    assert rel < 0.02, (rebuild, index, layer, rel)
+                executor.raise_if_unhealthy()
+    assert len(executor._flag_slots) == 38
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm native handshake")
+@pytest.mark.parametrize("overlap", [False, True])
+def test_rocm10_hybrid_graph_replay(overlap, monkeypatch):
+    import freetoken.layers.moe as moe
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, _FLAG_SYNC
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    if not _FLAG_SYNC:
+        pytest.skip("native HIP handshake explicitly disabled")
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setattr(moe, "_HYBRID_OVERLAP", overlap)
+    torch.manual_seed(350)
+    L, E, H, I, K, B = 2, 4, 128, 64, 2, 2
+    cache = OffloadMoeCache(
+        L, E, E, torch.device("cuda"), decode_target="hybrid", hybrid_max_fetch=1,
+    )
+    banks = {}
+    for name, shape in (("gate_up", (2 * I, H)), ("down", (H, I))):
+        bank = alloc_pinned_tensor(L * E, *shape, dtype=torch.bfloat16)
+        bank.copy_(torch.randn(bank.shape) * 0.05)
+        banks[name] = list(bank.split(E))
+    cache.set_bank_sources(banks)
+    executor = CpuMoeExecutor(
+        cache, top_k=K, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=B, device=torch.device("cuda"),
+    )
+    assert executor._flag_sync
+    cache.set_cpu_executor(executor)
+    layers = [moe.OffloadMoELayer(l, E, K, H, I, quant_config=NoQuantConfig()) for l in range(L)]
+    for layer in layers:
+        layer.offload_cache = cache
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        hidden = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
+        ids = torch.arange(B * K, dtype=torch.int32, device="cuda").reshape(B, K)
+        weights = torch.rand(B, K, device="cuda")
+
+        def forward():
+            return [layer._decode_routed(hidden, weights, ids.clone()) for layer in layers]
+
+        forward()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = forward()
+        for step in range(16):
+            x = torch.randn(B, H, dtype=torch.bfloat16)
+            raw_ids = (torch.arange(B * K).reshape(B, K) + step).remainder(E).int()
+            w = torch.rand(B, K)
+            w[0, 0] = 0
+            hidden.copy_(x)
+            ids.copy_(raw_ids)
+            weights.copy_(w)
+            graph.replay()
+            stream.synchronize()
+            for layer, output in enumerate(outputs):
+                ref = _reference(cache, layer, x, raw_ids, w)
+                error = (output.float().cpu() - ref).abs().max()
+                # GPU gate/up rounds to bf16; CPU GEMV retains fp32 intermediates.
+                assert error < 0.03 * ref.abs().max() + 1e-5, (step, layer, error)
+            executor.raise_if_unhealthy()
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
-    """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
+    """gpt-oss mxfp4 path under capture/replay: the handshake must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
+    if torch.version.hip and os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC") == "0":
+        pytest.skip("native HIP handshake explicitly disabled")
     from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts
 
     torch.manual_seed(7)
@@ -572,6 +792,8 @@ def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
     FP8 round-trip -> gate_up -> intermediate FP8 round-trip -> down) must recompute
     from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
+    if torch.version.hip and os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC") == "0":
+        pytest.skip("native HIP handshake explicitly disabled")
     from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
     torch.manual_seed(11)
