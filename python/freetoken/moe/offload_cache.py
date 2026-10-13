@@ -1075,19 +1075,43 @@ class OffloadMoeCache:
         self._prefill_buffer_released[buffer_id] = True
 
     def loads_prefill_on_demand(self, num_tokens: int) -> bool:
-        return num_tokens <= self.prefill_demand_tokens
+        return 0 < num_tokens <= self.prefill_demand_tokens
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, counts_as_decode: bool = True) -> None:
+    def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
+        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
+        ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
+        evicts: LRU evicts an earlier query's slots last while the chunk's distinct experts fit the
+        layer's pool, which one admission of the whole chunk needs as well. The admissions stay out
+        of the decode statistics."""
+        from freetoken.moe.offload_kernels import ENSURE_QUERY_WIDTH, ensure_experts
+
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a chunk's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            self.copy_missing()
+        return self.slot_for_id[layer_id][topk_ids.long()]
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq and counts_as_decode:
+        if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids, record_stats=counts_as_decode)
+        ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False

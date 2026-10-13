@@ -357,13 +357,12 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if cache.loads_prefill_on_demand(hidden_states.shape[0]):
-            cache.ensure_experts(self.layer_id, topk_ids, counts_as_decode=False)
-            cache.copy_missing()
+            slots = cache.load_prefill_experts(self.layer_id, topk_ids)
             return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
-                topk_ids,
+                slots,
                 views=cache.pool_bank_views(self.layer_id),
                 n=cache.pool_slots(self.layer_id),
                 alphas=cache.alphas_for_slots(self.layer_id),
