@@ -41,7 +41,7 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0, split=None
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,12 +52,17 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats).
+
+    ``split`` = (weights, cpu_ids, gpu_w, clamp), GPU only: the same launch also writes the CPU's
+    routes (expert id, -1 for a GPU route) and the GPU's weights (0 for a CPU route), and with
+    ``clamp`` rewrites CPU routes to slot 0 instead of -1."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
+        assert split is None, "the route split is GPU-only"
         return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, split)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,7 +100,7 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, split=None
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -112,6 +117,8 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        *(split[:3] if split is not None else (expert_ids,) * 3),
+        *(cache.hybrid_stats if cache.collect_stats else (expert_ids,) * 2),
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -121,6 +128,9 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        SPLIT=split is not None,
+        CLAMP=split is not None and split[3],
+        STATS=cache.collect_stats,
         num_warps=num_warps,
     )
 
@@ -300,6 +310,11 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    weights_ptr,
+    cpu_ids_ptr,
+    gpu_w_ptr,
+    stats_ptr,
+    stats_layer_ptr,
     layer_id,
     num_active,
     max_fetch,
@@ -309,6 +324,9 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    SPLIT: tl.constexpr,
+    CLAMP: tl.constexpr,
+    STATS: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -401,7 +419,26 @@ def _ensure_experts_hybrid_kernel(
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
         s = tl.load(slot_for_id_ptr + base + e)
+        if SPLIT:
+            on_gpu = s >= 0
+            tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
+            tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
+            if CLAMP:
+                s = tl.maximum(s, 0)
         tl.store(expert_ids_ptr + i, s)
+
+    # stats_ptr: (missing, fetched, active, calls); stats_layer_ptr: the same per layer, [num_layers, 4]
+    if STATS:
+        n_active = tl.sum((is_active & e_mask).to(tl.int64))
+        tl.store(stats_ptr + 0, tl.load(stats_ptr + 0) + num_missing)
+        tl.store(stats_ptr + 1, tl.load(stats_ptr + 1) + num_fetch)
+        tl.store(stats_ptr + 2, tl.load(stats_ptr + 2) + n_active)
+        tl.store(stats_ptr + 3, tl.load(stats_ptr + 3) + 1)
+        row = stats_layer_ptr + layer_id * 4
+        tl.store(row + 0, tl.load(row + 0) + num_missing)
+        tl.store(row + 1, tl.load(row + 1) + num_fetch)
+        tl.store(row + 2, tl.load(row + 2) + n_active)
+        tl.store(row + 3, tl.load(row + 3) + 1)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

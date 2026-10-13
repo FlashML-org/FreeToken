@@ -224,24 +224,23 @@ class OffloadMoeCache:
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
-        # the kernel, which accumulates in the same launch. The stat_* tensors below stay
-        # for the hybrid path, whose kernel is still ours.
+        # the kernel, which accumulates in the same launch. The stat_* tensors below are
+        # the hybrid path's: views of one buffer its kernel accumulates into the same way.
         self.lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
-        self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.stat_active = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.stat_calls = torch.zeros((), dtype=torch.int64, device=self.device)
-        # hybrid only: experts actually fetched over PCIe (<= stat_missing). The CPU
-        # computes stat_missing - stat_fetched of them.
-        self.stat_fetched = torch.zeros((), dtype=torch.int64, device=self.device)
+        # (missing, fetched, active, calls), then the same per layer
+        stat_buf = torch.zeros(4 * (self.num_layers + 1), dtype=torch.int64, device=self.device)
+        self.hybrid_stats = (stat_buf[:4], stat_buf[4:])
+        # hybrid only: stat_fetched counts the experts actually fetched over PCIe (<= stat_missing).
+        # The CPU computes stat_missing - stat_fetched of them.
+        self.stat_missing, self.stat_fetched, self.stat_active, self.stat_calls = stat_buf[:4].unbind()
         # Per-layer counterparts of the scalars above (indexed by MoE-layer id). Same
         # device-side accumulation (graph-safe: layer_id is a static index per graph node),
         # so one req's per-layer miss rate is readable via decode_miss_stats_per_layer().
-        self.stat_missing_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
+        per_layer = stat_buf[4:].view(self.num_layers, 4)
+        self.stat_missing_layer, self.stat_fetched_layer = per_layer[:, 0], per_layer[:, 1]
+        self.stat_active_layer, self.stat_steps_layer = per_layer[:, 2], per_layer[:, 3]
         # Opt-in decode routing histogram (per layer, per expert) for cache-skew
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
@@ -855,7 +854,7 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, split=None) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -864,7 +863,8 @@ class OffloadMoeCache:
         left non-resident and ``expert_ids`` is rewritten to their cache slot (hit or
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
-        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
+        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
+        ``split``: see :func:`freetoken.moe.offload_kernels.ensure_experts_hybrid`."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
@@ -873,7 +873,7 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction, split
         )
 
     def materialize_layer(self, layer_id: int) -> None:
@@ -910,23 +910,6 @@ class OffloadMoeCache:
         Kept so the hybrid and non-hybrid call sites stay symmetric. The previous version
         was eight torch ops per layer per step, all captured into the decode graph.
         """
-
-    def record_decode_stats_hybrid(self, layer_id: int) -> None:
-        """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
-        the active count. The CPU computes (missing - fetched) experts. Device-side;
-        accumulates both the scalar totals and the per-layer breakdown."""
-        assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
-        missing = self.num_missing_full.sum()
-        fetched = self.num_indices.sum()
-        active = self.active_mask.sum()
-        self.stat_missing += missing
-        self.stat_fetched += fetched
-        self.stat_active += active
-        self.stat_calls += 1
-        self.stat_missing_layer[layer_id] += missing
-        self.stat_fetched_layer[layer_id] += fetched
-        self.stat_active_layer[layer_id] += active
-        self.stat_steps_layer[layer_id] += 1
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
