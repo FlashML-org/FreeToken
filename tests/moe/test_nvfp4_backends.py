@@ -326,15 +326,21 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
-def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit():
+@pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width):
     """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
     same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
-    its admissions must not count as decode misses."""
+    its admissions must not count as decode misses. The chunk routes more often than one
+    admission query compiles for, and the wider cache aligns past 1024 experts; the cache of one
+    layer's experts, filled three at a time, must keep every query's experts until the GEMM."""
+    from freetoken.moe import offload_kernels
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
+    if query_width is not None:
+        monkeypatch.setattr(offload_kernels, "ENSURE_QUERY_WIDTH", query_width)
     device = torch.device("cuda")
     torch.manual_seed(15)
-    M = 12
+    M = 600
     hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
     topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
     topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
@@ -346,18 +352,21 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit():
         hidden, *streamed_cache.bank_views(E), topk_weights, topk_ids.clone(), E, "silu", False
     )
 
-    demand_cache, _ = _triton_cache(device, cache_size=2 * S)
+    demand_cache, _ = _triton_cache(device, cache_size=cache_size)
     demand_cache.collect_stats = True
-    slots = topk_ids.clone()
-    demand_cache.ensure_experts(1, slots, counts_as_decode=False)
-    demand_cache.copy_missing()
+    # decode left the other layer's experts and one of this layer's resident, so slots are not expert ids
+    for layer_id, resident in ((0, [7, 6]), (1, [2])):
+        demand_cache.ensure_experts(layer_id, torch.tensor([resident], dtype=torch.int32, device=device))
+        demand_cache.copy_missing()
+    decode_stats = demand_cache.lru_stats.clone()
+    slots = demand_cache.load_prefill_experts(1, topk_ids)
     demanded = fused_experts_nvfp4(
         hidden, *demand_cache.bank_views(), topk_weights, slots, demand_cache.cache_size, "silu", False
     )
 
-    assert not torch.equal(slots, topk_ids), "the admission must have rewritten expert ids to slots"
+    assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
     assert torch.equal(demanded, streamed)
-    assert int(demand_cache.lru_stats.sum()) == 0
+    assert torch.equal(demand_cache.lru_stats, decode_stats)
 
 
 @cuda

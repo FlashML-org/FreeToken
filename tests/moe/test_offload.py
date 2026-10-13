@@ -23,18 +23,20 @@ def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size
     )
 
 
-def _make_layer_and_cache():
+def _make_layer_and_cache(num_experts: int = 4, cache_size: int = 6):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
+    layer = _bf16_offload_layer(0, num_experts, 2, 8, 16)
     cache = OffloadMoeCache(
         num_layers=1,
-        num_experts=4,
-        cache_size=6,
+        num_experts=num_experts,
+        cache_size=cache_size,
         device=torch.device("cpu"),
     )
-    cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(num_experts, 32, 8)], "down": [torch.randn(num_experts, 8, 16)]}
+    )
     layer.offload_cache = cache
     return layer, cache
 
@@ -126,24 +128,33 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
 
 
 def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cache(monkeypatch):
-    layer, cache = _make_layer_and_cache()
-    cache.prefill_demand_tokens = 1
-    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
-    hidden_states = torch.randn(1, 8)
+    from freetoken.moe import offload_kernels
+
+    layer, cache = _make_layer_and_cache(num_experts=160, cache_size=192)
+    cache.prefill_demand_tokens = 96
+    cache.collect_decode_freq = True
+    # the first 96 tokens route 192 times, to all 160 experts
+    routes = torch.arange(194, dtype=torch.int32).remainder(160).view(97, 2)
+    events = []
     calls = {}
 
     monkeypatch.setattr(
         "freetoken.layers.moe.fused_topk",
-        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, torch.tensor([[2, 1]], dtype=torch.int32)),
+        lambda *, hidden_states, gating_output, topk, renormalize: (
+            torch.rand(hidden_states.shape[0], 2), routes[: hidden_states.shape[0]].clone()
+        ),
     )
-    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("materialized", layer_id))
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: events.append(("materialized", layer_id)))
+    monkeypatch.setattr(cache, "copy_missing", lambda: events.append(("copied",)))
 
-    def ensure(layer_id, expert_ids, *, counts_as_decode=True):
-        calls["ensured"] = (layer_id, expert_ids.tolist(), counts_as_decode)
-        expert_ids.copy_(torch.tensor([[5, 3]], dtype=torch.int32))
+    def admit(cache, layer_id, expert_ids, *, record_stats=True):
+        # the slot cache's contract: every queried expert resident, the query rewritten to its slots in place
+        query = expert_ids.view(-1)
+        events.append(("admitted", query.tolist(), record_stats))
+        cache.slot_for_id[layer_id, query.long()] = cache.cache_size - 1 - query
+        query.copy_(cache.cache_size - 1 - query)
 
-    monkeypatch.setattr(cache, "ensure_experts", ensure)
-    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+    monkeypatch.setattr(offload_kernels, "ensure_experts", admit)
 
     def fake_fused(hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation, apply_router_weight_on_input,
                    act_alpha=1.0, act_limit=float("inf")):
@@ -153,19 +164,34 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
 
     monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
-    out = layer.prefill_forward(hidden_states, torch.randn(1, 4))
+    hidden_states = torch.randn(96, 8)
+    out = layer.prefill_forward(hidden_states, torch.randn(96, 160))
 
+    admissions = [event for event in events if event[0] == "admitted"]
+    # lru_ensure takes at most 128 ids a query, never a chunk's routes
+    assert [len(query) for _, query, _ in admissions] == [128, 32]
+    # each query's misses are copied before the next query can evict
+    assert events == [event for admission in admissions for event in (admission, ("copied",))]
+    assert sorted(expert for _, query, _ in admissions for expert in query) == list(range(160))
+    assert not any(record_stats for *_, record_stats in admissions)
+    assert int(cache.decode_freq.sum()) == 0
     assert out is hidden_states
-    assert "materialized" not in calls
-    assert calls["ensured"] == (0, [[2, 1]], False)
-    assert calls["copied"] is True
     # the grouped GEMM reads the whole slot cache at the slots the admission wrote
     assert calls["w1"].shape[0] == cache.cache_size
-    assert calls["topk_ids"].tolist() == [[5, 3]]
+    assert torch.equal(calls["topk_ids"], cache.cache_size - 1 - routes[:96])
 
-    calls.clear()
-    layer.prefill_forward(torch.randn(2, 8), torch.randn(2, 4))
-    assert calls["materialized"] == 0 and "ensured" not in calls
+    events.clear()
+    layer.prefill_forward(torch.randn(97, 8), torch.randn(97, 160))
+    assert events == [("materialized", 0), ("copied",)]
+
+
+def test_offload_moe_cache_takes_a_prefill_chunk_on_demand_only_within_its_threshold():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    assert not cache.loads_prefill_on_demand(0)
+    cache.prefill_demand_tokens = 2
+    assert [cache.loads_prefill_on_demand(tokens) for tokens in range(4)] == [False, True, True, False]
 
 
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):

@@ -15,6 +15,10 @@ _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
 
+# lru_ensure dedups its query in a [K, K] register block: flat in cost up to 128 ids, spilling past
+# that and failing to compile past 1024, so a wider admission goes to it in queries this wide.
+ENSURE_QUERY_WIDTH = 128
+
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
