@@ -508,6 +508,18 @@ def test_adjust_config_rope_gate_exempts_dsv4():
     _adjust_config(cfg)  # must not raise
 
 
+def test_expandable_segments_are_requested_without_a_deprecation_warning(monkeypatch, recwarn):
+    from freetoken.engine.engine import _ensure_expandable_segments
+
+    settings: list[str] = []
+    monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", settings.append)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    _ensure_expandable_segments()
+    assert settings == ["expandable_segments:True"]
+    assert [str(warning.message) for warning in recwarn] == []
+
+
 # ---- _pin_budget_bytes: host bytes already pinned outside the expert banks ----
 
 
