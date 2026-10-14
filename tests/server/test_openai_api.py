@@ -50,6 +50,11 @@ class FakeState:
         for reply in self.replies:
             yield reply
 
+    async def stream_with_cancellation(self, gen, request, uid: int):
+        # Route serialization tests exercise its wire output, not disconnect handling.
+        async for chunk in gen:
+            yield chunk
+
 
 def tool_schema():
     return [
