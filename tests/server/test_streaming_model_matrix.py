@@ -604,7 +604,7 @@ from freetoken.server.reasoning_parser import (  # noqa: E402
 
 _DR02_ARG = f"a{_DR02_CLOSE}b{_DR02_OPEN}c"
 _DR02_BLOCK = (
-    "<tool_call><function=read><parameter=filePath>" + _DR02_ARG + "</parameter></function>ing"
+    "<tool_call><function=read><parameter=filePath>" + _DR02_ARG + "</parameter></function></tool_call>"
 )
 
 

@@ -366,7 +366,7 @@ def test_mimo_tool_parser_streaming_schema_union_matches_one_shot():
     truncated = FunctionCallParser(tools, "qwen3_coder").parse_non_stream(
         "Checking. <tool_call><function=lookup><parameter=limit>3</parameter>"
     )
-    assert truncated.normal_text == "Checking."
+    assert truncated.normal_text == "Checking. "
     assert len(truncated.calls) == 1
     assert truncated.calls[0].name == "lookup"
     assert json.loads(truncated.calls[0].parameters) == {"limit": 3}
@@ -426,7 +426,7 @@ def test_mimo_preserves_exact_string_values_while_qwen_keeps_legacy_trim():
     assert json.loads(qwen.calls[0].parameters) == {"leading": "line\n"}
 
 
-def test_mimo_outer_close_only_at_end_of_stream_recovers_string_call():
+def test_mimo_outer_close_only_at_end_of_stream_is_preserved():
     tools = [{
         "type": "function",
         "function": {
@@ -441,11 +441,11 @@ def test_mimo_outer_close_only_at_end_of_stream_recovers_string_call():
         _, calls = parser.parse_stream_chunk(wire[i : i + 2])
         fragments.extend(call.parameters for call in calls if call.name is None)
     fragments.extend(call.parameters for call in parser.finalize_stream())
-    assert json.loads("".join(fragments)) == {"text": "partial"}
+    assert json.loads("".join(fragments)) == {"text": "partial</tool_call>"}
     assert parser.finish_stream() == ""
 
 
-def test_mimo_unknown_tool_with_missing_parameter_close_does_not_swallow_next_call(monkeypatch):
+def test_mimo_unknown_tool_open_value_does_not_infer_another_call(monkeypatch):
     monkeypatch.setattr("freetoken.server.function_call_parser.FORWARD_UNKNOWN_TOOLS", False)
     tools = [{
         "type": "function",
@@ -466,9 +466,9 @@ def test_mimo_unknown_tool_with_missing_parameter_close_does_not_swallow_next_ca
         _, emitted = parser.parse_stream_chunk(wire[i : i + 2])
         calls.extend(emitted)
     named = [call for call in calls if call.name is not None]
-    assert [call.name for call in named] == ["lookup"]
-    args = "".join(call.parameters for call in calls if call.name is None)
-    assert json.loads(args) == {"limit": 3}
+    assert named == []
+    assert calls == []
+    assert FunctionCallParser(tools, "mimo_v2").parse_non_stream(wire).calls == []
 
 
 @pytest.mark.parametrize(
@@ -713,9 +713,8 @@ def test_dr01_unterminated_value_end_of_stream_recovery_unchanged():
     assert parser.finish_stream() == ""
 
 
-def test_dr01_real_closer_pair_without_parameter_close_eos_recovery_unchanged():
-    # Pins current EOS policy: a missing parameter closer (malformed output)
-    # still ends the value at the real invoke closer at end of stream.
+def test_dr01_closer_pair_without_parameter_close_is_literal_at_eos():
+    # No parameter closer: retain ambiguous bytes, do not invent a boundary.
     parser = FunctionCallParser(_dr01_echo_tools(), "mimo_v2")
     wire = _DR01_PREFIX + "value" + _DR01_CLOSER
     fragments = []
@@ -723,7 +722,7 @@ def test_dr01_real_closer_pair_without_parameter_close_eos_recovery_unchanged():
         _, emitted = parser.parse_stream_chunk(wire[i : i + 3])
         fragments.extend(call.parameters for call in emitted if call.name is None)
     fragments.extend(call.parameters for call in parser.finalize_stream())
-    assert json.loads("".join(fragments)) == {"text": "value"}
+    assert json.loads("".join(fragments)) == {"text": "value" + _DR01_CLOSER}
     assert parser.finish_stream() == ""
 
 
@@ -821,6 +820,178 @@ def test_streaming_support_flags():
 # replay one-shot detectors (mimo_v2, muse_glimmer) inherit it automatically.
 # --------------------------------------------------------------------------- #
 DR03_FAMILIES = ("qwen3_coder", "minimax", "mimo_v2", "muse_glimmer")
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+@pytest.mark.parametrize("literal", [
+    "x</function> quoted <function=oops",
+    "x</function><function=oops><parameter=text>y",
+    "x</function></tool_call><tool_call><function=oops><parameter=text>y",
+])
+def test_vfa02_real_parameter_closer_wins_over_literal_headers(family, literal):
+    tools = _dr03_tools({"text": {"type": "string"}})
+    tools[0]["function"]["name"] = "echo"
+    wire = _dr03_wire(family, [[("text", literal)]]).replace("demo", "echo")
+    expected = [("echo", {"text": literal})]
+    assert _dr03_oneshot(tools, family, wire) == expected
+    _dr07_two_chunk_invariant(family, tools, wire, expected)
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+@pytest.mark.parametrize("prop,raw,expected", [
+    ({"type": "boolean"}, "perhaps", "perhaps"),
+    ({"type": "integer"}, "abc", "abc"),
+    ({"type": "number"}, "abc", "abc"),
+    ({"type": "object"}, "not json", "not json"),
+    ({"type": "array"}, "[1,", "[1,"),
+    ({"type": ["integer", "null"]}, "null", None),
+    ({"type": "string"}, "literal", "literal"),
+    ({"type": "boolean"}, "true", True),
+    ({"type": "integer"}, "12", 12),
+    ({"type": "number"}, "1.5", 1.5),
+    ({"type": "object"}, '{"a":1}', {"a": 1}),
+    ({"type": "array"}, "[1,2]", [1, 2]),
+])
+@pytest.mark.parametrize("required", [False, True])
+def test_vfa03_truncated_value_preserved_across_shared_consumers(family, prop, raw, expected, required):
+    tools = _dr03_tools({"value": prop}, ["value"] if required else [])
+    detector = FunctionCallParser(tools, family).detector
+    wire = _dr03_wire(family, [[("value", raw)]])
+    wire = wire[:wire.index(detector._ps_param_close)]
+    result = [("demo", {"value": expected})]
+    assert _dr03_oneshot(tools, family, wire) == result
+    assert _dr03_stream(tools, family, wire, 1) == result
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+def test_vfa03_missing_parameter_closer_preserves_raw_markup(family):
+    tools = _dr03_tools({"enabled": {"type": "boolean"}})
+    detector = FunctionCallParser(tools, family).detector
+    wire = _dr03_wire(family, [[("enabled", "perhaps")]])
+    wire = wire.replace(detector._ps_param_close, "", 1)
+    value = "perhaps" + detector._ps_invoke_close + detector._ps_outer_close
+    expected = [("demo", {"enabled": value})]
+    assert _dr03_oneshot(tools, family, wire) == expected
+    assert _dr03_stream(tools, family, wire, 1) == expected
+
+
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+def test_shared_open_value_literal_tail_is_not_duplicated_as_content(family):
+    tools = _dr03_tools({"text": {"type": "string"}})
+    detector = FunctionCallParser(tools, family).detector
+    wire = _dr03_wire(family, [[("text", "x")]]).replace(detector._ps_param_close, "", 1)
+    wire = wire.replace("<|eot|>", " quoted<|eot|>") if family == "muse_glimmer" else wire + " quoted"
+    full = FunctionCallParser(tools, family).parse_non_stream(wire)
+    assert full.normal_text == ""
+    expected = {"text": "x" + detector._ps_invoke_close + detector._ps_outer_close + " quoted"}
+    assert json.loads(full.calls[0].parameters) == expected
+    parser = FunctionCallParser(tools, family)
+    content = []
+    for char in wire:
+        normal, _ = parser.parse_stream_chunk(char)
+        content.append(normal)
+    parser.finalize_stream()
+    content.append(parser.finish_stream())
+    assert "".join(content) == ""
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "mimo_v2"])
+def test_unwrapped_function_looking_prose_does_not_infer_a_call(family):
+    wire = "Example <function=echo><parameter=text>x</parameter></function>"
+    parser = FunctionCallParser(_dr01_echo_tools(), family)
+    full = parser.parse_non_stream(wire)
+    assert full.calls == []
+    assert full.normal_text == wire
+    parts = []
+    for char in wire:
+        normal, calls = parser.parse_stream_chunk(char)
+        parts.append(normal)
+        assert calls == []
+    parts.append(parser.finish_stream())
+    assert "".join(parts) == wire
+
+
+@pytest.mark.parametrize("leading", ["", " \n"])
+@pytest.mark.parametrize("ending", ["", " ordinary <function=phantom>", "\n<function=echo><parameter=text>second</parameter></function>"])
+def test_qwen_standalone_shipped_grammar_matches_complete_and_incremental(leading, ending):
+    value = "Paris</function><function=phantom><parameter=text>literal"
+    wire = leading + "<function=echo><parameter=text>" + value + "</parameter></function>" + ending
+    expected = [("echo", {"text": value})]
+    if ending.startswith("\n<function=echo>"):
+        expected.append(("echo", {"text": "second"}))
+    tools = _dr01_echo_tools()
+    full = FunctionCallParser(tools, "qwen3_coder").parse_non_stream(wire)
+    assert [(call.name, json.loads(call.parameters)) for call in full.calls] == expected
+    _dr07_two_chunk_invariant("qwen3_coder", tools, wire, expected)
+    parser = FunctionCallParser(tools, "qwen3_coder")
+    content = []
+    for char in wire:
+        normal, _ = parser.parse_stream_chunk(char)
+        content.append(normal)
+    parser.finalize_stream()
+    content.append(parser.finish_stream())
+    assert "".join(content) == full.normal_text
+
+
+@pytest.mark.parametrize("family", ["qwen3_coder", "minimax"])
+@pytest.mark.parametrize("chunk_count", [256, 512, 1024])
+@pytest.mark.parametrize("ending", ["closed", "eos", "partial", "interior"])
+def test_shared_newline_tail_boundary_scan_is_linear(family, chunk_count, ending):
+    tools = _dr03_tools({"text": {"type": "string"}})
+    parser = FunctionCallParser(tools, family)
+    detector = parser.detector
+    wire = _dr03_wire(family, [[("text", "x")]])
+    prefix, suffix = wire.split(">x", 1)
+    prefix += ">"
+    literal = detector._ps_invoke_close + detector._ps_outer_close
+    prefix += literal
+    newlines = "\n" * (129 * chunk_count)
+    extra = "z\n\n" if ending == "interior" else "</para" if ending == "partial" else ""
+    value = literal + newlines + extra
+    expected = value[:-1] if family == "qwen3_coder" and value.endswith("\n") else value.rstrip("\n") if family == "minimax" else value
+    chunks = [prefix] + ["\n" * 129] * chunk_count + [extra]
+    if ending in ("closed", "interior"):
+        chunks.extend(suffix)
+    scans = []
+    resolve = detector._ps_boundary_resolution
+
+    def track(text):
+        scans.append(len(text))
+        return resolve(text)
+
+    detector._ps_boundary_resolution = track
+    fragments = []
+    for chunk in chunks:
+        normal, calls = parser.parse_stream_chunk(chunk)
+        assert normal == ""
+        fragments.extend(call.parameters for call in calls if call.name is None)
+    fragments.extend(call.parameters for call in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"text": expected}
+    assert sum(scans) <= 2 * sum(map(len, chunks))
+    full = FunctionCallParser(tools, family).parse_non_stream("".join(chunks))
+    assert json.loads(full.calls[0].parameters) == {"text": expected}
+
+
+@pytest.mark.parametrize("chunk_len", [127, 128, 129, 4096])
+def test_dr01_long_literal_tail_has_bounded_pending_buffer(chunk_len):
+    parser = FunctionCallParser(_dr01_echo_tools(), "mimo_v2")
+    chunks = [_DR01_PREFIX, _DR01_CLOSER] + ["a" * chunk_len] * 256 + [_DR01_SUFFIX]
+    scan_lengths = []
+    resolve = parser.detector._ps_boundary_resolution
+
+    def track_scan(text):
+        scan_lengths.append(len(text))
+        return resolve(text)
+
+    parser.detector._ps_boundary_resolution = track_scan
+    fragments = []
+    for chunk in chunks:
+        _, calls = parser.parse_stream_chunk(chunk)
+        fragments.extend(item.parameters for item in calls if item.name is None)
+        assert len(parser.detector._buffer) < 128
+    fragments.extend(item.parameters for item in parser.finalize_stream())
+    assert json.loads("".join(fragments)) == {"text": _DR01_CLOSER + "a" * (chunk_len * 256)}
+    assert sum(scan_lengths) <= 2 * sum(map(len, chunks))
 
 
 def _dr03_tools(properties, required=None):
@@ -996,7 +1167,7 @@ def test_dr03_mismatched_typed_value_preserved_raw_both_modes(label, prop, value
     assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
 
 
-# DR-07: adjacent invoke openers confirm missing-parameter-close recovery.
+# DR-07: adjacent invoke openers inside an open value are ambiguous literal data.
 def _dr07_tools(typed=False):
     return [{"type": "function", "function": {
         "name": name, "parameters": {"properties": {
@@ -1055,59 +1226,28 @@ def _dr07_stream(family="qwen3_coder", variant="same", typed=False, chunk_size=3
 
 
 _DR07_CLEAN = [("first", {"text": "x"}), ("second", {"text": "y"})]
-_DR07_TYPED = [("first", {"count": "x"}), ("second", {"text": "y"})]
 
 
-def test_dr07_pin_qwen3_coder_streaming_recovers_second_call():
-    assert _dr07_stream(chunk_size=len(_dr07_wire())) == _DR07_CLEAN
+def _dr07_literal_expected(family, wire, typed=False):
+    detector = FunctionCallParser(_dr07_tools(typed), family).detector
+    key = "count" if typed else "text"
+    start = wire.index(_dr07_opener(detector, "_ps_param_open_prefix", key))
+    start += len(_dr07_opener(detector, "_ps_param_open_prefix", key))
+    end = wire.find(detector._ps_param_close, start)
+    value = wire[start:end] if end != -1 else wire[start:]
+    return [("first", {key: value})]
 
 
-@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 40])
-def test_dr07_pin_qwen3_coder_recovery_is_chunk_stable(chunk_size):
-    assert _dr07_stream(chunk_size=chunk_size) == _DR07_CLEAN
-
-
-def test_dr07_pin_qwen3_coder_recovered_calls_complete_before_eos():
-    parser = FunctionCallParser(_dr07_tools(), "qwen3_coder")
-    _normal, emitted = parser.parse_stream_chunk(_dr07_wire())
-    named = [item for item in emitted if item.name is not None]
-    args = {}
-    for item in emitted:
-        if item.name is None:
-            args[item.tool_index] = args.get(item.tool_index, "") + item.parameters
-    assert [
-        (item.name, json.loads(args.get(item.tool_index) or "{}")) for item in named
-    ] == _DR07_CLEAN
-    assert parser.finalize_stream() == []
-    assert parser.finish_stream() == ""
-
-
-def test_dr07_pin_qwen3_coder_oneshot_regex_emits_both_calls_cleanly():
-    assert _dr03_oneshot(_dr07_tools(), "qwen3_coder", _dr07_wire()) == _DR07_CLEAN
-
-
-def test_dr07_parity_qwen3_coder_streaming_matches_oneshot():
-    assert _dr07_stream() == _dr03_oneshot(_dr07_tools(), "qwen3_coder", _dr07_wire())
-
-
-def test_dr07_pin_mimo_v2_replay_one_shot_recovers_second_call():
-    assert _dr07_stream("mimo_v2") == _DR07_CLEAN
-    assert _dr03_oneshot(_dr07_tools(), "mimo_v2", _dr07_wire("mimo_v2")) == _DR07_CLEAN
-
-
-def test_dr07_pin_qwen3_coder_typed_first_value_preserved_raw():
-    assert _dr07_stream(typed=True) == _DR07_TYPED
-
-
-def test_dr07_parity_qwen3_coder_typed_variant_matches_oneshot():
-    assert _dr07_stream(typed=True) == _dr03_oneshot(
-        _dr07_tools(True), "qwen3_coder", _dr07_wire(typed=True)
-    )
-
-
-def test_dr07_pin_mimo_v2_typed_variant_preserves_raw_in_both_modes():
-    assert _dr07_stream("mimo_v2", typed=True) == _DR07_TYPED
-    assert _dr03_oneshot(_dr07_tools(True), "mimo_v2", _dr07_wire("mimo_v2", typed=True)) == _DR07_TYPED
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+@pytest.mark.parametrize("variant", ["same", "separate", "missing_outer_next", "literal"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_dr07_ambiguous_next_call_is_literal_in_both_modes(family, variant, typed):
+    # The original DR07 sequence also describes one valid literal value.
+    # A second call cannot be inferred without violating preservation.
+    wire = _dr07_wire(family, variant, typed)
+    expected = _dr07_literal_expected(family, wire, typed)
+    assert _dr03_oneshot(_dr07_tools(typed), family, wire) == expected
+    _dr07_two_chunk_invariant(family, _dr07_tools(typed), wire, expected)
 
 
 def test_dr07_pin_same_wrapper_consecutive_calls_stream_normally_when_wellformed():
@@ -1116,39 +1256,12 @@ def test_dr07_pin_same_wrapper_consecutive_calls_stream_normally_when_wellformed
         assert _dr03_oneshot(_dr07_tools(), family, _dr07_wire(family, "wellformed")) == _DR07_CLEAN
 
 
-def test_dr07_pin_minimax_streaming_recovers_second_call():
-    assert _dr07_stream("minimax") == _DR07_CLEAN
-
-
-def test_dr07_pin_minimax_oneshot_emits_first_with_empty_args_and_second():
-    assert _dr03_oneshot(_dr07_tools(), "minimax", _dr07_wire("minimax")) == [
-        ("first", {}), ("second", {"text": "y"})
-    ]
-
-
-def test_dr07_pin_minimax_cross_mode_empty_args_gap():
-    # Full MiniMax parity remains a separate pre-existing one-shot regex gap.
-    streamed = _dr07_stream("minimax")
-    oneshot = _dr03_oneshot(_dr07_tools(), "minimax", _dr07_wire("minimax"))
-    assert streamed == _DR07_CLEAN
-    assert oneshot == [("first", {}), ("second", {"text": "y"})]
-    assert streamed != oneshot
-
-
-def test_dr07_pin_muse_glimmer_replay_one_shot_recovers_second_call():
-    assert _dr07_stream("muse_glimmer") == _DR07_CLEAN
-    assert _dr03_oneshot(_dr07_tools(), "muse_glimmer", _dr07_wire("muse_glimmer")) == _DR07_CLEAN
-
-
-@pytest.mark.parametrize("family", ["qwen3_coder", "mimo_v2"])
-def test_dr07_pin_separate_wrapper_recovery_finds_next_call(family):
-    assert _dr07_stream(family, "separate") == _DR07_CLEAN
-    assert _dr03_oneshot(_dr07_tools(), family, _dr07_wire(family, "separate")) == _DR07_CLEAN
-
-
-@pytest.mark.parametrize("family", ["qwen3_coder", "mimo_v2"])
-def test_dr07_pin_later_envelope_preserves_all_three_calls(family):
-    assert _dr07_stream(family, "third") == _DR07_CLEAN + [("third", {"text": "z"})]
+@pytest.mark.parametrize("family", DR03_FAMILIES)
+def test_dr07_later_unambiguous_envelope_is_a_new_call(family):
+    wire = _dr07_wire(family, "third")
+    expected = _dr07_literal_expected(family, wire) + [("third", {"text": "z"})]
+    assert _dr03_oneshot(_dr07_tools(), family, wire) == expected
+    _dr07_two_chunk_invariant(family, _dr07_tools(), wire, expected)
 
 
 def test_dr07_pin_missing_invoke_closer_eos_completes_call():
@@ -1164,13 +1277,13 @@ def test_dr07_pin_missing_outer_closer_eos_completes_call():
 
 
 def test_dr07_pin_missing_outer_closer_next_envelope_recovers():
-    assert _dr07_stream(variant="missing_outer_next") == _DR07_CLEAN
+    wire = _dr07_wire(variant="missing_outer_next").replace("x</function>", "x</parameter></function>", 1)
+    assert _dr03_stream(_dr07_tools(), "qwen3_coder", wire) == _DR07_CLEAN
 
 
 @pytest.mark.parametrize("family", ["qwen3_coder", "mimo_v2"])
 def test_dr07_pin_literal_function_looking_string_stays_data(family):
-    detector = FunctionCallParser(_dr07_tools(), family).detector
-    expected = [("first", {"text": "use " + detector._ps_outer_open}), ("second", {"text": "y"})]
+    expected = _dr07_literal_expected(family, _dr07_wire(family, "literal"))
     assert _dr07_stream(family, "literal") == expected
     assert _dr03_oneshot(_dr07_tools(), family, _dr07_wire(family, "literal")) == expected
 
@@ -1242,24 +1355,21 @@ def test_dr07_wrapper_repetition_follows_reachability(family):
     _dr07_two_chunk_invariant(
         family, _dr07_tools(), wire, [("first", {"text": "x" + absorbed})]
     )
-    # Repeated outer openers are debris the block scanner drops silently, so
-    # recovery still confirms and both calls survive.
+    # Repeated outer openers inside an open value are also literal data.
     wire = _dr07_modified_wire(family, detector._ps_invoke_close + opener * 2)
-    _dr07_two_chunk_invariant(family, _dr07_tools(), wire, _DR07_CLEAN)
+    _dr07_two_chunk_invariant(family, _dr07_tools(), wire, _dr07_literal_expected(family, wire))
 
 
 @pytest.mark.parametrize("family", ["minimax", "muse_glimmer"])
 @pytest.mark.parametrize("registered", [True, False])
 def test_dr07_embedded_param_close_in_header_is_chunk_invariant(family, registered):
-    # A quoted tool name may embed a parameter closer. Whole delivery sees a
-    # complete header; a split inside the header must hold pending instead of
-    # resolving at the embedded closer, so both modes agree on the boundary.
+    # With a closed preceding parameter, the following header is unambiguous.
     detector = FunctionCallParser(_dr07_tools(), family).detector
     name = "sec" + detector._ps_param_close + "ond"
     tools = _dr07_tools()
     if registered:
         tools[1]["function"]["name"] = name
-    wire = _dr07_wire(family).replace("second", name, 1)
+    wire = _dr07_wire(family, "wellformed").replace("second", name, 1)
     expected = [("first", {"text": "x"}), (name, {"text": "y"})]
     _dr07_two_chunk_invariant(family, tools, wire, expected)
 
@@ -1281,18 +1391,18 @@ def test_dr07_phantom_opener_prefix_in_value_is_chunk_invariant(family, wellform
     # the first structural closer, in whole or any split delivery.
     detector = FunctionCallParser(_dr07_tools(), family).detector
     value = "x call " + detector._ps_invoke_open_prefix + " to see"
+    wire = _dr07_phantom_wire(family, wellformed)
     _dr07_two_chunk_invariant(
         family,
         _dr07_tools(),
-        _dr07_phantom_wire(family, wellformed),
-        [("first", {"text": value}), ("second", {"text": "y"})],
+        wire,
+        [("first", {"text": value}), ("second", {"text": "y"})] if wellformed else _dr07_literal_expected(family, wire),
     )
 
 
 @pytest.mark.parametrize("family", DR03_FAMILIES)
 def test_dr07_phantom_opener_prefix_eos_partial_next_header_is_invariant(family):
-    # At EOS a phantom value span must not swallow the trailing closer or the
-    # incomplete next header; the value still ends at the first boundary.
+    # At EOS retain the incomplete next header as raw value bytes too.
     detector = FunctionCallParser(_dr07_tools(), family).detector
     wire = _dr07_phantom_wire(family, wellformed=False)
     cut = wire.index(detector._ps_invoke_close) + len(detector._ps_invoke_close) + 4
@@ -1300,7 +1410,7 @@ def test_dr07_phantom_opener_prefix_eos_partial_next_header_is_invariant(family)
         family,
         _dr07_tools(),
         wire[:cut],
-        [("first", {"text": "x call " + detector._ps_invoke_open_prefix + " to see"})],
+        _dr07_literal_expected(family, wire[:cut]),
     )
 
 

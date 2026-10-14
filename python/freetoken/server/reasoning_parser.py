@@ -130,8 +130,10 @@ class BaseReasoningParser:
 
         self._in_reasoning = force_reasoning
         self._buffer = ""
-        self._stripped_think_start = False
+        self._stripped_think_start = bool(force_reasoning and tool_end_token)
         self._in_tool_region = False
+        self._reasoning_tool_parts: List[str] = []
+        self._reasoning_tool_prefix = ""
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         """One-shot parse of a complete completion."""
@@ -184,7 +186,7 @@ class BaseReasoningParser:
             if in_reasoning:
                 end_idx = text.find(self.think_end_token, i)
                 tool_idx = text.find(self.tool_start_token, i)
-                if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+                if tool_idx != -1 and end_idx == -1:
                     reasoning_parts.append(text[i:tool_idx])
                     i = self._consume_tool_region(text, tool_idx, normal_parts)
                     in_reasoning = False
@@ -326,6 +328,21 @@ class BaseReasoningParser:
         normal_parts: List[str] = []
         while True:
             buf = self._buffer
+            if self._reasoning_tool_parts:
+                end_idx = buf.find(self.think_end_token)
+                if end_idx == -1:
+                    safe, held = self._split_trailing_partial(buf, tokens=[self.think_end_token])
+                    if safe:
+                        self._reasoning_tool_parts.append(safe)
+                    self._buffer = held
+                    break
+                self._reasoning_tool_parts.append(buf[:end_idx])
+                reasoning_parts.append(self._reasoning_tool_prefix + "".join(self._reasoning_tool_parts))
+                self._reasoning_tool_parts = []
+                self._reasoning_tool_prefix = ""
+                self._buffer = buf[end_idx + len(self.think_end_token):]
+                self._in_reasoning = False
+                continue
             if self._in_tool_region:
                 close_idx = buf.find(self.tool_end_token)
                 if close_idx == -1:
@@ -347,14 +364,17 @@ class BaseReasoningParser:
             if self._in_reasoning:
                 end_idx = buf.find(self.think_end_token)
                 tool_idx = buf.find(self.tool_start_token)
-                if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
-                    # Tool envelope wins over a later closer: reasoning ends at
-                    # the opener, the region streams verbatim from here.
-                    reasoning_parts.append(buf[:tool_idx])
-                    self._buffer = buf[tool_idx:]
-                    self._in_reasoning = False
-                    self._in_tool_region = True
-                    continue
+                if tool_idx != -1 and end_idx == -1:
+                    # A later explicit closer can reclaim the quoted envelope.
+                    # Keep pieces without repeatedly rescanning the held body.
+                    if self.stream_reasoning:
+                        reasoning_parts.append(buf[:tool_idx])
+                    else:
+                        self._reasoning_tool_prefix = buf[:tool_idx]
+                    safe, held = self._split_trailing_partial(buf[tool_idx:], tokens=[self.think_end_token])
+                    self._reasoning_tool_parts = [safe]
+                    self._buffer = held
+                    break
                 if end_idx != -1:
                     reasoning_parts.append(buf[:end_idx])
                     self._buffer = buf[end_idx + len(self.think_end_token) :]
@@ -426,6 +446,12 @@ class BaseReasoningParser:
         """
         buf = self._buffer
         self._buffer = ""
+        if self._reasoning_tool_parts:
+            buf = "".join(self._reasoning_tool_parts) + buf
+            self._reasoning_tool_parts = []
+            prefix, self._reasoning_tool_prefix = self._reasoning_tool_prefix, ""
+            self._in_reasoning = False
+            return ReasoningParseResult(reasoning_text=prefix, normal_text=buf)
         if not buf:
             return ReasoningParseResult()
         if self.tool_start_token and buf.lstrip().startswith(self.tool_start_token):

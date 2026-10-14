@@ -714,6 +714,7 @@ class InvokeParamStreamMixin:
     _ps_trim: str = "\n"
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
+    _ps_allow_standalone: bool = False
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
@@ -723,6 +724,10 @@ class InvokeParamStreamMixin:
         self._ps_json_started = False
         self._ps_lead_trimmed = False
         self._ps_param_config: Dict = {}
+        self._ps_value_parts: List[str] = []
+        self._ps_string_trim_parts: List[str] = []
+        self._ps_at_start = True
+        self._ps_standalone = False
 
     def _ps_convert_value(self, key: str, raw: str) -> Any:
         if key in self._ps_param_config or self._ps_missing_type != "loose":
@@ -743,6 +748,31 @@ class InvokeParamStreamMixin:
         default; muse_glimmer collapses template-doubled ``name.name`` recipients)."""
         return name
 
+    def _ps_parse_complete(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Replay the value grammar so complete parsing cannot reinterpret literals."""
+        clone = type(self)()
+        raw_calls: List[ToolCallItem] = []
+        normal_parts: List[str] = []
+        chunk = text
+        while True:
+            result = clone.parse_streaming_increment(chunk, tools)
+            raw_calls.extend(result.calls)
+            normal_parts.append(result.normal_text)
+            if not chunk and not result.calls and not result.normal_text:
+                break
+            chunk = ""
+        raw_calls.extend(clone.finalize_streaming())
+        normal_parts.append(clone.finish_streaming())
+        by_index: Dict[int, ToolCallItem] = {}
+        for item in raw_calls:
+            if item.name is not None:
+                by_index[item.tool_index] = ToolCallItem(
+                    tool_index=len(by_index), name=item.name, parameters=""
+                )
+            if item.parameters and item.tool_index in by_index:
+                by_index[item.tool_index].parameters += item.parameters
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=list(by_index.values()))
+
     def _ps_trim_leading(self, text: str) -> str:
         if self._ps_trim_single:
             return text[1:] if text[:1] and text[:1] in self._ps_trim else text
@@ -753,132 +783,13 @@ class InvokeParamStreamMixin:
             return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
         return text.rstrip(self._ps_trim)
 
-    def _ps_pos_inside_invoke_header(self, text: str, pos: int, boundary_pos: int) -> bool:
-        """True when ``pos`` falls inside an invoke opener header that begins
-        after ``boundary_pos`` (the earliest structural boundary in the
-        buffer), complete or still streaming. Block consumption takes such a
-        header atomically, so structural tokens inside it are name data, never
-        boundaries. An opener at or before ``boundary_pos`` is value data: a
-        genuine next-call header can only follow a closer, so its span must
-        never suppress a boundary."""
-        prefix = self._ps_invoke_open_prefix
-        if not prefix:
-            return False
-        start = text.rfind(prefix, 0, pos + 1)
-        while start != -1:
-            if start <= boundary_pos:
-                return False
-            if start + len(prefix) <= pos:
-                match = self._ps_invoke_open_re.match(text, start)
-                if match is None or pos < match.end():
-                    return True
-            start = text.rfind(prefix, 0, start)
-        return False
-
-    def _ps_find_boundary(self, text: str) -> tuple[int, str | None]:
-        pos, token = -1, None
-        candidates = [
-            candidate
-            for candidate in dict.fromkeys(
-                (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
-            )
-            if candidate
-        ]
-        # Earliest raw boundary: opener prefixes before it are value data and
-        # their spans must never suppress a boundary (phantom header spans).
-        boundary_pos = min(
-            (p for p in (text.find(candidate) for candidate in candidates) if p != -1),
-            default=-1,
-        )
-        for candidate in candidates:
-            candidate_pos = text.find(candidate)
-            while candidate_pos != -1 and self._ps_pos_inside_invoke_header(
-                text, candidate_pos, boundary_pos
-            ):
-                candidate_pos = text.find(candidate, candidate_pos + 1)
-            if candidate_pos != -1 and (pos == -1 or candidate_pos < pos):
-                pos, token = candidate_pos, candidate
-        return pos, token
-
     def _ps_partial_boundary_len(self, text: str) -> int:
-        return max(
-            (
-                self._ends_with_partial_token(text, token)
-                for token in dict.fromkeys(
-                    (self._ps_param_close, self._ps_invoke_close, self._ps_outer_close)
-                )
-                if token
-            ),
-            default=0,
-        )
+        return self._ends_with_partial_token(text, self._ps_param_close)
 
-    def _ps_skip_ws(self, text: str, cursor: int) -> int:
-        return cursor + len(text[cursor:]) - len(text[cursor:].lstrip())
-
-    def _ps_following_call_pos(self, text: str, pos: int, boundary: str) -> int:
-        """Confirm recovery only for arrangements the block scanner can actually
-        consume without truncating the value or leaking the next call.
-
-        After an invoke closer the scanner sits in the block state, which
-        accepts an invoke opener directly, after outer-open debris, or after
-        one outer close plus a new outer open. After an outer closer the
-        scanner ends idle and requires a new outer opener first. Any other
-        arrangement must not confirm, so the resolution stays pending or
-        value data instead of truncating-and-losing the call."""
-        if boundary not in (self._ps_invoke_close, self._ps_outer_close):
-            return -1
-        cursor = self._ps_skip_ws(text, pos + len(boundary))
-        if boundary == self._ps_outer_close:
-            # Idle state: only a new outer opener followed by an invoke
-            # opener is reachable; a bare invoke opener would leak.
-            if not (
-                self._ps_outer_open and text.startswith(self._ps_outer_open, cursor)
-            ):
-                return -1
-            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
-        elif self._ps_outer_close and text.startswith(self._ps_outer_close, cursor):
-            # Block state: one outer close may hand over to a new envelope.
-            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_close))
-            if not (
-                self._ps_outer_open and text.startswith(self._ps_outer_open, cursor)
-            ):
-                return -1
-            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
-        while self._ps_outer_open and text.startswith(self._ps_outer_open, cursor):
-            cursor = self._ps_skip_ws(text, cursor + len(self._ps_outer_open))
-        # Only an adjacent invoke opener confirms recovery; quoted prose does not.
-        return cursor if self._ps_invoke_open_re.match(text, cursor) else -1
-
-    def _ps_boundary_resolution(
-        self, text: str, *, end_of_stream: bool = False
-    ) -> tuple[int, str | None, str | None]:
-        """Prefer a later parameter close unless an adjacent invoke opens first.
-
-        Structural tokens inside an invoke opener header that begins after the
-        boundary (quoted names may embed them) are name data: the search skips
-        them and the resolution holds pending until the header completes or
-        the stream ends, so whole and split delivery agree on the boundary."""
-        pos, boundary = self._ps_find_boundary(text)
-        if boundary is None:
-            return pos, boundary, None
-        if boundary == self._ps_param_close:
-            return pos, boundary, "parameter"
-
-        next_call = self._ps_following_call_pos(text, pos, boundary)
-        parameter_close = text.find(self._ps_param_close, pos + len(boundary))
-        while parameter_close != -1 and self._ps_pos_inside_invoke_header(
-            text, parameter_close, pos
-        ):
-            parameter_close = text.find(self._ps_param_close, parameter_close + 1)
-        if next_call != -1 and (parameter_close == -1 or next_call < parameter_close):
-            return pos, boundary, "structural"
-        if parameter_close != -1:
-            return parameter_close, self._ps_param_close, "parameter"
-        # Buffered volume after a closer pair proves nothing across chunk
-        # boundaries; only end of stream may promote it to structural.
-        if end_of_stream:
-            return pos, boundary, "structural"
-        return pos, boundary, "pending"
+    def _ps_boundary_resolution(self, text: str) -> tuple[int, str | None, str | None]:
+        """Only a parameter closer can end a value; other markup is ambiguous data."""
+        pos = text.find(self._ps_param_close)
+        return (pos, self._ps_param_close, "parameter") if pos != -1 else (-1, None, None)
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
@@ -926,12 +837,25 @@ class InvokeParamStreamMixin:
             if mode == "idle":
                 if calls:
                     break  # text after a call defers to the next step (wire order)
+                if self._ps_allow_standalone and self._ps_at_start:
+                    stripped = buf.lstrip()
+                    if stripped != buf:
+                        normal_parts.append(buf[:len(buf) - len(stripped)])
+                        self._buffer = stripped
+                        continue
+                    if buf.startswith(self._ps_invoke_open_prefix):
+                        self._ps_standalone = True
+                        self._ps_mode = "block"
+                        continue
+                    if self._ps_invoke_open_prefix.startswith(buf):
+                        break
                 pos = buf.find(self._ps_outer_open)
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self._ps_outer_open)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
+                        self._ps_at_start = False
                         self._buffer = buf[len(release):]
                     break
                 if pos > 0:
@@ -939,6 +863,7 @@ class InvokeParamStreamMixin:
                     self._buffer = buf[pos:]
                     continue
                 self._buffer = buf[len(self._ps_outer_open):]
+                self._ps_at_start = False
                 self._ps_mode = "block"
                 continue
 
@@ -996,7 +921,8 @@ class InvokeParamStreamMixin:
                     if mode == "invoke":
                         _close_invoke()
                     self._buffer = buf[e + len(self._ps_invoke_close):]
-                    self._ps_mode = "block"
+                    self._ps_mode = "idle" if self._ps_standalone else "block"
+                    self._ps_standalone = False
                     continue
                 if p != -1:
                     m = self._ps_param_open_re.search(buf, p)
@@ -1007,6 +933,7 @@ class InvokeParamStreamMixin:
                         self._ps_mode = "pskip"
                         continue
                     self._ps_key = m.group(1).strip()
+                    self._ps_value_parts = []
                     lead = "{" if not self._ps_json_started else ","
                     ptype = self._schema_param_type(
                         self._ps_key, self._ps_param_config, self._ps_missing_type
@@ -1017,6 +944,7 @@ class InvokeParamStreamMixin:
                         self._args_started = True
                         self._ps_emitted_any = False
                         self._ps_lead_trimmed = False
+                        self._ps_string_trim_parts = []
                         self._ps_mode = "pstr"
                     else:
                         self._ps_lead = lead
@@ -1042,54 +970,36 @@ class InvokeParamStreamMixin:
                         self._ps_lead_trimmed = True
                 end, boundary, resolution = self._ps_boundary_resolution(buf)
                 if resolution == "parameter":
-                    tail = self._ps_trim_trailing(buf[:end])
+                    tail = self._ps_trim_trailing("".join(self._ps_string_trim_parts) + buf[:end])
+                    self._ps_string_trim_parts = []
                     _emit(self._json_escape_chunk(tail) + '"')
                     _update_prev()
                     self._buffer = buf[end + len(self._ps_param_close):]
                     self._ps_mode = "invoke"
                     continue
-                if resolution == "structural" and boundary == self._ps_invoke_close:
-                    tail = self._ps_trim_trailing(buf[:end])
-                    _emit(self._json_escape_chunk(tail) + '"')
-                    _update_prev()
-                    self._buffer = buf[end:]
-                    self._ps_mode = "invoke"
-                    continue
-                if resolution == "structural" and boundary == self._ps_outer_close:
-                    tail = self._ps_trim_trailing(buf[:end])
-                    _emit(self._json_escape_chunk(tail) + '"')
-                    _update_prev()
-                    self._buffer = buf[end:]
-                    _close_invoke()
-                    self._ps_mode = "block"
-                    continue
-                if resolution == "pending":
-                    # Hold from the unconfirmed boundary (as pbuf does): buffered
-                    # volume cannot decide literal-vs-structural mid-stream.
-                    safe = buf[:end]
-                    keep = len(safe) - len(safe.rstrip(self._ps_trim))
-                    emit_now = safe[: len(safe) - keep]
-                    if emit_now:
-                        _emit(self._json_escape_chunk(emit_now))
-                        self._ps_emitted_any = True
-                        self._buffer = buf[len(emit_now):]
-                    break
                 if boundary is None:
                     hold = self._ps_partial_boundary_len(buf)
                     safe = buf[: len(buf) - hold] if hold else buf
                     keep = len(safe) - len(safe.rstrip(self._ps_trim))
                     emit_now = safe[: len(safe) - keep]
                     if emit_now:
-                        _emit(self._json_escape_chunk(emit_now))
+                        _emit(self._json_escape_chunk("".join(self._ps_string_trim_parts) + emit_now))
+                        self._ps_string_trim_parts = []
                         self._ps_emitted_any = True
-                        self._buffer = buf[len(emit_now):]
+                    if keep:
+                        # Pending trim characters may become interior data later;
+                        # keep pieces out of the delimiter-search buffer.
+                        self._ps_string_trim_parts.append(safe[len(safe) - keep:])
+                    self._buffer = buf[len(safe):]
                     break
 
             if mode in ("pbuf", "pskip"):
                 end, boundary, resolution = self._ps_boundary_resolution(buf)
                 if resolution == "parameter":
                     if mode == "pbuf":
-                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
+                        raw = "".join(self._ps_value_parts) + buf[:end]
+                        self._ps_value_parts = []
+                        raw = self._ps_trim_trailing(self._ps_trim_leading(raw))
                         valid, converted = self._ps_resolve_value(self._ps_key, raw)
                         # DR-03: a failed typed conversion is preserved raw in
                         # every delivery mode, matching the one-shot paths.
@@ -1101,33 +1011,13 @@ class InvokeParamStreamMixin:
                     self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                     continue
 
-                if resolution == "structural" and boundary == self._ps_invoke_close:
+                hold = self._ps_partial_boundary_len(buf)
+                safe = buf[: len(buf) - hold] if hold else buf
+                if safe:
                     if mode == "pbuf":
-                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
-                        valid, converted = self._ps_resolve_value(self._ps_key, raw)
-                        self._ps_json_started = True
-                        self._args_started = True
-                        _emit(self._ps_typed_fragment(converted if valid else raw))
-                        _update_prev()
-                    self._buffer = buf[end:]
-                    self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
-                    continue
-
-                if resolution == "structural" and boundary == self._ps_outer_close:
-                    if mode == "pbuf":
-                        raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
-                        valid, converted = self._ps_resolve_value(self._ps_key, raw)
-                        self._ps_json_started = True
-                        self._args_started = True
-                        _emit(self._ps_typed_fragment(converted if valid else raw))
-                        _update_prev()
-                        _close_invoke()
-                    self._buffer = buf[end:]
-                    self._ps_mode = "block"
-                    continue
-
-                if resolution in (None, "pending"):
-                    break  # hold the value until a parameter or structural closer arrives
+                        self._ps_value_parts.append(safe)
+                    self._buffer = buf[len(safe):]
+                break
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
@@ -1150,38 +1040,28 @@ class InvokeParamStreamMixin:
         residual = buf
         next_mode = "block"
         if mode == "pstr":
-            end, boundary, resolution = self._ps_boundary_resolution(buf, end_of_stream=True)
+            end, boundary, resolution = self._ps_boundary_resolution(buf)
             if resolution == "parameter":
                 raw = buf[:end]
                 residual = buf[end + len(self._ps_param_close):]
-            elif resolution == "structural":
-                raw = buf[:end]
-                residual = buf[end + len(boundary):]
-                if boundary == self._ps_invoke_close and residual.startswith(self._ps_outer_close):
-                    residual = residual[len(self._ps_outer_close):]
-                    next_mode = "idle"
-                elif boundary == self._ps_outer_close:
-                    next_mode = "idle"
             else:
-                hold = self._ps_partial_boundary_len(buf)
-                raw = buf[: len(buf) - hold] if hold else buf
+                logger.warning("Unclosed tool parameter %s; preserving raw value without call recovery", self._ps_key)
+                raw = buf
+                residual = ""
+            raw = "".join(self._ps_string_trim_parts) + raw
+            self._ps_string_trim_parts = []
             emit(self._json_escape_chunk(self._ps_trim_trailing(raw)) + '"')
         elif mode == "pbuf":
-            end, boundary, resolution = self._ps_boundary_resolution(buf, end_of_stream=True)
+            end, boundary, resolution = self._ps_boundary_resolution(buf)
             if resolution == "parameter":
                 raw = buf[:end]
                 residual = buf[end + len(self._ps_param_close):]
-            elif resolution == "structural":
-                raw = buf[:end]
-                residual = buf[end + len(boundary):]
-                if boundary == self._ps_invoke_close and residual.startswith(self._ps_outer_close):
-                    residual = residual[len(self._ps_outer_close):]
-                    next_mode = "idle"
-                elif boundary == self._ps_outer_close:
-                    next_mode = "idle"
             else:
-                hold = self._ps_partial_boundary_len(buf)
-                raw = buf[: len(buf) - hold] if hold else buf
+                logger.warning("Unclosed tool parameter %s; preserving raw value without call recovery", self._ps_key)
+                raw = buf
+                residual = ""
+            raw = "".join(self._ps_value_parts) + raw
+            self._ps_value_parts = []
             raw = self._ps_trim_trailing(self._ps_trim_leading(raw))
             valid, converted = self._ps_resolve_value(self._ps_key, raw)
             # DR-03: preserve the raw value at end-of-stream truncation too.
@@ -2205,9 +2085,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
 class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     toolcall_opener = "<tool_call>"
+    returns_full_normal_text = True
     _ps_trim = "\n"
     _ps_trim_single = True
     _ps_missing_type = "string"
+    _ps_allow_standalone = True
 
     """
     Detector for Qwen3-Coder XML-style function call format.
@@ -2335,28 +2217,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return json.dumps(param_dict, ensure_ascii=False)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-
-        if "<function=" not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        # Extract function blocks from tool_call blocks (or raw text as fallback)
-        tool_call_blocks = self.tool_call_block_regex.findall(text)
-        if not tool_call_blocks:
-            tool_call_blocks = [text]
-
-        calls = []
-        for block in tool_call_blocks:
-            func_matches = self.function_regex.findall(block)
-            for match in func_matches:
-                func_str = match[0] if match[0] else match[1]
-                item = self._parse_function_call(func_str, tools)
-                if item:
-                    item.tool_index = len(calls)
-                    calls.append(item)
-
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        return self._ps_parse_complete(text, tools)
 
 
 class MiMoV2ToolCallDetector(Qwen3CoderDetector):
@@ -2364,46 +2225,11 @@ class MiMoV2ToolCallDetector(Qwen3CoderDetector):
 
     _ps_trim = ""
     _ps_trim_single = False
+    _ps_allow_standalone = False
     returns_full_normal_text = True
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        """Replay the streaming grammar so literal closer text inside values survives."""
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx] if idx != -1 else text
-        normal_parts = [normal_text]
-        clone = type(self)()
-        raw_calls: List[ToolCallItem] = []
-        saw_call = False
-        chunk = text
-        while True:
-            result = clone.parse_streaming_increment(chunk, tools)
-            raw_calls.extend(result.calls)
-            if saw_call:
-                normal_parts.append(result.normal_text)
-            saw_call = saw_call or bool(result.calls)
-            if not chunk and not result.calls and not result.normal_text:
-                break
-            chunk = ""
-        raw_calls.extend(clone.finalize_streaming())
-        clone.finish_streaming()
-
-        order: List[int] = []
-        by_index: Dict[int, Dict[str, str]] = {}
-        for item in raw_calls:
-            if item.name is not None and item.tool_index not in by_index:
-                by_index[item.tool_index] = {"name": item.name, "params": ""}
-                order.append(item.tool_index)
-            if item.parameters and item.tool_index in by_index:
-                by_index[item.tool_index]["params"] += item.parameters
-        calls = [
-            ToolCallItem(
-                tool_index=ordinal,
-                name=by_index[index]["name"],
-                parameters=by_index[index]["params"] or "{}",
-            )
-            for ordinal, index in enumerate(order)
-        ]
-        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+        return self._ps_parse_complete(text, tools)
 
 
 class Gemma4Detector(BaseFormatDetector):
@@ -2698,6 +2524,7 @@ class Gemma4Detector(BaseFormatDetector):
 
 class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
     toolcall_opener = "<minimax:tool_call>"
+    returns_full_normal_text = True
     _ps_trim = "\n"
     _ps_trim_single = False
     _ps_missing_type = "loose"
@@ -2730,34 +2557,7 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if idx == -1:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
-        for func_name, invoke_body in self.invoke_regex.findall(text):
-            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
-                logger.warning(f"Model attempted to call undefined function: {func_name}")
-                continue
-            args = {}
-            config = self._get_param_config(func_name, tools)
-            for name, value in self.param_regex.findall(invoke_body):
-                key = name.strip()
-                raw = value.strip("\n")
-                if key in config:
-                    args[key] = self._convert_param_value(raw, key, config, func_name)
-                else:
-                    args[key] = _parse_loose_json_value(raw)
-            calls.append(
-                ToolCallItem(
-                    tool_index=len(calls),
-                    name=func_name,
-                    parameters=json.dumps(args, ensure_ascii=False),
-                )
-            )
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        return self._ps_parse_complete(text, tools)
 
 
 
@@ -3556,24 +3356,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._truncated_channel = True  # what follows is the broken channel's residue
         calls: List[ToolCallItem] = []
         if mode in ("invoke", "pstr", "pbuf"):
-            ledger = self.streamed_args_for_tool[self.current_tool_id]
-            if mode == "pstr":
-                frag = '"}'  # the ledger ends inside an open string value
-            elif ledger:
-                frag = "}"  # ends after a complete "key": value pair
-            else:
-                frag = "{}"  # invoke opened, no parameter emitted yet
-            self.streamed_args_for_tool[self.current_tool_id] += frag
-            calls.append(
-                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag)
-            )
-            try:
-                parsed = json.loads(self.streamed_args_for_tool[self.current_tool_id])
-            except (json.JSONDecodeError, ValueError):
-                parsed = {}
-            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
-                parsed if isinstance(parsed, dict) else {}
-            )
+            calls.extend(InvokeParamStreamMixin.finalize_streaming(self))
             self.streamed_args_for_tool[self.current_tool_id] = ""
             self.current_tool_id += 1
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
@@ -3783,6 +3566,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             # Finalize a mid-flight invoke (its Start already streamed) instead of
             # letting the next channel's call merge into it, then transition; any
             # residue ahead of the boundary is markup debris and drops with it.
+            self._buffer = buf[:pos]
             calls.extend(self._finalize_truncated_invoke())
             if kind == "closer":
                 self._buffer = buf[pos + len(payload):]

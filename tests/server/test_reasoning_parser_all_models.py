@@ -150,8 +150,29 @@ from freetoken.server.reasoning_parser import (  # noqa: E402
 
 _DR02_ARG = f"a{_T_CLOSE}b{_T_OPEN}c"
 _DR02_ENVELOPE = (
-    "<tool_call><function=echo><parameter=text>" + _DR02_ARG + "</parameter></function>ing"
+    "<tool_call><function=echo><parameter=text>" + _DR02_ARG + "</parameter></function></tool_call>"
 )
+
+
+@pytest.mark.parametrize("stream_reasoning", [True, False])
+@pytest.mark.parametrize("tail_len", [0, 1024])
+@pytest.mark.parametrize("force_reasoning", [True, False])
+def test_vfa01_explicit_reasoning_closer_keeps_quoted_tool_envelope(stream_reasoning, tail_len, force_reasoning):
+    quoted = "Example <tool_call><function=echo><parameter=text>x</parameter></function></tool_call> is not a call" + "a" * tail_len
+    answer = "answer <think>ordinary marker</think>"
+    text = ("" if force_reasoning else "<think>") + quoted + "</think>" + answer
+    assert ReasoningParser("mimo_v2", force_reasoning=force_reasoning).parse_non_stream(text) == (quoted, answer)
+    for cut in range(len(text) + 1):
+        parser = ReasoningParser("mimo_v2", force_reasoning=force_reasoning, stream_reasoning=stream_reasoning)
+        assert _stream(parser, [text[:cut], text[cut:]]) == (quoted, answer)
+
+
+def test_dr02_literal_tool_closer_does_not_end_argument_opacity():
+    envelope = "<tool_call><function=echo><parameter=text></function></tool_call><think>x</think></parameter></function></tool_call>"
+    text = envelope + " ordinary <think>quoted</think>"
+    assert ReasoningParser("mimo_v2", force_reasoning=False).parse_non_stream(text) == ("", text)
+    for cut in range(len(text) + 1):
+        assert _stream(ReasoningParser("mimo_v2", force_reasoning=False), [text[:cut], text[cut:]]) == ("", text)
 
 
 def test_mimo_tool_arg_think_markers_stay_verbatim():
@@ -176,15 +197,15 @@ def test_mimo_reasoning_then_tool_arg_think_markers():
     assert _stream(parser, chunks) == ("I'll echo it verbatim", _DR02_ENVELOPE)
 
 
-def test_mimo_unclosed_reasoning_arg_closer_does_not_reclaim():
-    # Malformed turn: reasoning never closes before the tool call, and the
-    # argument itself carries a closer -- the held block must not be split at it.
+def test_mimo_explicit_closer_reclaims_quoted_envelope():
+    # Inside reasoning, a real closer wins over the missing-closer fallback.
     text = f"{_T_OPEN}the tag " + _DR02_ENVELOPE
     parser = ReasoningParser("mimo_v2", force_reasoning=False)
-    assert parser.parse_non_stream(text) == ("the tag ", _DR02_ENVELOPE)
+    expected = ("the tag " + _DR02_ENVELOPE.split(_T_CLOSE, 1)[0], _DR02_ENVELOPE.split(_T_CLOSE, 1)[1])
+    assert parser.parse_non_stream(text) == expected
     parser = ReasoningParser("mimo_v2", force_reasoning=False)
     chunks = [text[i : i + 9] for i in range(0, len(text), 9)]
-    assert _stream(parser, chunks) == ("the tag ", _DR02_ENVELOPE)
+    assert _stream(parser, chunks) == expected
 
 
 def test_mimo_tool_arg_chunk_cuts_inside_think_markers():

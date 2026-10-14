@@ -119,6 +119,28 @@ def parse_sse(chunks: list[bytes]) -> list[dict | str]:
     return events
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+def test_qwen_standalone_call_openai_compatibility(chunk_size):
+    output = "<function=get_weather><parameter=city>Paris</parameter></function>"
+    state = FakeState([UserReply(uid=42, incremental_output=output, finished=True)], "qwen3_coder")
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    choice = response["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    call = choice["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "get_weather"
+    assert json.loads(call["arguments"]) == {"city": "Paris"}
+    pieces = [output[i:i + chunk_size] for i in range(0, len(output), chunk_size)]
+    state = FakeState([
+        UserReply(uid=42, incremental_output=piece, finished=(i == len(pieces) - 1))
+        for i, piece in enumerate(pieces)
+    ], "qwen3_coder")
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+    calls = [call for event in events if isinstance(event, dict) for choice in event.get("choices", []) for call in choice.get("delta", {}).get("tool_calls", [])]
+    assert [call["function"]["name"] for call in calls if call.get("function", {}).get("name")] == ["get_weather"]
+    assert json.loads("".join(call.get("function", {}).get("arguments", "") for call in calls)) == {"city": "Paris"}
+    assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_chat_request_accepts_tool_messages_and_assistant_tool_calls():
     req = ChatCompletionRequest(
         model="client-model",
@@ -364,7 +386,7 @@ def test_mimo_openai_stream_cutoffs_keep_argument_deltas_valid_json():
             assert events[-2]["choices"][0]["finish_reason"] == "length"
 
 
-def test_mimo_openai_stream_recovers_missing_parameter_close_before_next_call():
+def test_mimo_openai_open_value_does_not_infer_calls_from_literal_markup():
     schema = [
         {
             "type": "function",
@@ -446,14 +468,15 @@ def test_mimo_openai_stream_recovers_missing_parameter_close_before_next_call():
                 current["name"] = delta.get("function", {}).get("name") or current["name"]
                 current["arguments"] += delta.get("function", {}).get("arguments", "")
 
-    assert [calls[index]["name"] for index in sorted(calls)] == [
-        "first", "typed", "outer", "second"
-    ]
-    assert json.loads(calls[0]["arguments"]) == {"text": "first value"}
-    assert json.loads(calls[1]["arguments"]) == {"count": 5}
-    assert json.loads(calls[2]["arguments"]) == {"text": "outer only"}
-    assert json.loads(calls[3]["arguments"]) == {"count": 2}
+    assert [calls[index]["name"] for index in sorted(calls)] == ["first"]
+    value = output.split("<parameter=text>", 1)[1].split("</parameter>", 1)[0]
+    assert json.loads(calls[0]["arguments"]) == {"text": value}
     assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+    state = FakeState([UserReply(uid=42, incremental_output=output, finished=True)], "mimo_v2", "mimo_v2")
+    response = run(handle_chat_completion(chat_request(tools=schema), request=None, state=state, model_sampling={}))
+    full_calls = response["choices"][0]["message"]["tool_calls"]
+    assert [call["function"]["name"] for call in full_calls] == ["first"]
+    assert json.loads(full_calls[0]["function"]["arguments"]) == {"text": value}
 
 
 def test_rejected_typed_argument_keeps_following_call_valid_in_shared_stream_parsers():
@@ -952,8 +975,55 @@ from freetoken.server.reasoning_parser import (  # noqa: E402
 
 _DR02_ARG = f"a{_DR02_CLOSE}b{_DR02_OPEN}c"
 _DR02_BLOCK = (
-    "<tool_call><function=get_weather><parameter=city>" + _DR02_ARG + "</parameter></function>ing"
+    "<tool_call><function=get_weather><parameter=city>" + _DR02_ARG + "</parameter></function></tool_call>"
 )
+
+
+@pytest.mark.parametrize("case", ["quoted", "tool", "surrounding"])
+def test_mimo_auto_selected_reasoning_and_tools_complete_lifecycle(monkeypatch, case):
+    from freetoken.server.args import parse_args
+
+    config = SimpleNamespace(to_dict=lambda: {"architectures": ["MiMoV2ForCausalLM"], "torch_dtype": "bfloat16"})
+    monkeypatch.setattr("freetoken.utils.cached_load_hf_config", lambda _path: config)
+    args, _ = parse_args(["--model", "/models/anonymous"])
+    assert (args.tool_call_parser, args.reasoning_parser) == ("mimo_v2", "mimo_v2")
+    value = "<think>x</think>"
+    envelope = "<tool_call><function=get_weather><parameter=city>" + value + "</parameter></function></tool_call>"
+    if case == "quoted":
+        reasoning = "Example " + envelope + " is not a call"
+        # Use a simple quoted envelope here: nested think closers are themselves ambiguous.
+        reasoning = reasoning.replace(value, "x")
+        output = "<think>" + reasoning + "</think>answer"
+        content, expected_calls = "answer", []
+    else:
+        reasoning = "Checking" if case == "surrounding" else ""
+        content = "ordinary <think>quoted</think>"
+        output = ("<think>Checking</think>" if reasoning else "") + envelope + content
+        expected_calls = ["get_weather"]
+
+    state = FakeState([UserReply(uid=42, incremental_output=output, finished=True)], args.tool_call_parser, args.reasoning_parser)
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    message = response["choices"][0]["message"]
+    assert (message.get("reasoning_content") or "") == reasoning
+    assert message["content"] == content
+    assert [call["function"]["name"] for call in message.get("tool_calls", [])] == expected_calls
+    if expected_calls:
+        assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": value}
+
+    for size in (1, 7, len(output)):
+        pieces = [output[i:i + size] for i in range(0, len(output), size)]
+        state = FakeState([
+            UserReply(uid=42, incremental_output=piece, finished=(i == len(pieces) - 1))
+            for i, piece in enumerate(pieces)
+        ], args.tool_call_parser, args.reasoning_parser)
+        events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+        deltas = [choice["delta"] for event in events if isinstance(event, dict) for choice in event.get("choices", [])]
+        assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == reasoning
+        assert "".join(delta.get("content") or "" for delta in deltas) == content
+        calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
+        assert [call["function"]["name"] for call in calls if call.get("function", {}).get("name")] == expected_calls
+        if expected_calls:
+            assert json.loads("".join(call.get("function", {}).get("arguments", "") for call in calls)) == {"city": value}
 
 
 def test_mimo_dr02_tool_arg_markers_non_stream_reasoning_channel_clean():
