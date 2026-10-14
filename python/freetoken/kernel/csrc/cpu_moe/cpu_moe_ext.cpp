@@ -37,6 +37,7 @@
 
 #include "format.h"
 #include "gpu_sync.h"
+#include "gpu_sync_io.h"
 
 namespace freetoken::cpu_moe {
 
@@ -158,6 +159,7 @@ struct CpuMoeExecutor {
   // The GPU rings the doorbell with a task word at submit; this coordinator thread busy-polls it, runs the task on the worker pool, and completes it, which the GPU waits on at sync.
   // This removes the ~2x30-50us host-func dispatch round trips per MoE layer per decode step that otherwise idle the GPU (~6 ms/step on a 75-layer model).
   std::unique_ptr<GpuSync> gpu_sync;
+  std::unique_ptr<KernelIo> kernel_io;  // replaces the copies around the doorbell once enable_kernel_io() runs
   std::thread coord_thread;
   std::atomic<bool> coord_stop{false};
   std::atomic<int64_t> flag_served{0};  // completed doorbells (tests, watchdog)
@@ -411,6 +413,17 @@ struct CpuMoeExecutor {
     gpu_sync->gpu_submit(stream, to_word(task(layer_id, num_tokens)));
   }
   void flag_wait(uintptr_t stream) { gpu_sync->gpu_wait(stream); }
+  void enable_kernel_io() {
+    kernel_io = std::make_unique<KernelIo>(gpu_sync->ready_word(), gpu_sync->done_word(), io_x, io_ids, io_w, io_y, params.H,
+                                           params.top_k);
+  }
+  void flag_publish(uintptr_t stream, uintptr_t x, uintptr_t ids, uintptr_t w, int layer_id, int num_tokens) {
+    kernel_io->publish(stream, reinterpret_cast<const void*>(x), reinterpret_cast<const int32_t*>(ids),
+                       reinterpret_cast<const float*>(w), num_tokens, to_word(task(layer_id, num_tokens)));
+  }
+  void flag_combine(uintptr_t stream, uintptr_t out, int num_tokens, bool accumulate) {
+    kernel_io->combine(stream, reinterpret_cast<void*>(out), num_tokens, accumulate);
+  }
   bool flag_pending() const { return gpu_sync && gpu_sync->pending(); }
   // Complete a doorbell the coordinator never answered so the stream can make progress.
   void poison_flag() {
@@ -520,6 +533,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("num_tokens"))
       .def("flag_wait", &CpuMoeExecutor::flag_wait, py::arg("stream"))
       .def("flag_pending", &CpuMoeExecutor::flag_pending)
+      .def("enable_kernel_io", &CpuMoeExecutor::enable_kernel_io)
+      .def("flag_publish", &CpuMoeExecutor::flag_publish, py::arg("stream"), py::arg("x"), py::arg("ids"), py::arg("w"),
+           py::arg("layer_id"), py::arg("num_tokens"))
+      .def("flag_combine", &CpuMoeExecutor::flag_combine, py::arg("stream"), py::arg("out"), py::arg("num_tokens"),
+           py::arg("accumulate"))
       .def("poison_flag", &CpuMoeExecutor::poison_flag)
       .def("isa_name", &CpuMoeExecutor::isa_name)
       .def("set_spin_wait",
@@ -527,6 +545,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
   m.def("memops_probe", &GpuSync::probe, py::arg("stream"));
+  m.def("kernel_io_probe", &freetoken::cpu_moe::KernelIo::probe, py::arg("stream"));
   m.def("host_func_capture_safe", &GpuSync::host_func_capture_safe);
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act

@@ -8,6 +8,8 @@ the whole CUDA-graph-capturable sequence on the current stream:
       -> submit (doorbell naming (layer, bs), or a cudaLaunchHostFunc host node)
       -> sync   (wait for the CPU pool to finish)
       -> H2D (pinned expert output -> GPU)
+
+With the doorbell on CUDA, a publish kernel does the D2H and the doorbell, and skips the step when no route goes to the CPU; a combine kernel does the H2D (csrc/cpu_moe/gpu_sync_io.h).
 """
 
 from __future__ import annotations
@@ -302,8 +304,17 @@ class CpuMoeExecutor:
         # stream and raise_if_unhealthy() turns the step into a loud error instead of silent
         # stale output (flag_sync itself was decided above, before thread sizing).
         self._unhealthy = False
+        self._kernel_io = False
         if self._flag_sync:
             self._ext.start_flag_coordinator(self._coord_core)
+            # ROCm keeps the copies until the kernel IO has been checked on AMD GPUs.
+            if torch.version.hip is None:
+                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+                if reason:
+                    logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
+                else:
+                    self._ext.enable_kernel_io()
+                    self._kernel_io = True
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -326,7 +337,8 @@ class CpuMoeExecutor:
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
-            f"spin_wait={self.spin_wait}"
+            f"spin_wait={self.spin_wait} "
+            f"handshake={'kernel' if self._kernel_io else 'memop' if self._flag_sync else 'host-func'}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
@@ -498,7 +510,7 @@ class CpuMoeExecutor:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple:
-        """Issue the D2H copies + the CPU-pool submit host node, then return without
+        """Issue the D2H copies + the CPU-pool submit host node (or the publish kernel), then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
         :meth:`decode_sync` so the CPU compute overlaps the GPU GEMM / PCIe fetch.
 
@@ -524,6 +536,15 @@ class CpuMoeExecutor:
 
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
 
+        stream = torch.cuda.current_stream().cuda_stream
+        if self._kernel_io and hidden_states.dtype == torch.bfloat16:
+            x = hidden_states.contiguous()
+            ids = topk_ids.to(torch.int32).contiguous()
+            w = topk_weights.to(torch.float32).contiguous()
+            assert x.shape == (bs, self.H) and ids.shape == w.shape == (bs, self.top_k), (x.shape, ids.shape, w.shape)
+            self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs)
+            return (bs, torch.empty_like(x), True)
+
         # D2H: ship this step's activations + routing to pinned host memory.
         io = self._io
         io["x"][:bs].copy_(hidden_states, non_blocking=True)
@@ -531,20 +552,20 @@ class CpuMoeExecutor:
         io["w"][:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         out = torch.empty_like(hidden_states)
-        stream = torch.cuda.current_stream().cuda_stream
         if self._flag_sync:
             # Front-end memops: reset done, then ring the doorbell with (layer, bs).
             # No kernel launched; no host-func round trip.
             self._ext.flag_signal(stream, layer_id, bs)
         else:
             self._ext.submit_with_cuda_stream(stream, layer_id, bs)
-        return (bs, out)
+        return (bs, out, False)
 
-    def decode_sync(self, pending: tuple) -> torch.Tensor:
+    def decode_sync(self, pending: tuple, add_to: torch.Tensor | None = None) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
-        memop on done (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, out = pending
+        memop on done (set by the CPU coordinator); otherwise a cudaLaunchHostFunc.
+        With ``add_to``, return ``add_to`` + the CPU output; the kernel path adds in place into ``add_to``."""
+        bs, out, kernel_io = pending
         stream = torch.cuda.current_stream().cuda_stream
         if self._flag_sync:
             # Front-end WAIT(done >= 1): blocks this stream's later nodes without
@@ -552,8 +573,14 @@ class CpuMoeExecutor:
             self._ext.flag_wait(stream)
         else:
             self._ext.sync_with_cuda_stream(stream)
+        if kernel_io:
+            if add_to is not None and add_to.dtype == torch.bfloat16 and add_to.is_contiguous() and add_to.shape == out.shape:
+                self._ext.flag_combine(stream, add_to.data_ptr(), bs, True)
+                return add_to
+            self._ext.flag_combine(stream, out.data_ptr(), bs, False)
+            return out if add_to is None else add_to + out
         out.copy_(self._io["y"][:bs], non_blocking=True)
-        return out
+        return out if add_to is None else add_to + out
 
     def _watchdog_tick(self, suspect: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).

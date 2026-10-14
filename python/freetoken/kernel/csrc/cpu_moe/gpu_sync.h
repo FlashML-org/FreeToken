@@ -5,6 +5,8 @@
 // 2. wait, CPU -> GPU: gpu_wait(stream) holds later work of the stream until cpu_done(), and that work sees every CPU write made before cpu_done().
 // task is a nonzero word, opaque here; the executor encodes the layer and token count in it, as a constant baked into each captured graph.
 // One task is in flight at a time: decode runs on one stream and every layer waits before the next one signals.
+// KernelIo (gpu_sync_io.h) may replace the copies around submit and wait: its kernel copies the inputs into the IO rows and does gpu_submit's writes itself.
+// It skips a step without a CPU route: done = 1 and no ready, so cpu_poll() never sees the step and gpu_wait() passes at once.
 #pragma once
 
 #include <cstdint>
@@ -63,6 +65,10 @@ class GpuSync {
 
   // Submitted but not polled yet (watchdog only).
   bool pending() const;
+
+  // Device addresses of the two words, for KernelIo.
+  uintptr_t ready_word() const;
+  uintptr_t done_word() const;
 
  private:
   struct Impl;

@@ -257,4 +257,8 @@ bool GpuSync::pending() const {
   return flag_load_acquire(as_flag(impl_->ready)) != 0 && flag_load_acquire(as_flag(impl_->done)) == 0;
 }
 
+uintptr_t GpuSync::ready_word() const { return reinterpret_cast<uintptr_t>(impl_->ready); }
+
+uintptr_t GpuSync::done_word() const { return reinterpret_cast<uintptr_t>(impl_->done); }
+
 }  // namespace freetoken::cpu_moe

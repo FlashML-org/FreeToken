@@ -77,15 +77,22 @@ IS_ROCM = _is_rocm()
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
     runtime_link_args = [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
-    # These extensions contain host code only. BuildExtension supplies the ROCm
+    # Host sources. BuildExtension supplies the ROCm
     # platform defines to the C++ compiler; offload architecture flags belong on
     # HIP device sources and would be rejected by the host compiler here.
     extra_compile = ["-O3", "-std=c++20"]
+    # Device sources (.cu, built by hipcc); BuildExtension adds the offload architectures.
+    device_compile = ["-O3", "-std=c++20"]
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     runtime_link_args = []
     extra_compile = ["-O3", "-std=c++20"]
+    # Device sources (.cu, built by nvcc): SASS for each major arch, which also runs on the newer minors of that major,
+    # plus PTX for the oldest arch nvcc 13 supports, which the driver builds for any other GPU at load.
+    # Naming archs also stops torch from picking them, which fails on a build machine without a GPU.
+    device_compile = ["-O3", "-std=c++20"] + [f"-gencode=arch=compute_{a},code=sm_{a}" for a in (75, 80, 90, 100, 120)]
+    device_compile.append("-gencode=arch=compute_75,code=compute_75")
 
 _check_toolchain()
 
@@ -113,6 +120,7 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
                 f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
+                "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
                 *sorted(
                     str(p.relative_to(ROOT))
                     for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
@@ -121,7 +129,7 @@ setup(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args=extra_compile + ["-pthread"],
+            extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
             extra_link_args=runtime_link_args,
         ),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies

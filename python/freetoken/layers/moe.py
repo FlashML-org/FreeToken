@@ -346,8 +346,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        if not _HYBRID_OVERLAP:
+            return gpu_routed + cpu_routed_early
+        return executor.decode_sync(pending, add_to=gpu_routed)
 
     def _prefill_routed(
         self,

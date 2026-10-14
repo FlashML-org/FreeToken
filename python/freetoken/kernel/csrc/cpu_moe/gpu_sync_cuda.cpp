@@ -89,6 +89,7 @@ static void cumemop_check(int rc, const char* what) {
 // ready and done live on separate cache lines of one mapped-pinned block; with UVA the GPU memops and the coordinator use the same addresses.
 struct GpuSync::Impl {
   void* block = nullptr;
+  void* device_block = nullptr;
   volatile int64_t* ready = nullptr;
   volatile int64_t* done = nullptr;
 };
@@ -101,6 +102,11 @@ GpuSync::GpuSync() : impl_(std::make_unique<Impl>()) {
   std::memset(impl_->block, 0, 128);
   impl_->ready = static_cast<volatile int64_t*>(impl_->block);
   impl_->done = impl_->ready + 8;
+  const cudaError_t dev_rc = cudaHostGetDevicePointer(&impl_->device_block, impl_->block, 0);
+  if (dev_rc != cudaSuccess) {
+    cudaFreeHost(impl_->block);
+    throw std::runtime_error(std::string("CPU MoE flag device address: ") + cudaGetErrorString(dev_rc));
+  }
 }
 
 GpuSync::~GpuSync() { cudaFreeHost(impl_->block); }
@@ -152,5 +158,9 @@ uint64_t GpuSync::cpu_poll() {
 void GpuSync::cpu_done() { flag_store_release(impl_->done, 1); }
 
 bool GpuSync::pending() const { return flag_load_acquire(impl_->ready) != 0 && flag_load_acquire(impl_->done) == 0; }
+
+uintptr_t GpuSync::ready_word() const { return reinterpret_cast<uintptr_t>(impl_->device_block); }
+
+uintptr_t GpuSync::done_word() const { return reinterpret_cast<uintptr_t>(impl_->device_block) + 8 * sizeof(int64_t); }
 
 }  // namespace freetoken::cpu_moe
