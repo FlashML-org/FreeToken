@@ -81,6 +81,17 @@ def _as_error(msg: Any) -> str | None:
     return None
 
 
+def _as_cuda_oom(msg: Any) -> str | None:
+    """Only the worker's typed torch.cuda.OutOfMemoryError receipt enables recovery.
+
+    A human exception string is deliberately insufficient: ordinary failures which happen to
+    contain 'OOM'/'out of memory' retain the existing terminal process-exit behavior.
+    """
+    if isinstance(msg, tuple) and msg and msg[0] == "cuda_oom":
+        return str(msg[1]) if len(msg) > 1 else "CUDA out of memory"
+    return None
+
+
 def _drain_pending_error(get: Callable[[float], Any], attempts: int = 5, timeout: float = 0.02) -> str | None:
     """After a worker death, poll the ack queue briefly for a final ("error", reason) ack still
     in flight (the queue feeder flushes on process exit), so the real reason wins over the
@@ -96,12 +107,47 @@ def _drain_pending_error(get: Callable[[float], Any], attempts: int = 5, timeout
     return None
 
 
+def _drain_pending_failure(get: Callable[[float], Any]) -> tuple[str | None, bool]:
+    """Return the final worker reason plus whether it was a typed CUDA OOM."""
+    for _ in range(5):
+        try:
+            msg = get(0.02)
+        except Empty:
+            continue
+        if (oom := _as_cuda_oom(msg)) is not None:
+            return oom, True
+        if (err := _as_error(msg)) is not None:
+            return err, False
+    return None, False
+
+
+def _retire_oom_workers(processes: List[Any]) -> None:
+    """Terminate, join, and if necessary kill every failed worker before replacement CUDA use."""
+    survivors = []
+    for process in processes:
+        try:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+            if process.is_alive():
+                survivors.append(getattr(process, "name", "unknown"))
+        except Exception:  # noqa: BLE001
+            survivors.append(getattr(process, "name", "unknown"))
+    if survivors:
+        raise WorkerDied("OOM workers could not be stopped: " + ", ".join(survivors))
+
+
 def drain_ready(
     handle: BackendHandle,
     progress: LoadProgress,
     get: Callable[[float], Any] | None = None,
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
+    timeout_s: float | None = None,
+    is_shutting_down: Callable[[], bool] | None = None,
 ) -> None:
     """Block until ``expected_acks`` non-progress acks arrive, applying ("progress", …)
     tuples to ``progress``. Between acks, poll worker liveness; raise WorkerDied if a worker
@@ -115,7 +161,12 @@ def drain_ready(
             return handle.ack_queue.get(timeout=timeout)
 
     ready = 0
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while ready < handle.expected_acks:
+        if is_shutting_down is not None and is_shutting_down():
+            raise WorkerDied("backend startup cancelled by shutdown")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorkerDied("backend readiness timed out")
         try:
             msg = get(poll)
         except Empty:
@@ -129,6 +180,11 @@ def drain_ready(
         err = _as_error(msg)
         if err is not None:
             raise WorkerDied(err)
+        oom = _as_cuda_oom(msg)
+        if oom is not None:
+            # Recovery is deliberately post-initial-ready only. A load-time CUDA OOM has no
+            # healthy generation to retire and follows the ordinary startup-failure path.
+            raise WorkerDied(oom)
         if isinstance(msg, tuple) and msg and msg[0] == "progress":
             _tag, desc, done, total = msg
             progress.update(desc, done, total)
@@ -147,6 +203,11 @@ def run_backend_supervisor(
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
+    restart_backend: Callable[[int], BackendHandle] | None = None,
+    on_restarting: Callable[[str, int], None] | None = None,
+    max_restarts: int = 1,
+    restart_ready_timeout: float | None = None,
+    can_restart: Callable[[], bool] | None = None,
 ) -> None:
     """Drain to readiness (watching liveness), flip the gate via ``on_ready``, then watch
     forever: a worker that dies AFTER ready (a scheduler crash while the frontend keeps
@@ -164,6 +225,9 @@ def run_backend_supervisor(
     def _shutting_down() -> bool:
         return bool(is_shutting_down is not None and is_shutting_down())
 
+    def _can_restart() -> bool:
+        return not _shutting_down() and (can_restart is None or can_restart())
+
     try:
         drain_ready(handle, progress, poll=poll, on_meta=on_meta)
     except WorkerDied as exc:
@@ -174,13 +238,48 @@ def run_backend_supervisor(
 
     on_ready()
 
+    attempts = 0
     while True:
         dead = _first_dead(handle.processes)
         if dead is not None:
             if _shutting_down():
                 # Orderly stop in progress: the worker exit is expected — stay quiet.
                 return
-            if on_failure is not None:
-                on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
-            return
+            reason, is_cuda_oom = _drain_pending_failure(lambda timeout: handle.ack_queue.get(timeout=timeout))
+            message = reason or f"backend worker {getattr(dead, 'name', '?')} exited"
+            if not is_cuda_oom or restart_backend is None or attempts >= max_restarts:
+                if on_failure is not None:
+                    on_failure(message)
+                return
+            if not _can_restart():
+                return
+            attempts += 1
+            if on_restarting is not None:
+                try:
+                    on_restarting(message, attempts)
+                except Exception as exc:  # noqa: BLE001
+                    if _can_restart() and on_failure is not None:
+                        on_failure(f"OOM recovery transition failed: {exc}")
+                    return
+            fresh = None
+            try:
+                _retire_oom_workers(handle.processes)
+                if not _can_restart():
+                    return
+                fresh = restart_backend(attempts)
+                drain_ready(fresh, progress, poll=poll, on_meta=on_meta,
+                            timeout_s=restart_ready_timeout, is_shutting_down=lambda: not _can_restart())
+            except Exception as exc:  # noqa: BLE001
+                failure = f"OOM recovery failed: {exc}"
+                if fresh is not None:
+                    try:
+                        _retire_oom_workers(fresh.processes)
+                    except WorkerDied as cleanup:
+                        failure += f"; {cleanup.message}"
+                if not _shutting_down() and on_failure is not None:
+                    on_failure(failure)
+                return
+            handle = fresh
+            on_ready()
+            continue
         time.sleep(poll)

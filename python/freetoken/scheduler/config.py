@@ -18,6 +18,9 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    # Parent-owned worker generation marker. ServerArgs inherits it; keeping the default at the
+    # scheduler boundary preserves offline and CPU callers that construct SchedulerConfig.
+    backend_epoch: int = 0
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

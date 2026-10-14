@@ -91,6 +91,7 @@ def test_prompt_admitted_signal_uses_existing_frontend_usage_channel():
 def test_schedule_reports_admission_only_after_prepare_succeeds():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 4), (2, 34, 0)])
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
@@ -115,6 +116,7 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
 def test_prepare_failure_emits_no_prompt_admission():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 0)])
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
@@ -132,6 +134,7 @@ def test_prepare_failure_emits_no_prompt_admission():
 
 def test_scheduler_rejection_emits_error_but_no_admission():
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.engine = SimpleNamespace(max_seq_len=4)
     added = []
     scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
@@ -153,6 +156,7 @@ def test_scheduler_rejection_emits_error_but_no_admission():
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.prefill_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
@@ -167,8 +171,36 @@ def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
     assert sent[0].uid == 77 and sent[0].error == "request aborted"
 
 
+def test_scheduler_epoch_filters_stale_input_and_stamps_admission_and_abort_replies():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=3)
+    scheduler.engine = SimpleNamespace(max_seq_len=64)
+    added, sent = [], []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append, abort_req=lambda uid: None)
+    scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
+    scheduler._pending_abort_acks = set()
+    scheduler.send_result = sent.extend
+
+    Scheduler._process_one_msg(
+        scheduler,
+        UserMsg(uid=1, input_ids=torch.arange(4, dtype=torch.int32),
+                sampling_params=SamplingParams(max_tokens=1), epoch=2),
+    )
+    assert added == [] and sent == []
+
+    Scheduler._report_prompt_admissions(
+        scheduler, SimpleNamespace(is_prefill=True, prompt_admissions=[(2, 9, 3)])
+    )
+    scheduler._pending_abort_acks.add(3)
+    Scheduler._flush_abort_acks(scheduler)
+    assert [(type(message), message.epoch) for message in sent] == [
+        (PromptAdmittedMsg, 3), (ErrorReplyMsg, 3),
+    ]
+
+
 def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.engine = SimpleNamespace(max_seq_len=64)
     added = []
     scheduler.prefill_manager = SimpleNamespace(
@@ -200,6 +232,7 @@ def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
 
 def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(backend_epoch=0)
     scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()

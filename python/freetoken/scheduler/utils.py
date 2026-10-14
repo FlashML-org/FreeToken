@@ -20,6 +20,7 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
+    epoch: int = 0
 
     @property
     def input_len(self) -> int:

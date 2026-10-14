@@ -492,7 +492,7 @@ class FakeState:
     def frontend_tokenizer(self):
         return self._count_manager
 
-    def new_user(self):
+    async def new_user(self):
         self._uid += 1
         return self._uid
 

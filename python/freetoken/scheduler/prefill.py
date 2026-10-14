@@ -216,6 +216,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             prompt_len=pending_req.input_len,
+            epoch=pending_req.epoch,
         )
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
@@ -288,6 +289,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                epoch=req.epoch,
             )
         )
 

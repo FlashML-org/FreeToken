@@ -92,11 +92,12 @@ class TokenizeManager:
                         mm_items=mm.mm_items,
                         mrope_positions=mm.mrope_positions,
                         mrope_delta=mm.mrope_delta,
+                        epoch=msg.epoch,
                     )
                 )
             else:
                 results.append(
-                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params, epoch=msg.epoch)
                 )
         return results
 

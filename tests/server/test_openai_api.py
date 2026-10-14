@@ -39,7 +39,7 @@ class FakeState:
         self.replies = replies
         self.sent: TokenizeMsg | None = None
 
-    def new_user(self) -> int:
+    async def new_user(self) -> int:
         return 42
 
     async def send_one(self, msg):

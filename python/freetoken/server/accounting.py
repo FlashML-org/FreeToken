@@ -66,7 +66,7 @@ async def prepare_stop_accounting(
         maintenance = getattr(state, "maintenance_state", "serving")
         if maintenance == "rebuilding":
             raise AccountingDrainError("cache rebuild is in progress; retry stop after it finishes")
-        if maintenance not in {"loading", "serving", "stopping", "failed"}:
+        if maintenance not in {"loading", "serving", "restarting", "stopping", "failed"}:
             raise AccountingDrainError(f"engine cannot prepare stop from state {maintenance!r}")
 
         # This assignment and FrontendManager.new_user's check run on the same event loop, making
