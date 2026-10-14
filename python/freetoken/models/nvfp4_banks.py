@@ -73,6 +73,7 @@ def iter_nvfp4_expert_pieces(
     chunk: int = 8 << 20,
     drop_page_cache: DropPageCache | None = None,
     primary: bool = True,
+    skip_experts_from: int | None = None,
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
@@ -94,6 +95,8 @@ def iter_nvfp4_expert_pieces(
         match = spec.key_pattern.match(name)
         if match is None:
             continue
+        if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
+            continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
@@ -104,7 +107,7 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * config.num_experts * 9
+    expected = _num_moe_layers(config) * (config.num_experts if skip_experts_from is None else skip_experts_from) * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 

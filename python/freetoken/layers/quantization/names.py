@@ -41,7 +41,10 @@ def ct_set(patterns: tuple[str, ...], *, class_names: bool) -> Matcher:
     """compressed-tensors ``targets`` / ``ignore``: module names, ``re:`` regexes, or the class name Linear.
 
     A name covers that module alone, not its children: llm-compressor lists every skipped module, containers included, so an ``ignore`` entry for ``linear_attn`` says nothing about ``linear_attn.in_proj_qkv``."""
-    names = frozenset(p for p in patterns if not p.startswith("re:") and p != "Linear")
+    names = frozenset(
+        p for p in patterns
+        if not p.startswith("re:") and p not in {"Linear", "Gemma4TextExperts"}
+    )
     # a class name other than Linear cannot be matched from a module name alone; fail here rather than serve the module bf16
     unknown = [p for p in names if "." not in p and p[:1].isupper()] if class_names else []
     if unknown:
@@ -49,7 +52,13 @@ def ct_set(patterns: tuple[str, ...], *, class_names: bool) -> Matcher:
     regexes = [p[3:] for p in patterns if p.startswith("re:")]
     rx = re.compile("|".join(f"(?:{r})" for r in regexes)) if regexes else None
     any_linear = class_names and "Linear" in patterns
-    return lambda name: any_linear or name in names or (rx is not None and rx.match(name) is not None)
+    any_gemma_experts = class_names and "Gemma4TextExperts" in patterns
+    return lambda name: (
+        any_linear
+        or (any_gemma_experts and is_routed_expert(name))
+        or name in names
+        or (rx is not None and rx.match(name) is not None)
+    )
 
 
 _ROUTED_EXPERT = re.compile(r"\.experts\.\d+(\.|$)")

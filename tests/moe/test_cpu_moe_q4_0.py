@@ -21,6 +21,49 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def test_q4_k_gguf_moe_dispatches_to_native_kernel(monkeypatch):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    layer = object.__new__(OffloadMoELayer)
+    layer.quant_method = None
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
+    layer.num_experts = 4
+
+    gate_up = torch.empty((8, 2, 4), dtype=torch.uint8)
+    down = torch.empty((8, 4, 2), dtype=torch.uint8)
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    topk_w = torch.tensor([[0.5, 0.5], [1.0, 0.0]], dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+
+    calls = {}
+
+    def fake(path):
+        calls["called"] = True
+        return torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    monkeypatch.setattr("freetoken.moe.fused_q4_0.fused_experts_gguf_q4_k", fake)
+
+    cache = SimpleNamespace(
+        quant_format="q4_k",
+        bank_views=lambda *args, **kwargs: (gate_up, down),
+    )
+
+    out = layer._expert_gemm(
+        cache,
+        hidden,
+        topk_w,
+        topk_ids,
+        views=(gate_up, down),
+        n=None,
+        alphas=None,
+        is_prefill=False,
+    )
+
+    assert calls["called"]
+    assert out.dtype == torch.bfloat16
+
+
 def _pack_q4_0(nibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Pack [S, OUT, K] uint8 nibble codes (0..15) + [S, OUT, K//32] fp16 scales into
     the native Q4_0 row layout [S, OUT, K//32*18]: each 32-elem block is a 2-byte fp16
@@ -44,6 +87,75 @@ def _dequant_bank(packed: torch.Tensor, K: int, dev) -> torch.Tensor:
     S, OUT, _ = packed.shape
     flat = dequantize(packed.reshape(-1), GGML_Q4_0, torch.bfloat16)
     return flat.reshape(S, OUT, K).to(dev)
+
+
+def _pack_q8_0(values: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Pack [S, OUT, K] values into native Q8_0 rows [S, OUT, K//32*34]."""
+    S, OUT, K = values.shape
+    blocks = values.reshape(S, OUT, K // 32, 32)
+    scales = scale.to(torch.float16).view(torch.uint8).reshape(S, OUT, K // 32, 2)
+    return torch.cat([scales, blocks.view(torch.uint8)], dim=-1).reshape(S, OUT, K // 32 * 34).contiguous()
+
+
+def _make_q8_0_cache(L, E, H, I, seed=0):
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    torch.manual_seed(seed)
+    S = L * E
+
+    def rows(OUT, K):
+        values = torch.randint(-127, 128, (S, OUT, K), dtype=torch.int8)
+        scale = 0.002 + 0.008 * torch.rand(S, OUT, K // 32)
+        packed = _pack_q8_0(values, scale)
+        pinned = alloc_pinned_tensor(*packed.shape, dtype=torch.uint8)
+        pinned.copy_(packed)
+        return pinned
+
+    return SimpleNamespace(
+        quant_format="q8_0",
+        bank_sources={"gate_up": list(rows(2 * I, H).split(E)), "down": list(rows(H, I).split(E))},
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+
+
+@pytest.mark.parametrize("bs", [1, 3])
+def test_cpu_decode_q8_0_matches_dequant_then_gpu(bs):
+    """CPU Q8_0 W8A16 GEMV matches reference dequantization plus GPU decode."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused import fused_experts_decode_impl
+
+    torch.manual_seed(500 + bs)
+    L, E, H, I, top_k = 2, 8, 256, 64, 4
+    layer = 1
+    dev = torch.device("cuda")
+    cache = _make_q8_0_cache(L, E, H, I)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="gelu_tanh", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=bs, device=dev,
+    )
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16) * 0.5
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    weights = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    cpu_out = ex.decode(layer, hidden, weights, ids).float()
+    torch.cuda.synchronize()
+
+    from freetoken.models.gguf.dequant import GGML_Q8_0, dequantize
+
+    gate_up_raw = cache.bank_sources["gate_up"][layer]
+    down_raw = cache.bank_sources["down"][layer]
+    gate_up = dequantize(gate_up_raw.reshape(-1), GGML_Q8_0, torch.bfloat16).reshape(
+        E, 2 * I, H
+    ).to(dev)
+    down = dequantize(down_raw.reshape(-1), GGML_Q8_0, torch.bfloat16).reshape(E, H, I).to(dev)
+    gpu_out = fused_experts_decode_impl(
+        hidden, gate_up, down, weights, ids.clone(), "gelu_tanh", False
+    ).float()
+    rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
+    assert rel < 2e-2, f"q8_0 bs={bs} rel err {rel.item()}"
 
 
 def _make_q4_0_cache(L, E, H, I, seed=0):

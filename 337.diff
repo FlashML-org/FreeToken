@@ -1,0 +1,1889 @@
+diff --git a/python/freetoken/engine/config.py b/python/freetoken/engine/config.py
+index 7ab792f9e..d37959a8a 100644
+--- a/python/freetoken/engine/config.py
++++ b/python/freetoken/engine/config.py
+@@ -49,6 +49,13 @@ class EngineConfig:
+     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
+     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
+     moe_cpu_threads: int = 0
++    # Disk tier (--moe-disk-tier, see moe/disk_tier.py): "off" = classic behavior.
++    # When "on", experts [0, expert_ram_experts) per layer stay pinned in RAM and the
++    # rest are fetched from the original checkpoint on slot-cache miss. Requires the
++    # native NVFP4 layout, gpu decode target, no prefill overlap, no cuda graphs.
++    moe_disk_tier: str = "off"
++    expert_ram_experts: int = 0
++    disk_fetch_workers: int = 8
+     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
+     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
+     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
+diff --git a/python/freetoken/engine/engine.py b/python/freetoken/engine/engine.py
+index 006c19089..60941e042 100644
+--- a/python/freetoken/engine/engine.py
++++ b/python/freetoken/engine/engine.py
+@@ -544,6 +544,29 @@ def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+                 "(locked layers prefill via synchronous pageable copies)"
+             )
+             object.__setattr__(config, "moe_prefill_overlap", False)
++        disk_tier = None
++        if config.moe_disk_tier == "on":
++            from freetoken.moe.disk_tier import DiskTierSpec
++
++            E = config.model_config.num_experts
++            # Collect ALL unmet preconditions and raise once: each used to surface as a
++            # separate boot-time ValueError, costing a full boot per missing flag.
++            problems = []
++            if not 0 < config.expert_ram_experts < E:
++                problems.append(
++                    f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
++            if decode_target != "gpu":
++                problems.append(
++                    "--moe-disk-tier v0 requires the gpu decode path (--moe-strategy offload)")
++            if config.moe_prefill_overlap:
++                problems.append("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
++            if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
++                problems.append(
++                    "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
++            if problems:
++                raise ValueError(
++                    "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))
++            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
+         # Fast path: an FTW checkpoint loads its repacked banks directly.
+         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
+         # expert-tensor granularity. Both pin-after-fill.
+@@ -570,6 +593,7 @@ def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+                 parallel=expert_parallel,
+                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                 layer_residency=requested_residency,
++                disk_tier=disk_tier,
+             )
+         except PinFailed as exc:
+             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+@@ -619,6 +643,21 @@ def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
+         cache.cpu_layer_ids = cpu_layer_ids
+         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
++        if banks.disk_index is not None:
++            cache.attach_disk_tier(
++                banks.disk_index, banks.disk_ram_experts,
++                workers=config.disk_fetch_workers)
++            logger.info_rank0(
++                f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
++                f"experts/layer pinned in RAM; the rest fetched from "
++                f"{config.model_path} on slot-cache miss")
++        elif disk_tier is not None:
++            # The loader released experts [K, E) but no fetcher came back: serving would
++            # multiply by zeroed rows and log nothing. Fail where the flag was set.
++            raise NotImplementedError(
++                "--moe-disk-tier on: this checkpoint's expert provider returned no disk "
++                "index, so experts released at load would never be refetched "
++                f"(quant_format={banks.quant_format!r})")
+         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+         if decode_target == "hybrid":
+             self._resolve_hybrid_fetch(config, cache)
+diff --git a/python/freetoken/layers/moe.py b/python/freetoken/layers/moe.py
+index 42ad822b4..244dc3378 100644
+--- a/python/freetoken/layers/moe.py
++++ b/python/freetoken/layers/moe.py
+@@ -278,6 +278,9 @@ def _decode_routed(
+             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+         cache.ensure_experts(self.layer_id, topk_ids)
+         cache.copy_missing()
++        if (cache.disk_tier_enabled and self.layer_id == 0
++                and os.environ.get("FT_DISK_TIER_VERIFY")):
++            cache._disk_tier.verify_decode_mapping(cache, self.layer_id, topk_ids)
+         return self._expert_gemm(
+             cache,
+             hidden_states,
+@@ -364,7 +367,12 @@ def _prefill_routed(
+             )
+             cache.release_prefill_layer(self.layer_id)
+             return out
+-        cache.materialize_layer(self.layer_id)
++        if cache.disk_tier_enabled:
++            # Disk tier: stream only the RAM-resident prefix + fetch the routed
++            # disk-resident experts (identity slots, so topk_ids pass through).
++            cache.materialize_layer(self.layer_id, topk_ids)
++        else:
++            cache.materialize_layer(self.layer_id)
+         cache.copy_missing()
+         return self._expert_gemm(
+             cache,
+diff --git a/python/freetoken/models/nvfp4_banks.py b/python/freetoken/models/nvfp4_banks.py
+index 1d1b42859..2eae169a9 100644
+--- a/python/freetoken/models/nvfp4_banks.py
++++ b/python/freetoken/models/nvfp4_banks.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import collections
++import itertools
+ import json
+ import os
+ import re
+@@ -74,6 +75,7 @@ def iter_nvfp4_expert_pieces(
+     chunk: int = 8 << 20,
+     drop_page_cache: DropPageCache | None = None,
+     primary: bool = True,
++    skip_experts_from: int | None = None,
+ ):
+     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
+     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
+@@ -81,6 +83,12 @@ def iter_nvfp4_expert_pieces(
+ 
+     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
+     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
++
++    ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are disk-resident.
++    The serial reader never calls ``get_tensor`` for them (no I/O); the parallel reader filters
++    them at the reader (the whole-shard read is unchanged, but no per-expert work happens). Each
++    skipped expert still yields an EMPTY piece so the bank fill completes the layer without
++    touching the (released) tail rows.
+     """
+     from freetoken.models.loader import drop_page_cache as _drop
+     from freetoken.moe.expert_pieces import per_expert_pieces
+@@ -95,6 +103,8 @@ def iter_nvfp4_expert_pieces(
+         match = spec.key_pattern.match(name)
+         if match is None:
+             continue
++        if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
++            continue  # disk-resident: never read
+         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
+         if bank_layer is None:
+             continue
+@@ -105,7 +115,8 @@ def iter_nvfp4_expert_pieces(
+         if kind not in ("weight", "weight_scale", "weight_scale_2"):
+             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
+-    expected = _num_moe_layers(config) * config.num_experts * 9
++    experts = min(skip_experts_from, config.num_experts) if skip_experts_from is not None else config.num_experts
++    expected = _num_moe_layers(config) * experts * 9
+     if len(wanted) != expected:
+         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
+ 
+@@ -133,7 +144,19 @@ def _parallel():
+                 tensor = _ingest_global(spec, tensor)
+             yield name, tensor
+ 
+-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
++    pieces = per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
++    if skip_experts_from is not None:
++        pieces = itertools.chain(pieces, _disk_skip_pieces(config, skip_experts_from))
++    return pieces
++
++
++def _disk_skip_pieces(config, skip_from: int):
++    """Empty pieces for the disk-resident experts ``[skip_from, E)``: the rows are
++    complete without a checkpoint read (``build_expert_banks`` marks them written,
++    pins only the prefix, and releases the tail)."""
++    for bank_layer in range(_num_moe_layers(config)):
++        for e in range(skip_from, config.num_experts):
++            yield bank_layer, e, e + 1, {}
+ 
+ 
+ __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+diff --git a/python/freetoken/moe/disk_tier.py b/python/freetoken/moe/disk_tier.py
+new file mode 100644
+index 000000000..959ce319a
+--- /dev/null
++++ b/python/freetoken/moe/disk_tier.py
+@@ -0,0 +1,685 @@
++"""Disk tier: NVMe-backed MoE experts (VRAM <- RAM <- NVMe).
++
++Lets the offload backend serve experts that do NOT fit in pinned RAM: the RAM
++bank holds only the first ``ram_experts`` experts per layer (pinned), the rest
++stay on disk in the original checkpoint. When the GPU slot cache misses a
++disk-resident expert, :class:`DiskTier` fetches its rows with O_DIRECT preadv
++into a small pinned staging buffer and H2D-copies them into the slot the LRU
++kernel already assigned, then shrinks the miss list so the existing PCIe
++``copy_missing`` path only moves the RAM-resident misses.
++
++v0 scope (prototype):
++* native NVFP4 layout only (the "triton" backend banks -- what sm_120 picks);
++* ``decode_target == "gpu"`` (offload) only -- the CPU executor reads banks
++  directly and would read released pages;
++* synchronous fetch (the layer waits for its disk misses); no CUDA-graph
++  capture (the miss-list D2H/H2D round trip is host-side and variable);
++* prefill_overlap off (the double-buffer prefill path bypasses the slot cache).
++
++The bank rows are read from the ORIGINAL safetensors shards: every expert
++tensor is a contiguous per-expert tensor, so a bank row is one (or two, for
++the gate|up-fused banks) aligned super-block preads. No FTW conversion needed.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import json
++import os
++import struct
++import threading
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass
++
++import torch
++
++from freetoken.moe.host_banks import HostBank
++
++_ALIGN = 4096
++
++
++@dataclass(frozen=True)
++class DiskTierSpec:
++    """Engine -> loader: how many experts per layer stay pinned in RAM.
++
++    Experts ``[0, ram_experts)`` are pinned as usual; ``[ram_experts, E)`` keep
++    their bank rows allocated but their pages are released after load and are
++    served from disk by :class:`DiskTier`."""
++
++    ram_experts: int
++
++
++def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: int,
++                       ram_experts: int) -> None:
++    """MADV_DONTNEED the unpinned tail rows of every bank layer (post-load).
++
++    The release is an optimization, not an invariant: the tail rows were never
++    written at load, so when a row boundary is not page-aligned (the small scale
++    banks) we warn and skip that bank instead of failing the boot."""
++    _PAGE = 4096
++    for layer_banks in banks_by_name.values():
++        for bank in layer_banks:
++            row_bytes = bank.nbytes // num_experts
++            offset = ram_experts * row_bytes
++            size = bank.nbytes - offset
++            if offset % _PAGE or size % _PAGE:
++                print(f"[disk-tier] WARNING: bank row boundary not page-aligned "
++                      f"(ram_experts={ram_experts}, row_bytes={row_bytes}); skipping "
++                      f"the release for this bank -- the tail rows were never written, "
++                      f"so nothing is lost", flush=True)
++                continue
++            bank.release_range(offset, size)
++
++
++def tail_resident_bytes(bank: HostBank, num_experts: int, ram_experts: int) -> int:
++    """Bytes the kernel currently backs in the released tail rows ``[ram_experts, E)``.
++
++    mincore(2) over the tail's byte range: one syscall, per-page residency.
++    Conservative -- mincore also reports private-anon pages mapped from the
++    shared zero page (a plain READ of a tail row), so this overcounts what
++    actually costs RAM (cgroup memory.stat shmem is the real number).
++    Returns -1 if mincore itself fails."""
++    row_bytes = bank.nbytes // num_experts
++    off = ram_experts * row_bytes
++    size = bank.nbytes - off
++    if size <= 0:
++        return 0
++    _PAGE = 4096
++    vec = (ctypes.c_ubyte * (size // _PAGE))()
++    libc = ctypes.CDLL("libc.so.6", use_errno=True)
++    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
++    if libc.mincore(ctypes.c_void_p(bank.addr + off), size, vec) != 0:
++        return -1
++    return sum(vec) * _PAGE
++
++
++def check_tail_unbacked(banks_by_name: dict[str, list[HostBank]], num_experts: int,
++                        ram_experts: int) -> None:
++    """Startup sanity check for the lazy-tail invariant, right after
++    ``release_bank_tails``: nothing reads or writes the tail rows, so the kernel
++    should be backing ~none of them. The expected worst case is one 2 MiB THP
++    huge page per bank layer (shmem_enabled=always|force can back the
++    prefix/tail boundary as a huge page); more than that means something touched
++    the tail and the disk-tier RAM math no longer holds. Always logs, warns
++    above the bound."""
++    _HUGE = 2 << 20
++    resident = tail = n_banks = 0
++    for layer_banks in banks_by_name.values():
++        for bank in layer_banks:
++            row_bytes = bank.nbytes // num_experts
++            t = bank.nbytes - ram_experts * row_bytes
++            if t <= 0:
++                continue
++            r = tail_resident_bytes(bank, num_experts, ram_experts)
++            if r < 0:
++                continue  # mincore failed: skip rather than warn on our own probe
++            resident += r
++            tail += t
++            n_banks += 1
++    if n_banks == 0:
++        return
++    from freetoken.distributed import try_get_tp_info
++    tp = try_get_tp_info()
++    rank = getattr(tp, "rank", "?")
++    size_ = getattr(tp, "size", "?")
++    bound = n_banks * _HUGE
++    print(f"[disk-tier] tail check rank={rank}/{size_}: resident {resident >> 20} MiB "
++          f"of {tail >> 20} MiB (warn bound {bound >> 20} MiB = 1x2MiB per bank layer)",
++          flush=True)
++    if resident > bound:
++        print(f"[disk-tier] WARNING: tail rows more resident than the THP bound -- "
++              f"something is reading the released rows; the disk-tier RAM math no longer holds",
++              flush=True)
++
++# Native NVFP4 bank order (== _BANK_SCHEMAS["nvfp4"]) and, per bank, the
++# checkpoint segments that make up one expert row: (proj, kind, dst_row_start,
++# dst_row_end). The gate|up-fused banks splice gate rows then up rows on the
++# output-row axis; down banks are a single segment. Row ends are None = rest.
++_NVP4_BANK_SEGS = (
++    (("gate_proj", "weight", 0, None), ("up_proj", "weight", None, None)),
++    (("gate_proj", "weight_scale", 0, None), ("up_proj", "weight_scale", None, None)),
++    (("gate_proj", "weight_scale_2", 0, None), ("up_proj", "weight_scale_2", None, None)),
++    (("down_proj", "weight", 0, None),),
++    (("down_proj", "weight_scale", 0, None),),
++    (("down_proj", "weight_scale_2", 0, None),),
++)
++
++
++
++def _preadv_error(tier, staging, shard_idx: int, off: int, a0: int, slen: int,
++                  direct: bool) -> OSError:
++    vma = "?"
++    try:
++        for line in open("/proc/self/maps"):
++            lo, hi = line.split()[0].split("-")
++            if int(lo, 16) <= staging.addr < int(hi, 16):
++                vma = line.strip()[:120]
++                break
++    except OSError:
++        pass
++    return OSError(
++        f"disk-tier preadv failed: shard={shard_idx} off={off} a0={a0} "
++        f"slen={slen} direct={direct} buf={hex(staging.addr)} "
++        f"staging_size={tier._staging_size} thread={threading.current_thread().name} "
++        f"vma={vma}"
++    )
++
++
++def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
++    """{tensor_name: (start, end)} from a shard's safetensors header, as ABSOLUTE
++    file offsets (data_offsets are relative to the data section, i.e. after the
++    8-byte length + header JSON)."""
++    with open(path, "rb") as f:
++        (hlen,) = struct.unpack("<Q", f.read(8))
++        meta = json.loads(f.read(hlen))
++    base = 8 + hlen
++    return {
++        k: (v["data_offsets"][0] + base, v["data_offsets"][1] + base)
++        for k, v in meta.items() if k != "__metadata__"
++    }
++
++
++class Nvfp4DiskIndex:
++    """(bank, layer, expert) -> per-segment (shard_idx, offset, nbytes) locations.
++
++    Built from the original checkpoint: the HF index json (name -> shard) plus
++    each referenced shard's safetensors header (name -> byte range). Expert
++    tensors are per-expert and contiguous, so a row is exactly one byte range
++    per segment.
++    """
++
++    def __init__(self, model_dir: str, config, spec) -> None:
++        from freetoken.models.nvfp4_banks import _num_moe_layers
++        from freetoken.utils.hf import download_hf_weight
++
++        model_dir = download_hf_weight(model_dir)  # hub id -> local cache dir; no-op if local
++        index_path = os.path.join(model_dir, "model.safetensors.index.json")
++        with open(index_path, encoding="utf-8") as f:
++            weight_map = json.load(f)["weight_map"]
++
++        num_layers = _num_moe_layers(config)
++        # (bank_layer, expert, proj, kind) -> (tensor_name, shard)
++        loc: dict[tuple[int, int, str, str], tuple[str, str]] = {}
++        for name, shard in weight_map.items():
++            m = spec.key_pattern.match(name)
++            if m is None:
++                continue
++            bank_layer = spec.layer_to_bank(int(m.group("layer")), config)
++            if bank_layer is None:
++                continue
++            loc[(bank_layer, int(m.group("expert")), m.group("proj"), m.group("kind"))] = (
++                name, shard)
++
++        shards = sorted(set(shard for _, shard in loc.values()))
++        self.shard_paths = [os.path.join(model_dir, s) for s in shards]
++        offsets = {s: _read_safetensors_offsets(os.path.join(model_dir, s)) for s in shards}
++        shard_idx = {s: i for i, s in enumerate(shards)}
++
++        E = config.num_experts
++        seg_size = struct.calcsize("<iqq")  # (shard_idx, offset, nbytes)
++        self.entries: list[list[bytes]] = []  # [bank][layer] -> packed segments per expert
++        for bank_idx in range(len(_NVP4_BANK_SEGS)):
++            per_layer = []
++            for layer in range(num_layers):
++                rows = bytearray()
++                for e in range(E):
++                    for proj, kind, _, _ in _NVP4_BANK_SEGS[bank_idx]:
++                        key = (layer, e, proj, kind)
++                        entry = loc.get(key)
++                        if entry is None:
++                            raise KeyError(
++                                f"disk tier: no {proj}.{kind} tensor for layer {layer} expert {e} "
++                                f"(bank {bank_idx}) in {index_path}"
++                            )
++                        name, shard = entry
++                        start, end = offsets[shard][name]
++                        rows += struct.pack("<iqq", shard_idx[shard], start, end - start)
++                per_layer.append(bytes(rows))
++            self.entries.append(per_layer)
++        self._seg_size = seg_size
++
++    def row_segments(self, bank_idx: int, layer: int, expert: int) -> list[tuple[int, int, int]]:
++        """[(shard_idx, offset, nbytes)] for one expert row, in segment order."""
++        base = expert * self._seg_size * len(_NVP4_BANK_SEGS[bank_idx])
++        raw = self.entries[bank_idx][layer][base:base + self._seg_size * len(_NVP4_BANK_SEGS[bank_idx])]
++        return [
++            struct.unpack_from("<iqq", raw, i * self._seg_size)
++            for i in range(len(_NVP4_BANK_SEGS[bank_idx]))
++        ]
++
++
++class DiskTier:
++    """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""
++
++    def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8) -> None:
++        self._index = index
++        self._ram = ram_experts
++        self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
++        self._row_bytes = [
++            b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
++        ]  # full expert-row bytes per bank (staging must hold the biggest one)
++        # Per-bank destination row slices (gate|up split at the row midpoint).
++        self._dst_slices: list[list[tuple[int, int]]] = []
++        for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
++            row = host_layer[0][0]
++            if len(_NVP4_BANK_SEGS[bank_idx]) == 2:
++                mid = row.shape[0] // 2
++                self._dst_slices.append([(0, mid), (mid, row.shape[0])])
++            else:
++                self._dst_slices.append([(0, row.shape[0])])
++        if os.environ.get("FT_DISK_TIER_VERIFY"):
++            # TP=2 debug: prove per-rank whether the host bank rows are full or
++            # TP-sharded, and that the disk index's full-row segments match them.
++            from freetoken.distributed import try_get_tp_info
++            tp = try_get_tp_info()
++            host_shapes = [tuple(b[0][0][0].shape) for b in self._banks]
++            disk_bytes = [
++                sum(nb for _, _, nb in self._index.row_segments(bi, 0, 0))
++                for bi in range(len(self._banks))
++            ]
++            print(f"[disk-tier-init] tp_rank={getattr(tp, 'rank', '?')}/{getattr(tp, 'size', '?')} "
++                  f"ram={ram_experts} host_row_shapes={host_shapes} "
++                  f"host_row_bytes={self._row_bytes} disk_row_bytes={disk_bytes}", flush=True)
++        max_row = max(self._row_bytes)
++        self._staging_size = ((max_row + _ALIGN - 1) // _ALIGN + 2) * _ALIGN
++        self._staging = threading.local()
++        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-tier")
++        self._fd_lock = threading.Lock()
++        self._fds: dict[int, tuple[int, bool]] = {}
++        self._fetches = 0
++        self._fetch_bytes = 0
++        self._decode_verify_steps = 0
++        self._map_verify_steps = 0
++        self._cache = cache
++
++    # ------------------------------------------------------------------ fds
++    def _fd(self, shard_idx: int) -> tuple[int, bool]:
++        """(fd, o_direct) for a shard; O_DIRECT falls back to plain preadv where the
++        filesystem refuses it (tmpfs/overlayfs -- tests)."""
++        ent = self._fds.get(shard_idx)
++        if ent is None:
++            with self._fd_lock:
++                ent = self._fds.get(shard_idx)
++                if ent is None:
++                    path = self._index.shard_paths[shard_idx]
++                    try:
++                        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++                        direct = True
++                    except OSError:
++                        fd = os.open(path, os.O_RDONLY)
++                        direct = False
++                    ent = (fd, direct)
++                    self._fds[shard_idx] = ent
++        return ent
++
++    # --------------------------------------------------------------- staging
++    # Staging ring depth per worker thread. A buffer must not be overwritten by the
++    # next preadv until the async H2D copy that read it has finished (pinned-memory
++    # reuse race -- the copy is DMA, still reading host bytes after copy_ returns).
++    # The depth only needs to cover one copy's DMA time in host-side preadv time;
++    # the per-slot CUDA event below makes any shallower lap correct, just slower.
++    _STAGING_RING = 8
++
++    def _staging_ring(self) -> list:
++        ring = getattr(self._staging, "ring", None)
++        if ring is None:
++            # Fresh worker threads default to CUDA device 0, but the rank may
++            # live on another device (TP>1). The H2D copies land on the
++            # destination tensor's device stream, while ev.record() below uses
++            # the thread's CURRENT stream -- without this, the ring's reuse
++            # guard waits on an idle stream and a preadv can overwrite the
++            # buffer mid-DMA (corrupted slot rows on TP=2 rank 1).
++            dev = self._banks[0][1].device
++            if dev.type == "cuda":
++                torch.cuda.set_device(dev)
++            ring = []
++            for _ in range(self._STAGING_RING):
++                buf = HostBank((self._staging_size,), torch.uint8)
++                buf.pin()  # pin once per worker thread
++                ev = torch.cuda.Event() if torch.cuda.is_available() else None
++                if ev is not None:
++                    ev.record()  # start "complete"; re-recorded after each copy
++                ring.append([buf, ev])
++            self._staging.ring = ring
++        return ring
++
++    # ---------------------------------------------------------------- fetch
++    def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
++        # The server runs under inference_mode; the fetch pool threads do not,
++        # so the H2D writes into the (inference) slot cache need their own scope.
++        with torch.inference_mode():
++            self._fetch_expert_inner(layer, expert, slot)
++
++    def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
++        ring = self._staging_ring()
++        ri = getattr(self._staging, "ri", 0)
++        for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
++            row = gpu_cache[slot]
++            segs = self._index.row_segments(bank_idx, layer, expert)
++            for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
++                staging, ev = ring[ri]
++                if ev is not None:
++                    # This buffer's last async H2D copy must be done before the
++                    # preadv below overwrites it (pinned-memory reuse race).
++                    ev.synchronize()
++                ri = (ri + 1) % len(ring)
++                fd, direct = self._fd(shard_idx)
++                if direct:
++                    a0 = off & ~(_ALIGN - 1)
++                    slen = (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
++                else:
++                    a0, slen = off, nbytes
++                mv = (ctypes.c_char * slen).from_address(staging.addr)
++                try:
++                    os.preadv(fd, [mv], a0)
++                except OSError:
++                    raise _preadv_error(self, staging, shard_idx, off, a0, slen, direct)
++                row_off = off - a0
++                if bank_idx in (2, 5):
++                    # Global-scale banks: the checkpoint stores a per-expert fp32
++                    # SCALAR (weight_scale_2); the bank row is that value as fp16
++                    # broadcast across the row -- convert + fill, no byte copy.
++                    val = staging.tensor[row_off:row_off + 4].view(torch.float32)[0].to(
++                        torch.float16)
++                    row[d0:d1].fill_(val)
++                    continue
++                src = staging.tensor[row_off:row_off + nbytes]
++                dst = row[d0:d1]
++                dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
++                if ev is not None:
++                    # Arm: the next reuse of this buffer waits for this copy.
++                    ev.record()
++        self._staging.ri = ri
++        self._fetches += 1
++        self._fetch_bytes += sum(self._row_bytes)
++
++    def _sync_fetches(self) -> None:
++        """Wait for the pool threads' async H2D copies to land.
++
++        The copies are enqueued on the pool threads' default stream; f.result() only
++        waits for them to be ENQUEUED. The GEMM's stream is not ordered with that
++        stream, so sync the default stream before the GEMM reads the slots."""
++        # Key this on where the BANKS live, not on whether the machine has a GPU: the
++        # disk-tier unit tests build CPU banks on a CUDA box, and default_stream() rejects
++        # a CPU device outright. There is nothing to order for a CPU->CPU copy anyway.
++        device = self._banks[0][1].device
++        if device.type != "cuda":
++            return  # CPU banks: the copies are synchronous CPU->CPU
++        torch.cuda.default_stream(device).synchronize()
++
++    def _verify_slot(self, cache, layer: int, expert: int, slot: int | None = None,
++                     phase: str = "prefill") -> None:
++        """One-shot debug: read back an expert's slot rows and compare against the
++        checkpoint bytes (ground truth). Gated on FT_DISK_TIER_VERIFY."""
++        import torch
++        if slot is None:
++            slot = expert  # identity mapping (prefill)
++        for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
++            slot_row = gpu_cache[slot].contiguous()
++            flat = slot_row.view(torch.uint8).reshape(-1)
++            ref = self._ref_row(bank_idx, layer, expert, flat.numel(),
++                                slot_row.element_size(),
++                                slot_row.numel() // slot_row.shape[0] if slot_row.dim() > 1 else 1)
++            try:
++                ref = ref.to(flat.device)
++                match = bool(torch.equal(flat, ref))
++                if match:
++                    print(f"[verify] {phase} L{layer} bank={bank_idx} expert={expert} "
++                          f"slot={slot} match=True", flush=True)
++                    continue
++                diff = (flat != ref)
++                nz = torch.nonzero(diff).flatten()
++                print(f"[verify] {phase} L{layer} bank={bank_idx} expert={expert} "
++                      f"slot={slot} match=False n_diff={int(diff.sum())}/{flat.numel()} "
++                      f"first_off={int(nz[0])} last_off={int(nz[-1])} "
++                      f"slot_norm={slot_row.float().norm().item():.4f} "
++                      f"ref_norm={ref.view(slot_row.dtype).view(slot_row.shape).float().norm().item():.4f} "
++                      f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}", flush=True)
++                self._identify_overwriter(layer, bank_idx, expert, flat)
++            except Exception as exc:  # never crash the server in debug
++                print(f"[verify] bank={bank_idx} expert={expert} ERROR {exc!r}", flush=True)
++
++    def _ref_row(self, bank_idx: int, layer: int, expert: int, row_bytes: int,
++                 row_el: int, row_leading: int) -> torch.Tensor:
++        """Reference row bytes for (bank, layer, expert) straight from the checkpoint."""
++        ref = torch.zeros(row_bytes, dtype=torch.uint8)
++        segs = self._index.row_segments(bank_idx, layer, expert)
++        for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
++            fd, direct = self._fd(shard_idx)
++            a0 = off if not direct else (off & ~(_ALIGN - 1))
++            slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
++            buf = os.pread(fd, slen, a0)
++            row_off = off - a0
++            seg = buf[row_off:row_off + nbytes]
++            if bank_idx in (2, 5):
++                import struct as _st
++                import numpy as _np
++                f16 = _np.float16(_st.unpack("<f", seg[:4])[0]).tobytes()
++                for r in range(d0, d1):
++                    ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
++            else:
++                dst_off = d0 * row_leading * row_el
++                ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
++        return ref
++
++    def _identify_overwriter(self, layer: int, bank_idx: int, expert: int,
++                             flat: torch.Tensor) -> None:
++        """Debug: on a verify mismatch, find whose row the slot actually holds.
++
++        Compares the slot's first 64 bytes against (a) every other expert of the
++        same layer and (b) the same expert in every other layer, straight from the
++        checkpoint. A hit names the overwriter (e.g. a staging-buffer reuse race
++        landing a neighbour's preadv); no hit means a partial mix. Only runs on
++        mismatch, so the ~300 extra preads are free otherwise."""
++        head = flat[:64].cpu()
++        host_row = self._banks[bank_idx][0][0][0]  # expert-0 row (all rows share its shape)
++        row_el = host_row.element_size()
++        row_leading = host_row.numel() // host_row.shape[0] if host_row.dim() > 1 else 1
++        num_experts = self._cache.num_experts
++        num_layers = len(self._banks[bank_idx][0])
++        hits = []
++        for e in range(num_experts):
++            if e == expert:
++                continue
++            ref = self._ref_row(bank_idx, layer, e, flat.numel(), row_el, row_leading)
++            if bool(torch.equal(ref[:64], head)):
++                hits.append(f"L{layer}_e{e}")
++        for L in range(num_layers):
++            if L == layer:
++                continue
++            ref = self._ref_row(bank_idx, L, expert, flat.numel(), row_el, row_leading)
++            if bool(torch.equal(ref[:64], head)):
++                hits.append(f"L{L}_e{expert}")
++        print(f"[overwriter] L{layer} B{bank_idx} e{expert} head64 matches: "
++              f"{hits if hits else 'NONE (partial mix?)'}", flush=True)
++
++    def verify_ram(self, cache, layer: int) -> None:
++        """One-shot debug: after the PCIe copy, check a RAM-resident expert's slot rows
++        against the checkpoint reference. Gated on FT_DISK_TIER_VERIFY."""
++        expert = min(10, self._ram - 1)  # a RAM-resident expert
++        print(f"[verify-ram] layer={layer} expert={expert} (RAM prefix)", flush=True)
++        self._verify_slot(cache, layer, expert)
++        # Check ALL RAM experts: slot vs host row (host correctness established
++        # separately). Count mismatches; identify the source of the first one.
++        n_bad = 0
++        identified = False
++        for e in range(self._ram):
++            for bank_idx, (host_layer, gpu_cache) in enumerate(self._banks):
++                slot_row = gpu_cache[e].contiguous()
++                flat = slot_row.view(torch.uint8).reshape(-1)
++                hflat = host_layer[layer][e].contiguous().view(torch.uint8).reshape(-1)
++                if flat.numel() != hflat.numel() or not bool(torch.equal(flat.cpu(), hflat)):
++                    n_bad += 1
++                    if n_bad <= 12:
++                        print(f"[verify-ram] MISMATCH e={e} bank={bank_idx} "
++                              f"slot_head={flat[:8].tolist()} host_head={hflat[:8].tolist()}",
++                              flush=True)
++                    if not identified:
++                        identified = True
++                        self._identify_source(layer, bank_idx, flat)
++        print(f"[verify-ram] layer={layer} mismatches={n_bad}/{self._ram * len(self._banks)}",
++              flush=True)
++
++    def _identify_source(self, layer: int, bank_idx: int, flat: torch.Tensor) -> None:
++        """Debug: find where a corrupted slot's bytes came from (GPU slot, host row,
++        or checkpoint row)."""
++        flat_cpu = flat.cpu()
++        head = flat_cpu[:16]
++        found = []
++        _host_layer, gpu_cache = self._banks[bank_idx]
++        gpu_flat = gpu_cache.view(torch.uint8).reshape(gpu_cache.shape[0], -1)
++        if gpu_flat.shape[1] == flat_cpu.numel():
++            cand = torch.nonzero(
++                (gpu_flat[:, :16].cpu() == head.unsqueeze(0)).all(dim=1)).flatten().tolist()
++            for s in cand[:16]:
++                if bool(torch.equal(gpu_flat[s].cpu(), flat_cpu)):
++                    found.append(f"gpu_slot={s}(L{layer},B{bank_idx})")
++        for e in range(self._ram):
++            hflat = _host_layer[layer][e].contiguous().view(torch.uint8).reshape(-1)
++            if hflat.numel() == flat_cpu.numel() and bool(torch.equal(hflat, flat_cpu)):
++                found.append(f"host_row_e{e}(L{layer},B{bank_idx})")
++        import itertools
++        num_layers = len(self._banks[bank_idx][0])
++        targets = sorted(set(itertools.product([layer], range(256)))
++                         | set(itertools.product(range(num_layers), [10])))
++        for (L, e) in targets:
++            row_el, row_leading = None, None
++            hrow = _host_layer[layer][0]
++            row_el = hrow.element_size()
++            row_leading = hrow.numel() // hrow.shape[0] if hrow.dim() > 1 else 1
++            try:
++                ref = self._ref_row(bank_idx, L, e, flat_cpu.numel(), row_el, row_leading)
++            except Exception:
++                continue
++            if bool(torch.equal(ref, flat_cpu)):
++                found.append(f"checkpoint_L{L}_e{e}")
++        print(f"[identify] L{layer} B{bank_idx} n={flat_cpu.numel()} "
++              f"source={found if found else 'UNKNOWN'}", flush=True)
++
++    def verify_decode_mapping(self, cache, layer_id: int, topk_ids: torch.Tensor) -> None:
++        """Debug: after the LRU rewrite + fetch/copy, check that every slot the GEMM
++        will read actually holds the expert the bookkeeping says it holds. Gated on
++        FT_DISK_TIER_VERIFY; first 4 decode steps only."""
++        if self._map_verify_steps >= 4:
++            return
++        self._map_verify_steps += 1
++        slots = torch.unique(topk_ids.reshape(-1))
++        nbad = 0
++        for s in slots.tolist():
++            s = int(s)
++            flat_id = int(cache.id_of_slot[s].item())
++            if flat_id < 0:
++                print(f"[verify-map] step={self._map_verify_steps} slot={s} id_of_slot=-1",
++                      flush=True)
++                nbad += 1
++                continue
++            expert = flat_id % cache.num_experts
++            for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
++                slot_row = gpu_cache[s].contiguous()
++                flat = slot_row.view(torch.uint8).reshape(-1)
++                ref = self._ref_row(bank_idx, layer_id, expert, flat.numel(),
++                                    slot_row.element_size(),
++                                    slot_row.numel() // slot_row.shape[0]
++                                    if slot_row.dim() > 1 else 1)
++                if not bool(torch.equal(flat.cpu(), ref)):
++                    nbad += 1
++                    if nbad <= 8:
++                        print(f"[verify-map] step={self._map_verify_steps} slot={s} "
++                              f"expert={expert} bank={bank_idx} MISMATCH "
++                              f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}",
++                              flush=True)
++        print(f"[verify-map] step={self._map_verify_steps} slots={slots.numel()} bad={nbad}",
++              flush=True)
++
++    def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
++        """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
++        (the normal kernel restricted to K experts; the following ``copy_missing``
++        streams it over PCIe), then fetch the routed disk-resident experts into
++        THEIR identity slots. The identity mapping (position == expert id) is
++        preserved, so the prefill GEMM is unchanged."""
++        from freetoken.moe.offload_kernels import _materialize_layer_gpu
++
++        # Prefill identity mapping owns ALL of slots [0, E) for this layer, but
++        # the kernel only scans slots < materialize_count, so the disk slots
++        # [ram, E) that still hold a previous layer's experts (previous prefill
++        # layer or decode LRU) would keep their slot_for_id entries -- phantom
++        # decode hits that read another layer's weights. Clear them first
++        # (device-side, no sync).
++        seg = cache.id_of_slot[self._ram:cache.num_experts]
++        valid = seg >= 0
++        cache.slot_for_id.view(-1)[seg[valid].long()] = -1
++        seg[valid] = -1
++        cache.usage[self._ram:cache.num_experts][valid] = 0
++
++        _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
++        routed = expert_ids.reshape(-1)
++        disk = torch.unique(routed[routed >= self._ram])
++        if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
++            print(f"[disk-tier dbg] layer={layer_id} routed={routed.numel()} "
++                  f"unique_disk={disk.numel()} disk={disk.tolist()[:12]}", flush=True)
++        if disk.numel() == 0:
++            return
++        # cache.step was already incremented by the kernel; assign the 0-d tensor
++        # device-side (same dtype/device as usage) instead of .item()-ing it, which
++        # would sync the stream once per layer on the prefill/decode path.
++        futures = [
++            self._pool.submit(self._fetch_expert, layer_id, int(e), int(e))
++            for e in disk.tolist()
++        ]
++        for f in futures:
++            f.result()
++        self._sync_fetches()
++        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
++            limit = disk.numel() if layer_id == 0 else 6  # layer 0: ALL experts (race hunt)
++            for e in disk.tolist()[:limit]:
++                self._verify_slot(cache, layer_id, int(e), phase="prefill")
++        # Same bookkeeping the materialize kernel writes, per fetched expert.
++        flat = layer_id * cache.num_experts + disk
++        cache.slot_for_id[layer_id, disk] = disk
++        cache.id_of_slot[disk] = flat
++        cache.usage[disk] = cache.step
++
++    def fetch_pending(self, cache, layer_id: int) -> None:
++        """Fetch this layer's disk-resident misses into their slots; shrink the miss
++        list to the RAM-resident remainder for the existing PCIe copy path."""
++        n = int(cache.num_indices.item())
++        if n == 0:
++            return
++        src = cache.src_indices[:n].cpu()
++        slots = cache.evict_slots[:n].cpu()
++        disk = [i for i in range(n) if int(src[i]) >= self._ram]
++        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
++            print(f"[fetch-pend] layer=0 n={n} ndisk={len(disk)} "
++                  f"src_head={src[:4].tolist()}", flush=True)
++        if not disk:
++            return
++        futures = [
++            self._pool.submit(self._fetch_expert, layer_id, int(src[i]), int(slots[i]))
++            for i in disk
++        ]
++        for f in futures:
++            f.result()
++        self._sync_fetches()
++        if (os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0
++                and self._decode_verify_steps < 3):
++            self._decode_verify_steps += 1
++            for i in disk[:8]:
++                print(f"[verify-decode] step={self._decode_verify_steps} "
++                      f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
++                self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]),
++                                  phase="decode")
++        disk_set = set(disk)
++        ram = [i for i in range(n) if i not in disk_set]
++        if ram:
++            sel = torch.tensor(ram, dtype=torch.long)
++            cache.src_indices[:len(ram)].copy_(src[sel].to(cache.src_indices.dtype))
++            cache.evict_slots[:len(ram)].copy_(slots[sel].to(cache.evict_slots.dtype))
++        cache.num_indices.fill_(len(ram))
++
++    def refresh(self, cache) -> None:
++        """Rebind the slot-cache references after a runtime cache rebuild."""
++        self._banks = list(cache.banks)
++        self._cache = cache
++
++    def stats(self) -> dict:
++        return {"experts_fetched": self._fetches, "bytes_fetched": self._fetch_bytes}
+diff --git a/python/freetoken/moe/expert_banks.py b/python/freetoken/moe/expert_banks.py
+index e3a768b6d..15564ea5d 100644
+--- a/python/freetoken/moe/expert_banks.py
++++ b/python/freetoken/moe/expert_banks.py
+@@ -48,6 +48,11 @@ class ExpertBanks:
+     kind: QuantKind | None = None
+     kernel: str | None = None
+     layout: dict | None = None
++    # Disk tier (None when off): a moe.disk_tier.Nvfp4DiskIndex over the original
++    # checkpoint plus how many experts per layer are RAM-resident (the rest are
++    # disk-resident and fetched on slot-cache miss).
++    disk_index: object | None = field(default=None)
++    disk_ram_experts: int = 0
+ 
+ 
+ def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
+@@ -75,6 +80,7 @@ def build_expert_banks(
+     device: torch.device,
+     layer_sink=None,
+     dummy: bool = False,
++    ram_prefix: int | None = None,
+ ) -> ExpertBanks:
+     """Fill host banks in the kernel's layout from a stream of expert pieces.
+ 
+@@ -83,6 +89,13 @@ def build_expert_banks(
+     complete once its ``num_experts`` rows have arrived: with ``layer_sink=None`` its banks
+     are pinned in the background, otherwise the sink receives them (converter). ``dummy``
+     skips the pieces and fills the banks with finite random contents.
++
++    ``ram_prefix`` (the disk tier): rows ``[ram_prefix, E)`` are disk-resident. The
++    reader yields an EMPTY piece for each of them (nothing was read from the
++    checkpoint), so ``_fill`` marks the rows complete without touching the banks,
++    only the first ``ram_prefix`` rows are pinned (``PinPipeline(prefix_rows=...)``),
++    and the released tail pages are dropped (``release_bank_tails``) once the load
++    settles. The rows stay allocated -- they are the tier's fetch destination.
+     """
+     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
+     from freetoken.moe.legacy_format import legacy_format_for
+@@ -123,6 +136,15 @@ def _fill(sink) -> None:
+             if written[layer_id, e0:e1].any():
+                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+             written[layer_id, e0:e1] = 1
++            if not piece:
++                # Disk tier: a disk-resident row. Nothing was read from the
++                # checkpoint and the bank rows stay unbacked (the tier fetches
++                # into the GPU slot cache, never through the bank tail) -- but
++                # the row still counts toward layer completion.
++                if tracker is not None:
++                    for _ in range(e1 - e0):
++                        tracker.note(layer_id)
++                continue
+             out = {role: banks[role][layer_id][e0:e1] for role in specs}
+             got = method.pack(piece, out)
+             for role, values in got.items():
+@@ -137,11 +159,19 @@ def _fill(sink) -> None:
+     if layer_sink is not None:
+         _fill(layer_sink)
+     elif torch.cuda.is_available():
+-        with PinPipeline() as pins:
++        with PinPipeline(prefix_rows=ram_prefix) as pins:
+             _fill(pins)
+     else:
+         _fill(None)
+ 
++    if ram_prefix is not None:
++        # Drop the released tail pages now that the load has settled (the prefix
++        # is pinned; the tail rows were never written).
++        from freetoken.moe.disk_tier import check_tail_unbacked, release_bank_tails
++
++        release_bank_tails(hb, E, ram_prefix)
++        check_tail_unbacked(hb, E, ram_prefix)
++
+     return ExpertBanks(
+         legacy_format_for(method.kind, kernel.name), banks,
+         gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
+@@ -192,16 +222,53 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
+     )
+ 
+ 
+-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+-    from freetoken.moe.expert_pieces import iter_expert_pieces
++def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk,
++                         layer_sink=None, disk_tier=None) -> ExpertBanks:
++    from freetoken.moe.expert_pieces import iter_expert_pieces, nvfp4_expert_spec_of
+ 
+     num_layers = model_config.num_moe_layers
+     if dummy:
+         return build_expert_banks(method, num_layers, None, device=device, dummy=True)
++
++    # Disk tier: v0 speaks the native NVFP4 (triton) bank layout -- the index and
++    # the fetch path are written against it. Fail before any bank is allocated.
++    disk_index = None
++    if disk_tier is not None:
++        from freetoken.layers.quantization import QuantKind
++
++        if method.kind is not QuantKind.NVFP4 or method.kernel.name != "triton":
++            raise NotImplementedError(
++                f"disk tier requires the native NVFP4 layout (got kind={method.kind!r}, "
++                f"kernel={method.kernel.name!r})")
++        if layer_sink is not None:
++            raise NotImplementedError("disk tier is a serving path; the converter (layer_sink) is not supported")
++        source_spec = nvfp4_expert_spec_of(model_path, model_config)
++        if source_spec is None:
++            raise NotImplementedError(
++                f"--moe-disk-tier on: {model_config.architectures[0]} exposes no "
++                "nvfp4_expert_spec, so the tier cannot locate expert rows in the "
++                "checkpoint (the loader would release them and never refetch)")
++        # Build the index HERE, next to the release below: a family that reaches
++        # the release without an index would serve zeroed experts. Resolving the
++        # spec through the family hook keeps the index and the loader reading
++        # the same rows.
++        from freetoken.moe.disk_tier import Nvfp4DiskIndex
++
++        disk_index = Nvfp4DiskIndex(model_path, model_config, source_spec)
++
+     pieces = iter_expert_pieces(
+-        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
++        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,
++        skip_experts_from=disk_tier.ram_experts if disk_tier is not None else None,
+     )
+-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
++    banks = build_expert_banks(
++        method, num_layers, pieces, device=device, layer_sink=layer_sink,
++        ram_prefix=disk_tier.ram_experts if disk_tier is not None else None,
++    )
++    if disk_index is not None:
++        import dataclasses
++
++        banks = dataclasses.replace(banks, disk_index=disk_index, disk_ram_experts=disk_tier.ram_experts)
++    return banks
+ 
+ 
+ def _host_ram_fits_parallel(model_path: str) -> bool:
+@@ -286,6 +353,7 @@ def load_expert_banks(
+     decode_target: str = "gpu",
+     layer_sink=None,
+     layer_residency: list[str] | None = None,
++    disk_tier=None,
+ ) -> ExpertBanks:
+     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
+     the same normalized ``ExpertBanks`` and both pinning after fill:
+@@ -314,6 +382,10 @@ def load_expert_banks(
+     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
+ 
+     if model_path and is_ftw_checkpoint(model_path) and not dummy:
++        if disk_tier is not None:
++            raise NotImplementedError(
++                "disk tier v0 reads the original safetensors checkpoint; FTW checkpoints "
++                "are not supported yet (serve from the source path)")
+         banks = load_ftw_banks(
+             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+             layer_residency=layer_residency,
+@@ -354,7 +426,8 @@ def load_expert_banks(
+ 
+     def _build(par: bool) -> ExpertBanks:
+         if method is not None:
+-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
++            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk,
++                                        layer_sink, disk_tier=disk_tier)
+         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+ 
+     with requested_residency(layer_residency) as residency_plan:
+diff --git a/python/freetoken/moe/expert_pieces.py b/python/freetoken/moe/expert_pieces.py
+index 79f655a95..7eba9a825 100644
+--- a/python/freetoken/moe/expert_pieces.py
++++ b/python/freetoken/moe/expert_pieces.py
+@@ -37,8 +37,21 @@ def _model_hook(spec, name: str):
+         return None
+ 
+ 
++def nvfp4_expert_spec_of(model_path: str, config):
++    """The family's ``Nvfp4ExpertSourceSpec`` (its ``nvfp4_expert_spec`` hook), or None.
++
++    The disk tier resolves the spec through this same hook the reader uses, so the
++    index and the loader read the same rows (see ``moe.disk_tier.Nvfp4DiskIndex``)."""
++    spec = get_model_spec(config.architectures[0])
++    hook = _model_hook(spec, "nvfp4_expert_spec")
++    if hook is None:
++        return None
++    return hook(model_path, config)
++
++
+ def iter_expert_pieces(
+-    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20
++    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8,
++    chunk: int = 8 << 20, skip_experts_from: int | None = None,
+ ) -> Iterator[Piece]:
+     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
+ 
+@@ -47,12 +60,19 @@ def iter_expert_pieces(
+     experts come from the family's stacked ``iter_weights`` and NVFP4 experts from its
+     ``nvfp4_expert_spec``. The reader is resolved here, before any bank is allocated, so a
+     missing parallel reader raises ``NotImplementedError`` while a serial fallback is still cheap.
+-    """
++
++    ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are
++    disk-resident -- the NVFP4 reader never reads their tensors and yields an empty
++    piece for each so the bank fill still completes the layer."""
+     spec = get_model_spec(config.architectures[0])
+     hook = _model_hook(spec, "iter_expert_pieces")
+     if hook is not None:
+         pieces = hook(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
+         if pieces is not None:
++            if skip_experts_from is not None:
++                raise NotImplementedError(
++                    f"{spec.module} owns its expert reader; the disk-tier row skip is only "
++                    "implemented in the shared NVFP4 reader")
+             return pieces
+     if kind is QuantKind.NONE:
+         return _bf16_pieces(model_path, config, spec, parallel=parallel, workers=workers, chunk=chunk)
+@@ -63,7 +83,8 @@ def iter_expert_pieces(
+         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+ 
+         return iter_nvfp4_expert_pieces(
+-            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers, chunk=chunk
++            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers,
++            chunk=chunk, skip_experts_from=skip_experts_from,
+         )
+     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
+ 
+diff --git a/python/freetoken/moe/host_banks.py b/python/freetoken/moe/host_banks.py
+index 91e264877..b78652ece 100644
+--- a/python/freetoken/moe/host_banks.py
++++ b/python/freetoken/moe/host_banks.py
+@@ -83,7 +83,7 @@ class HostBank:
+ 
+     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
+ 
+-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
++    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_pinned_bytes", "_locked")
+ 
+     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
+                  *, backing: str | None = None):
+@@ -108,11 +108,19 @@ def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
+             self.addr = raw.data_ptr() + off
+             assert self.addr % _BLK == 0
+             self._pinned = True  # born pinned+mapped; pin() is a no-op
++            self._pinned_bytes = asize
+         else:
+-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
++            # MAP_PRIVATE, not CPython's default MAP_SHARED: on a shared anonymous mapping a
++            # *read* fault allocates a page (no zero-page sharing) and MADV_DONTNEED is ignored,
++            # so an untouched region is only free by convention and a freed one never comes back.
++            # Private anonymous gives both for real: reads map the shared zero page, and
++            # release_range() actually returns memory. Nothing needs the mapping to be shared --
++            # the loaders are thread pools and ranks are mp-spawned, each with its own banks.
++            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+             _LIVE_BUFFERS.append(self._buf)
+             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+             self._pinned = False
++            self._pinned_bytes = 0
+         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+         self._locked = False
+ 
+@@ -142,11 +150,53 @@ def pin(self) -> None:
+         except RuntimeError as exc:
+             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
+         self._pinned = True
++        self._pinned_bytes = len(self._buf)
++
++    def pin_prefix(self, nrows: int) -> None:
++        """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
++
++        The unpinned tail keeps its filled pages until :meth:`release_range` drops
++        them; nothing may DMA from the tail (the disk tier's miss filter guarantees
++        the GPU never copies those rows)."""
++        if self._pinned:
++            return
++        from freetoken.kernel.pinned import host_register
++
++        row_bytes = self.nbytes // self.tensor.shape[0]
++        nbytes = nrows * row_bytes
++        try:
++            host_register(self.addr, nbytes)
++        except RuntimeError as exc:
++            raise RuntimeError(
++                f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
++            ) from exc
++        self._pinned = True
++        self._pinned_bytes = nbytes
++
++    def release_range(self, offset: int, nbytes: int) -> None:
++        """Free a byte range of the backing mapping with MADV_DONTNEED.
++
++        The bank is a MAP_PRIVATE anonymous mapping, so dropping a range frees the
++        pages outright and a later read faults the shared zero page again; every
++        existing pointer and torch view stays valid (the mapping is never replaced).
++
++        The range must be page-aligned and must not overlap the pinned prefix:
++        dropping pages under a cudaHostRegister'd range corrupts silently, so it is
++        asserted here rather than left to the caller (the disk tier's unpinned tails).
++        """
++        assert offset % _BLK == 0 and nbytes % _BLK == 0, (
++            "release_range: page-aligned range required")
++        assert offset >= self._pinned_bytes, (
++            f"release_range: [{offset}, {offset + nbytes}) overlaps the pinned prefix "
++            f"[0, {self._pinned_bytes})")
++        if nbytes:
++            self._buf.madvise(mmap.MADV_DONTNEED, offset, nbytes)
+ 
+     def release(self) -> None:
+         """Drop the resident pages; the address space stays valid, the contents become undefined.
+ 
+-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
++        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
++        (This frees memory only because the mapping is MAP_PRIVATE; the kernel ignores MADV_DONTNEED on shared ones.)"""
+         if self._pinned:
+             return
+         self._buf.madvise(mmap.MADV_DONTNEED)
+@@ -291,7 +341,8 @@ class PinPipeline:
+     A clean context-manager exit drains the queue and re-raises the first settle failure.
+     """
+ 
+-    def __init__(self) -> None:
++    def __init__(self, prefix_rows: int | None = None) -> None:
++        self._prefix_rows = prefix_rows
+         self._q: queue.SimpleQueue = queue.SimpleQueue()
+         self._exc: BaseException | None = None
+         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
+@@ -310,9 +361,16 @@ def _run(self) -> None:
+                 continue  # drain without settling after a failure
+             bank, residency, plan, layer_id = item
+             try:
+-                _settle(bank, residency)
+-                if plan is not None and residency == HostResidency.LOCKED.value:
+-                    plan.record(layer_id, bank.residency.value)
++                if self._prefix_rows is not None:
++                    # Disk tier: pin only the RAM-resident expert prefix; the
++                    # disk-resident tail is released by the caller. Takes
++                    # precedence over the residency label (H2D needs the
++                    # prefix page-locked regardless).
++                    bank.pin_prefix(self._prefix_rows)
++                else:
++                    _settle(bank, residency)
++                    if plan is not None and residency == HostResidency.LOCKED.value:
++                        plan.record(layer_id, bank.residency.value)
+             except BaseException as exc:  # surfaced by wait()/__exit__
+                 self._exc = exc
+ 
+diff --git a/python/freetoken/moe/offload_cache.py b/python/freetoken/moe/offload_cache.py
+index 7abb9c800..80275ef08 100644
+--- a/python/freetoken/moe/offload_cache.py
++++ b/python/freetoken/moe/offload_cache.py
+@@ -158,6 +158,9 @@ def __post_init__(self) -> None:
+         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
+         # all layers = the plain --moe-strategy cpu case).
+         self.cpu_layer_ids: frozenset = frozenset()
++        # Disk tier (None when off): a moe.disk_tier.DiskTier that fetches
++        # disk-resident slot-cache misses before the PCIe copy path.
++        self._disk_tier = None
+         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
+         self.validate_rebuild(self.cache_size)
+         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
+@@ -532,6 +535,8 @@ def rebuild(self, cache_size: int) -> None:
+             self.prefill_overlap = False
+         if self.prefill_overlap:
+             self._init_prefill_overlap_buffers()
++        if self._disk_tier is not None:
++            self._disk_tier.refresh(self)  # slot caches were reallocated
+ 
+     def set_alphas(
+         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
+@@ -873,7 +878,19 @@ def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None
+             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+         )
+ 
+-    def materialize_layer(self, layer_id: int) -> None:
++    @property
++    def disk_tier_enabled(self) -> bool:
++        return self._disk_tier is not None
++
++    def materialize_layer(self, layer_id: int, expert_ids: torch.Tensor | None = None) -> None:
++        if self._disk_tier is not None:
++            # Disk tier: stream only the RAM-resident prefix, then fetch the routed
++            # disk-resident experts into their identity slots (needs the routing).
++            assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
++            self._pending_src_layer = layer_id
++            self._pending_whole_layer = True
++            self._disk_tier.materialize_layer(self, layer_id, expert_ids)
++            return
+         from freetoken.moe.offload_kernels import materialize_layer
+ 
+         self._pending_src_layer = layer_id
+@@ -1008,11 +1025,25 @@ def decode_routing_stats(self) -> dict:
+             "norm_entropy": norm_ent,
+         }
+ 
++    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
++        """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
++        original checkpoint before the PCIe copy path (see moe/disk_tier.py)."""
++        from freetoken.moe.disk_tier import DiskTier
++
++        assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
++        assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
++        assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
++        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers)
++
+     def copy_missing(self) -> None:
+         assert self.banks, "set_bank_sources must register the banks first"
+         layer_id = self._pending_src_layer
+         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+-        if layer_id in self._unpinned_layers:
++        if self._disk_tier is not None:
++            # Fetch this layer's disk-resident misses into their slots, then shrink the
++            # miss list to the RAM-resident remainder for the PCIe copy below.
++            self._disk_tier.fetch_pending(self, layer_id)
++        elif layer_id in self._unpinned_layers:
+             if not self._pending_whole_layer:
+                 raise RuntimeError(
+                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
+@@ -1024,6 +1055,13 @@ def copy_missing(self) -> None:
+             for per_layer, cache in self.banks:
+                 cache[: self.num_experts].copy_(per_layer[layer_id])
+             return
++        if (self._disk_tier is not None and layer_id == 0
++                and os.environ.get("FT_DISK_TIER_VERIFY")
++                and not torch.cuda.is_current_stream_capturing()):
++            print(f"[copy-miss] layer={layer_id} fused={self._copy_fused_ok} "
++                  f"n={int(self.num_indices.item())} "
++                  f"evict={self.evict_slots[:4].cpu().tolist()} "
++                  f"src={self.src_indices[:4].cpu().tolist()}", flush=True)
+         if self._copy_fused_ok:
+             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+ 
+@@ -1039,18 +1077,21 @@ def copy_missing(self) -> None:
+                 self.src_indices,
+                 self.num_indices,
+             )
+-            return
+-
+-        from freetoken.kernel import fast_index_copy_jit
++        else:
++            from freetoken.kernel import fast_index_copy_jit
+ 
+-        for per_layer, cache in self.banks:
+-            fast_index_copy_jit(
+-                cache,
+-                self.evict_slots,
+-                per_layer[layer_id],
+-                self.src_indices,
+-                self.num_indices,
+-            )
++            for per_layer, cache in self.banks:
++                fast_index_copy_jit(
++                    cache,
++                    self.evict_slots,
++                    per_layer[layer_id],
++                    self.src_indices,
++                    self.num_indices,
++                )
++        if (self._disk_tier is not None and layer_id == 0
++                and self._pending_whole_layer
++                and os.environ.get("FT_DISK_TIER_VERIFY")):
++            self._disk_tier.verify_ram(self, layer_id)
+ 
+ 
+ def iter_offload_moe_layers(model) -> Iterator:
+diff --git a/python/freetoken/moe/offload_kernels.py b/python/freetoken/moe/offload_kernels.py
+index cf513f52d..3b6d67fb7 100644
+--- a/python/freetoken/moe/offload_kernels.py
++++ b/python/freetoken/moe/offload_kernels.py
+@@ -188,7 +188,10 @@ def _ensure_experts_hybrid_cpu(
+         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+ 
+ 
+-def _materialize_layer_gpu(cache, layer_id: int) -> None:
++def _materialize_layer_gpu(cache, layer_id: int, materialize_count: int | None = None) -> None:
++    # materialize_count < num_experts: the disk tier's RAM-resident prefix only; the
++    # flat-id base still uses the full num_experts (the id space is layer * E + expert).
++    count = cache.num_experts if materialize_count is None else materialize_count
+     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
+     _materialize_layer_kernel[(1,)](
+         cache.slot_for_id,
+@@ -200,6 +203,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
+         cache.num_indices,
+         layer_id,
+         cache.num_experts,
++        count,
+         cache.cache_size,
+         BLOCK=block,
+     )
+@@ -257,11 +261,12 @@ def _materialize_layer_kernel(
+     num_indices_ptr,
+     layer_id: tl.constexpr,
+     num_experts: tl.constexpr,
++    materialize_count: tl.constexpr,
+     cache_size: tl.constexpr,
+     BLOCK: tl.constexpr,
+ ):
+     off = tl.arange(0, BLOCK)
+-    expert_mask = off < num_experts
++    expert_mask = off < materialize_count
+     slot_mask = off < cache_size
+     slot = off
+ 
+@@ -282,7 +287,7 @@ def _materialize_layer_kernel(
+     tl.store(usage_ptr + slot, step, mask=expert_mask)
+     tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
+     tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
+-    tl.store(num_indices_ptr, num_experts)
++    tl.store(num_indices_ptr, materialize_count)
+ 
+ 
+ 
+diff --git a/python/freetoken/server/args.py b/python/freetoken/server/args.py
+index 32e8d1266..9f74a7521 100644
+--- a/python/freetoken/server/args.py
++++ b/python/freetoken/server/args.py
+@@ -597,6 +597,39 @@ def _infer_reasoning_parser(model_path: str) -> str | None:
+         help="The unified MoE cache eviction policy.",
+     )
+ 
++    parser.add_argument(
++        "--moe-disk-tier",
++        default=ServerArgs.moe_disk_tier,
++        choices=["off", "on"],
++        help=(
++            "NVMe tier for MoE experts (see moe/disk_tier.py): experts beyond "
++            "--expert-ram-experts per layer stay on disk in the original checkpoint "
++            "and are fetched on slot-cache miss. Requires native NVFP4 banks. "
++            "v0 preconditions (all enforced at once at boot): --moe-strategy offload "
++            "(gpu decode), --disable-moe-prefill-overlap, --cuda-graph-max-bs 0, "
++            "and 0 < --expert-ram-experts < num_experts."
++        ),
++    )
++    parser.add_argument(
++        "--expert-ram-experts",
++        type=int,
++        default=ServerArgs.expert_ram_experts,
++        help=(
++            "With --moe-disk-tier on: experts per layer kept pinned in RAM "
++            "(0 < N < num_experts; the rest are disk-resident). Keep "
++            "N * (smallest bank row bytes) page-aligned (a multiple of 4096) or "
++            "the small scale banks' tail rows stay resident instead of released "
++            "(warns, does not abort). The rule is per-model: e.g. Qwen3.8-Flash-Next "
++            "needs a multiple of 8, Ornith-1.5-35B a multiple of 2."
++        ),
++    )
++    parser.add_argument(
++        "--disk-fetch-workers",
++        type=int,
++        default=ServerArgs.disk_fetch_workers,
++        help="Disk-tier O_DIRECT fetch threads (default 8).",
++    )
++
+     parser.add_argument(
+         "--moe-cpu-threads",
+         type=int,
+diff --git a/tests/moe/test_disk_tier.py b/tests/moe/test_disk_tier.py
+new file mode 100644
+index 000000000..aea439d14
+--- /dev/null
++++ b/tests/moe/test_disk_tier.py
+@@ -0,0 +1,352 @@
++"""CPU tests for the NVMe disk tier (moe/disk_tier.py).
++
++A synthetic NVFP4 MoE checkpoint (2 layers, 4 experts) is written as safetensors
++shards with deterministic per-tensor content; the tests verify that
++:class:`Nvfp4DiskIndex` resolves the right byte ranges and that
++:class:`DiskTier` places the right bytes into slot-cache rows and rewrites the
++miss list. No CUDA needed -- the "GPU" banks here are CPU tensors and the
++staging pin is stubbed.
++"""
++
++import json
++import re
++import struct
++import threading
++import types
++
++import pytest
++import torch
++
++from freetoken.moe.disk_tier import DiskTier, Nvfp4DiskIndex
++from freetoken.moe.host_banks import HostBank
++from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
++
++H, I, E, L = 16, 32, 4, 2
++SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
++
++SPEC = Nvfp4ExpertSourceSpec(
++    key_pattern=re.compile(
++        r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
++        r"(?P<proj>gate_proj|up_proj|down_proj)\."
++        r"(?P<kind>weight|weight_scale|weight_scale_2)$"
++    ),
++    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
++    layer_to_bank=lambda layer, config: layer,
++    desc="disk-tier test",
++)
++
++# (proj, kind, shape, dtype) -- the native NVFP4 per-expert tensor layout.
++TENSOR_SPECS = (
++    ("gate_proj", "weight", (I, H // 2), torch.uint8),
++    ("up_proj", "weight", (I, H // 2), torch.uint8),
++    ("down_proj", "weight", (H, I // 2), torch.uint8),
++    ("gate_proj", "weight_scale", (I, H // 16), torch.uint8),
++    ("up_proj", "weight_scale", (I, H // 16), torch.uint8),
++    ("down_proj", "weight_scale", (H, I // 16), torch.uint8),
++    # weight_scale_2 is a per-expert fp32 SCALAR in the real checkpoints; the
++    # bank row is its fp16 value broadcast across the row.
++    ("gate_proj", "weight_scale_2", (), torch.float32),
++    ("up_proj", "weight_scale_2", (), torch.float32),
++    ("down_proj", "weight_scale_2", (), torch.float32),
++)
++
++BANK_SHAPES = (
++    (2 * I, H // 2),  # gate_up_packed
++    (2 * I, H // 16),  # gate_up_scale
++    (2 * I,),  # gate_up_global
++    (H, I // 2),  # down_packed
++    (H, I // 16),  # down_scale
++    (H,),  # down_global
++)
++BANK_DTYPES = (torch.uint8, torch.uint8, torch.float16, torch.uint8, torch.uint8, torch.float16)
++
++
++def _name(layer, expert, proj, kind):
++    return f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}.{kind}"
++
++
++def _tensor_for(layer, expert, proj, kind):
++    """Deterministic content: a base offset per (layer, expert, proj, kind) so any
++    misplacement is visible."""
++    proj_i = ("gate_proj", "up_proj", "down_proj").index(proj)
++    kind_i = ("weight", "weight_scale", "weight_scale_2").index(kind)
++    base = layer * 100000 + expert * 1000 + proj_i * 100 + kind_i * 10
++    for p, k, shape, dtype in TENSOR_SPECS:
++        if p == proj and k == kind:
++            if shape == ():  # per-expert fp32 scalar (kept in fp16 range)
++                return torch.tensor(float(base % 50000), dtype=torch.float32)
++            n = int(torch.tensor(shape).prod())
++            if dtype == torch.uint8:
++                return torch.arange(n, dtype=torch.uint8).add_(base % 251).view(shape)
++            return (torch.arange(n, dtype=torch.float32) + base).to(dtype).view(shape)
++    raise AssertionError((proj, kind))
++
++
++@pytest.fixture()
++def checkpoint(tmp_path):
++    import safetensors.torch
++
++    by_shard = {s: {} for s in SHARDS}
++    weight_map = {}
++    for layer in range(L):
++        for expert in range(E):
++            for proj, kind, _shape, _dtype in TENSOR_SPECS:
++                shard = SHARDS[(layer * E + expert) % 2]
++                name = _name(layer, expert, proj, kind)
++                by_shard[shard][name] = _tensor_for(layer, expert, proj, kind)
++                weight_map[name] = shard
++    for shard, tensors in by_shard.items():
++        safetensors.torch.save_file(tensors, str(tmp_path / shard), metadata={"format": "pt"})
++    with open(tmp_path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
++        json.dump({"weight_map": weight_map, "metadata": None}, f)
++    config = types.SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
++                                   num_layers=L, first_k_dense_replace=0)
++    return tmp_path, config
++
++
++def _index(checkpoint):
++    path, config = checkpoint
++    return Nvfp4DiskIndex(str(path), config, SPEC)
++
++
++def test_index_segments_match_file_bytes(checkpoint):
++    import safetensors
++
++    path, config = checkpoint
++    index = _index(checkpoint)
++    assert len(index.shard_paths) == 2
++    # Every (bank, layer, expert) row segment must point at the exact tensor bytes.
++    for bank_idx in range(6):
++        for layer in range(L):
++            for expert in range(E):
++                segs = index.row_segments(bank_idx, layer, expert)
++                expected = {
++                    0: [("gate_proj", "weight"), ("up_proj", "weight")],
++                    1: [("gate_proj", "weight_scale"), ("up_proj", "weight_scale")],
++                    2: [("gate_proj", "weight_scale_2"), ("up_proj", "weight_scale_2")],
++                    3: [("down_proj", "weight")],
++                    4: [("down_proj", "weight_scale")],
++                    5: [("down_proj", "weight_scale_2")],
++                }[bank_idx]
++                assert len(segs) == len(expected)
++                for (shard_idx, off, nbytes), (proj, kind) in zip(segs, expected):
++                    shard_path = index.shard_paths[shard_idx]
++                    with open(shard_path, "rb") as f:
++                        (hlen,) = struct.unpack("<Q", f.read(8))
++                        meta = json.loads(f.read(hlen))
++                        tstart, tend = meta[_name(layer, expert, proj, kind)]["data_offsets"]
++                        base = 8 + hlen  # data_offsets are data-section-relative
++                        assert (off, off + nbytes) == (tstart + base, tend + base), (
++                            bank_idx, layer, expert, proj, kind)
++                    with safetensors.safe_open(shard_path, framework="pt", device="cpu") as sf:
++                        tensor = sf.get_tensor(_name(layer, expert, proj, kind))
++                    assert nbytes == tensor.numel() * tensor.element_size()
++
++
++def _fake_cache():
++    """CPU stand-in for OffloadMoeCache: banks in schema order + miss-list tensors."""
++    banks = [
++        (
++            [torch.zeros(E, *shape, dtype=dtype) for _ in range(L)],
++            torch.full((8, *shape), 0xFF, dtype=dtype),
++        )
++        for shape, dtype in zip(BANK_SHAPES, BANK_DTYPES)
++    ]
++    cache = type("FakeCache", (), {})()
++    cache.banks = banks
++    cache.num_experts = E
++    cache.num_layers = L
++    cache.num_indices = torch.tensor([0], dtype=torch.int64)
++    cache.src_indices = torch.zeros(64, dtype=torch.int32)
++    cache.evict_slots = torch.zeros(64, dtype=torch.int32)
++    return cache
++
++
++def _tier(checkpoint, cache, ram_experts=2):
++    index = _index(checkpoint)
++    tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2)
++    # Staging must hold the largest bank row's O_DIRECT super-block (a size
++    # regression here overflows the buffer -> EFAULT/segfault at fetch time).
++    max_row = max(
++        b[0][0][0].numel() * b[0][0][0].element_size() for b in cache.banks)
++    assert tier._staging_size >= max_row + 2 * 4096, (tier._staging_size, max_row)
++    # Stub the pinned staging (HostBank.pin needs CUDA) with the same per-thread
++    # ring semantics as production (threading.local, no CUDA events on CPU).
++    local = threading.local()
++
++    def _staging_ring():
++        ring = getattr(local, "ring", None)
++        if ring is None:
++            ring = [[HostBank((tier._staging_size,), torch.uint8), None]
++                    for _ in range(tier._STAGING_RING)]
++            local.ring = ring
++        return ring
++
++    tier._staging_ring = _staging_ring
++    return tier
++
++
++def _expected_rows(layer, expert):
++    """The 6 bank rows for one expert, as flat uint8, in schema order."""
++    rows = []
++    for bank_idx, (shape, dtype) in enumerate(zip(BANK_SHAPES, BANK_DTYPES)):
++        if bank_idx == 2:
++            gate = _tensor_for(layer, expert, "gate_proj", "weight_scale_2").to(torch.float16)
++            up = _tensor_for(layer, expert, "up_proj", "weight_scale_2").to(torch.float16)
++            row = torch.cat([gate.expand(I), up.expand(I)]).view(shape)
++        elif bank_idx == 5:
++            row = (_tensor_for(layer, expert, "down_proj", "weight_scale_2")
++                   .to(torch.float16).expand(H).view(shape))
++        elif bank_idx < 3:
++            kind = ("weight", "weight_scale")[bank_idx]
++            gate = _tensor_for(layer, expert, "gate_proj", kind)
++            up = _tensor_for(layer, expert, "up_proj", kind)
++            row = torch.cat([gate.reshape(-1), up.reshape(-1)]).view(shape)
++        else:
++            row = _tensor_for(layer, expert, "down_proj", ("weight", "weight_scale")[bank_idx - 3])
++        rows.append(row.contiguous().view(torch.uint8).reshape(-1))
++    return rows
++
++
++def test_fetch_expert_places_all_banks(checkpoint):
++    cache = _fake_cache()
++    tier = _tier(checkpoint, cache)
++    for layer in range(L):
++        for expert in range(E):
++            slot = (layer * E + expert) % 8
++            tier._fetch_expert(layer, expert, slot)
++            expected = _expected_rows(layer, expert)
++            for bank_idx, (host_layer, gpu_cache) in enumerate(cache.banks):
++                got = gpu_cache[slot].contiguous().view(torch.uint8).reshape(-1)
++                assert torch.equal(got, expected[bank_idx]), (bank_idx, layer, expert)
++    stats = tier.stats()
++    assert stats["experts_fetched"] == L * E
++
++
++def test_fetch_pending_filters_and_rewrites(checkpoint):
++    cache = _fake_cache()
++    tier = _tier(checkpoint, cache, ram_experts=2)  # experts 0,1 RAM; 2,3 disk
++    layer = 1
++    # Miss list: expert 0 (RAM), 2 (disk), 3 (disk) -> slots 5, 6, 7.
++    cache.src_indices[:3] = torch.tensor([0, 2, 3], dtype=torch.int32)
++    cache.evict_slots[:3] = torch.tensor([5, 6, 7], dtype=torch.int32)
++    cache.num_indices.fill_(3)
++
++    tier.fetch_pending(cache, layer)
++
++    # Disk misses fetched into their slots...
++    expected = _expected_rows(layer, 2)
++    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
++        assert torch.equal(
++            gpu_cache[6].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
++    expected = _expected_rows(layer, 3)
++    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
++        assert torch.equal(
++            gpu_cache[7].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
++    # ...and the miss list shrank to the RAM-resident remainder.
++    assert cache.num_indices.item() == 1
++    assert cache.src_indices[0].item() == 0
++    assert cache.evict_slots[0].item() == 5
++
++
++def test_fetch_pending_all_ram_is_noop(checkpoint):
++    cache = _fake_cache()
++    tier = _tier(checkpoint, cache, ram_experts=2)
++    cache.src_indices[:2] = torch.tensor([0, 1], dtype=torch.int32)
++    cache.evict_slots[:2] = torch.tensor([0, 1], dtype=torch.int32)
++    cache.num_indices.fill_(2)
++    tier.fetch_pending(cache, 0)
++    assert cache.num_indices.item() == 2
++    assert tier.stats()["experts_fetched"] == 0
++
++
++def test_fetch_pending_all_disk_clears_list(checkpoint):
++    cache = _fake_cache()
++    tier = _tier(checkpoint, cache, ram_experts=2)
++    cache.src_indices[:1] = torch.tensor([3], dtype=torch.int32)
++    cache.evict_slots[:1] = torch.tensor([4], dtype=torch.int32)
++    cache.num_indices.fill_(1)
++    tier.fetch_pending(cache, 0)
++    assert cache.num_indices.item() == 0
++    expected = _expected_rows(0, 3)
++    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
++        assert torch.equal(
++            gpu_cache[4].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
++
++
++def test_release_range_frees_pages():
++    """release_range must actually drop the resident pages. The bank is a
++    MAP_PRIVATE anonymous mapping, so MADV_DONTNEED frees for real; mincore
++    verifies the pages are gone (a MAP_SHARED mapping would keep them)."""
++    import ctypes as ct
++
++    size = 4 * 1024 * 1024
++    bank = HostBank((size,), torch.uint8)
++    bank.tensor.fill_(7)  # fault every page in
++    libc = ct.CDLL("libc.so.6", use_errno=True)
++    libc.mincore.argtypes = [ct.c_void_p, ct.c_size_t, ct.POINTER(ct.c_ubyte)]
++    libc.mincore.restype = ct.c_int
++
++    def resident_pages(addr, nbytes):
++        vec = (ct.c_ubyte * ((nbytes + 4095) // 4096))()
++        assert libc.mincore(addr, nbytes, vec) == 0
++        return sum(1 for b in vec if b & 1)
++
++    pages = size // 4096
++    assert resident_pages(bank.addr, size) == pages
++    bank.release_range(0, size)
++    assert resident_pages(bank.addr, size) == 0
++    # The mapping stays valid: the refaulted pages read back as zeros.
++    assert bank.tensor[0] == 0
++
++
++def test_tail_unbacked_after_release():
++    """Lazy-tail invariant (the disk-tier RAM math): after release_range, the
++    tail rows [K, E) back NO pages -- until something writes them. mincore over
++    the tail is the cheap startup check check_tail_unbacked() runs for real."""
++    from freetoken.moe.disk_tier import release_bank_tails, tail_resident_bytes
++
++    E, K = 8, 4
++    bank = HostBank((E, 4096), torch.uint8)  # page-sized rows
++    bank.tensor[:K].fill_(1)  # touch only the prefix
++    release_bank_tails({"b": [bank]}, E, K)
++    assert tail_resident_bytes(bank, E, K) == 0
++    # The mapping still works: one tail write backs exactly one page (the
++    # invariant is "nothing touches the tail", not "the tail refuses to back").
++    bank.tensor[K].fill_(2)
++    assert tail_resident_bytes(bank, E, K) == 4096
++
++
++def test_release_bank_tails_unaligned_row_boundary():
++    """A row boundary that is not page-aligned (the small scale banks) must not
++    fail the boot: release_bank_tails warns and skips that bank instead of
++    asserting in release_range. The tail rows were never written, so skipping
++    loses nothing. Aligned boundaries still release."""
++    import ctypes as ct
++
++    from freetoken.moe.disk_tier import release_bank_tails
++
++    libc = ct.CDLL("libc.so.6", use_errno=True)
++    libc.mincore.argtypes = [ct.c_void_p, ct.c_size_t, ct.POINTER(ct.c_ubyte)]
++    libc.mincore.restype = ct.c_int
++
++    def resident_pages(addr, nbytes):
++        vec = (ct.c_ubyte * ((nbytes + 4095) // 4096))()
++        assert libc.mincore(addr, nbytes, vec) == 0
++        return sum(1 for b in vec if b & 1)
++
++    # A real Ornith gate_up_scale row size: 2048 bytes/row, NOT page-aligned.
++    E, K = 256, 127
++    bank = HostBank((E, 2048), torch.uint8)
++    bank.tensor.fill_(7)  # fault every page in
++    assert resident_pages(bank.addr, bank.nbytes) == bank.nbytes // 4096
++    # K=127: offset = 127*2048 = 259072, not % 4096 -> warn+skip, no AssertionError.
++    release_bank_tails({"gate_up_scale": [bank]}, E, K)
++    # Skipped: the (already resident) tail pages are untouched, not freed.
++    assert resident_pages(bank.addr, bank.nbytes) == bank.nbytes // 4096
++
++    # Aligned K on the same bank shape: offset = 128*2048 = 262144 (% 4096) -> releases.
++    bank2 = HostBank((E, 2048), torch.uint8)
++    bank2.tensor.fill_(7)
++    release_bank_tails({"gate_up_scale": [bank2]}, E, 128)
++    assert resident_pages(bank2.addr + 128 * 2048, bank2.nbytes - 128 * 2048) == 0
+diff --git a/tests/moe/test_disk_tier_families.py b/tests/moe/test_disk_tier_families.py
+new file mode 100644
+index 000000000..2db100f09
+--- /dev/null
++++ b/tests/moe/test_disk_tier_families.py
+@@ -0,0 +1,76 @@
++"""Every NVFP4 family must hand the disk tier a source spec.
++
++The loader releases expert rows ``[K, E)`` for every family, so a family that reaches
++that release without an index would serve zeroed experts silently. These tests pin the
++hook (``nvfp4_expert_spec``, resolved by ``moe.expert_pieces.nvfp4_expert_spec_of``)
++that keeps the disk index and the loader reading the same rows.
++"""
++from __future__ import annotations
++
++import importlib
++
++import pytest
++
++# Families whose NVFP4 experts load through the shared reader (nvfp4_expert_spec).
++NVFP4_FAMILIES = [
++    "qwen3_5_moe", "qwen4_exp", "glm4_moe", "glm5_next", "gemma4", "minimax_m2", "minimax_m3",
++]
++
++
++@pytest.mark.parametrize("family", NVFP4_FAMILIES)
++def test_family_exposes_a_source_spec_hook(family):
++    mod = importlib.import_module(f"freetoken.models.{family}.weight")
++    getter = getattr(mod, "nvfp4_expert_spec", None)
++    assert callable(getter), (
++        f"{family} defines _NVFP4_SOURCE_SPEC but exposes no nvfp4_expert_spec, so "
++        "the disk tier cannot build a disk index for it")
++
++
++@pytest.mark.parametrize("family", [f for f in NVFP4_FAMILIES if f != "glm5_next"])
++def test_hook_returns_the_spec_the_loader_uses(family):
++    # glm5_next is excluded here only because its hook reads the checkpoint config to pick
++    # between the compressed-tensors and modelopt namings; it is covered by the test below.
++    mod = importlib.import_module(f"freetoken.models.{family}.weight")
++    spec = mod.nvfp4_expert_spec("unused/for/these/families", None)
++    assert spec is mod._NVFP4_SOURCE_SPEC
++    assert spec.key_pattern.groupindex.keys() >= {"layer", "expert", "proj", "kind"}
++    assert set(spec.proj_to_role.values()) == {"gate", "up", "down"}
++
++
++def test_glm5_next_hook_follows_the_checkpoint_quant_method(monkeypatch):
++    mod = importlib.import_module("freetoken.models.glm5_next.weight")
++
++    class _Cfg:
++        def __init__(self, method):
++            self.quantization_config = {"quant_method": method}
++
++    monkeypatch.setattr(mod, "cached_load_hf_config", lambda path: _Cfg("compressed-tensors"))
++    assert mod.nvfp4_expert_spec("p", None) is mod._NVFP4_CT_SOURCE_SPEC
++    monkeypatch.setattr(mod, "cached_load_hf_config", lambda path: _Cfg("modelopt"))
++    assert mod.nvfp4_expert_spec("p", None) is mod._NVFP4_SOURCE_SPEC
++
++
++def test_provider_refuses_a_family_without_a_spec(monkeypatch):
++    """A family with no hook must fail at load, not release rows and serve zeros."""
++    from freetoken.layers.quantization import QuantKind
++    from freetoken.moe import expert_banks
++    from freetoken.moe.disk_tier import DiskTierSpec
++
++    monkeypatch.setattr("freetoken.moe.expert_pieces.nvfp4_expert_spec_of",
++                        lambda path, config: None)
++
++    class _Kernel:
++        name = "triton"
++
++    class _Method:
++        kind = QuantKind.NVFP4
++        kernel = _Kernel()
++
++    class _Cfg:
++        num_moe_layers = 1
++        architectures = ["SomeMoEForCausalLM"]
++
++    with pytest.raises(NotImplementedError, match="nvfp4_expert_spec"):
++        expert_banks._method_expert_banks(
++            "does/not/matter", _Cfg(), _Method(), None, False,
++            False, 8, 8 << 20, disk_tier=DiskTierSpec(ram_experts=1))
+diff --git a/tests/moe/test_offload.py b/tests/moe/test_offload.py
+index b29ce531d..ebcffeafa 100644
+--- a/tests/moe/test_offload.py
++++ b/tests/moe/test_offload.py
+@@ -876,3 +876,22 @@ def boom(addr, nbytes):
+         with hb.PinPipeline() as pins:
+             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
+     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
++
++
++def test_copy_miss_verify_probe_gated_on_disk_tier(monkeypatch, capsys):
++    """FT_DISK_TIER_VERIFY must not fire the [copy-miss] probe when the disk tier
++    is off: the probe's .item()/.cpu() are device-to-host syncs, which crash any
++    CUDA graph capture (PR #337 issuecomment-5519070434 -- every graph-capturing
++    boot died with the env var left over from a tier session). Gated on the tier
++    like its neighbours, and skipped while a stream is capturing."""
++    layer, cache = _make_layer_and_cache()
++    cache._pending_src_layer = 0
++    cache.evict_slots = torch.tensor([0, 1], dtype=torch.int32)
++    cache.src_indices = torch.tensor([2, 3], dtype=torch.int32)
++    cache.num_indices = torch.tensor(2)
++    cache._copy_fused_ok = False
++    monkeypatch.setattr("freetoken.kernel.fast_index_copy_jit", lambda *a, **k: None)
++    monkeypatch.setenv("FT_DISK_TIER_VERIFY", "1")
++
++    cache.copy_missing()
++    assert "[copy-miss]" not in capsys.readouterr().out

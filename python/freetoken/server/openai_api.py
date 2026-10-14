@@ -96,6 +96,8 @@ def _maintenance_gate(state: Any) -> JSONResponse | None:
     """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
     runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
     None when serving."""
+    if hasattr(state, "_clear_stale_rebuild_gate"):
+        state._clear_stale_rebuild_gate()
     mstate = getattr(state, "maintenance_state", "serving")
     if mstate == "serving":
         return None

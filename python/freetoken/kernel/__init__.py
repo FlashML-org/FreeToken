@@ -1,3 +1,11 @@
+import os
+import sys
+
+# Source checkouts still use the installed CUDA extension modules.
+_installed_kernel = os.path.join(sys.prefix, "Lib", "site-packages", "freetoken", "kernel")
+if os.path.isdir(_installed_kernel) and _installed_kernel not in __path__:
+    __path__.append(_installed_kernel)
+
 from .index import indexing
 from .fast_index_copy import fast_index_copy_jit, update_copy_flag_jit
 from .moe_impl import (

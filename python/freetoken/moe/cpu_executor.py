@@ -71,8 +71,15 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
-             "fp8_block": 5}
+_WFMT_IDS = {
+    "bf16": 0,
+    "nvfp4": 1,
+    "mxfp4_triton": 2,
+    "ds_fp4": 3,
+    "q4_0": 4,
+    "q8_0": 5,
+    "fp8_block": 6,
+}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -157,7 +164,8 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or fp8_block — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0, q8_0, or fp8_block — see
+    ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -427,7 +435,10 @@ class CpuMoeExecutor:
             return ptrs, (H, I)
 
         if fmt == "q4_0":
-            return self._resolve_q4_0_banks(banks)
+            return self._resolve_packed_gguf_banks(banks, block_bytes=18, fmt="q4_0")
+
+        if fmt == "q8_0":
+            return self._resolve_packed_gguf_banks(banks, block_bytes=34, fmt="q8_0")
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
@@ -464,11 +475,10 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+    def _resolve_packed_gguf_banks(
+        self, banks: dict, *, block_bytes: int, fmt: str
+    ) -> tuple[dict, tuple[int, int]]:
+        """Resolve native GGUF Q4_0/Q8_0 row-major packed expert banks."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
             gate_up[0].dtype, down[0].dtype,
@@ -477,8 +487,8 @@ class CpuMoeExecutor:
         H = int(down[0].shape[1])
         assert gate_up[0].shape[1] == 2 * I
         assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        assert int(gate_up[0].shape[2]) == (H // 32) * block_bytes, (fmt, gate_up[0].shape, H)
+        assert int(down[0].shape[2]) == (I // 32) * block_bytes, (fmt, down[0].shape, I)
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),

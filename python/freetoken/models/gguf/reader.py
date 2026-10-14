@@ -37,6 +37,8 @@ FTW_METADATA_GGUF = "source_metadata.gguf"
 # Records whether the source carried an untied "output.weight" head (the tensor table
 # is stripped from metadata-only gguf files, so the fact travels as a KV).
 OUTPUT_WEIGHT_PRESENT_KV = "freetoken.output_weight_present"
+GGUF_FORMAT_KV = "freetoken.gguf_format"
+GGML_NVFP4 = 40
 
 
 def gguf_config_source(model_path: str) -> str | None:
@@ -179,6 +181,8 @@ __all__ = [
     "is_gguf_path",
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
+    "GGUF_FORMAT_KV",
+    "GGML_NVFP4",
     "gguf_config_source",
     "write_metadata_gguf",
     "GgufTensor",

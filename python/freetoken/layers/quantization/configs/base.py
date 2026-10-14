@@ -70,6 +70,21 @@ class QuantConfig(ABC):
             return self._schemes[prefix]
         names = self.name_map.to_checkpoint(prefix)
         schemes = {None if self.unquantized(n) else self.scheme_for_name(n) for n in names}
+        # Some multimodal wrappers store weights below model.language_model while their
+        # quantization metadata names the logical text modules as model.layers. If the
+        # checkpoint-root mapping finds no scheme, retry the original logical prefix.
+        if all(scheme is None for scheme in schemes) and prefix not in names:
+            logical_names = tuple(
+                name.replace("model.language_model.", "model.", 1)
+                for name in names
+            )
+            if logical_names != names:
+                # The mapped checkpoint root is authoritative when it has no scheme
+                # (for example, a BF16 vision tower in a globally quantized checkpoint).
+                schemes = {
+                    None if self.unquantized(name) else self.scheme_for_name(name)
+                    for name in logical_names
+                }
         if len(schemes) != 1:
             raise ValueError(f"fused module {prefix!r} mixes quantization schemes across {names}: {schemes}")
         scheme = schemes.pop()

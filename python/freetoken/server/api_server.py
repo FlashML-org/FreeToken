@@ -146,6 +146,11 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Monotonic wall-clock when the most recent rebuild was latched. A timed-out or lost
+    # rebuild can leave the gate stuck in "rebuilding" if the backend never sends the final
+    # CacheRebuildReply; guard against that stale latch by reopening the gate once the backend
+    # has clearly stopped resolving it.
+    rebuild_started_at: float | None = None
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -262,6 +267,34 @@ class FrontendManager:
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
+    def _clear_stale_rebuild_gate(self) -> bool:
+        """If the backend never resolved a rebuild request, reopen the gate rather than leaving
+        the server wedged in "rebuilding" forever. This is intentionally conservative: it only
+        clears the gate when there is no live request future waiting to be resolved, which means
+        the frontend has no pending rebuild waiter left to wake and no terminal reply can still be
+        delivered to it. The model is still serving; this is a stale-latch recovery, not an
+        application-level rollback."""
+        if self.maintenance_state != "rebuilding":
+            return False
+        if self.rebuild_futures:
+            return False
+        started = self.rebuild_started_at
+        if started is None:
+            logger.warning("rebuild gate was latched without a start time; clearing stale 'rebuilding' state")
+            self.maintenance_state = "serving"
+            return True
+        if time.monotonic() - started < 30.0:
+            return False
+        logger.warning("recovering stale rebuild gate after no reply was received for %.1fs", time.monotonic() - started)
+        self.maintenance_state = "serving"
+        self.rebuild_started_at = None
+        self.last_rebuild = {
+            "request_id": None,
+            "status": "recovered",
+            "error": "stale rebuild gate recovered; backend never sent a terminal reply",
+        }
+        return True
+
     def _resolve_rebuild(self, msg: CacheRebuildReply) -> None:
         """Terminal transition for a rebuild: rebuilding -> serving | failed. This is the ONLY
         path that reopens the gate dispatch_rebuild latches to "rebuilding", so it must always
@@ -276,6 +309,7 @@ class FrontendManager:
           - Otherwise only a genuine destructive "failed" latches maintenance; "ok"/"busy"/
             "rejected"/"unsupported" all leave the prior cache intact, so the engine keeps
             serving."""
+        self.rebuild_started_at = None
         self.last_rebuild = {
             "request_id": msg.request_id,
             "status": msg.status,
@@ -554,6 +588,7 @@ async def dispatch_rebuild(
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
+    state.rebuild_started_at = time.monotonic()
     state.maintenance_state = "rebuilding"
     try:
         await state.send_one(
@@ -576,12 +611,12 @@ async def dispatch_rebuild(
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
-        # Do NOT reopen the maintenance gate here: the scheduler may still be mid-rebuild
-        # (e.g. a slow CUDA-graph recapture) and the backend request was not cancelled.
-        # Leave maintenance_state == "rebuilding" so new generation and new rebuilds stay
-        # blocked; the eventual CacheRebuildReply flips it to serving/failed via
-        # _resolve_rebuild. Drop the now-cancelled future so it does not linger.
+        # A timed-out wait is a real signal that the backend has not delivered a terminal reply,
+        # but we must not leave the server wedged forever if the scheduler never replies. Clear the
+        # stale gate only when there is no live future left to resolve; otherwise keep the rebuild
+        # blocked until the final CacheRebuildReply arrives.
         state.rebuild_futures.pop(request_id, None)
+        state._clear_stale_rebuild_gate()
         return {"status": "timeout", "request_id": request_id}
 
 
@@ -975,6 +1010,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
+    if os.name == "nt":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)

@@ -15,7 +15,13 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
+from freetoken.layers.quantization import (
+    LayerKind,
+    QuantBackend,
+    QuantKind,
+    finalize_quant,
+    set_quant_backend,
+)
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -651,7 +657,10 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
-        method = shared_offload_method(self.model)
+        method = shared_offload_method(
+            self.model,
+            include_unquantized=_include_unquantized_offload_method(config.model_config),
+        )
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
@@ -694,6 +703,21 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        disk_tier = None
+        if config.moe_disk_tier == "on":
+            from freetoken.moe.disk_tier import DiskTierSpec
+
+            if getattr(config.model_config, "model_type", "") != "qwen4_exp":
+                raise ValueError("--moe-disk-tier currently supports native qwen4_exp NVFP4 only")
+            if not 0 < config.expert_ram_experts < config.model_config.num_experts:
+                raise ValueError(
+                    f"--expert-ram-experts must be in (0, {config.model_config.num_experts})"
+                )
+            if decode_target != "gpu" or config.moe_prefill_overlap:
+                raise ValueError("--moe-disk-tier requires GPU offload and prefill overlap disabled")
+            if config.cuda_graph_max_bs != 0:
+                raise ValueError("--moe-disk-tier requires --cuda-graph-max-bs 0")
+            disk_tier = DiskTierSpec(config.expert_ram_experts)
         requested_residency = None
         if split_residency:
             from freetoken.moe.host_banks import HostResidency
@@ -715,6 +739,7 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    disk_tier=disk_tier,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -737,7 +762,7 @@ class Engine:
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         layout = max_slots = None
-        if method is not None:
+        if method is not None and disk_tier is None:
             if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
@@ -760,10 +785,15 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            disk_ram_experts=None if disk_tier is None else config.expert_ram_experts,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        if banks.disk_index is not None:
+            cache.attach_disk_tier(
+                banks.disk_index, banks.disk_ram_experts, workers=config.disk_fetch_workers
+            )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -840,9 +870,19 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=method.cpu_format if method is not None else None,
-            act_block=method.cfg.act_block if method is not None else None,
+            # Native-format providers (GGUF/Qwen NVFP4) keep packed banks in the
+            # offload cache while their layer method may be QuantKind.NONE.
+            fmt=(
+                cache.quant_format
+                if sample.quant_method is None or sample.quant_method.kind is QuantKind.NONE
+                else sample.quant_method.cpu_format
+            ),
+            act_block=(
+                sample.quant_method.cfg.act_block
+                if sample.quant_method is not None
+                and getattr(sample.quant_method, "cfg", None) is not None
+                else None
+            ),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1181,6 +1221,11 @@ def _fused_resident_ok(model_config) -> bool:
     """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
+    if (
+        getattr(model_config, "model_type", "") == "qwen4_exp"
+        and getattr(model_config, "expert_quant", "none") == "none"
+    ):
+        return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
 
 
@@ -1491,11 +1536,24 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), kernel),))
 
 
-def shared_offload_method(model):
-    """The expert method every offload MoE layer of ``model`` uses, or None for models whose MoE layers carry none (GGUF).
+def shared_offload_method(model, *, include_unquantized: bool = False):
+    """Return the common method, or None when native-format experts use a separate provider.
 
+    ``include_unquantized`` opts ordinary BF16 experts into the generic bank reader.
     The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
-    layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
+    all_layers = list(iter_offload_moe_layers(model))
+    layers = [
+        l
+        for l in all_layers
+        if getattr(l, "quant_method", None) is not None
+        and l.quant_method.kind is not QuantKind.NONE
+    ]
+    if not layers and include_unquantized:
+        layers = [
+            layer for layer in all_layers
+            if getattr(layer, "quant_method", None) is not None
+            and layer.quant_method.kind is QuantKind.NONE
+        ]
     if not layers:
         return None
     keys = {(layer.quant_method.kind, layer.quant_method.kernel.name) for layer in layers}
@@ -1505,6 +1563,14 @@ def shared_offload_method(model):
     kind, kernel = keys.pop()
     logger.info_rank0(f"MoE experts: {kind} via {kernel}")
     return layers[0].quant_method
+
+
+def _include_unquantized_offload_method(model_config) -> bool:
+    return (
+        model_config.model_type != "qwen4_exp"
+        and model_config.expert_quant == "none"
+        and model_config.moe_weight_format is None
+    )
 
 
 def offload_expert_method(config: EngineConfig):
@@ -1519,7 +1585,10 @@ def offload_expert_method(config: EngineConfig):
     object.__setattr__(config.model_config, "decode_target", "gpu")
     with torch.device("meta"), torch_dtype(config.dtype):
         model = create_model(config.model_config)
-    return shared_offload_method(model)
+    return shared_offload_method(
+        model,
+        include_unquantized=_include_unquantized_offload_method(config.model_config),
+    )
 
 
 def _adjust_config(config: EngineConfig):

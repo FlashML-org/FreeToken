@@ -50,6 +50,7 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    dtype: str
 
     @property
     def total_rows(self) -> int:
@@ -63,6 +64,7 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     paths: list[str] = []
     path_idx: dict[str, int] = {}
     shards: dict[int, tuple[int, int]] = {}
+    shard_dtype: str | None = None
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
         for key, meta in header.items():
@@ -75,8 +77,14 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+            dtype = meta["dtype"]
+            if dtype not in (_PLE_ST_DTYPE, "BF16"):
+                raise ValueError(
+                    f"PLE shard {key} has dtype {dtype}, expected {_PLE_ST_DTYPE} or BF16"
+                )
+            if shard_dtype is not None and dtype != shard_dtype:
+                raise ValueError(f"PLE shards have mixed dtypes: {shard_dtype} and {dtype}")
+            shard_dtype = dtype
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -89,10 +97,18 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
-    if scale is None:
+    if scale is None and shard_dtype != "BF16":
         raise ValueError("PLE table has no weight_scale")
     order = [shards[i] for i in range(len(shards))]
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
+    assert shard_dtype is not None
+    if scale is None:
+        scale = torch.tensor(1.0, dtype=torch.bfloat16)
+    itemsize = 1 if shard_dtype == _PLE_ST_DTYPE else 2
+    row_bytes = cols * itemsize
+    return PleRowSource(
+        paths, [f for f, _ in order], [b for _, b in order], rows,
+        row_bytes, row_bytes, float(scale), shard_dtype,
+    )
 
 
 def resolve_row_source(folder: str) -> PleRowSource:
@@ -115,8 +131,11 @@ class DiskRowTable:
         from freetoken.kernel.row_store import PleStore
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_bytes // (1 if source.dtype == _PLE_ST_DTYPE else 2)
         self.dtype = dtype
+        self._value_dtype = (
+            torch.float8_e4m3fn if source.dtype == _PLE_ST_DTYPE else torch.bfloat16
+        )
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
         self.eos_token_id = int(hash_constants["eos_token_id"])
@@ -142,7 +161,7 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        self._token_bytes = self.heads * source.row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -272,7 +291,7 @@ class DiskRowTable:
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        values = dev[:nbytes].view(self._value_dtype).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

@@ -22,6 +22,7 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,12 +33,17 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
+_DEQUANT = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
+_UNQUANTIZED_DTYPE = {
+    GGML_F32: torch.float32,
+    GGML_F16: torch.float16,
+    GGML_BF16: torch.bfloat16,
+}
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -52,7 +58,10 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
     if qweight_type in _UNQUANTIZED:
-        return x @ qweight.T
+        weight = qweight
+        if weight.dtype == torch.uint8:
+            weight = weight.view(_UNQUANTIZED_DTYPE[qweight_type])
+        return (x.to(weight.dtype) @ weight.T).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
@@ -125,4 +134,16 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+class GGUFMergedLinear(BaseOP):
+    """Concatenate independently quantized GGUF projections along output rows."""
+
+    def __init__(self, in_features: int, output_sizes: list[int], quant_types: list[int]):
+        for index, (size, quant_type) in enumerate(zip(output_sizes, quant_types)):
+            setattr(self, f"part{index}", GGUFLinear(in_features, size, quant_type))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        parts = [getattr(self, name).forward(x) for name in self.__dict__ if name.startswith("part")]
+        return torch.cat(parts, dim=-1)
+
+
+__all__ = ["GGUFLinear", "GGUFEmbedding", "GGUFMergedLinear", "fused_mul_mat_gguf"]

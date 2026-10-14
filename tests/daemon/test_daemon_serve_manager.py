@@ -843,6 +843,22 @@ def test_probe_sends_the_running_serves_key(monkeypatch):
     assert seen == [None, "Bearer k1", "Bearer k1"]
 
 
+def test_daemon_server_supports_legacy_manager_api_key(monkeypatch):
+    from freetoken.daemon.server import _manager_serve_api_key
+
+    monkeypatch.setenv("FREETOKEN_API_KEY", "legacy-key")
+
+    class LegacyManager:
+        pass
+
+    class CurrentManager:
+        def serve_api_key(self):
+            return None
+
+    assert _manager_serve_api_key(LegacyManager()) == "legacy-key"
+    assert _manager_serve_api_key(CurrentManager()) is None
+
+
 def test_start_and_switch_routes_hand_the_api_key_to_the_manager():
     calls = []
 

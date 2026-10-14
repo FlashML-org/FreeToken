@@ -23,8 +23,10 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
 GGML_Q6_K = 14
 GGML_BF16 = 30
+GGML_NVFP4 = 40
 
 # (block numel, bytes per block) per ggml type.
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
@@ -33,7 +35,9 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
     GGML_Q6_K: (256, 210),
+    GGML_NVFP4: (64, 36),
 }
 
 GGML_NAME = {
@@ -42,7 +46,9 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
     GGML_Q6_K: "Q6_K",
+    GGML_NVFP4: "NVFP4",
 }
 
 
@@ -115,9 +121,38 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def _e4m3_to_f32(raw: torch.Tensor) -> torch.Tensor:
+    """Decode finite FP8 E4M3 bytes without relying on a CUDA FP8 dtype."""
+    bits = raw.to(torch.int32)
+    sign = torch.where((bits & 0x80) != 0, -1.0, 1.0)
+    exponent = (bits >> 3) & 0x0F
+    mantissa = bits & 0x07
+    normal = sign * (1.0 + mantissa.to(torch.float32) / 8.0) * torch.pow(
+        2.0, exponent.to(torch.float32) - 7.0
+    )
+    subnormal = sign * (mantissa.to(torch.float32) / 8.0) * (2.0 ** -6)
+    return torch.where(exponent == 0, subnormal, normal)
+
+
+def dequant_nvfp4(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """NVFP4: four FP8 scales plus GGML's grouped 32-byte E2M1 payload."""
+    raw = raw.reshape(-1, 36)
+    scales = _e4m3_to_f32(raw[:, :4]).repeat_interleave(16, dim=1)
+    grouped = raw[:, 4:].reshape(-1, 4, 8)
+    codes = torch.cat((grouped & 0x0F, grouped >> 4), dim=-1).reshape(-1, 64)
+    lut = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0),
+        dtype=torch.float32,
+        device=raw.device,
+    )
+    return (lut[codes.to(torch.long)] * scales).reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_NVFP4: dequant_nvfp4,
 }
 
 
@@ -143,11 +178,14 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
     "GGML_Q6_K",
+    "GGML_NVFP4",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
     "dequant_q6_k",
+    "dequant_nvfp4",
     "dequantize",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
@@ -13,6 +14,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    detect_expert_quant,
 )
 from freetoken.models.qwen3_vl.config import parse_vision_config
 
@@ -73,6 +75,17 @@ class Qwen4ExpArgs:
 
 PLE_CONV_STATE = "ple_conv"
 PLE_NGRAM_STATE = "ple_ngram_ctx"
+
+
+def _quant_get(hf_config: Any):
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return None
+    return quant.get if isinstance(quant, dict) else (lambda key, default=None: getattr(quant, key, default))
+
+
+def _ignored(patterns, module_name: str) -> bool:
+    return any(fnmatch(module_name, pattern) for pattern in patterns)
 
 
 def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
@@ -140,6 +153,60 @@ def parse_config(hf_config: Any) -> ModelConfig:
         if rope_type in (None, "default")
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
+
+    get = _quant_get(hf_config)
+    if get is None:
+        expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
+    else:
+        detected_expert_quant = detect_expert_quant(hf_config)
+        algo = str(get("quant_algo") or get("quant_method") or "").lower()
+        block = get("weight_block_size")
+        if detected_expert_quant == "nvfp4":
+            expert_quant = "nvfp4"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "fp8" and block:
+            # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
+            # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
+            # GDN, the shared expert, HC, PLE and lm_head stay bf16.
+            bs = tuple(int(x) for x in block)
+            assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
+            expert_quant = "fp8_block"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "mixed_precision":
+            # modelopt MIXED_PRECISION declares quantization per module in
+            # ``quantized_layers`` rather than once at the top level.
+            quantized = get("quantized_layers") or {}
+
+            def _is_nvfp4(spec: Any) -> bool:
+                if isinstance(spec, dict):
+                    return any(_is_nvfp4(value) for value in spec.values())
+                if isinstance(spec, (list, tuple)):
+                    return any(_is_nvfp4(value) for value in spec)
+                return "NVFP4" in str(spec).upper()
+
+            layer_specs = quantized.items() if isinstance(quantized, dict) else enumerate(quantized)
+            experts_nvfp4 = any(
+                (".mlp.experts" in f"{module} {spec}" or "EXPERT" in f"{module} {spec}".upper())
+                and _is_nvfp4(spec)
+                for module, spec in layer_specs
+            )
+            expert_quant = "nvfp4" if experts_nvfp4 else "none"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        else:
+            is_fp4 = "fp4" in algo
+            ignore = list(get("ignore") or [])
+
+            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
+            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
+            # and stay bf16. Derive every flag from that list instead of assuming the split.
+            def _quant(probe: str) -> str:
+                return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
+
+            prefix = "model.language_model.layers.0"
+            expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
+            dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
+            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
+            lm_head_quant = _quant("lm_head")
 
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")

@@ -10,6 +10,7 @@ import torch
 from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
+from freetoken.scheduler.config import _zmq_addr
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -80,13 +81,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return _zmq_addr(3, self._unique_suffix)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = _zmq_addr(4, self._unique_suffix)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -740,6 +741,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-tier",
+        choices=["off", "on"],
+        default=ServerArgs.moe_disk_tier,
+        help="Keep only a prefix of native NVFP4 experts in host RAM and fetch tail rows from safetensors.",
+    )
+
+    parser.add_argument(
+        "--expert-ram-experts",
+        type=int,
+        default=ServerArgs.expert_ram_experts,
+        help="Number of experts per layer retained in host RAM when --moe-disk-tier on.",
+    )
+
+    parser.add_argument(
+        "--disk-fetch-workers",
+        type=_positive_int,
+        default=ServerArgs.disk_fetch_workers,
+        help="Worker count reserved for disk-tier row reads.",
+    )
+
+    parser.add_argument(
         "--moe-cpu-layers",
         type=str,
         default=ServerArgs.moe_cpu_layers,
@@ -908,6 +930,16 @@ def parse_args(
             model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
+
+    if kwargs["moe_disk_tier"] == "on":
+        if kwargs["moe_strategy"] != "offload":
+            parser.error("--moe-disk-tier on requires --moe-strategy offload")
+        if kwargs["expert_ram_experts"] < 1:
+            parser.error("--expert-ram-experts must be >= 1 when --moe-disk-tier is on")
+        if kwargs["moe_prefill_overlap"]:
+            parser.error("--moe-disk-tier on requires --disable-moe-prefill-overlap")
+        if kwargs["cuda_graph_max_bs"] is None or kwargs["cuda_graph_max_bs"] > 0:
+            parser.error("--moe-disk-tier on requires --cuda-graph-max-bs 0")
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /
     # hybrid configs (e.g. Qwen3.5-MoE) keep it under ``text_config`` and use the newer

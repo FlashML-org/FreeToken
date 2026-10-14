@@ -82,6 +82,40 @@ def _pack_nvfp4(codes: torch.Tensor) -> torch.Tensor:
     return (lo | (hi << 4)).contiguous().to(torch.uint8)
 
 
+def test_gguf_nvfp4_pack_matches_ggml_byte_layout():
+    """GGUF NVFP4 packing must preserve the raw byte stream's adjacent low/high pairs."""
+    from freetoken.models.gguf.nvfp4 import nvfp4_parts
+
+    rows = 2
+    raw = torch.tensor([
+        [0x00, 0x11, 0x22, 0x33, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xBA, 0xDC, 0xFE, 0x10,
+         0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F,
+         0x00, 0x00, 0x00, 0x00],
+        [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+         0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+         0x00, 0x00, 0x00, 0x00],
+    ], dtype=torch.uint8)
+
+    class FakeTensor:
+        def __init__(self, packed):
+            self._packed = packed
+            self.rows = packed.shape[0]
+
+        def packed(self):
+            return self._packed
+
+    packed, scales = nvfp4_parts(FakeTensor(raw))
+    assert packed.shape == (rows, 32)
+    assert scales.shape == (rows, 4)
+
+    # GGML stores each 16-code group as eight low nibbles followed by eight high
+    # nibbles; the helper must interleave those halves before repacking.
+    grouped = raw[:, 4:].reshape(rows, -1, 4, 8)
+    ref_codes = torch.cat((grouped & 0x0F, grouped >> 4), dim=-1).reshape(rows, -1, 16)
+    ref_packed = (ref_codes[..., 0::2] | (ref_codes[..., 1::2] << 4)).reshape(rows, -1)
+    assert torch.equal(packed, ref_packed)
+
+
 def _make_nvfp4_cache(L, E, H, I, seed=0):
     """Random but valid NVFP4 banks (native ModelOpt schema) for the cpu backend."""
     torch.manual_seed(seed)

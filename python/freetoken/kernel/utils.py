@@ -35,6 +35,37 @@ def _is_rocm() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+def _patch_tvm_ffi_windows_nvcc_flags() -> None:
+    """Keep TVM-FFI's MSVC flags as one NVCC compiler argument on Windows."""
+    if os.name != "nt":
+        return
+    import tvm_ffi.cpp.extension as extension
+
+    if getattr(extension, "_freetoken_windows_flags_patched", False):
+        return
+    original = extension._generate_ninja_build
+
+    def generate(*args, **kwargs):
+        ninja = original(*args, **kwargs)
+        ninja = ninja.replace(
+            "-Xcompiler /std:c++17 /O2",
+            "-Xcompiler=/std:c++20,/O2",
+        )
+        lines = []
+        for line in ninja.splitlines():
+            if "flags = " in line and " -I" in line:
+                head, includes = line.split(" -I", 1)
+                quoted = []
+                for path in includes.split(" -I"):
+                    quoted.append(f'-I"{path}"')
+                line = head + " " + " ".join(quoted)
+            lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    extension._generate_ninja_build = generate
+    extension._freetoken_windows_flags_patched = True
+
+
 def _cuda_arch_list() -> List[str]:
     """Archs a CUDA build targets: the AOT build's TVM_FFI_CUDA_ARCH_LIST, else the GPU this process is bound to."""
     arch_list = os.getenv(CUDA_ARCH_LIST_ENV, "").split()
@@ -81,6 +112,8 @@ def _pin_tvm_ffi_arch_ctx(arch_list: List[str], env_var: str) -> Iterator[None]:
 def _cuda_cflags(extra: List[str], arch_list: List[str]) -> List[str]:
     """CUDA nvcc flags for a kernel build. tvm-ffi emits one SASS cubin per arch in ``arch_list`` and no PTX, so add the PTX of the highest arch: a GPU newer than every listed arch still runs through the driver's PTX JIT. This flag also carries the arch into tvm-ffi's build hash, which skips tvm-ffi's own -gencode, so GPUs of different archs never share a cached .so."""
     flags = DEFAULT_CUDA_CFLAGS + extra
+    if os.name == "nt":
+        flags.append("-allow-unsupported-compiler")
     if arch_list:
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")
@@ -259,8 +292,11 @@ def _load_prebuilt(name: str) -> Module | None:
             )
         return None
 
-    so_path = cache_dir / name / f"{name}.so"
-    if so_path.exists():
+    suffixes = (".dll", ".so") if os.name == "nt" else (".so", ".dll")
+    for suffix in suffixes:
+        so_path = cache_dir / name / f"{name}{suffix}"
+        if not so_path.exists():
+            continue
         import tvm_ffi
 
         return tvm_ffi.load_module(str(so_path))
@@ -268,7 +304,7 @@ def _load_prebuilt(name: str) -> Module | None:
     if _env_enabled(DISABLE_JIT_ENV):
         raise RuntimeError(
             "JIT compilation is disabled by FREETOKEN_DISABLE_JIT, "
-            f"but prebuilt kernel {name!r} was not found at {so_path}"
+            f"but prebuilt kernel {name!r} was not found at {cache_dir / name}"
         )
     return None
 
@@ -317,6 +353,7 @@ def load_aot(
 
     from tvm_ffi.cpp import load
 
+    _patch_tvm_ffi_windows_nvcc_flags()
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
     extra_cflags = extra_cflags or []
@@ -379,6 +416,7 @@ def load_jit(
 
     from tvm_ffi.cpp import load_inline
 
+    _patch_tvm_ffi_windows_nvcc_flags()
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
     cpp_wrappers = cpp_wrappers or []

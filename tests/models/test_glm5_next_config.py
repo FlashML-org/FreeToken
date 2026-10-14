@@ -310,6 +310,25 @@ def test_compressed_tensors_mixed_precision_reads_the_expert_group():
     assert cfg.expert_quant == "compressed-tensors"
 
 
+def test_gemma4_float_quantized_experts_are_detected():
+    """Gemma 4's published compressed-tensors export uses an FP8 group targeting
+    ``Gemma4TextExperts`` at the top level; the detector must classify routed experts
+    as the compressed-tensors path instead of falling back to ``none``."""
+    quant = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear", "Gemma4TextExperts"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel"},
+                "input_activations": {"dynamic": True},
+            }
+        },
+    }
+    cfg = parse_config(_hf_config(quant))
+    assert cfg.expert_quant == "compressed-tensors"
+
+
 def test_expert_source_spec_selection():
     """quant_method picks the bank source spec: compressed-tensors maps
     weight_packed/weight_global_scale onto the canonical kinds with a reciprocal

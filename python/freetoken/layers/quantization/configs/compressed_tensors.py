@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from ..names import Matcher, ct_set
+from ..names import Matcher, ct_set, is_routed_expert
 from ..registry import register_dialect
 from ..scheme import QuantKind, QuantScheme
 from ..scheme import fp8_block_scheme, fp8_tensor_scheme, nvfp4_scheme
@@ -43,6 +43,11 @@ class CompressedTensorsConfig(QuantConfig):
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         if self.ignore(name):
+            return None
+        # Routed experts (e.g. Gemma4TextExperts) load through the legacy expert_banks path
+        # (_compressed_tensors_banks -> _load_ct_fp8_expert_banks), not through quant_method.
+        # Return None so they're built as unquantized; loading happens at expert_banks level.
+        if is_routed_expert(name):
             return None
         for targets, scheme in self.groups:
             if targets(name):

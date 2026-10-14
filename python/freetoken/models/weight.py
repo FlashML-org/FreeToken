@@ -280,10 +280,21 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_q8_0_moe_expert_sources(
+    model_path: str, model_config, *, dummy: bool = False, layer_sink=None
+) -> dict:
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        raise NotImplementedError("dummy Q8_0 GGUF expert banks are not implemented")
+    loader = _load_attr(spec.module, "load_q8_0_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
 __all__ = [
     "load_weight",
     "load_vision_weight",
     "ftw_lacks_vision",
     "load_q4_0_moe_expert_sources",
+    "load_q8_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

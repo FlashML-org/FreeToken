@@ -116,7 +116,7 @@ setup(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args=extra_compile + ["-pthread"],
+            extra_compile_args=extra_compile + ["-pthread"] + (["/DNOMINMAX"] if sys.platform == "win32" else []),
             extra_link_args=runtime_link_args,
         ),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies

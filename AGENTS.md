@@ -8,7 +8,7 @@ AI-assisted code is welcome. Submitting code the contributor does not understand
 
 Agents must not:
 
-- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
+- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` against the upstream `FlashML-org/FreeToken` repository. These actions may be performed against the user's configured fork only when the user explicitly requests them.
 - Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
 - Report tests or benchmarks as run when they were not.
 

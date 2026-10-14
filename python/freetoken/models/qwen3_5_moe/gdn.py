@@ -29,7 +29,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-        conv_kernel_size, rms_norm_eps, layer_id, *, quant_config: QuantConfig | None = None,
+        conv_kernel_size, rms_norm_eps, layer_id, *, force_split_in_proj: bool = False,
+        quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         self.layer_id = layer_id
@@ -49,9 +50,19 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
-        self._split_in_proj = (
-            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
-        )
+        self._split_in_proj = force_split_in_proj
+        if quant_config is not None:
+            def has_scheme(name: str) -> bool:
+                return (
+                    quant_config.scheme_for(name) is not None
+                    or quant_config.scheme_for_name(name) is not None
+                )
+
+            self._split_in_proj = (
+                has_scheme(f"{prefix}.in_proj_qkvz")
+                or has_scheme(f"{prefix}.in_proj_qkv")
+                or has_scheme(f"{prefix}.in_proj_z")
+            )
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split_in_proj:

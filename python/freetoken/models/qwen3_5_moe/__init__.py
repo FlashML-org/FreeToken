@@ -1,4 +1,4 @@
-from .config import parse_config
+from .config import parse_config, parse_gguf_config
 from .model import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
@@ -13,6 +13,7 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "parse_config",
+    "parse_gguf_config",
     "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",

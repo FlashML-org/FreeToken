@@ -14,18 +14,19 @@ from __future__ import annotations
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-from freetoken.models.gguf.dequant import GGML_Q4_0
+from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q4_K
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
 
-def fused_experts_gguf_q4_0(
+def fused_experts_gguf(
     hidden_states: torch.Tensor,
     gate_up_q: torch.Tensor,  # [num_slots, 2I, H//32*18] uint8
     down_q: torch.Tensor,  # [num_slots, H, I//32*18] uint8
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str,
+    quant_type: int,
 ) -> torch.Tensor:
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
@@ -37,7 +38,7 @@ def fused_experts_gguf_q4_0(
     n2 = gate_up_q.shape[1]  # 2 * intermediate
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
-    qt = int(GGML_Q4_0)
+    qt = int(quant_type)
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
@@ -50,4 +51,50 @@ def fused_experts_gguf_q4_0(
     return out.sum(dim=1)
 
 
-__all__ = ["fused_experts_gguf_q4_0"]
+def fused_experts_gguf_q4_0(
+    hidden_states: torch.Tensor,
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    return fused_experts_gguf(
+        hidden_states,
+        gate_up_q,
+        down_q,
+        topk_weights,
+        topk_ids,
+        activation,
+        GGML_Q4_0,
+    )
+
+
+def fused_experts_gguf_q8_0(
+    hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation
+):
+    return fused_experts_gguf(
+        hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation, GGML_Q8_0
+    )
+
+
+def fused_experts_gguf_q4_k(
+    hidden_states: torch.Tensor,
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    return fused_experts_gguf(
+        hidden_states,
+        gate_up_q,
+        down_q,
+        topk_weights,
+        topk_ids,
+        activation,
+        GGML_Q4_K,
+    )
+
+
+__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0", "fused_experts_gguf_q8_0", "fused_experts_gguf_q4_k"]

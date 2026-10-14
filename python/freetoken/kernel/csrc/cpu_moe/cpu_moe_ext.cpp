@@ -10,10 +10,10 @@
 // sync() blocks the host-func thread until the pool drains. The heavy GEMV runs
 // on the persistent worker threads, not the host-func thread.
 //
-// Weight formats: bf16, NVFP4, MXFP4, ds_fp4, Q4_0 and block-FP8 expert banks (see WFmt and
-// the per-format bank schemas). Compute is FP32-accumulate; the intermediate is
-// stored bf16 to match the GPU decode path. ISA is chosen once at construction
-// (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
+// Weight formats: bf16, NVFP4, MXFP4, ds_fp4, Q4_0, Q8_0 and block-FP8 expert
+// banks (see WFmt and the per-format bank schemas). Compute is FP32-accumulate;
+// the intermediate is stored bf16 to match the GPU decode path. ISA is chosen
+// once at construction (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
 #include <algorithm>
 #include <atomic>
@@ -1241,6 +1241,25 @@ constexpr int HBLK = 32;
 // scales the block sum by wd*xd in fp32. No fp weight dequant / shuffle chain. The GPU
 // offload path (ggml_moe_a8_vec / MMVQ) is also W4A8, so cpu and hybrid stay close.
 using q4dot_fn = float (*)(const uint8_t*, const int8_t*, const float*, int);
+using q8dot_fn = float (*)(const uint8_t*, const bf16_t*, int);
+
+// Native GGUF Q8_0 experts: per-32 block = fp16 scale d + 32 signed int8 values,
+// with w = d * q. The CPU path keeps activations in bf16 and accumulates in fp32.
+float q8_0_dot_bf16_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  float acc = 0.0f;
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 34;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
+    float block = 0.0f;
+    for (int j = 0; j < 32; ++j)
+      block += static_cast<float>(q[j]) * bf16_to_f32(x[(size_t)b * 32 + j]);
+    acc += fp16_to_f32(dh) * block;
+  }
+  return acc;
+}
 
 float q4_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
   float acc = 0.0f;
@@ -1342,8 +1361,15 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4,
-             WF_FP8_BLOCK = 5 };
+enum WFmt {
+  WF_BF16 = 0,
+  WF_NVFP4 = 1,
+  WF_MXFP4 = 2,
+  WF_DSFP4 = 3,
+  WF_Q4_0 = 4,
+  WF_Q8_0 = 5,
+  WF_FP8_BLOCK = 6,
+};
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1383,6 +1409,8 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  q8dot_fn q8dot;
+  bool use_q8 = false;          // q8_0: W8A16 with bf16 activations
   fp8_block_dot_fn fp8_block_dot;
   // fp8_block: bf16 scale per 128x128 weight block. These are the scale tensor's
   // trailing strides, including any padding used by the host bank layout.
@@ -1392,12 +1420,12 @@ struct CpuMoeExecutor {
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
   // PATH (~0.3ms/layer at H=4096, every worker and the GPU waiting on it); moving
   // it to a captured GPU elementwise kernel removes it while keeping the official
-  // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
   // ds_fp4 activation round-trip block (the checkpoint's fp8 block); set via set_act_block.
   int act_block = 128;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
+  int q8_gu_row_bytes = 0, q8_dn_row_bytes = 0;
   float e2m1_lut[16];
   float e4m3_lut[256];
   float e8m0_lut[256];         // mxfp4 block scale: 2^(s-127), s clamped to [0,254]
@@ -1521,12 +1549,19 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    q8dot = q8_0_dot_bf16_scalar;
     fp8_block_dot = select_fp8_block_dot();
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+    }
+    if (weight_format == WF_Q8_0) {
+      if (H % 32 != 0 || I % 32 != 0)
+        throw std::runtime_error("Q8_0 CPU MoE requires H and I to be multiples of 32");
+      q8_gu_row_bytes = (H / 32) * 34;  // K = H (gate_up rows)
+      q8_dn_row_bytes = (I / 32) * 34;  // K = I (down rows)
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
@@ -1535,10 +1570,12 @@ struct CpuMoeExecutor {
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
+    use_q8 = (weight_format == WF_Q8_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
+    const char* q8tag = use_q8 ? "+q8_0-w8a16" : "";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
-    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag + q8tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
@@ -1634,6 +1671,11 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
+    if (fmt == WF_Q8_0) {
+      const uint8_t* w =
+          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q8_gu_row_bytes;
+      return q8dot(w, x, H);
+    }
     if (fmt == WF_FP8_BLOCK) {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)H;
       const bf16_t* sc = reinterpret_cast<const bf16_t*>(gu_scale_l) +
@@ -1662,6 +1704,10 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_Q8_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q8_dn_row_bytes;
+      return q8dot(w, g, I);
     }
     if (fmt == WF_FP8_BLOCK) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)I;

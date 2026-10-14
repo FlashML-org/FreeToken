@@ -1,4 +1,5 @@
 from .dequant import GGML_NAME, dequantize
+from .nvfp4 import nvfp4_parts
 from .reader import (
     FTW_METADATA_GGUF,
     GgufTensor,
@@ -14,6 +15,7 @@ from .reader import (
 __all__ = [
     "GGML_NAME",
     "dequantize",
+    "nvfp4_parts",
     "FTW_METADATA_GGUF",
     "GgufTensor",
     "gguf_architecture",

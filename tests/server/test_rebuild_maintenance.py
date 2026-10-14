@@ -107,6 +107,15 @@ def test_timeout_stays_rebuilding_then_late_reply_resolves():
     assert state.last_rebuild["num_pages"] == 1024
 
 
+def test_stale_rebuild_gate_recovers_without_pending_future():
+    """A rebuild timeout can leave no in-flight future and no reply. The stale latch must self-
+    recover so the server does not stay wedged forever in maintenance mode."""
+    state = _FakeState(None, maintenance_state="rebuilding")
+    state.rebuild_started_at = time.monotonic() - 31.0
+    assert FrontendManager._clear_stale_rebuild_gate(state) is True
+    assert state.maintenance_state == "serving"
+
+
 def test_resolve_failed_latches_failed():
     state = _FakeState(None, maintenance_state="rebuilding")
     FrontendManager._resolve_rebuild(state, _reply("r1", "failed", error="OOM during recapture"))

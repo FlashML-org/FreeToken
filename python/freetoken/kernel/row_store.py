@@ -11,12 +11,20 @@ the driver rejects memops in capture, the caller falls back to launch-gating (fi
 
 from __future__ import annotations
 
+import sys
+
 import torch
 
-from freetoken.kernel import _row_store
+try:
+    from freetoken.kernel import _row_store
+except ImportError:
+    if sys.platform != "win32":
+        raise
+    from freetoken.kernel import _ple_store as _row_store
+
 from freetoken.kernel.pinned import alloc_pinned_tensor
 
-RowStore = _row_store.RowStore
+RowStore = getattr(_row_store, "RowStore", None)
 PleStore = _row_store.PleStore
 
 

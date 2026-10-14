@@ -46,6 +46,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    "q8_0": ("gate_up", "down"),
+    # native GGUF Q4_K experts use the same two packed bank roles with 144-byte rows.
+    "q4_k": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -91,6 +94,7 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "q8_0": lambda H, I: 2 * I * (H // 32) * 34 + H * (I // 32) * 34,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
@@ -145,6 +149,7 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    disk_ram_experts: int | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -290,6 +295,7 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.disk_tier = None
 
     def set_bank_sources(
         self,
@@ -351,7 +357,9 @@ class OffloadMoeCache:
                     )
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
-                assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
+                expected_rows = self.num_experts if self.disk_ram_experts is None else self.disk_ram_experts
+                if source.size(0) != expected_rows:
+                    raise ValueError((name, layer_id, source.shape))
                 assert source.shape == head.shape and source.dtype == head.dtype, (
                     name, layer_id, source.shape, source.dtype,
                 )
@@ -365,6 +373,19 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    @property
+    def disk_tier_enabled(self) -> bool:
+        return self.disk_tier is not None
+
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+        from freetoken.moe.disk_tier import DiskTier
+
+        if self.disk_ram_experts != ram_experts:
+            raise ValueError("disk-tier source prefix does not match the cache configuration")
+        if ram_experts >= self.num_experts:
+            raise ValueError("disk tier requires fewer RAM experts than the model has")
+        self.disk_tier = DiskTier(index, self, ram_experts, workers)
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -1015,6 +1036,27 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.disk_tier is not None:
+            if self._pending_whole_layer:
+                for expert in range(self.num_experts):
+                    if expert < self.disk_tier.ram_experts:
+                        for sources, cache in self.banks:
+                            cache[expert].copy_(sources[layer_id][expert])
+                    else:
+                        self.disk_tier.fetch(layer_id, expert, expert)
+                return
+            count = int(self.num_indices.item())
+            slots = self.evict_slots[:count].cpu().tolist()
+            experts = self.src_indices[:count].cpu().tolist()
+            for slot, expert in zip(slots, experts):
+                expert = int(expert)
+                slot = int(slot)
+                if expert < self.disk_tier.ram_experts:
+                    for sources, cache in self.banks:
+                        cache[slot].copy_(sources[layer_id][expert])
+                else:
+                    self.disk_tier.fetch(layer_id, expert, slot)
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

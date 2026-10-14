@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Iterator
 
 import torch
+from freetoken.layers import BaseOP
 
 from freetoken.models.config import (
     FullAttentionGroupConfig,
@@ -22,7 +23,7 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
-from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
+from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q6_K, dequantize, row_bytes
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -93,6 +94,38 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         scaling=None,
     )
 
+    hf_nvfp4 = shim.is_hf_nvfp4
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    embedding_bf16 = any(
+        t.name in {"model.language_model.embed_tokens.weight", "token_embd.weight"}
+        and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
+    embedding_type = next(
+        (
+            t.ggml_type
+            for t in iter_gguf_tensors(shim.model_path)
+            if t.name in {"model.language_model.embed_tokens.weight", "token_embd.weight"}
+        ),
+        None,
+    )
+    router_bf16 = any(
+        (
+            t.name.endswith(".router.proj.weight")
+            or t.name.endswith(".ffn_gate_inp.weight")
+        )
+        and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
+    dense_bf16 = any(
+        (
+            t.name.endswith(".self_attn.q_proj.weight")
+            or t.name.endswith(".attn_q.weight")
+        )
+        and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -112,8 +145,13 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         model_type="gemma4",
         architectures=list(shim.architectures),
         moe_enabled=True,
-        expert_quant="q4_0",
-        moe_weight_format="q4_0",
+        expert_quant="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
+        moe_weight_format="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
+        gguf_embedding_bf16=embedding_bf16,
+        gguf_embedding_type=embedding_type,
+        gguf_model_path=shim.model_path,
+        gguf_router_bf16=router_bf16,
+        gguf_dense_bf16=dense_bf16,
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -184,6 +222,24 @@ def _require_tp1(what: str) -> None:
         )
 
 
+def _gguf_expert_quant(model_path: str) -> str:
+    """Return the native GGML format used by the routed expert tensors."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    expert_types = {
+        t.ggml_type
+        for t in iter_gguf_tensors(model_path)
+        if "exps.weight" in t.name
+    }
+    if not expert_types:
+        return "q4_0"
+    if expert_types == {GGML_Q8_0}:
+        return "q8_0"
+    if expert_types == {GGML_Q4_0}:
+        return "q4_0"
+    raise ValueError(f"unsupported mixed GGUF expert quantization types: {sorted(expert_types)}")
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -200,8 +256,21 @@ def iter_gguf_weights(
     same ``row_bytes``). Routed experts are served from the offload cache, so they are
     skipped here (asserts the offload contract like the other MoE models).
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.gguf.reader import GGML_NVFP4, iter_gguf_tensors, load_gguf_metadata
     from freetoken.utils import cached_load_hf_config
+
+    from freetoken.models.gguf.reader import gguf_tensor_names
+
+    tensor_names = gguf_tensor_names(model_path)
+    if (
+        "model.language_model.embed_tokens.weight" in tensor_names
+        or (
+            "token_embd.weight" in tensor_names
+            and any(t.ggml_type == GGML_NVFP4 for t in iter_gguf_tensors(model_path))
+        )
+    ):
+        yield from _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe)
+        return
 
     assert not include_moe_experts, (
         "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
@@ -298,6 +367,159 @@ def iter_gguf_weights(
     assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
 
 
+from freetoken.models.gguf.nvfp4 import nvfp4_parts
+
+_nvfp4_parts = nvfp4_parts
+
+
+def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe):
+    from freetoken.models.gguf.reader import GGML_NVFP4, iter_gguf_tensors, load_gguf_metadata
+
+    tensors = list(iter_gguf_tensors(model_path))
+    by_name = {t.name: t for t in tensors}
+    merge: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+    metadata = load_gguf_metadata(model_path)
+    swa_pattern = [bool(x) for x in metadata["gemma4.attention.sliding_window_pattern"]]
+
+    def rename(name: str) -> str:
+        if name == "token_embd.weight":
+            return "model.embed_tokens.weight"
+        if name == "output_norm.weight":
+            return "model.norm.weight"
+        if name.startswith("blk."):
+            _, layer, suffix = name.split(".", 2)
+            layer_prefix = f"model.layers.{layer}"
+            legacy_map = {
+                "attn_q.weight": "self_attn.q_proj.weight",
+                "attn_k.weight": "self_attn.k_proj.weight",
+                "attn_v.weight": "self_attn.v_proj.weight",
+                "attn_output.weight": "self_attn.o_proj.weight",
+                "ffn_gate.weight": "feed_forward.shared_mlp.gate_proj.weight",
+                "ffn_up.weight": "feed_forward.shared_mlp.up_proj.weight",
+                "ffn_down.weight": "feed_forward.shared_mlp.down_proj.weight",
+                "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
+            }
+            if suffix in legacy_map:
+                return f"{layer_prefix}.{legacy_map[suffix]}"
+            if suffix in _LAYER_SCALAR_MAP:
+                return f"{layer_prefix}.{_LAYER_SCALAR_MAP[suffix]}"
+            if suffix.endswith("_exps.weight"):
+                return f"{layer_prefix}.feed_forward.experts.{suffix}"
+            return f"{layer_prefix}.{suffix}"
+        name = name.removeprefix("model.language_model.")
+        name = "model." + name
+        marker = ".layers."
+        if marker not in name:
+            return name
+        layer_prefix, layer_key = name.split(marker, 1)
+        layer_id, _, layer_key = layer_key.partition(".")
+        prefix = f"{layer_prefix}{marker}{layer_id}"
+        if layer_key.startswith("mlp."):
+            return f"{prefix}.feed_forward.shared_mlp.{layer_key[4:]}"
+        if layer_key.startswith((
+            "experts.", "router.", "layer_scalar",
+            "post_feedforward_layernorm.", "post_feedforward_layernorm_1.",
+            "post_feedforward_layernorm_2.", "pre_feedforward_layernorm_2.",
+        )):
+            return f"{prefix}.feed_forward.{layer_key}"
+        return name
+
+    def emit(name: str, packed: torch.Tensor, scales: torch.Tensor):
+        global_name = name.removesuffix(".weight") + ".weight_scale"
+        if global_name in by_name:
+            global_scale = _to_bf16(by_name[global_name]).reshape(-1)
+        else:
+            global_scale = torch.ones(packed.shape[0], dtype=torch.float16)
+        # FreeToken's E4M3 decoder uses the full-scale representation, so the
+        # standard E2M1 LUT and GGML's doubled-code convention already cancel out.
+        return packed.to(device), scales.to(device), global_scale.to(device)
+
+    def state(name: str, values):
+        packed, scales, global_scale = values
+        yield name, packed
+        yield name.removesuffix(".weight") + ".weight_scale", scales
+        yield name.removesuffix(".weight") + ".weight_global", global_scale
+
+    for t in tensors:
+        name = t.name
+        if not (
+            name.startswith("model.language_model.")
+            or name.startswith("blk.")
+            or name in {"token_embd.weight", "output_norm.weight"}
+        ):
+            continue
+        if name.endswith(".weight_scale") or name.endswith(".weight_scale_2"):
+            continue
+        if t.ggml_type != GGML_NVFP4:
+            if include_non_moe and ".experts." not in name:
+                key = rename(name)
+                tensor = _to_bf16(t).to(device)
+                scale_name = name.removesuffix(".weight") + ".weight_scale"
+                if name.endswith(".weight") and scale_name in by_name:
+                    scale = _to_bf16(by_name[scale_name]).to(device=device, dtype=tensor.dtype)
+                    tensor = tensor * scale.reshape(-1, 1)
+                if key.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight")):
+                    slot = key.rsplit(".", 2)[-2][0]
+                    fused = key.rsplit(".", 2)[0] + ".qkv_proj.weight"
+                    merge.setdefault(fused, {})[slot] = (tensor, None, None)
+                    if all(x in merge[fused] for x in "qkv"):
+                        parts = merge.pop(fused)
+                        yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                elif key.endswith((".gate_proj.weight", ".up_proj.weight")):
+                    slot = "gate" if key.endswith(".gate_proj.weight") else "up"
+                    fused = key.rsplit(".", 2)[0] + ".gate_up_proj.weight"
+                    merge.setdefault(fused, {})[slot] = (tensor, None, None)
+                    if all(x in merge[fused] for x in ("gate", "up")):
+                        parts = merge.pop(fused)
+                        yield fused, torch.cat([parts[x][0] for x in ("gate", "up")])
+                else:
+                    yield key, tensor
+            continue
+        if not name.endswith(".weight"):
+            continue
+        packed, scales = _nvfp4_parts(t)
+        key = rename(name)
+        if ".experts." in key:
+            if include_moe_experts:
+                yield from state(key, emit(name, packed, scales))
+            continue
+        if not include_non_moe:
+            continue
+        if key.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight")):
+            slot = key.rsplit(".", 2)[-2][0]
+            fused = key.rsplit(".", 2)[0] + ".qkv_proj.weight"
+            merge.setdefault(fused, {})[slot] = emit(name, packed, scales)
+            if all(slot in merge[fused] for slot in "qkv"):
+                parts = merge.pop(fused)
+                if parts["q"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in "qkv"]), torch.cat([parts[x][1] for x in "qkv"]), torch.cat([parts[x][2] for x in "qkv"])))
+        elif key.endswith((".gate_proj.weight", ".up_proj.weight")):
+            slot = "gate" if key.endswith(".gate_proj.weight") else "up"
+            fused = key.rsplit(".", 2)[0] + ".gate_up_proj.weight"
+            merge.setdefault(fused, {})[slot] = emit(name, packed, scales)
+            if all(slot in merge[fused] for slot in ("gate", "up")):
+                parts = merge.pop(fused)
+                if parts["gate"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in ("gate", "up")])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in ("gate", "up")]), torch.cat([parts[x][1] for x in ("gate", "up")]), torch.cat([parts[x][2] for x in ("gate", "up")])))
+        elif key.endswith(".down_proj.weight") or key.endswith(".weight"):
+            yield from state(key, emit(name, packed, scales))
+    for fused, parts in list(merge.items()):
+        if fused.endswith(".self_attn.qkv_proj.weight"):
+            layer = int(fused.split(".layers.", 1)[1].split(".", 1)[0])
+            if not swa_pattern[layer] and set(parts) == {"q", "k"}:
+                parts["v"] = parts["k"]
+                del merge[fused]
+                if parts["q"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in "qkv"]), torch.cat([parts[x][1] for x in "qkv"]), torch.cat([parts[x][2] for x in "qkv"])))
+    assert not merge, f"incomplete HF mixed groups: {sorted(merge)}"
+
+
 # --------------------------------------------------------------------------------------
 # Model layer swap: dense bf16 Linear/Embedding -> native GGUF-quant ops.
 # --------------------------------------------------------------------------------------
@@ -305,7 +527,7 @@ def iter_gguf_weights(
 
 def is_gguf_model(config: ModelConfig) -> bool:
     """True when the model was parsed from a GGUF checkpoint (native-quant path)."""
-    return getattr(config, "moe_weight_format", None) == "q4_0"
+    return getattr(config, "moe_weight_format", None) in ("q4_0", "q8_0", "nvfp4")
 
 
 class GGUFTiedLMHead:
@@ -337,17 +559,113 @@ class GGUFTiedLMHead:
         return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
 
 
+class Nvfp4Embedding(BaseOP):
+    def __init__(self, num_embeddings: int, embedding_dim: int, embed_scale: float | None = None):
+        self.weight = torch.empty(num_embeddings, embedding_dim // 2, dtype=torch.uint8)
+        self.weight_scale = torch.empty(num_embeddings, embedding_dim // 16, dtype=torch.float8_e4m3fn)
+        self.weight_global = torch.empty(num_embeddings, dtype=torch.float16)
+        self.embed_scale = embed_scale
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        self.weight = state_dict.pop(f"{prefix}.weight")
+        self.weight_scale = state_dict.pop(f"{prefix}.weight_scale")
+        self.weight_global = state_dict.pop(f"{prefix}.weight_global")
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+
+        flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
+        # Dequantize only the vocabulary rows used by this batch. Passing the full
+        # [vocab, hidden] table as one expert-like bank makes the dequantizer allocate
+        # [tokens, vocab, hidden], which can be hundreds of GiB during warmup.
+        packed = self.weight.index_select(0, flat_ids).unsqueeze(1).contiguous()
+        scales = self.weight_scale.index_select(0, flat_ids).unsqueeze(1).contiguous()
+        globals_ = self.weight_global.index_select(0, flat_ids).unsqueeze(1).contiguous()
+        rows = dequant_nvfp4(
+            packed, scales, globals_, torch.arange(flat_ids.numel(), device=flat_ids.device),
+            dtype=torch.bfloat16,
+        ).squeeze(1)
+        if self.embed_scale is not None:
+            rows = rows * self.embed_scale
+        return rows.reshape(*input_ids.shape, -1)
+
+
+class Nvfp4TiedLMHead(BaseOP):
+    def __init__(self, embedding):
+        self._embedding = embedding
+
+    def state_dict(self, *, prefix: str = "", result=None):
+        return result if result is not None else {}
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        state_dict.pop(f"{prefix}.weight", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+        from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            x = x[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
+        return nvfp4_dense_linear(
+            x, self._embedding.weight, self._embedding.weight_scale,
+            self._embedding.weight_global,
+        )
+
+
 def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     """In place: replace gemma4's dense projections + embedding with native GGUF ops.
 
     Quantized in the checkpoint -> swapped: attention qkv/o, shared-MLP gate_up/down
-    (all Q4_0) and the token embedding (Q6_K, also the tied LM head). Left as dense
+    (all Q4_0) and the token embedding (native GGUF type, also the tied LM head). Left as dense
     bf16 (F32 in the GGUF): the router gate, all RMSNorms, the per-layer scalars, and
     the routed experts (served from the offload cache).
     """
+    if config.moe_weight_format == "nvfp4":
+        from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
+
+        inner = model.model
+        if config.gguf_embedding_bf16:
+            from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
+
+            embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, config.embedding_scale
+            )
+            inner.embed_tokens = embed
+            model.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                tie_word_embeddings=True,
+                tied_embedding=embed,
+            )
+        else:
+            embed = Nvfp4Embedding(config.vocab_size, config.hidden_size, config.embedding_scale)
+            inner.embed_tokens = embed
+            model.lm_head = Nvfp4TiedLMHead(embed)
+        if not config.gguf_dense_bf16:
+            for layer in inner.layers.op_list:
+                layer.self_attn.qkv_proj = Nvfp4DenseColMerged(
+                    config.hidden_size,
+                    [layer.self_attn.q_dim, layer.self_attn.kv_dim, layer.self_attn.kv_dim],
+                )
+                layer.self_attn.o_proj = Nvfp4DenseLinear(
+                    layer.self_attn.q_dim, config.hidden_size
+                )
+        return
+
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
 
-    def swap_linear(owner, attr, quant_type=GGML_Q4_0):
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    tensor_types = {t.name: t.ggml_type for t in iter_gguf_tensors(config.gguf_model_path)}
+
+    def tensor_type(name: str) -> int:
+        try:
+            return tensor_types[name]
+        except KeyError as exc:
+            raise ValueError(f"GGUF tensor type is missing for {name}") from exc
+
+    def swap_linear(owner, attr, quant_type):
         lin = getattr(owner, attr)
         out_features, in_features = lin.weight.shape
         setattr(
@@ -357,39 +675,52 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         )
 
     inner = model.model
+    embedding_type = config.gguf_embedding_type
+    if embedding_type is None:
+        raise ValueError("GGUF embedding quantization type is missing from the model config")
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
+        quant_type=embedding_type,
         embed_scale=config.embedding_scale,
     )
     inner.embed_tokens = embed
 
-    for layer in inner.layers.op_list:
-        swap_linear(layer.self_attn, "qkv_proj")
-        swap_linear(layer.self_attn, "o_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "gate_up_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "down_proj")
+    for layer_id, layer in enumerate(inner.layers.op_list):
+        prefix = f"blk.{layer_id}."
+        swap_linear(layer.self_attn, "qkv_proj", tensor_type(prefix + "attn_q.weight"))
+        swap_linear(layer.self_attn, "o_proj", tensor_type(prefix + "attn_output.weight"))
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "gate_up_proj",
+            tensor_type(prefix + "ffn_gate.weight"),
+        )
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "down_proj",
+            tensor_type(prefix + "ffn_down.weight"),
+        )
 
     if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, embedding_type)
 
 
 # --------------------------------------------------------------------------------------
 # Routed-expert host banks (native Q4_0) for the offload cache.
 # --------------------------------------------------------------------------------------
 
-def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def _q4_0_expert_specs(config: ModelConfig, gate_up_type=GGML_Q4_0, down_type=GGML_Q4_0) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     return {
-        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
+        "gate_up": ((E, 2 * I, row_bytes(H, gate_up_type)), torch.uint8),
+        "down": ((E, H, row_bytes(I, down_type)), torch.uint8),
     }
 
 
 def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
+    model_path: str, config: ModelConfig, *, layer_sink=None, quant_type=GGML_Q4_0,
+    down_quant_type=None
 ) -> dict[str, list[torch.Tensor]]:
     """Per-layer host banks of the routed experts' native Q4_0 block bytes.
 
@@ -407,27 +738,48 @@ def load_q4_0_expert_sources(
     valid until then (the caller owns that tradeoff).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline
 
     _require_tp1("expert banks")
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
-    h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
+    down_quant_type = quant_type if down_quant_type is None else down_quant_type
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    gate_up_names = [
+        f"blk.{layer}.ffn_gate_up_exps.weight"
+        if f"blk.{layer}.ffn_gate_up_exps.weight" in tensors
+        else f"blk.{layer}.ffn_gate_exps.weight"
+        for layer in range(L)
+    ]
+    hb = {
+        "gate_up": [HostBank((E, 2 * I, tensors[name].row_bytes), torch.uint8) for name in gate_up_names],
+        "down": [HostBank((E, H, tensors[f"blk.{layer}.ffn_down_exps.weight"].row_bytes), torch.uint8) for layer in range(L)],
+    }
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
+    pending_gu: dict[int, dict[str, torch.Tensor]] = {}
 
     def _load(sink) -> None:
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
-        for t in iter_gguf_tensors(model_path):
+        for t in tensors.values():
             if not t.name.startswith("blk."):
                 continue
             layer = int(t.name.split(".")[1])
             if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, h_bytes))
+                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, t.row_bytes))
                 seen_gu.add(layer)
+            elif t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
+                slot = "gate" if t.name.endswith("ffn_gate_exps.weight") else "up"
+                parts = pending_gu.setdefault(layer, {})
+                parts[slot] = t.packed().reshape(E, I, t.row_bytes)
+                if len(parts) == 2:
+                    banks["gate_up"][layer].copy_(torch.cat([parts["gate"], parts["up"]], dim=1))
+                    seen_gu.add(layer)
+                    del pending_gu[layer]
             elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
+                banks["down"][layer].copy_(t.packed().reshape(E, H, t.row_bytes))
                 seen_dn.add(layer)
             else:
                 continue
@@ -447,6 +799,68 @@ def load_q4_0_expert_sources(
         f"missing Q4_0 expert layers: gate_up {sorted(want - seen_gu)}, "
         f"down {sorted(want - seen_dn)}"
     )
+    return banks
+
+
+def load_q8_0_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    return load_q4_0_expert_sources(
+        model_path, config, layer_sink=layer_sink, quant_type=GGML_Q8_0
+    )
+
+
+def load_nvfp4_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Convert HF-style GGML NVFP4 expert blocks into native NVFP4 host banks."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+    E, H, I, L = config.num_experts, config.hidden_size, config.moe_intermediate_size, config.num_layers
+    hb = alloc_layer_banks(
+        {
+            "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
+            "gate_up_scale": ((E, 2 * I, H // 16), torch.float8_e4m3fn),
+            "gate_up_global": ((E, 2 * I), torch.float16),
+            "down_packed": ((E, H, I // 2), torch.uint8),
+            "down_scale": ((E, H, I // 16), torch.float8_e4m3fn),
+            "down_global": ((E, H), torch.float16),
+        },
+        L,
+    )
+    banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
+    tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    legacy = "blk.0.ffn_gate_up_exps.weight" in tensors
+    for layer in range(L):
+        if legacy:
+            gate_up, gate_up_scales = _nvfp4_parts(tensors[f"blk.{layer}.ffn_gate_up_exps.weight"])
+            down, down_scales = _nvfp4_parts(tensors[f"blk.{layer}.ffn_down_exps.weight"])
+            gate_up_global = torch.ones(2 * I, dtype=torch.float16)
+            down_global = torch.ones(H, dtype=torch.float16)
+            banks["gate_up_packed"][layer].copy_(gate_up.reshape(E, 2 * I, H // 2))
+            banks["gate_up_scale"][layer].copy_(gate_up_scales.reshape(E, 2 * I, H // 16))
+            banks["gate_up_global"][layer].copy_(gate_up_global.expand(E, -1))
+            banks["down_packed"][layer].copy_(down.reshape(E, H, I // 2))
+            banks["down_scale"][layer].copy_(down_scales.reshape(E, H, I // 16))
+            banks["down_global"][layer].copy_(down_global.expand(E, -1))
+            continue
+        for expert in range(E):
+            parts = {}
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                prefix = f"model.language_model.layers.{layer}.experts.{expert}.{projection}"
+                packed, scales = _nvfp4_parts(tensors[prefix + ".weight"])
+                global_scale = _to_bf16(tensors[prefix + ".weight_scale"]).reshape(-1)
+                parts[projection] = (packed, scales, global_scale)
+            gate, up, down = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
+            banks["gate_up_packed"][layer][expert].copy_(torch.cat((gate[0], up[0])))
+            banks["gate_up_scale"][layer][expert].copy_(torch.cat((gate[1], up[1])))
+            banks["gate_up_global"][layer][expert].copy_(torch.cat((gate[2], up[2])))
+            banks["down_packed"][layer][expert].copy_(down[0])
+            banks["down_scale"][layer][expert].copy_(down[1])
+            banks["down_global"][layer][expert].copy_(down[2])
+    if layer_sink is None and torch.cuda.is_available():
+        pin_banks(hb)
     return banks
 
 
@@ -470,5 +884,7 @@ __all__ = [
     "convert_gemma4_to_gguf",
     "is_gguf_model",
     "load_q4_0_expert_sources",
+    "load_q8_0_expert_sources",
+    "load_nvfp4_expert_sources",
     "dummy_q4_0_expert_sources",
 ]

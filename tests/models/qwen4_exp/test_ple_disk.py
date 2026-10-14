@@ -220,6 +220,20 @@ def test_layouts_readers_and_errors(tmp_path):
     with pytest.raises(ValueError, match="dtype"):
         source_from_safetensors(str(tmp_path))
     save_file(
+        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.bfloat16),
+         f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
+        str(tmp_path / "model.safetensors"),
+    )
+    source = source_from_safetensors(str(tmp_path))
+    assert source.dtype == "BF16"
+    assert source.row_bytes == 8
+    save_file(
+        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.bfloat16)},
+        str(tmp_path / "model.safetensors"),
+    )
+    source = source_from_safetensors(str(tmp_path))
+    assert source.scale == 1.0
+    save_file(
         {f"{_KEY_PREFIX}.shard_1.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
          f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
         str(tmp_path / "model.safetensors"),

@@ -13,6 +13,7 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 from __future__ import annotations
 
 import functools
+import glob
 import os
 import pathlib
 import shutil
@@ -34,6 +35,14 @@ def _host_compiler() -> str | None:
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override
+    if os.name == "nt":
+        candidates = glob.glob(
+            r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        ) + glob.glob(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        )
+        if candidates:
+            return sorted(candidates)[-1]
     for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
         if shutil.which(cxx):
             return cxx
@@ -47,11 +56,42 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
+def _short_windows_path(path: pathlib.Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    import ctypes
+
+    get_short = ctypes.windll.kernel32.GetShortPathNameW
+    buf = ctypes.create_unicode_buffer(32768)
+    length = get_short(str(path), buf, len(buf))
+    return buf.value if length else str(path)
+
+
+def _force_windows_msvc_toolchain(cxx_path: str) -> None:
+    if os.name != "nt" or not cxx_path.lower().endswith("cl.exe"):
+        return
+    cl = pathlib.Path(cxx_path)
+    vc_tools = cl.parents[3]  # ...\VC\Tools\MSVC\14.x.x\
+    vc_root = cl.parents[6]  # ...\VC\
+    host_bin = cl.parent      # ...\Hostx64\x64
+    lib_dir = vc_tools / "lib" / "x64"
+    include_dir = vc_tools / "include"
+    os.environ["PATH"] = str(host_bin) + os.pathsep + os.environ.get("PATH", "")
+    os.environ["LIB"] = str(lib_dir) + os.pathsep + os.environ.get("LIB", "")
+    os.environ["INCLUDE"] = str(include_dir) + os.pathsep + os.environ.get("INCLUDE", "")
+    os.environ["VCToolsInstallDir"] = str(vc_tools) + os.pathsep
+    os.environ["VCINSTALLDIR"] = str(vc_root) + os.pathsep
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    extra_cuda_cflags = [
+        "-std=c++20", "-Xcompiler", "/std:c++20", "-allow-unsupported-compiler",
+        "-O3", "--expt-relaxed-constexpr",
+    ]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
@@ -59,6 +99,10 @@ def _module():
         # default (CXX unset -> g++) can be a gcc too new for the torch headers.
         cxx_path = shutil.which(host_cxx) or host_cxx
         extra_cuda_cflags += ["-ccbin", cxx_path]
+        if os.name == "nt" and cxx_path.lower().endswith("cl.exe"):
+            _force_windows_msvc_toolchain(cxx_path)
+            msvc_include = _short_windows_path(pathlib.Path(cxx_path).parents[3] / "include")
+            extra_cuda_cflags += [f"-Xcompiler=/I{msvc_include}"]
         os.environ["CXX"] = cxx_path
         os.environ["CC"] = _c_compiler_for(cxx_path)
 
