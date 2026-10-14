@@ -189,6 +189,10 @@ class OffloadMoELayer(MoELayer):
         )
         self.offload_cache: OffloadMoeCache | None = None
 
+    @property
+    def skips_inactive_slots(self) -> bool:
+        return self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -289,7 +293,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -317,7 +321,8 @@ class OffloadMoELayer(MoELayer):
         assert executor is not None, "CPU MoE executor was not initialized"
         # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
-        clamp = not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots)
+        # with several quants this holds only because the cache zeroes staged slot 0 rows (zero_inactive_route_slots)
+        clamp = not self.skips_inactive_slots
         gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
@@ -333,7 +338,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -370,16 +375,18 @@ class OffloadMoELayer(MoELayer):
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.stage_views(self.layer_id, 0),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        cache.release_prefill_layer(self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

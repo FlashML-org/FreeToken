@@ -523,3 +523,55 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_moe_slot_pool_split(tmp_path):
+    import json
+
+    from freetoken.moe.pool_policy import group_layers, load_profile, make_pools, split_slots
+
+    pools = make_pools(group_layers("per-layer", [0] * 4, [1] * 4), num_experts=16, min_num_slots=8, slot_limit=None)
+    assert split_slots(41, pools) == [11, 10, 10, 10]
+    with pytest.raises(ValueError, match="need"):
+        split_slots(31, pools)
+    with pytest.raises(ValueError, match="hold"):
+        split_slots(65, pools)
+    # one pool takes the whole cache, as before pools existed
+    assert split_slots(100, make_pools(group_layers("unified", [0] * 4, [1] * 4), 16, 8, None)) == [100]
+    # unified pools one bank layout each, widest slots first
+    assert group_layers("unified", ["a", "b", "a", "b"], [1, 3, 1, 3]) == [[1, 3], [0, 2]]
+
+    # layer 0 uses two experts, layer 1 has a hot half and a cold half, layers 2 and 3 use all 16 evenly
+    counts = [[5] * 2 + [0] * 14, [3] * 8 + [1] * 8, [1] * 16, [1] * 16]
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({"model": "toy", "expert_counts": counts}))
+    assert split_slots(48, pools, load_profile(path, 4, 16)) == [8, 8, 16, 16]
+    with pytest.raises(ValueError, match="needs"):
+        load_profile(path, 4, 32)
+
+
+
+def test_moe_pool_flags_and_decode_batch_clamp():
+    from unittest.mock import patch
+
+    from freetoken.engine.engine import _clamp_decode_batch_to_pools
+    from freetoken.server.args import parse_args
+
+    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+        args, _ = parse_args([
+            "--model", "/models/anon", "--moe-cache-mem", "1.5GiB",
+            "--moe-cache-scope", "per-layer", "--moe-cache-split", "profile:/p.json",
+        ])
+        assert (args.moe_cache_mem, args.moe_cache_scope, args.moe_cache_split) == (3 << 29, "per-layer", "profile:/p.json")
+        for bad in (["--moe-cache-mem", "12"], ["--moe-cache-mem", "1GiB", "--moe-cache-size", "512"]):
+            with pytest.raises(SystemExit):
+                parse_args(["--model", "/models/anon", *bad])
+
+    # GPU decode needs batch * top_k distinct experts to fit the smallest pool below num_experts
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4],
+    )
+    _clamp_decode_batch_to_pools(config, [12, 16, 9])
+    assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (2, 2, [1, 2])

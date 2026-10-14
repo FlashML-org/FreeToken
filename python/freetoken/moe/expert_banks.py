@@ -48,6 +48,8 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # per-layer quant tag (e.g. the gate_up and down GGUF types), for layers whose banks match in dtype and row shape but not in quant; None = one quant
+    layer_tags: list | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:

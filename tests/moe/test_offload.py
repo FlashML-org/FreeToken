@@ -209,7 +209,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     assert fused_calls[0]["w2_ptr"] == fused_calls[2]["w2_ptr"]
     assert fused_calls[0]["w1_ptr"] != fused_calls[1]["w1_ptr"]
     assert fused_calls[0]["w2_ptr"] != fused_calls[1]["w2_ptr"]
-    prefill_gate_up_buffer, prefill_down_buffer = cache.prefill_bank_buffers
+    prefill_gate_up_buffer, prefill_down_buffer = cache.stage_views(0, 0)
     assert prefill_gate_up_buffer.data_ptr() == cache.bank_caches["gate_up"].data_ptr()
     assert prefill_down_buffer.data_ptr() == cache.bank_caches["down"].data_ptr()
 
@@ -639,6 +639,136 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
     assert torch.all(cache.id_of_slot == -1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, top_k = 4, 8, 4
+    # layers 1 and 3 keep wider down rows (uint8, like Q6_K next to Q4_K); their pools come first
+    wide = (1, 3)
+    sources = {
+        "gate_up": [torch.randn(E, 1024, 256, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+        "down": [
+            torch.randint(0, 255, (E, 512, 768), dtype=torch.uint8).pin_memory() if layer in wide
+            else torch.randn(E, 512, 256, dtype=torch.bfloat16).pin_memory()
+            for layer in range(L)
+        ],
+    }
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=33, device=torch.device("cuda"),
+        prefill_overlap=True, prefill_hit_d2d=True, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
+    )
+    cache.set_bank_sources(sources)
+    assert [v[1].dtype for v in map(cache.pool_bank_views, range(L))] == [torch.bfloat16, torch.uint8] * 2
+    # staging buffers take 2 x 8 rows of every bank: all of the wide pools, the first 8 slots of layer 0's pool
+    assert cache._pool_stable_from == [6, 5, 8, 0]
+
+    def check_resident() -> None:
+        torch.cuda.synchronize()
+        for layer in range(L):
+            for e, s in enumerate(cache.slot_for_id[layer].tolist()):
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                        assert torch.equal(view[s].cpu(), src[layer][e]), (layer, e, s)
+
+    def decode(steps: int) -> None:
+        for _ in range(steps):
+            for layer in range(L):
+                cache.ensure_experts(layer, torch.randperm(E)[:top_k].to(torch.int32).view(1, top_k).cuda())
+                cache.copy_missing()
+        check_resident()
+
+    decode(20)
+    cache.zero_inactive_route_slots = True
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        views = cache.wait_prefill_layer(layer)
+        torch.cuda.synchronize()
+        for (src, _), view in zip(cache.banks, views):
+            assert torch.equal(view.cpu(), src[layer])
+        cache.release_prefill_layer(layer)
+    assert cache.prefill_hit_rows > 0
+    for p, stable in enumerate(cache._pool_stable_from):
+        if stable:
+            assert not any(view[0].any() for view in cache.pool_bank_views(cache.pool_of_layer.index(p)))
+    check_resident()
+    decode(20)
+
+    cache.materialize_layer(3)
+    cache.copy_missing()
+    for (src, _), view in zip(cache.banks, cache.stage_views(3, 0)):
+        assert torch.equal(view.cpu(), src[3])
+    check_resident()
+
+    cache.rebuild(32, [5, 5, 10, 12])
+    decode(20)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_slot_pools_split_layers_of_one_bank_layout_by_quant_tag():
+    from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
+    from freetoken.moe.pool_policy import group_layers
+
+    _init_tp()
+    L, E = 4, 8
+    # uint8 rows of one width, as GGUF Q4_K and IQ4_NL rows are
+    sources = {
+        "gate_up": [torch.randint(1, 255, (E, 64, 144), dtype=torch.uint8).pin_memory() for _ in range(L)],
+        "down": [torch.randint(1, 255, (E, 32, 144), dtype=torch.uint8).pin_memory() for _ in range(L)],
+    }
+    tags = [("ggml", "Q4_K", "Q4_K"), ("ggml", "IQ4_NL", "IQ4_NL")] * 2
+    assert group_layers("unified", bank_layouts(sources, tags), [1] * L) == [[0, 2], [1, 3]]
+
+    def make(pool_of_layer, pool_sizes):
+        return OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=sum(pool_sizes), device=torch.device("cuda"),
+            prefill_overlap=True, pool_of_layer=pool_of_layer, pool_sizes=pool_sizes,
+        )
+
+    with pytest.raises(AssertionError, match="layouts"):
+        make([0] * L, [20]).set_bank_sources(sources, layer_tags=tags)
+    cache = make([0, 1, 0, 1], [10, 10])
+    cache.set_bank_sources(sources, layer_tags=tags)
+    assert cache.bank_caches["down"].shape == (20, 32, 144)
+    # the staging buffers cover pool 0 and slots [0, 6) of pool 1, so both slot 0 rows end up with another quant's bytes
+    cache.zero_inactive_route_slots = True
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        cache.wait_prefill_layer(layer)
+        cache.release_prefill_layer(layer)
+    torch.cuda.synchronize()
+    for layer in (0, 1):
+        for view in cache.pool_bank_views(layer):
+            assert not view[0].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_cache_rebuild_frees_the_old_slots_first():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=32, device=torch.device("cuda"),
+        pool_of_layer=[0, 1], pool_sizes=[16, 16],
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.zeros(4, 1024, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+        "down": [torch.zeros(4, 512, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+    })
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    cache.rebuild(32, [8, 24])
+    # 96 MiB of slots: holding the old ones while allocating the new ones would double it
+    assert torch.cuda.max_memory_allocated() - before < 8 << 20
+
+
 def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -654,7 +784,7 @@ def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
 
     assert cache.cache_size == 5
     assert cache.prefill_overlap is False
-    assert cache.prefill_bank_buffers == []
+    assert cache._stage_views[0][1] is None  # no room for the second staging buffer
 
 
 def test_offload_cache_rebuild_keeps_overlap_at_boundary():
@@ -688,6 +818,58 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     bf16 = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
     with pytest.raises(ValueError, match="num_experts"):
         bf16.validate_rebuild(3)  # below the num_experts floor
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("target", ["gpu", "hybrid"])
+def test_slot_pools_keep_each_layer_in_its_own_slots(target):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, sizes = 3, 16, [5, 7, 20]
+    # hybrid routes more experts than the smallest pool holds; GPU decode must fit them
+    top_k = 2 if target == "gpu" else 8
+    sources = {
+        "gate_up": [torch.randn(E, 64, 32, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+        "down": [torch.randn(E, 32, 32, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+    }
+
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=sum(sizes), device=torch.device("cuda"),
+        decode_target=target, hybrid_max_fetch=E, pool_of_layer=[0, 1, 2], pool_sizes=sizes,
+    )
+    cache.set_bank_sources(sources)
+    for _ in range(50):
+        for layer in range(L):
+            experts = torch.randperm(E)[:top_k].to(torch.int32)
+            slots = experts.cuda()
+            if target == "gpu":
+                cache.ensure_experts(layer, slots)
+            else:
+                cache.ensure_experts_hybrid(layer, slots, torch.rand(top_k, device="cuda"))
+            cache.copy_missing()
+            resident = [(e, s) for e, s in zip(experts.tolist(), slots.tolist()) if s >= 0]
+            assert len({s for _, s in resident}) == len(resident)
+            for e, s in resident:
+                assert s < sizes[layer]
+                for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                    assert torch.equal(view[s].cpu(), src[layer][e])
+
+    # with several pools a whole-layer prefill stages slots [0, E) without registering them in any pool
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    for (src, _), view in zip(cache.banks, cache.stage_views(1, 0)):
+        assert torch.equal(view.cpu(), src[1])
+    slot_for_id, id_of_slot = cache.slot_for_id.cpu(), cache.id_of_slot.cpu()
+    for layer in range(L):
+        for e, s in enumerate(slot_for_id[layer].tolist()):
+            if s >= 0:
+                assert cache.pool_bases[layer] + s >= E
+                assert id_of_slot[cache.pool_bases[layer] + s] == layer * E + e
+
+    cache.rebuild(40, [8, 8, 24])
+    assert [v[0].shape[0] for v in map(cache.pool_bank_views, range(L))] == [8, 8, 24]
 
 
 def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):

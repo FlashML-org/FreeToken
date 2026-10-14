@@ -187,7 +187,7 @@ def test_marlin_prefill_matches_dequant_reference():
     cache.materialize_layer(0)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_layer(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views(E)
+    gu_p, gu_s, dn_p, dn_s = cache.stage_views(0, 0)
     out = marlin_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         topk_weights, topk_ids, "silu", False,
@@ -214,7 +214,7 @@ def test_marlin_decode_matches_dequant_reference_after_prefill_stomp():
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
         g1, g2 = cache.alphas_for_slots(layer_id)
-        gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+        gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(layer_id)
         out = marlin_fused_experts(
             hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
             topk_weights, ids, "silu", False,
@@ -278,7 +278,7 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
     assert int(cache.num_indices.item()) == 2, "stale slot mappings survived the prefetch"
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
     out = marlin_fused_experts(
         dec_hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         dec_weights, ids, "silu", False,
@@ -403,7 +403,7 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
         ref = _ref_moe(ref_sources, layer_id, hidden, topk_weights, ids)
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
-        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.bank_views()
+        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.pool_bank_views(layer_id)
         out = fused_experts_decode_nvfp4_marlin(
             hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g, topk_weights, ids, "silu", False
         )
@@ -433,7 +433,7 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     ids = torch.tensor([[1, 6]], dtype=torch.int32, device=device)
     cache.ensure_experts(0, ids)
     cache.copy_missing()
-    banks = cache.bank_views()
+    banks = cache.pool_bank_views(0)
     marlin = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
     base = fused_experts_decode_nvfp4_serial(hidden, *banks, topk_weights, ids, "silu", False)
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
@@ -461,7 +461,7 @@ def test_b12x_decode_matches_dequant_reference():
     cache.ensure_experts(0, ids)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
     out = b12x_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, topk_weights, ids, "silu", False
     )

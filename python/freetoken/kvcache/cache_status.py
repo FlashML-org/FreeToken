@@ -40,6 +40,9 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
         banks = getattr(engine.moe_offload_cache, "bank_caches", None)
         if not banks:
             return 0
+        if getattr(engine.moe_offload_cache, "_raw_banks", False):
+            # pools of several bank layouts share byte segments: report the mean slot size
+            return int(sum(t.numel() for t in banks.values()) // engine.moe_offload_cache.cache_size)
         # Each bank cache is (cache_size, *row_shape); one slot's bytes = row bytes summed over
         # the format's banks (== cache_budget.expert_bytes_per_slot on the source rows).
         return int(sum(t[0].numel() * t.element_size() for t in banks.values()))

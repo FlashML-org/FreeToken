@@ -413,14 +413,11 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     specs = _offload_bank_specs(fmt, H, I)
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
     total_bytes = 0
+    sources = {}
     for name, (elems, dtype) in specs.items():
-        src = alloc_pinned_tensor(E, elems, dtype=dtype)  # cudaHostAlloc (mapped) like the loaders
-        dst = torch.empty(E, elems, dtype=dtype, device=device)
-        cache.bank_sources[name] = [src]
-        cache.bank_caches[name] = dst
-        cache.banks.append(([src], dst))
+        sources[name] = [alloc_pinned_tensor(E, elems, dtype=dtype)]  # cudaHostAlloc (mapped) like the loaders
         total_bytes += E * elems * dtype.itemsize
-    cache._build_copy_plan()  # enable the fused path (production default) when aligned
+    cache.set_bank_sources(sources)  # builds the fused copy plan (production default) when aligned
 
     cache.evict_slots[:E].copy_(torch.arange(E, dtype=torch.int32, device=device))
     cache.src_indices[:E].copy_(torch.randperm(E, device=device).to(torch.int32))
