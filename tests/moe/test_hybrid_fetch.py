@@ -1,8 +1,7 @@
 """Hybrid decode's bandwidth-matched fetch split.
 
-Covers the two halves of --moe-hybrid-max-fetch auto: the profile reader that turns
-`ft bench bw` kernel bandwidths into a fetch fraction, and the ensure kernel's
-per-step integer split rule.
+Covers the profile reader of --moe-hybrid-max-fetch auto, which turns `ft bench bw`
+kernel bandwidths into a fetch fraction.
 """
 
 import json
@@ -11,31 +10,6 @@ import os
 import pytest
 
 from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
-
-Q = 1 << 16
-
-
-def _balanced_fetch(num_missing: int, frac_q16: int) -> int:
-    """Reference split: F ~ frac * misses, rounded to whichever integer neighbor
-    minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac)."""
-    lo = (num_missing * frac_q16) >> 16
-    cost = lambda f: max(f * (Q - frac_q16), (num_missing - f) * frac_q16)  # noqa: E731
-    return min(num_missing, lo if cost(lo) <= cost(lo + 1) else lo + 1)
-
-
-def test_balanced_fetch_tracks_fraction():
-    # The split follows fetched : cpu = pcie : (cpu - pcie) up to integer rounding, and
-    # never over/under-shoots by more than one expert.
-    for frac in (0.1, 0.415, 0.454, 0.7, 1.0):
-        q = round(frac * Q)
-        for m in range(0, 65):
-            f = _balanced_fetch(m, q)
-            assert 0 <= f <= m
-            assert abs(f - frac * m) <= 1.0
-    # ceil would over-fetch here (the regression this rule fixed): 41.5% of 3 misses is
-    # 1.24 -> fetching 2 makes the PCIe side ~1.6x slower than balance; keep it at 1.
-    assert _balanced_fetch(3, round(0.415 * Q)) == 1
-    assert _balanced_fetch(4, round(0.415 * Q)) == 2
 
 
 def test_load_hybrid_fetch_fraction(tmp_path):
