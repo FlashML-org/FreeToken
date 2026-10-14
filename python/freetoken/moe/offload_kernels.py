@@ -51,8 +51,10 @@ def ensure_experts_hybrid(
     the CPU). ``fetch_fraction`` > 0 replaces the fixed cap with the bandwidth-matched
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
-    together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    together. With recency priority, a zero automatic split may promote one recurring
+    miss into an empty slot so a stable working set can finish warming the cache.
+    ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` = pre-cap
+    miss count (stats)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
@@ -155,11 +157,18 @@ def _ensure_experts_hybrid_cpu(
         missing.sort(key=lambda e: (-rec[e], e))
     else:
         missing.sort()
+    promotion_slot = -1
     if frac_q16 > 0:
         m, q = len(missing), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
+        if _HYBRID_FETCH_BY_RECENCY and max_fetch == 0 and missing and rec[missing[0]] >= 0:
+            promotion_slot = next(
+                (s for s, expert in enumerate(cache.id_of_slot.tolist()) if expert < 0), -1
+            )
+            if promotion_slot >= 0:
+                max_fetch = 1
     num_fetch = min(len(missing), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
@@ -167,7 +176,9 @@ def _ensure_experts_hybrid_cpu(
     usage = cache.usage.tolist()
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        victim = promotion_slot if promotion_slot >= 0 else min(
+            range(cache.cache_size), key=lambda s: (usage[s], s)
+        )
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -354,20 +365,29 @@ def _ensure_experts_hybrid_kernel(
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
     # spans only [0, num_experts), so it can only break exact-recency ties).
+    promotion_slot = tl.full((), -1, tl.int32)
     if BY_RECENCY:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
             is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
+        # A zero split must not leave recurring misses on the CPU while slots sit empty.
+        if (fetch_frac_q16 > 0) & (num_fetch == 0) & (num_missing > 0):
+            recurring = tl.sum((is_missing & (rec >= 0)).to(tl.int32)) > 0
+            if recurring:
+                off_s = tl.arange(0, BLOCK_C)
+                owners = tl.load(id_of_slot_ptr + off_s, mask=off_s < cache_size, other=0)
+                promotion_slot = tl.min(tl.where(owners < 0, off_s, cache_size))
+                num_fetch = (promotion_slot < cache_size).to(tl.int32)
     else:
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
@@ -381,7 +401,7 @@ def _ensure_experts_hybrid_kernel(
             owner_active = owner_active | (oid == base + ei)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
-            victim = tl.argmin(u, axis=0).to(tl.int32)
+            victim = tl.where(promotion_slot >= 0, promotion_slot, tl.argmin(u, axis=0)).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
@@ -404,7 +424,7 @@ def _ensure_experts_hybrid_kernel(
         tl.store(expert_ids_ptr + i, s)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
-    # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
+    # computed on the CPU now ranks high for a later fetch if it recurs.
     if BY_RECENCY:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
