@@ -55,7 +55,7 @@ dependencies = [
     # PyPI's torch 2.14.1 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
     "torch>=2.14,<2.15",
-    "torchvision>=0.29,<0.30",
+    "torchvision>=0.29.0a0,<0.30",
     "tqdm>=4.66,<5",
     "transformers>=5.18,<5.19",
     # CUDA torch 2.14 resolves Triton 3.8; AMD's ROCm 7.14 image supplies its
