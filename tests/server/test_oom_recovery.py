@@ -102,6 +102,30 @@ def test_oom_terminalizes_every_dispatched_stream_once_and_never_replays_it():
             assert terminal[0].finished is True
             assert terminal[0].error_code == "insufficient_workspace"
             assert terminal[0].epoch == state.request_epoch(uid)
+        assert state.stats.active == 0
+        # An OOM terminal finishes an admitted request; it is not a client cancellation.
+        assert state.stats.completed == 2
+
+    asyncio.run(scenario())
+
+
+def test_oom_terminalizes_an_already_aborted_delivery_uid_in_global_accounting():
+    async def scenario() -> None:
+        state = _state()
+        state._loop = asyncio.get_running_loop()
+        uid = await state.new_user()
+        # abort_user removes delivery maps before a scheduler terminal acknowledgement; OOM
+        # must synthesize that terminal acknowledgement for StatsTracker nevertheless.
+        state.ack_map.pop(uid)
+        state.event_map.pop(uid)
+        state.request_epochs.pop(uid)
+        state.stats.on_abort(uid)
+
+        state.fail_dispatched_for_oom("CUDA out of memory")
+        await asyncio.sleep(0)
+
+        assert state.stats.active == 0
+        assert state.stats.completed == 0
 
     asyncio.run(scenario())
 

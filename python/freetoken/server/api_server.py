@@ -384,14 +384,39 @@ class FrontendManager:
         """Terminally fail live requests once; no partial work is replayed into a new epoch."""
         if self._loop is None:
             return
+
         def _fail() -> None:
-            for uid, replies in list(self.ack_map.items()):
-                if any(reply.finished for reply in replies):
-                    continue
-                replies.append(UserReply(uid=uid, incremental_output="", finished=True,
-                    error=message, error_code="insufficient_workspace", epoch=self.request_epochs[uid]))
-                self.event_map[uid].set()
+            self.terminalize_oom_inflight(message)
+
         self._loop.call_soon_threadsafe(_fail)
+
+    def terminalize_oom_inflight(self, message: str) -> None:
+        """Finish every admitted request exactly once on the API event loop.
+
+        ``StatsTracker`` deliberately retains an aborted request until a terminal scheduler
+        acknowledgement arrives.  A CUDA OOM retires that scheduler, so synthesize its terminal
+        acknowledgement for *all* inflight UIDs, including ones whose client has already removed
+        its delivery queue.  Observe before delivery: that is the sole completion/accounting
+        chokepoint and leaves the zero-token OOM reply out of token totals.
+        """
+        for uid in self.stats.inflight_uids:
+            replies = self.ack_map.get(uid)
+            if replies is not None and any(reply.finished for reply in replies):
+                continue
+            reply = UserReply(
+                uid=uid,
+                incremental_output="",
+                finished=True,
+                error=message,
+                error_code="insufficient_workspace",
+                epoch=self.request_epochs.get(uid, self.backend_epoch),
+            )
+            self.stats.observe(reply)
+            if replies is not None:
+                replies.append(reply)
+                event = self.event_map.get(uid)
+                if event is not None:
+                    event.set()
 
     def _create_listener_once(self):
         if not self.initialized:
@@ -1164,12 +1189,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
                 _GLOBAL_STATE._ready_event.clear()
             # Resolve all loop-owned state atomically with the epoch transition, before old
             # workers are retired. No cache rebuild coroutine can re-open this gate afterward.
-            for uid, replies in list(_GLOBAL_STATE.ack_map.items()):
-                if not any(reply.finished for reply in replies):
-                    replies.append(UserReply(uid=uid, incremental_output="", finished=True,
-                        error="worker_restarting_after_cuda_oom: " + message,
-                        error_code="insufficient_workspace", epoch=_GLOBAL_STATE.request_epochs[uid]))
-                    _GLOBAL_STATE.event_map[uid].set()
+            _GLOBAL_STATE.terminalize_oom_inflight(
+                "worker_restarting_after_cuda_oom: " + message
+            )
             for request_id, future in list(_GLOBAL_STATE.rebuild_futures.items()):
                 _GLOBAL_STATE.rebuild_futures.pop(request_id, None)
                 if not future.done():
@@ -1188,14 +1210,19 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
                     future.set_result({"status": "failed", "error": message})
             if _GLOBAL_STATE._ready_event is not None:
                 _GLOBAL_STATE._ready_event.set()
-        _on_loop(_apply)
         logger.error("Backend supervisor: %s", message)
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
-        if not run_shell:
-            _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
+        # Publishing the failure is loop-serialized, but a wedged loop may reject that callback.
+        # The outer daemon must still receive a finite terminal signal; otherwise it could retain
+        # a ``serving`` frontend backed by workers that are already dead.
+        try:
+            _on_loop(_apply)
+        finally:
+            if not run_shell:
+                _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
 
     def _on_meta(meta: dict) -> None:
         # Per-unit cache VRAM costs + the free-VRAM seed + per-pool floors + the actual pool
