@@ -377,6 +377,61 @@ def test_completion_accepts_text_prompt():
     assert response["usage"] == {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
 
 
+def _completion_client(replies: list[UserReply]) -> TestClient:
+    app = FastAPI()
+    register_openai_routes(app, lambda: FakeState(replies), lambda: {})
+    return TestClient(app)
+
+
+def test_raw_completion_non_stream_preserves_terminal_error_code():
+    with _completion_client([
+        UserReply(
+            uid=42, incremental_output="", finished=True,
+            error="worker_restarting_after_cuda_oom", error_code="insufficient_workspace",
+        )
+    ]) as client:
+        response = client.post("/v1/completions", json={"model": "client-model", "prompt": "hi"})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "worker_restarting_after_cuda_oom",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "insufficient_workspace",
+    }
+
+
+def test_raw_completion_stream_keeps_partial_text_then_emits_one_coded_oom_terminal():
+    with _completion_client([
+        UserReply(uid=42, incremental_output="partial", finished=False),
+        UserReply(
+            uid=42, incremental_output="", finished=True,
+            error="worker_restarting_after_cuda_oom", error_code="insufficient_workspace",
+        ),
+    ]) as client:
+        response = client.post(
+            "/v1/completions",
+            json={"model": "client-model", "prompt": "hi", "stream": True},
+        )
+
+    assert response.status_code == 200
+    events = parse_sse([response.content])
+    assert events.count("[DONE]") == 1
+    assert events[-1] == "[DONE]"
+    assert [event["choices"][0]["text"] for event in events if isinstance(event, dict) and event.get("choices")] == ["partial"]
+    error = next(event["error"] for event in events if isinstance(event, dict) and "error" in event)
+    assert error == {
+        "message": "worker_restarting_after_cuda_oom",
+        "type": "invalid_request_error",
+        "code": "insufficient_workspace",
+    }
+    assert not any(
+        choice.get("finish_reason") == "length"
+        for event in events if isinstance(event, dict)
+        for choice in event.get("choices", [])
+    )
+
+
 def test_completion_forwards_length_finish_reason():
     state = FakeState(
         [UserReply(uid=42, incremental_output="hello", finished=True, finish_reason="length")]
