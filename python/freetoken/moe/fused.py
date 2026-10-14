@@ -84,7 +84,18 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    from freetoken.kernel.backend import is_sgl_kernel_installed
+    from freetoken.kernel.backend import is_rocm, is_sgl_kernel_installed
+
+    if is_rocm():
+        import triton
+        from packaging.version import Version
+
+        # Avoid the ROCm Triton 3.8 histogram-mask miscompile until 3.9.
+        # https://github.com/triton-lang/triton/pull/11246
+        if Version(triton.__version__) < Version("3.9"):
+            from freetoken.kernel import moe_align_block_size_triton
+
+            return moe_align_block_size_triton(topk_ids, block_size, num_experts)
 
     if not is_sgl_kernel_installed():
         from freetoken.kernel.triton.moe_align import (
