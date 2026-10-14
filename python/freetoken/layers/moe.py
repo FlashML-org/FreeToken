@@ -318,10 +318,7 @@ class OffloadMoELayer(MoELayer):
         # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
         clamp = not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots)
-        topk_weights = topk_weights.contiguous()
-        cpu_ids, gpu_w = torch.empty_like(topk_ids), torch.empty_like(topk_weights)
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids, split=(topk_weights, cpu_ids, gpu_w, clamp))
-        gpu_slots = topk_ids
+        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the

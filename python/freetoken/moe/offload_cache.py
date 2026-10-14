@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
@@ -27,6 +27,9 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
+
+if TYPE_CHECKING:
+    from freetoken.moe.offload_kernels import HybridRoutes
 
 logger = init_logger(__name__)
 
@@ -854,7 +857,9 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, split=None) -> None:
+    def ensure_experts_hybrid(
+        self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
+    ) -> HybridRoutes:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -864,7 +869,7 @@ class OffloadMoeCache:
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
-        ``split``: see :func:`freetoken.moe.offload_kernels.ensure_experts_hybrid`."""
+        Returns the routes split between GPU and CPU (:class:`freetoken.moe.offload_kernels.HybridRoutes`)."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
@@ -872,8 +877,8 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction, split
+        return ensure_experts_hybrid(
+            self, layer_id, expert_ids, weights, self.hybrid_max_fetch, self.hybrid_fetch_fraction, clamp
         )
 
     def materialize_layer(self, layer_id: int) -> None:
