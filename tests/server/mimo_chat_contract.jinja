@@ -1,0 +1,36 @@
+{# Authored text-only regression contract, not an upstream checkpoint template. #}
+{%- if tools -%}
+{{ '<|im_start|>system\nYou are provided with the following tools:\n\n<tools>' }}
+{%- for definition in tools -%}
+{{ '\n' }}{{ definition | tojson(ensure_ascii=False) }}
+{%- endfor -%}
+{{ '\n</tools><|im_end|>' }}
+{%- endif -%}
+{%- for turn in messages -%}
+{{ '<|im_start|>' }}{{ turn.role }}{{ '\n' }}
+{%- if turn.role == 'assistant' -%}
+{{ '<think>' }}{{ turn.get('reasoning_content') or '' }}{{ '</think>' }}
+{%- endif -%}
+{{ turn.get('content') or '' }}
+{%- for call in turn.get('tool_calls', []) -%}
+{%- set function = call['function'] -%}
+{{ '<tool_call><function=' }}{{ function.name }}{{ '>' }}
+{%- for name, value in function.arguments.items() -%}
+{{ '<parameter=' }}{{ name }}{{ '>' }}
+{%- if value is string -%}
+{{ value }}
+{%- else -%}
+{{ value | tojson(ensure_ascii=False) }}
+{%- endif -%}
+{{ '</parameter>' }}
+{%- endfor -%}
+{{ '</function></tool_call>' }}
+{%- endfor -%}
+{{ '<|im_end|>' }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ '<|im_start|>assistant\n' }}
+{%- if enable_thinking is sameas false -%}
+{{ '<think></think>' }}
+{%- endif -%}
+{%- endif -%}

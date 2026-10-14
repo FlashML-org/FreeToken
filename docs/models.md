@@ -34,14 +34,20 @@ other quantization dialects, quantized dense projections, shared experts, and TP
 are not supported by this family loader.
 
 Validation status: unlike the families above, this port has not been validated end
-to end on real hardware. What was verified: config parsing and weight plumbing
-against synthetic weights, eager vs cached-attention numerics comparisons, and the
-release NVFP4 checkpoint's own provenance files (`config.json`,
-`model.safetensors.index.json`). What was not verified: loading the full release
+to end on real hardware. The repository includes synthetic config/weight tests and
+eager vs cached-attention numerical comparisons; their presence is not evidence
+that they ran on this revision or on checkpoint weights. Supplied external NVFP4
+metadata (`config.json`, `model.safetensors.index.json`) was inspected, not loaded
+as a complete model. Unverified: loading the full release
 checkpoint on a GPU, quantized expert numerics through the offload backend with
 real weights, scheduler reuse, graph replay, and performance. The upstream modeling
 code and design notes this port was derived from are not distributed with the
-repository; code comments cite them only as provenance for ported behavior.
+repository; code comments cite them only as provenance for ported behavior, not
+exact numerical equivalence. In particular, the external `MiMoV2MoEGate` requests
+unsorted expert top-k and this port uses sorted top-k; ordering and full-model
+equivalence are not claimed. The reproducible parser/template contract and its
+separate external corroboration limits are described in
+[`tests/server/mimo_chat_contract.md`](../tests/server/mimo_chat_contract.md).
 
 Checkpoint facts, read directly from the NVFP4 release files (not executed):
 `config.json` declares `architectures: ["MiMoV2ForCausalLM"]`, `model_type: "mimo_v2"`,
@@ -58,7 +64,8 @@ files (`metadata.total_size` 193964338432, about 181 GiB); every routed-expert
 projection ships `weight`, `weight_scale`, and `weight_scale_2` tensors, and the
 index also carries the MTP, vision, audio, and speech-embedding tensors the loader
 drops. The checkpoint's own `conversion_metadata.source_revision` is
-`3b38d063180c3e4aed9691fdc735f3d10b266ee4`.
+`3b38d063180c3e4aed9691fdc735f3d10b266ee4`. This is a metadata claim, not an
+independently authenticated checkpoint, modeling-code, or tokenizer/template revision.
 
 ### Image input
 

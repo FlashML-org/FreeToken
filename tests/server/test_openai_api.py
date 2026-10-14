@@ -783,12 +783,54 @@ def test_mimo_nonstream_and_stream_preserve_text_between_tool_calls():
         check_roundtrip("Before" + first + middle + second + "After", expected)
 
 
-def test_mimo_history_renders_verbatim_arguments_in_reference_template():
-    import os
+def _pinned_mimo_template(path, expected_sha256, *, normalize_newlines=False):
+    import hashlib
     from pathlib import Path
 
     from jinja2 import Environment
 
+    data = Path(path).read_bytes()
+    if normalize_newlines:
+        data = data.replace(b"\r\n", b"\n")
+    assert hashlib.sha256(data).hexdigest() == expected_sha256, f"MiMo template SHA256 mismatch: {path}"
+    environment = Environment()
+    environment.filters["tojson"] = lambda value, ensure_ascii=True: json.dumps(
+        value, ensure_ascii=ensure_ascii
+    )
+    return environment.from_string(data.decode("utf-8"))
+
+
+@pytest.fixture
+def mimo_chat_template():
+    import os
+    from pathlib import Path
+
+    contract = _pinned_mimo_template(
+        Path(__file__).with_name("mimo_chat_contract.jinja"),
+        "5d1656529ef121e333c5a5c65aa1717f8ac7a73ac48c801968fe9c6f354ca9c4",
+        normalize_newlines=True,
+    )
+    reference = os.environ.get("FREETOKEN_MIMO_CHAT_TEMPLATE")
+    if reference is not None:
+        return _pinned_mimo_template(
+            reference, "853650bee57bf95020373e4c928bd5a4b41b9915adf964a77711d2b49a291887"
+        )
+    return contract
+
+
+@pytest.mark.parametrize("missing", [False, True], ids=["alternate-content", "missing-file"])
+def test_mimo_template_pin_rejects_invalid_override(monkeypatch, request, missing):
+    from pathlib import Path
+
+    path = Path(__file__).with_name("missing-mimo-template.jinja" if missing else "mimo_chat_contract.jinja")
+    monkeypatch.setenv("FREETOKEN_MIMO_CHAT_TEMPLATE", str(path))
+    error = FileNotFoundError if missing else AssertionError
+    match = None if missing else "MiMo template SHA256 mismatch"
+    with pytest.raises(error, match=match):
+        request.getfixturevalue("mimo_chat_template")
+
+
+def test_mimo_history_renders_verbatim_arguments_in_pinned_template(mimo_chat_template):
     expected = {
         "leading": "\nline\n\n",
         "empty": "",
@@ -841,21 +883,7 @@ def test_mimo_history_renders_verbatim_arguments_in_reference_template():
         max_tokens=8,
     )
     spec = chat_request_to_genspec(follow_up, {})
-    root = Path(__file__).resolve().parents[2]
-    template_path = Path(
-        os.environ.get(
-            "FREETOKEN_MIMO_CHAT_TEMPLATE",
-            root / "validation" / "real_ckpt_ref" / "chat_template.jinja",
-        )
-    )
-    if not template_path.is_file():
-        pytest.skip("MiMo validation chat template is not available")
-    template = template_path.read_text()
-    environment = Environment()
-    environment.filters["tojson"] = lambda value, ensure_ascii=True: json.dumps(
-        value, ensure_ascii=ensure_ascii
-    )
-    rendered = environment.from_string(template).render(
+    rendered = mimo_chat_template.render(
         messages=spec.messages,
         tools=spec.template_tools,
         add_generation_prompt=True,
@@ -871,98 +899,71 @@ def test_mimo_history_renders_verbatim_arguments_in_reference_template():
     assert expected_envelope in rendered
 
 
-def test_mimo_reference_template_generation_position_matrix():
-    """DR-09: the reference template must leave the generation slot outside the
-    think block in every mode (thinking on/off x tools present/absent, plus the
-    kwargs pass-through default). This is
-    the premise behind the unconditional force_reasoning=False for the mimo_v2
-    reasoning parser in generation.py."""
-    import os
-    from pathlib import Path
+@pytest.mark.parametrize("effort", [None, "high", "none"], ids=["default", "thinking-on", "thinking-off"])
+@pytest.mark.parametrize("with_tools", [False, True], ids=["no-tools", "tools"])
+def test_mimo_pinned_template_generation_position_matrix(mimo_chat_template, effort, with_tools):
+    """DR-09: rendered generation boundaries must agree with the production factory.
 
-    from jinja2 import Environment
-
+    Default coverage uses an authored contract, not authenticated upstream code;
+    the optional external artifact is separately pinned (see mimo_chat_contract.md).
+    """
+    from freetoken.server.generation import _make_reasoning_parser, resolve_thinking_mode
     from freetoken.server.reasoning_parser import THINK_END_TOKEN, THINK_START_TOKEN
 
-    root = Path(__file__).resolve().parents[2]
-    template_path = Path(
-        os.environ.get(
-            "FREETOKEN_MIMO_CHAT_TEMPLATE",
-            root / "validation" / "real_ckpt_ref" / "chat_template.jinja",
-        )
-    )
-    if not template_path.is_file():
-        pytest.skip("MiMo validation chat template is not available")
-    template = template_path.read_text()
-    environment = Environment()
-    environment.filters["tojson"] = lambda value, ensure_ascii=True: json.dumps(
-        value, ensure_ascii=ensure_ascii
-    )
-    jinja_template = environment.from_string(template)
-
-    # The kwargs the server actually sends: the reasoning-effort mapping
-    # broadcasts every toggle spelling; this template reads enable_thinking.
-    on_spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
-    assert on_spec.chat_template_kwargs == {
-        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    request = chat_request(reasoning_effort=effort, tools=tool_schema() if with_tools else None)
+    spec = chat_request_to_genspec(request, {})
+    expected_kwargs = {
+        None: {},
+        "high": {"enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"},
+        "none": {"enable_thinking": False, "thinking_mode": "disabled"},
     }
-    off_spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
-    assert off_spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
-
-    # Genuinely tool-free specs: chat_request defaults to tools=tool_schema(),
-    # so the absence legs must be built with tools=None explicitly.
-    on_no_tools_spec = chat_request_to_genspec(
-        chat_request(reasoning_effort="high", tools=None), {}
+    assert spec.chat_template_kwargs == expected_kwargs[effort]
+    assert bool(spec.template_tools) is with_tools
+    if not with_tools:
+        assert spec.template_tools is None
+    assert resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == (
+        "thinking" if with_tools or effort == "high" else "chat"
     )
-    assert on_no_tools_spec.template_tools is None
-    off_no_tools_spec = chat_request_to_genspec(
-        chat_request(reasoning_effort="none", tools=None), {}
+
+    rendered = mimo_chat_template.render(
+        messages=spec.messages,
+        tools=spec.template_tools,
+        add_generation_prompt=True,
+        **spec.chat_template_kwargs,
     )
-    assert off_no_tools_spec.template_tools is None
-
-    # A client sending neither reasoning_effort nor a thinking key passes no
-    # template kwargs at all (the most common real-world path).
-    default_spec = chat_request_to_genspec(chat_request(), {})
-    assert default_spec.chat_template_kwargs == {}
-
-    # Template-structural literals, quoted from the reference template's own
-    # rendered output (it never reads thinking_mode; only enable_thinking
-    # is false opens the empty block).
     assistant_header = "<|im_start|>assistant\n"
     tools_header = "You are provided with the following tools:\n\n<tools>"
+    assert (tools_header in rendered) is with_tools
+    generation_slot = rendered.rsplit(assistant_header, 1)[1]
+    assert generation_slot == (THINK_START_TOKEN + THINK_END_TOKEN if effort == "none" else "")
 
-    for label, spec, with_tools, thinking_on in (
-        ("thinking-on+tools", on_spec, True, True),
-        ("thinking-on", on_no_tools_spec, False, True),
-        ("thinking-off+tools", off_spec, True, False),
-        ("thinking-off", off_no_tools_spec, False, False),
-        ("kwargs-passthrough", default_spec, True, True),
-    ):
-        rendered = jinja_template.render(
-            messages=spec.messages,
-            tools=spec.template_tools,
-            add_generation_prompt=True,
-            **spec.chat_template_kwargs,
-        )
-        if with_tools:
-            assert tools_header in rendered, label
+    state = FakeState([], tool_call_parser="mimo_v2", reasoning_parser="mimo_v2")
+    parser = _make_reasoning_parser(spec, state)
+    assert parser is not None
+    # Both allowed suffixes are outside reasoning; an implicit opener would fail above.
+    assert parser.detector.force_reasoning is False
+    assert parser.detector._in_reasoning is False
+    assert parser.parse_non_stream("Visible answer") == ("", "Visible answer")
+
+    tool_call = (
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>"
+        if with_tools else ""
+    )
+    reasoning = "Check weather" if effort != "none" else ""
+    continuation = (THINK_START_TOKEN + reasoning + THINK_END_TOKEN if reasoning else "")
+    continuation += tool_call + "Visible answer"
+    for chunk_size in (None, 1, 7):
+        parser = _make_reasoning_parser(spec, state)
+        if chunk_size is None:
+            result = parser.parse_non_stream(continuation)
         else:
-            # Genuinely tool-free render: the absence axis must not silently
-            # degenerate into a duplicate of the tools leg.
-            assert tools_header not in rendered, label
-        markers = 0 if thinking_on else 1
-        assert rendered.count(THINK_START_TOKEN) == markers, label
-        assert rendered.count(THINK_END_TOKEN) == markers, label
-        if thinking_on:
-            # No opener is pre-emitted in any thinking-on mode, with or without
-            # tools: the slot is bare and the model opens the block itself when
-            # it reasons, so the parser must not be forced.
-            expected_suffix = assistant_header
-        else:
-            # Thinking off pre-emits an empty, already-closed think block, so
-            # generation continues after the closer, outside reasoning.
-            expected_suffix = assistant_header + THINK_START_TOKEN + THINK_END_TOKEN
-        assert rendered.endswith(expected_suffix), label
+            deltas = [
+                parser.parse_stream_chunk(continuation[i:i + chunk_size])
+                for i in range(0, len(continuation), chunk_size)
+            ]
+            deltas.append(parser.flush())
+            result = tuple("".join(delta[i] for delta in deltas) for i in (0, 1))
+        assert result == (reasoning, tool_call + "Visible answer")
 
 
 # --------------------------------------------------------------------------- #

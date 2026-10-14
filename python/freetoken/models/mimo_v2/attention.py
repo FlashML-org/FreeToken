@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 # V heads carry the GROUP's v_head_dim (config.v_head_dim / swa_v_head_dim,
-# modeling_mimo_v2.py:240,244,249 — 128 on the release, 64 on the tiny validation ckpt).
+# modeling_mimo_v2.py:240,244,249 - 128 in supplied release metadata, 64 in test fixtures).
 # o_proj input is num_qo_heads * v_head_dim, NOT num_qo_heads * head_dim.
 def pad_value_heads(
     v: torch.Tensor,
@@ -65,11 +65,11 @@ class MiMoV2Attention(BaseOP):
 
     Fused ``qkv_proj`` splits into ``[Q(kv*head_dim) | K | V]`` with V heads 128-dim;
     V is scaled by ``attention_value_scale`` then zero-padded to the group ``head_dim``
-    192 (Option B, an upstream design decision; the contract this port was checked
-    against is not distributed with the repository) so both groups share the 192-wide KV pool, and the
+    192 in the supplied release metadata so both groups share the 192-wide KV pool, and the
     attention output is sliced back to ``[..., :128]`` before ``o_proj``. Partial NeoX
     rope (first 64 of 192) runs with the group's own theta; SWA layers add fp32 softmax
-    ``sinks`` and the 128-token sliding window.
+    ``sinks`` and the 128-token sliding window. These describe the port's layout,
+    not verified equivalence to a complete upstream model.
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):

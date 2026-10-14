@@ -205,8 +205,7 @@ def _validate_config(hf_config: Any) -> None:
 def parse_config(hf_config: Any) -> ModelConfig:
     """Parse a HuggingFace ``MiMoV2Config`` into FreeToken's :class:`ModelConfig`.
 
-    MiMo v2 specifics (per the upstream modeling code this port was derived from; the
-    design contract it was checked against is not distributed with the repository):
+    Supplied release metadata and port choices (not full-model validation):
     - hybrid full/SWA attention split by ``hybrid_layer_pattern`` (0 = full, 9 layers;
       1 = swa, 39 layers with ``sliding_window`` 128); head_dim 192 in both groups, V
       heads 128 in both (the family pads V to 192, Option B, in attention.py).
@@ -216,8 +215,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
       with 256 routed experts, sigmoid + correction-bias (noaux_tc, n_group=1) routing,
       no shared experts and ``routed_scaling_factor`` defaulting to 1.0.
     - ``mtp``/vision/audio towers are dropped (text-only); ``attention_chunk_size`` has
-      no kernel-math consumer (flagged as an open question in the upstream design notes,
-      which are not distributed with the repository) and is ignored.
+      no kernel-math consumer here and is ignored. Its upstream semantics have not
+      been validated by this port.
     """
     _validate_config(hf_config)
     num_layers = hf_config.num_hidden_layers
@@ -225,8 +224,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     swa_head_dim = getattr(hf_config, "swa_head_dim", None) or head_dim
     # Per-group V width (modeling_mimo_v2.py:239-249): the full group reads ``v_head_dim``
     # (default head_dim), the SWA group ``swa_v_head_dim`` (default v_head_dim). The
-    # release ships 128 on both; a checkpoint may ship any width (the tiny validation
-    # ckpt uses 64), and the qkv/o_proj row math follows the config, never a constant.
+    # supplied release metadata declares 128 on both; synthetic fixtures use 64.
+    # The qkv/o_proj row math follows the admitted config, never a constant.
     v_head_dim = getattr(hf_config, "v_head_dim", None) or head_dim
     swa_v_head_dim = getattr(hf_config, "swa_v_head_dim", None) or v_head_dim
     num_kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads)
@@ -297,8 +296,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         n_group=int(getattr(hf_config, "n_group", 1)),
         topk_group=int(getattr(hf_config, "topk_group", 1)),
         has_attn_bias=bool(getattr(hf_config, "attention_bias", False)),
-        # sm_scale = head_dim**-0.5 = 192**-0.5 on BOTH groups (QK dim based; an upstream
-        # design decision, from notes not distributed with the repository)
+        # The port uses the QK-based scale for both attention groups.
         attn_sm_scale=float(head_dim) ** -0.5,
         attention_value_scale=(
             None if getattr(hf_config, "attention_value_scale", None) is None

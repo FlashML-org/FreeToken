@@ -15,13 +15,11 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 class MiMoV2SparseBlock(BaseOP):
     """MiMo v2 sparse MoE block: top-k routed experts only (``n_shared_experts`` is None).
 
-    Routing matches the upstream HF ``MiMoV2TopKRouter`` exactly, per the upstream
-    modeling code this port was derived from (not distributed with the repository):
-    fp32 gate GEMM
-    (``moe_router_dtype`` is ignored by the modeling code), sigmoid scores, add the
-    ``e_score_correction_bias`` for *selection only* (``n_group`` 1 keeps the noaux_tc
-    grouping degenerate), gather the unbiased sigmoid scores, renormalize with +1e-20,
-    then scale by ``routed_scaling_factor`` (1.0).
+    Uses fp32 gate GEMM, sigmoid scores, correction bias for selection only,
+    unbiased contribution scores, optional normalization, and routed scaling.
+    The supplied external ``MiMoV2MoEGate`` is provenance, not an exact-equivalence
+    oracle: it requests unsorted expert top-k whereas this port uses sorted top-k.
+    Synthetic routing tests do not establish full-checkpoint numerical equivalence.
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
@@ -58,7 +56,7 @@ class MiMoV2SparseBlock(BaseOP):
         return scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:
-        # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
+        # Keep logits in fp32 to avoid rounding before sigmoid and expert selection.
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         scores = logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias.float()
