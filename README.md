@@ -47,18 +47,21 @@ The disk-tier prototype currently targets Qwen4Exp/Qwen3.8 native NVFP4 checkpoi
 
 The current Windows CPython 3.12 site-library snapshot is [`freetoken-0.1.3+g52322e984-site-lib.zip`](./freetoken-0.1.3+g52322e984-site-lib.zip) in the repository root. It includes the `freetoken` package, active native extensions, and the compiled `freetoken_gguf_kernels.pyd`; it excludes bytecode caches and disabled shadow modules.
 
-Stop the FreeToken daemon and server before extracting it into the app environment:
+After refreshing the engine wheel or extracting the archive, stop the FreeToken daemon and server before disabling stale extensions. From the repository root, preview the candidates with:
 
 ```powershell
 $sitePackages = Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Lib\site-packages'
-$ftwExtension = Join-Path $sitePackages 'freetoken\checkpoint\ftw.cp312-win_amd64.pyd'
-if (Test-Path $ftwExtension) {
-  Rename-Item -LiteralPath $ftwExtension -NewName 'ftw.cp312-win_amd64.pyd.local-disabled'
-}
 Expand-Archive -LiteralPath .\freetoken-0.1.3+g52322e984-site-lib.zip -DestinationPath $sitePackages -Force
+.\scripts\disable-stale-pyd.ps1 -SitePackages $sitePackages
 ```
 
-Restart the daemon or server after extraction so it imports the updated package.
+Review the preview, then apply it with:
+
+```powershell
+.\scripts\disable-stale-pyd.ps1 -SitePackages $sitePackages -Apply
+```
+
+The helper uses a fixed allowlist of the 17 module paths already disabled in the current app venv; it does not scan for or disable any other `.pyd` files. It verifies that each target still has a same-name `.py` source and renames only matching ABI-tagged extensions to `.pyd.disabled`, without deleting them. Restart the daemon or server after cleanup.
 
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
