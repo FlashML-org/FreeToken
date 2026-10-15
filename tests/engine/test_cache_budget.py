@@ -473,11 +473,11 @@ def test_explicit_cpu_paths_fail_before_bank_and_cache_allocation(monkeypatch, s
     monkeypatch.setattr(engine, "OffloadMoeCache", forbidden)
     monkeypatch.setattr(engine, "_check_pin_budget", forbidden)
     monkeypatch.setattr(engine, "shared_offload_method", lambda _model: None)
-    with pytest.raises(RuntimeError, match="current _cpu_moe shared-IO ABI"):
+    with pytest.raises(RuntimeError, match="shared-IO executor ABI"):
         engine._adjust_config(config)
     # Also cover direct cache initialization callers that bypass config adjustment.
     stub = SimpleNamespace(model=None, _host_tables_bytes=0)
-    with pytest.raises(RuntimeError, match="current _cpu_moe shared-IO ABI"):
+    with pytest.raises(RuntimeError, match="shared-IO executor ABI"):
         engine.Engine._init_offload_moe_cache(stub, config)
 
 
@@ -526,6 +526,186 @@ def test_zero_cpu_layers_does_not_require_native_executor(monkeypatch):
     object.__setattr__(config, "attention_backend", "triton")
     _adjust_config(config)
     assert config.moe_strategy == "offload"
+
+
+def _int02_native(monkeypatch, formats=("bf16", "nvfp4", "mxfp4_triton", "ds_fp4"), max_act=4):
+    """Mocked admission metadata only: this does not validate native execution."""
+    from freetoken import kernel
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("capability validation initialized workers, buffers, or GPU IO")
+
+    native = SimpleNamespace(
+        weight_formats=lambda: list(formats), max_generic_act_id=lambda: max_act,
+        memops_probe=forbidden, host_func_capture_safe=forbidden, kernel_io_probe=forbidden,
+        CpuMoeExecutor=forbidden,
+    )
+    monkeypatch.setattr(kernel, "_cpu_moe", native, raising=False)
+    return native
+
+
+@pytest.mark.parametrize("fmt", ["bf16", "nvfp4", "mxfp4", "mxfp4_triton", "ds_fp4"])
+@pytest.mark.parametrize("activation", ["silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai", "swiglu_clamp"])
+def test_int02_supported_metadata_query_is_pure(monkeypatch, fmt, activation):
+    from freetoken.moe import cpu_executor
+
+    _int02_native(monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("metadata query reached allocation, affinity, thread, or CUDA initialization")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
+    monkeypatch.setattr(cpu_executor, "alloc_pinned_tensor", forbidden)
+    monkeypatch.setattr(cpu_executor, "resolve_threads_and_affinity", forbidden)
+    monkeypatch.setattr(cpu_executor.threading, "Thread", forbidden)
+    assert cpu_executor.validate_cpu_moe_capability(fmt, activation) == (
+        "mxfp4_triton" if fmt == "mxfp4" else fmt
+    )
+
+
+@pytest.mark.parametrize("state,fmt,activation,router,reason", [
+    ("missing", "bf16", "silu", False, "unavailable or predates the shared-IO executor ABI"),
+    ("stale", "unknown", "unknown", True, "shared-IO executor ABI"),
+    ("current", "unknown", "unknown", True, "checkpoint's experts are 'unknown'"),
+    ("current", "bf16", "unknown", True, "unsupported activation 'unknown'"),
+    ("current", "ds_fp4", "silu", True, "ds_fp4 experts apply the router weight on the output only"),
+    ("current", "mxfp4", "silu", True, "mxfp4_triton experts apply the router weight on the output only"),
+    ("old-act", "nvfp4", "swiglu_clamp", False, "predates activation 'swiglu_clamp' (max generic act id 2)"),
+    ("no-act-marker", "bf16", "swigluoai", False, "predates activation 'swigluoai' (max generic act id 2)"),
+])
+def test_int02_early_and_constructor_rejections_match_before_side_effects(monkeypatch, state, fmt, activation, router, reason):
+    from freetoken import kernel
+    from freetoken.engine import engine
+    from freetoken.moe import cpu_executor
+
+    native = _int02_native(monkeypatch, max_act=2 if state == "old-act" else 4)
+    if state == "missing":
+        monkeypatch.setattr(kernel, "_cpu_moe", None)
+    elif state == "stale":
+        native.kernel_io_probe = None
+    elif state == "no-act-marker":
+        del native.max_generic_act_id
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("rejected constructor reached allocation, banks, workers, or CUDA")
+
+    monkeypatch.setattr(cpu_executor.CpuMoeExecutor, "_resolve_banks", forbidden)
+    monkeypatch.setattr(cpu_executor, "alloc_pinned_tensor", forbidden)
+    monkeypatch.setattr(cpu_executor, "resolve_threads_and_affinity", forbidden)
+    monkeypatch.setattr(cpu_executor.threading, "Thread", forbidden)
+    monkeypatch.setattr(torch, "empty", forbidden)
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
+    mc = SimpleNamespace(expert_quant=fmt, hidden_act=activation, apply_router_weight_on_input=router)
+    with pytest.raises((RuntimeError, NotImplementedError)) as early:
+        engine._require_cpu_moe_executor(mc)
+    with pytest.raises(type(early.value)) as constructor:
+        cpu_executor.CpuMoeExecutor(
+            SimpleNamespace(quant_format=fmt), top_k=2, activation=activation,
+            apply_router_weight_on_input=router, num_threads=1, max_tokens=1,
+            device=torch.device("cuda"),
+        )
+    assert reason in str(early.value)
+    assert str(early.value) == str(constructor.value)
+    assert not engine._cpu_moe_executor_viable(mc)
+
+
+def test_int02_mxfp4_kernel_activation_and_distinct_serving_policy(monkeypatch):
+    from freetoken.engine import engine
+    from freetoken.moe.cpu_executor import validate_cpu_moe_capability
+
+    native = _int02_native(monkeypatch, max_act=2)
+    assert validate_cpu_moe_capability("mxfp4", "gpt_oss_swiglu", serving=True) == "mxfp4_triton"
+    assert validate_cpu_moe_capability("mxfp4_triton", "swiglu_clamp") == "mxfp4_triton"
+    native.max_generic_act_id = lambda: 4
+    assert validate_cpu_moe_capability("bf16", "gpt_oss_swiglu") == "bf16"
+    with pytest.raises(NotImplementedError, match="serving requires MXFP4"):
+        engine._require_cpu_moe_executor(SimpleNamespace(hidden_act="gpt_oss_swiglu"))
+
+
+@pytest.mark.parametrize("strategy,layers", [("fused", None), ("offload", None), ("offload", "0"), ("auto", None)])
+def test_int02_gpu_only_does_not_query_native_capability(monkeypatch, strategy, layers):
+    from freetoken.engine import engine
+    from freetoken.moe import bench_profile, cpu_executor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("GPU-only strategy required CPU native capability")
+
+    monkeypatch.setattr(cpu_executor, "validate_cpu_moe_capability", forbidden)
+    monkeypatch.setattr(cpu_executor, "compiled_extension_current", forbidden)
+    monkeypatch.setattr(bench_profile, "load_backend_recommendation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: (None, None))
+    config = _offload_engine_config(moe_strategy=strategy, moe_cpu_layers=layers, moe_cache_size=8)
+    object.__setattr__(config, "attention_backend", "triton")
+    engine._adjust_config(config)
+    assert config.moe_strategy == ("offload" if strategy == "auto" else strategy)
+
+
+@pytest.mark.parametrize("strategy,layers", [("cpu", None), ("hybrid", None), ("offload", "1"), ("auto", "1")])
+@pytest.mark.parametrize("fmt", ["bf16", "nvfp4", "mxfp4", "ds_fp4"])
+def test_int02_explicit_supported_admission(monkeypatch, strategy, layers, fmt):
+    from freetoken.engine import engine
+    from freetoken.moe import bench_profile
+
+    _int02_native(monkeypatch)
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: (None, None))
+    monkeypatch.setattr(bench_profile, "load_backend_recommendation", lambda *args, **kwargs: None)
+    config = _offload_engine_config(moe_strategy=strategy, moe_cpu_layers=layers, moe_cache_size=8)
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.expert_quant = "none" if fmt in ("bf16", "mxfp4") else fmt
+    config.model_config.moe_weight_format = fmt
+    config.model_config.hidden_act = "gpt_oss_swiglu" if fmt == "mxfp4" else "silu"
+    engine._adjust_config(config)
+    assert config.moe_strategy == ("offload" if strategy == "auto" else strategy)
+
+
+@pytest.mark.parametrize("fmt", ["bf16", "nvfp4", "mxfp4", "ds_fp4"])
+@pytest.mark.parametrize("state", ["current", "missing-format", "old-act", "unknown-act"])
+def test_int02_profile_admission_uses_format_specific_capability(tmp_path, monkeypatch, fmt, state):
+    import json
+    from freetoken.engine import engine
+
+    native = _int02_native(monkeypatch, max_act=2 if state == "old-act" else 4)
+    if state == "missing-format":
+        native.weight_formats = lambda: []
+    profile = tmp_path / "benchbw.json"
+    profile_fmt = "mxfp4_triton" if fmt == "mxfp4" else fmt
+    profile.write_text(json.dumps({"version": 5, "gpu": {"name": "FAKE GPU"}, "dtypes": {profile_fmt: "hybrid"}}))
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", str(profile))
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: ("FAKE GPU", None))
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    messages = []
+    monkeypatch.setattr(engine.logger, "info_rank0", messages.append)
+    config = _offload_engine_config()
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.expert_quant = "none" if fmt in ("bf16", "mxfp4") else fmt
+    config.model_config.moe_weight_format = fmt
+    config.model_config.hidden_act = "unknown" if state == "unknown-act" else "swiglu_clamp"
+    engine._adjust_config(config)
+    # The MXFP4 activation is kernel-owned, so an old generic marker is irrelevant.
+    supported = state == "current" or (state == "old-act" and fmt == "mxfp4")
+    assert config.moe_strategy == ("hybrid" if supported else "offload")
+    if state == "missing-format":
+        executor_fmt = "mxfp4_triton" if fmt == "mxfp4" else fmt
+        assert any(f"checkpoint's experts are {executor_fmt!r}" in msg for msg in messages)
+    elif state == "old-act" and not supported:
+        assert any("max generic act id 2" in msg for msg in messages)
+    elif state == "unknown-act":
+        assert any("activation 'unknown'" in msg for msg in messages)
+
+
+def test_int02_activation_precheck_preserves_diagnostic_order(monkeypatch):
+    from freetoken import kernel
+    from freetoken.engine import engine
+
+    monkeypatch.setattr(kernel, "_cpu_moe", None, raising=False)
+    config = _offload_engine_config(moe_strategy="cpu")
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.hidden_act = "unknown"
+    with pytest.raises(ValueError, match="expert activation 'unknown'"):
+        engine._adjust_config(config)
 
 
 def test_page_table_width_covers_whole_trailing_pages():

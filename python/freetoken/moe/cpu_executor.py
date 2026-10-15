@@ -18,6 +18,7 @@ import os
 import threading
 import time
 import weakref
+from collections.abc import Callable
 
 import torch
 
@@ -93,6 +94,54 @@ def compiled_extension_supports(activation: str) -> bool:
     except ImportError:
         return False
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
+
+
+def cpu_moe_activation_supported(activation: str, fmt: str, *, serving: bool = False) -> bool:
+    # Serving reserves the GPT-OSS spelling for MXFP4; standalone executors also
+    # expose its generic epilogue for benchmarks and numerical tests.
+    return activation in _ACT_IDS and not (
+        serving and activation == "gpt_oss_swiglu" and fmt not in ("mxfp4", "mxfp4_triton")
+    )
+
+
+def validate_cpu_moe_capability(
+    fmt: str | Callable[[], str], activation: str, apply_router_weight_on_input: bool = False, *, serving: bool = False,
+) -> str:
+    """Validate metadata only, returning the executor format without allocating or probing GPU IO."""
+    if not compiled_extension_current():
+        raise RuntimeError(
+            "the compiled _cpu_moe extension is unavailable or predates the shared-IO executor ABI; "
+            "rebuild it with `python setup.py build_ext --inplace` (or reinstall "
+            "the matching wheel) before using the cpu/hybrid backend"
+        )
+    from freetoken.kernel import _cpu_moe
+
+    # Defer cache metadata access until the ABI diagnostic has priority.
+    fmt = fmt() if callable(fmt) else fmt
+    fmt = "mxfp4_triton" if fmt == "mxfp4" else fmt
+    formats = _cpu_moe.weight_formats()
+    if fmt not in formats:
+        raise NotImplementedError(
+            f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
+            f"{sorted(formats)} formats, but this checkpoint's experts are "
+            f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
+        )
+    if not cpu_moe_activation_supported(activation, fmt, serving=serving):
+        policy = " (serving requires MXFP4 for gpt_oss_swiglu)" if serving and activation == "gpt_oss_swiglu" else ""
+        raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}{policy}")
+    if apply_router_weight_on_input and fmt in ("mxfp4_triton", "ds_fp4"):
+        raise NotImplementedError(f"CPU MoE backend: {fmt} experts apply the router weight on the output only")
+    # MXFP4 handles its activation inside the kernel and predates this marker.
+    if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+        supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
+        if _ACT_IDS[activation] > supported:
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates activation "
+                f"{activation!r} (max generic act id {supported}); rebuild it "
+                "with `python setup.py build_ext --inplace` (or reinstall the "
+                "wheel) before serving this model on the cpu/hybrid backend."
+            )
+    return fmt
 
 
 def physical_core_cpus() -> list[int]:
@@ -177,39 +226,9 @@ class CpuMoeExecutor:
         fmt: str | None = None,
         act_block: int | None = None,
     ) -> None:
-        if not compiled_extension_current():
-            raise RuntimeError(
-                "the compiled _cpu_moe extension is unavailable or predates the shared-IO executor ABI; "
-                "rebuild it with `python setup.py build_ext --inplace` (or reinstall "
-                "the matching wheel) before using the cpu/hybrid backend"
-            )
+        fmt = validate_cpu_moe_capability(lambda: fmt or cache.quant_format, activation, apply_router_weight_on_input)
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
-
-        fmt = fmt or cache.quant_format
-        if fmt not in _cpu_moe.weight_formats():
-            raise NotImplementedError(
-                f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
-                f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
-                f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
-            )
-        if activation not in _ACT_IDS:
-            raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
-        if apply_router_weight_on_input and fmt in ("mxfp4_triton", "ds_fp4"):
-            raise NotImplementedError(f"CPU MoE backend: {fmt} experts apply the router weight on the output only")
-        # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
-        # error and silently computes the wrong activation in the generic
-        # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
-        # handles its act inside the kernel and predates the marker.)
-        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
-            supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
-            if _ACT_IDS[activation] > supported:
-                raise RuntimeError(
-                    f"the compiled _cpu_moe extension predates activation "
-                    f"{activation!r} (max generic act id {supported}); rebuild it "
-                    "with `python setup.py build_ext --inplace` (or reinstall the "
-                    "wheel) before serving this model on the cpu/hybrid backend."
-                )
 
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)

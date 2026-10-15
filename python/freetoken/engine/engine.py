@@ -1360,43 +1360,26 @@ def _decode_target(config: EngineConfig) -> str:
     return "gpu"
 
 
-# expert activations the CPU MoE executor supports (csrc ActKind)
-_CPU_MOE_ACTS = (
-    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
-)
-
-
 def _cpu_moe_executor_viable(model_config) -> bool:
     """Whether an automatic CPU-decode decision may target the CPU MoE executor.
 
     A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
-    from freetoken.moe.cpu_executor import compiled_extension_current, compiled_extension_supports
-
-    if not compiled_extension_current():
-        return False
     try:
-        from freetoken.kernel import _cpu_moe
-    except ImportError:
+        _require_cpu_moe_executor(model_config)
+    except (RuntimeError, NotImplementedError):
         return False
-    act = getattr(model_config, "hidden_act", "silu")
-    moe_wfmt = getattr(model_config, "moe_weight_format", None)
-    if act not in _CPU_MOE_ACTS and not (moe_wfmt == "mxfp4" and act == "gpt_oss_swiglu"):
-        return False
-    if moe_wfmt != "mxfp4" and not compiled_extension_supports(act):
-        return False
-    expert_quant = getattr(model_config, "expert_quant", "none")
-    fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return ("mxfp4_triton" if fmt == "mxfp4" else fmt) in _cpu_moe.weight_formats()
+    return True
 
 
 def _require_cpu_moe_executor(model_config) -> None:
-    if not _cpu_moe_executor_viable(model_config):
-        raise RuntimeError(
-            "CPU/Hybrid MoE requires a current _cpu_moe shared-IO ABI supporting this "
-            "model's expert format and activation; rebuild the matching extension or "
-            "use --moe-strategy offload without --moe-cpu-layers."
-        )
+    from freetoken.moe.cpu_executor import validate_cpu_moe_capability
+
+    expert_quant = getattr(model_config, "expert_quant", "none")
+    fmt = expert_quant if expert_quant != "none" else (getattr(model_config, "moe_weight_format", None) or "bf16")
+    validate_cpu_moe_capability(
+        fmt, getattr(model_config, "hidden_act", "silu"),
+        getattr(model_config, "apply_router_weight_on_input", False), serving=True,
+    )
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
@@ -1663,9 +1646,13 @@ def _adjust_config(config: EngineConfig):
     # hidden_act (the dense activation) stands proxy for the expert activation --
     # true for every in-tree model. mxfp4 experts pass regardless: their act runs
     # inside the mxfp4 kernel, not the generic epilogue.
-    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _CPU_MOE_ACTS or (
-        getattr(model_config, "moe_weight_format", None) == "mxfp4"
-    )
+    _cpu_moe_act_ok = True
+    if is_moe and (config.moe_strategy in ("cpu", "hybrid", "auto") or config.moe_cpu_layers):
+        from freetoken.moe.cpu_executor import cpu_moe_activation_supported
+
+        _cpu_moe_act_ok = getattr(model_config, "moe_weight_format", None) == "mxfp4" or cpu_moe_activation_supported(
+            getattr(model_config, "hidden_act", "silu"), "generic", serving=True,
+        )
     if (
         is_moe
         and not _cpu_moe_act_ok
@@ -1744,16 +1731,16 @@ def _adjust_config(config: EngineConfig):
                     f"support this model's expert activation "
                     f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
                 )
-            elif not _cpu_moe_executor_viable(model_config):
-                logger.info_rank0(
-                    "benchbw profile recommends hybrid, but the current CPU MoE ABI, "
-                    "expert format, or activation is unavailable; staying on offload"
-                )
             else:
-                default_backend = "hybrid"
-                logger.info_rank0(
-                    f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
-                )
+                try:
+                    _require_cpu_moe_executor(model_config)
+                except (RuntimeError, NotImplementedError) as exc:
+                    logger.info_rank0(f"benchbw profile recommends hybrid, but {exc}; staying on offload")
+                else:
+                    default_backend = "hybrid"
+                    logger.info_rank0(
+                        f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
+                    )
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")
 
