@@ -38,7 +38,8 @@ NO_REASONING_FORMAT = {
 
 # `llama3` is the end of the cascade -- the answer when nothing matched.
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
-NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM"}
+# LFM2.5's `<|tool_call_start|>[f(a=1)]<|tool_call_end|>` grammar has no detector yet.
+NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM", "Lfm2MoeForCausalLM"}
 
 
 class _Config:

@@ -403,6 +403,36 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((8, 128),),
     ),
+    # ---- LFM2/LFM2.5-MoE (short-conv / GQA hybrid) ----
+    AotModel(
+        name="LiquidAI/LFM2-8B-A1B",
+        architecture="Lfm2MoeForCausalLM",
+        hidden_size=2048,
+        kv_groups=((8, 64),),  # the full-attention group; the 18 conv layers hold no paged KV
+        top_k=4,
+        moe_intermediate_size=1792,
+        expert_formats=("bf16",),
+        aliases=("LiquidAI/LFM2.5-8B-A1B",),
+    ),
+    AotModel(
+        name="LiquidAI/LFM2.5-24B-A2B",
+        architecture="Lfm2MoeForCausalLM",
+        hidden_size=2048,
+        kv_groups=((8, 64),),
+        top_k=4,
+        moe_intermediate_size=1536,
+        expert_formats=("bf16",),
+        aliases=("LiquidAI/LFM2-24B-A2B",),
+    ),
+    AotModel(
+        name="LiquidAI/LFM2.5-24B-A2B-FP8",
+        architecture="Lfm2MoeForCausalLM",
+        hidden_size=2048,
+        kv_groups=((8, 64),),
+        top_k=4,
+        moe_intermediate_size=1536,
+        expert_formats=("fp8_block",),
+    ),
 )
 
 

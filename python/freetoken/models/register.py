@@ -326,6 +326,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # LFM2/LFM2.5-MoE (model_type lfm2_moe): depthwise short-conv + GQA hybrid, dense MLP on the
+    # first num_dense_layers, sigmoid-routed experts with a selection-only expert_bias, tied head.
+    # Checkpoint names are the model's own attribute paths, so no packed mapping is needed.
+    "Lfm2MoeForCausalLM": ModelSpec(
+        "freetoken.models.lfm2_moe",
+        "Lfm2MoeForCausalLM",
+        # conv / router are bf16 in every release (the FP8 export's own `ignore` lists them)
+        unquantized_modules=("*.conv.in_proj", "*.conv.out_proj", "*.feed_forward.gate"),
+    ),
 }
 
 
