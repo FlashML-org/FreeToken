@@ -723,6 +723,11 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+        # read before the expert load, so a bad profile fails in seconds
+        expert_counts = resolve_profile(
+            config.moe_cache_split, config.model_path,
+            config.model_config.num_moe_layers, config.model_config.num_experts,
+        )
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -747,13 +752,7 @@ class Engine:
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
                 "layer to decode from the GPU slot cache; they do not combine with --moe-strategy cpu or --moe-cpu-layers"
             )
-        self._moe_expert_counts = (
-            resolve_profile(
-                config.moe_cache_split, config.model_path,
-                config.model_config.num_moe_layers, config.model_config.num_experts,
-            )
-            if len(self._moe_pool_groups) > 1 else None
-        )
+        self._moe_expert_counts = expert_counts if len(self._moe_pool_groups) > 1 else None
         if len(self._moe_pool_groups) == 1 and config.moe_cache_split != "equal":
             logger.warning_rank0(
                 f"--moe-cache-split {config.moe_cache_split} is ignored: all MoE layers share one slot pool "
