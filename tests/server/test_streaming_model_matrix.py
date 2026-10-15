@@ -843,3 +843,134 @@ def test_trailing_text_parity_with_non_stream(family):
 
     assert norm(_content(events)) == norm(full.content)
     assert [c.name for c in _calls(events)] == [c.name for c in full.tool_calls] == ["read"]
+
+
+def _int01_generation(chunks, family, tools, finish_reason, reasoning="mimo_v2"):
+    spec = _spec(tools)
+
+    async def run():
+        events = [event async for event in generate_events(
+            42, spec, FakeState(chunks, family, reasoning, finish_reason)
+        )]
+        full = await generate_full(42, spec, FakeState(chunks, family, reasoning, finish_reason))
+        return events, full
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("count", [15, 16, 17, 257])
+@pytest.mark.parametrize("ending", ["unfinished", "tail"])
+@pytest.mark.parametrize("fragmented", [False, True])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_int01_mimo_factory_generation_eos_drain(count, ending, fragmented, finish_reason):
+    tools = [{"type": "function", "function": {
+        "name": "echo", "parameters": {"properties": {"text": {"type": "string"}}},
+    }}]
+    values = [f"value-{index}" for index in range(count - 1)] + ["x"]
+    blocks = [f"<tool_call><function=echo><parameter=text>{value}</parameter></function></tool_call>"
+              for value in values]
+    if ending == "unfinished":
+        blocks[-1] = "<tool_call><function=echo><parameter=text>x"
+    text = "<think>plan" + "".join(blocks) + ("TAIL" if ending == "tail" else "")
+    chunks = _random_chunks(text, 23) if fragmented else [text]
+    events, full = _int01_generation(chunks + [""], "mimo_v2", tools, finish_reason)
+    _assert_stream_invariants(events, "mimo_v2")
+    expected = [{"text": value} for value in values]
+    for calls in (_calls(events), full.tool_calls):
+        assert len(calls) == count
+        assert [call.name for call in calls] == ["echo"] * count
+        assert [call.tool_index for call in calls] == list(range(count))
+        assert [json.loads(call.parameters) for call in calls] == expected
+    assert _content(events) == full.content == ("TAIL" if ending == "tail" else "")
+    assert _reasoning(events) == full.reasoning == "plan"
+    assert events[-1].finish_reason == full.finish_reason == (
+        "length" if finish_reason == "length" else "tool_calls"
+    )
+    assert events[-1].prompt_tokens == full.prompt_tokens == 1
+    assert events[-1].completion_tokens == full.completion_tokens == len(chunks) + 1
+    if ending == "tail":
+        assert isinstance(events[-2], ContentDelta) and events[-2].text == "TAIL"
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "qwen3_coder"])
+@pytest.mark.parametrize("fragmented", [False, True])
+@pytest.mark.parametrize("closed_parameter", [False, True])
+@pytest.mark.parametrize(("prop", "value", "expected"), [
+    ({"type": "string"}, "x</function></tool_call>", "x</function></tool_call>"),
+    ({"type": "string"}, "x<think>quoted</think>", "x<think>quoted</think>"),
+    ({"type": "string"}, "x</paramet", "x</paramet"),
+    ({"type": "string"}, "x</function", "x</function"),
+    ({"type": "string"}, "x</tool_cal", "x</tool_cal"),
+    ({"type": "string"}, "x" + "\n" * 1024 + "y", "x" + "\n" * 1024 + "y"),
+    ({"type": "integer"}, "42", 42),
+    ({"type": "boolean"}, "tru", "tru"),
+    ({"type": "array"}, "[1,", "[1,"),
+])
+def test_int01_shared_factory_eos_keeps_parameter_authority(
+    family, fragmented, closed_parameter, prop, value, expected,
+):
+    tools = [{"type": "function", "function": {
+        "name": "echo", "parameters": {"properties": {"text": prop}},
+    }}]
+    complete = "<tool_call><function=echo><parameter=text>0</parameter></function></tool_call>"
+    last = "<tool_call><function=echo><parameter=text>" + value
+    if closed_parameter:
+        last += "</parameter></function></tool_call>TAIL"
+    # MiMo's paired reasoning parser preserves think bytes in values. Exercise
+    # Qwen's shared tool grammar without changing its legacy reasoning policy.
+    text = ("<think>plan</think>" if family == "mimo_v2" else "") + complete * 16 + last
+    chunks = _random_chunks(text, 23) if fragmented else [text]
+    reasoning = "mimo_v2" if family == "mimo_v2" else None
+    events, full = _int01_generation(chunks + [""], family, tools, "length", reasoning)
+    _assert_stream_invariants(events, family)
+    for calls in (_calls(events), full.tool_calls):
+        assert len(calls) == 17
+        assert [call.name for call in calls] == ["echo"] * 17
+        assert [call.tool_index for call in calls] == list(range(17))
+        assert json.loads(calls[-1].parameters) == {"text": expected}
+    assert _content(events) == full.content == ("TAIL" if closed_parameter else "")
+    assert _reasoning(events) == full.reasoning == ("plan" if family == "mimo_v2" else "")
+    assert events[-1].finish_reason == full.finish_reason == "length"
+
+
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_int01_standalone_qwen_factory_typed_eos(fragmented):
+    tools = [{"type": "function", "function": {
+        "name": "echo", "parameters": {"properties": {"text": {"type": "integer"}}},
+    }}]
+    first = "<function=echo><parameter=text>0</parameter></function>"
+    block = "<tool_call>" + first + "</tool_call>"
+    text = first + block * 15 + "<tool_call><function=echo><parameter=text>42"
+    chunks = _random_chunks(text, 23) if fragmented else [text]
+    events, full = _int01_generation(chunks + [""], "qwen3_coder", tools, "length", None)
+    _assert_stream_invariants(events, "qwen3_coder")
+    for calls in (_calls(events), full.tool_calls):
+        assert [call.tool_index for call in calls] == list(range(17))
+        assert [call.name for call in calls] == ["echo"] * 17
+        assert [json.loads(call.parameters) for call in calls] == [{"text": 0}] * 16 + [{"text": 42}]
+    assert _content(events) == full.content == _reasoning(events) == full.reasoning == ""
+    assert events[-1].finish_reason == full.finish_reason == "length"
+
+
+def test_int01_mimo_wire_call_ids_and_indices():
+    block = CALL_BLOCKS["mimo_v2"]
+    state = FakeState(["<think>plan" + block * 17 + "TAIL", ""], "mimo_v2", "mimo_v2", "stop")
+    req = ChatCompletionRequest.model_validate({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+    })
+    frames = _sse_frames(stream_chat_completion_chunks(42, req, state, _spec()))
+    deltas = [choice["delta"] for _, data in frames if data for choice in data.get("choices", [])]
+    starts = [call for delta in deltas for call in delta.get("tool_calls", []) if call.get("id")]
+    assert len(starts) == 17
+    assert [call["index"] for call in starts] == list(range(17))
+    assert len({call["id"] for call in starts}) == 17
+    assert all(call["id"] and call["function"]["name"] == "read" for call in starts)
+    for index in range(17):
+        args = "".join(call["function"].get("arguments", "") for delta in deltas
+                       for call in delta.get("tool_calls", []) if call["index"] == index)
+        assert json.loads(args) == READ_ARGS
+    assert "".join(delta.get("content", "") or "" for delta in deltas) == "TAIL"
+    assert "".join(delta.get("reasoning_content", "") for delta in deltas) == "plan"
+    finishes = [choice.get("finish_reason") for _, data in frames if data
+                for choice in data.get("choices", []) if choice.get("finish_reason")]
+    assert finishes == ["tool_calls"]

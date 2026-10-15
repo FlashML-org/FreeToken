@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from freetoken.server.function_call_parser import FunctionCallParser, SUPPORTED_TOOL_CALL_PARSERS
+from freetoken.server.function_call_parser import (
+    FunctionCallParser, SUPPORTED_TOOL_CALL_PARSERS, StreamingParseResult, ToolCallItem,
+)
 
 
 TOOLS = [
@@ -1494,3 +1496,70 @@ def test_dr03_truncated_invalid_partial_preserved_raw_both_modes(prop, partial):
     expected = [("demo", {"value": partial})]
     assert _dr03_stream(tools, "qwen3_coder", wire) == expected
     assert _dr03_oneshot(tools, "qwen3_coder", wire) == expected
+
+
+@pytest.mark.parametrize("payload", ["text", "calls", "empty-fragment"])
+def test_int01_empty_drain_does_not_publish_nonprogress_events(monkeypatch, payload):
+    parser = FunctionCallParser(TOOLS, "qwen25")
+    iterations = 0
+
+    def increment(text, tools):
+        nonlocal iterations
+        iterations += 1
+        assert iterations <= 3, "drain repeated a nonprogress result"
+        if payload == "text":
+            return StreamingParseResult(normal_text="once")
+        return StreamingParseResult(calls=[ToolCallItem(
+            tool_index=0, name="get_weather" if payload == "calls" else None,
+            parameters="" if payload == "empty-fragment" else "{}",
+        )])
+
+    monkeypatch.setattr(parser.detector, "parse_streaming_increment", increment)
+    events = parser.parse_stream_events("input")
+    assert len(events) == 1
+    assert iterations == 2
+    assert parser.parse_stream_events("") == []
+
+
+def test_int01_silent_consumption_drains_to_ordered_normal_event(monkeypatch):
+    parser = FunctionCallParser(TOOLS, "qwen25")
+    detector = parser.detector
+    detector._buffer = "xxxTAIL"
+    iterations = 0
+
+    def increment(text, tools):
+        nonlocal iterations
+        iterations += 1
+        assert not text
+        if detector._buffer.startswith("x"):
+            detector._buffer = detector._buffer[1:]
+            return StreamingParseResult()
+        tail, detector._buffer = detector._buffer, ""
+        return StreamingParseResult(normal_text=tail)
+
+    monkeypatch.setattr(detector, "parse_streaming_increment", increment)
+    assert parser.parse_stream_events("") == [("text", "TAIL")]
+    assert iterations == 5
+
+
+def test_int01_json_name_progress_without_consumption():
+    parser = FunctionCallParser(TOOLS, "qwen25")
+    wire = '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>TAIL'
+    events = parser.parse_stream_events(wire)
+    calls = [item for kind, payload in events if kind == "calls" for item in payload]
+    assert [item.name for item in calls if item.name is not None] == ["get_weather"]
+    assert json.loads("".join(item.parameters for item in calls)) == {"city": "Paris"}
+    assert events[-1] == ("text", "TAIL")
+    assert parser.parse_stream_events("") == []
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "qwen3_coder"])
+def test_int01_recovery_uses_actual_eos_bytes(family):
+    parser = FunctionCallParser(_dr01_echo_tools(), family)
+    # Exercise the fallback directly: a real outer closer is value data without
+    # a parameter closer; recovery must not add another outer closer to the value.
+    parser.detector._buffer = _DR01_PREFIX + "x</tool_call>"
+    calls = parser.recover_truncated_call()
+    assert len(calls) == 1 and calls[0].name == "echo"
+    assert json.loads(calls[0].parameters) == {"text": "x</tool_call>"}
+    assert parser.detector._buffer == ""

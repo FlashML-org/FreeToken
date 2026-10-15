@@ -3803,28 +3803,42 @@ class FunctionCallParser:
         # Drain loop: an increment may return after consuming only part of its buffer
         # (e.g. one complete invoke of several, leaving the rest and the closing tag
         # behind). Re-feed "" until the detector stops making progress.
+        det = self.detector
+
+        def progress() -> tuple:
+            index = det.current_tool_id
+            ledger = det.streamed_args_for_tool
+            return (
+                len(det._buffer), len(getattr(det, "_normal_text_buffer", "")),
+                index, det.current_tool_name_sent, len(ledger),
+                len(ledger[index]) if 0 <= index < len(ledger) else 0,
+            )
+
         text = chunk_text
-        for _ in range(16):
-            sp_result = self.detector.parse_streaming_increment(text, self.tools)
+        while True:
+            before = progress()
+            sp_result = det.parse_streaming_increment(text, self.tools)
+            # A calls list can contain a repeated empty argument diff. Publish
+            # empty-input results only when buffered work or emission state advances.
+            if not text and progress() == before:
+                break
             if sp_result.normal_text:
                 segments.append(("text", sp_result.normal_text))
             if sp_result.calls:
                 segments.append(("calls", sp_result.calls))
-            if text == "" and not sp_result.calls and not sp_result.normal_text:
-                break
             text = ""
         return segments
 
     def recover_truncated_call(self) -> List[ToolCallItem]:
-        """Best-effort parse of a tool call cut off by end-of-generation while its
-        tag block was still open: append the closing tag and re-parse. Consumes the
-        detector buffer on success; returns [] when nothing recoverable."""
+        """Best-effort detector-owned EOS parse of an unfinished tool block.
+        Reparse only actual bytes: an invented envelope closer can become literal
+        parameter data. Consumes the buffer on success; [] when unrecoverable."""
         det = self.detector
         buf = det._buffer
-        if not buf or not det.eot_token or not det.has_tool_call(buf):
+        if not buf or not det.has_tool_call(buf):
             return []
         try:
-            parsed = det.detect_and_parse(buf + det.eot_token, self.tools)
+            parsed = det.detect_and_parse(buf, self.tools)
         except Exception:  # noqa: BLE001 — recovery is best-effort by definition
             return []
         if parsed.calls:
