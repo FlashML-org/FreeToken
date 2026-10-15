@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_combine_norm,
     hc_gate_mix,
     hc_silu,
 )
@@ -119,14 +120,16 @@ class GatedResidual(BaseOP):
         # both slices keep unit inner stride, so the kernels read them without a copy
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
-    def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+    def _mix_kernel(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        if rn is None:
+            rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
 
-    def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+    def _mix_torch(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        if rn is None:
+            rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
         lora, s = self._down(rn)
         lora = F.silu(lora.float() / self.hc_count)
         gate = self.input_mix_weight_up.forward(lora.to(R.dtype))
@@ -140,15 +143,50 @@ class GatedResidual(BaseOP):
         out = out + y.float().unsqueeze(-2) * inject.unsqueeze(-1)
         return out.flatten(-2).to(R.dtype)
 
-    def mix(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
-        return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
+    def mix(self, R: torch.Tensor, rn: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine).
+
+        ``rn`` is the pre-normalized R from a preceding :meth:`combine_norm` (same norm weight as
+        this block's ``hc_norm``), letting the caller fuse the two kernels; None recomputes it."""
+        return self._mix_kernel(R, rn) if R.is_cuda else self._mix_torch(R, rn)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
         if R.is_cuda:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
+
+    def combine_norm(
+        self, R: torch.Tensor, y: torch.Tensor | tuple, s: torch.Tensor, next_block: "GatedResidual"
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """combine() fused with ``next_block``'s hc_norm; returns (R', Rn'). CPU keeps the split path (Rn' = None).
+
+        ``y`` may be an (routed, shared, gate) epilogue tuple: the shared-expert gate
+        mul-add is then folded into the fused kernel, bit-exact vs the split path."""
+        gated = isinstance(y, tuple)
+        if not R.is_cuda:
+            return self.combine(R, self._epilogue(y), s), None
+        if gated:
+            routed, shared, gate = y
+            return hc_combine_norm(
+                R, routed, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count,
+                shared=shared, gate=gate,
+            )
+        return hc_combine_norm(
+            R, y, s, next_block.hc_norm.weight, next_block.hc_norm.eps, self.hc_count
+        )
+
+    @staticmethod
+    def _epilogue(y: torch.Tensor | tuple) -> torch.Tensor:
+        """Materialize an (routed, shared, gate) tuple with the standalone epilogue."""
+        if not isinstance(y, tuple):
+            return y
+        from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add
+
+        routed, shared, gate = y
+        if not routed.is_cuda:
+            return (routed.float() + gate[:, None] * shared.float()).to(routed.dtype)
+        return shared_gate_mul_add(routed, shared, gate)
 
 
 __all__ = ["GatedResidual", "GroupedPlusOneRMSNorm", "grouped_plus_one_rms_norm"]
