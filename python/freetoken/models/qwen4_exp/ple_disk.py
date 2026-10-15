@@ -134,11 +134,14 @@ class DiskRowTable:
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
+        from freetoken.layers.quantization.ggml_types import float_dtype
 
         self.num_rows = source.total_rows
         self.head_dim = source.row_values or source.row_bytes  # fp8: one byte per element
         self._ggml_type = source.ggml_type
         self._row_bytes = source.row_bytes
+        # float rows (fp8, or F32 / F16 / BF16 in a GGUF) are only cast; quantized ggml rows go through ggml
+        self._row_dtype = torch.float8_e4m3fn if source.ggml_type is None else float_dtype(source.ggml_type)
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -295,12 +298,13 @@ class DiskRowTable:
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
-        if self._ggml_type is not None:
+        if self._row_dtype is not None:
+            # copy=True: rows already in self.dtype must not alias the staging buffer the next fill reuses
+            values = dev[:nbytes].view(self._row_dtype).to(self.dtype, copy=True)
+        else:
             from freetoken.kernel import ggml
 
             values = ggml.dequantize(dev[:nbytes].view(-1, self._row_bytes), self._ggml_type, self.head_dim, self.dtype)
-        else:
-            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
