@@ -1,0 +1,12 @@
+llama.cpp 8c2134a8755d8a9792af513dab20282affe903e4 (2026-10-14)
+
+Only the ggml files that the GGUF ops (freetoken/ggml_ops.cu, built by kernel/ggml.py) compile or include:
+ggml/include -> include, ggml/src -> src, ggml/src/ggml-cuda -> ggml-cuda.
+
+Local changes, kept in freetoken.patch (already applied):
+- quantize.cu/.cuh: the q8_1 quantize kernels read bf16 activations as well as fp32.
+- mmq.cu: MMQ takes bf16 activations, except on the native fp4 path.
+- mmvq.cu/.cuh: MMVQ takes bf16 activations, can write bf16 results, and can reuse activations already quantized to q8_1 (src1_q8_1_pre).
+- mmq.cu/.cuh, mmid.cu/.cuh: MoE MMQ runs a flat grid over only the (expert, column tile) pairs that hold tokens, listed by mm_ids_tile_map; ncols_max > 0 keeps the regular grid.
+
+To update: copy the same files from a newer llama.cpp, apply freetoken.patch, and update this file.
