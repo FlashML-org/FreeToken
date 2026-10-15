@@ -73,17 +73,19 @@ class Qwen4ExpDecoderLayer(BaseOP):
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, batch: Batch, rn: torch.Tensor | None = None):
+        """Returns (R, mlp_out, inject) un-combined: the caller fuses the mlp combine with the
+        next consumer's norm (next layer's attn mix, or the final mixer)."""
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        block_input, inject = self.attn_hyper_connection.mix(hidden, rn=rn)
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        hidden, rn_mlp = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
+        block_input, inject = self.mlp_hyper_connection.mix(hidden, rn=rn_mlp)
+        return hidden, self.mlp.forward(block_input), inject
 
 
 class Qwen4ExpModel(BaseOP):
@@ -118,13 +120,25 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
-            hidden = layer.forward(hidden, batch)
+        # The last block of each layer combines through the layer boundary, fusing the
+        # combine with the next consumer's hc_norm -- except before a PLE layer, whose
+        # `hidden + ple(hidden)` happens after the boundary and changes what the norm sees.
+        layers = self.layers.op_list
+        rn = None
+        for i, layer in enumerate(layers):
+            hidden, mlp_out, inject = layer.forward(hidden, batch, rn=rn)
+            nxt = layers[i + 1] if i + 1 < len(layers) else None
+            if nxt is not None and nxt.ple is not None:
+                hidden = layer.mlp_hyper_connection.combine(hidden, mlp_out, inject)
+                rn = None
+            else:
+                consumer = nxt.attn_hyper_connection if nxt is not None else self.hyper_connection_mixer
+                hidden, rn = layer.mlp_hyper_connection.combine_norm(hidden, mlp_out, inject, consumer)
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        return self.hyper_connection_mixer.mix(hidden, rn=rn)[0]
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
