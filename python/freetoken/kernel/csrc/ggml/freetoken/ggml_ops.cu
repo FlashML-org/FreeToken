@@ -370,12 +370,22 @@ void op_dequantize(TensorView w, int64_t type_id, int64_t k, TensorView out) {
         return;
     }
     const cudaStream_t stream = current_stream(w.device());
+    if (type == otype) {
+        CUDA_CHECK(cudaMemcpyAsync(out.data_ptr(), w.data_ptr(), rows * k * ggml_type_size(type), cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
     if (otype == GGML_TYPE_BF16) {
-        ggml_get_to_bf16_cuda(type)(w.data_ptr(), (nv_bfloat16 *) out.data_ptr(), rows * k, stream);
+        const auto convert = ggml_get_to_bf16_cuda(type);
+        RuntimeCheck(convert != nullptr, "no ggml bf16 conversion for ", ggml_type_name(type));
+        convert(w.data_ptr(), (nv_bfloat16 *) out.data_ptr(), rows * k, stream);
     } else if (otype == GGML_TYPE_F16) {
-        ggml_get_to_fp16_cuda(type)(w.data_ptr(), (half *) out.data_ptr(), rows * k, stream);
+        const auto convert = ggml_get_to_fp16_cuda(type);
+        RuntimeCheck(convert != nullptr, "no ggml fp16 conversion for ", ggml_type_name(type));
+        convert(w.data_ptr(), (half *) out.data_ptr(), rows * k, stream);
     } else {
-        ggml_get_to_fp32_cuda(type)(w.data_ptr(), (float *) out.data_ptr(), rows * k, stream);
+        const auto convert = ggml_get_to_fp32_cuda(type);
+        RuntimeCheck(convert != nullptr, "no ggml fp32 conversion for ", ggml_type_name(type));
+        convert(w.data_ptr(), (float *) out.data_ptr(), rows * k, stream);
     }
 }
 
