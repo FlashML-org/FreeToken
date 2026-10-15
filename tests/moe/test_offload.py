@@ -691,7 +691,12 @@ def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
         for (src, _), view in zip(cache.banks, views):
             assert torch.equal(view.cpu(), src[layer])
         cache.release_prefill_layer(layer)
-    assert cache.prefill_hit_rows > 0
+    # hit-D2D is an auto-fallback optimization: where the cudaMemcpyBatchAsync probe fails the
+    # prefill takes the full-layer path and the counter must stay 0 (checked both ways)
+    if cache._hit_d2d_usable():
+        assert cache.prefill_hit_rows > 0
+    else:
+        assert cache.prefill_hit_rows == 0
     for p, stable in enumerate(cache._pool_stable_from):
         if stable:
             assert not any(view[0].any() for view in cache.pool_bank_views(cache.pool_of_layer.index(p)))
