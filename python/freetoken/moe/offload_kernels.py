@@ -108,7 +108,7 @@ def materialize_layer(cache, layer_id: int) -> None:
         return
     # staging buffer 0 may overlap several pools, so it only holds the layer for this forward and registers nothing
     E = cache.num_experts
-    cache._invalidate_prefill_buffer(0)
+    cache._invalidate_prefill_buffer(0, layer_id)
     rows = torch.arange(E, dtype=torch.int32, device=cache.device)
     cache.evict_slots[:E].copy_(rows)
     cache.src_indices[:E].copy_(rows)

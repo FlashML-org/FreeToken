@@ -749,6 +749,56 @@ def test_slot_pools_split_layers_of_one_bank_layout_by_quant_tag():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("wide", [(), (1, 3)], ids=["cpu-mode", "two-layouts"])
+def test_slot_pools_and_staging_buffers_end_in_zero_mmq_tails(wide):
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes, row_bytes
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, top_k = 4, 8, 4
+
+    def layout(ggml_type):
+        """(rows, row bytes, tail bytes) of gate_up and down for Gemma-4 26B-A4B's K = 2816 and 704, with fewer rows."""
+        return tuple((rows, row_bytes(ggml_type, k), mmq_tail_bytes(ggml_type, k)) for rows, k in ((32, 2816), (64, 704)))
+
+    q4_0, q8_0 = layout(GGMLQuantizationType.Q4_0), layout(GGMLQuantizationType.Q8_0)
+    shapes = [q8_0 if layer in wide else q4_0 for layer in range(L)]
+    roles = ("gate_up", "down")
+    sources = {role: [torch.randint(1, 255, (E, *shapes[l][k][:2]), dtype=torch.uint8).pin_memory() for l in range(L)] for k, role in enumerate(roles)}
+    tails = {role: [shapes[l][k][2] for l in range(L)] for k, role in enumerate(roles)}
+    # cpu mode: the slots are exactly the two staging buffers
+    pools = dict(pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10], prefill_hit_d2d=True) if wide else dict(pool_of_layer=[0] * L, pool_sizes=[2 * E])
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=sum(pools["pool_sizes"]), device=torch.device("cuda"), prefill_overlap=True, **pools)
+    cache.set_bank_sources(sources, row_tail_bytes=tails)
+    assert cache.prefill_overlap
+
+    def assert_zero_tails(layer: int, views) -> None:
+        torch.cuda.synchronize()
+        for k, ((_, bank), view) in enumerate(zip(cache.banks, views)):
+            end, tail = view.storage_offset() + view.numel(), shapes[layer][k][2]
+            assert end + tail <= bank.numel() and not bank[end : end + tail].any(), (layer, k)
+
+    for _ in range(20):
+        for layer in range(L):
+            cache.ensure_experts(layer, torch.randperm(E)[:top_k].to(torch.int32).view(1, top_k).cuda())
+            cache.copy_missing()
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        assert_zero_tails(layer, cache.wait_prefill_layer(layer))
+        cache.release_prefill_layer(layer)
+    for layer in range(L):
+        assert_zero_tails(layer, cache.pool_bank_views(layer))
+    if wide:
+        cache.materialize_layer(0)
+        cache.copy_missing()
+        assert_zero_tails(0, cache.stage_views(0, 0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_offload_cache_rebuild_frees_the_old_slots_first():
     from freetoken.moe.offload_cache import OffloadMoeCache
 

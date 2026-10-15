@@ -828,7 +828,7 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags)
+        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags, row_tail_bytes=banks.row_tail_bytes)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)

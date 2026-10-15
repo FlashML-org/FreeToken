@@ -11,7 +11,7 @@ import os
 import torch
 
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.ggml_types import float_dtype, pad_rows, type_name
+from freetoken.layers.quantization.ggml_types import float_dtype, mmq_tail_bytes, pad_rows, type_name
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
@@ -53,6 +53,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
 
     index = gguf_tensor_index(model_path)
     sources: dict[str, list[torch.Tensor]] = {"gate_up": [], "down": []}
+    tails: dict[str, list[int]] = {"gate_up": [], "down": []}
     tags = []
     with PinPipeline() if device is None else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
@@ -67,6 +68,8 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
                 parts = [gate, up]
             tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
+            tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
+            tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
@@ -95,7 +98,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
     logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
-    return ExpertBanks("gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags)
+    return ExpertBanks("gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
 
 
 __all__ = ["load_gguf_expert_banks"]

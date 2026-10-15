@@ -50,6 +50,8 @@ class ExpertBanks:
     layout: dict | None = None
     # per-layer quant tag (e.g. the gate_up and down GGUF types), for layers whose banks match in dtype and row shape but not in quant; None = one quant
     layer_tags: list | None = None
+    # per bank, per layer: bytes past an expert matrix's last row that the kernel reads and that must read as zeros (ggml MMQ); None = no such reads
+    row_tail_bytes: dict[str, list[int]] | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:

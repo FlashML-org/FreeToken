@@ -48,6 +48,12 @@ def pad_rows(k: int) -> int:
     return 0 if k % MATRIX_ROW_PADDING == 0 else 1
 
 
+def mmq_tail_bytes(ggml_type: int, k: int) -> int:
+    """Bytes past the last row of a packed [rows, K] matrix that MMQ reads and that must read as zeros."""
+    rem = k % MATRIX_ROW_PADDING
+    return 0 if rem == 0 or not is_quantized(ggml_type) else row_bytes(ggml_type, MATRIX_ROW_PADDING - rem)
+
+
 @dataclass(frozen=True)
 class Segment:
     """A run of consecutive fused parts that share one ggml type: one packed matrix and one GEMM."""
@@ -79,4 +85,4 @@ def segment_param(index: int) -> str:
     return "weight" if index == 0 else f"weight_{index}"
 
 
-__all__ = ["MATRIX_ROW_PADDING", "Segment", "float_dtype", "is_quantized", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
+__all__ = ["MATRIX_ROW_PADDING", "Segment", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
