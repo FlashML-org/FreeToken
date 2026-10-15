@@ -436,7 +436,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         "model_config",
         SimpleNamespace(
             has_swa_attention=False,
-            has_linear_attention=False,
+            has_state_layers=False,
             is_moe=True,
             num_layers=10,
             num_moe_layers=10,

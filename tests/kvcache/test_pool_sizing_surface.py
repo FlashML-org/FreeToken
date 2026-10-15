@@ -23,7 +23,7 @@ def _spec(name, attn_type, *, mla=False, index_head_dim=0, sliding_window=None):
 
 
 def _model_config(specs, **attrs):
-    mc = SimpleNamespace(has_swa_attention=False, dsv4_args=None, **attrs)
+    mc = SimpleNamespace(has_swa_attention=False, has_state_layers=False, dsv4_args=None, **attrs)
     mc.kv_cache_group_specs = lambda: specs
     return mc
 
@@ -52,7 +52,7 @@ def test_resolve_pool_class_follows_attn_type():
 
 def _generic_config(num_page_override=None):
     mc = _model_config((_spec("full", AttnType.FULL),))
-    mc.linear_attention_group = lambda: None
+    mc.state_group = lambda: None
     return SimpleNamespace(
         model_config=mc, page_size=16, dtype=SimpleNamespace(itemsize=2),
         tp_info=SimpleNamespace(size=1), cache_type="radix",
@@ -208,7 +208,7 @@ def test_create_kv_pool_builds_the_right_family():
         set_tp_info(rank=0, size=1)
 
     mc = SimpleNamespace(
-        has_swa_attention=False, has_linear_attention=False, dsv4_args=None,
+        has_swa_attention=False, has_state_layers=False, dsv4_args=None,
         num_layers=2, num_kv_heads=1, head_dim=8,
     )
     mc.kv_cache_group_specs = lambda: (_spec("full", AttnType.FULL),)
@@ -226,7 +226,7 @@ def test_create_kv_pool_builds_the_right_family():
         dataclasses.replace(_spec("swa", AttnType.SWA, sliding_window=4), layer_ids=(1,)),
     )
     mc2 = SimpleNamespace(
-        has_swa_attention=True, has_linear_attention=False, dsv4_args=None, num_layers=2,
+        has_swa_attention=True, has_state_layers=False, dsv4_args=None, num_layers=2,
     )
     mc2.kv_cache_group_specs = lambda: swa_specs
     config2 = SimpleNamespace(
@@ -254,12 +254,12 @@ def test_linear_state_pool_prices_itself():
     config = _generic_config()
     config.linear_state_cache_ratio = 0.5
     config.cache_type = "hybrid_radix"
-    config.model_config.linear_attention_group = lambda: group
+    config.model_config.state_group = lambda: group
     per_req = linear_state_bytes_per_req(group, config.tp_info.size, config.dtype)
     assert state_pool_bytes(config) == per_req * _linear_pool_num_slots(config)
     assert state_pool_bytes(config, num_slots=7) == per_req * 7
     # models without a linear group price to zero
-    config.model_config.linear_attention_group = lambda: None
+    config.model_config.state_group = lambda: None
     assert state_pool_bytes(config) == 0
 
 

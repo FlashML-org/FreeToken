@@ -52,7 +52,7 @@ def _engine_config(**overrides):
         "model_config",
         SimpleNamespace(
             has_swa_attention=False,
-            has_linear_attention=False,
+            has_state_layers=False,
             is_moe=False,
             num_layers=10,
             expert_quant="none",

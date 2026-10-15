@@ -129,7 +129,7 @@ def _dsv4_adjust_cfg(**over):
 
     model_config = SimpleNamespace(
         single_stream_only=False, dsv4_args=SimpleNamespace(window_size=128), is_moe=True,
-        expert_quant="ds_fp4", has_swa_attention=False, has_linear_attention=False,
+        expert_quant="ds_fp4", has_swa_attention=False, has_state_layers=False,
     )
 
     class Cfg:
@@ -204,7 +204,7 @@ def test_adjust_config_resolves_num_tokens_generic():
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
-        has_swa_attention=False, has_linear_attention=False,
+        has_swa_attention=False, has_state_layers=False,
     )
 
     class Cfg:
@@ -246,7 +246,7 @@ def test_mha_kv_cost_simple_full_attention():
                 num_kv_heads=8, head_dim=64, sliding_window=None,
             )]
 
-        def linear_attention_group(self):
+        def state_group(self):
             return None
 
     class StubConfig:
@@ -282,7 +282,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
                 name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64, sliding_window=None,
             )]
 
-        def linear_attention_group(self):
+        def state_group(self):
             return None
 
     class StubConfig:
@@ -362,7 +362,7 @@ def _offload_engine_config(**overrides):
         "model_config",
         SimpleNamespace(
             has_swa_attention=False,
-            has_linear_attention=False,
+            has_state_layers=False,
             is_moe=True,
             num_layers=10,
             num_moe_layers=10,
@@ -440,7 +440,7 @@ def _generic_rotary_cfg(max_position, override, scaling=None):
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
-        has_swa_attention=False, has_linear_attention=False,
+        has_swa_attention=False, has_state_layers=False,
         rotary_config=RotaryConfig(
             head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
         ),

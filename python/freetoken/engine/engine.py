@@ -461,13 +461,13 @@ class Engine:
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
 
-        # ======================= Linear (GatedDeltaNet) state initialization ========================
-        linear_group = config.model_config.linear_attention_group()
-        if linear_group is not None:
+        # ======================= Linear (GDN/KDA/short-conv) state initialization ========================
+        state_group = config.model_config.state_group()
+        if state_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
             self.linear_state_pool = LinearStatePool(
-                group=linear_group,
+                group=state_group,
                 num_slots=_linear_pool_num_slots(config),
                 dtype=self.dtype,
                 device=self.device,
@@ -1291,11 +1291,12 @@ def _ensure_expandable_segments() -> None:
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
 
-def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
-    # Hybrid GDN models default to the HybridRadixCache (snapshots GDN state at chunk
-    # boundaries -> cross-request prefix reuse). An explicit ``--cache-type naive`` opts out
-    # to the old no-reuse path (debugging / parity baseline / lower GDN-state memory).
-    if has_linear_attention:
+def _resolve_cache_type(has_state_layers: bool, requested: str) -> str:
+    # Hybrid state-carrying models (GDN/KDA recurrence, LFM2 short conv) default to the
+    # HybridRadixCache (snapshots the layer state at chunk boundaries -> cross-request prefix
+    # reuse). An explicit ``--cache-type naive`` opts out to the old no-reuse path (debugging /
+    # parity baseline / lower state-pool memory).
+    if has_state_layers:
         return "naive" if requested == "naive" else "hybrid_radix"
     return requested
 
@@ -1615,7 +1616,7 @@ def _adjust_config(config: EngineConfig):
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
-    has_linear_attention = getattr(model_config, "has_linear_attention", False)
+    has_state_layers = getattr(model_config, "has_state_layers", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
@@ -1676,7 +1677,7 @@ def _adjust_config(config: EngineConfig):
                 )
             override("cache_type", "swa_radix")
 
-    if has_linear_attention:
+    if has_state_layers:
         override(
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),

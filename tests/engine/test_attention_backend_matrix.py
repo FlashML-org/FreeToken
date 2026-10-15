@@ -48,7 +48,7 @@ def _model_config(kind):
         is_moe=False,
         expert_quant="none",
         has_swa_attention=False,
-        has_linear_attention=False,
+        has_state_layers=False,
         num_layers=4,
         rotary_config=RotaryConfig(head_dim=128, rotary_dim=128, max_position=1024, base=1e4, scaling=None),
     )
@@ -73,10 +73,10 @@ def _model_config(kind):
     elif kind == "qsa":
         # Qwen3.8-Flash-Next shape: hybrid-linear + one FULL-family group whose index keys
         # are compressed index_ratio:1 -> QSA.
-        mc.has_linear_attention = True
+        mc.has_state_layers = True
         specs = (_spec("full", AttnType.QSA, index_head_dim=128, index_ratio=4),)
     elif kind == "linear_hybrid":
-        mc.has_linear_attention = True
+        mc.has_state_layers = True
         specs = (_spec("full", AttnType.FULL),)
     else:
         raise AssertionError(kind)
@@ -406,3 +406,36 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
+
+
+def test_a_short_conv_group_is_a_state_group_and_drives_hybrid_radix():
+    """LFM2-MoE: the state layers are conv-only (no recurrence), so ``has_linear_attention``
+    stays False -- but the model is still state-carrying, and the cache type follows it."""
+    from freetoken.engine.engine import _adjust_config, _resolve_cache_type
+    from freetoken.models.config import ShortConvGroupConfig
+
+    mc = dataclasses_replace_groups(
+        _real_hybrid_model_config(),
+        (
+            FullAttentionGroupConfig(
+                name="full", layer_ids=(0, 1), num_kv_heads=2, head_dim=64, rotary_config=_rotary(),
+            ),
+            ShortConvGroupConfig(name="conv", layer_ids=(2, 3), conv_dim=512, conv_kernel_dim=3),
+        ),
+    )
+    assert mc.has_state_layers and not mc.has_linear_attention
+    assert mc.is_short_conv_layer(2) and mc.attn_type_for_layer(2) is AttnType.LINEAR
+    assert mc.state_group().name == "conv"
+    (spec,) = mc.kv_cache_group_specs()  # the conv group emits no paged-KV spec
+    assert spec.layer_ids == (0, 1)
+
+    assert _resolve_cache_type(mc.has_state_layers, "radix") == "hybrid_radix"
+    assert _resolve_cache_type(mc.has_state_layers, "naive") == "naive"
+
+    # the _adjust_config override follows the group, not the flag's name
+    for requested, expected in (("radix", "hybrid_radix"), ("naive", "naive")):
+        config = _config("full")
+        object.__setattr__(config, "cache_type", requested)  # a SchedulerConfig field, resolved here
+        object.__setattr__(config, "model_config", mc)
+        _adjust_config(config)
+        assert config.cache_type == expected

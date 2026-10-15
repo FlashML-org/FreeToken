@@ -171,7 +171,7 @@ def create_kvcache_pool(
     # slabs.
     layer_ids: tuple[int, ...] | None = None
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
-    if model_config.has_linear_attention:
+    if model_config.has_state_layers:
         assert len(kv_specs) == 1, (
             f"hybrid-linear models support one paged-KV group, got "
             f"{[s.name for s in kv_specs]}"

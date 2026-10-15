@@ -201,6 +201,19 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
 
 
 @dataclass(frozen=True)
+class ShortConvGroupConfig(BaseAttentionGroupConfig):
+    """Depthwise causal short-conv layers (LFM2-MoE): no paged KV and no recurrent state,
+    one conv-state slab per layer in the LinearStatePool (``conv_states``)."""
+
+    kind: ClassVar[Literal["short_conv"]] = "short_conv"
+    cache_kind: ClassVar[Literal["conv_state"]] = "conv_state"
+
+    conv_dim: int
+    conv_kernel_dim: int
+    conv_bias: bool = False
+
+
+@dataclass(frozen=True)
 class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
     class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
@@ -225,6 +238,7 @@ AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
+    | ShortConvGroupConfig
     | DSV4AttentionGroupConfig
 )
 
@@ -308,6 +322,9 @@ class ModelConfig:
     n_shared_experts: int = 0
     # Selected-expert weights are multiplied by this after renormalization (GLM-4: 2.5).
     routed_scaling_factor: float = 1.0
+    # Additive per-expert bias that shifts the ROUTER's selection only, never the returned
+    # weights (LFM2-MoE: the ``expert_bias`` checkpoint tensor, always on in the releases).
+    use_expert_bias: bool = False
     # Group-limited routing (DeepSeek-V3 noaux_tc); GLM-4 uses n_group=topk_group=1 so the
     # grouping is a no-op, but we keep the knobs for completeness.
     n_group: int = 1
@@ -400,6 +417,13 @@ class ModelConfig:
             for group in self.attention_groups
         )
 
+    @property
+    def has_state_layers(self) -> bool:
+        """Layers that keep per-request state in the LinearStatePool: GDN/KDA or short conv."""
+        return self.has_linear_attention or any(
+            isinstance(group, ShortConvGroupConfig) for group in self.attention_groups
+        )
+
     def default_full_attention_group(self) -> FullAttentionGroupConfig:
         return FullAttentionGroupConfig(
             name="full",
@@ -439,6 +463,33 @@ class ModelConfig:
             raise ValueError("Expected at most one linear-gated-delta attention group")
         return groups[0] if groups else None
 
+    def short_conv_group(self) -> ShortConvGroupConfig | None:
+        groups = [
+            group
+            for group in self.attention_groups
+            if isinstance(group, ShortConvGroupConfig)
+        ]
+        if len(groups) > 1:
+            raise ValueError("Expected at most one short-conv attention group")
+        return groups[0] if groups else None
+
+    def state_group(self) -> LinearGatedDeltaGroupConfig | ShortConvGroupConfig | None:
+        """The LinearStatePool's geometry: the model's single state-carrying attention group."""
+        groups = [
+            group
+            for group in self.attention_groups
+            if isinstance(group, (LinearGatedDeltaGroupConfig, ShortConvGroupConfig))
+        ]
+        if len(groups) > 1:
+            raise ValueError("Expected at most one state-carrying attention group")
+        return groups[0] if groups else None
+
+    def is_short_conv_layer(self, layer_id: int) -> bool:
+        return isinstance(
+            self.attention_group_for_layer(layer_id),
+            ShortConvGroupConfig,
+        )
+
     def is_swa_layer(self, layer_id: int) -> bool:
         return isinstance(self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig)
 
@@ -453,6 +504,8 @@ class ModelConfig:
         top-down on the attention groups; this is the layer-granular view)."""
         group = self.attention_group_for_layer(layer_id)
         if isinstance(group, LinearGatedDeltaGroupConfig):
+            return AttnType.LINEAR
+        if isinstance(group, ShortConvGroupConfig):
             return AttnType.LINEAR
         if isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA

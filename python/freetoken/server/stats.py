@@ -104,7 +104,7 @@ class StatsTracker:
 def derive_model_card(config: Any) -> dict:
     """attn enum + moe bool + ctx from the model config; input_modalities is what the API accepts right now."""
     mc = config.model_config
-    if getattr(mc, "has_linear_attention", False):
+    if getattr(mc, "has_state_layers", False):
         attn = "hybrid_linear"
     elif getattr(mc, "has_swa_attention", False):
         attn = "hybrid_swa"

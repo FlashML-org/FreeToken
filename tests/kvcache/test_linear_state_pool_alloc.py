@@ -166,7 +166,7 @@ def test_slot_state_in_the_byte_account():
     assert _pool(slot_states=_SPECS).bytes_per_slot() == with_state
 
     mc = SimpleNamespace(slot_states=_SPECS)
-    mc.linear_attention_group = lambda: group
+    mc.state_group = lambda: group
     config = SimpleNamespace(
         model_config=mc, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
         cache_type="naive", max_running_req=3, linear_state_cache_ratio=0.5,
@@ -177,7 +177,7 @@ def test_slot_state_in_the_byte_account():
     assert state_pool_bytes(config, num_slots=4) == gdn_only * 4
 
     mc.slot_states = _SPECS
-    mc.linear_attention_group = lambda: None
+    mc.state_group = lambda: None
     with pytest.raises(ValueError, match="slot_states"):
         state_pool_bytes(config, num_slots=4)
 
