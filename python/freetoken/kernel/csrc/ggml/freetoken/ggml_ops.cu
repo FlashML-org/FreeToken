@@ -108,8 +108,15 @@ int64_t mmq_tail_bytes(int64_t type_id, int64_t k) {
     return rem == 0 ? 0 : (int64_t) ggml_row_size((ggml_type) type_id, MATRIX_ROW_PADDING - rem);
 }
 
-// The native fp4 MMQ paths quantize fp32 activations only.
-bool mmq_reads_bf16(ggml_type type) { return type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4; }
+// The native fp4 MMQ path quantizes fp32 activations only; it is built only with GGML_CUDA_FP4_MMA.
+bool mmq_reads_bf16(ggml_type type) {
+#ifdef GGML_CUDA_FP4_MMA
+    return type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4;
+#else
+    GGML_UNUSED(type);
+    return true;
+#endif
+}
 
 struct Activation {
     const void * data;
