@@ -186,9 +186,6 @@ class OffloadMoeCache:
         # _pad_bytes[g][k]: zeroed bytes after the last row of every pool and staging buffer of layout g in bank k, for kernels that read past it (16-aligned)
         self._pad_bytes: list[list[int]] = []
         self._raw_banks = False
-        # Set by the engine when hybrid decode hands CPU routes to a kernel that reads slot 0 with weight 0 (no supports_inactive_slots).
-        # With several quants a staging buffer can leave another quant's bytes in a pool's slot 0, which may decode to NaN, so the last prefill layer zeroes those rows.
-        self.zero_inactive_route_slots = False
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size, self.pool_sizes)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -302,9 +299,8 @@ class OffloadMoeCache:
         # _stage_views[g][b] are buffer b's per-bank [num_experts, ...] views for layout g; _inval[b] are the global slots it overwrites.
         self._stage_bytes: list[int] = []
         self._stage_views: list[list[tuple[torch.Tensor, ...] | None]] = []
-        # _stage_tails[g][b]: the pad after buffer b's rows in layout g; _stage_pads[b]: the pool pads buffer b overwrites
+        # _stage_tails[g][b]: the pad after buffer b's rows in layout g
         self._stage_tails: list[list[list[torch.Tensor]]] = []
-        self._stage_pads: list[list[torch.Tensor]] = [[], []]
         self._inval: list[slice | torch.Tensor] = []
         self.prefill_copy_stream: torch.cuda.Stream | None = None
         self.prefill_begin_event: torch.cuda.Event | None = None
@@ -381,10 +377,8 @@ class OffloadMoeCache:
             for p, s in enumerate(self.pool_sizes)
         ]
         self._inval = []
-        masks = []
         for b in range(2):
             mask = torch.zeros(self.cache_size, dtype=torch.bool)
-            masks.append(mask)
             for k in range(len(rows)):
                 lo, hi = b * stage[k], (b + 1) * stage[k]
                 for p, (base, s) in enumerate(spans):
@@ -397,9 +391,8 @@ class OffloadMoeCache:
             else:
                 self._inval.append(idx.to(self.device))
         self._stage_dirty = [False, False]
-        self._stage_slot0_rows = [[], []]
         if not self.banks:
-            self._pool_bank_views, self._stage_views, self._stage_tails, self._stage_pads = [], [], [], [[], []]
+            self._pool_bank_views, self._stage_views, self._stage_tails = [], [], []
             return
         self._pool_bank_views = [
             tuple(self._bank_rows(k, self._pool_layout(p), offsets[k][p], s) for k in range(len(self.banks)))
@@ -416,18 +409,6 @@ class OffloadMoeCache:
             [[self.banks[k][1][b * stage[k] + E * row[k] :][: pad[k]] for k in range(len(self.banks)) if pad[k] and self._stage_fits(b + 1)] for b in range(2)]
             for row, pad in zip(self._row_bytes, self._pad_bytes)
         ]
-        self._stage_pads = [[], []]
-        for k, (_, cache) in enumerate(self.banks):
-            for p, (offset, s) in enumerate(zip(offsets[k], self.pool_sizes)):
-                end = offset + s * rows[k][p]
-                for b in range(2):
-                    if pads[k][p] and b * stage[k] < end + pads[k][p] and end < (b + 1) * stage[k]:
-                        self._stage_pads[b].append(cache[end : end + pads[k][p]])
-        if len(self.layouts) > 1:
-            self._stage_slot0_rows = [
-                [self._bank_rows(k, self._pool_layout(p), offsets[k][p], 1) for p, base in enumerate(bases) if masks[b][base] for k in range(len(self.banks))]
-                for b in range(2)
-            ]
 
     def stage_views(self, layer_id: int, buffer_id: int) -> tuple[torch.Tensor, ...]:
         """Per-bank ``[num_experts, ...]`` views of prefill staging buffer ``buffer_id`` in ``layer_id``'s layout; row == expert id."""
@@ -696,9 +677,7 @@ class OffloadMoeCache:
         self.bank_caches = {}
         self._pool_bank_views = []
         self._stage_views = []
-        self._stage_slot0_rows = [[], []]
         self._stage_tails = []
-        self._stage_pads = [[], []]
         self.cache_size = cache_size
         self.pool_sizes = sizes
         if self.device.type == "cuda":
@@ -1040,8 +1019,9 @@ class OffloadMoeCache:
             # the staged slots were invalidated and nothing registers them within the forward, so their bytes are free to clear
             for b in range(2):
                 if self._stage_dirty[b]:
-                    for row in (self._stage_slot0_rows[b] if self.zero_inactive_route_slots else []) + self._stage_pads[b]:
-                        row.zero_()
+                    # staged rows left there may be shifted or of another quant, and kernels still read them: MMQ past a slot's last row, weight-0 routes on slot 0
+                    for (_, cache), stage in zip(self.banks, self._stage_bytes):
+                        cache.view(-1).view(torch.uint8)[b * stage : (b + 1) * stage].zero_()
                     self._stage_dirty[b] = False
         if not self.prefill_overlap:
             return

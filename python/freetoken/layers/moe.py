@@ -316,7 +316,7 @@ class OffloadMoELayer(MoELayer):
         assert executor is not None, "CPU MoE executor was not initialized"
         # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
-        # with several quants this holds only because the cache zeroes staged slot 0 rows (zero_inactive_route_slots)
+        # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
         gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)

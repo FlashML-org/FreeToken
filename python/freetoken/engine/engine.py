@@ -837,7 +837,6 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
-        cache.zero_inactive_route_slots = cache.decode_target == "hybrid" and not all(layer.skips_inactive_slots for layer in layers)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache

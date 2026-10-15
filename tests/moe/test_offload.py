@@ -681,7 +681,6 @@ def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
         check_resident()
 
     decode(20)
-    cache.zero_inactive_route_slots = True
     cache.begin_prefill()
     for layer in range(L):
         cache.prefetch_prefill_layer(layer)
@@ -735,7 +734,6 @@ def test_slot_pools_split_layers_of_one_bank_layout_by_quant_tag():
     cache.set_bank_sources(sources, layer_tags=tags)
     assert cache.bank_caches["down"].shape == (20, 32, 144)
     # the staging buffers cover pool 0 and slots [0, 6) of pool 1, so both slot 0 rows end up with another quant's bytes
-    cache.zero_inactive_route_slots = True
     cache.begin_prefill()
     for layer in range(L):
         cache.prefetch_prefill_layer(layer)
