@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .utils import load_aot
+from .utils import _is_rocm, load_aot
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -28,10 +28,14 @@ def load_module(build_directory: str | None = None) -> Module:
         *(cuda_dir / f for f in ("mmvq.cu", "mmq.cu", "mmid.cu", "quantize.cu", "convert.cu", "getrows.cu")),
         *sorted((cuda_dir / "template-instances").glob("mmq-instance-*.cu")),
     ]
+    flags = ["-use_fast_math", "--extended-lambda"]
+    if not _is_rocm():
+        # a multi-arch kernel-cache build is ~6x smaller with compressed SASS
+        flags.append("--compress-mode=size")
     return load_aot(
         "ggml",
         cuda_files=[str(s) for s in sources],
-        extra_cuda_cflags=["-use_fast_math", "--extended-lambda"],
+        extra_cuda_cflags=flags,
         extra_include_paths=[str(_ROOT / "include"), str(_ROOT / "src"), str(cuda_dir)],
         build_directory=build_directory,
     )
