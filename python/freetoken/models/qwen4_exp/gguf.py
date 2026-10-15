@@ -185,15 +185,17 @@ def iter_gguf_weights(
         return float_tensor(t(name)).float() - 1.0
 
     def hc(prefix: str, src: str) -> Iterator[tuple[str, torch.Tensor]]:
-        yield from fused(f"{prefix}.input_mix_weight_down_block_inject", [t(f"{src}_down"), t(f"{src}_inject")],
-                          [float_tensor(t(f"{src}_down")), float_tensor(t(f"{src}_inject"))], hidden * config.qwen4_args.hc_count, pad_to=16)
-        yield f"{prefix}.input_mix_weight_up.weight", float_tensor(t(f"{src}_up"))
+        down, inject, up = (t(f"{src}_{p}") for p in ("down", "inject", "up"))
+        yield from fused(f"{prefix}.input_mix_weight_down_block_inject", [down, inject], [matrix(down), matrix(inject)],
+                         hidden * config.qwen4_args.hc_count, pad_to=16)
+        yield from fused(f"{prefix}.input_mix_weight_up", [up], [matrix(up)], config.qwen4_args.hc_lowrank)
         yield f"{prefix}.hc_norm.weight", norm(f"{src}_norm")
 
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
     yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
-    yield "model.hyper_connection_mixer.input_mix_weight_down.weight", float_tensor(t("output_hc_down"))
-    yield "model.hyper_connection_mixer.input_mix_weight_up.weight", float_tensor(t("output_hc_up"))
+    for proj, k in (("down", hidden * config.qwen4_args.hc_count), ("up", config.qwen4_args.hc_lowrank)):
+        info = t(f"output_hc_{proj}")
+        yield from fused(f"model.hyper_connection_mixer.input_mix_weight_{proj}", [info], [matrix(info)], k)
     yield "model.hyper_connection_mixer.hc_norm.weight", norm("output_hc_norm")
 
     for layer in range(config.num_layers):
@@ -206,13 +208,13 @@ def iter_gguf_weights(
             v_start = 2 * nk * dk
             qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
             z_rows = _untile(matrix(gate), nk, g.value_head_dim)
-            beta = _untile(float_tensor(t(f"{blk}.ssm_beta")), nk, 1)
-            alpha = _untile(float_tensor(t(f"{blk}.ssm_alpha")), nk, 1)
+            beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
+            beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
             if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
                 yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
-                yield f"{la}.in_proj_ba.weight", torch.cat([beta, alpha]).to(torch.bfloat16)
+                yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
             else:
-                yield f"{la}.in_proj.weight", torch.cat([qkv_rows, z_rows, beta, alpha]).to(torch.bfloat16)
+                yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
             conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
             conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
             yield f"{la}.conv1d.weight", conv.unsqueeze(1)

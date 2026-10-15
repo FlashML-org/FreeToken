@@ -98,6 +98,7 @@ class GatedResidual(BaseOP):
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
             self.input_mix_weight_down_block_inject = LinearReplicated(
                 width, self.lowrank + self.hc_count + self.pad_size, has_bias=False,
+                output_sizes=[self.lowrank, self.hc_count + self.pad_size],
                 quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_down_block_inject",
             )
         else:
