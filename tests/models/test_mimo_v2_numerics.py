@@ -298,10 +298,8 @@ _MOE_TOY = {
 }
 
 
-def test_resident_moe_layer_builds_the_unquantized_gate_up_down_tree():
-    """expert_quant=none + fused strategy: the sparse block's experts are a resident MoELayer
-    whose state-dict tree is EXACTLY experts.gate_up_proj [E, 2I, H] / experts.down_proj [E, H, I]
-    in bf16 -- the keys the bf16 iter_weights path must fill."""
+def test_resident_moe_layer_declares_unquantized_bank_layout():
+    """Sparse layers expose the bank geometry and dense-prefix-adjusted bank id."""
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import MoELayer, OffloadMoELayer
     from freetoken.utils.torch_utils import torch_dtype
@@ -317,12 +315,15 @@ def test_resident_moe_layer_builds_the_unquantized_gate_up_down_tree():
     experts = block.experts
     assert isinstance(experts, MoELayer) and not isinstance(experts, OffloadMoELayer)
     assert experts.prefix == "model.layers.1.mlp.experts"
-    state = block.state_dict()  # prefix-relative: the model root namespaces these under model.layers.N.mlp.
+    assert experts.layer_id == 0
+    assert experts._expert_banks is None
+    assert not any(key.startswith("experts.") for key in block.state_dict())
+    layout = experts.quant_method.layout()
     expected = {
-        "experts.gate_up_proj": (4, 2 * 32, 64),
-        "experts.down_proj": (4, 64, 32),
+        "gate_up": (2 * 32, 64),
+        "down": (64, 32),
     }
-    assert set(expected) <= set(state)
+    assert set(expected) == set(layout)
     for key, shape in expected.items():
-        assert tuple(state[key].shape) == shape, key
-        assert state[key].dtype is torch.bfloat16, key
+        assert layout[key].shape == shape, key
+        assert layout[key].dtype is torch.bfloat16, key

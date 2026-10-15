@@ -1,6 +1,8 @@
 """Unit tests for the reasoning-effort dialect layer (tokenizer/effort.py)."""
 from __future__ import annotations
 
+import pytest
+
 from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
     EffortProfile,
@@ -131,3 +133,37 @@ def test_probe_skips_rounds_whose_baseline_fails():
     profile = probe_effort_profile(render)
     assert profile.supported == frozenset({"xhigh", "medium", "low"})
     assert profile.consumes_effort
+
+
+def _numeric_render(kwargs, tools):
+    if not tools and not kwargs.get("enable_thinking"):
+        return "chat"
+    effort = kwargs.get("reasoning_effort", "high")
+    if isinstance(effort, str):
+        effort = {"low": 50, "high": 75, "max": 100}[effort]
+    if type(effort) is not int or not 1 <= effort <= 100:
+        raise ValueError("invalid budget")
+    return f"Reasoning Effort: {effort}"
+
+
+def test_probe_preserves_validated_numeric_budgets():
+    profile = probe_effort_profile(_numeric_render)
+    assert profile.integer_range == (1, 100)
+    assert profile.default == "high"
+    for budget in range(1, 101):
+        assert quantize_effort(budget, profile) == budget
+    for bad in (0, 101, -1, True, False, 1.0, 1.5):
+        with pytest.raises(ValueError, match="integer"):
+            quantize_effort(bad, profile)
+
+
+def test_numeric_capability_requires_validation_and_the_whole_range():
+    assert probe_effort_profile(_dsv4_render).integer_range is None
+    assert probe_effort_profile(lambda kw, tools: str(kw)).integer_range is None
+
+    def holes(kwargs, tools):
+        if kwargs.get("reasoning_effort") == 42:
+            raise ValueError("unsupported")
+        return _numeric_render(kwargs, tools)
+
+    assert probe_effort_profile(holes).integer_range is None

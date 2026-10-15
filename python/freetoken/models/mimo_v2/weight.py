@@ -109,10 +109,10 @@ def iter_weights(
     - ``model.mtp.*``, ``visual.*``, ``audio_encoder.*`` and ``speech_embeddings.*`` are
       never yielded; the strict loader would reject them.
     - MTP beyond the main layers is always skipped.
-    - unquantized checkpoints (``expert_quant == "none"``) keep experts resident:
+    - unquantized checkpoints (``expert_quant == "none"``) provide bank-source tensors:
       ``include_moe_experts=True`` yields per-layer stacked ``experts.gate_up_proj`` /
-      ``experts.down_proj``, the format the resident MoELayer consumes.
-    - NVFP4 checkpoints serve experts only through the offload cache's expert pieces, so
+      ``experts.down_proj`` in source dtype; bank packing performs the single target cast.
+    - NVFP4 checkpoints serve resident or offloaded experts through NVFP4 pieces, so
       ``include_moe_experts=True`` stays rejected there.
     """
     tp_size = get_tp_info().size
@@ -135,8 +135,8 @@ def iter_weights(
             reader.close()
         return
     assert not include_moe_experts, (
-        "MiMo v2 stores experts as NVFP4 and only supports the offload backend; experts "
-        "are loaded into the offload cache from their NVFP4 pieces."
+        "MiMo v2 stores experts as NVFP4; resident and offload banks load their NVFP4 "
+        "pieces, not dense expert tensors."
     )
     assert include_non_moe
     folder = download_hf_weight(model_path)

@@ -103,6 +103,16 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "dsv41_sparse",
+    BackendInfo(supported_types=frozenset({AttnType.DSV41})),
+)
+def create_dsv41_sparse_backend(config: ModelConfig):
+    from .dsv41_sparse import DSV41SparseAttnBackend
+
+    return DSV41SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
     BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
 )

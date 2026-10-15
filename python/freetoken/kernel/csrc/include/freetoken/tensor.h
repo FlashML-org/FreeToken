@@ -34,7 +34,7 @@ struct DeviceRef;
 
 inline constexpr auto kAnyDeviceID = -1;
 inline constexpr auto kAnySize = static_cast<int64_t>(-1);
-inline constexpr auto kNullSize = static_cast<int64_t>(0);
+inline constexpr auto kNullSize = static_cast<int64_t>(-1);
 inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
 inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
 
@@ -147,7 +147,7 @@ public:
     RuntimeCheck(!this->has_value(), "Size value already set");
     m_value = value;
   }
-  auto has_value() const -> bool { return m_value != 0; }
+  auto has_value() const -> bool { return m_value != details::kNullSize; }
   auto get_value() const -> std::optional<int64_t> {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
@@ -385,6 +385,10 @@ public:
   auto with_dtype(DTypeRef &&dtype) && -> TensorMatcher && {
     m_init_dtype();
     m_dtype.rebind(*dtype);
+    // no options given: keep the ones already set on the shared symbol
+    if constexpr (sizeof...(Ts) > 0) {
+      m_dtype->set_options<Ts...>();
+    }
     return std::move(*this);
   }
 
@@ -400,6 +404,9 @@ public:
   auto with_device(DeviceRef &&device) && -> TensorMatcher && {
     m_init_device();
     m_device.rebind(*device);
+    if constexpr (sizeof...(Codes) > 0) {
+      m_device->set_options<Codes...>();
+    }
     return std::move(*this);
   }
 

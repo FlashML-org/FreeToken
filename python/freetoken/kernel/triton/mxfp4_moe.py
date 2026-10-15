@@ -53,30 +53,36 @@ def mxfp4_splitk_gemv_kernel(
     expert_id = tl.load(expert_ids_ptr + pid_e)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < N
+    # w_ptr / s_ptr are int16 views: one element holds the bytes of columns 2p (low) and 2p+1 (high)
+    offs_p = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+    mask_p = offs_p < N // 2
 
     k_groups = K // 32
     kg0 = pid_k * K_GROUPS_PER_SPLIT
     kg1 = tl.minimum(kg0 + K_GROUPS_PER_SPLIT, k_groups)
 
-    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc_even = tl.zeros([BLOCK_N // 2], dtype=tl.float32)
+    acc_odd = tl.zeros([BLOCK_N // 2], dtype=tl.float32)
     w_base = expert_id * stride_we
     s_base = expert_id * stride_se
     x_base = pid_e * stride_xe
 
     for kg in range(kg0, kg1):
-        s_val = tl.load(s_ptr + s_base + kg * stride_sk + offs_n, mask=mask_n, other=0)
-        scale_f = _e8m0_scale(s_val)
+        s_pair = tl.load(s_ptr + s_base + kg * stride_sk + offs_p, mask=mask_p, other=0).to(tl.int32)
+        scale_even = _e8m0_scale(s_pair & 0xFF)
+        scale_odd = _e8m0_scale((s_pair >> 8) & 0xFF)
         for kk in tl.static_range(16):
             k_packed = kg * 16 + kk
-            w_byte = tl.load(
-                w_ptr + w_base + k_packed * stride_wk + offs_n, mask=mask_n, other=0
+            w_pair = tl.load(
+                w_ptr + w_base + k_packed * stride_wk + offs_p, mask=mask_p, other=0
             ).to(tl.int32)
-            lo = w_byte & 0x0F
-            hi = (w_byte >> 4) & 0x0F
             x_lo = tl.load(x_ptr + x_base + kg * 32 + kk * 2).to(tl.float32)
             x_hi = tl.load(x_ptr + x_base + kg * 32 + kk * 2 + 1).to(tl.float32)
-            acc += _fp4_table_lut(lo, lut_ptr) * scale_f * x_lo
-            acc += _fp4_table_lut(hi, lut_ptr) * scale_f * x_hi
+            acc_even += _fp4_table_lut(w_pair & 0x0F, lut_ptr) * scale_even * x_lo
+            acc_even += _fp4_table_lut((w_pair >> 4) & 0x0F, lut_ptr) * scale_even * x_hi
+            acc_odd += _fp4_table_lut((w_pair >> 8) & 0x0F, lut_ptr) * scale_odd * x_lo
+            acc_odd += _fp4_table_lut((w_pair >> 12) & 0x0F, lut_ptr) * scale_odd * x_hi
+    acc = tl.reshape(tl.join(acc_even, acc_odd), (BLOCK_N,))
 
     if HAS_BIAS and pid_k == 0:
         acc += tl.load(

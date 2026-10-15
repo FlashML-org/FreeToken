@@ -1,6 +1,6 @@
 """Qwen3.5 / 3.6 / 3.8 checkpoint reader.
 
-The dense pass reads every Linear module under the scheme the checkpoint's QuantConfig gives it, the same answer the model built its buffers from, so bf16, block-fp8, ModelOpt and llm-compressor exports in any mix all land as the model's state dict. Routed experts are read by the offload cache (``nvfp4_expert_spec`` / ``iter_expert_pieces``); only bf16 stacked experts and resident block-fp8 experts come from here.
+The dense pass reads every Linear module under the scheme the checkpoint's QuantConfig gives it, the same answer the model built its buffers from, so bf16, block-fp8, ModelOpt and llm-compressor exports in any mix all land as the model's state dict. Routed experts are read by the expert-bank loader (``nvfp4_expert_spec`` / ``iter_expert_pieces``); only the bf16 stacked experts it reads come from here.
 """
 
 from __future__ import annotations
@@ -241,9 +241,9 @@ def iter_weights(
     include_non_moe: bool,
     include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield the dense weights fused to the model's buffers, and the routed experts only where a resident path takes them from here: bf16 stacked experts as stored, block-fp8 experts restacked per layer.
+    """Yield the dense weights fused to the model's buffers, and with ``include_moe_experts`` the bf16 stacked experts as stored.
 
-    Per-expert NVFP4 experts always come from the offload cache's expert reader.
+    Block-fp8 and NVFP4 experts always come from the expert-bank reader.
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading supports TP=1 only")
@@ -253,8 +253,6 @@ def iter_weights(
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
         yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
-    if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
-        yield from _resident_fp8_experts(model_path, config)
 
 
 def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
@@ -327,7 +325,7 @@ def iter_weights_parallel(
 
 
 # ======================================================================================
-# Block-FP8 routed experts (Qwen3.5-35B-A3B-FP8): offload expert pieces and resident stacks.
+# Block-FP8 routed experts (Qwen3.5-35B-A3B-FP8): expert pieces.
 # ======================================================================================
 
 # Routed-expert checkpoint key (per-expert, un-fused). ``mtp.layers...`` is excluded by the
@@ -336,35 +334,6 @@ _FP8_EXPERT_KEY_RE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|{scale})$"
 )
-
-
-def _resident_fp8_experts(model_path, config):
-    from freetoken.kernel.triton.fp8_block_linear import FP8
-
-    B = 128
-    L, E, H, I, dense = _moe_dims(config)
-    shapes = {
-        "gate_up_proj": ((E, 2 * I, H), FP8),
-        "gate_up_scale_inv": ((E, 2 * I // B, H // B), torch.bfloat16),
-        "down_proj": ((E, H, I), FP8),
-        "down_scale_inv": ((E, H // B, I // B), torch.bfloat16),
-    }
-    layers: dict[int, dict[str, torch.Tensor]] = {}
-    placed = [0] * L
-    for li, e0, e1, piece in iter_expert_pieces(model_path, config, QuantKind.FP8_BLOCK, parallel=None):
-        stack = layers.setdefault(li, {n: torch.empty(shape, dtype=dt) for n, (shape, dt) in shapes.items()})
-        stack["gate_up_proj"][e0:e1, :I] = piece["gate"]
-        stack["gate_up_proj"][e0:e1, I:] = piece["up"]
-        stack["gate_up_scale_inv"][e0:e1, : I // B] = piece["gate_scale"]
-        stack["gate_up_scale_inv"][e0:e1, I // B :] = piece["up_scale"]
-        stack["down_proj"][e0:e1] = piece["down"]
-        stack["down_scale_inv"][e0:e1] = piece["down_scale"]
-        placed[li] += e1 - e0
-        if placed[li] == E:
-            pre = f"model.layers.{dense + li}.mlp.experts"
-            for name, tensor in layers.pop(li).items():
-                yield f"{pre}.{name}", tensor
-    assert not layers, f"incomplete resident fp8 experts for layers {sorted(layers)}"
 
 
 def _moe_dims(model_config):

@@ -152,6 +152,75 @@ def test_triton_fused_respects_input_dtype(dtype, tol):
         assert err < tol, f"{name} [{dtype}]: max abs err {err}"
 
 
+def test_single_pass_applies_the_previous_pre_and_hands_on_its_own():
+    """Single-pass mHC (DeepSeek-V4.1): the input mix uses ``pre_mix_in``, the gates
+    computed here are the next sublayer's pre; post/comb are unchanged from multi-pass."""
+    from freetoken.layers.mhc import (
+        mhc_fused_post_pre_single_pass,
+        mhc_gates,
+        mhc_mix_input,
+        mhc_pre_single_pass,
+    )
+
+    fn, scale, base = _weights(seed=21)
+    res = _residual(seed=22)
+    x = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    pre_in = torch.rand(T, N, dtype=torch.float32)
+    post0, comb0, _ = mhc_pre(res, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN)
+
+    r1, p1, c1, pre1, li1 = mhc_fused_post_pre_single_pass(
+        x, res, post0, comb0, pre_in, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
+    )
+    r_ref = mhc_post(x, res, post0, comb0)
+    pre_ref, p_ref, c_ref = mhc_gates(r_ref, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN)
+    assert torch.equal(r1, r_ref) and torch.equal(p1, p_ref) and torch.equal(c1, c_ref)
+    assert torch.equal(pre1, pre_ref)
+    assert torch.equal(li1, mhc_mix_input(r_ref, pre_in))
+    # the multi-pass input would have used pre_ref, not pre_in
+    assert not torch.equal(li1, mhc_mix_input(r_ref, pre_ref))
+    # a one-hot pre picks one stream (the model's seed for the chain)
+    one_hot = torch.zeros(T, N)
+    one_hot[:, 0] = 1.0
+    _, _, _, li0 = mhc_pre_single_pass(res, one_hot, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN)
+    assert torch.equal(li0, res[:, 0])
+    # no post on the first sublayer: the streams pass through untouched
+    r0, *_ = mhc_fused_post_pre_single_pass(
+        x, res, None, None, one_hot, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
+    )
+    assert torch.equal(r0, res)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("t,hidden,with_post", [(1, 64, True), (9, 64, True), (3, 5120, True), (3, 5120, False)])
+def test_triton_single_pass_matches_torch(t, hidden, with_post):
+    from freetoken.layers.mhc import mhc_fused_post_pre_single_pass_torch
+    from freetoken.kernel.triton.mhc import mhc_fused_post_pre_single_pass_triton
+
+    torch.manual_seed(23)
+    mix = 2 * N + N * N
+    fn = torch.randn(mix, N * hidden, dtype=torch.float32, device="cuda") * 0.05
+    scale = torch.rand(3, dtype=torch.float32, device="cuda") + 0.5
+    base = torch.randn(mix, dtype=torch.float32, device="cuda") * 0.3
+    res = torch.randn(t, N, hidden, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
+    pre_in = torch.rand(t, N, dtype=torch.float32, device="cuda")
+    post0 = torch.rand(t, N, 1, dtype=torch.float32, device="cuda") * POST_MULT if with_post else None
+    comb0 = torch.softmax(torch.randn(t, N, N, device="cuda"), dim=-1) if with_post else None
+
+    ref = mhc_fused_post_pre_single_pass_torch(
+        x, res, post0, comb0, pre_in, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
+    )
+    got = mhc_fused_post_pre_single_pass_triton(
+        x, res, post0, comb0, pre_in, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
+    )
+    names = ("residual", "post", "comb", "pre_new", "layer_input")
+    tols = (2e-2, 2e-3, 2e-3, 2e-3, 2e-2)
+    for name, r, g, tol in zip(names, ref, got, tols):
+        assert g.shape == r.shape, (name, g.shape, r.shape)
+        err = (g.float() - r.float()).abs().max().item()
+        assert err < tol, f"{name}: max abs err {err}"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_triton_pre_only_matches_torch():
     """HAS_POST=False path (layer 0's standalone hc_pre through the fused kernel)."""
@@ -176,3 +245,31 @@ def test_triton_pre_only_matches_torch():
     assert (got_post.float() - ref_post.float()).abs().max().item() < 2e-3
     assert (got_comb.float() - ref_comb.float()).abs().max().item() < 2e-3
     assert (got_li.float() - ref_li.float()).abs().max().item() < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_mhc_split_preserves_chunked_results_and_graph_replay():
+    from freetoken.kernel.triton.mhc import mhc_fused_post_pre_single_pass_triton as fused
+
+    torch.manual_seed(26)
+    hidden, tokens = 5120, 7
+    res = torch.randn(tokens, N, hidden, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    post = torch.rand(tokens, N, 1, device="cuda")
+    comb = torch.softmax(torch.randn(tokens, N, N, device="cuda"), -1)
+    pre = torch.rand(tokens, N, device="cuda")
+    fn = torch.randn(2 * N + N * N, N * hidden, device="cuda") * 0.05
+    scale, base = torch.ones(3, device="cuda"), torch.zeros(2 * N + N * N, device="cuda")
+    def run(lo, hi):
+        return fused(x[lo:hi], res[lo:hi], post[lo:hi], comb[lo:hi], pre[lo:hi], fn, scale, base,
+                     RMS_EPS, EPS, POST_MULT, SINKHORN)
+    whole = run(0, tokens)
+    chunks = [run(0, 2), run(2, tokens)]
+    for i, expected in enumerate(whole):
+        assert torch.equal(expected, torch.cat([chunk[i] for chunk in chunks]))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(0, tokens)
+    graph.replay()
+    for got, expected in zip(captured, whole):
+        assert torch.equal(got, expected)

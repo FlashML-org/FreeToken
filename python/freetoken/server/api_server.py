@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -34,6 +36,7 @@ from freetoken.utils import (
     load_generation_sampling,
 )
 from pydantic import BaseModel
+from starlette.datastructures import Headers
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
@@ -417,6 +420,39 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
     )
 
 
+class _ApiKeyMiddleware:
+    def __init__(self, app, api_key: str) -> None:
+        self.app = app
+        self._digest = hashlib.sha256(api_key.encode()).digest()
+
+    def _matches(self, value: str | None) -> bool:
+        # compare digests so the time taken does not depend on the key length
+        return value is not None and hmac.compare_digest(
+            hashlib.sha256(value.encode()).digest(), self._digest
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket") or scope["path"] == "/health":
+            return await self.app(scope, receive, send)
+        headers = Headers(scope=scope)
+        scheme, _, token = headers.get("authorization", "").partition(" ")
+        if (scheme.lower() == "bearer" and self._matches(token)) or self._matches(
+            headers.get("x-api-key")
+        ):
+            return await self.app(scope, receive, send)
+        await JSONResponse({"error": "Unauthorized"}, status_code=401)(scope, receive, send)
+
+
+def install_api_key(app: FastAPI, api_key: str | None) -> None:
+    """Require ``api_key`` on every route but /health.
+
+    Run it before install_cors, so CORS answers preflights and adds its headers to 401s."""
+    if api_key is None:
+        return
+    app.add_middleware(_ApiKeyMiddleware, api_key=api_key)
+    logger.info("API key required on every route except /health")
+
+
 app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifespan)
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
@@ -563,8 +599,12 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
         or pools.get("num_pages", 0) or 0
     )
     page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
-    is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
-    swa_page_size = page_size if is_dsv4 else 1
+    from freetoken.kvcache.cache_status import window_pool_spec
+
+    spec = window_pool_spec(config)
+    if spec is None:
+        raise ValueError("swa_full_tokens_ratio requested but this model has no resizable window pool")
+    swa_page_size = spec.page_size
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
@@ -604,12 +644,16 @@ async def cache_rebuild(req: CacheRebuildRequest):
             {"status": "failed", "error": "swa_full_tokens_ratio must be in (0, 1]"},
             status_code=422,
         )
+    try:
+        num_swa_pages = _resolve_num_swa_pages(state, req)
+    except ValueError as exc:
+        return JSONResponse({"status": "failed", "error": str(exc)}, status_code=422)
     result = await dispatch_rebuild(
         state,
         moe_cache_size=req.moe_cache_size,
         num_pages=req.num_pages,
         num_mamba_slots=req.num_mamba_slots,
-        num_swa_pages=_resolve_num_swa_pages(state, req),
+        num_swa_pages=num_swa_pages,
         mode=req.mode,
         timeout=req.timeout,
     )
@@ -739,11 +783,11 @@ def cache_geometry(state: Any) -> dict:
     # the internal currency), else the load-time meta value. 0.0 for models without a window pool.
     swa_full_tokens_ratio = float(getattr(state, "swa_full_tokens_ratio", 0.0) or 0.0)
     last_swa_pages = last.get("num_swa_pages")
-    if last_swa_pages:
-        is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
-        full = num_pages if is_dsv4 else num_pages * page_size
+    swa_page_size = int(pools.get("swa_page_size", 0) or 0)
+    if last_swa_pages and swa_page_size:
+        full = num_pages * page_size
         if full > 0:
-            swa_full_tokens_ratio = min(1.0, last_swa_pages / full)
+            swa_full_tokens_ratio = min(1.0, last_swa_pages * swa_page_size / full)
     try:
         model_config = config.model_config
         num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -785,9 +829,8 @@ def cache_geometry(state: Any) -> dict:
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
         "unit_bytes": unit_bytes,
         "swa_full_tokens_ratio": swa_full_tokens_ratio,
-        # The window pool's page unit for num_swa_pages: DSV4 = P (== page_size), radix-SWA = 1
-        # token, 0 for models without a window pool. Lets a client denominate the swa control.
-        "swa_page_size": int(pools.get("swa_page_size", 0) or 0),
+        # The pool's window page unit; 0 for models without a resizable window pool.
+        "swa_page_size": swa_page_size,
         # Concrete current window size in that unit (usable pages): the last rebuild's value if it
         # pinned/derived one, else the load-time pool size. 0 for models without a window pool.
         "num_swa_pages": int(last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0),
@@ -876,7 +919,7 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int) -> None:
+def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -909,7 +952,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # /health and echoes the same load progress the desktop app polls for. A ^C during that
         # wait is a stop, not a crash -- exit through the teardown below, not a traceback.
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(run_shell(origin, connect_grace=30.0))
+            asyncio.run(run_shell(origin, connect_grace=30.0, api_key=api_key))
     finally:
         server.should_exit = True
         thread.join(timeout=15)
@@ -951,6 +994,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     host = config.server_host
     port = config.server_port
 
+    install_api_key(app, config.api_key)
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
@@ -1037,7 +1081,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     ).start()
 
     if run_shell:
-        _serve_and_run_shell(host, port)
+        _serve_and_run_shell(host, port, config.api_key)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
     uvicorn.run(app, host=host, port=port)

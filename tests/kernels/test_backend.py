@@ -105,3 +105,39 @@ def test_explicit_flashinfer_backend_error_explains_unavailable_import(monkeypat
     )
     with pytest.raises(RuntimeError, match=r"unavailable \(not installed or failed to import"):
         engine._validate_attention_backend_choice(config, None, frozenset({AttnType.FULL}))
+
+
+@pytest.mark.parametrize("probe", ["is_flashinfer_installed", "is_sgl_kernel_installed", "is_vllm_installed"])
+def test_rocm_never_imports_cuda_only_backends(monkeypatch, probe):
+    from freetoken.kernel import backend
+
+    monkeypatch.setattr(backend, "is_rocm", lambda: True)
+    monkeypatch.setattr(importlib, "import_module", lambda *_: pytest.fail("CUDA import on ROCm"))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *_: pytest.fail("CUDA probe on ROCm"))
+    check = getattr(backend, probe)
+    check.cache_clear()
+    try:
+        assert check() is False
+    finally:
+        check.cache_clear()
+
+
+def test_stale_cpu_moe_abi_disables_auto_cpu_selection(monkeypatch):
+    from freetoken import kernel
+    from freetoken.engine.engine import _cpu_moe_executor_viable
+
+    monkeypatch.setattr(kernel, "_cpu_moe", SimpleNamespace(), raising=False)
+    assert not _cpu_moe_executor_viable(SimpleNamespace(hidden_act="silu", expert_quant="none"))
+
+
+def test_stale_cpu_moe_abi_errors_before_allocating_banks(monkeypatch):
+    from freetoken import kernel
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    import torch
+
+    monkeypatch.setattr(kernel, "_cpu_moe", SimpleNamespace(), raising=False)
+    with pytest.raises(RuntimeError, match="predates the shared-IO executor ABI"):
+        CpuMoeExecutor(
+            SimpleNamespace(), top_k=1, activation="silu", apply_router_weight_on_input=False,
+            num_threads=1, max_tokens=1, device=torch.device("cpu"),
+        )

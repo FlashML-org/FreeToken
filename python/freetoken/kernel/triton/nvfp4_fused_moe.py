@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.kernel.triton.nvfp4_linear import _nvfp4_pair_f32
 
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -131,6 +132,31 @@ def _decode_nvfp4_moe_kernel(
 
 
 @triton.jit
+def _bf16x4_to_f32(v):
+    """Four bf16 packed in one int64 -> four fp32 (a bf16 is the high half of its fp32)."""
+    lo = v.to(tl.int32)
+    hi = (v >> 32).to(tl.int32)
+    return (
+        (lo << 16).to(tl.float32, bitcast=True),
+        (lo & -65536).to(tl.float32, bitcast=True),
+        (hi << 16).to(tl.float32, bitcast=True),
+        (hi & -65536).to(tl.float32, bitcast=True),
+    )
+
+
+@triton.jit
+def _f16x4_to_f32(v):
+    lo = v.to(tl.int32)
+    hi = (v >> 32).to(tl.int32)
+    return (
+        lo.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        (lo >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        hi.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        (hi >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+    )
+
+
+@triton.jit
 def _decode_nvfp4_marlin_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
@@ -139,7 +165,6 @@ def _decode_nvfp4_marlin_kernel(
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
-    lut_ptr,           # [16] fp32
     total_routes,
     N,
     K,
@@ -151,9 +176,11 @@ def _decode_nvfp4_marlin_kernel(
     stride_tw_m, stride_tw_k,
     stride_tid_m, stride_tid_k,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_KW: tl.constexpr,  # int32 words per K-iter (covers 8*KW k-values)
+    BLOCK_SIZE_KW: tl.constexpr,  # int32 words per tile (covers 8*KW k-values)
+    UNROLL: tl.constexpr,         # tiles per loop trip
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
+    A_WIDE: tl.constexpr,         # activation rows are contiguous bf16/fp16, 16-byte aligned
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
 ):
@@ -165,13 +192,18 @@ def _decode_nvfp4_marlin_kernel(
       * Loads the FP4 codes as **int32 words** (8 codes / 4 bytes per element) so the HBM
         read issues wide coalesced transactions -- the single biggest lever for the
         gate/up GEMM, whose mem-only ceiling jumps from ~65% to ~85% of peak read BW.
-      * **Defers** the K reduction: the ``[BLOCK_KW, BLOCK_N]`` partial accumulates across
+      * **Defers** the K reduction: the ``[BLOCK_N, BLOCK_KW]`` partial accumulates across
         *all* K-iters and is reduced once at the end, removing the per-iter ``tl.sum``
         barrier so the weight loads of successive iters pipeline.
 
-    The e2m1 codes share one fp8 block scale per 16 k-values (== 2 words), applied per
-    word. Mirrors the fast kernel's route/tile mapping and epilogue so it is a drop-in
-    decode GEMV (CUDA-graph safe: fixed shapes, no host sync)."""
+    Every load in the K-loop is shaped so the compiler keeps the whole loop in the word
+    tile's register layout (no shared-memory layout conversions): the block scales are
+    loaded as a half tile and interleaved in registers (one e4m3 scale per 16 k-values
+    == 2 words), the e2m1 codes are decoded with the fp16 bit trick of
+    :func:`_nvfp4_pair_f32` (2^14 folded into the scale), and with ``A_WIDE`` the 8
+    activations of a word are read as two int64 and unpacked by shifts. Mirrors the fast
+    kernel's route/tile mapping and epilogue so it is a drop-in decode GEMV (CUDA-graph
+    safe: fixed shapes, no host sync)."""
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
     token_id = route_id // TOP_K
@@ -185,37 +217,70 @@ def _decode_nvfp4_marlin_kernel(
     a_base = a_ptr + a_row * stride_am
 
     offs_kw = tl.arange(0, BLOCK_SIZE_KW)
+    offs_kh = tl.arange(0, BLOCK_SIZE_KW // 2)
     K_WORDS = K // 8
-    partial = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+    partial = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
 
-    packed_slot = packed_ptr + slot * stride_pe
-    scale_slot = scale_ptr + slot * stride_se
-    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW)):
-        widx = kw_start * BLOCK_SIZE_KW + offs_kw
-        w_mask = widx < K_WORDS
+    p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
+    s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
+        for u in tl.static_range(UNROLL):
+            widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
+            w_mask = widx < K_WORDS
+            word = tl.load(
+                p_base + widx[None, :] * stride_pkw,
+                mask=n_mask[:, None] & w_mask[None, :], other=0,
+            )
+            hidx = (kw_start + u) * (BLOCK_SIZE_KW // 2) + offs_kh
+            s_ptrs = s_base + hidx[None, :] * stride_sblk
+            s_mask = n_mask[:, None] & (hidx[None, :] < K_WORDS // 2)
+            if e4m3_native_cx():
+                s_half = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+            else:
+                s_half = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            s_half = s_half * 16384.0
+            scale = tl.interleave(s_half, s_half)
 
-        word = tl.load(
-            packed_slot + offs_n[None, :] * stride_pn + widx[:, None] * stride_pkw,
-            mask=w_mask[:, None] & n_mask[None, :], other=0,
-        )
-        # 8 codes/word fall in the same or adjacent 16-wide block -> one scale per word.
-        s_ptrs = scale_slot + offs_n[None, :] * stride_sn + (widx[:, None] // 2) * stride_sblk
-        s_mask = w_mask[:, None] & n_mask[None, :]
-        if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
-        else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            if A_WIDE:
+                a64 = a_base.to(tl.pointer_type(tl.int64), bitcast=True)
+                v = tl.load(
+                    a64 + widx[:, None] * 2 + tl.arange(0, 2)[None, :],
+                    mask=w_mask[:, None], other=0,
+                )
+                v0, v1 = tl.split(v)
+                if a_ptr.dtype.element_ty == tl.bfloat16:
+                    a0, a1, a2, a3 = _bf16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _bf16x4_to_f32(v1)
+                else:
+                    a0, a1, a2, a3 = _f16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _f16x4_to_f32(v1)
+            else:
+                kbase = 8 * widx
+                a0 = tl.load(a_base + kbase * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a1 = tl.load(a_base + (kbase + 1) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a2 = tl.load(a_base + (kbase + 2) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a3 = tl.load(a_base + (kbase + 3) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a4 = tl.load(a_base + (kbase + 4) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a5 = tl.load(a_base + (kbase + 5) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a6 = tl.load(a_base + (kbase + 6) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a7 = tl.load(a_base + (kbase + 7) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
 
-        kbase = 8 * widx
-        acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
-        for j in tl.static_range(8):
-            code = (word >> (4 * j)) & 0xF
-            b = tl.load(lut_ptr + code)
-            a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
-            acc_w += a_j[:, None] * b
-        partial += acc_w * scale
+            acc_w = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+            b0, b4 = _nvfp4_pair_f32(word)
+            b1, b5 = _nvfp4_pair_f32(word >> 4)
+            b2, b6 = _nvfp4_pair_f32(word >> 8)
+            b3, b7 = _nvfp4_pair_f32(word >> 12)
+            acc_w += a0[None, :] * b0
+            acc_w += a1[None, :] * b1
+            acc_w += a2[None, :] * b2
+            acc_w += a3[None, :] * b3
+            acc_w += a4[None, :] * b4
+            acc_w += a5[None, :] * b5
+            acc_w += a6[None, :] * b6
+            acc_w += a7[None, :] * b7
+            partial += acc_w * scale
 
-    accumulator = tl.sum(partial, axis=0)
+    accumulator = tl.sum(partial, axis=1)
     g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
     accumulator = accumulator * g
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from freetoken.attention import AttnType
+
 
 def test_kv_usage_pages_excludes_evictable_prefix_cache():
     # page_usage now lives on the CacheManagerLike interface (polymorphic vs DSV4); test the
@@ -53,10 +55,15 @@ def _fake_engine(swa=True, moe=True, mamba=True):
         config=SimpleNamespace(
             page_size=16,
             cache_type="swa_radix",
-            model_config=SimpleNamespace(dsv4_args=None, has_swa_attention=swa),
+            max_running_req=1,
+            model_config=SimpleNamespace(
+                dsv4_args=None, has_swa_attention=swa,
+                kv_cache_group_specs=lambda: [SimpleNamespace(attn_type=AttnType.SWA, is_swa=True, sliding_window=128)] if swa else [],
+                swa_attention_group=lambda: SimpleNamespace(sliding_window=128),
+            ),
         ),
         kv_cache=SimpleNamespace(
-            swa_num_tokens=513, unit_bytes=lambda: (1 << 20, 1 << 21)
+            window_pages=512, swa_num_tokens=513, unit_bytes=lambda: (1 << 20, 1 << 21)
         ),
         moe_offload_cache=SimpleNamespace(
             cache_size=24, num_layers=8, num_experts=16,

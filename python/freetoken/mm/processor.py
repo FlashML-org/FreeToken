@@ -200,7 +200,8 @@ def get_mm_processor(model_path: str, mm: MultimodalConfig | None = None) -> MMP
     served = [e for e in spec.encoders if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders]
     if spec.mm_processor is None or not served:
         return None
-    check_mm_pad_shift(config.text_config.vocab_size)
+    # families with a flat checkpoint config (deepseek_v4) carry vocab_size at the top level
+    check_mm_pad_shift(getattr(config, "text_config", config).vocab_size)
     module, _, cls = spec.mm_processor.partition(":")
     return getattr(importlib.import_module(module), cls)(config, model_path, mm)
 

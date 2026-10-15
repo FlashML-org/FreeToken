@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
@@ -23,6 +23,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
+    hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -32,6 +34,9 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
+    # prompt's last window; "exact" runs them on every token.
+    swa_decoder_replay: str = "bounded"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -103,7 +108,7 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return cached_load_hf_config(self.model_path, self.hf_overrides)
 
     @cached_property
     def model_spec(self) -> ModelSpec:
@@ -142,7 +147,7 @@ class EngineConfig:
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        return self.model_config.rotary_config.table_positions
 
     @property
     def max_forward_len(self) -> int:

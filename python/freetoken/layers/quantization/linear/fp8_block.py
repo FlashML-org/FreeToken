@@ -1,4 +1,4 @@
-"""fp8 e4m3 weight with 128x128 block scales (DeepSeek-V3 style)."""
+"""fp8 e4m3 weight with square block scales: 128x128 (DeepSeek-V3 style) or 32x32 (DeepSeek-V4.1)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind
+from ..scheme import FP8_BLOCK, QuantKind, fp8_block_size
 from .base import LinearConfig, LinearKernel, LinearMethod
 
 FP8 = torch.float8_e4m3fn
@@ -16,6 +16,11 @@ E8M0 = torch.float8_e8m0fnu
 
 def _e8m0(cfg: LinearConfig) -> bool:
     return cfg.scheme is not None and cfg.scheme.weight.scale == "e8m0"
+
+
+def layer_block_size(layer: Any) -> int:
+    """The block edge a finalized layer was declared with: ``K / (scale columns)``, exact by construction."""
+    return layer.weight.shape[1] // layer.weight_scale_inv.shape[1]
 
 
 class Dsv4Fp8BlockLinearKernel(LinearKernel):
@@ -29,7 +34,7 @@ class Dsv4Fp8BlockLinearKernel(LinearKernel):
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
 
-        return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias)
+        return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias, block=layer_block_size(layer))
 
 
 class TritonFp8BlockLinearKernel(LinearKernel):
@@ -38,7 +43,11 @@ class TritonFp8BlockLinearKernel(LinearKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
-        return "reads float block scales; e8m0 codes go to the dsv4 kernel" if _e8m0(cfg) else None
+        if _e8m0(cfg):
+            return "reads float block scales; e8m0 codes go to the dsv4 kernel"
+        if fp8_block_size(cfg.scheme) != FP8_BLOCK:
+            return f"float-scale kernel serves {FP8_BLOCK}x{FP8_BLOCK} blocks only"
+        return None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear
@@ -52,9 +61,10 @@ class Fp8BlockLinearMethod(LinearMethod):
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
-        if g.in_features % BLOCK or any(o % BLOCK for o in g.output_sizes):
-            raise ValueError(f"block-fp8 needs in/out sizes divisible by {BLOCK}, got K={g.in_features} N={g.output_sizes}")
+        block = fp8_block_size(g.scheme)
+        if g.in_features % block or any(o % block for o in g.output_sizes):
+            raise ValueError(f"block-fp8 needs in/out sizes divisible by {block}, got K={g.in_features} N={g.output_sizes}")
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         # e8m0 codes stay codes for the dsv4 kernel; float scales are bf16 as the readers push them today
         scale_dtype = E8M0 if _e8m0(g) else torch.bfloat16
-        layer.weight_scale_inv = torch.empty(g.out_features // BLOCK, g.in_features // BLOCK, dtype=scale_dtype)
+        layer.weight_scale_inv = torch.empty(g.out_features // block, g.in_features // block, dtype=scale_dtype)

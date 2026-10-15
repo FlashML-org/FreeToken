@@ -215,7 +215,8 @@ class SWARadixCache:
         # then a live (non-tombstone) leaf for the in-window remainder (never a tombstone leaf --
         # the clamp + the free_swa -page_size margin guarantee a live tail).
         if total < insert_len:
-            suffix_ids = input_ids[total:]
+            # Both suffix nodes can share this copy without retaining the request buffer.
+            suffix_ids = input_ids[total:].clone()
             suffix_kv = kv_indices[total:].clone()
             boundary = max(0, min(swa_evicted_seqlen, insert_len) - total)
             boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))

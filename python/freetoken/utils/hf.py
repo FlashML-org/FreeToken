@@ -1,9 +1,8 @@
+import copy
 import functools
 import json
 import os
-from typing import Any
-
-from typing import FrozenSet
+from typing import Any, FrozenSet, Mapping
 
 from huggingface_hub import hf_hub_download, snapshot_download
 from huggingface_hub.utils import EntryNotFoundError
@@ -235,20 +234,40 @@ def _load_hf_config(model_path: str) -> Any:
     return config
 
 
-def cached_load_hf_config(model_path: str) -> PretrainedConfig:
+def _with_overrides(config: Any, data: dict, overrides: Mapping[str, Any]) -> dict:
+    merged = dict(data)
+    for key, value in overrides.items():
+        section = getattr(config, key, None)
+        if isinstance(value, Mapping) and isinstance(section, (PretrainedConfig, RawConfigShim)):
+            merged[key] = _with_overrides(section, merged.get(key) or {}, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def cached_load_hf_config(
+    model_path: str, overrides: Mapping[str, Any] | None = None
+) -> PretrainedConfig:
+    """A fresh copy of the checkpoint's config with ``overrides`` applied as vLLM's --hf-overrides
+    does: nested config sections update key by key, every other value is replaced whole."""
     # A .gguf file (or an FTW dir converted from one) carries its own metadata (no HF
     # config.json); return a shim the model registry dispatches on instead of a
     # PretrainedConfig.
     from freetoken.models.gguf.reader import gguf_config_source
 
     if (gguf_src := gguf_config_source(model_path)) is not None:
+        if overrides:
+            raise ValueError("--hf-overrides applies to a HF config.json; a GGUF carries its own metadata")
         from freetoken.models.gguf.config import build_gguf_shim
 
         return build_gguf_shim(gguf_src)
     config = _load_hf_config(model_path)
+    data = config.to_dict()
+    if overrides:
+        data = _with_overrides(config, data, overrides)
     if isinstance(config, RawConfigShim):
-        return RawConfigShim(config.to_dict())
-    return type(config)(**config.to_dict())
+        return RawConfigShim(data)
+    return type(config)(**data)
 
 
 def _weight_allow_patterns(repo_id: str) -> list[str]:

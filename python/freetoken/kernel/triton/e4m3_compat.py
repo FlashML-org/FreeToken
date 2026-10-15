@@ -110,6 +110,20 @@ def e4m3_u8_to_f16_x128(v):
 
 
 @jit
+def e4m3_f32_to_u8(x):
+    """Encode an fp32 value that already sits on the e4m3 grid (see :func:`round_e4m3`, |x| <= 448)
+    into its e4m3 bit pattern (uint8). Normals: fp32 exponent rebased 127 -> 7 with the top three
+    mantissa bits; subnormals (|x| < 2^-6, grid 2^-9): mantissa = |x| / 2^-9, exponent field 0."""
+    b = x.to(tl.uint32, bitcast=True)
+    sign = ((b >> 31) & 1).to(tl.uint8) << 7
+    exp = ((b >> 23) & 0xFF).to(tl.int32) - 127 + 7
+    man = ((b >> 20) & 0x7).to(tl.uint8)
+    normal = (exp.to(tl.uint8) << 3) | man
+    sub = (tl.abs(x) * 512.0).to(tl.uint8)  # 0..7 on the 2^-9 grid
+    return sign | tl.where(tl.abs(x) >= 0.015625, normal, sub)
+
+
+@jit
 def round_e4m3(x):
     """Round fp32 onto the e4m3 value grid (RNE), fp32 -> fp32, in a SINGLE
     rounding step -- an fp32 -> fp16 -> 3-bit chain double-rounds when the fp16

@@ -367,7 +367,7 @@ def _offload_engine_config(**overrides):
             num_layers=10,
             num_moe_layers=10,
             num_experts=8,
-            expert_quant="nvfp4",  # quantized experts -> must resolve to an offload backend
+            expert_quant="nvfp4",
             moe_strategy="auto",
         ),
     )
@@ -389,7 +389,7 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
-def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
+def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend(monkeypatch):
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
     args.py's parse-time default only fires when the backend is *already*
@@ -400,9 +400,12 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     moe_cache_auto=True, so _init_offload_moe_cache's _require_offload_cache_size guard is never
     reached with moe_cache_size still 0.
     """
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
     from freetoken.moe import is_offload_moe_strategy
 
+    # a unified-memory host (GB10) resolves auto to fused instead
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
     config = _offload_engine_config()
     _adjust_config(config)
 
@@ -412,6 +415,117 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert is_offload_moe_strategy(config.moe_strategy)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
+
+
+@pytest.mark.parametrize("native_state", ["unavailable", "stale", "wrong-format", "wrong-activation", "current"])
+def test_recommending_profile_only_upgrades_with_viable_cpu_executor(tmp_path, monkeypatch, native_state):
+    import json
+    from freetoken import kernel
+    from freetoken.engine import engine
+    from freetoken.moe.bench_profile import load_backend_recommendation
+
+    profile = tmp_path / "benchbw.json"
+    profile.write_text(json.dumps({"version": 5, "gpu": {"name": "FAKE GPU"}, "dtypes": {"bf16": "hybrid"}}))
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", str(profile))
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: ("FAKE GPU", None))
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    native = SimpleNamespace(
+        weight_formats=lambda: ["nvfp4"] if native_state == "wrong-format" else ["bf16"],
+        memops_probe=lambda *_: True, host_func_capture_safe=lambda: True, kernel_io_probe=lambda *_: "",
+        max_generic_act_id=lambda: 2 if native_state == "wrong-activation" else 4,
+    )
+    if native_state == "unavailable":
+        native = None
+    elif native_state == "stale":
+        native = SimpleNamespace(max_generic_act_id=lambda: 4)
+    monkeypatch.setattr(kernel, "_cpu_moe", native, raising=False)
+    config = _offload_engine_config()
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.expert_quant = "none"
+    config.model_config.hidden_act = "swiglu_clamp" if native_state == "wrong-activation" else "silu"
+    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU") == "hybrid"
+
+    engine._adjust_config(config)
+
+    assert config.moe_strategy == ("hybrid" if native_state == "current" else "offload")
+    assert config.moe_cache_auto is True
+
+
+@pytest.mark.parametrize("strategy", ["cpu", "hybrid", "offload", "auto"])
+@pytest.mark.parametrize("native", [None, SimpleNamespace(max_generic_act_id=lambda: 4)])
+def test_explicit_cpu_paths_fail_before_bank_and_cache_allocation(monkeypatch, strategy, native):
+    from freetoken import kernel
+    from freetoken.engine import engine
+
+    monkeypatch.setattr(kernel, "_cpu_moe", native, raising=False)
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: (None, None))
+    config = _offload_engine_config(moe_strategy=strategy, moe_cpu_layers="1" if strategy in ("offload", "auto") else None)
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.expert_quant = "none"
+    config.model_config.hidden_act = "silu"
+    config.model_config.decode_target = "hybrid" if strategy == "hybrid" else "cpu"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("allocation/pinning reached before CPU executor admission")
+
+    monkeypatch.setattr(engine, "load_expert_banks", forbidden)
+    monkeypatch.setattr(engine, "OffloadMoeCache", forbidden)
+    monkeypatch.setattr(engine, "_check_pin_budget", forbidden)
+    monkeypatch.setattr(engine, "shared_offload_method", lambda _model: None)
+    with pytest.raises(RuntimeError, match="current _cpu_moe shared-IO ABI"):
+        engine._adjust_config(config)
+    # Also cover direct cache initialization callers that bypass config adjustment.
+    stub = SimpleNamespace(model=None, _host_tables_bytes=0)
+    with pytest.raises(RuntimeError, match="current _cpu_moe shared-IO ABI"):
+        engine.Engine._init_offload_moe_cache(stub, config)
+
+
+def test_auto_unified_memory_discards_cpu_layers_before_native_admission(monkeypatch):
+    from freetoken import kernel
+    from freetoken.engine import engine
+
+    monkeypatch.setattr(kernel, "_cpu_moe", None, raising=False)
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: True)
+    monkeypatch.setattr(engine, "_profile_gpu", lambda: (None, None))
+    monkeypatch.setattr(engine, "_require_cpu_moe_executor", lambda _mc: pytest.fail("discarded CPU flags required native admission"))
+    config = _offload_engine_config(moe_strategy="auto", moe_cpu_layers="1")
+    object.__setattr__(config, "attention_backend", "triton")
+    config.model_config.expert_quant = "none"
+    config.model_config.hidden_act = "silu"
+
+    engine._adjust_config(config)
+
+    assert config.moe_strategy == "fused"
+    assert config.moe_cpu_layers is None
+
+
+def test_mxfp4_cpu_admission_requires_its_native_format(monkeypatch):
+    from freetoken import kernel
+    from freetoken.engine.engine import _cpu_moe_executor_viable
+
+    native = SimpleNamespace(
+        weight_formats=lambda: ["bf16"], memops_probe=lambda *_: True,
+        host_func_capture_safe=lambda: True, kernel_io_probe=lambda *_: "",
+    )
+    monkeypatch.setattr(kernel, "_cpu_moe", native, raising=False)
+    mc = SimpleNamespace(expert_quant="none", moe_weight_format="mxfp4", hidden_act="gpt_oss_swiglu")
+    assert not _cpu_moe_executor_viable(mc)
+    native.weight_formats = lambda: ["mxfp4_triton"]
+    assert _cpu_moe_executor_viable(mc)
+    mc.hidden_act = "unknown"
+    assert not _cpu_moe_executor_viable(mc)
+
+
+def test_zero_cpu_layers_does_not_require_native_executor(monkeypatch):
+    from freetoken import kernel
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setattr(kernel, "_cpu_moe", None, raising=False)
+    config = _offload_engine_config(moe_strategy="offload", moe_cpu_layers="0")
+    object.__setattr__(config, "attention_backend", "triton")
+    _adjust_config(config)
+    assert config.moe_strategy == "offload"
 
 
 def test_page_table_width_covers_whole_trailing_pages():
@@ -430,13 +544,17 @@ def test_page_table_width_covers_whole_trailing_pages():
             assert w > last_col and w % 32 == 0
 
 
-def _generic_rotary_cfg(max_position, override):
+def _generic_rotary_cfg(max_position, override, scaling=None):
     from types import SimpleNamespace
+
+    from freetoken.models.config import RotaryConfig
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
         has_swa_attention=False, has_linear_attention=False,
-        rotary_config=SimpleNamespace(max_position=max_position),
+        rotary_config=RotaryConfig(
+            head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
+        ),
     )
 
     class Cfg:
@@ -474,6 +592,19 @@ def test_adjust_config_allows_override_at_rope_table_boundary():
     from freetoken.engine.engine import _adjust_config
 
     _adjust_config(_generic_rotary_cfg(max_position=1024, override=1024))  # must not raise
+
+
+YARN_4X = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024}
+
+
+def test_adjust_config_allows_override_to_the_yarn_extended_table():
+    # A YaRN override that leaves max_position_embeddings at the trained length (Qwen3.8's 1M
+    # recipe) serves original * factor positions; the gate must follow the table, not the config.
+    from freetoken.engine.engine import _adjust_config
+
+    _adjust_config(_generic_rotary_cfg(max_position=1024, override=4096, scaling=YARN_4X))
+    with pytest.raises(ValueError, match=r"rope table \(4096 positions\)"):
+        _adjust_config(_generic_rotary_cfg(max_position=1024, override=4097, scaling=YARN_4X))
 
 
 def test_adjust_config_rope_gate_exempts_dsv4():

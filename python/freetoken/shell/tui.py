@@ -515,13 +515,15 @@ def _format_load_progress(doc: dict) -> str:
     return f"loading ({phase})..."
 
 
-async def run_shell(origin: str, *, connect_grace: float = 0.0) -> int:
+async def run_shell(
+    origin: str, *, connect_grace: float = 0.0, api_key: str | None = None
+) -> int:
     """Attach to the FreeToken server at ``origin`` and run the terminal chat.
 
     ``connect_grace`` is how long to keep retrying a refused connection before giving up --
     left at 0 when attaching to a server the user says is already running, raised when the
     caller just started one in this process (see ``server/api_server.py``)."""
-    client = ShellClient(origin)
+    client = ShellClient(origin, api_key=api_key)
     try:
         return await _run_shell(client, origin, connect_grace=connect_grace)
     finally:

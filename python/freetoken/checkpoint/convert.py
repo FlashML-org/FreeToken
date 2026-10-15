@@ -203,7 +203,8 @@ def convert_checkpoint(
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
                        dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
     mc = cfg.model_config
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
+    # every MoE strategy reads the routed experts from the banks, fused included
+    offload = getattr(mc, "is_moe", False)
     include_moe_experts = not offload
     method = None
     if offload:
@@ -211,6 +212,7 @@ def convert_checkpoint(
         from freetoken.layers import set_rope_device
 
         set_rope_device(dev)
+        object.__setattr__(cfg, "moe_strategy", "offload")
         method = offload_expert_method(cfg)
 
     # Dense tensors are converted ONCE to the dtype their model parameter declares -- the
@@ -229,6 +231,11 @@ def convert_checkpoint(
     with torch.device("meta"), torch_dtype(dtype):
         meta_model = create_model(mc)
     param_dtypes = {name: t.dtype for name, t in meta_model.state_dict().items()}
+    if offload and moe_backend == "fused":
+        from freetoken.layers import iter_moe_layers
+
+        # Resident banks use the model dtype, not the offload/CPU BF16 layout.
+        method = next(iter_moe_layers(meta_model)).quant_method
     del meta_model
 
     from freetoken.utils.progress import byte_bar, count_bar

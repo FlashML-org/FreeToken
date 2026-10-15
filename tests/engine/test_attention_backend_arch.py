@@ -116,3 +116,41 @@ def test_fa_backend_rejects_cc12(monkeypatch):
     monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (12, 0))
     with pytest.raises(RuntimeError, match="12.x"):
         FlashAttentionBackend(SimpleNamespace(head_dim=128))
+
+
+@pytest.mark.parametrize("requested", ["auto", "fi", "fa", "trtllm", "triton,fi"])
+def test_rocm_attention_selection_avoids_cuda_packages(monkeypatch, requested):
+    import builtins
+
+    from freetoken.engine import engine
+    from freetoken.kernel import backend
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"flashinfer", "sgl_kernel"}:
+            pytest.fail(f"ROCm tried to import {name}")
+        return real_import(name, *args, **kwargs)
+
+    def unexpected_probe(_name):
+        pytest.fail("ROCm tried to discover a CUDA package")
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(backend, "is_rocm", lambda: True)
+    monkeypatch.setattr(backend, "_importable", unexpected_probe)
+    monkeypatch.setattr(engine, "is_sm90_family", lambda: False)
+    monkeypatch.setattr(engine, "is_sm100_family", lambda: False)
+    backend.is_flashinfer_installed.cache_clear()
+    backend.is_sgl_kernel_installed.cache_clear()
+    try:
+        assert not engine._sgl_flash_attn_available()
+        config = _engine_config(attention_backend=requested)
+        if requested == "auto":
+            engine._adjust_config(config)
+            assert config.attention_backend == "triton"
+        else:
+            with pytest.raises(RuntimeError, match="CUDA-only.*ROCm"):
+                engine._adjust_config(config)
+    finally:
+        backend.is_flashinfer_installed.cache_clear()
+        backend.is_sgl_kernel_installed.cache_clear()

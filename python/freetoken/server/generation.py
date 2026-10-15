@@ -25,6 +25,7 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.inline_system import InlineSystemError
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -142,6 +143,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    inline_system_policy: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -167,6 +169,8 @@ def resolve_sampling(
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -188,6 +192,8 @@ def resolve_sampling(
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
     )
 
 
@@ -302,6 +308,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
             images=images,
+            inline_system_policy=spec.inline_system_policy,
         )
     )
     return uid
@@ -312,6 +319,8 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    *,
+    inline_system_policy: str | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -334,10 +343,13 @@ async def count_prompt_tokens(
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
         images=images,
+        inline_system_policy=inline_system_policy,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
         (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
+    except InlineSystemError as exc:
+        raise GenerationError(str(exc)) from exc
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
     return int(user_msg.input_ids.numel())
@@ -361,6 +373,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        inline_system_policy=spec.inline_system_policy,
     )
     try:
         manager = await asyncio.to_thread(build)

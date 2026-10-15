@@ -349,7 +349,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                # Overlap can advance device_len ahead of the token delivered to the host.
+                # Overlap can advance device_len one token ahead of this host reply.
                 hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
@@ -737,17 +737,10 @@ class Scheduler(SchedulerIOMixin):
         the CONCRETE current window (usable pages) so a rollback restores it byte-for-byte,
         whether it was pinned or ratio-derived."""
         eng = self.engine
-        config = self.config
-        mc = config.model_config
-        num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
-            sizes = getattr(eng.kv_cache, "sizes", None)
-            if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
-                num_swa_pages = max(0, sizes.n_win_pages - 1)
-        elif getattr(mc, "has_swa_attention", False) and (
-            getattr(config, "cache_type", None) == "swa_radix"
-        ):  # usable window tokens = pool tokens minus the slot-0 sentinel
-            num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import window_pool_spec
+
+        spec = window_pool_spec(self.config)
+        num_swa_pages = eng.kv_cache.window_pages if spec is not None else None
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,

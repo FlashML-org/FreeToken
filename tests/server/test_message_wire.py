@@ -28,6 +28,18 @@ from freetoken.message import (
 from freetoken.core import SamplingParams
 
 
+def test_inline_system_policy_tokenizer_roundtrip():
+    for policy in (None, "auto", "preserve", "fold"):
+        msg = TokenizeMsg(uid=1, text=[{"role": "system", "content": "instruction"}],
+                          sampling_params=SamplingParams(), inline_system_policy=policy)
+        decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+        assert decoded.inline_system_policy == policy
+        assert decoded.text == msg.text
+    legacy = BaseTokenizerMsg.encoder(msg)
+    legacy.pop("inline_system_policy")
+    assert BaseTokenizerMsg.decoder(legacy).inline_system_policy is None
+
+
 def test_cache_rebuild_msg_roundtrip():
     msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))

@@ -7,6 +7,7 @@ importable (no import side effects), and the result is cached. flashinfer is
 the exception: it probes with a real import because a version-mismatched
 python/cubin/jit-cache mix is ``find_spec``-visible yet raises on import (see
 ``is_flashinfer_installed``).
+On ROCm, the optional-package probes return False so callers use the fallbacks.
 """
 from __future__ import annotations
 
@@ -32,10 +33,12 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
+    if is_rocm():
+        return False
     # ``find_spec`` only proves a wheel is present: a version-mismatched
     # flashinfer-python / -cubin / -jit-cache mix imports raise, so callers
     # would crash instead of falling back to triton. Probe with a real import,
-    # swallowing any failure like ``driver_cuda_version()`` / ``driver_hip_version()``.
+    # swallowing any failure like ``driver_cuda_version()``.
     try:
         importlib.import_module("flashinfer")
     except ModuleNotFoundError as exc:
@@ -60,11 +63,15 @@ def is_flashinfer_installed() -> bool:
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("sgl_kernel")
 
 
 @functools.cache
 def is_vllm_installed() -> bool:
+    if is_rocm():
+        return False
     return _importable("vllm")
 
 
@@ -85,17 +92,6 @@ def is_rocm() -> bool:
 
 
 @functools.cache
-def driver_hip_version() -> int | None:
-    """ROCm driver version, or None if undetermined."""
-    # TODO(ROCm): flashinfer/sgl_kernel have no ROCm builds — Triton fallback is used.
-    try:
-        from freetoken.kernel.pinned import _load_pinned_extension
-        return int(_load_pinned_extension().driver_cuda_version()) or None
-    except Exception:
-        return None
-
-
-@functools.cache
 def driver_cuda_version() -> int | None:
     """Max CUDA version the installed NVIDIA driver supports (``13000`` == CUDA 13.0),
     or None if undetermined. Driver-JIT kernels (PTX compiled at runtime, e.g.
@@ -103,6 +99,8 @@ def driver_cuda_version() -> int | None:
     toolkit version. Resolved through the ``_pinned_tensor`` extension's link-time
     cudart, so it works wherever the extension builds (including Windows) -- no dlopen
     by soname."""
+    if is_rocm():
+        return None
     try:
         from freetoken.kernel.pinned import _load_pinned_extension
 

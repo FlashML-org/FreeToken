@@ -10,6 +10,8 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
+from freetoken.launch import resolve_api_key
+
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1919"
 # (CLI dest, pool, rebuild body key). moe/mamba are slot counts and pass straight through;
@@ -74,6 +76,7 @@ def _request_json(
     body: dict[str, Any] | None = None,
     query: dict[str, Any] | None = None,
     timeout: float = 10.0,
+    api_key: str | None,
 ) -> dict[str, Any]:
     with _open_request(
         method,
@@ -83,6 +86,7 @@ def _request_json(
         query=query,
         accept="application/json",
         timeout=timeout,
+        api_key=api_key,
     ) as response:
         raw = response.read()
 
@@ -104,6 +108,7 @@ def _request_sse_text(
     *,
     body: dict[str, Any] | None = None,
     timeout: float = 10.0,
+    api_key: str | None,
 ) -> str:
     with _open_request(
         method,
@@ -112,6 +117,7 @@ def _request_sse_text(
         body=body,
         accept="text/event-stream",
         timeout=timeout,
+        api_key=api_key,
     ) as response:
         return _read_sse_text(response)
 
@@ -125,9 +131,12 @@ def _open_request(
     query: dict[str, Any] | None = None,
     accept: str,
     timeout: float,
+    api_key: str | None,
 ) -> Any:
     data = None
     headers = {"Accept": accept}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -284,6 +293,10 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         default=DEFAULT_BASE_URL,
         help=f"FreeToken server URL (default: {DEFAULT_BASE_URL})",
     )
+    parser.add_argument(
+        "--api-key",
+        help="API key of a server started with --api-key (default: $FREETOKEN_API_KEY)",
+    )
     parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout in seconds")
     parser.add_argument("--json", action="store_true", help="Print raw JSON response")
 
@@ -355,14 +368,19 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft ctl") -> int:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
+    args.api_key = resolve_api_key(args.api_key)
 
     try:
         if args.command == "health":
-            doc = _request_json("GET", args.base_url, "/health", timeout=args.timeout)
+            doc = _request_json(
+                "GET", args.base_url, "/health", timeout=args.timeout, api_key=args.api_key
+            )
             _print_doc(doc, _format_health, raw_json=args.json)
             return 0
         if args.command == "stats":
-            doc = _request_json("GET", args.base_url, "/v1/stats", timeout=args.timeout)
+            doc = _request_json(
+                "GET", args.base_url, "/v1/stats", timeout=args.timeout, api_key=args.api_key
+            )
             _print_doc(doc, _format_stats, raw_json=args.json)
             return 0
         if args.command == "generate":
@@ -376,6 +394,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft ctl") -> int:
                     "ignore_eos": args.ignore_eos,
                 },
                 timeout=args.timeout,
+                api_key=args.api_key,
             )
             if args.json:
                 print(json.dumps({"text": text}, ensure_ascii=False, indent=2, sort_keys=True))
@@ -390,13 +409,16 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft ctl") -> int:
                 "/v1/requests",
                 query=query,
                 timeout=args.timeout,
+                api_key=args.api_key,
             )
             _print_doc(doc, _format_requests, raw_json=args.json)
             return 0
         if args.command == "cache" and args.cache_command in (None, "status"):
             if args.cache_command is None and _cache_targets(args):
                 return _run_cache_rebuild(args)
-            doc = _request_json("GET", args.base_url, "/v1/cache/status", timeout=args.timeout)
+            doc = _request_json(
+                "GET", args.base_url, "/v1/cache/status", timeout=args.timeout, api_key=args.api_key
+            )
             _print_doc(doc, _format_cache_status, raw_json=args.json)
             return 0
         if args.command == "cache" and args.cache_command == "rebuild":
@@ -444,7 +466,9 @@ def _run_cache_rebuild(args: argparse.Namespace) -> int:
         print("error: cache rebuild requires at least one cache target", file=sys.stderr)
         return 2
     # The token targets can only be converted against the live geometry, so read it first.
-    status = _request_json("GET", args.base_url, "/v1/cache/status", timeout=args.timeout)
+    status = _request_json(
+        "GET", args.base_url, "/v1/cache/status", timeout=args.timeout, api_key=args.api_key
+    )
     body = _rebuild_body(targets, status.get("geometry") or {})
     body["timeout"] = args.wait
     doc = _request_json(
@@ -453,6 +477,7 @@ def _run_cache_rebuild(args: argparse.Namespace) -> int:
         "/v1/cache/rebuild",
         body=body,
         timeout=args.wait + args.timeout,
+        api_key=args.api_key,
     )
     if args.json or doc.get("status") != "ok":
         _print_doc(doc, _format_rebuild, raw_json=args.json)
@@ -462,7 +487,9 @@ def _run_cache_rebuild(args: argparse.Namespace) -> int:
     # /cache prints. Best-effort -- the rebuild already succeeded.
     print("status=ok")
     try:
-        print(_format_cache_status(_request_json("GET", args.base_url, "/v1/cache/status")))
+        print(_format_cache_status(
+            _request_json("GET", args.base_url, "/v1/cache/status", api_key=args.api_key)
+        ))
     except ControlCliError:
         pass
     return 0

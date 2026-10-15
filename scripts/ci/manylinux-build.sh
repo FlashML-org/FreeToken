@@ -97,11 +97,11 @@ for cptag in $MATRIX; do
   VENV="/tmp/build-venv-$cptag"
   say "creating build venv ($cptag)"
   uv venv --quiet --python "$PYBIN" "$VENV"
-  # Provenance pin: PyPI's torch 2.11.0 is itself the cu130 build, but this index
+  # Provenance pin: PyPI's torch 2.14.1 is itself the cu130 build, but this index
   # serves ONLY cu130 wheels, so the resolve can never pick a different-CUDA torch
   # and tag the kernel-cache wheel wrong; everything else is plain PyPI.
   uv pip install --quiet --python "$VENV/bin/python" \
-    --index-url https://download.pytorch.org/whl/cu130 "torch>=2.11,<2.12"
+    --index-url https://download.pytorch.org/whl/cu130 "torch>=2.14,<2.15"
   uv pip install --quiet --python "$VENV/bin/python" \
     "setuptools>=77" wheel ninja "apache-tvm-ffi==0.1.13.post3"
 

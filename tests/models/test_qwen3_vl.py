@@ -39,7 +39,7 @@ def _engine_config(monkeypatch, hf, processor, **overrides):
     import freetoken.engine.config as engine_config
     import freetoken.mm.processor as mm_processor
 
-    monkeypatch.setattr(engine_config, "cached_load_hf_config", lambda path: hf)
+    monkeypatch.setattr(engine_config, "cached_load_hf_config", lambda path, overrides: hf)
     monkeypatch.setattr(engine_config, "checkpoint_quant_config", lambda *args: None)
     monkeypatch.setattr(mm_processor, "get_mm_processor", lambda path, mm=None: processor)
     return EngineConfig(

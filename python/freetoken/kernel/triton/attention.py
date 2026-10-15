@@ -18,6 +18,11 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
 def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
@@ -398,10 +403,15 @@ def decode_paged_attention(
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
+    grid = (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
+    block_n = 32
+    if sliding_window and head_dim <= 256:
+        split_len = triton.cdiv(triton.cdiv(sliding_window, max_kv_splits), _MIN_BLOCK_KV) * _MIN_BLOCK_KV
+        # A window split of several tiles in a single-wave grid is latency bound; 64-key tiles halve its serial steps.
+        if split_len >= 128 and grid[0] * grid[1] * grid[2] <= _num_sms(q.device.index):
+            block_n = 64
 
-    _decode_grouped_stage1_kernel[
-        (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
-    ](
+    _decode_grouped_stage1_kernel[grid](
         q,
         k_cache,
         v_cache,
@@ -428,7 +438,7 @@ def decode_paged_attention(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        BLOCK_N=32,
+        BLOCK_N=block_n,
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
@@ -596,6 +606,48 @@ def _extend_attention_kernel(
 
 
 @triton.jit
+def _extend_attend_tile(
+    q, m_i, l_i, acc, qk_scale, k_base, v_base, k_rows, v_rows, offs_d, offs_dv, mask_d, mask_dv, mask_n, mask,
+    MASKED: tl.constexpr,
+):
+    if MASKED:
+        k_mask = mask_n[None, :] & mask_d[:, None]
+        v_mask = mask_n[:, None] & mask_dv[None, :]
+    else:
+        k_mask = mask_d[:, None]
+        v_mask = mask_dv[None, :]
+    k = tl.load(k_base + k_rows[None, :] + offs_d[:, None], mask=k_mask, other=0.0)
+    scores = tl.dot(q.to(k.dtype), k)
+    if MASKED:
+        scores = tl.where(mask, scores, -float("inf"))
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1) * qk_scale)
+    if MASKED:
+        m_new = tl.where(m_new == -float("inf"), -1e20, m_new)
+    alpha = tl.math.exp2(m_i - m_new)
+    p = tl.math.exp2(scores * qk_scale - m_new[:, None])
+    v = tl.load(v_base + v_rows[:, None] + offs_dv[None, :], mask=v_mask, other=0.0)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    return m_new, l_i, acc
+
+
+@triton.jit
+def _extend_tile_ranges(
+    first_row, diag, end, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SLIDING_WINDOW: tl.constexpr
+):
+    """Split keys [0, end) seen by rows first_row + [0, BLOCK_M) into skipped [0, lo), masked [lo, u0), unmasked [u0, u1) and masked [u1, end); keys below diag are causal for every row."""
+    if SLIDING_WINDOW > 0:
+        lo = tl.minimum(tl.maximum(first_row - SLIDING_WINDOW + 1, 0) // BLOCK_N * BLOCK_N, end)
+        full = tl.cdiv(tl.maximum(first_row + BLOCK_M - SLIDING_WINDOW, 0), BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
+        full = 0
+    u1 = tl.maximum(diag, lo)
+    u0 = tl.minimum(tl.maximum(full, lo), u1)
+    return lo, u0, u1
+
+
+@triton.jit
 def _extend_attention_split_kernel(
     q_ptr,
     k_extend_ptr,
@@ -642,7 +694,8 @@ def _extend_attention_split_kernel(
     kv_start = tl.load(kv_indptr_ptr + seq_id)
     prefix_len = tl.load(prefix_lens_ptr + seq_id)
 
-    offs_m = block_m_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    block_start = block_m_id * BLOCK_M
+    offs_m = block_start + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -650,6 +703,8 @@ def _extend_attention_split_kernel(
     mask_d = offs_d < D
     mask_dv = offs_dv < D
     q_abs_pos = prefix_len + offs_m
+    # Scores live in the log2 domain: exp2 lowers to ex2.approx.ftz, while tl.exp adds a denormal fixup per element.
+    qk_scale = sm_scale * 1.4426950408889634
 
     q = tl.load(
         q_ptr
@@ -661,7 +716,7 @@ def _extend_attention_split_kernel(
     )
 
     if HAS_SINKS:
-        sink = tl.load(sinks_ptr + q_head).to(tl.float32)
+        sink = tl.load(sinks_ptr + q_head).to(tl.float32) * 1.4426950408889634
         m_i = tl.full((BLOCK_M,), sink, dtype=tl.float32)
         l_i = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
     else:
@@ -669,59 +724,54 @@ def _extend_attention_split_kernel(
         l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
 
-    for start_n in tl.range(0, prefix_len, BLOCK_N):
-        kv_offsets = start_n + offs_n
-        mask_n = kv_offsets < prefix_len
-        key_pos = kv_offsets
-        final_mask = mask_m[:, None] & mask_n[None, :]
+    kc_base = k_cache_ptr + kv_head * stride_kch
+    vc_base = v_cache_ptr + kv_head * stride_vch
+    prefix_end = tl.where(block_start < q_len, prefix_len, 0)
+    lo, u0, u1 = _extend_tile_ranges(
+        prefix_len + block_start, prefix_end // BLOCK_N * BLOCK_N, prefix_end, BLOCK_M, BLOCK_N, SLIDING_WINDOW
+    )
+    for start_n in tl.range(u0, u1, BLOCK_N):
+        slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n)
+        m_i, l_i, acc = _extend_attend_tile(
+            q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
+            offs_d, offs_dv, mask_d, mask_dv, None, None, False,
+        )
+    n_left = (u0 - lo) // BLOCK_N
+    for i in tl.range(0, n_left + tl.cdiv(prefix_end - u1, BLOCK_N)):
+        kv_offsets = tl.where(i < n_left, lo + i * BLOCK_N, u1 + (i - n_left) * BLOCK_N) + offs_n
+        mask_n = kv_offsets < prefix_end
+        final_mask = mask_n[None, :]
         if SLIDING_WINDOW > 0:
-            window_mask = (key_pos[None, :] + SLIDING_WINDOW) > q_abs_pos[:, None]
-            final_mask = final_mask & window_mask
+            final_mask = final_mask & ((kv_offsets[None, :] + SLIDING_WINDOW) > q_abs_pos[:, None])
+        slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
+        m_i, l_i, acc = _extend_attend_tile(
+            q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
+            offs_d, offs_dv, mask_d, mask_dv, mask_n, final_mask, True,
+        )
 
-        skip_tile = False
-        if SLIDING_WINDOW > 0:
-            skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
-
-        if not skip_tile:
-            slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_kcs
-                + kv_head * stride_kch
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
-            scores = tl.dot(q.to(k.dtype), k) * sm_scale
-            scores = tl.where(final_mask, scores, -float("inf"))
-
-            row_max = tl.max(scores, axis=1)
-            row_max_fixed = tl.where(row_max == -float("inf"), -1e20, row_max)
-            m_new = tl.maximum(row_max_fixed, m_i)
-            alpha = tl.exp(m_i - m_new)
-            p = tl.exp(scores - m_new[:, None])
-
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vcs
-                + kv_head * stride_vch
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            m_i = m_new
-
-    current_end = tl.minimum(q_len, (block_m_id + 1) * BLOCK_M)
+    ke_base = k_extend_ptr + kv_head * stride_keh
+    ve_base = v_extend_ptr + kv_head * stride_veh
+    current_end = tl.minimum(q_len, block_start + BLOCK_M)
     if HAS_BLOCKS:
         # rows inside a multimodal span also attend forward to the span's later keys: the tile loop must reach them
         block_end = tl.load(block_ends_ptr + q_start + offs_m, mask=mask_m, other=0) - prefix_len
         current_end = tl.minimum(q_len, tl.maximum(current_end, tl.max(block_end, axis=0)))
     else:
         block_end = tl.zeros((BLOCK_M,), dtype=tl.int32)
-    for start_n in tl.range(0, current_end, BLOCK_N):
-        local_kv_offsets = start_n + offs_n
+    current_end = tl.where(block_start < q_len, current_end, 0)
+    lo, u0, u1 = _extend_tile_ranges(
+        block_start, tl.minimum(block_start // BLOCK_N * BLOCK_N, current_end), current_end, BLOCK_M, BLOCK_N,
+        SLIDING_WINDOW,
+    )
+    for start_n in tl.range(u0, u1, BLOCK_N):
+        rows = q_start + start_n + offs_n
+        m_i, l_i, acc = _extend_attend_tile(
+            q, m_i, l_i, acc, qk_scale, ke_base, ve_base, rows * stride_ket, rows * stride_vet,
+            offs_d, offs_dv, mask_d, mask_dv, None, None, False,
+        )
+    n_left = (u0 - lo) // BLOCK_N
+    for i in tl.range(0, n_left + tl.cdiv(current_end - u1, BLOCK_N)):
+        local_kv_offsets = tl.where(i < n_left, lo + i * BLOCK_N, u1 + (i - n_left) * BLOCK_N) + offs_n
         mask_n = local_kv_offsets < current_end
         local_q_pos = offs_m
         causal_mask = local_kv_offsets[None, :] <= local_q_pos[:, None]
@@ -731,41 +781,12 @@ def _extend_attention_split_kernel(
             causal_mask = causal_mask & (
                 (local_kv_offsets[None, :] + SLIDING_WINDOW) > local_q_pos[:, None]
             )
-        final_mask = mask_m[:, None] & mask_n[None, :] & causal_mask
-
-        skip_tile = False
-        if SLIDING_WINDOW > 0:
-            skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
-
-        if not skip_tile:
-            k = tl.load(
-                k_extend_ptr
-                + (q_start + local_kv_offsets[None, :]) * stride_ket
-                + kv_head * stride_keh
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
-            scores = tl.dot(q.to(k.dtype), k) * sm_scale
-            scores = tl.where(final_mask, scores, -float("inf"))
-
-            row_max = tl.max(scores, axis=1)
-            row_max_fixed = tl.where(row_max == -float("inf"), -1e20, row_max)
-            m_new = tl.maximum(row_max_fixed, m_i)
-            alpha = tl.exp(m_i - m_new)
-            p = tl.exp(scores - m_new[:, None])
-
-            v = tl.load(
-                v_extend_ptr
-                + (q_start + local_kv_offsets[:, None]) * stride_vet
-                + kv_head * stride_veh
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            m_i = m_new
+        final_mask = mask_n[None, :] & causal_mask
+        rows = q_start + local_kv_offsets
+        m_i, l_i, acc = _extend_attend_tile(
+            q, m_i, l_i, acc, qk_scale, ke_base, ve_base, rows * stride_ket, rows * stride_vet,
+            offs_d, offs_dv, mask_d, mask_dv, mask_n, final_mask, True,
+        )
 
     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])
     tl.store(

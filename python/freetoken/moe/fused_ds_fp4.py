@@ -12,10 +12,7 @@ from __future__ import annotations
 import torch
 import triton
 
-from freetoken.kernel.triton.dsv4.fp8_linear import (
-    act_quant_fp8_inplace,
-    act_quant_fp8_roundtrip,
-)
+from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 from freetoken.kernel.triton.dsv4.fused_moe import (
     _decode_dsfp4_moe_kernel,
     _e2m1_lut,
@@ -50,7 +47,8 @@ def _grouped_decode(
     """Grouped per-route GEMM ``c[t,r,:] = a[row] @ dequant(W[slot])^T``.
 
     Returns ``[T, top_k, N]``. Used for both gate_up (a_row=token) and down
-    (a_row=route). FP4 weights are dequantized inline from the slot cache.
+    (a_row=route). FP4 weights are dequantized inline from the slot cache. A slot
+    of ``-1`` is an inactive route: its output is zero and its storage is never read.
     """
     T, top_k = slots.shape
     N = packed_cache.shape[1]
@@ -62,14 +60,13 @@ def _grouped_decode(
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
 
-    # Decode is a per-route GEMV, bound by the inline FP4 dequant (LUT gather + block
-    # scale), not weight HBM bandwidth -- so it tops out ~29% of HBM peak. BN=16/
-    # BKB=128/1 warp maximizes memory-level parallelism (many single-warp CTAs, no
-    # cross-warp reduction) -> ~950 GB/s on H100 (was ~830 at BN=8/BKB=256/2). K_BYTES
-    # must be a multiple of BLOCK_SIZE_KB (gate_up 2048, down 1024 -- both /128).
+    # One fixed launch geometry, never tuned per machine: the row / warp split changes the per-row
+    # K reduction layout (and so the output bits) on some Triton versions. 16 rows on 2 warps is at
+    # or near the fastest split for the V4 and V4.1 decode shapes. Each K tile contains whole
+    # packed FP4 scale groups.
     BLOCK_SIZE_N = 16
     BLOCK_SIZE_KB = 128
-    _NW = 1
+    _NW = 2
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
     _decode_dsfp4_moe_kernel[grid](
@@ -103,28 +100,28 @@ def routed_experts_fp4(
     down_packed: torch.Tensor,     # [S, H, I//2] uint8
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
+    act_block: int = 128,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
-    Precision matches the reference ``fp4_gemm(act_quant(x, 128), W_fp4)``: the gate_up
-    and down activations are FP8-round-tripped (block 128, ue8m0) before each GEMM. Since
-    an fp8 value x pow2 scale is exact in bf16, the round-tripped activation entering the
-    bf16 decode kernel is bit-identical to the reference's dequantized FP8 activation
-    (validated max diff = 0 vs the tilelang ``fp4_gemm`` reference)."""
+    Precision matches the reference ``fp4_gemm(act_quant(x, act_block), W_fp4)``: the gate_up
+    and down activations are FP8-round-tripped (block ``act_block`` -- the checkpoint's fp8 block,
+    128 on V4 and 32 on V4.1 -- ue8m0) before each GEMM. Since an fp8 value x pow2 scale is exact
+    in bf16, the round-tripped activation entering the bf16 decode kernel is bit-identical to the
+    reference's dequantized FP8 activation (validated max diff = 0 vs the tilelang ``fp4_gemm``
+    reference). The routing weight scales each route's down output in the GEMM epilogue."""
     T, top_k = slots.shape
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
+    x = act_quant_fp8_roundtrip(x, act_block)  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
         x, gate_up_packed, gate_up_scale, slots, None,
         a_row_is_route=False, mul_routed_weight=False,
     )  # [T, top_k, 2I]
-    act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
-
-    act = act.reshape(T * top_k, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+    # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(T * top_k, I)
     down = _grouped_decode(
         act, down_packed, down_scale, slots, topk_weights,
         a_row_is_route=True, mul_routed_weight=True,
@@ -191,6 +188,7 @@ def routed_experts_fp4_prefill(
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
     num_rows: int,
+    act_block: int = 128,
 ) -> torch.Tensor:
     """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
     chunks: one moe_align sort shared by both GEMMs, each expert's weights
@@ -201,7 +199,7 @@ def routed_experts_fp4_prefill(
     if T * top_k < _GROUPED_MIN_ROUTES:
         return routed_experts_fp4(
             x, slots, topk_weights,
-            gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit,
+            gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit, act_block=act_block,
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -217,16 +215,14 @@ def routed_experts_fp4_prefill(
     sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
     tw = topk_weights.reshape(-1).contiguous()
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
+    x = act_quant_fp8_roundtrip(x, act_block)  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = torch.empty((T, top_k, two_I), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         x, gate_up_packed, gate_up_scale, gate_up, tw,
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
     )
-    act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
-
-    act = act.reshape(routes, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+    # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(routes, I)
     down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,

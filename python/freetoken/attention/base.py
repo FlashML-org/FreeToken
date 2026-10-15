@@ -20,6 +20,9 @@ class AttnType(str, Enum):
     MLA = "mla"  # plain latent-KV MLA -> MLAKVCache
     DSA = "dsa"  # latent-KV MLA + DSA sparse indexer -> DSAKVCache
     DSV4 = "dsv4"  # DSV4 window+compressed sparse -> DSV4PagedKVCache
+    # DSV41 (DeepSeek-V4.1): window + cross-layer-shared compressed KV in packed fp8/fp4
+    # rows, Full/Reindex/Reuse layer modes -> DSV41PagedKVCache
+    DSV41 = "dsv41"
     LINEAR = "linear"  # GDN/mamba state layers -> LinearStatePool
     # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
     # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache

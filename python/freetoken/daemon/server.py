@@ -132,7 +132,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
 
     ring = LogRing(capacity=args.log_capacity)
     store = ServeStateStore(os.path.join(state_dir, "serve.json"))
-    probe = ServeProbe()
+    # read at call time: the running serve's key, from the manager created below
+    probe = ServeProbe(api_key=lambda: manager.serve_api_key())
 
     def tailer_factory(child):
         log_path = getattr(child, "log_path", None)

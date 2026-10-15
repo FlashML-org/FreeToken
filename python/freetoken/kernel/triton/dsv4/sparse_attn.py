@@ -99,7 +99,8 @@ def _sparse_attn_paged_kernel(
         # multiple KV tiles in shared memory. Result is bit-identical to the two-pool form -- each
         # column still reads from the same pool/slot.
         is_win = offs_t < N_WINDOW
-        base = tl.where(is_win, win_ptr, cmp_ptr)  # [BLOCK_T] per-column pool base pointer
+        # The select drops the pools' 16-byte alignment (asserted in the wrapper); without this hint Triton 3.8 gathers in 2-byte loads.
+        base = tl.multiple_of(tl.where(is_win, win_ptr, cmp_ptr), 16)  # [BLOCK_T] per-column pool base pointer
         kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
         kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)  # [BLOCK_T, D]
 
@@ -182,7 +183,7 @@ def _sparse_attn_paged_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             is_win = offs_t < N_WINDOW
-            base = tl.where(is_win, win_ptr, cmp_ptr)
+            base = tl.multiple_of(tl.where(is_win, win_ptr, cmp_ptr), 16)
             kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
             kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
 
@@ -314,6 +315,7 @@ def sparse_attn_paged(
     # The kernel selects one pool base per column and gathers with a single stride pair, so both
     # pools must share strides. Guaranteed here by .contiguous() on their [*, D] shape.
     assert window_pool.stride() == cmp_pool.stride(), (window_pool.stride(), cmp_pool.stride())
+    assert window_pool.data_ptr() % 16 == 0 and cmp_pool.data_ptr() % 16 == 0, (window_pool.data_ptr(), cmp_pool.data_ptr())
 
     has_counts = cmp_counts is not None
     if has_counts:

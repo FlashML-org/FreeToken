@@ -366,14 +366,42 @@ def test_public_nvfp4_piece_route_rejects_an_alternate_scale_suffix(tmp_path):
         iter_nvfp4_expert_pieces(folder, config, spec)
 
 
-def test_nvfp4_layout_still_rejects_resident_experts(checkpoint):
-    """Quantized layout + include_moe_experts=True must raise: its experts only come from the NVFP4 pieces."""
+def test_nvfp4_layout_rejects_dense_expert_loading(checkpoint):
+    """Resident and offload NVFP4 experts both come from pieces, never dense tensors."""
     folder, _raw_w = checkpoint
     assert parse_config(cached_load_hf_config(folder)).expert_quant == "nvfp4"
     with pytest.raises(AssertionError, match="NVFP4"):
         dict(iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True))
     with pytest.raises(AssertionError, match="NVFP4"):
         dict(iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=False))
+
+
+def test_nvfp4_resident_bank_loading_preserves_modelopt_rows(checkpoint):
+    """Packing/attachment only: CPU assertions do not claim GPU dequantization parity."""
+    folder, raw = checkpoint
+    model = _build_model(folder, "fused", device=torch.device("cpu"))
+    _engine_state(folder, torch.bfloat16, "fused", model=model)
+    for layer in MOE_LAYERS:
+        experts = model.model.layers.op_list[layer].mlp.experts
+        assert experts.layer_id == layer - 1
+        view = experts.quant_method.resident_view(experts)
+        assert set(view.tensors) == {
+            "gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global",
+        }
+        assert view.tensors["gate_up"].shape == (E, 2 * MI, H // 2)
+        assert view.tensors["down"].shape == (E, H, MI // 2)
+        assert view.tensors["gate_up"].dtype == torch.uint8
+        assert view.tensors["gate_up_scale"].dtype == FP8
+        assert view.tensors["gate_up_global"].dtype == torch.float16
+        for e in range(E):
+            prefix = f"model.layers.{layer}.mlp.experts.{e}"
+            for proj, role, rows in (("gate", "gate_up", slice(0, MI)), ("up", "gate_up", slice(MI, 2 * MI)),
+                                     ("down", "down", slice(0, H))):
+                key = f"{prefix}.{proj}_proj"
+                assert torch.equal(view.tensors[role][e, rows], raw[key + ".weight"])
+                assert torch.equal(view.tensors[role + "_scale"][e, rows].view(torch.uint8), raw[key + ".weight_scale"].view(torch.uint8))
+                expected_global = raw[key + ".weight_scale_2"].to(torch.float16)
+                assert torch.equal(view.tensors[role + "_global"][e, rows], expected_global.expand(view.tensors[role + "_global"][e, rows].shape))
 
 
 # ---------------------------------------------------------------- unquantized (resident experts) layout
@@ -433,25 +461,33 @@ def test_bf16_experts_yield_stacked_resident_names(bf16_checkpoint):
             assert torch.equal(down[e], raw[f"{m}.down_proj.weight"])
 
 
-def test_bf16_resident_load_fills_the_resident_model_state_dict(bf16_checkpoint):
-    """Full load (experts + dense) == the state dict of the resident engine model, keys/shapes;
-    the engine's single conversion (DR-04) lands every emitted tensor on the buffer dtype."""
-    folder, _raw_w = bf16_checkpoint
-    loaded = {
-        n: t.clone()
-        for n, t in iter_weights(
-            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
-        )
-    }
+def test_bf16_resident_load_fills_dense_state_and_expert_banks(bf16_checkpoint):
+    """The production load sequence fills dense buffers and attaches every sparse bank."""
+    folder, raw = bf16_checkpoint
+    loaded = _load(folder)
     state = _meta_state_dict(folder, strategy="fused")
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():
         assert tensor.shape == state[key].shape, key
-    materialized = _engine_state(folder, torch.bfloat16, "fused")
+    model = _build_model(folder, "fused", device=torch.device("cpu"))
+    materialized = _engine_state(folder, torch.bfloat16, "fused", model=model)
     assert set(materialized) == set(state)
     for key, tensor in materialized.items():
         assert tensor.dtype is state[key].dtype, key
-    assert any(k.endswith("mlp.experts.gate_up_proj") for k in loaded)  # experts are resident here
+    assert not any(".experts." in key for key in materialized)
+    for layer in MOE_LAYERS:
+        experts = model.model.layers.op_list[layer].mlp.experts
+        assert experts.layer_id == layer - 1
+        view = experts.quant_method.resident_view(experts)
+        assert set(view.tensors) == {"gate_up", "down"} and view.n == E
+        assert view.tensors["gate_up"].shape == (E, 2 * MI, H)
+        assert view.tensors["down"].shape == (E, H, MI)
+        for e in range(E):
+            prefix = f"model.layers.{layer}.mlp.experts.{e}"
+            assert torch.equal(view.tensors["gate_up"][e, :MI], raw[f"{prefix}.gate_proj.weight"])
+            assert torch.equal(view.tensors["gate_up"][e, MI:], raw[f"{prefix}.up_proj.weight"])
+            assert torch.equal(view.tensors["down"][e], raw[f"{prefix}.down_proj.weight"])
+        assert all(t.dtype == torch.bfloat16 and t.device.type == "cpu" for t in view.tensors.values())
 
 
 # ---------------------------------------------------------------- device placement (GPU sinks crash)
@@ -647,7 +683,7 @@ def test_tied_checkpoint_without_lm_head_loads_the_embedding_as_head(tmp_path, m
     loaded = {
         n: t.clone()
         for n, t in iter_weights(
-            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+            folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True
         )
     }
     # state tree: exactly the engine's buffers (the tied head's state_dict is empty)
@@ -694,7 +730,7 @@ def test_tied_checkpoint_with_redundant_lm_head_ignores_it(tmp_path):
     raw["lm_head.weight"] = torch.zeros(V, H, dtype=torch.bfloat16)
     folder = _write(tmp_path, raw, quantized=False, indexed=False, tie=True)
     loaded = dict(
-        iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True)
+        iter_weights(folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True)
     )
     assert "lm_head.weight" not in loaded
     assert set(loaded) == set(_meta_state_dict(folder, strategy="fused"))
@@ -757,7 +793,6 @@ _DR04_ROW_F32, _DR04_COL_F32 = 50, 11
 _DR04_QKV_KEY = "model.layers.0.self_attn.qkv_proj.weight"
 _DR04_DENSE_KEYS = tuple(f"model.layers.0.mlp.{p}.weight" for p in ("gate_proj", "up_proj", "down_proj"))
 _DR04_EXPERT_KEY = "model.layers.1.mlp.experts.0.gate_proj.weight"
-_DR04_EXPERT_STACK_KEY = "model.layers.1.mlp.experts.gate_up_proj"  # gate rows [0, MI) of expert 0
 
 
 def _raw_dr04(nvfp4: bool) -> dict[str, torch.Tensor]:
@@ -797,17 +832,27 @@ def _engine_state(folder: str, dtype: torch.dtype, strategy: str, *, model=None)
     through ``_materialize_loaded_weight_state_dict`` (the dtype=expected.dtype conversion)
     and are strict-mounted onto the real-dtype model."""
     from freetoken.engine.engine import _materialize_loaded_weight_state_dict
+    from freetoken.engine.engine import Engine
+    from freetoken.layers import iter_moe_layers
     from freetoken.models.weight import load_weight
+    from types import SimpleNamespace
 
     if model is None:
         model = _build_model(folder, strategy, device=torch.device("cpu"), dtype=dtype)
-    include_experts = strategy != "offload"  # engine.py:555 (is_offload_moe_strategy mirror)
     state = _materialize_loaded_weight_state_dict(
         model.state_dict(),
-        load_weight(folder, torch.device("cpu"), include_moe_experts=include_experts, include_vision=False),
+        load_weight(folder, torch.device("cpu"), include_moe_experts=False, include_vision=False),
         device=torch.device("cpu"),
     )
     model.load_state_dict(dict(state))  # BaseOP.load_state_dict pops from its argument
+    if strategy == "fused":
+        config = SimpleNamespace(
+            model_path=folder, model_config=parse_config(cached_load_hf_config(folder)),
+            use_dummy_weight=False, expert_load="serial",
+        )
+        Engine._load_resident_experts(
+            SimpleNamespace(device=torch.device("cpu"), dtype=dtype), config, list(iter_moe_layers(model))
+        )
     return state
 
 
@@ -850,15 +895,16 @@ def test_dr04_fp16_unquantized_expert_converts_directly_from_f32(dr04_bf16_exper
     """The stacked-expert site hits unquantized experts: an F32 gate projection with 65504.0
     must survive fp16 execution (gate rows [0, MI) of expert 0's stack)."""
     folder, raw = dr04_bf16_experts_checkpoint
-    state = _engine_state(folder, torch.float16, "fused")
-    stack = state[_DR04_EXPERT_STACK_KEY]
+    model = _build_model(folder, "fused", device=torch.device("cpu"), dtype=torch.float16)
+    _engine_state(folder, torch.float16, "fused", model=model)
+    stack = model.model.layers.op_list[1].mlp.experts._expert_banks["gate_up"]
     assert stack.dtype is torch.float16
     gate = stack[0, :MI]  # expert 0's merged gate piece
     assert torch.isfinite(gate[_DR04_ROW_F16, _DR04_COL_F16]), "fp16 execution read inf from a finite F32 expert source"
     assert gate[_DR04_ROW_F16, _DR04_COL_F16].tolist() == _DR04_F16_SENTINEL
     assert torch.equal(gate, raw[_DR04_EXPERT_KEY].to(torch.float16))
     for layer in MOE_LAYERS:  # every stacked expert lands for the fused strategy
-        assert f"model.layers.{layer}.mlp.experts.gate_up_proj" in state
+        assert set(model.model.layers.op_list[layer].mlp.experts._expert_banks) == {"gate_up", "down"}
 
 
 # ---------------------------------------------------------------- folded repro (fp32)
@@ -894,8 +940,9 @@ def test_dr04_fp32_dense_mlp_keeps_full_f32_precision(fixture, strategy, request
 
 def test_dr04_fp32_unquantized_expert_keeps_full_f32_precision(dr04_bf16_experts_checkpoint):
     folder, raw = dr04_bf16_experts_checkpoint
-    state = _engine_state(folder, torch.float32, "fused")
-    stack = state[_DR04_EXPERT_STACK_KEY]
+    model = _build_model(folder, "fused", device=torch.device("cpu"), dtype=torch.float32)
+    _engine_state(folder, torch.float32, "fused", model=model)
+    stack = model.model.layers.op_list[1].mlp.experts._expert_banks["gate_up"]
     assert stack.dtype is torch.float32
     gate = stack[0, :MI]
     assert gate[_DR04_ROW_F32, _DR04_COL_F32].tolist() == _DR04_F32_SENTINEL

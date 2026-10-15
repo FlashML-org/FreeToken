@@ -6,7 +6,13 @@ import torch
 
 from freetoken.message import MMItem
 from freetoken.mm.encoder_cache import EncoderCache
-from freetoken.scheduler.mm import cut_image_spans, mm_chunk_end, mm_rows_after, plan_mm_batch, plan_mm_chunk
+from freetoken.scheduler.mm import (
+    cut_image_spans,
+    mm_chunk_end,
+    mm_rows_after,
+    plan_mm_batch,
+    plan_mm_chunk,
+)
 
 CPU = torch.device("cpu")
 

@@ -391,6 +391,7 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
         max_tokens=bs,
         device=dev,
         swiglu_limit=swiglu_limit,
+        act_block=128,
     )
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -439,8 +440,116 @@ def _reference(cache, layer, hidden, ids, w, act="silu", apply_in=False):
     return out
 
 
+@pytest.fixture(scope="module")
+def hip_probe_fault_library(tmp_path_factory):
+    import importlib.util
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+
+    if not torch.version.hip:
+        pytest.skip("requires the HIP sync backend")
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("requires a C++ compiler for HIP fault injection")
+    candidates = [Path(os.getenv("ROCM_HOME", "/opt/rocm")), Path("/opt/rocm")]
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec and spec.submodule_search_locations:
+        candidates.append(Path(next(iter(spec.submodule_search_locations))))
+    include = next((root / "include" for root in candidates if (root / "include/hip/hip_runtime.h").exists()), None)
+    if include is None:
+        pytest.skip("requires HIP SDK headers for fault injection")
+    library = tmp_path_factory.mktemp("hip_probe") / "faults.so"
+    command = [
+        compiler, "-std=c++20", "-shared", "-fPIC", "-D__HIP_PLATFORM_AMD__=1",
+        f"-I{include}", str(Path(__file__).with_name("hip_probe_faults.cpp")),
+        "-ldl", "-o", str(library),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return library
+
+
+@pytest.mark.parametrize("fault", ["dependency", "end-capture", "pending"])
+def test_cpu_moe_hip_probe_error_recovery(hip_probe_fault_library, fault):
+    """Rejected probes leave eager usable and preserve errors predating the probe."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import ctypes
+        import os
+        import runpy
+        import sys
+
+        import pytest
+        import torch
+        from freetoken.kernel import _cpu_moe
+        from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+        shim = ctypes.CDLL(os.environ["LD_PRELOAD"])
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        fault = os.environ["FREETOKEN_TEST_HIP_PROBE_FAULT"]
+        if fault == "pending":
+            assert shim.probe_test_make_error() != 0
+            pending = shim.probe_test_peek_error()
+            with pytest.raises(RuntimeError, match="pending error before probe"):
+                _cpu_moe.memops_probe(stream_ptr)
+            assert shim.probe_test_peek_error() == pending
+            assert shim.probe_test_begins() == 0
+            sys.exit(0)
+
+        helpers = runpy.run_path(sys.argv[1])
+        torch.manual_seed(17)
+        cache = helpers["_make_cache"](2, 8, 256, 128, scale=0.03)
+        ex = CpuMoeExecutor(
+            cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+            num_threads=4, max_tokens=3, device=torch.device("cuda"),
+        )
+        assert not ex._flag_sync and not ex._graph_capture_safe
+        assert shim.probe_test_injected() > 0
+        assert shim.probe_test_begins() == shim.probe_test_ends()
+        assert shim.probe_test_peek_error() == 0
+        if fault == "dependency":
+            assert shim.probe_test_removed_nodes() == 1
+            assert shim.probe_test_last_end_rc() == 0
+        else:
+            assert shim.probe_test_last_end_rc() != 0
+
+        for index in range(2):
+            torch.manual_seed(23 + index)
+            hidden = (torch.randn(3, 256) * 0.3).bfloat16().cuda()
+            ids = torch.randint(0, 8, (3, 4), dtype=torch.int32).cuda()
+            weights = torch.rand(3, 4).cuda()
+            actual = ex.decode(1, hidden, weights, ids).float().cpu()
+            expected = helpers["_reference"](cache, 1, hidden, ids.cpu(), weights.cpu())
+            relative = (actual - expected).abs().max() / (expected.abs().max() + 1e-6)
+            assert relative < 2e-2, relative
+
+        stream = torch.cuda.Stream()
+        with pytest.raises(RuntimeError, match="--cuda-graph-max-bs 0"):
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+                ex.decode(1, hidden, weights, ids)
+        assert torch.isfinite(ex.decode(1, hidden, weights, ids).cpu()).all()
+    """)
+    env = dict(os.environ, LD_PRELOAD=str(hip_probe_fault_library),
+               FREETOKEN_TEST_HIP_PROBE_FAULT=fault, FREETOKEN_CPU_MOE_FLAG_SYNC="1")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(Path(__file__).resolve())],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_cpu_moe_decode_cuda_graph_replay():
-    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, compiled_extension_current
+
+    if not compiled_extension_current():
+        pytest.skip("CPU-work/no-work replay requires the matching shared-IO native extension")
 
     torch.manual_seed(0)
     L, E, H, I, top_k = 3, 8, 512, 256, 2
@@ -466,7 +575,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
     ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
 
-    # Eager forward: also materializes the per-bs pinned buffers + per-(layer,bs) task.
+    # Eager forward.
     out_eager = ex.decode(layer, hidden, w, ids)
     torch.cuda.synchronize()
     ref_eager = _reference(cache, layer, hidden, ids.cpu(), w.cpu())
@@ -481,10 +590,14 @@ def test_cpu_moe_decode_cuda_graph_replay():
 
     # Replay several times with NEW data; the captured host nodes must read the
     # freshly written pinned buffers, not the capture-time values.
-    for it in range(3):
+    for it, cpu_work in enumerate((True, False, True, False, True)):
         torch.manual_seed(100 + it)
         new_hidden = torch.randn(bs, H, dtype=torch.bfloat16)
         new_ids = torch.randint(0, E, (bs, top_k), dtype=torch.int32)
+        if cpu_work:
+            new_ids[0].fill_(-1)  # mixed active/inactive rows
+        else:
+            new_ids.fill_(-1)  # shared IO must not reuse the previous CPU result
         new_w = torch.rand(bs, top_k, dtype=torch.float32)
         hidden.copy_(new_hidden)
         ids.copy_(new_ids)
@@ -492,18 +605,19 @@ def test_cpu_moe_decode_cuda_graph_replay():
         g.replay()
         torch.cuda.synchronize()
         ref = _reference(cache, layer, new_hidden, new_ids, new_w)
-        rel = (out_cap.float().cpu() - ref).abs().max() / ref.abs().max()
-        assert rel < 2e-2, f"replay {it} rel err {rel}"
+        if cpu_work:
+            rel = (out_cap.float().cpu() - ref).abs().max() / ref.abs().max()
+            assert rel < 2e-2, f"replay {it} rel err {rel}"
+        else:
+            assert torch.equal(out_cap.cpu(), torch.zeros_like(ref)), "CPU-free replay returned stale output"
 
     # When the flag handshake is available (stream memops probed OK), the decodes above
     # must actually have exercised it -- guard against a silent fallback to the
     # host-func path making this test vacuous for the capture-embedded memops.
     if ex._flag_sync:
-        assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
-        slot = ex._flag_slots[(layer, bs)]
-        assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
-        assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
+        assert ex._ext.flag_served() >= 4, "1 eager + 3 CPU-work replay dispatches expected"
+        assert not ex._ext.flag_pending(), "handshake at rest"
+        assert not ex._unhealthy, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")
@@ -585,7 +699,7 @@ def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
     ex = CpuMoeExecutor(
         cache, top_k=top_k, activation="silu",
         apply_router_weight_on_input=False, num_threads=8, max_tokens=bs, device=dev,
-        swiglu_limit=limit,
+        swiglu_limit=limit, act_block=128,
     )
     b = cache.bank_sources
     layer_banks = [b[n][layer].to(dev) for n in (

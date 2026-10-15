@@ -1,18 +1,15 @@
 """Python wrapper around the ``_cpu_moe`` C++ executor (--moe-strategy cpu).
 
-Owns the persistent CPU worker pool, the per-batch-size pinned IO buffers, and
-the per-(layer, batch-size) host-func task descriptors. ``decode`` issues the
-whole CUDA-graph-capturable sequence on the current stream:
+Owns the persistent CPU worker pool and one pinned IO block of ``max_tokens`` rows that
+every layer and batch size shares (one task is in flight at a time). ``decode`` issues
+the whole CUDA-graph-capturable sequence on the current stream:
 
-    D2H (hidden, topk_ids, topk_weights -> pinned)
-      -> submit host node (cudaLaunchHostFunc: enqueue MoE task to the pool)
-      -> sync host node   (cudaLaunchHostFunc: spin until the pool drains)
+    D2H (hidden, topk_ids, topk_weights -> pinned IO rows [:bs])
+      -> submit (doorbell naming (layer, bs), or a cudaLaunchHostFunc host node)
+      -> sync   (wait for the CPU pool to finish)
       -> H2D (pinned expert output -> GPU)
 
-Buffers and tasks are allocated lazily per batch size. GraphRunner runs an eager
-``model.forward()`` at each batch size immediately before capturing it, so the
-first (eager) call materializes the stable pinned buffers + task pointers that
-the subsequent capture embeds in its host/memcpy nodes.
+With the doorbell on CUDA, a publish kernel does the D2H and the doorbell, and skips the step when no route goes to the CPU; a combine kernel does the H2D (csrc/cpu_moe/gpu_sync_io.h).
 """
 
 from __future__ import annotations
@@ -35,26 +32,27 @@ logger = init_logger(__name__)
 # on a 75-layer model). Instead the GPU raises a mapped-pinned "ready" flag at submit; a
 # persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets a "done"
 # flag the GPU waits on at sync -- no host-func round-trip. Both GPU-side operations are
-# STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64, resolved from the
-# driver at runtime): they execute on the GPU front end with no SM-resident kernel, so
+# STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64 on CUDA, see
+# gpu_sync.h): they execute on the GPU front end with no SM-resident kernel, so
 # GPU utilization stays truthful during the CPU compute window. (The first cut used a
 # spin-wait kernel; that pinned reported utilization at 99% and laptop CPU/GPU dynamic
 # power schedulers responded by clamping the CPU frequency -- a net decode regression on
-# power-coupled edge devices.) Each (layer, decode batch size) pair gets its own flag
-# slot, so every captured decode graph rides the handshake. Where memops are unavailable
-# (Windows WDDM, vGPU, old drivers -- functionally probed at startup) or the slot
-# capacity is exceeded, decode keeps the host-func path (functional, slower). A Python
-# watchdog thread turns a wedged coordinator into a loud RuntimeError (via err[] +
-# raise_if_unhealthy) instead of an indefinite stream stall.
+# power-coupled edge devices.) The doorbell word names the (layer, decode batch size)
+# task, so one ready/done pair serves every layer and every captured graph (gpu_sync.h).
+# Where memops are unavailable (some driver models, vGPU, old drivers -- functionally probed at
+# startup), decode keeps the host-func path (functional, slower). ROCm 7.14 cannot replay
+# that path from a graph, so capture fails loudly there instead. A Python watchdog thread
+# turns a wedged coordinator into a loud RuntimeError (via raise_if_unhealthy) instead of
+# an indefinite stream stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
 _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
-# Flag slots per MoE layer: covers this many distinct decode batch sizes (captured graph
-# sizes plus any eager padded sizes); more than that is unheard of, and the overflow
-# just keeps the host-func path for the extra combos.
-_FLAG_SLOTS_PER_LAYER = 16
+# Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
+_SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
+# ds_fp4 runs its input FP8 round-trip on the GPU when it can; tests turn this off to compare against the CPU round-trip.
+_DSFP4_GPU_PREQUANT = True
 
-# Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
+# Activation ids must match ActKind in csrc/cpu_moe/common.h. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
 # "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel.
 _ACT_IDS = {
@@ -68,8 +66,16 @@ _ACT_IDS = {
     "swiglu_clamp": 4,
 }
 
-# Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+
+def compiled_extension_current() -> bool:
+    """The Python executor requires the format registry and shared-IO sync ABI."""
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        return False
+    return all(callable(getattr(_cpu_moe, name, None)) for name in (
+        "weight_formats", "memops_probe", "host_func_capture_safe", "kernel_io_probe",
+    ))
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -116,6 +122,17 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
+    """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
+    if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
+        return False
+    pool = list(core_ids) + ([coord_core] if coord_core >= 0 else [])
+    if len(set(pool)) != len(pool):
+        return False
+    spare = set(os.sched_getaffinity(0)) - set(pool)
+    return len(spare) >= 2
+
+
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
@@ -143,7 +160,7 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (the formats ``_cpu_moe.weight_formats()`` lists — see ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -158,19 +175,28 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        act_block: int | None = None,
     ) -> None:
+        if not compiled_extension_current():
+            raise RuntimeError(
+                "the compiled _cpu_moe extension is unavailable or predates the shared-IO executor ABI; "
+                "rebuild it with `python setup.py build_ext --inplace` (or reinstall "
+                "the matching wheel) before using the cpu/hybrid backend"
+            )
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
-        if fmt not in _WFMT_IDS:
+        if fmt not in _cpu_moe.weight_formats():
             raise NotImplementedError(
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
-                f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
+                f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
                 f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
+        if apply_router_weight_on_input and fmt in ("mxfp4_triton", "ds_fp4"):
+            raise NotImplementedError(f"CPU MoE backend: {fmt} experts apply the router weight on the output only")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
@@ -195,28 +221,42 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        ptrs, (self.H, self.I) = self._resolve_banks(
+        banks, options, (self.H, self.I) = self._resolve_banks(
             {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
         )
+
+        # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
+        # that the C++ side runs single-threaded on the CUDA host-callback thread --
+        # straight on the decode critical path (~0.3ms/layer at H=4096, every worker and
+        # the GPU waiting on it). When a GPU is present we run the numerically identical
+        # round-trip as a captured GPU kernel BEFORE the D2H (see decode_submit) and tell
+        # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
+        # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
+        self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda" and _DSFP4_GPU_PREQUANT
+        # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
+        self._act_block = act_block
+        if fmt == "ds_fp4":
+            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
+            options.update(act_block=int(act_block), input_prequant=int(self._gpu_prequant))
+        if self._gpu_prequant:
+            logger.info_rank0(
+                "ds_fp4: input FP8 round-trip moved to the GPU "
+                "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
+            )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
         self._flag_sync = _FLAG_SYNC and device.type == "cuda"
-        self._cpu_moe = _cpu_moe  # module ref for the decode-path memop calls
-        if self._flag_sync:
-            probe_scratch = alloc_pinned_tensor(1, dtype=torch.int64)
-            probe_scratch.zero_()
-            if not _cpu_moe.memops_probe(
-                torch.cuda.current_stream().cuda_stream, probe_scratch.data_ptr()
-            ):
-                logger.info_rank0(
-                    "cpu-moe flag handshake unavailable: CUDA stream memory operations "
-                    "are not supported here (Windows WDDM / vGPU / old driver); using "
-                    "the cudaLaunchHostFunc sync"
-                )
-                self._flag_sync = False
+        if self._flag_sync and not _cpu_moe.memops_probe(torch.cuda.current_stream().cuda_stream):
+            logger.info_rank0(
+                "cpu-moe flag handshake unavailable: stream memory operations failed the "
+                "startup probe; using the cudaLaunchHostFunc sync"
+            )
+            self._flag_sync = False
+        # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
+        self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
         nthreads, core_ids = resolve_threads_and_affinity(num_threads)
         coord_core = -1
@@ -227,6 +267,17 @@ class CpuMoeExecutor:
             nthreads -= 1
             core_ids = core_ids[:-1]
         self._coord_core = coord_core
+        alloc_io = (
+            (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))
+            if device.type == "cpu"
+            else alloc_pinned_tensor
+        )
+        self._io = {
+            "x": alloc_io(self.max_tokens, self.H, dtype=torch.bfloat16),
+            "ids": alloc_io(self.max_tokens, self.top_k, dtype=torch.int32),
+            "w": alloc_io(self.max_tokens, self.top_k, dtype=torch.float32),
+            "y": alloc_io(self.max_tokens, self.H, dtype=torch.bfloat16),
+        }
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
             num_layers=self.num_layers,
@@ -237,15 +288,22 @@ class CpuMoeExecutor:
             max_tokens=self.max_tokens,
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
-            weight_format=_WFMT_IDS[fmt],
+            weight_format=fmt,
+            banks=banks,
+            options=options,
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
-            **ptrs,
+            x_ptr=self._io["x"].data_ptr(),
+            ids_ptr=self._io["ids"].data_ptr(),
+            w_ptr=self._io["w"].data_ptr(),
+            y_ptr=self._io["y"].data_ptr(),
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
+        self.spin_wait = _spin_wait_ok(core_ids, coord_core)
+        self._ext.set_spin_wait(self.spin_wait)
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
@@ -256,34 +314,24 @@ class CpuMoeExecutor:
             )
             torch.set_num_threads(clamp)
 
-        self._io: dict[int, dict[str, torch.Tensor]] = {}
-        self._tasks: dict[tuple[int, int], int] = {}
-
-        # Flag-based handshake: mapped-pinned ready/done/err int64 arrays (one slot per
-        # (MoE layer, decode batch size) pair, allocated as tasks are created) + a
-        # persistent CPU coordinator that polls ready[], runs the slot's task on the
-        # pool, and sets done[]. Binary per-step protocol (GPU memops: done=0, ready=1;
-        # coordinator: consume ready, run, done=1; GPU waits done>=1 -- the WAIT
-        # immediate is constant, so CUDA-graph replays are safe). err[] is raised by the
-        # WATCHDOG thread when a ready flag stays unanswered (dead coordinator): it
-        # poisons done to unblock the stream and raise_if_unhealthy() turns the step
-        # into a loud error instead of silent stale output. Buffers are kept alive on
-        # self so the coordinator's pinned pointers stay valid for the executor's
-        # lifetime (flag_sync itself was decided above, before thread sizing).
-        self._ready = self._done = self._err = None
-        self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
-        self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
+        # Flag-based handshake: the extension owns the ready/done words (gpu_sync.h) and a
+        # persistent CPU coordinator that polls the doorbell, runs the task it names on the
+        # pool, and sets done for the GPU. The WATCHDOG thread marks the executor unhealthy
+        # when a doorbell stays unanswered (dead coordinator): it poisons done to unblock the
+        # stream and raise_if_unhealthy() turns the step into a loud error instead of silent
+        # stale output (flag_sync itself was decided above, before thread sizing).
+        self._unhealthy = False
+        self._kernel_io = False
         if self._flag_sync:
-            self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._err = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._ready.zero_()
-            self._done.zero_()
-            self._err.zero_()
-            self._ext.start_flag_coordinator(
-                self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
-                self._coord_core,
-            )
+            self._ext.start_flag_coordinator(self._coord_core)
+            # ROCm keeps the copies until the kernel IO has been checked on AMD GPUs.
+            if torch.version.hip is None:
+                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+                if reason:
+                    logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
+                else:
+                    self._ext.enable_kernel_io()
+                    self._kernel_io = True
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -300,26 +348,14 @@ class CpuMoeExecutor:
             )
             self._watchdog.start()
 
-        # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
-        # that the C++ side runs single-threaded on the CUDA host-callback thread --
-        # straight on the decode critical path (~0.3ms/layer at H=4096, every worker and
-        # the GPU waiting on it). When a GPU is present we run the numerically identical
-        # round-trip as a captured GPU kernel BEFORE the D2H (see decode_submit) and tell
-        # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
-        # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
-        self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
-        if self._gpu_prequant:
-            self._ext.set_input_prequant(True)
-            logger.info_rank0(
-                "ds_fp4: input FP8 round-trip moved to the GPU "
-                "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
-            )
 
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
-            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
+            f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
+            f"spin_wait={self.spin_wait} "
+            f"handshake={'kernel' if self._kernel_io else 'memop' if self._flag_sync else 'host-func'}"
         )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
@@ -337,14 +373,35 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
-        """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
+    def _tables(self, **roles: list[torch.Tensor]) -> dict[str, int]:
+        """Per-layer table addresses keyed by canonical bank role."""
+        return {role: self._make_table(layers).data_ptr() for role, layers in roles.items()}
+
+    def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
+        """Block-FP8 schema: row-major e4m3 + one bf16 scale per 128x128 block; the scale banks pad their last dim, so C++ gets the real row stride."""
+        gu, gus = banks["gate_up"], banks["gate_up_scale"]
+        dn, dns = banks["down"], banks["down_scale"]
+        assert gu[0].element_size() == 1 and dn[0].element_size() == 1, (gu[0].dtype, dn[0].dtype)
+        assert gus[0].dtype == torch.bfloat16 and dns[0].dtype == torch.bfloat16, (gus[0].dtype, dns[0].dtype)
+        I = int(gu[0].shape[1] // 2)
+        H = int(gu[0].shape[2])
+        assert gu[0].shape[1] == 2 * I
+        assert tuple(dn[0].shape[1:]) == (H, I), (dn[0].shape, H, I)
+        assert gus[0].shape[1] == (2 * I + 127) // 128 and gus[0].shape[2] >= (H + 127) // 128, (gus[0].shape, H, I)
+        assert dns[0].shape[1] == (H + 127) // 128 and dns[0].shape[2] >= (I + 127) // 128, (dns[0].shape, H, I)
+        banks = self._tables(gate_up=gu, down=dn, gate_up_scale=gus, down_scale=dns)
+        options = dict(gu_scale_stride=int(gus[0].stride(1)), dn_scale_stride=int(dns[0].stride(1)))
+        return banks, options, (H, I)
+
+    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, dict, tuple[int, int]]:
+        """Return (banks, options, (H, I)) for the C++ ctor: banks maps each canonical role
+        the format reads to its per-layer table's address, options holds its integer settings.
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
         (the per-layer host bank contract); shapes are read from the first layer so
-        per-partition (TP) sizes are exact. Unused pointers are 0. Every pointer kwarg
-        is actually a per-layer table's address (see ``_make_table``), not a single
-        bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
+        per-partition (TP) sizes are exact. Every bank address is a per-layer table
+        (see ``_make_table``), not a single bank's -- the C++ side resolves
+        ``tbl[layer_id]`` per task.
         """
         if fmt == "bf16":
             gate_up = banks["gate_up"]
@@ -357,17 +414,8 @@ class CpuMoeExecutor:
             I = int(gate_up[0].shape[1] // 2)
             assert gate_up[0].shape[1] == 2 * I
             assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
-            ptrs = dict(
-                gate_up_ptr=self._make_table(gate_up).data_ptr(),
-                down_ptr=self._make_table(down).data_ptr(),
-                gate_up_scale_ptr=0,
-                gate_up_global_ptr=0,
-                down_scale_ptr=0,
-                down_global_ptr=0,
-                gate_up_bias_ptr=0,
-                down_bias_ptr=0,
-            )
-            return ptrs, (H, I)
+            banks = self._tables(gate_up=gate_up, down=down)
+            return banks, {}, (H, I)
 
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
@@ -377,6 +425,9 @@ class CpuMoeExecutor:
 
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
+
+        if fmt == "fp8_block":
+            return self._resolve_fp8_block_banks(banks)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
@@ -392,19 +443,10 @@ class CpuMoeExecutor:
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 16), (dns[0].shape, H, I)
         assert tuple(gug[0].shape[1:]) == (2 * I,) and tuple(dng[0].shape[1:]) == (H,)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gup).data_ptr(),
-            down_ptr=self._make_table(dnp).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=self._make_table(gug).data_ptr(),
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=self._make_table(dng).data_ptr(),
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
-        return ptrs, (H, I)
+        banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, gate_up_global=gug, down_scale=dns, down_global=dng)
+        return banks, {}, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
         """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
         bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
         gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
@@ -419,19 +461,10 @@ class CpuMoeExecutor:
         assert H % 32 == 0 and I % 32 == 0, (H, I)
         assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
         assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gate_up).data_ptr(),
-            down_ptr=self._make_table(down).data_ptr(),
-            gate_up_scale_ptr=0,
-            gate_up_global_ptr=0,
-            down_scale_ptr=0,
-            down_global_ptr=0,
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
-        return ptrs, (H, I)
+        banks = self._tables(gate_up=gate_up, down=down)
+        return banks, {}, (H, I)
 
-    def _resolve_mxfp4_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+    def _resolve_mxfp4_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales
         (N innermost) + per-output-row biases. The C++ kernel streams K and
         accumulates a contiguous N-block, so the GPU-tiled layout is read in place
@@ -450,23 +483,14 @@ class CpuMoeExecutor:
         assert tuple(gus[0].shape[1:]) == (H // 32, 2 * I), (gus[0].shape, H, I)
         assert tuple(dns[0].shape[1:]) == (I // 32, H), (dns[0].shape, H, I)
         assert tuple(gob[0].shape[1:]) == (2 * I,) and tuple(dob[0].shape[1:]) == (H,)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gub).data_ptr(),
-            down_ptr=self._make_table(dnb).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=0,
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=0,
-            gate_up_bias_ptr=self._make_table(gob).data_ptr(),
-            down_bias_ptr=self._make_table(dob).data_ptr(),
-        )
-        return ptrs, (H, I)
+        banks = self._tables(gate_up=gub, down=dnb, gate_up_scale=gus, down_scale=dns, gate_up_bias=gob, down_bias=dob)
+        return banks, {}, (H, I)
 
-    def _resolve_dsfp4_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+    def _resolve_dsfp4_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
         """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
-        activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
+        activations (the checkpoint's fp8 block) to match the DeepSeek W4A8 reference."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
@@ -474,56 +498,12 @@ class CpuMoeExecutor:
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        assert H % 32 == 0 and I % 32 == 0, (H, I)  # e8m0 scales per 32 along K
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gup).data_ptr(),
-            down_ptr=self._make_table(dnp).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=0,
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=0,
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
-        return ptrs, (H, I)
-
-    def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
-        io = self._io.get(bs)
-        if io is None:
-            io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-            }
-            self._io[bs] = io
-        return io
-
-    def _task_for(self, layer_id: int, bs: int) -> int:
-        key = (layer_id, bs)
-        task = self._tasks.get(key)
-        if task is None:
-            io = self._io_for(bs)
-            task = self._ext.create_task(
-                layer_id,
-                bs,
-                io["x"].data_ptr(),
-                io["ids"].data_ptr(),
-                io["w"].data_ptr(),
-                io["y"].data_ptr(),
-            )
-            self._tasks[key] = task
-            # Allocate this (layer, bs) combo a flag slot and register its task with the
-            # coordinator. Combos past the slot capacity keep the host-func path.
-            if self._flag_sync and key not in self._flag_slots:
-                slot = len(self._flag_slots)
-                if slot < self._flag_capacity:
-                    self._flag_slots[key] = slot
-                    self._ext.register_flag_task(slot, task)
-        return task
+        banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, down_scale=dns)
+        return banks, {}, (H, I)
 
     def decode(
         self,
@@ -547,7 +527,7 @@ class CpuMoeExecutor:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple:
-        """Issue the D2H copies + the CPU-pool submit host node, then return without
+        """Issue the D2H copies + the CPU-pool submit host node (or the publish kernel), then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
         :meth:`decode_sync` so the CPU compute overlaps the GPU GEMM / PCIe fetch.
 
@@ -556,7 +536,14 @@ class CpuMoeExecutor:
         :meth:`decode_sync`. The output tensor is allocated here so it stays live (and
         distinct from the interleaved GPU work) across the overlap window."""
         bs = hidden_states.shape[0]
-        io = self._io_for(bs)
+        if bs > self.max_tokens:
+            raise ValueError(f"CPU MoE decode batch {bs} exceeds the executor's max_tokens {self.max_tokens}")
+        if not self._graph_capture_safe and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CPU MoE decode cannot be captured into a CUDA graph here: the stream-memop "
+                "doorbell is off or failed its startup probe, and the host-function sync is not "
+                "replay-safe on this runtime; run with --cuda-graph-max-bs 0"
+            )
 
         if self._gpu_prequant:
             # DSV4: apply the reference FP8 round-trip on the GPU (the same kernel the
@@ -564,93 +551,88 @@ class CpuMoeExecutor:
             # pre-quantized activations and skips its serial scalar pass.
             from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 
-            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
+            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
+
+        stream = torch.cuda.current_stream().cuda_stream
+        if self._kernel_io and hidden_states.dtype == torch.bfloat16:
+            x = hidden_states.contiguous()
+            ids = topk_ids.to(torch.int32).contiguous()
+            w = topk_weights.to(torch.float32).contiguous()
+            assert x.shape == (bs, self.H) and ids.shape == w.shape == (bs, self.top_k), (x.shape, ids.shape, w.shape)
+            self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs)
+            return (bs, torch.empty_like(x), True)
 
         # D2H: ship this step's activations + routing to pinned host memory.
-        io["x"].copy_(hidden_states, non_blocking=True)
-        io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        io = self._io
+        io["x"][:bs].copy_(hidden_states, non_blocking=True)
+        io["ids"][:bs].copy_(topk_ids.to(torch.int32), non_blocking=True)
+        io["w"][:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        task = self._task_for(layer_id, bs)
         out = torch.empty_like(hidden_states)
-        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
-        if slot is not None:
-            # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
-            # doorbell). No kernel launched; no host-func round trip.
-            self._cpu_moe.memop_submit(
-                torch.cuda.current_stream().cuda_stream,
-                self._done.data_ptr(), self._ready.data_ptr(), slot,
-            )
+        if self._flag_sync:
+            # Front-end memops: reset done, then ring the doorbell with (layer, bs).
+            # No kernel launched; no host-func round trip.
+            self._ext.flag_signal(stream, layer_id, bs)
         else:
-            stream = torch.cuda.current_stream().cuda_stream
-            self._ext.submit_with_cuda_stream(stream, task)
-        return (bs, task, out, slot)
+            self._ext.submit_with_cuda_stream(stream, layer_id, bs)
+        return (bs, out, False)
 
-    def decode_sync(self, pending: tuple) -> torch.Tensor:
+    def decode_sync(self, pending: tuple, add_to: torch.Tensor | None = None) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
-        memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot = pending
-        if slot is not None:
-            # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
+        memop on done (set by the CPU coordinator); otherwise a cudaLaunchHostFunc.
+        With ``add_to``, return ``add_to`` + the CPU output; the kernel path adds in place into ``add_to``."""
+        bs, out, kernel_io = pending
+        stream = torch.cuda.current_stream().cuda_stream
+        if self._flag_sync:
+            # Front-end WAIT(done >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
-            self._cpu_moe.memop_sync(
-                torch.cuda.current_stream().cuda_stream, self._done.data_ptr(), slot,
-            )
+            self._ext.flag_wait(stream)
         else:
-            stream = torch.cuda.current_stream().cuda_stream
-            self._ext.sync_with_cuda_stream(stream, task)
-        io = self._io[bs]
-        out.copy_(io["y"], non_blocking=True)
-        return out
+            self._ext.sync_with_cuda_stream(stream)
+        if kernel_io:
+            if add_to is not None and add_to.dtype == torch.bfloat16 and add_to.is_contiguous() and add_to.shape == out.shape:
+                self._ext.flag_combine(stream, add_to.data_ptr(), bs, True)
+                return add_to
+            self._ext.flag_combine(stream, out.data_ptr(), bs, False)
+            return out if add_to is None else add_to + out
+        out.copy_(self._io["y"][:bs], non_blocking=True)
+        return out if add_to is None else add_to + out
 
-    def _watchdog_tick(self, suspects: dict) -> None:
+    def _watchdog_tick(self, suspect: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).
 
-        A slot is only declared dead when THREE things hold across >=10 s: its doorbell
-        is still pending (ready==1 && done==0), it was already pending when first
-        suspected, and the coordinator has served NOTHING on it since (flag_served_count
-        unchanged). The served-count criterion kills the false-positive window: two
-        point samples can land on the same slot's (independent, us-scale) pending
-        windows under heavy external load, but a coordinator that made progress in
-        between is alive by definition. ``suspects`` maps slot -> (first_seen,
-        served_at_first_sight) and persists across ticks."""
-        stuck = (self._ready == 1) & (self._done == 0)
-        if not bool(stuck.any()):
-            suspects.clear()
+        The doorbell is only declared dead when THREE things hold across >=10 s: it is
+        still pending (ready set, done==0), it was already pending when first suspected, and
+        the coordinator has served NOTHING since (flag_served unchanged). The served-count
+        criterion kills the false-positive window: two point samples can land on
+        (independent, us-scale) pending windows under heavy external load, but a
+        coordinator that made progress in between is alive by definition. ``suspect``
+        holds (first_seen, served_at_first_sight) and persists across ticks."""
+        if not self._ext.flag_pending():
+            suspect.clear()
             return
         now = time.monotonic()
-        pending = set(stuck.nonzero().flatten().tolist())
-        for slot in list(suspects):
-            if slot not in pending:
-                del suspects[slot]
-        dead = []
-        for slot in pending:
-            served = self._ext.flag_served_count(slot)
-            first_seen, served_then = suspects.get(slot, (None, None))
-            if first_seen is None or served != served_then:
-                suspects[slot] = (now, served)  # new suspect, or alive-but-loaded: rearm
-                continue
-            if now - first_seen >= 10.0:
-                dead.append(slot)
-        if not dead:
+        served = self._ext.flag_served()
+        if not suspect or suspect["served"] != served:
+            suspect.update(first_seen=now, served=served)  # new suspect, or alive-but-loaded: rearm
+            return
+        if now - suspect["first_seen"] < 10.0:
             return
         logger.error(
-            f"cpu-moe flag watchdog: slots {dead} unanswered for >10s with no coordinator "
-            "progress (wedged/dead); poisoning done[] and failing the next step"
+            "cpu-moe flag watchdog: doorbell unanswered for >10s with no coordinator "
+            "progress (wedged/dead); poisoning done and failing the next step"
         )
-        for i in dead:
-            self._err[i] = 1
-        for i in dead:
-            self._done[i] = 1  # after err: unblock the stream into a checked failure
-            suspects.pop(i, None)
+        self._unhealthy = True
+        self._ext.poison_flag()  # after the mark: unblock the stream into a checked failure
+        suspect.clear()
 
     def raise_if_unhealthy(self) -> None:
         """Raise if the flag watchdog fired (a doorbell stayed unanswered because the
         coordinator never responded). Called by the engine once per forward -- a single
-        pinned read -- so a dead coordinator surfaces as a loud error on the next step
+        flag read -- so a dead coordinator surfaces as a loud error on the next step
         instead of silently shipping stale expert outputs."""
-        if self._err is not None and bool((self._err != 0).any()):
+        if self._unhealthy:
             raise RuntimeError(
                 "CPU MoE flag-handshake watchdog fired: a decode step's doorbell was "
                 "never answered by the coordinator thread (its outputs cannot be "
@@ -663,13 +645,13 @@ class CpuMoeExecutor:
 def _watchdog_main(executor_ref) -> None:
     """Watchdog daemon body: weakref-deref per tick so the thread never keeps a dead
     executor alive (see the start site in ``CpuMoeExecutor.__init__``)."""
-    suspects: dict = {}
+    suspect: dict = {}
     while True:
         time.sleep(2.0)
         executor = executor_ref()
-        if executor is None or executor._watchdog_stop or executor._ready is None:
+        if executor is None or executor._watchdog_stop:
             return
         try:
-            executor._watchdog_tick(suspects)
+            executor._watchdog_tick(suspect)
         finally:
             del executor  # drop the strong ref before the next sleep

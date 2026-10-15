@@ -24,6 +24,9 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil
+from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, round_e4m3
+
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -71,6 +74,12 @@ def _decode_dsfp4_moe_kernel(
     n_mask = offs_n < N
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    if slot < 0:
+        # an inactive route (hybrid decode computes it on the CPU): zero contribution, and no read of
+        # any slot -- a slot's storage may be uninitialized, and 0 * NaN is not 0
+        tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=compute_type), mask=(route_id < total_routes) & n_mask)
+        return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 
@@ -113,7 +122,6 @@ def _decode_dsfp4_moe_kernel(
         weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
         accumulator = accumulator * weight
 
-    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
@@ -124,11 +132,15 @@ def _swiglu_kernel(
     R, I, limit,
     stride_gr, stride_gi, stride_or, stride_oi,
     BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, compute_type: tl.constexpr,
+    ACT_BLOCK: tl.constexpr,  # > 0: fp8 (e4m3, ue8m0 per ACT_BLOCK) round-trip of the stored value, fused
 ):
     """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit)``.
 
     Collapses the gate/up split + two clamps + silu + mul + the fp32 round-trip
-    (6 elementwise launches over [R, I]) between the two FP4 GEMVs into one pass."""
+    (6 elementwise launches over [R, I]) between the two FP4 GEMVs into one pass. With
+    ``ACT_BLOCK`` the down projection's activation quant (``act_quant_fp8_inplace`` on the bf16
+    value: ``s = 2**ceil(log2(max(|x|, 1e-4) / 448))``, e4m3 rounding, dequant) is applied to the
+    same tile before the store -- one launch and one memory pass fewer, bit-identical."""
     row = tl.program_id(0)
     cb = tl.program_id(1)
     offs = cb * BLOCK + tl.arange(0, BLOCK)
@@ -139,6 +151,17 @@ def _swiglu_kernel(
         g = tl.minimum(g, limit)
         u = tl.minimum(tl.maximum(u, -limit), limit)
     act = (g * tl.sigmoid(g)) * u
+    if ACT_BLOCK > 0:
+        tl.static_assert(BLOCK % ACT_BLOCK == 0, "the tile holds whole quant blocks")
+        xs = tl.reshape(act.to(compute_type).to(tl.float32), (BLOCK // ACT_BLOCK, ACT_BLOCK))  # the value the store would hold
+        amax = tl.maximum(tl.max(tl.abs(xs), axis=1), 1e-4)
+        sc = tl.exp2(_log2_ceil(amax * (1.0 / 448.0)).to(tl.float32))
+        q = tl.clamp(xs / sc[:, None], -448.0, 448.0)
+        if e4m3_native_cx():
+            q = q.to(tl.float8e4nv).to(tl.float32)
+        else:
+            q = round_e4m3(q)
+        act = tl.reshape(q * sc[:, None], (BLOCK,))
     tl.store(out_ptr + row * stride_or + offs * stride_oi, act.to(compute_type), mask=mask)
 
 
@@ -274,20 +297,22 @@ def _compute_type(dtype: torch.dtype):
     return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[dtype]
 
 
-def fused_swiglu(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
-    """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``)."""
+def fused_swiglu(gate_up: torch.Tensor, limit: float, *, act_block: int = 0) -> torch.Tensor:
+    """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``). ``act_block > 0``
+    also applies the down projection's fp8 activation round-trip (block ``act_block``) in the same pass."""
     *lead, two_I = gate_up.shape
     I = two_I // 2
     gu = gate_up.reshape(-1, two_I)
     R = gu.shape[0]
     out = torch.empty((R, I), dtype=gate_up.dtype, device=gate_up.device)
     BLOCK = 1024
+    assert act_block == 0 or (I % act_block == 0 and BLOCK % act_block == 0), (I, act_block)
     grid = (R, triton.cdiv(I, BLOCK))
     _swiglu_kernel[grid](
         gu, out, R, I, float(limit),
         gu.stride(0), gu.stride(1), out.stride(0), out.stride(1),
         BLOCK=BLOCK, HAS_LIMIT=limit > 0,
-        compute_type=_compute_type(gate_up.dtype), num_warps=4,
+        compute_type=_compute_type(gate_up.dtype), ACT_BLOCK=act_block, num_warps=4,
     )
     return out.reshape(*lead, I)
 

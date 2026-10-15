@@ -215,3 +215,54 @@ def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_confi
     quant = _quant(_hf_config(quantization_config), tmp_path)
     for prefix in DENSE_PREFIXES + BF16_PREFIXES:
         assert quant.scheme_for(prefix) is None, prefix
+
+
+# Qwen3.8-Flash-Next model card, "Processing Ultra-Long Texts": the 1M-token override.
+MODEL_CARD_YARN = {
+    "mrope_interleaved": True,
+    "mrope_section": [11, 11, 10],
+    "rope_type": "yarn",
+    "rope_theta": 10000000,
+    "partial_rotary_factor": 0.25,
+    "factor": 4.0,
+    "original_max_position_embeddings": 262144,
+}
+
+
+def _write_checkpoint_config(path, **fields) -> None:
+    import json
+
+    text = {k: v for k, v in vars(_text_config()).items()}
+    config = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "image_token_id": 248056,
+        "text_config": text,
+        "quantization_config": RADIXARK_NVFP4,
+        **fields,
+    }
+    (path / "config.json").write_text(json.dumps(config))
+
+
+def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+
+    _write_checkpoint_config(tmp_path)
+    config = EngineConfig(
+        model_path=str(tmp_path),
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        hf_overrides={"text_config": {"rope_parameters": MODEL_CARD_YARN}},
+        mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
+    )
+    rotary = config.model_config.rotary_config
+    assert rotary.scaling["rope_type"] == "yarn" and rotary.scaling["factor"] == 4.0 and rotary.mrope_section is None
+    assert rotary.max_position == 262144 and rotary.rotary_dim == 64 and rotary.base == 10000000
+    assert config.max_seq_len == 4 * 262144
+    plain = EngineConfig(model_path=str(tmp_path), tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16,
+                         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    assert plain.model_config.rotary_config.scaling is None and plain.max_seq_len == 262144

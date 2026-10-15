@@ -84,7 +84,8 @@ class EffortProfile:
     template interpolates anything". ``strength_dialect`` True means the
     template reads the ``reasoning_strength`` spelling (muse-glimmer's family,
     whose documented ladder tops out at xhigh) rather than only
-    ``reasoning_effort``.
+    ``reasoning_effort``. ``integer_range`` records a validated 1-100 budget
+    accepted independently of the named effort vocabulary.
     """
 
     supported: frozenset[str]
@@ -92,6 +93,7 @@ class EffortProfile:
     consumes_effort: bool
     validates: bool = False
     strength_dialect: bool = False
+    integer_range: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,7 @@ class ThinkingProfile:
 _MAX_QUANTIZE_DISTANCE = 0.15
 
 
-def quantize_effort(value: Any, profile: EffortProfile) -> str | None:
+def quantize_effort(value: Any, profile: EffortProfile) -> str | int | None:
     """Map a client's effort onto ``profile``; ``None`` means "send nothing".
 
     In-vocabulary values pass through untouched. Other named levels land on the
@@ -128,6 +130,11 @@ def quantize_effort(value: Any, profile: EffortProfile) -> str | None:
     the template default. With "max" excluded the remaining scale values are
     unique, so quantization is deterministic across processes.
     """
+    if profile.integer_range is not None and isinstance(value, (int, float)):
+        low, high = profile.integer_range
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"reasoning_effort must be an integer in [{low}, {high}]")
+        return value
     supported = effective_efforts(profile)
     if not supported:
         return None
@@ -181,6 +188,7 @@ def probe_effort_profile(
     diverged: set[str] = set()
     matches_baseline: dict[str, bool] = {name: True for name in KNOWN_REASONING_EFFORTS}
     ran_rounds = 0
+    integer_range = None
 
     for base_kwargs, tools in _PROBE_ROUNDS:
         try:
@@ -198,6 +206,10 @@ def probe_effort_profile(
             if _renderings_differ(rendering, baseline):
                 diverged.add(name)
                 matches_baseline[name] = False
+        # Only a validated budget range is a numeric capability; arbitrary Jinja
+        # interpolation must not advertise support for numeric reasoning effort.
+        if _accepts_integer_budget(render, base_kwargs, tools):
+            integer_range = (1, 100)
 
     if ran_rounds == 0:
         # Nothing learnable: sending no effort is the only safe rendering.
@@ -214,7 +226,7 @@ def probe_effort_profile(
         strength_dialect = False
 
     supported = frozenset(name for name in KNOWN_REASONING_EFFORTS if name not in rejected)
-    consumes = bool(rejected or diverged)
+    consumes = bool(rejected or diverged or integer_range)
     default = None
     if consumes:
         defaults = [name for name in supported if matches_baseline[name]]
@@ -226,7 +238,24 @@ def probe_effort_profile(
         consumes_effort=consumes,
         validates=bool(rejected),
         strength_dialect=strength_dialect,
+        integer_range=integer_range,
     )
+
+
+def _accepts_integer_budget(render, base_kwargs, tools) -> bool:
+    for value in (0, 101):
+        try:
+            render({**base_kwargs, "reasoning_effort": value}, tools)
+        except Exception:  # noqa: BLE001 -- the encoder owns validation
+            continue
+        return False
+    outputs = []
+    for value in range(1, 101):
+        try:
+            outputs.append(render({**base_kwargs, "reasoning_effort": value}, tools))
+        except Exception:  # noqa: BLE001
+            return False
+    return _renderings_differ(outputs[0], outputs[-1])
 
 
 def probe_thinking_profile(

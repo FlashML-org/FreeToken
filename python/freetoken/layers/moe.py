@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Iterator, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -307,19 +307,18 @@ class OffloadMoELayer(MoELayer):
 
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
         the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+        routing split runs inside the hybrid ensure kernel and the CPU submit/sync are host nodes.
+        Each route is computed exactly once -- CPU-assigned routes reach the GPU as slot -1 with
+        weight 0 (a kernel with ``supports_inactive_slots`` skips them without a read; any other reads
+        slot 0, whose storage is a payload or the bank's zero fill) and the CPU ids are -1 for
+        GPU-assigned routes (the C++ kernel skips id<0).
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
-
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
+        # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
+        clamp = not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots)
+        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -329,8 +328,6 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -341,8 +338,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        if not _HYBRID_OVERLAP:
+            return gpu_routed + cpu_routed_early
+        return executor.decode_sync(pending, add_to=gpu_routed)
 
     def _prefill_routed(
         self,
@@ -435,6 +433,19 @@ class OffloadMoELayer(MoELayer):
         raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
 
 
+def iter_moe_layers(model) -> Iterator[MoELayer]:
+    if isinstance(model, MoELayer):
+        yield model
+    if not isinstance(model, BaseOP):
+        return
+    for value in model.__dict__.values():
+        if isinstance(value, BaseOP):
+            yield from iter_moe_layers(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from iter_moe_layers(item)
+
+
 def make_moe_layer(
     config: "ModelConfig",
     *,
@@ -483,10 +494,10 @@ def make_moe_layer(
         has_bias=has_bias,
         quant_config=quant_config,
         prefix=prefix,
+        layer_id=layer_id,
     )
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
-        kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
     return layer_cls(**kwargs)

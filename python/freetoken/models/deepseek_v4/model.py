@@ -4,7 +4,7 @@ A faithful single-stream port of the reference (MLA attention with a sliding win
 + stateful KV compressors / Lightning Indexer, manifold-constrained Hyper-Connections,
 sqrtsoftplus / hash MoE), wired onto FreeToken's shared paged engine:
 
-  - KV lives in DSV4-owned paged pools (:class:`~freetoken.kvcache.dsv4_paged_pool.DSV4PagedKVCache`):
+  - KV lives in DSV4-owned paged pools (:class:`~freetoken.kvcache.dsv4.v4_pool.DSV4PagedKVCache`):
     each layer's window-ring + compressed KV is a region of a shared global pool, addressed by
     per-layer slot maps. Sparse attention is a PAGED physical-slot gather:
     ``sparse_attn_paged`` reads KV directly from the two global pools (window / compressed) at
@@ -29,11 +29,12 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 
 from .args import DeepseekV4Args
 from .attention import Attention
 from .moe import MoE
+from .vision import COMPRESS_PAD_TO, DSV4Vision
 
 # Re-exports: keep every class/helper previously defined here importable from .model
 # (external import stability; the moved definitions live in their own modules).
@@ -85,7 +86,7 @@ class Block(BaseOP):
         )
         return y.view(shape)
 
-    def prefill_batched(self, x, input_ids, segments, flat_positions):
+    def prefill_batched(self, x, input_ids, segments, flat_positions, spans_by_ti=None):
         # Ragged batched prefill (cu_seqlens, no padding; bs >= 1, cold and radix-hit segments
         # mixed freely). ``x`` is [1, T, hc_mult, dim] -- the requests' token streams
         # concatenated. Per-token ops (HC / norm / MoE) run batched over ALL T tokens (the
@@ -93,10 +94,12 @@ class Block(BaseOP):
         # T queries (Attention.forward_ragged), with the stateful compressor/indexer looped per
         # request. ``segments`` = [(offset, extend_len, table_idx, start_pos)] off the attention
         # metadata; ``flat_positions`` [T] = per-token ABSOLUTE position (batch.positions).
+        # ``spans_by_ti`` maps a page-table row to its image spans: the sparse attention needs
+        # the pairs, the block-tiled backends read the flat ends (batch.mm_block_ends) instead.
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm.forward(x)
-        x = self.attn.forward_ragged(x, segments, flat_positions)
+        x = self.attn.forward_ragged(x, segments, flat_positions, spans_by_ti=spans_by_ti)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -152,6 +155,7 @@ class Transformer(BaseOP):
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
+        spans_by_ti: dict | None = None,
     ) -> torch.Tensor:
         # Ragged batched prefill (bs >= 1). ``input_ids`` is [1, T] -- the requests' NEW tokens
         # concatenated (cu_seqlens, no padding); each request starts at its own cached_len
@@ -163,10 +167,13 @@ class Transformer(BaseOP):
         # metadata; ``flat_positions`` [T] is the scheduler-staged batch.positions (per-token
         # ABSOLUTE position); the head picks each request's final token off the attention
         # metadata -> its next-token logits row.
-        h = self.embed.forward(input_ids.view(-1)).view(1, -1, self.args.dim)
+        batch = get_global_ctx().batch
+        # on a chunk that carries image rows, batch.mm_embeds' leading columns replace the
+        # embedding of every row in batch.mm_rows -- the whole image span, sentinels included
+        h = embed_input_ids(self.embed, input_ids.view(-1), batch).view(1, -1, self.args.dim)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers.op_list:
-            h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+            h = layer.prefill_batched(h, input_ids, segments, flat_positions, spans_by_ti)
         h = self.hc_head(h)
         h = self.norm.forward(h)
         return self.head.forward(h[0])  # [B, vocab]
@@ -200,6 +207,26 @@ class Transformer(BaseOP):
         return self.head.forward(h[:, -1])
 
 
+def _image_spans_by_ti(reqs) -> dict | None:
+    """The batch's image spans as ``(IMAGE_START position, block end)`` pairs per page-table row.
+
+    Only this model reads the pairs (built here, not staged on the batch): its sparse
+    attention builds candidate lists per span. The reference ``get_image_visible`` counts
+    visibility within [IMAGE_START, IMAGE_END], so the span starts at the START sentinel
+    (after ``build_image_block``'s alignment lead pads), not at the block's first token.
+    """
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for req in reqs:
+        req_spans = [
+            (lo + COMPRESS_PAD_TO - 1 - lo % COMPRESS_PAD_TO, hi)
+            for item in req.mm_items or ()
+            for lo, hi in item.offsets
+        ]
+        if req_spans:
+            spans[req.table_idx] = req_spans
+    return spans or None
+
+
 class DeepseekV4ForCausalLM(BaseLLMModel):
     """Engine adapter: a registered :class:`BaseLLMModel` wrapping the DSV4 transformer.
 
@@ -211,6 +238,12 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._args: DeepseekV4Args = config.dsv4_args
         self.model = Transformer(self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, prefix="model")
         self._bound = False
+        # Vision (DeepSeek-V4-Flash-Vision-Exp). config.is_multimodal is the engine's
+        # resolved gate, so a text-only process never builds weights the loader skips.
+        # The whole stack sits under one ``visual.`` mount, so the shared vision-key
+        # filter (VISION_KEY_PREFIXES) covers every image-only parameter.
+        if config.is_multimodal:
+            self.visual = DSV4Vision(config.vision_config, config.hidden_size)
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -226,6 +259,12 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         block count, freqs) depends on the new pool's geometry, so re-derive it via _ensure_bound."""
         self._bound = False
 
+    def place_encoder_weights(self, mode: str) -> None:
+        self.visual.place_weights(mode)
+
+    def encode(self, item):
+        return self.visual.forward(item)
+
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch
@@ -240,6 +279,7 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             # cross requests.
             return self.model.prefill_batched(
                 input_ids.view(1, -1), md.segments, batch.positions.long(),
+                spans_by_ti=_image_spans_by_ti(batch.reqs),
             )
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1

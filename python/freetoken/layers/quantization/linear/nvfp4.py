@@ -38,6 +38,8 @@ class MarlinNvfp4LinearKernel(LinearKernel):
     name = "marlin"
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        if backend.is_rocm():
+            return "Marlin is CUDA-only and unavailable on ROCm; use triton"
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
         if len(cfg.output_sizes) > 1:

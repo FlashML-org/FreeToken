@@ -4,15 +4,16 @@
 open for the daemon's whole life. flock (not a bare port-bind) avoids TIME_WAIT races and is
 released automatically if the daemon dies, so a crashed daemon never wedges its own restart.
 
-``ServeStateStore`` persists ``{model, port, pid, args, starttime, logPath}`` as JSON on every
+``ServeStateStore`` persists ``{model, port, pid, args, starttime, log_path, api_key}`` as JSON on every
 lifecycle change, so a restarted daemon can re-adopt a still-running serve. ``starttime`` +
-``args`` are what make re-adoption PID-reuse-safe and config-exact."""
+``args`` are what make re-adoption PID-reuse-safe and config-exact.
+The file is owner-only because it holds the serve's API key."""
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 class AlreadyRunning(RuntimeError):
@@ -63,6 +64,7 @@ class ServeState:
     args: list[str]
     starttime: int | None = None
     log_path: str | None = None
+    api_key: str | None = field(default=None, repr=False)
 
 
 class ServeStateStore:
@@ -72,7 +74,12 @@ class ServeStateStore:
     def save(self, state: ServeState) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = f"{self.path}.tmp"
-        with open(tmp, "w") as fh:
+        # unlink first: O_CREAT applies the 0o600 mode only to a file it creates
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
             json.dump(asdict(state), fh)
             fh.flush()
             os.fsync(fh.fileno())
@@ -102,6 +109,7 @@ class ServeStateStore:
                 args=list(doc.get("args") or []),
                 starttime=doc.get("starttime"),
                 log_path=doc.get("log_path"),
+                api_key=doc.get("api_key"),
             )
         except (KeyError, TypeError, ValueError):
             return None

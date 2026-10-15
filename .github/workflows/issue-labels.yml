@@ -1,23 +1,35 @@
-name: Label issues
+name: Label issues and PRs
 
 on:
   issues:
     types: [opened, edited]
+  pull_request_target:
+    types: [opened, edited]
 
 permissions:
   issues: write
+  pull-requests: write
 
 jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      - uses: github/issue-labeler@v3.4
+      - if: github.event_name == 'issues'
+        uses: github/issue-labeler@v3.4
         with:
           configuration-path: .github/issue-labeler.yml
           enable-versioned-regex: 0
           include-title: 0
           repo-token: ${{ github.token }}
-      - if: github.event.action == 'opened'
+      - if: github.event.action == 'opened' || github.event.changes.title
+        uses: github/issue-labeler@v3.4
+        with:
+          configuration-path: .github/issue-title-labeler.yml
+          enable-versioned-regex: 0
+          include-title: 1
+          include-body: 0
+          repo-token: ${{ github.token }}
+      - if: github.event_name == 'issues' && github.event.action == 'opened'
         uses: actions/github-script@v7
         with:
           script: |

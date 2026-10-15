@@ -35,7 +35,7 @@ def _decode_fp8_moe_kernel(
     stride_twm, stride_twk, stride_tidm, stride_tidk,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
-    compute_type: tl.constexpr,
+    compute_type: tl.constexpr, EVEN_K: tl.constexpr,
 ):
     route_id = tl.program_id(0)
     n_block = tl.program_id(1)
@@ -54,7 +54,10 @@ def _decode_fp8_moe_kernel(
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for kb in range(tl.cdiv(K, BLOCK_K)):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
+        if EVEN_K:
+            k_mask = tl.full((BLOCK_K,), True, tl.int1)
+        else:
+            k_mask = offs_k < K
         if e4m3_native_cx():
             w = tl.load(
                 w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
@@ -66,8 +69,10 @@ def _decode_fp8_moe_kernel(
                 mask=n_mask[:, None] & k_mask[None, :], other=0,
             ))
         sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
-        a = tl.load(a_base + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
-        acc += tl.sum(w * a[None, :], axis=1) * sc
+        # load the activation row at the weight tile shape so it gets the weight tile layout (no shared-memory layout conversion)
+        a_ptrs = tl.broadcast_to(a_base + offs_k[None, :] * stride_ak, (BLOCK_N, BLOCK_K))
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0).to(tl.float32)
+        acc += tl.sum(w * a, axis=1) * sc
 
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
@@ -92,7 +97,7 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
         topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), num_warps=4,
+        compute_type=_TL.get(c.dtype, tl.bfloat16), EVEN_K=w.shape[2] % 128 == 0, num_warps=4,
     )
 
 

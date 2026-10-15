@@ -37,3 +37,19 @@ python -m pip install --no-build-isolation -e .
 
 Set both architecture variables to `gfx1200` for RX 9060 family GPUs, or to the
 actual target reported by `rocminfo`.
+
+## Optional kernel backends
+
+FreeToken's FlashInfer, `sgl_kernel`, and vLLM kernel integrations are CUDA-only.
+On ROCm, these paths use the built-in fallbacks; do not install the `[accel]`,
+`[fi]`, or `[sgl]` extras. Forcing `--attention-backend fi`, `fa`, or `trtllm`,
+or NVFP4 Marlin/b12x (e.g. `--quant-backend moe.nvfp4=marlin` or
+`--quant-backend moe.nvfp4=b12x`), fails with a ROCm-specific error.
+
+## CPU and hybrid MoE
+
+`--moe-strategy cpu`, `hybrid` and `--moe-cpu-layers` sync the GPU with the CPU
+expert pool through HIP stream memory operations. ROCm 10 records them into CUDA
+graphs itself; on ROCm 7.14, which does not, FreeToken adds the graph nodes
+explicitly. When the startup probe of that path fails, CUDA graph capture stops
+with an error; run those strategies with `--cuda-graph-max-bs 0`.

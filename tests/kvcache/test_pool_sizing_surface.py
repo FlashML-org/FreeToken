@@ -30,7 +30,7 @@ def _model_config(specs, **attrs):
 
 def test_resolve_pool_class_follows_attn_type():
     from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
 
@@ -91,11 +91,11 @@ def _dsv4_config(num_page_override=None):
 
 
 def test_dsv4_kv_cost_and_floor_parity():
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_swa_ratio, _dsv4_window_floor_pages
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_swa_ratio, _dsv4_window_floor_pages
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 
-    pytest.importorskip("freetoken.kvcache.dsv4_cost_model")
-    from freetoken.kvcache.dsv4_cost_model import dsv4_auto_cost_model
+    pytest.importorskip("freetoken.kvcache.dsv4.v4_cost_model")
+    from freetoken.kvcache.dsv4.v4_cost_model import dsv4_auto_cost_model
 
     config = _dsv4_config()
     P = 128
@@ -147,8 +147,8 @@ def test_generic_validate_rebuild_budget_check():
 
 def test_dsv4_validate_rebuild_floor():
     from freetoken.kvcache.base import CacheRebuildRejected
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_window_floor_pages
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 
     config = _dsv4_config()
     pool = object.__new__(DSV4PagedKVCache)  # floor path reads no instance state
@@ -165,7 +165,7 @@ def test_rebuild_from_config_explicit_num_swa_pages_wins():
     # The explicit parameter must take precedence over config.swa_num_pages_override --
     # the engine's override write would otherwise mask a dropped parameter forever.
     from freetoken.distributed import set_tp_info, try_get_tp_info
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_pool_sizes
+    from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_pool_sizes
     from freetoken.kvcache.hybrid_swa_pool import _swa_paged_num_tokens, _swa_pool_floor
 
     if try_get_tp_info() is None:
@@ -183,7 +183,7 @@ def test_rebuild_from_config_explicit_num_swa_pages_wins():
     assert _swa_paged_num_tokens(swa_cfg, 11, num_swa_pages=explicit) == explicit + 1
     assert _swa_paged_num_tokens(swa_cfg, 11) == 999_999 + 1  # override path unchanged
 
-    from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages
+    from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_window_floor_pages
 
     d_cfg = _dsv4_config()
     d_floor = _dsv4_window_floor_pages(d_cfg, d_cfg.page_size)

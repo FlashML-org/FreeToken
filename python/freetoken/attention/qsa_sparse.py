@@ -167,23 +167,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def _index_rope_cache(self) -> torch.Tensor:
         """cos/sin table of the indexer rope: same rotary_dim and frequencies as the main
-        attention, ``head_size`` 128 instead of 256, so it is a separate get_rope instance.
+        attention with ``head_size`` 128 instead of 256, so the attention's own table.
 
         The table itself (not RotaryEmbedding.forward) because the indexer's norm+rope is one
         fused kernel and the compressed keys rope at their group's position, not the query's."""
         if self._index_cos_sin is None:
-            from freetoken.layers.rotary import get_rope
+            from freetoken.layers.rotary import rope_cos_sin_table
 
             rotary = self.rotary_config
             with torch.device(self.device):
-                rope = get_rope(
-                    head_dim=self.index_head_dim,
-                    rotary_dim=rotary.rotary_dim,
-                    max_position=rotary.max_position,
-                    base=rotary.base,
-                    rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
+                self._index_cos_sin = rope_cos_sin_table(
+                    self.index_head_dim,
+                    rotary.rotary_dim,
+                    rotary.max_position,
+                    rotary.base,
+                    tuple(rotary.scaling.items()) if rotary.scaling else None,
                 )
-            self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
 
     def _index_rope_rows(self, positions: torch.Tensor) -> torch.Tensor:
