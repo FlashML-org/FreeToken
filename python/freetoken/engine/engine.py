@@ -786,10 +786,12 @@ class Engine:
             # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
             while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
                 size -= 1
+            overlap = config.moe_prefill_overlap and size >= 2 * config.model_config.num_experts
             object.__setattr__(config, "moe_cache_size", size)
+            object.__setattr__(config, "moe_prefill_overlap", overlap)
             logger.info_rank0(
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
-                f"({per_slot / 2**20:.2f} MiB per slot)"
+                f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
