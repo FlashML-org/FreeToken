@@ -251,6 +251,18 @@ def _torch_topk_blocks(logits, visible, width):
     return out
 
 
+def _selected_scores(logits, selection):
+    """The sorted scores a selection picked, with empty (-1) slots counted as -inf.
+
+    Top-k with ties is a set of SCORES, not of indices: the winning score multiset is unique even
+    when which tied column fills a given slot is not. So this is the tie-invariant thing to compare
+    between the kernel and torch.topk (which break ties differently)."""
+    safe = selection.clamp(min=0).long()
+    scores = logits.gather(1, safe)
+    scores = torch.where(selection >= 0, scores, torch.full_like(scores, -float("inf")))
+    return scores.sort(-1).values
+
+
 def _topk_case(n_blocks: int, bs: int, mode: str, seed: int):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -280,8 +292,11 @@ def test_block_topk_matches_torch_topk(n_blocks: int, width: int, bs: int, mode:
     qsa_block_topk(logits, visible, blocks)
     expected = _torch_topk_blocks(logits, visible, width)
 
-    # Selection is a set: torch.topk orders by descending score, the kernel by column id.
-    torch.testing.assert_close(blocks.sort(-1).values, expected.sort(-1).values)
+    # Top-k with ties is a set of SCORES, not of indices: torch.topk and the kernel break ties
+    # differently (torch by its GPU order, the kernel deterministically by lowest column id), so
+    # comparing which index won on the tied boundary is wrong. Compare the winning score multiset,
+    # which every valid top-k shares.
+    torch.testing.assert_close(_selected_scores(logits, blocks), _selected_scores(logits, expected))
     live = (blocks >= 0).sum(-1)
     torch.testing.assert_close(live, (expected >= 0).sum(-1))
     # expand.py reads ranks [0, complete_blocks), so a -1 may only sit in the tail.
