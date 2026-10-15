@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.models.test_lfm2_moe_weight import E, V, _raw, _write
+from .test_lfm2_moe_weight import E, V, _raw, _write
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

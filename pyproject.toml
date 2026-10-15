@@ -117,6 +117,10 @@ where = ["python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/` itself is the import basedir for the test modules (they import sibling
+# subpackages, e.g. `from kernels.test_dsv41_pack import ...`), which leaves the repo root
+# off sys.path and breaks the `from tests.models...` cross-imports. Put both on it.
+pythonpath = ["."]
 python_files = ["test_*.py"]
 markers = [
     "slow: takes tens of seconds (big kernel sweeps, real-checkpoint reads); deselect with -m 'not slow'",
