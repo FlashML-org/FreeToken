@@ -16,6 +16,8 @@ math mirrors ``ggml-quants.c``.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 # ggml_type enum values (subset present in these checkpoints).
@@ -23,6 +25,7 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +36,7 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +46,7 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -57,6 +62,33 @@ def row_bytes(numel: int, ggml_type: int) -> int:
         f"{numel} not a multiple of block {block} for {GGML_NAME.get(ggml_type, ggml_type)}"
     )
     return numel // block * type_size
+
+
+def padded_row_bytes(numel: int, ggml_type: int) -> tuple[int, int]:
+    """``(row_bytes, padded_numel)``: the row padded with whole blocks to a 16-byte multiple.
+
+    The offload cache moves expert rows with 16-byte-granular kernels, but a ggml K-quant row
+    is only as aligned as its blocks allow (Q6_K: 210 bytes per 256 elements, so a 1536-wide
+    row is 1260 bytes; Q4_K: 144 bytes per 256, already a multiple of 16). Padding with whole
+    super-blocks keeps the row 16-byte aligned; an all-zero weight block dequantizes to exactly
+    zero and the matching zero-padded activation contributes exactly zero, so the dot products
+    are unchanged.
+    """
+    block, type_size = BLOCK_SHAPE[ggml_type]
+    if numel % block:
+        raise ValueError(
+            f"{numel} not a multiple of block {block} for {GGML_NAME.get(ggml_type, ggml_type)}"
+        )
+    blocks = numel // block
+    step = 16 // math.gcd(type_size, 16)  # blocks per 16-byte row segment
+    blocks = -(-blocks // step) * step
+    return blocks * type_size, blocks * block
+
+
+def row_numel(row_bytes: int, ggml_type: int) -> int:
+    """Element width of a packed row of ``row_bytes`` bytes (the inverse of :func:`padded_row_bytes`)."""
+    block, type_size = BLOCK_SHAPE[ggml_type]
+    return row_bytes // type_size * block
 
 
 def _f16_scales(raw: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
@@ -77,6 +109,51 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K: 256-elem super-block = fp16 ``d`` + fp16 ``dmin`` + 12B packed 6-bit scales/mins
+    + 128B nibbles; ``w = d*sc*q - dmin*m``. Vectorization of ggml's ``get_scale_min_k4``
+    block loop."""
+
+    raw = raw.reshape(-1, 144)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    dmin = _f16_scales(raw, 2, 4)  # [n,1]
+    packed_scales = raw[:, 4:16].to(torch.int32)  # [n,12] raw bytes
+    low = packed_scales & 0x3F  # [n,12]: bytes 0-3 scales, 4-7 mins, 8-11 the high halves
+    qs = raw[:, 16:144].to(torch.int32)  # [n,128]
+
+    # 8 sub-blocks of 32 elements: scales 0-3 / mins 0-3 in the low 6 bits of bytes 0-7,
+    # scales 4-7 / mins 4-7 in the low 4 bits of bytes 8-11 plus the top 2 bits of 0-7
+    # (ggml get_scale_min_k4).
+    sc = torch.empty((n, 8), dtype=torch.int32, device=raw.device)
+    mn = torch.empty((n, 8), dtype=torch.int32, device=raw.device)
+    sc[:, :4] = low[:, :4]
+    mn[:, :4] = low[:, 4:8]
+    hi = packed_scales[:, 8:12]  # [n,4]
+    sc[:, 4:] = (hi & 0x0F) | ((packed_scales[:, 0:4] >> 6) << 4)
+    mn[:, 4:] = (hi >> 4) | ((packed_scales[:, 4:8] >> 6) << 4)
+
+    y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
+    for half in range(4):  # 64 elements per iteration: 32 low nibbles then 32 high nibbles
+        q = qs[:, half * 32 : (half + 1) * 32]
+        d1 = d * sc[:, 2 * half].unsqueeze(1).to(torch.float32)
+        m1 = dmin * mn[:, 2 * half].unsqueeze(1).to(torch.float32)
+        d2 = d * sc[:, 2 * half + 1].unsqueeze(1).to(torch.float32)
+        m2 = dmin * mn[:, 2 * half + 1].unsqueeze(1).to(torch.float32)
+        base = half * 64
+        y[:, base : base + 32] = d1 * (q & 0x0F).to(torch.float32) - m1
+        y[:, base + 32 : base + 64] = d2 * (q >> 4).to(torch.float32) - m2
+    return y.reshape(-1).to(out_dtype)
+
+
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 values; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -117,6 +194,8 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_Q4_K: dequant_q4_k,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -143,11 +222,16 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
+    "padded_row_bytes",
+    "row_numel",
     "dequant_q4_0",
+    "dequant_q8_0",
+    "dequant_q4_k",
     "dequant_q6_k",
     "dequantize",
 ]

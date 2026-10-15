@@ -49,6 +49,11 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF K-quant experts (a Q4_K_M-style file mixes Q4_K and Q6_K per tensor):
+    # same packed-rows-per-output-row layout as q4_0, but the type is per layer -- the
+    # loader carries it in ``layer_tags`` as (gate_up_type, down_type) and pads rows with
+    # whole super-blocks to a 16-byte multiple (see models/gguf/dequant.padded_row_bytes).
+    "gguf_k": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -126,12 +131,15 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
-    # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
+    # "bf16" (default, dense expert weights), one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
-    # W4A16); or "mxfp4_triton" (gpt-oss transposed split-K GEMV decode + _t grouped
-    # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
-    # may read the banks; the cache machinery itself is layout-agnostic.
+    # W4A16); "mxfp4_triton" (gpt-oss transposed split-K GEMV decode + _t grouped
+    # prefill); or a native GGUF layout, whose rows are the checkpoint's own packed
+    # ggml blocks read by the borrowed ggml MoE kernels -- "q4_0" (one type for every
+    # layer) or "gguf_k" (the type is per layer, carried in ``layer_tags``). The format
+    # names its bank layout (_BANK_SCHEMAS) and which kernels may read the banks; the
+    # cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
@@ -240,6 +248,9 @@ class OffloadMoeCache:
             self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
+        # per-layer quant tag (see bank_layouts): the GGUF K-quant kernel dispatch reads the
+        # (gate_up_type, down_type) pair from here; None = one quant for every layer (q4_0).
+        self.layer_tags: list | None = None
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
@@ -492,6 +503,7 @@ class OffloadMoeCache:
                         )
             self.bank_sources[name] = list(per_layer)
         keys = bank_layouts(sources, layer_tags)
+        self.layer_tags = None if layer_tags is None else list(layer_tags)
         unique = list(dict.fromkeys(keys))
         self.layouts = [banks for _, banks in unique]
         self.layer_layout = [unique.index(key) for key in keys]

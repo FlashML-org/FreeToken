@@ -15,6 +15,66 @@ from .reader import gguf_architecture, load_gguf_metadata
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 _TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
 
+# LFM2's byte-level BPE splits on a GPT-4-style pattern, which the converter's generic
+# GPT-2 path does not produce (digits group in 1-3s, punctuation runs stay whole).
+# llama.cpp names it ``tokenizer.ggml.pre = "lfm2"``; the pattern below is the one the
+# released LFM2/LFM2.5 ``tokenizer.json`` carries.
+_LFM2_PRE = "lfm2"
+_LFM2_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+# Markers llama.cpp writes as CONTROL although the released tokenizer ships them
+# non-special: they delimit text a client parses, so they must survive
+# decode(skip_special_tokens=True).
+_PLAIN_MARKERS_BY_PRE = {
+    _LFM2_PRE: ("<|tool_call_start|>", "<|tool_call_end|>"),
+}
+
+
+def _register_gguf_special_tokens(
+    tokenizer, tokens: list, token_types, plain_markers: tuple[str, ...] = ()
+) -> None:
+    """Encoder-isolate the tokens the GGUF marks CONTROL (special) and USER_DEFINED.
+
+    llama.cpp splits them out before BPE, so without this the chat markers
+    (``<|im_start|>``, ``<think>``, ...) would BPE-split into pieces. The generic GPT-2
+    converter path used by families without their own converter (LFM2) registers none.
+    """
+    from tokenizers import AddedToken
+
+    types = list(token_types or [])
+    specials, plain = [], []
+    for i, kind in enumerate(types):
+        if i >= len(tokens):
+            break
+        if kind not in (3, 4):  # gguf CONTROL / USER_DEFINED
+            continue
+        token = tokens[i]
+        special = kind == 3 and token not in plain_markers
+        (specials if special else plain).append(
+            AddedToken(token, normalized=False, special=special)
+        )
+    if specials:
+        tokenizer.add_special_tokens(specials)
+    if plain:
+        tokenizer.add_tokens(plain)
+
+
+def _apply_pre_tokenizer_override(tokenizer, pre: str | None) -> None:
+    """Give ``pre`` its trained pre-tokenizer + decoder (the converter has no entry for it)."""
+    if pre != _LFM2_PRE:
+        return
+    from tokenizers import Regex, decoders, pre_tokenizers
+
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(_LFM2_PATTERN), behavior="isolated"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, trim_offsets=True, use_regex=False),
+        ]
+    )
+    tokenizer.decoder = decoders.ByteLevel(add_prefix_space=True, trim_offsets=True, use_regex=True)
+
 
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
@@ -22,13 +82,23 @@ def load_gguf_tokenizer(model_path: str):
 
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
-    conv_arch = _TOKENIZER_ARCH.get(arch, arch)
     tok_dict: dict[str, Any] = {
         k[len("tokenizer.ggml.") :]: v
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
+    # Families whose converter key differs from the GGUF architecture name (gemma4) are
+    # listed; everything else uses the file's own ``tokenizer.ggml.model`` (the BPE variant
+    # llama.cpp wrote, e.g. "gpt2" for LFM2's byte-level BPE).
+    conv_arch = _TOKENIZER_ARCH.get(arch) or str(tok_dict.get("model") or arch)
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+    _register_gguf_special_tokens(
+        fast,
+        tok_dict["tokens"],
+        tok_dict.get("token_type"),
+        _PLAIN_MARKERS_BY_PRE.get(tok_dict.get("pre"), ()),
+    )
+    _apply_pre_tokenizer_override(fast, tok_dict.get("pre"))
 
     tokens = tok_dict["tokens"]
 

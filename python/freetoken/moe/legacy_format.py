@@ -42,5 +42,8 @@ def legacy_format_for(kind: QuantKind, kernel: str) -> str:
     return LEGACY_FORMAT[(kind, kernel)]
 
 
-def kind_kernel_for(legacy_format: str) -> tuple[QuantKind, str]:
-    return _KIND_KERNEL[legacy_format]
+def kind_kernel_for(legacy_format: str) -> tuple[QuantKind | None, str | None]:
+    """The (kind, kernel) a tag was packed for; ``(None, None)`` for the native GGUF bank
+    layouts (q4_0 / gguf_k), which no ``QuantKind`` method produces -- their kernels dispatch
+    on the bank's own quant tag (and, for gguf_k, on the per-layer tags)."""
+    return _KIND_KERNEL.get(legacy_format, (None, None))

@@ -240,6 +240,9 @@ def convert_checkpoint(
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
     num_layers = None
+    # Native GGUF banks carry one ggml type pair per layer (a K-quant file mixes Q4_K and
+    # Q6_K): the bytes are only decodable with the tags, so the FTW index must carry them.
+    layer_tags = None
     if offload:
         # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
         from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
@@ -250,6 +253,7 @@ def convert_checkpoint(
             model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
         )
         quant_format = banks.quant_format
+        layer_tags = banks.layer_tags
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
@@ -317,6 +321,9 @@ def convert_checkpoint(
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
+        # per-layer expert quant tags (GGUF native banks): None for method-packed formats,
+        # whose single kernel layout is implied by quant_format
+        "expert_layer_tags": None if layer_tags is None else [list(t) for t in layer_tags],
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
         "side_files": side_files,

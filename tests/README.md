@@ -62,6 +62,7 @@ checkpoint is set:
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
+| `FREETOKEN_LFM2_GGUF_GLOB` | `models/test_lfm2_moe_gguf.py`, `tokenizer/test_tokenize.py` — glob matching a local LFM2/LFM2.5-MoE `.gguf` (config/geometry, bank plan, tokenizer; no weight load) |
 | `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 | `FREETOKEN_DSV4_VL_MODEL` | `tokenizer/test_mm_tokenize.py` - local DeepSeek-V4 vision checkpoint |
 | `FREETOKEN_DSV4_VISION_CKPT` | `models/test_dsv4_vision.py` - the same checkpoint, for the parity tests against its `inference/` reference code |

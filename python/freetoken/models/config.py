@@ -344,6 +344,16 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # GGUF (native-quant) checkpoints: each tensor's ggml quant type by checkpoint name, as
+    # sorted pairs so the config stays hashable. A K-quant file mixes types per tensor (Q4_K
+    # head projections, Q6_K v_proj / down experts), so the GGUF model classes instantiate
+    # each packed projection with the type this table names. Empty for every other model.
+    gguf_tensor_types: Tuple[Tuple[str, int], ...] = ()
+    # Exact routed-expert bank bytes when the family can state them without reading the
+    # weights (GGUF: the packed expert tensor bytes plus row alignment padding). The
+    # format-tag table cannot size a per-tensor mixed K-quant, and this figure feeds the
+    # pin-budget / auto-residency decisions, so the family supplies it at parse time.
+    expert_bank_bytes: int | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

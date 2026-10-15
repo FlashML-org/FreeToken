@@ -335,6 +335,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # conv / router are bf16 in every release (the FP8 export's own `ignore` lists them)
         unquantized_modules=("*.conv.in_proj", "*.conv.out_proj", "*.feed_forward.gate"),
     ),
+    # GGUF (native Q4_K/Q6_K) LFM2/LFM2.5-MoE: same model class, GGUF config + weight loaders.
+    "Lfm2MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.lfm2_moe",
+        "Lfm2MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
 }
 
 

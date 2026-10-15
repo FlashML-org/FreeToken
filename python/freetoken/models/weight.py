@@ -280,10 +280,34 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_gguf_k_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    dummy: bool = False,
+    layer_sink=None,
+) -> tuple[dict, list]:
+    """``(banks, layer_tags)`` of native GGUF K-quant expert rows.
+
+    ``banks`` holds one packed host tensor per layer per bank role (``gate_up``, ``down``) and
+    ``layer_tags`` the per-layer ``(gate_up_type, down_type)`` ggml pair the kernel dispatches
+    on -- a K-quant file mixes Q4_K and Q6_K per tensor, so the type is not a format constant.
+    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy.
+    """
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        builder = _model_override(spec, "dummy_gguf_k_expert_sources")
+        assert builder is not None, "model defines no dummy_gguf_k_expert_sources"
+        return builder(model_config)
+    loader = _load_attr(spec.module, "load_gguf_k_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
 __all__ = [
     "load_weight",
     "load_vision_weight",
     "ftw_lacks_vision",
     "load_q4_0_moe_expert_sources",
+    "load_gguf_k_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

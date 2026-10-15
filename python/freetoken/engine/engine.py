@@ -1259,7 +1259,7 @@ _RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4")
 
 
 def _fused_resident_ok(model_config) -> bool:
-    """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
+    """Whether the resident ('fused') MoE path can hold this model's experts; the native GGUF expert banks (q4_0 / gguf_k) and DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")

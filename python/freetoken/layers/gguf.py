@@ -22,6 +22,7 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,9 +33,9 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q6_K}
+_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
@@ -125,4 +126,51 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+class GGUFTiedLMHead:
+    """Tied LM head over a native block-quantized embedding table (logits via ggml matmul).
+
+    Holds only a reference to the GGUF embedding (no params of its own -> empty state_dict),
+    mirroring ``ParallelLMHead`` with ``tie_word_embeddings``. TP=1 only.
+    """
+
+    def __init__(self, embedding: GGUFEmbedding, quant_type: int):
+        self._embedding = embedding
+        self._quant_type = quant_type
+
+    def state_dict(self, *, prefix: str = "", result=None):
+        return result if result is not None else {}
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        state_dict.pop(f"{prefix}.weight", None)
+        state_dict.pop(f"{prefix}.bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
+
+
+class GGUFLinearHead(GGUFLinear):
+    """``GGUFLinear`` over an untied ``output.weight``, with the prefill last-token gather
+    ``ParallelLMHead`` performs (the engine samples one row per request)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            x = x[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
+        return super().forward(x)
+
+
+__all__ = [
+    "GGUFLinear",
+    "GGUFLinearHead",
+    "GGUFEmbedding",
+    "GGUFTiedLMHead",
+    "fused_mul_mat_gguf",
+]

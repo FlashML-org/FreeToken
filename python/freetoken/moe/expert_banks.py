@@ -181,9 +181,36 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _gguf_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf_k: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
+            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
+        )
+    from freetoken.models.weight import load_gguf_k_moe_expert_sources
+
+    # Native GGUF K-quant routed experts: the file's own packed block bytes (Q4_K / Q6_K,
+    # mixed per tensor) streamed to the GPU and dequantized inside the borrowed ggml MoE
+    # kernels, no bf16 expert copy. Rows are padded with whole super-blocks to a 16-byte
+    # multiple so the cache's row copies stay aligned; the per-layer (gate_up, down) type
+    # pair rides in layer_tags, which is what tells the kernel how to read them.
+    sink = None if dummy else layer_sink
+    sources, layer_tags = load_gguf_k_moe_expert_sources(
+        model_path, model_config, dummy=dummy, layer_sink=sink
+    )
+    return ExpertBanks(
+        "gguf_k",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf_k"]},
+        layer_tags=layer_tags,
+        streamed=sink is not None,
+    )
+
+
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "gguf_k": _gguf_k_banks,
 }
 
 
@@ -271,11 +298,18 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
     )
-    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     layers = getattr(model_config, "num_moe_layers", None)
     experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
+    if method is None:
+        # A family that knows its exact bank bytes (GGUF: the file's packed expert tensors
+        # plus row padding, which the per-format table below cannot size for a mixed K-quant)
+        # states them at parse time.
+        stated = getattr(model_config, "expert_bank_bytes", None)
+        if stated is not None:
+            return stated
+    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     if per_expert is None or not all((layers, experts, hidden, inter)):
         return None
     return layers * experts * per_expert(hidden, inter)

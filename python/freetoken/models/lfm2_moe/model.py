@@ -92,6 +92,14 @@ class Lfm2MoeForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+        # GGUF checkpoints carry native block-quantized weights: swap the dense projections
+        # and the embedding (also the tied head) for GGUF-quant ops; the routed experts stay
+        # on the offload cache as native K-quant banks.
+        from .gguf import convert_lfm2_moe_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_lfm2_moe_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         return self.lm_head.forward(self.model.forward(get_global_ctx().batch.input_ids))
 

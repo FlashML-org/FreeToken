@@ -37,6 +37,9 @@ FTW_METADATA_GGUF = "source_metadata.gguf"
 # Records whether the source carried an untied "output.weight" head (the tensor table
 # is stripped from metadata-only gguf files, so the fact travels as a KV).
 OUTPUT_WEIGHT_PRESENT_KV = "freetoken.output_weight_present"
+# The source's per-tensor ggml quant types, as "name|type" strings (same reason: families
+# whose model classes instantiate one packed op per tensor need the types without a table).
+GGUF_TENSOR_TYPES_KV = "freetoken.tensor_types"
 
 
 def gguf_config_source(model_path: str) -> str | None:
@@ -82,7 +85,16 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     present = any(t.name == "output.weight" for t in reader.tensors)
     buf += struct.pack("<Q", len(key)) + key
     buf += struct.pack("<I", int(gguf.GGUFValueType.BOOL)) + bytes([1 if present else 0])
-    struct.pack_into("<Q", buf, 16, struct.unpack_from("<Q", buf, 16)[0] + 1)
+    # ... and the per-tensor quant types, for families whose model classes instantiate one
+    # packed op per tensor (a mixed K-quant file cannot be reconstructed without them).
+    types_key = GGUF_TENSOR_TYPES_KV.encode()
+    entries = [f"{t.name}|{int(t.tensor_type)}".encode() for t in reader.tensors]
+    buf += struct.pack("<Q", len(types_key)) + types_key
+    buf += struct.pack("<II", int(gguf.GGUFValueType.ARRAY), int(gguf.GGUFValueType.STRING))
+    buf += struct.pack("<Q", len(entries))
+    for entry in entries:
+        buf += struct.pack("<Q", len(entry)) + entry
+    struct.pack_into("<Q", buf, 16, struct.unpack_from("<Q", buf, 16)[0] + 2)
     tmp = dest_path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(buf)
@@ -92,9 +104,13 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     assert not check.tensors, "metadata gguf still lists tensors after patch"
     src_keys = {k for k in reader.fields if not k.startswith("GGUF.")}
     dst_keys = {k for k in check.fields if not k.startswith("GGUF.")}
-    assert dst_keys == src_keys | {OUTPUT_WEIGHT_PRESENT_KV}, (
+    added = {OUTPUT_WEIGHT_PRESENT_KV, GGUF_TENSOR_TYPES_KV}
+    assert dst_keys == src_keys | added, (
         f"metadata gguf KV keys differ from source: "
-        f"missing {sorted(src_keys - dst_keys)}, extra {sorted(dst_keys - src_keys - {OUTPUT_WEIGHT_PRESENT_KV})}"
+        f"missing {sorted(src_keys - dst_keys)}, extra {sorted(dst_keys - src_keys - added)}"
+    )
+    assert len(check.fields[GGUF_TENSOR_TYPES_KV].contents()) == len(entries), (
+        "metadata gguf tensor type map did not survive the re-parse"
     )
 
 
@@ -179,6 +195,7 @@ __all__ = [
     "is_gguf_path",
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
+    "GGUF_TENSOR_TYPES_KV",
     "gguf_config_source",
     "write_metadata_gguf",
     "GgufTensor",

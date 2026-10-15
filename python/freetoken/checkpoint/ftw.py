@@ -666,9 +666,11 @@ def load_ftw_banks(
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    tags = reader.meta("expert_layer_tags")
     return ExpertBanks(
         quant_format, sources, **alpha_kw,
         layer_residency=applied, kind=kind, kernel=kernel,
+        layer_tags=None if tags is None else [tuple(t) for t in tags],
     )
 
 
@@ -732,7 +734,11 @@ def load_ftw_banks_to_device(path: str, *, num_layers: int, device: torch.device
         reader.close()
 
     kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
-    return ExpertBanks(quant_format, sources, **alphas, kind=kind, kernel=kernel)
+    tags = reader.meta("expert_layer_tags")
+    return ExpertBanks(
+        quant_format, sources, **alphas, kind=kind, kernel=kernel,
+        layer_tags=None if tags is None else [tuple(t) for t in tags],
+    )
 
 
 __all__ = [

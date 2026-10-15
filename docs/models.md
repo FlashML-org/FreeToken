@@ -79,6 +79,20 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- GGUF checkpoints load directly (`ft serve --model <file>.gguf`): the llama.cpp `gemma4`
+  and `lfm2moe` architectures. Quantized weights stay in their packed ggml blocks and are
+  dequantized inside the borrowed ggml kernels (no bf16 copy of a weight is ever
+  materialized), and the routed experts load as native host banks -- `--moe-strategy offload`
+  is forced for them, so a `Q4_K_M` LFM2.5-24B-A2B serves from ~14 GiB of host RAM plus its
+  GPU slot cache. TP=1 only: neither the packed linears nor the expert banks are
+  tensor-parallel sharded. Per-tensor quant types are read from the file, so llama.cpp's
+  mixed recipes work as written (Q4_K attention and gate/up experts with Q6_K `v_proj` and
+  down experts); the types served are Q4_0, Q8_0, Q4_K and Q6_K. A K-quant row whose byte
+  length is not a 16-byte multiple (a Q6_K row of 1536 elements is 1260 bytes) is padded with
+  whole super-blocks, because the offload cache moves rows with 16-byte-granular kernels; the
+  padding blocks are zero and the activation is zero-padded to match, so the dot products are
+  unchanged. `ft checkpoint` keeps the weights packed and records the per-tensor types in the
+  FTW index, so a converted directory serves identically.
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps

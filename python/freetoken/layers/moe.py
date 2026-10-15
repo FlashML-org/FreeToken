@@ -428,16 +428,32 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
-            # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+        if fmt in ("q4_0", "gguf_k"):
+            # Native GGUF packed experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+            # streamed banks; topk_ids already index the cache slots / layer. The per-layer
+            # tag carries each bank's ggml type (a K-quant file mixes Q4_K / Q6_K); a format
+            # without tags has every bank packed Q4_0 (the gemma4 GGUF layout).
+            from freetoken.models.gguf.dequant import GGML_Q4_0
+            from freetoken.moe.fused_gguf import fused_experts_gguf
 
             gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            tags = cache.layer_tags
+            gate_up_type, down_type = (
+                (GGML_Q4_0, GGML_Q4_0) if tags is None else tags[self.layer_id]
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+            return fused_experts_gguf(
+                hidden_states,
+                gate_up,
+                down,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                gate_up_type,
+                down_type,
+            )
+        raise AssertionError(
+            f"offload experts without a quant method only serve native GGUF banks, got {fmt!r}"
+        )
 
 
 def iter_moe_layers(model) -> Iterator[MoELayer]:

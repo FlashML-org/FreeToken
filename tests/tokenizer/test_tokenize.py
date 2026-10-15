@@ -816,3 +816,34 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     )
     assert manager.render_prompt(msg) == f"Reasoning Effort: {budget}"
     assert msg.chat_template_kwargs["reasoning_effort"] == budget
+
+
+LFM2_GGUF_GLOB = os.environ.get("FREETOKEN_LFM2_GGUF_GLOB", "")
+
+
+@pytest.mark.skipif(
+    not LFM2_GGUF_GLOB, reason="FREETOKEN_LFM2_GGUF_GLOB not set to a local LFM2-MoE .gguf"
+)
+def test_gguf_tokenizer_for_an_lfm2_byte_level_bpe():
+    """The LFM2 GGUFs are byte-level BPE with the ``lfm2`` pre-tokenizer, which no gguf-py
+    converter entry produces: the tokens it isolates (``<|im_start|>``, ``<think>``) and the
+    GPT-4-style split (digits in runs of at most three) must come out as in the released
+    ``tokenizer.json``, and the tool/marker tokens llama.cpp calls CONTROL must stay in
+    decoded text."""
+    import glob as _glob
+
+    from freetoken.models.gguf.tokenizer import load_gguf_tokenizer
+
+    tok = load_gguf_tokenizer(_glob.glob(LFM2_GGUF_GLOB)[0])
+    # the chat markers are single added tokens, not BPE pieces
+    assert tok.encode("<|im_start|>assistant\n<think>") == [124899, 63514, 207, 124901]
+    assert tok.encode("<|startoftext|>The capital of France is")[:2] == [124894, 597]
+    # digit runs stop at three (the lfm2 pre-tokenizer's GPT-4-style pattern), so a long
+    # number splits into merges of at most three digits
+    assert tok.encode("1234567890", add_special_tokens=False) == [9792, 25677, 23944, 24]
+    assert tok.encode("abc1234567", add_special_tokens=False) == [48140, 9792, 25677, 31]
+    # llama.cpp marks the tool-call delimiters CONTROL, the released tokenizer ships them
+    # non-special: they must survive a special-skipping decode
+    text = "<|tool_call_start|>[f(a=1)]<|tool_call_end|>"
+    assert tok.decode(tok.encode(text), skip_special_tokens=True) == text
+    assert tok.decode(tok.encode("<|im_start|>hi<|im_end|>"), skip_special_tokens=True) == "hi"

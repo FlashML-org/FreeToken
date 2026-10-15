@@ -423,6 +423,10 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=1536,
         expert_formats=("bf16",),
         aliases=("LiquidAI/LFM2-24B-A2B",),
+        # the Q4_K_M GGUF release: same geometry, native K-quant banks. They move through the
+        # fused multi-bank copy, which takes its per-row byte sizes at runtime, so they add no
+        # per-bank fast_index_copy spec here.
+        arch_aliases=("Lfm2MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="LiquidAI/LFM2.5-24B-A2B-FP8",
