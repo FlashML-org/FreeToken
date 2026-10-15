@@ -143,6 +143,24 @@ class HostBank:
             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
 
+    def discard(self) -> None:
+        """Free a bank that was never published: drop the tensor view, unmap the buffer and forget it.
+
+        For a loader rolling back after ``HostBank(...)``: nothing else may hold the bank's ``memoryview`` (release it first, or ``mmap.close`` refuses). A registered (``pin()``-ed) mmap cannot be unmapped safely without ``cudaHostUnregister``, which the extension does not expose, so such a bank is only forgotten by this object and stays mapped. Idempotent."""
+        if self.tensor is None:
+            return
+        buf, self._buf = self._buf, None
+        self.tensor = None
+        self.nbytes = 0
+        if not isinstance(buf, mmap.mmap):
+            return  # cuda backing: dropping the numpy slice (and its .base) frees the pinned allocation
+        if self._pinned:
+            logger.warning(f"discarding a registered {len(buf) / 2**30:.1f} GiB bank: the mapping stays registered until exit")
+            return
+        buf.close()
+        with contextlib.suppress(ValueError):
+            _LIVE_BUFFERS.remove(buf)
+
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
