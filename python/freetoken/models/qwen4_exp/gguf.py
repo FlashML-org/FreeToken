@@ -244,8 +244,9 @@ def iter_gguf_weights(
 
         if layer in config.qwen4_args.ple_layer_ids:
             ple = f"{pre}.ple"
-            yield f"{ple}.key_proj.weight", float_tensor(t(f"{blk}.ple_key"))
-            yield f"{ple}.value_proj.weight", float_tensor(t(f"{blk}.ple_value"))
+            for proj in ("key", "value"):
+                info = t(f"{blk}.ple_{proj}")
+                yield from fused(f"{ple}.{proj}_proj", [info], [matrix(info)], config.qwen4_args.ple_embed_dim)
             for n in ("key", "query", "conv"):
                 yield f"{ple}.norm_{n}.weight", norm(f"{blk}.ple_norm_{n}")
             yield f"{ple}.conv1d.weight", float_tensor(t(f"{blk}.ple_conv1d")).float().unsqueeze(1)
