@@ -268,7 +268,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "cache_size", "id_of_slot_ptr", "usage_ptr"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -291,7 +291,7 @@ def _ensure_experts_hybrid_kernel(
     max_fetch,
     fetch_frac_q16,
     num_experts: tl.constexpr,
-    cache_size: tl.constexpr,
+    cache_size,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
