@@ -25,7 +25,7 @@ jobs:
       run:
         shell: bash
     container:
-      image: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy@sha256:79ef9a883a79d115df706d908251601e3dcef22fc0fa96209928488024104430
+      image: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy
       volumes:
         - /nvme0/data/FreeToken:/assets:ro
       options: >-
@@ -34,7 +34,7 @@ jobs:
         --shm-size=32g
     env:
       CI: "true"
-      ROCM_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy@sha256:79ef9a883a79d115df706d908251601e3dcef22fc0fa96209928488024104430
+      ROCM_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy
       FREETOKEN_ROCM_ARCH: gfx1100
       ROCR_VISIBLE_DEVICES: "6"
       CI_ASSET_ROOT: /assets
