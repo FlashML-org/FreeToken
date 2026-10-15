@@ -1,6 +1,8 @@
 """Client-supplied image handling: ref collection, the accept gate, and byte fetching.
 
 Raises plain ValueError on bad input; the server layer maps it to its wire error type.
+The message names the class of failure only: no local path, allowlist root, errno or
+library text reaches the client (that detail goes to the server log).
 """
 
 from __future__ import annotations
@@ -8,10 +10,15 @@ from __future__ import annotations
 import base64
 from typing import TYPE_CHECKING, Any
 
+from freetoken.utils import init_logger
+
 if TYPE_CHECKING:
     from freetoken.server.args import ServerArgs
 
+logger = init_logger(__name__)
+
 _MAX_IMAGE_BYTES = 32 << 20
+_MAX_REDIRECTS = 5
 
 
 def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -56,6 +63,57 @@ def _check_media_domain(url: str, config: ServerArgs) -> None:
         )
 
 
+def _check_redirect_target(url: str, config: ServerArgs) -> None:
+    """A redirect hop is the remote server's choice, not the client's URL: it must pass the
+    allowlist like the original, and may never land on a loopback / private / link-local
+    address (an allowed public host 302-ing into the operator's network is the SSRF shape)."""
+    import ipaddress
+    from urllib.parse import urlparse
+
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("the URL redirects to a non-http(s) location")
+    try:
+        _check_media_domain(url, config)
+    except ValueError:
+        raise ValueError("the URL redirects outside the allowed domains") from None
+    host = (urlparse(url).hostname or "").rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("the URL redirects to a private or loopback address")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # a name; the allowlist above is the gate for names (no DNS resolution here)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if not ip.is_global or ip.is_multicast:  # covers loopback, private, link-local, CGNAT, unspecified
+        raise ValueError("the URL redirects to a private or loopback address")
+
+
+async def _fetch_remote_media(url: str, config: ServerArgs) -> bytes:
+    """GET an http(s) ref, following redirects one hop at a time so every target is re-checked."""
+    import httpx
+
+    _check_media_domain(url, config)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            async with client.stream("GET", url) as resp:
+                if resp.next_request is not None:  # a 3xx with a Location: httpx built the hop
+                    url = str(resp.next_request.url)
+                    _check_redirect_target(url, config)
+                    continue
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > _MAX_IMAGE_BYTES:
+                    raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} bytes")
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > _MAX_IMAGE_BYTES:
+                        raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} bytes")
+                return bytes(buf)
+    raise ValueError(f"the URL redirects more than {_MAX_REDIRECTS} times")
+
+
 def _load_local_media(url: str, config: ServerArgs) -> bytes:
     """Read a file:// ref; the resolved path must be a strict subpath of --allowed-local-media-path."""
     from pathlib import Path
@@ -70,41 +128,53 @@ def _load_local_media(url: str, config: ServerArgs) -> bytes:
     # resolve() follows symlinks, so a link inside the root escaping it is rejected too
     resolved = filepath.resolve()
     if Path(root).resolve() not in resolved.parents:
-        raise ValueError(
-            f"the file path {filepath} must be a subpath of "
-            f"--allowed-local-media-path {root}"
-        )
+        raise ValueError("the file path must be a subpath of --allowed-local-media-path")
     return resolved.read_bytes()
+
+
+async def _fetch_one(ref: dict[str, Any], config: ServerArgs) -> bytes:
+    """One ref to bytes. Our own ValueErrors are already client-safe and pass through; anything
+    a library raises is reduced to its failure class and logged with the detail."""
+    data = ref.get("data") or ""
+    try:
+        if ref.get("kind") == "b64":
+            return base64.b64decode(data)
+        if data.startswith("data:"):
+            return base64.b64decode(data.split(",", 1)[1])
+    except Exception as exc:  # noqa: BLE001 -- binascii.Error / IndexError, input-driven
+        raise ValueError("image data is not valid base64") from exc
+    if data.startswith(("http://", "https://")):
+        import httpx
+
+        try:
+            return await _fetch_remote_media(data, config)
+        except ValueError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(f"the image URL returned HTTP {exc.response.status_code}") from exc
+        except httpx.TimeoutException as exc:
+            raise ValueError("timed out fetching the image URL") from exc
+        except Exception as exc:  # noqa: BLE001 -- transport / protocol / bad URL
+            logger.warning("image URL fetch failed: %r", exc)
+            raise ValueError("the image URL is unreachable") from exc
+    if data.startswith("file://"):
+        try:
+            return _load_local_media(data, config)
+        except ValueError:
+            raise
+        except OSError as exc:
+            logger.warning("local image read failed: %r", exc)
+            raise ValueError("the local file is missing or unreadable") from exc
+    raise ValueError("unsupported image source (expect http(s)/file url or base64)")
 
 
 async def fetch_image_bytes(refs: list[dict[str, Any]], config: ServerArgs) -> list[bytes]:
     """Resolve collected image refs (URLs / base64) to raw bytes, in order."""
     out: list[bytes] = []
     for ref in refs:
-        data = ref.get("data") or ""
         try:
-            if ref.get("kind") == "b64":
-                out.append(base64.b64decode(data))
-            elif data.startswith("data:"):
-                out.append(base64.b64decode(data.split(",", 1)[1]))
-            elif data.startswith(("http://", "https://")):
-                import httpx
-
-                _check_media_domain(data, config)
-                # redirect targets are not re-checked against the allowlist
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    resp = await client.get(data)
-                    resp.raise_for_status()
-                    if len(resp.content) > _MAX_IMAGE_BYTES:
-                        raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} bytes")
-                    out.append(resp.content)
-            elif data.startswith("file://"):
-                out.append(_load_local_media(data, config))
-            else:
-                raise ValueError(
-                    "unsupported image source (expect http(s)/file url or base64)"
-                )
-        except Exception as exc:  # noqa: BLE001 -- input-driven, client-classifiable
+            out.append(await _fetch_one(ref, config))
+        except ValueError as exc:
             raise ValueError(f"could not load image: {exc}") from exc
     return out
 
