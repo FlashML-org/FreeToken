@@ -140,11 +140,11 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
 
     b = cache.bank_sources
     q4_0 = int(GGMLQuantizationType.Q4_0)
-    h = ggml.mul_mat_id(b["gate_up"][layer].to(dev), q4_0, hidden, ids, out_f32=True)
+    h = ggml.mul_mat_id(b["gate_up"][layer].to(dev), q4_0, hidden.float(), ids)
     inter = torch.empty(bs, top_k, I, device=dev)
     gated_act_and_mul("gelu_tanh", h.view(-1, 2 * I), inter.view(-1, I))
-    y = ggml.mul_mat_id(b["down"][layer].to(dev), q4_0, inter, ids, out_f32=True)
-    gpu_out = ggml.moe_weighted_sum(y, w, torch.bfloat16).float()
+    y = ggml.mul_mat_id(b["down"][layer].to(dev), q4_0, inter, ids)
+    gpu_out = ggml.moe_weighted_sum(y, w)
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
     assert rel < 6e-2, f"q4_0 vs ggml-mmvq rel err {rel.item()}"

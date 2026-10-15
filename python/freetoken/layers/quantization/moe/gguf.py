@@ -82,14 +82,13 @@ class GgmlMoEKernel(MoEKernel):
         if glu is not None and small:
             inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu)
         else:
-            # the intermediate stays fp32 between the expert GEMMs, as in llama.cpp
-            h = ggml.mul_mat_id(gate_up, gate_up_type, x, ids, out_f32=True)
+            h = ggml.mul_mat_id(gate_up, gate_up_type, x, ids)
             t, k, two_i = h.shape
-            inter = torch.empty(t, k, two_i // 2, dtype=torch.float32, device=h.device)
+            inter = torch.empty(t, k, two_i // 2, dtype=h.dtype, device=h.device)
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
-        y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, out_f32=True)
-        return ggml.moe_weighted_sum(y, topk_weights, x.dtype)
+        y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids)
+        return ggml.moe_weighted_sum(y, topk_weights)
 
     @staticmethod
     def _apply_float(layer, x, topk_weights, topk_ids, view: ExpertView, ggml_type: int, *, is_prefill: bool):

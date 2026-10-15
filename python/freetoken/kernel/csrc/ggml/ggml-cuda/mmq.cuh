@@ -10,6 +10,17 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// FreeToken: MMQ writes fp32, bf16 or fp16 results (dst_t); the sums stay fp32 until the store
+template <typename T> static __device__ __forceinline__ T mmq_cast(float v);
+template <> __device__ __forceinline__ float mmq_cast<float>(float v) { return v; }
+template <> __device__ __forceinline__ nv_bfloat16 mmq_cast<nv_bfloat16>(float v) { return __float2bfloat16(v); }
+template <> __device__ __forceinline__ half mmq_cast<half>(float v) { return __float2half(v); }
+
+struct mmq_dst {
+    void * p;
+    ggml_type type;
+};
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -429,8 +440,8 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
-        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, typename dst_t = float> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
+        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, dst_t * __restrict__ dst,
         const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -456,21 +467,21 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
 
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (y_scale_used) {
-                    dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                    dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size]);
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                    dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(sum[(j0/nwarps) * (I/warp_size) + i0/warp_size]);
                 }
             } else {
-                dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(sum[(j0/nwarps) * (I/warp_size) + i0/warp_size]);
                 GGML_UNUSED(y_scale_used);
             }
         }
     }
 }
 
-template<ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+template<ggml_type type, int J, bool fallback, ggml_prec prec_src1, typename dst_t = float>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
-            const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+            const float * __restrict__ sum, const int * __restrict__ ids_dst, dst_t * __restrict__ dst,
             const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -506,12 +517,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
 
                 if constexpr (type == GGML_TYPE_NVFP4) {
                     if (y_scale_used) {
-                        dst[ids_dst[j]*stride + i] = y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l]);
                     } else {
-                        dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                        dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(sum[(j0/tile_C::J + n)*tile_C::ne + l]);
                     }
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    dst[ids_dst[j]*stride + i] = mmq_cast<dst_t>(sum[(j0/tile_C::J + n)*tile_C::ne + l]);
                     GGML_UNUSED(y_scale_used);
                 }
             }
@@ -869,10 +880,10 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1>
+template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, typename dst_t>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
-        const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int * __restrict__ ids_dst, dst_t * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
@@ -942,8 +953,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
-    } else {
+    } else if constexpr (std::is_same_v<dst_t, float>) {
         write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    } else if constexpr (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout()) {
+        ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, dst_t>(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    } else {
+        ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, dst_t>(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
     }
 }
 
@@ -959,11 +974,11 @@ static __device__ __forceinline__ void mmq_flat_tile(const int2 * __restrict__ t
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, typename dst_t>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, const int2 * __restrict__ tile_map, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds, const int2 * __restrict__ tile_map, dst_t * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -1387,8 +1402,18 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+// FreeToken: copies an fp32 result with dst's layout into dst
+template <typename dst_t>
+static __global__ void mmq_store_dst(const float * __restrict__ src, dst_t * __restrict__ dst, const int nrows, const int stride) {
+    const int64_t col = blockIdx.x;
+    const int     row = blockIdx.y*blockDim.x + threadIdx.x;
+    if (row < nrows) {
+        dst[col*stride + row] = mmq_cast<dst_t>(src[col*stride + row]);
+    }
+}
+
 struct mmq_args {
-    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; mmq_dst dst;
     const float * y_scale;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
@@ -1420,9 +1445,6 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
-
     // a flat MoE grid puts all experts into one channel of ntx_flat column tiles
     const int64_t nchannels_grid = args.tile_map ? 1 : args.nchannels_y;
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
@@ -1442,13 +1464,66 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!config.stream_k) {
-        mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.tile_map, args.dst, nullptr, args.y_scale,
+    const auto run = [&](auto * dst, const dim3 & block_nums, float * tmp_fixup) {
+        using dst_t = std::remove_pointer_t<decltype(dst)>;
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1, dst_t>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1, dst_t>), nbytes_shared);
+        mul_mat_q<type, J, fallback, prec_src1, dst_t><<<block_nums, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.tile_map, dst, tmp_fixup, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
              ntx_fd);
+    };
+
+    // FreeToken: the fixup kernel adds partial sums into an fp32 dst, so a bf16 dst that needs it is computed in fp32 first.
+    // An fp16 dst always is, unless GGML_MMQ_F16_DST builds the fp16 kernels.
+    const auto launch = [&](const dim3 & block_nums, const bool fixup, float * tmp_fixup) {
+        bool via_f32 = fixup && args.dst.type != GGML_TYPE_F32;
+#ifndef GGML_MMQ_F16_DST
+        via_f32 = via_f32 || args.dst.type == GGML_TYPE_F16;
+#endif // GGML_MMQ_F16_DST
+        ggml_cuda_pool_alloc<float> dst_f32(ctx.pool(id));
+        float * dst_float = args.dst.type == GGML_TYPE_F32 ? (float *) args.dst.p : nullptr;
+        if (via_f32) {
+            GGML_ASSERT(args.ids_dst || (args.nchannels_y == 1 && args.nsamples_y == 1));
+            dst_float = dst_f32.alloc(args.ncols_dst * args.nrows_dst);
+        }
+
+        if (dst_float) {
+            run(dst_float, block_nums, tmp_fixup);
+        } else if (args.dst.type == GGML_TYPE_BF16) {
+            run((nv_bfloat16 *) args.dst.p, block_nums, tmp_fixup);
+        }
+#ifdef GGML_MMQ_F16_DST
+        else {
+            run((half *) args.dst.p, block_nums, tmp_fixup);
+        }
+#endif // GGML_MMQ_F16_DST
+
+        if (fixup) {
+            CUDA_CHECK(cudaGetLastError());
+            const dim3 block_nums_fixup(block_nums.x, config.I/warp_size, 1);
+            const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+            mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+                (args.ids_dst, args.expert_bounds, dst_float, tmp_fixup, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+                 args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+                 ntx_fd);
+        }
+
+        if (via_f32) {
+            CUDA_CHECK(cudaGetLastError());
+            const dim3 block_nums_store(args.ncols_dst, (args.nrows_x + 255) / 256, 1);
+            if (args.dst.type == GGML_TYPE_BF16) {
+                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (nv_bfloat16 *) args.dst.p, args.nrows_x, args.nrows_dst);
+            } else {
+                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (half *) args.dst.p, args.nrows_x, args.nrows_dst);
+            }
+        }
+    };
+
+    if (!config.stream_k) {
+        launch(block_nums_xy_tiling, false, nullptr);
         return;
     }
 
@@ -1470,25 +1545,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
     }
 
-    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
-    const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
-
-    mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.tile_map, args.dst, tmp_fixup.ptr, args.y_scale,
-         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-         channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
-
-    if (!fixup_needed) {
-        return;
-    }
-
-    CUDA_CHECK(cudaGetLastError());
-    mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
-         args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+    launch(block_nums_stream_k, fixup_needed, tmp_fixup.ptr);
 }
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1>

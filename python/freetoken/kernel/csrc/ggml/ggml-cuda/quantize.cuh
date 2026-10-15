@@ -16,7 +16,7 @@ typedef void (*quantize_cuda_t)(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
-// FreeToken: src_t is float or nv_bfloat16
+// FreeToken: src_t is float, nv_bfloat16 or half
 template <typename src_t>
 void quantize_row_q8_1_cuda(
         const src_t * x, const int32_t * ids, void * vy,

@@ -1,6 +1,7 @@
 """llama.cpp's ggml-cuda kernels (vendored under ``csrc/ggml``) as a tvm-ffi module: prebuilt in the kernel cache, else compiled on first use.
 
 Weights stay in their packed ggml blocks. ``mul_mat`` / ``mul_mat_id`` pick MMVQ or MMQ the way llama.cpp's mul_mat / mul_mat_id do.
+Activations are fp32, bf16 or fp16 and are quantized to q8_1 first; results come out in the activation dtype and are accumulated in fp32.
 """
 
 from __future__ import annotations
@@ -17,8 +18,6 @@ if TYPE_CHECKING:
     from tvm_ffi import Module
 
 _ROOT = pathlib.Path(__file__).parent / "csrc" / "ggml"
-# dtypes the kernels read and write; others go through fp32
-_NATIVE = (torch.bfloat16, torch.float32)
 
 
 def load_module(build_directory: str | None = None) -> Module:
@@ -43,19 +42,6 @@ def _module() -> Module:
     return load_module()
 
 
-def _activation(x: torch.Tensor) -> torch.Tensor:
-    return (x if x.dtype in _NATIVE else x.float()).contiguous()
-
-
-def _writable(out: torch.Tensor) -> torch.Tensor:
-    """``out``, or an fp32 buffer to copy into it when the kernels cannot write its dtype."""
-    return out if out.dtype in _NATIVE else torch.empty(out.shape, dtype=torch.float32, device=out.device)
-
-
-def _result_dtype(x: torch.Tensor, out_f32: bool) -> torch.dtype:
-    return torch.bfloat16 if x.dtype == torch.bfloat16 and not out_f32 else torch.float32
-
-
 @functools.cache
 def _mmq_tail_bytes(ggml_type: int, k: int) -> int:
     return _module().mmq_tail_bytes(ggml_type, k)
@@ -71,22 +57,17 @@ def _check_mmq_tail(w: torch.Tensor, ggml_type: int, k: int) -> None:
         raise ValueError(f"ggml type {ggml_type} K={k} weight needs {tail} bytes of zero padding after its last row for MMQ")
 
 
-def mul_mat(
-    w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out_f32: bool = False, out: torch.Tensor | None = None, xq: torch.Tensor | None = None
-) -> torch.Tensor:
-    """``x[M, K] @ w[N, K]^T`` with ``w`` packed as ``[N, row_bytes]`` uint8; the result is in ``x``'s dtype unless ``out_f32``, or written into the ``[M, N]`` view ``out``.
+def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tensor | None = None, xq: torch.Tensor | None = None) -> torch.Tensor:
+    """``x[M, K] @ w[N, K]^T`` in ``x``'s dtype with ``w`` packed as ``[N, row_bytes]`` uint8, or written into the ``[M, N]`` view ``out``.
 
     ``xq`` is ``quantize_q8_1(x)``: the vector kernel reads it instead of quantizing ``x`` again.
     """
     m, k = x.shape
     if out is None:
-        out = torch.empty(m, w.shape[0], dtype=_result_dtype(x, out_f32), device=x.device)
+        out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
     if not uses_mmvq(ggml_type, m):
         _check_mmq_tail(w, ggml_type, k)
-    res = _writable(out)
-    _module().mul_mat(w, ggml_type, _activation(x), res, xq)
-    if res is not out:
-        out.copy_(res)
+    _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
     return out
 
 
@@ -94,7 +75,7 @@ def quantize_q8_1(x: torch.Tensor) -> torch.Tensor:
     """``x[M, K]`` as the vector kernel's q8_1 blocks, to share among GEMVs that read the same ``x``."""
     m, k = x.shape
     out = torch.empty(m, _q8_1_row_bytes(k), dtype=torch.uint8, device=x.device)
-    _module().quantize_q8_1(_activation(x), out)
+    _module().quantize_q8_1(x.contiguous(), out)
     return out
 
 
@@ -109,42 +90,31 @@ def uses_mmvq(ggml_type: int, m: int) -> bool:
     return _module().uses_mmvq(ggml_type, m)
 
 
-def mul_mat_id(
-    w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, *, out_f32: bool = False, ncols_max: int | None = None
-) -> torch.Tensor:
-    """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]``; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``.
-
-    ``ncols_max`` is an upper bound on the routes any one expert gets; without it the matrix kernel runs only the tiles that hold routes.
-    """
+def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]`` in ``x``'s dtype; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``."""
     t, top_k = ids.shape
-    out = torch.empty(t, top_k, w.shape[1], dtype=torch.float32 if out_f32 else x.dtype, device=x.device)
+    out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
         _check_mmq_tail(w, ggml_type, x.shape[-1])
-    res = _writable(out)
-    _module().mul_mat_id(w, ggml_type, _activation(x.unsqueeze(1) if x.dim() == 2 else x), ids, res, ncols_max or -1)
-    if res is not out:
-        out.copy_(res)
+    _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out)
     return out
 
 
 def mul_mat_id_glu(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, glu: str, limit: float = 0.0) -> torch.Tensor:
-    """``glu(gate, up)`` per route in one pass for small ``T``: ``w[E, 2I, row_bytes]`` holds gate rows then up rows; returns fp32 ``[T, k, I]``.
+    """``glu(gate, up)`` per route in one pass for small ``T``: ``w[E, 2I, row_bytes]`` holds gate rows then up rows; returns ``[T, k, I]`` in ``x``'s dtype.
 
     ``glu`` is one of ``swiglu``, ``geglu`` (tanh GELU), ``swiglu_oai`` (alpha 1.702, limit 7) and ``swiglu_clamp`` (alpha 1, clamped at ``limit``).
     """
     t, top_k = ids.shape
-    out = torch.empty(t, top_k, w.shape[1] // 2, dtype=torch.float32, device=x.device)
-    _module().mul_mat_id_glu(w, ggml_type, _activation(x), ids, out, glu, limit)
+    out = torch.empty(t, top_k, w.shape[1] // 2, dtype=x.dtype, device=x.device)
+    _module().mul_mat_id_glu(w, ggml_type, x.contiguous(), ids, out, glu, limit)
     return out
 
 
-def moe_weighted_sum(y: torch.Tensor, weights: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """``sum_j weights[t, j] * y[t, j, :]`` over fp32 ``y[T, k, N]``, accumulated in fp32."""
-    out = torch.empty(y.shape[0], y.shape[2], dtype=dtype, device=y.device)
-    res = _writable(out)
-    _module().moe_weighted_sum(y, weights.float().contiguous(), res)
-    if res is not out:
-        out.copy_(res)
+def moe_weighted_sum(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """``sum_j weights[t, j] * y[t, j, :]`` over ``y[T, k, N]``, accumulated in fp32 and returned in ``y``'s dtype."""
+    out = torch.empty(y.shape[0], y.shape[2], dtype=y.dtype, device=y.device)
+    _module().moe_weighted_sum(y.contiguous(), weights.float().contiguous(), out)
     return out
 
 

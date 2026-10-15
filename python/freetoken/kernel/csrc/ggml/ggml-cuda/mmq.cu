@@ -134,9 +134,9 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         int64_t ncols_max) {
-    // FreeToken: bf16 activations are quantized directly, except for the native fp4 paths
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
-    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    // FreeToken: bf16 and fp16 activations are quantized directly, except for the native fp4 paths; dst is fp32, bf16 or fp16
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16 || dst->type  == GGML_TYPE_F16);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -158,8 +158,9 @@ void ggml_cuda_mul_mat_q(
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
-    float       *  dst_d = (float       *)  dst->data;
+    const mmq_dst  dst_d = {dst->data, dst->type};
     const nv_bfloat16 * src1_bf16 = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1->data : nullptr;
+    const half        * src1_f16  = src1->type == GGML_TYPE_F16  ? (const half        *) src1->data : nullptr;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -257,6 +258,9 @@ void ggml_cuda_mul_mat_q(
             } else if (src1_bf16) {
                 quantize_mmq_q8_1_cuda(src1_bf16, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
+            } else if (src1_f16) {
+                quantize_mmq_q8_1_cuda(src1_f16, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -347,11 +351,17 @@ void ggml_cuda_mul_mat_q(
         } else if (dedup_bcast && src1_bf16) {
             quantize_scatter_mmq_q8_1_cuda(src1_bf16, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+        } else if (dedup_bcast && src1_f16) {
+            quantize_scatter_mmq_q8_1_cuda(src1_f16, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                    /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else if (src1_bf16) {
             quantize_mmq_q8_1_cuda(src1_bf16, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                   ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+        } else if (src1_f16) {
+            quantize_mmq_q8_1_cuda(src1_f16, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,

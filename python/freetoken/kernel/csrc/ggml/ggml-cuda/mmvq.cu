@@ -597,7 +597,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// FreeToken: dst_t is float or nv_bfloat16
+// FreeToken: dst_t is float, nv_bfloat16 or half
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, typename dst_t = float>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -1440,9 +1440,9 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const void * src1_q8_1_pre) {
-    // FreeToken: activations and results may also be bf16
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
-    GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16);
+    // FreeToken: activations and results may also be bf16 or fp16
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16 || dst->type  == GGML_TYPE_F16);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -1546,6 +1546,8 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
         if (src1->type == GGML_TYPE_BF16) {
             quantize_row_q8_1_cuda((const nv_bfloat16 *) src1->data, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else if (src1->type == GGML_TYPE_F16) {
+            quantize_row_q8_1_cuda((const half *) src1->data, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
@@ -1584,6 +1586,9 @@ void ggml_cuda_mul_mat_vec_q(
         // FreeToken: the fused shared expert writes an fp32 shared_dst
         GGML_ASSERT(!fusion || !fusion->shared_up);
         launch((nv_bfloat16 *) dst->data);
+    } else if (dst->type == GGML_TYPE_F16) {
+        GGML_ASSERT(!fusion || !fusion->shared_up);
+        launch((half *) dst->data);
     } else {
         launch(dst_d);
     }

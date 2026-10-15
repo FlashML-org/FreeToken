@@ -454,7 +454,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     GGML_UNUSED(n_expert_used);
 }
 
-// FreeToken: 4 consecutive activations as float, from fp32 or bf16
+// FreeToken: 4 consecutive activations as float, from fp32, bf16 or fp16
 static __device__ __forceinline__ float4 load_float4(const float * x) {
     return *(const float4 *) x;
 }
@@ -463,6 +463,13 @@ static __device__ __forceinline__ float4 load_float4(const nv_bfloat16 * x) {
     const uint2 v = *(const uint2 *) x;
     const float2 lo = __bfloat1622float2(*(const nv_bfloat162 *) &v.x);
     const float2 hi = __bfloat1622float2(*(const nv_bfloat162 *) &v.y);
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+static __device__ __forceinline__ float4 load_float4(const half * x) {
+    const uint2 v = *(const uint2 *) x;
+    const float2 lo = __half22float2(*(const half2 *) &v.x);
+    const float2 hi = __half22float2(*(const half2 *) &v.y);
     return make_float4(lo.x, lo.y, hi.x, hi.y);
 }
 
@@ -719,3 +726,4 @@ void quantize_mmq_fp4_cuda(
 
 FREETOKEN_QUANTIZE_INSTANCES(float)
 FREETOKEN_QUANTIZE_INSTANCES(nv_bfloat16)
+FREETOKEN_QUANTIZE_INSTANCES(half)
