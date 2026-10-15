@@ -415,6 +415,11 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # model then emits just the closing tag); "adaptive" (default) leaves the
         # model to open the tag itself and "disabled" pre-closes it.
         force_reasoning = (spec.chat_template_kwargs or {}).get("thinking_mode") == "enabled"
+    elif parser_name == "lfm2":
+        # LFM2.5's generation prompt always opens <think> (the template has no thinking-mode
+        # variable), so the model emits only the closing </think>: never label its leading
+        # text as visible content.
+        force_reasoning = True
     else:
         force_reasoning = (
             resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"

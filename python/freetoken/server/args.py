@@ -279,6 +279,10 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        # LFM2.5's template wraps the chain of thought in <think> tags and forces <think> in
+        # the generation prompt
+        if "lfm2" in marker:
+            return "lfm2"
         return None
 
     parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")

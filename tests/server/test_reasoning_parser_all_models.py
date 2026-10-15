@@ -91,7 +91,7 @@ def test_harmony_streaming_splits_marker_across_chunks():
 import pytest
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "lfm2"])
 def test_think_non_stream_splits_reasoning(name):
     parser = ReasoningParser(name, force_reasoning=False)
     reasoning, content = parser.parse_non_stream("<think>weigh options</think>final answer")
@@ -99,7 +99,7 @@ def test_think_non_stream_splits_reasoning(name):
     assert content == "final answer"
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "lfm2"])
 def test_think_implicit_only_closing_tag(name):
     # Implicit-think: template injected the opening <think>; output starts inside.
     parser = ReasoningParser(name, force_reasoning=True)
@@ -108,12 +108,25 @@ def test_think_implicit_only_closing_tag(name):
     assert content == "the answer"
 
 
-@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax", "lfm2"])
 def test_think_no_reasoning_passthrough(name):
     parser = ReasoningParser(name, force_reasoning=False)
     reasoning, content = parser.parse_non_stream("just an answer")
     assert reasoning == ""
     assert content == "just an answer"
+
+
+def test_lfm2_builds_forced_because_its_template_pre_opens_think():
+    """LFM2.5's generation prompt always ends with <think> (no thinking-mode variable), so the
+    frontend must force the parser -- otherwise the chain of thought leaks into content."""
+    from freetoken.server.generation import _make_reasoning_parser
+
+    spec = SimpleNamespace(chat_template_kwargs={}, template_tools=None)
+    parser = _make_reasoning_parser(spec, SimpleNamespace(config=SimpleNamespace(reasoning_parser="lfm2")))
+    assert parser is not None
+    reasoning, content = parser.parse_non_stream("weigh options</think>final answer")
+    assert reasoning == "weigh options"
+    assert content == "final answer"
 
 
 # ----------------------------------------------------------------------- gemma
