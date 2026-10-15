@@ -15,7 +15,7 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
+from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -304,7 +304,7 @@ def _make_dummy_weight_state_dict(
             # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
             # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
             # buffers are packed payloads whose bytes mean something else entirely
-            # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
+            # (GGUF blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
             # keep the benign all-zeros fill below.
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
@@ -603,7 +603,6 @@ class Engine:
                 config.model_config,
                 method=layers[0].quant_method,
                 device=self.device,
-                dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
@@ -735,10 +734,8 @@ class Engine:
                     config.model_config,
                     method=method,
                     device=self.device,
-                    dtype=self.dtype,
                     dummy=config.use_dummy_weight,
                     parallel=expert_parallel,
-                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
                 )
         except PinFailed as exc:
@@ -808,7 +805,8 @@ class Engine:
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
                 )
-            layout = method.layout()
+            # GGUF layers keep their own ggml types, so the cache reads each layer's layout off its banks
+            layout = None if method.kind is QuantKind.GGUF else method.layout()
             max_slots = method.slot_limit()
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -907,6 +905,9 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         method = sample.quant_method
+        formats = {layer.quant_method.cpu_format for layer in layers}
+        if len(formats) > 1:
+            raise NotImplementedError(f"CPU MoE backend needs one expert format across the MoE layers, got {sorted(map(str, formats))}")
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -917,9 +918,8 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=method.cpu_format if method is not None else None,
-            act_block=method.cfg.act_block if method is not None else None,
+            fmt=method.cpu_format,
+            act_block=method.cfg.act_block,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1255,11 +1255,11 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
-_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4")
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4", "gguf")
 
 
 def _fused_resident_ok(model_config) -> bool:
-    """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
+    """Whether the resident ('fused') MoE path can hold this model's experts; DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
@@ -1752,7 +1752,7 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
-        # bigger than the GPU. The resident 'fused' path (every expert format but GGUF q4_0 and
+        # bigger than the GPU. The resident 'fused' path (every expert format but
         # DeepSeek-V4's) is still reachable, but only when asked for explicitly
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
@@ -1790,7 +1790,7 @@ def _adjust_config(config: EngineConfig):
         # offload -- same auto-sized GPU slot cache (_resolve_auto_moe_cache_size), plus a
         # host-RAM CPU executor -- so this never raises the OOM risk; with no profile (or one
         # from different hardware) it stays offload. offload remains the always-safe fallback.
-        # Key the lookup on the real expert format: mxfp4/q4_0 live in moe_weight_format when
+        # Key the lookup on the real expert format: mxfp4 lives in moe_weight_format when
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")

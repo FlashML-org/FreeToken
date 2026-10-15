@@ -42,7 +42,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
 - **fused** — experts resident on GPU (needs the VRAM). Serves every expert
-  format except GGUF and DeepSeek-V4's.
+  format except DeepSeek-V4's.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
@@ -56,7 +56,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 The GPU and the CPU share one DRAM, so offload only copies experts between two
 names for the same memory. On these GPUs `auto` resolves every MoE model to
-`fused`: the default is the resident path only. GGUF and DeepSeek-V4 experts
+`fused`: the default is the resident path only. DeepSeek-V4 experts
 have no resident path and stay on `offload`. Offload-only flags
 (`--moe-cpu-layers`, `--moe-cache-size` / `-rate` / `-auto`,
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a

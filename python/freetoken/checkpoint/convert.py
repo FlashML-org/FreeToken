@@ -247,7 +247,7 @@ def convert_checkpoint(
         names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
         sink = _ConvertSink(writer, names=names)
         banks = load_expert_banks(
-            model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
+            model_path, mc, method=method, device=dev, layer_sink=sink
         )
         quant_format = banks.quant_format
         if banks.streamed:

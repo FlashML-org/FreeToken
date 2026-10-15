@@ -196,7 +196,7 @@ def iter_weights(
                         continue
 
                     # Per-expert NVFP4 tensors go to the offload cache (expert pieces),
-                    # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
+                    # not this dense pass; fused bf16 experts lack ".experts.<int>." so are unaffected.
                     if _NVFP4_EXPERT_RE.search(raw_name):
                         continue
 

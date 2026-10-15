@@ -2,8 +2,8 @@
 
 The expert kernel (``QuantMethod.kernel``) owns the bank layout and the pack step; the
 checkpoint side delivers pieces (``moe.expert_pieces``) and this module fills the pinned host
-banks from them (``build_expert_banks``). The GGUF q4_0 experts still
-use their own providers until they get a method.
+banks from them (``build_expert_banks``). GGUF experts keep their packed ggml rows
+(``models.gguf.experts``).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
 from .host_banks import alloc_layer_banks
-from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
+from .offload_cache import _BANK_BYTES_PER_EXPERT
 
 logger = init_logger(__name__)
 
@@ -161,46 +161,6 @@ def build_expert_banks(
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    if parallel:
-        raise NotImplementedError(
-            "parallel reader not implemented for q4_0: GGUF is a single packed file "
-            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
-            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
-        )
-    from freetoken.models.weight import load_q4_0_moe_expert_sources
-
-    # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
-    # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
-    # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
-    # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
-    sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
-    return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
-    )
-
-
-# expert formats that still load through their own provider (GGUF)
-_PROVIDERS = {
-    "q4_0": _q4_0_banks,
-}
-
-
-def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    expert_quant = model_config.expert_quant
-    if expert_quant not in _PROVIDERS:
-        raise ValueError(
-            f"{expert_quant!r} experts load through their MoE quant method; "
-            f"only {sorted(_PROVIDERS)} still have a format provider"
-        )
-    return _PROVIDERS[expert_quant](
-        model_path, model_config, device, dtype, dummy,
-        parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
-    )
-
-
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
@@ -258,7 +218,7 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     """Estimated total expert-bank bytes of a raw checkpoint before loading it.
 
     With a bound expert ``method`` the kernel's layout gives the exact host bytes; otherwise the
-    format-tag table sizes the GGUF format. ``None`` for unknown formats or missing dims
+    format-tag table sizes the format. ``None`` for unknown formats or missing dims
     (callers then skip the pre-load sizing)."""
     layers = getattr(model_config, "num_moe_layers", None)
     if method is not None and layers:
@@ -287,12 +247,10 @@ def load_expert_banks(
     *,
     method=None,
     device: torch.device,
-    dtype: torch.dtype,
     dummy: bool = False,
     parallel: bool | None = None,
     workers: int = 8,
     chunk: int = _PARALLEL_CHUNK,
-    decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
     resident: bool = False,
@@ -315,8 +273,8 @@ def load_expert_banks(
     streamable formats, so callers must check ``streamed`` rather than assume it fired.
 
     ``method`` (the bound expert quant method of the model's offload layers) selects
-    the generic path: the family's pieces packed by the method's kernel. Without it only the
-    GGUF q4_0 format loads, through its own provider.
+    the generic path: the family's pieces packed by the method's kernel. Without it only an
+    FTW checkpoint loads.
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
@@ -370,9 +328,14 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
-        if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
-        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+        if method is not None and method.kind is QuantKind.GGUF:
+            from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+            # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
+            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, dummy=dummy, device=device if resident else None)
+        if method is None:
+            raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
+        return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
 
     with requested_residency(layer_residency) as residency_plan:
         try:

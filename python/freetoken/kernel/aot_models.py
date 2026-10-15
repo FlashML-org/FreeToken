@@ -16,7 +16,7 @@ JIT, which needs nvcc):
   DSV4 writes its MLA latent via torch scatter and contributes nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
-  DSV4 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
+  DSV4 (plain nn.Embedding) and GGUF embeddings (ggml get_rows) bypass it.
 
 The whole table targets the shipped serving configuration: TP=1 (TP>1 shards
 kv heads, shrinking the store row) and a 2-byte compute dtype (``--dtype
@@ -91,9 +91,6 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down": H * I,
             "down_scale": (H // B) * fp8_block_scale_pad(H // B, I // B) * 2,
         }
-    if fmt == "q4_0":
-        # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
-        return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
@@ -205,6 +202,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=10,
         moe_intermediate_size=640,
         expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
+        arch_aliases=("Qwen4ExpGGUFForCausalLM",),
     ),
     AotModel(
         name="google/gemma-4-26B-A4B-it",
@@ -215,9 +214,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 512), (8, 256)),
         top_k=8,
         moe_intermediate_size=704,
-        # q4_0 = the Q4_0 GGUF release (Gemma4GGUFForCausalLM); its GGUFEmbedding
-        # path skips indexing(), but the bf16 safetensors path needs the variant.
-        expert_formats=("bf16", "q4_0"),
+        expert_formats=("bf16",),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
         arch_aliases=("Gemma4ForCausalLM", "Gemma4GGUFForCausalLM"),
     ),
     AotModel(

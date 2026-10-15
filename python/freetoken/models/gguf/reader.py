@@ -2,22 +2,20 @@
 
 Thin layer over ``gguf.GGUFReader`` (gguf-py). Metadata is read into a plain dict
 keyed by the GGUF field name (``general.architecture``, ``gemma4.block_count`` ...);
-tensors are exposed as ``GgufTensor`` records carrying the *torch* shape (ggml dims
-reversed), the ggml quant type, and a zero-copy ``uint8`` view of the packed block
-bytes laid out as ``[rows, row_bytes]`` (rows = product of all but the fastest ggml
-dim; row_bytes spans whole quant blocks of the fastest dim).
+tensors are indexed as ``GgufTensorInfo`` records (ggml dims, ggml type, and where the
+packed bytes sit in the memory-mapped file).
 """
 
 from __future__ import annotations
 
 import functools
 import os
+import re
 import struct
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
-import torch
 
 
 def is_gguf_path(model_path: str) -> bool:
@@ -65,7 +63,7 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     Validates by re-parsing: the copy must list zero tensors and expose the identical KV
     key set (the KV *bytes* are copied verbatim, so identical keys imply identical values).
     """
-    import gguf
+    from freetoken.third_party import gguf
 
     reader = gguf.GGUFReader(source_gguf)
     assert reader.tensors, f"{source_gguf}: no tensors to bound the KV section"
@@ -98,20 +96,6 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     )
 
 
-@dataclass(frozen=True)
-class GgufTensor:
-    name: str
-    shape: tuple[int, ...]  # torch order (ggml dims reversed)
-    ggml_type: int
-    rows: int  # product of shape[:-1] over the *ggml* layout = blocks-major rows
-    row_bytes: int  # packed bytes per row (whole quant blocks of the fastest dim)
-    _raw: np.ndarray  # uint8 view, shape [rows, row_bytes]
-
-    def packed(self) -> torch.Tensor:
-        """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
-        return torch.from_numpy(self._raw)
-
-
 def _field_value(reader, name: str) -> Any:
     field = reader.fields.get(name)
     if field is None:
@@ -121,7 +105,7 @@ def _field_value(reader, name: str) -> Any:
 
 @functools.cache
 def _reader(model_path: str):
-    import gguf
+    from freetoken.third_party import gguf
 
     return gguf.GGUFReader(model_path)
 
@@ -133,6 +117,55 @@ def load_gguf_metadata(model_path: str) -> dict[str, Any]:
     return {name: field.contents() for name, field in reader.fields.items()}
 
 
+_SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+@functools.cache
+def gguf_split_paths(model_path: str) -> tuple[str, ...]:
+    """Every file of a split GGUF (``name-00001-of-00002.gguf``), in order; a single file is its own list."""
+    count = int(_field_value(_reader(model_path), "split.count") or 1)
+    if count == 1:
+        return (model_path,)
+    match = _SPLIT_RE.search(model_path)
+    if match is None:
+        raise ValueError(f"{model_path} is one of {count} GGUF splits but is not named like name-00001-of-{count:05d}.gguf")
+    stem = model_path[: match.start()]
+    paths = tuple(f"{stem}-{i:05d}-of-{count:05d}.gguf" for i in range(1, count + 1))
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(f"GGUF split files missing: {missing}")
+    return paths
+
+
+@dataclass(frozen=True)
+class GgufTensorInfo:
+    """Where one tensor's packed bytes sit: ``ne`` is in ggml order (fastest dim first)."""
+
+    name: str
+    path: str
+    offset: int
+    nbytes: int
+    ggml_type: int
+    ne: tuple[int, ...]
+
+    def data(self) -> np.ndarray:
+        """Zero-copy uint8 view of the bytes (memory-mapped)."""
+        reader = _reader(self.path)
+        return reader.data[self.offset : self.offset + self.nbytes]
+
+
+@functools.cache
+def gguf_tensor_index(model_path: str) -> dict[str, GgufTensorInfo]:
+    """Every tensor of every split, by name."""
+    index: dict[str, GgufTensorInfo] = {}
+    for path in gguf_split_paths(model_path):
+        for t in _reader(path).tensors:
+            index[t.name] = GgufTensorInfo(
+                t.name, path, int(t.data_offset), int(t.n_bytes), int(t.tensor_type), tuple(int(x) for x in t.shape)
+            )
+    return index
+
+
 def gguf_architecture(model_path: str) -> str:
     arch = _field_value(_reader(model_path), "general.architecture")
     if arch is None:
@@ -140,39 +173,8 @@ def gguf_architecture(model_path: str) -> str:
     return str(arch)
 
 
-def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
-    import gguf
-
-    reader = _reader(model_path)
-    for t in reader.tensors:
-        ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
-        torch_shape = tuple(reversed(ne))
-        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
-        n_fast = ne[0]
-        if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
-            )
-        row_bytes = n_fast // block * type_size
-        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
-        # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
-        # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-        flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-        raw = flat.reshape(rows, row_bytes)
-        yield GgufTensor(
-            name=t.name,
-            shape=torch_shape,
-            ggml_type=int(t.tensor_type),
-            rows=rows,
-            row_bytes=row_bytes,
-            _raw=raw,
-        )
-
-
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in _reader(model_path).tensors}
+    return {t.name for path in gguf_split_paths(model_path) for t in _reader(path).tensors}
 
 
 __all__ = [
@@ -181,9 +183,10 @@ __all__ = [
     "OUTPUT_WEIGHT_PRESENT_KV",
     "gguf_config_source",
     "write_metadata_gguf",
-    "GgufTensor",
+    "GgufTensorInfo",
+    "gguf_split_paths",
+    "gguf_tensor_index",
     "load_gguf_metadata",
     "gguf_architecture",
-    "iter_gguf_tensors",
     "gguf_tensor_names",
 ]

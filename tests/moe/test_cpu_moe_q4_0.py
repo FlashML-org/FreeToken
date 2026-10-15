@@ -3,7 +3,7 @@ the gemma4 GGUF checkpoint).
 
 The CPU W4A16 GEMV (``q4_0_dot`` in csrc/cpu_moe/kernels/q4_0.cpp) reads the *same*
 packed Q4_0 banks the GPU offload path streams and dequantizes weights inside the
-K-loop. We check it against the reference dequant (models/gguf/dequant.py) + the
+K-loop. We check it against the reference dequant (gguf-py's numpy dequantize) + the
 production bf16 GPU decode kernel on byte-identical banks: both are W4A16, so the
 only spread is weight bf16-rounding + reduction order -> tight relative tolerance.
 
@@ -39,11 +39,11 @@ def _pack_q4_0(nibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def _dequant_bank(packed: torch.Tensor, K: int, dev) -> torch.Tensor:
     """[S, OUT, K//32*18] packed Q4_0 -> [S, OUT, K] bf16 (storage order == elem order)."""
-    from freetoken.models.gguf.dequant import GGML_Q4_0, dequantize
+    from freetoken.third_party.gguf import GGMLQuantizationType, quants
 
     S, OUT, _ = packed.shape
-    flat = dequantize(packed.reshape(-1), GGML_Q4_0, torch.bfloat16)
-    return flat.reshape(S, OUT, K).to(dev)
+    values = quants.dequantize(packed.numpy(), GGMLQuantizationType.Q4_0)
+    return torch.from_numpy(values).reshape(S, OUT, K).to(dev, torch.bfloat16)
 
 
 def _make_q4_0_cache(L, E, H, I, seed=0):
@@ -115,8 +115,10 @@ def test_cpu_decode_q4_0_matches_dequant_then_gpu(bs):
 def test_cpu_decode_q4_0_matches_ggml_mmvq():
     """Sanity: the CPU W4A16 GEMV lands close to the GPU ggml MMVQ (W4A8) kernel the
     offload path uses -- a looser tol since MMVQ quantizes activations to int8."""
+    from freetoken.kernel import ggml
+    from freetoken.layers.activation import gated_act_and_mul
     from freetoken.moe.cpu_executor import CpuMoeExecutor
-    from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+    from freetoken.third_party.gguf import GGMLQuantizationType
 
     torch.manual_seed(77)
     L, E, H, I, top_k = 2, 16, 2816, 704, 8
@@ -137,11 +139,12 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
     torch.cuda.synchronize()
 
     b = cache.bank_sources
-    gate_up_layer = b["gate_up"][layer].to(dev)
-    down_layer = b["down"][layer].to(dev)
-    gpu_out = fused_experts_gguf_q4_0(
-        hidden, gate_up_layer, down_layer, w, ids.clone(), "gelu_tanh"
-    ).float()
+    q4_0 = int(GGMLQuantizationType.Q4_0)
+    h = ggml.mul_mat_id(b["gate_up"][layer].to(dev), q4_0, hidden, ids, out_f32=True)
+    inter = torch.empty(bs, top_k, I, device=dev)
+    gated_act_and_mul("gelu_tanh", h.view(-1, 2 * I), inter.view(-1, I))
+    y = ggml.mul_mat_id(b["down"][layer].to(dev), q4_0, inter, ids, out_f32=True)
+    gpu_out = ggml.moe_weighted_sum(y, w, torch.bfloat16).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
     assert rel < 6e-2, f"q4_0 vs ggml-mmvq rel err {rel.item()}"

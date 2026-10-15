@@ -189,7 +189,7 @@ ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. MoE experts are
 always packed into expert banks, which serve the fused and the offload
-strategies alike (GGUF and DeepSeek-V4 experts serve offload only);
+strategies alike (DeepSeek-V4 experts serve offload only);
 `--moe-backend` is kept for compatibility. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
 [scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.

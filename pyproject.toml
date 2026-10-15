@@ -40,7 +40,6 @@ dependencies = [
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.
     "flashlib==0.4.0", # pin it
-    "gguf>=0.19,<1",
     "huggingface_hub>=1.5,<2",
     "msgpack>=1.1,<2",
     "modelscope>=1.37,<2",
@@ -113,7 +112,7 @@ version = {attr = "freetoken.version.__version__"}
 where = ["python"]
 
 [tool.setuptools.package-data]
-"*" = ["csrc/**/*", "moe/configs/**/*.json"]
+"*" = ["csrc/**/*", "moe/configs/**/*.json", "third_party/*/LICENSE", "third_party/*/VERSION", "third_party/*/freetoken.patch"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

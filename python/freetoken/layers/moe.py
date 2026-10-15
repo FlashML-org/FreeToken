@@ -81,16 +81,12 @@ class MoELayer(BaseOP):
         self.strategy = strategy
         self.decode_target = decode_target
         self.prefix = prefix
-        # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
-        self.quant_method = None
-        if quant_config is not None or allocate_experts:
-            self.quant_method = quant_method_for(quant_config, self, prefix)
-            if allocate_experts:
-                self.quant_method.create_weights(self)
+        self.quant_method = quant_method_for(quant_config, self, prefix)
+        if allocate_experts:
+            self.quant_method.create_weights(self)
 
     def finalize(self) -> None:
-        if self.quant_method is not None:
-            self.quant_method.finalize(self)
+        self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
@@ -103,7 +99,6 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.quant_method is not None
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
@@ -191,7 +186,7 @@ class OffloadMoELayer(MoELayer):
 
     @property
     def skips_inactive_slots(self) -> bool:
-        return self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots
+        return self.quant_method.kernel.supports_inactive_slots
 
     def forward(
         self,
@@ -402,7 +397,6 @@ class OffloadMoELayer(MoELayer):
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
-    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -417,27 +411,15 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        if self.quant_method is not None:
-            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+        from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
-            view = ExpertView(
-                {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
-            )
-            return self.quant_method.apply(
-                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
-            )
-        fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
-            # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
-
-            gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
-            )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        view = ExpertView(
+            {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+        )
+        return self.quant_method.apply(
+            hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
+        )
 
 
 def iter_moe_layers(model) -> Iterator[MoELayer]:
