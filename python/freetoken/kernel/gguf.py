@@ -59,6 +59,12 @@ def _module():
         # default (CXX unset -> g++) can be a gcc too new for the torch headers.
         cxx_path = shutil.which(host_cxx) or host_cxx
         extra_cuda_cflags += ["-ccbin", cxx_path]
+        if "clang" in os.path.basename(cxx_path):
+            # -ccbin clang++ puts cudafe++ in EDG's --clang mode, where __has_builtin claims
+            # __builtin_clear_padding (clang has it, EDG's clang mode does not), so libstdc++ 16's
+            # <atomic> keeps the call and the front-end fails on the identifier. These kernels
+            # never clear atomic FP padding, so define the builtin away.
+            extra_cuda_cflags.append("'-D__builtin_clear_padding(x)='")
         os.environ["CXX"] = cxx_path
         os.environ["CC"] = _c_compiler_for(cxx_path)
 
