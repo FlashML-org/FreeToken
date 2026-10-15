@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, nvtx_annotate
@@ -13,11 +12,18 @@ from .quantization import LayerKind, QuantConfig, quant_method_for
 
 
 class VocabParallelEmbedding(BaseOP):
+    """The vocab table, sharded over TP: its ``quant_method`` owns the table, looks rows up, and serves a tied LM head's product."""
+
+    quant_layer_kind = LayerKind.EMBEDDING
+
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
         embed_scale: float | None = None,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         tp_info = get_tp_info()
@@ -28,7 +34,12 @@ class VocabParallelEmbedding(BaseOP):
         start_idx = self.num_embeddings_tp * tp_rank
         finish_idx = min(start_idx + self.num_embeddings_tp, num_embeddings)
         self.vocab_range = (start_idx, finish_idx - start_idx)
-        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim)
+        self.embedding_dim = embedding_dim
+        # the LM head subclass is a linear and builds its own method
+        self.quant_method = None
+        if self.quant_layer_kind is LayerKind.EMBEDDING:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            self.quant_method.create_weights(self)
         # Gemma scales embeddings by sqrt(hidden_size). The scale is materialized in
         # the weight dtype (bf16) to match HF, which downcasts the scalar. The GPU
         # scalar is built lazily (model __init__ runs on the meta device) and cached
@@ -39,14 +50,7 @@ class VocabParallelEmbedding(BaseOP):
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel import indexing
-
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
-
+        y = self.quant_method.embed(self, x)
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
         if self._embed_scale is not None:
@@ -83,7 +87,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.in_features = embedding_dim
         self.out_features = self.num_embeddings_tp
         self.output_sizes = (self.num_embeddings_tp,)
-        self.quant_method = None
         if tied_embedding is None:
             self.quant_method = quant_method_for(quant_config, self, prefix)
             self.quant_method.create_weights(self)
@@ -132,7 +135,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         if self.tied_embedding is not None:
-            logits = F.linear(x, self.tied_embedding.weight, self.bias)
+            logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
         else:
             logits = self.quant_method.apply(self, x)
         if self.tp_size == 1:

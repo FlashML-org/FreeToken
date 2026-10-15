@@ -11,6 +11,7 @@ from .scheme import QuantKind
 class LayerKind(Enum):
     LINEAR = "linear"
     MOE = "moe"
+    EMBEDDING = "embedding"
 
     def __str__(self) -> str:
         return self.value
