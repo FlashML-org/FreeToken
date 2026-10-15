@@ -141,7 +141,9 @@ class EngineConfig:
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}
         for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            if key not in built:
+            # a section the config does not carry already reads as None (the parsers getattr it), and
+            # the frozen shims (GgufConfigShim) have no such field to assign
+            if key not in built and hasattr(hf_config, key):
                 setattr(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
