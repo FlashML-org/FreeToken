@@ -59,9 +59,9 @@ class GGUFConfig(QuantConfig):
         quantized = [any(is_quantized(t) for t in p) for p in parts]
         if not any(quantized):
             scheme = None
-        elif not all(quantized) or any(len(p) != 1 for p in parts):
+        elif any(len(p) != 1 for p in parts):
             found = {n: [type_name(t) for t in p] for n, p in zip(names, parts)}
-            raise NotImplementedError(f"fused module {prefix!r} mixes quantized and float GGUF tensors: {found}")
+            raise NotImplementedError(f"fused module {prefix!r} needs one GGUF tensor per part, got {found}")
         else:
             scheme = gguf_scheme(p[0] for p in parts)
         self._schemes[prefix] = scheme

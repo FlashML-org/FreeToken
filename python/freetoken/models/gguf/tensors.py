@@ -30,18 +30,26 @@ def matrix(info: GgufTensorInfo) -> torch.Tensor:
 
 
 def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k: int, pad_to: int = 0) -> Iterator[tuple[str, torch.Tensor]]:
-    """One fused module: float parts concatenated into ``weight``, quantized parts packed into one matrix per ggml-type run."""
+    """One fused module: float parts concatenated into ``weight``; with any quantized part, one matrix per ggml-type run (float runs as bf16 rows, quantized runs packed)."""
     types = [i.ggml_type for i in infos]
+    pad = (-sum(p.shape[0] for p in parts)) % pad_to if pad_to else 0
     if not any(is_quantized(t) for t in types):
         rows = [p.to(torch.bfloat16) for p in parts]
-        pad = (-sum(r.shape[0] for r in rows)) % pad_to if pad_to else 0
         if pad:
             rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=torch.bfloat16))
         yield f"{prefix}.weight", torch.cat(rows, dim=0)
         return
-    for i, seg in enumerate(segments(tuple(types), tuple(p.shape[0] for p in parts))):
+    segs = segments(tuple(types), tuple(p.shape[0] for p in parts))
+    for i, seg in enumerate(segs):
         rows = parts[seg.first_part : seg.first_part + seg.num_parts]
-        tail = [torch.zeros(pad_rows(k), rows[0].shape[1], dtype=torch.uint8)] if pad_rows(k) else []
+        zeros = pad if i == len(segs) - 1 else 0
+        if is_quantized(seg.ggml_type):
+            zeros += pad_rows(k)
+            dtype = torch.uint8
+        else:
+            rows = [r.to(torch.bfloat16) for r in rows]
+            dtype = torch.bfloat16
+        tail = [torch.zeros(zeros, rows[0].shape[1], dtype=dtype)] if zeros else []
         yield f"{prefix}.{segment_param(i)}", torch.cat([*rows, *tail], dim=0)
 
 
