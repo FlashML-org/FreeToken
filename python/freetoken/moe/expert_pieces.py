@@ -16,6 +16,25 @@ from freetoken.models.register import _load_attr, get_model_spec
 
 Piece = tuple[int, int, int, dict[str, torch.Tensor]]
 
+E8M0_NAN_CODE = 0xFF  # the one e8m0 code with no finite value (OCP MX spec)
+
+
+def check_e8m0_scales(name: str, tensor: torch.Tensor, file: str) -> torch.Tensor:
+    """Refuse an e8m0 block-scale tensor that carries the NaN code ``0xFF``.
+
+    Every other e8m0 code is an exact power of two, ``2 ** (code - 127)``, and the expert
+    kernels fold that straight into the GEMM; one ``0xFF`` byte turns its whole 32-wide
+    block into NaN with no trace in the output. One pass over the tensor's bytes, counted
+    per tensor, before the piece reaches any bank. Returns ``tensor`` unchanged when clean.
+    """
+    bad = int(torch.count_nonzero(tensor.view(torch.uint8) == E8M0_NAN_CODE))
+    if bad:
+        raise ValueError(
+            f"e8m0 scale tensor {name!r} in {file!r} carries {bad} NaN scale code(s) "
+            f"(0xFF) out of {tensor.numel()}: the checkpoint is corrupt"
+        )
+    return tensor
+
 
 def num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
@@ -149,6 +168,7 @@ def per_expert_pieces(
 __all__ = [
     "Piece",
     "bank_layer_of",
+    "check_e8m0_scales",
     "iter_expert_pieces",
     "num_moe_layers",
     "packed_expert_source_info",

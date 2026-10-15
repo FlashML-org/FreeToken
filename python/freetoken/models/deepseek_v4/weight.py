@@ -245,10 +245,11 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     if get_tp_info().size > 1:
         raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
     from freetoken.models.weight import iter_expert_tensors_parallel
-    from freetoken.moe.expert_pieces import per_expert_pieces
+    from freetoken.moe.expert_pieces import check_e8m0_scales, per_expert_pieces
 
     args = load_args(model_path, max_batch_size=1)
     L, E = args.n_layers, args.n_routed_experts
+    weight_map = _weight_map(model_path)
 
     def locate(raw_name: str):
         m = _EXPERT_RE.match(raw_name)
@@ -256,12 +257,19 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
             return None
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
+    def _checked(tensors):
+        # the e8m0 scales are scanned as they are read, before any piece is grouped or packed
+        for name, tensor in tensors:
+            if name.endswith(".scale"):
+                check_e8m0_scales(name, tensor, weight_map[name])
+            yield name, tensor
+
     if parallel:
         tensors = iter_expert_tensors_parallel(model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk)
-        return per_expert_pieces(tensors, locate, tensors_per_expert=6)
+        return per_expert_pieces(_checked(tensors), locate, tensors_per_expert=6)
 
     def _serial():
-        reader = _ShardReader(model_path, _weight_map(model_path), torch.device("cpu"))
+        reader = _ShardReader(model_path, weight_map, torch.device("cpu"))
         try:
             for li in tqdm(range(L), desc="Loading DSV4 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
@@ -273,7 +281,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         finally:
             reader.close()
 
-    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+    return per_expert_pieces(_checked(_serial()), locate, tensors_per_expert=6)
 
 
 __all__ = ["iter_weights", "iter_expert_pieces", "iter_vision_weights"]
