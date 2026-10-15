@@ -277,6 +277,50 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
 
 
+def test_invalidate_prefill_slots_kernel_matches_eager_reference():
+    from freetoken.kernel.triton.moe import invalidate_prefill_slots
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the invalidation kernel")
+
+    for num_layers, num_experts, cache_size, slot_start in [
+        (3, 4, 8, 0),
+        (3, 4, 8, 4),
+        (2, 256, 1024, 512),
+    ]:
+        for trial in range(20):
+            torch.manual_seed(1234 + trial)
+            ids = torch.full((cache_size,), -1, dtype=torch.int32)
+            k = torch.randint(0, num_experts + 1, (1,)).item()
+            slots = torch.randperm(cache_size)[:k]
+            ids[slots] = torch.randint(0, num_layers * num_experts, (k,), dtype=torch.int32)
+            slot_for_id = torch.full((num_layers, num_experts), -1, dtype=torch.int32)
+            for slot, expert in enumerate(ids.tolist()):
+                if expert >= 0:
+                    slot_for_id.view(-1)[expert] = slot
+            usage = torch.randint(0, 999, (cache_size,), dtype=torch.int64)
+
+            ids_c, sfi_c, usage_c = ids.cuda(), slot_for_id.cuda(), usage.cuda()
+
+            ref_sfi = slot_for_id.clone()
+            ref_usage = usage.clone()
+            ref_ids = ids.clone()
+            buf = ref_ids[slot_start : slot_start + num_experts]
+            ref_sfi.view(-1)[buf[buf >= 0].long()] = -1
+            buf.fill_(-1)
+            ref_usage[slot_start : slot_start + num_experts].zero_()
+
+            invalidate_prefill_slots(ids_c, sfi_c, usage_c, slot_start, num_experts)
+            torch.cuda.synchronize()
+
+            assert torch.equal(ref_sfi, sfi_c.cpu())
+            assert torch.equal(ref_ids, ids_c.cpu())
+            assert torch.equal(ref_usage, usage_c.cpu())
+
+    with pytest.raises(ValueError):
+        invalidate_prefill_slots(ids.new_full((1,), -1), slot_for_id, usage.new_zeros(1), 0, 2)
+
+
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
