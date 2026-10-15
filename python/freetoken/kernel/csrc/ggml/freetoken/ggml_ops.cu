@@ -34,7 +34,11 @@ struct DeviceGuard {
     int prev, device;
 
     explicit DeviceGuard(DLDevice d) : prev(ggml_cuda_get_device()), device(d.device_id) {
+#ifdef GGML_USE_HIP
+        RuntimeCheck(d.device_type == kDLROCM, "ggml ops take ROCm tensors");
+#else
         RuntimeCheck(d.device_type == kDLCUDA, "ggml ops take CUDA tensors");
+#endif
         ggml_cuda_set_device(device);
     }
 
@@ -48,7 +52,11 @@ struct DeviceGuard {
 // ggml treats a null stream as unset and would create its own; name the default stream explicitly
 cudaStream_t current_stream(DLDevice d) {
     auto stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(d.device_type, d.device_id));
+#ifdef GGML_USE_HIP
+    return stream == nullptr ? hipStreamLegacy : stream;
+#else
     return stream == nullptr ? cudaStreamLegacy : stream;
+#endif
 }
 
 ggml_backend_cuda_context & context(DLDevice d) {
@@ -229,7 +237,8 @@ void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, 
     }
     const size_t s1 = w.stride(1), s2 = w.stride(0);
     ggml_tensor src0 = describe(type, w.data_ptr(), {k, n, e, 1}, {ggml_type_size(type), s1, s2, s2 * e});
-    ggml_tensor tids = describe(GGML_TYPE_I32, ids.data_ptr(), {top_k, t, 1, 1}, {4, 4 * top_k, 4 * top_k * t, 4 * top_k * t});
+    const size_t ids_stride = sizeof(int32_t) * top_k, ids_bytes = ids_stride * t;
+    ggml_tensor tids = describe(GGML_TYPE_I32, ids.data_ptr(), {top_k, t, 1, 1}, {sizeof(int32_t), ids_stride, ids_bytes, ids_bytes});
     auto & ctx = context(x.device());
     const cudaStream_t stream = ctx.stream();
     const int cc = device_cc();
@@ -292,7 +301,8 @@ void op_mul_mat_id_glu(TensorView w, int64_t type_id, TensorView x, TensorView i
     ggml_tensor up = describe(type, base + n * s1, {k, n, e, 1}, {ggml_type_size(type), s1, s2, s2 * e});
     ggml_tensor gate = describe(type, base, {k, n, e, 1}, {ggml_type_size(type), s1, s2, s2 * e});
     ggml_tensor src1 = describe(a.type, a.data, {k, 1, t, 1}, {a.esz, a.esz * k, a.esz * k, a.esz * k * t});
-    ggml_tensor tids = describe(GGML_TYPE_I32, ids.data_ptr(), {top_k, t, 1, 1}, {4, 4 * top_k, 4 * top_k * t, 4 * top_k * t});
+    const size_t ids_stride = sizeof(int32_t) * top_k, ids_bytes = ids_stride * t;
+    ggml_tensor tids = describe(GGML_TYPE_I32, ids.data_ptr(), {top_k, t, 1, 1}, {sizeof(int32_t), ids_stride, ids_bytes, ids_bytes});
     const size_t oe = ggml_type_size(otype);
     ggml_tensor dst = describe(otype, out.data_ptr(), {n, top_k, t, 1}, {oe, oe * n, oe * n * top_k, oe * n * top_k * t});
     ggml_cuda_mm_fusion_args_host fusion{};

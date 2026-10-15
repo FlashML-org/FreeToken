@@ -28,10 +28,11 @@ def load_module(build_directory: str | None = None) -> Module:
         *(cuda_dir / f for f in ("mmvq.cu", "mmq.cu", "mmid.cu", "quantize.cu", "convert.cu", "getrows.cu")),
         *sorted((cuda_dir / "template-instances").glob("mmq-instance-*.cu")),
     ]
-    flags = ["-use_fast_math", "--extended-lambda"]
-    if not _is_rocm():
+    if _is_rocm():
+        flags = ["-ffast-math", "-DGGML_USE_HIP"]
+    else:
         # a multi-arch kernel-cache build is ~6x smaller with compressed SASS
-        flags.append("--compress-mode=size")
+        flags = ["-use_fast_math", "--extended-lambda", "--compress-mode=size"]
     return load_aot(
         "ggml",
         cuda_files=[str(s) for s in sources],

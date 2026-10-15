@@ -83,8 +83,13 @@ struct EnvPool : ggml_cuda_pool {
         if (size == 0) {
             return nullptr;
         }
+#ifdef GGML_USE_HIP
+        constexpr DLDeviceType device_type = kDLROCM;
+#else
+        constexpr DLDeviceType device_type = kDLCUDA;
+#endif
         auto buf = tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, tvm::ffi::Shape({(int64_t) size}), DLDataType{kDLUInt, 8, 1},
-                                                  DLDevice{kDLCUDA, device});
+                                                DLDevice{device_type, device});
         void * ptr = buf.data_ptr();
         live.emplace(ptr, std::move(buf));
         return ptr;
@@ -220,7 +225,12 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
+#ifdef GGML_USE_HIP
+            GGML_ASSERT(std::string(prop.gcnArchName).starts_with("gfx"));
+            d.cc = GGML_CUDA_CC_OFFSET_AMD + static_cast<int>(std::strtol(prop.gcnArchName + 3, nullptr, 16));
+#else
             d.cc = 100 * prop.major + 10 * prop.minor;
+#endif
             d.nsm = prop.multiProcessorCount;
             d.smpb = prop.sharedMemPerBlock;
             d.smpbo = prop.sharedMemPerBlockOptin;
