@@ -112,10 +112,10 @@ struct CpuMoeExecutor {
 
   const int num_layers, num_experts;
   const bool apply_on_input;
-  MoeParams params;  // the format keeps a reference; declared before fmt
-  std::unique_ptr<MoeFormat> fmt;
-  bool preps_inter = false;
-  bool rounds_routes = false;
+  MoeParams params;  // the formats keep a reference; declared before fmts
+  // fmts[layer_fmt[layer]] serves a layer: the constructor's format serves every layer until set_layer_format moves some to another.
+  std::vector<std::unique_ptr<MoeFormat>> fmts;
+  std::vector<int> layer_fmt;
   int n_iblk = 0, n_hblk = 0;  // kRowBlock blocks per intermediate row and per output row
 
   // Pinned IO shared by every layer and batch size (one task in flight): [max_tokens, H] x and y, [max_tokens, top_k] ids and w.
@@ -184,9 +184,8 @@ struct CpuMoeExecutor {
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
-    fmt = make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)});
-    preps_inter = fmt->preps_inter();
-    rounds_routes = fmt->rounds_routes();
+    fmts.push_back(make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)}));
+    layer_fmt.assign(num_layers, 0);
     n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
     n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
@@ -217,7 +216,19 @@ struct CpuMoeExecutor {
     return MoeTask{static_cast<uint64_t>(layer_id), static_cast<uint64_t>(num_tokens)};
   }
 
-  std::string isa_name() const { return fmt->isa_name(); }
+  std::string isa_name() const { return fmts[0]->isa_name(); }
+
+  const MoeFormat& format_of(const MoeTask& t) const { return *fmts[layer_fmt[t.layer]]; }
+
+  // Experts of several formats: serve `layers` with another format over the same H, I and IO. Call before the first task.
+  void set_layer_format(const std::string& weight_format, std::map<std::string, uint64_t> banks,
+                        std::map<std::string, int64_t> options, const std::vector<int>& layers) {
+    fmts.push_back(make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)}));
+    for (const int layer : layers) {
+      if (layer < 0 || layer >= num_layers) throw std::out_of_range("CPU MoE layer " + std::to_string(layer) + " is outside the executor's layers");
+      layer_fmt[layer] = static_cast<int>(fmts.size()) - 1;
+    }
+  }
 
   // Whether any route of the task names an expert; do_pass1 and do_pass2 skip the others.
   bool has_routes(const MoeTask& t) const {
@@ -249,8 +260,8 @@ struct CpuMoeExecutor {
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     const int i0 = static_cast<int>(ib) * kRowBlock;
     const int i1 = std::min(I, i0 + kRowBlock);
-    fmt->gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
-                 g_scratch.data() + ((size_t)tok * top_k + k) * I);
+    format_of(t).gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
+                         g_scratch.data() + ((size_t)tok * top_k + k) * I);
   }
 
   // Pass 2 item p = one kRowBlock block of one token's output row, summed over its routes.
@@ -272,7 +283,9 @@ struct CpuMoeExecutor {
       ++n;
     }
     float part[kMaxTopK * kRowBlock];
-    if (n > 0) fmt->down(static_cast<int>(t.layer), h0, h1, routes, n, part);
+    const MoeFormat& f = format_of(t);
+    if (n > 0) f.down(static_cast<int>(t.layer), h0, h1, routes, n, part);
+    const bool rounds_routes = f.rounds_routes();
     bf16_t* y_row = io_y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
@@ -294,11 +307,12 @@ struct CpuMoeExecutor {
     barrier(local_sense);
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_inter.
     // Needs all of pass1 done (a full row spans every iblk).
-    if (preps_inter) {
+    if (prt_total > 0) {
+      MoeFormat& f = *fmts[layer_fmt[t.layer]];
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
-        fmt->prep_inter(r, g_scratch.data() + (size_t)r * params.I);
+        f.prep_inter(r, g_scratch.data() + (size_t)r * params.I);
       }
       barrier(local_sense);
     }
@@ -348,9 +362,10 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask t) {
     const int num_tokens = static_cast<int>(t.num_tokens);
+    MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
     p1_total = static_cast<int64_t>(num_tokens) * params.top_k * n_iblk;
     p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
-    prt_total = preps_inter ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
+    prt_total = fmt.preps_inter() ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -359,7 +374,7 @@ struct CpuMoeExecutor {
     bar_sense.store(0, std::memory_order_relaxed);
     // Prepare the per-token input once, up front.
     // Single-threaded: tiny for decode, and done before the workers are woken below.
-    for (int tok = 0; tok < num_tokens; ++tok) fmt->prep_input(tok, io_x + (size_t)tok * params.H);
+    for (int tok = 0; tok < num_tokens; ++tok) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
@@ -520,6 +535,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("banks"), py::arg("options"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
            py::arg("core_ids"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
+      .def("set_layer_format", &CpuMoeExecutor::set_layer_format, py::arg("weight_format"), py::arg("banks"),
+           py::arg("options"), py::arg("layers"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("layer_id"), py::arg("num_tokens"),
            py::call_guard<py::gil_scoped_release>())

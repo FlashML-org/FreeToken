@@ -102,6 +102,11 @@ _BANK_BYTES_PER_EXPERT = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+def placeholder_bank(num_experts: int) -> torch.Tensor:
+    """The source of a bank whose role a layer's expert kernel does not read (experts of several formats): zero bytes per row."""
+    return torch.empty((num_experts, 0), dtype=torch.uint8)
+
+
 def bank_layouts(sources: dict[str, list[torch.Tensor]], layer_tags: list | None = None) -> list[tuple]:
     """Each layer's layout key: its quant tag and every bank's (dtype, row shape). A slot pool holds layers of one key."""
     num_layers = len(next(iter(sources.values())))
@@ -154,6 +159,9 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # Per-layer kernel layouts for experts of several formats (replaces ``layout``). The banks are the union of their roles;
+    # a layer whose kernel reads no such role carries a zero-byte [num_experts, 0] uint8 placeholder (see placeholder_bank).
+    layer_layouts: list[dict] | None = None
     # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
@@ -162,7 +170,14 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
-        if self.layout is None:
+        if self.layer_layouts is not None:
+            assert self.layout is None, "pass layout or layer_layouts, not both"
+            assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
+            if len({tuple(layout) for layout in self.layer_layouts}) > 1 and any(
+                spec.resident for layout in self.layer_layouts for spec in layout.values()
+            ):
+                raise ValueError("experts of several formats cannot use a kernel with GPU-resident alphas (marlin, b12x)")
+        elif self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         if self.pool_sizes is None:
             self.pool_of_layer = [0] * self.num_layers
@@ -231,7 +246,11 @@ class OffloadMoeCache:
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
         # set_bank_sources). The GPU slot cache stays one unified pool per bank.
-        if self.layout is not None:
+        if self.layer_layouts is not None:
+            self.bank_schema = tuple(dict.fromkeys(
+                role for layout in self.layer_layouts for role, spec in layout.items() if not spec.resident
+            ))
+        elif self.layout is not None:
             self.bank_schema = tuple(role for role, spec in self.layout.items() if not spec.resident)
         else:
             self.bank_schema = _BANK_SCHEMAS[self.quant_format]
@@ -371,9 +390,9 @@ class OffloadMoeCache:
             for s, r, d in zip(self.pool_sizes[:-1], row, pad):
                 offsets[-1].append(offsets[-1][-1] + s * r + d)
         self._pool_offsets = offsets
-        # local slots below this index overlap the prefill staging area in some bank
+        # local slots below this index overlap the prefill staging area in some bank; a pool's zero-byte rows (a role its kernel does not read) overlap nothing
         self._pool_stable_from = [
-            max(min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)))
+            max((min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)) if rows[k][p]), default=0)
             for p, s in enumerate(self.pool_sizes)
         ]
         self._inval = []
@@ -382,6 +401,8 @@ class OffloadMoeCache:
             for k in range(len(rows)):
                 lo, hi = b * stage[k], (b + 1) * stage[k]
                 for p, (base, s) in enumerate(spans):
+                    if not rows[k][p]:
+                        continue
                     first = max((lo - offsets[k][p]) // rows[k][p], 0)
                     end = min(-(-(hi - offsets[k][p]) // rows[k][p]), s)
                     mask[base + first : base + max(first, end)] = True
@@ -488,8 +509,12 @@ class OffloadMoeCache:
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                if self.layout is not None:
-                    spec = self.layout[name]
+                spec = self.layout[name] if self.layout is not None else None
+                if self.layer_layouts is not None:
+                    spec = self.layer_layouts[layer_id].get(name)
+                    if spec is None and source.numel() != 0:
+                        raise ValueError(f"layer {layer_id}'s expert kernel reads no {name!r} bank, so it takes a zero-byte placeholder")
+                if spec is not None:
                     if tuple(source.shape[1:]) != tuple(spec.shape) or source.dtype != spec.dtype:
                         raise ValueError(
                             f"bank {name!r} rows are {tuple(source.shape[1:])} {source.dtype} but the expert kernel's layout "
@@ -585,6 +610,9 @@ class OffloadMoeCache:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
+                    continue
+                if source.numel() == 0:
+                    layer_src_ptrs[layer_id].append(0)  # placeholder bank: zero bytes per row, never dereferenced
                     continue
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
@@ -980,6 +1008,8 @@ class OffloadMoeCache:
             dst, src, nbytes = [], [], []
             for b, feat in enumerate(self._row_bytes[layout]):
                 stage = self._copy_dst_ptrs_host[b] + buffer_id * self._stage_bytes[b]
+                if feat == 0:
+                    continue
                 if feat < _SMALL_BANK_FEAT_BYTES:
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
@@ -1229,6 +1259,8 @@ class OffloadMoeCache:
 
         views = self.stage_views(layer_id, 0) if whole else self.pool_bank_views(layer_id)
         for (per_layer, _), cache in zip(self.banks, views):
+            if cache.numel() == 0:
+                continue
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,

@@ -18,8 +18,8 @@ import torch
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
-from .host_banks import alloc_layer_banks
-from .offload_cache import _BANK_BYTES_PER_EXPERT
+from .host_banks import HostBank
+from .offload_cache import _BANK_BYTES_PER_EXPERT, placeholder_bank
 
 logger = init_logger(__name__)
 
@@ -52,6 +52,8 @@ class ExpertBanks:
     layer_tags: list | None = None
     # per bank, per layer: bytes past an expert matrix's last row that the kernel reads and that must read as zeros (ggml MMQ); None = no such reads
     row_tail_bytes: dict[str, list[int]] | None = None
+    # per-layer quant_format of experts in several formats (``quant_format``/``kind``/``kernel`` then name the most common one); None = every layer is ``quant_format``
+    layer_formats: list[str] | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -80,6 +82,7 @@ def build_expert_banks(
     layer_sink=None,
     dummy: bool = False,
     resident: bool = False,
+    layers: list[int] | None = None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -89,6 +92,8 @@ def build_expert_banks(
     are pinned in the background, otherwise the sink receives them (converter). ``dummy``
     skips the pieces and fills the banks with finite random contents.
     ``resident`` packs into banks on ``device`` instead of host banks (the resident 'fused' experts).
+    ``layers`` fills only those bank layers (the ones ``method`` serves, for experts of several
+    formats): pieces of other layers are skipped and the other layers' sources are None.
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
@@ -96,29 +101,34 @@ def build_expert_banks(
     kernel = method.kernel
     layout = method.layout()
     E = method.cfg.num_experts
+    ids = list(range(num_layers)) if layers is None else sorted(layers)
+    filled = set(ids)
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
     if resident:
         assert layer_sink is None
         hb = None
-        banks = {role: [torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers)] for role, (shape, dtype) in specs.items()}
+        banks = {role: {l: torch.empty(shape, dtype=dtype, device=device) for l in ids} for role, (shape, dtype) in specs.items()}
     else:
-        hb = alloc_layer_banks(specs, num_layers)
-        banks = {role: [b.tensor for b in hb[role]] for role in specs}
+        hb = {role: {l: HostBank(shape, dtype) for l in ids} for role, (shape, dtype) in specs.items()}
+        banks = {role: {l: b.tensor for l, b in per_layer.items()} for role, per_layer in hb.items()}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
     }
 
+    def _sources() -> dict[str, list]:
+        return {role: [per_layer.get(l) for l in range(num_layers)] for role, per_layer in banks.items()}
+
     if dummy:
         for role, per_layer in banks.items():
-            for tensor in per_layer:
+            for tensor in per_layer.values():
                 _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
         if hb is not None and torch.cuda.is_available():
-            pin_banks(hb)
+            pin_banks({role: [per_layer[l] for l in ids] for role, per_layer in hb.items()})
         return ExpertBanks(
-            legacy_format_for(method.kind, kernel.name), banks,
+            legacy_format_for(method.kind, kernel.name), _sources(),
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
             kind=method.kind, kernel=kernel.name, layout=layout,
         )
@@ -130,6 +140,8 @@ def build_expert_banks(
         for layer_id, e0, e1, piece in pieces:
             if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
                 raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
+            if layer_id not in filled:
+                continue
             # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
             if written[layer_id, e0:e1].any():
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
@@ -141,8 +153,9 @@ def build_expert_banks(
             if tracker is not None:
                 for _ in range(e1 - e0):
                     tracker.note(layer_id)
-        missing = (written == 0).nonzero().tolist()
+        missing = (written[ids] == 0).nonzero().tolist()
         if missing:
+            missing = [[ids[l], e] for l, e in missing]
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
     if layer_sink is not None:
@@ -154,10 +167,67 @@ def build_expert_banks(
         _fill(None)
 
     return ExpertBanks(
-        legacy_format_for(method.kind, kernel.name), banks,
+        legacy_format_for(method.kind, kernel.name), _sources(),
         gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
         streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
     )
+
+
+def method_groups(layer_methods) -> list[tuple]:
+    """``[(method, [bank layers])]`` of the layers' expert methods, one entry per (kind, kernel), most layers first."""
+    groups: dict = {}
+    for layer, method in enumerate(layer_methods):
+        groups.setdefault((method.kind, method.kernel.name), (method, []))[1].append(layer)
+    return sorted(groups.values(), key=lambda g: (-len(g[1]), g[1][0]))
+
+
+def is_mixed(layer_methods) -> bool:
+    return layer_methods is not None and len(method_groups(layer_methods)) > 1
+
+
+def merge_expert_banks(parts: list[ExpertBanks], layer_methods, num_experts: int) -> ExpertBanks:
+    """One ``ExpertBanks`` over the per-format ``parts`` (each filled only on its layers): the banks are the
+    union of the roles, a layer without a role gets a zero-byte placeholder (see ``OffloadMoeCache.layer_layouts``)."""
+    from freetoken.moe.legacy_format import legacy_format_for
+
+    num_layers = len(layer_methods)
+    sources: dict[str, list] = {}
+    for part in parts:
+        if part.gate_up_alpha is not None or part.down_alpha is not None:
+            raise ValueError(f"experts of several formats cannot use the {part.kernel} kernel, which keeps GPU-resident alphas")
+        for role, per_layer in part.sources.items():
+            merged = sources.setdefault(role, [None] * num_layers)
+            for layer, tensor in enumerate(per_layer):
+                if tensor is not None:
+                    assert merged[layer] is None, (role, layer)
+                    merged[layer] = tensor
+    for per_layer in sources.values():
+        for layer, tensor in enumerate(per_layer):
+            if tensor is None:
+                per_layer[layer] = placeholder_bank(num_experts)
+    formats = [legacy_format_for(m.kind, m.kernel.name) for m in layer_methods]
+    primary = parts[0]
+    return ExpertBanks(
+        primary.quant_format, sources, streamed=all(p.streamed for p in parts),
+        kind=primary.kind, kernel=primary.kernel, layer_tags=formats, layer_formats=formats,
+    )
+
+
+def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+    from freetoken.moe.expert_pieces import iter_expert_pieces
+
+    num_layers = model_config.num_moe_layers
+    assert len(layer_methods) == num_layers, (len(layer_methods), num_layers)
+    parts = []
+    for method, layers in method_groups(layer_methods):
+        pieces = None if dummy else iter_expert_pieces(
+            model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+        )
+        parts.append(build_expert_banks(
+            method, num_layers, pieces, device=device, layer_sink=layer_sink, dummy=dummy, layers=layers,
+        ))
+        logger.info_rank0(f"expert banks: {method.kind} / {method.kernel.name} on {len(layers)} of {num_layers} MoE layers")
+    return merge_expert_banks(parts, layer_methods, model_config.num_experts)
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -216,19 +286,24 @@ def ftw_bank_bytes(model_path: str) -> int | None:
     return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
 
 
-def bank_bytes_estimate(model_config, method=None) -> int | None:
+def _method_expert_bytes(method) -> int:
+    return method.cfg.num_experts * sum(
+        math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
+        for spec in method.layout().values() if not spec.resident
+    )
+
+
+def bank_bytes_estimate(model_config, method=None, layer_methods=None) -> int | None:
     """Estimated total expert-bank bytes of a raw checkpoint before loading it.
 
-    With a bound expert ``method`` the kernel's layout gives the exact host bytes; otherwise the
-    format-tag table sizes the format. ``None`` for unknown formats or missing dims
-    (callers then skip the pre-load sizing)."""
+    With a bound expert ``method`` the kernel's layout gives the exact host bytes (``layer_methods``,
+    one per MoE layer, for experts of several formats); otherwise the format-tag table sizes the
+    format. ``None`` for unknown formats or missing dims (callers then skip the pre-load sizing)."""
     layers = getattr(model_config, "num_moe_layers", None)
+    if layer_methods is not None:
+        return sum(_method_expert_bytes(m) for m in layer_methods)
     if method is not None and layers:
-        per_expert = sum(
-            math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
-            for spec in method.layout().values() if not spec.resident
-        )
-        return layers * method.cfg.num_experts * per_expert
+        return layers * _method_expert_bytes(method)
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
@@ -256,6 +331,7 @@ def load_expert_banks(
     layer_sink=None,
     layer_residency: list[str] | None = None,
     resident: bool = False,
+    layer_methods: list | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -282,9 +358,15 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
 
     ``resident`` (with ``method``): the banks land on ``device`` for the resident 'fused' experts; no host bank outlives the load.
+
+    ``layer_methods`` (one bound method per MoE layer) serves experts of several formats: each
+    format fills its own layers and the banks merge over the union of roles (``merge_expert_banks``).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
 
+    mixed = is_mixed(layer_methods)
+    if mixed and (resident or layer_residency is not None):
+        raise ValueError("experts of several formats are served from the offload slot cache only (no resident experts, no --moe-cpu-layers)")
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
@@ -330,6 +412,8 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
+        if mixed:
+            return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink)
         if method is not None and method.kind is QuantKind.GGUF:
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
