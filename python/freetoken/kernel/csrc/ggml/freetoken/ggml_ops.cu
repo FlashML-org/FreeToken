@@ -123,6 +123,19 @@ int64_t mmq_tail_bytes(int64_t type_id, int64_t k) {
     return rem == 0 ? 0 : (int64_t) ggml_row_size((ggml_type) type_id, MATRIX_ROW_PADDING - rem);
 }
 
+// MMQ / MMVQ index weight blocks from the data pointer with 32-bit ints, MMQ tail reads included
+void check_block_offsets(TensorView w, ggml_type type, int64_t k) {
+    if (w.numel() == 0) {
+        return;
+    }
+    int64_t bytes = 1 + mmq_tail_bytes(type, k);
+    for (int d = 0; d < w.ndim(); ++d) {
+        bytes += (w.size(d) - 1) * w.stride(d);
+    }
+    const int64_t blocks = bytes / (int64_t) ggml_type_size(type);
+    RuntimeCheck(blocks <= INT32_MAX, "ggml weight spans ", blocks, " ", ggml_type_name(type), " blocks; MMQ / MMVQ address at most ", INT32_MAX);
+}
+
 struct Activation {
     const void * data;
     ggml_type type;
@@ -186,6 +199,7 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
     const ggml_type type = (ggml_type) type_id;
     const int64_t m = x.size(0), k = x.size(1), n = w.size(0);
     check_weight(w, type, k);
+    check_block_offsets(w, type, k);
     RuntimeCheck(out.ndim() == 2 && out.size(0) == m && out.size(1) == n && out.stride(1) == 1, "mul_mat out must be a [M, N] view with contiguous rows");
     const ggml_type otype = io_type(x, out);
     if (m == 0) {
@@ -229,6 +243,7 @@ void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, 
     RuntimeCheck(x.ndim() == 3 && x.size(0) == t && (x.size(1) == 1 || x.size(1) == top_k), "x must be [T, 1, K] or [T, k, K]");
     const int64_t ky = x.size(1), k = x.size(2), e = w.size(0), n = w.size(1);
     check_weight(w, type, k);
+    check_block_offsets(w, type, k);
     RuntimeCheck(out.ndim() == 3 && out.size(0) == t && out.size(1) == top_k && out.size(2) == n && out.IsContiguous(),
                  "out must be a contiguous [T, k, N] tensor");
     const ggml_type otype = io_type(x, out);
@@ -285,6 +300,7 @@ void op_mul_mat_id_glu(TensorView w, int64_t type_id, TensorView x, TensorView i
     const ggml_type type = (ggml_type) type_id;
     const int64_t t = ids.size(0), top_k = ids.size(1), k = x.size(1), e = w.size(0), n = w.size(1) / 2;
     check_weight(w, type, k);
+    check_block_offsets(w, type, k);
     RuntimeCheck(out.IsContiguous() && out.ndim() == 3 && out.size(0) == t && out.size(1) == top_k && out.size(2) == n,
                  "out must be a contiguous [T, k, I] tensor");
     const ggml_type otype = io_type(x, out);
