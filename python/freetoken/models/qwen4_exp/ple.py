@@ -112,8 +112,9 @@ class GpuResidentTable:
             flat = row_ids.reshape(-1)
             packed = self.weight.index_select(0, flat)
             scales = self.scale_tensor.index_select(0, flat).view(torch.float8_e4m3fn).float()
-            lo = self._lut[packed & 0x0F]
-            hi = self._lut[(packed >> 4) & 0x0F]
+            nibbles = packed.to(torch.int64)  # this torch build rejects uint8 indices
+            lo = self._lut[nibbles & 0x0F]
+            hi = self._lut[(nibbles >> 4) & 0x0F]
             rows = torch.stack((lo, hi), dim=2).reshape(flat.shape[0], self.head_dim)
             if self.scale != 1.0:
                 scales = scales * self.scale
