@@ -56,8 +56,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             raise KeyError(f"missing GGUF metadata key gemma4.{key}")
         return val
 
+    if int(m.get("gemma4.embedding_length_per_layer_input", 0)) or int(m.get("gemma4.attention.shared_kv_layers", 0)):
+        raise NotImplementedError("gemma4 E2B / E4B GGUF (per-layer input embeddings, shared KV layers) is not supported")
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
+    num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
     kv_per_layer = g("attention.head_count_kv")  # per-layer list
     # True -> sliding-window (SWA) layer, False -> full attention.
@@ -104,14 +107,14 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
         rotary_config=full_rotary,
-        num_experts=int(g("expert_count")),
-        num_experts_per_tok=int(g("expert_used_count")),
-        moe_intermediate_size=int(g("expert_feed_forward_length")),
+        num_experts=num_experts,
+        num_experts_per_tok=int(g("expert_used_count")) if num_experts else 0,
+        moe_intermediate_size=int(g("expert_feed_forward_length")) if num_experts else 0,
         norm_topk_prob=True,
         model_type="gemma4",
         architectures=list(shim.architectures),
-        moe_enabled=True,
-        expert_quant="gguf",
+        moe_enabled=num_experts > 0,
+        expert_quant="gguf" if num_experts else "none",
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -149,11 +152,14 @@ _LAYER_SCALAR_MAP = {
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
     "ffn_norm.weight": "pre_feedforward_layernorm.weight",
-    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm.weight": "feed_forward.post_feedforward_layernorm.weight",
+    "layer_output_scale.weight": "feed_forward.layer_scalar",
+}
+# the MoE layers' second feed-forward branch and router
+_MOE_LAYER_SCALAR_MAP = {
+    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm_1.weight": "feed_forward.post_feedforward_layernorm_1.weight",
     "post_ffw_norm_2.weight": "feed_forward.post_feedforward_layernorm_2.weight",
-    "layer_output_scale.weight": "feed_forward.layer_scalar",
     "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
     "ffn_gate_inp.scale": "feed_forward.router.scale",
     "ffn_down_exps.scale": "feed_forward.router.per_expert_scale",
@@ -184,6 +190,8 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     if m is None:
         return ()
     blk, leaf = f"blk.{m.group(1)}", m.group(2)
+    if leaf in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") and f"{blk}.attn_qkv.weight" in tensors:
+        return (f"{blk}.attn_qkv",)
     if leaf == "self_attn.v_proj":
         # the full-attention layers store no attn_v: k is reused as v
         return (f"{blk}.attn_v",) if f"{blk}.attn_v.weight" in tensors else (f"{blk}.attn_k",)
@@ -233,13 +241,18 @@ def iter_gguf_weights(
         yield from fused("lm_head", [out], [matrix(out)], hidden)
     yield "model.norm.weight", float_tensor(t("output_norm"))
 
+    scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else _LAYER_SCALAR_MAP
     for layer in range(config.num_layers):
         blk, base = f"blk.{layer}", f"model.layers.{layer}"
-        for suffix, rel in _LAYER_SCALAR_MAP.items():
+        for suffix, rel in scalar_map.items():
             tensor = float_tensor(index[f"{blk}.{suffix}"])
             yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
-        q, k = t(f"{blk}.attn_q"), t(f"{blk}.attn_k")
-        qkv = [q, k, index.get(f"{blk}.attn_v.weight", k)]
+        if f"{blk}.attn_qkv.weight" in index:
+            # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
+            qkv = [t(f"{blk}.attn_qkv")]
+        else:
+            q, k = t(f"{blk}.attn_q"), t(f"{blk}.attn_k")
+            qkv = [q, k, index.get(f"{blk}.attn_v.weight", k)]
         yield from fused(f"{base}.self_attn.qkv_proj", qkv, [matrix(p) for p in qkv], hidden)
         o = t(f"{blk}.attn_output")
         yield from fused(f"{base}.self_attn.o_proj", [o], [matrix(o)], int(o.ne[0]))

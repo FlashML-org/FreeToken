@@ -142,7 +142,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration",),  # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -152,7 +152,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),  # text-only release; its llama.cpp qwen35moe GGUF
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -381,13 +381,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen2ForCausalLM",
         hidden_size=3584,
         kv_groups=((4, 128),),
+        arch_aliases=("Qwen2GGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3-8B",
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
-        arch_aliases=("Qwen3VLForConditionalGeneration",),  # Qwen3-VL-8B: same text tower
+        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM"),  # Qwen3-VL-8B: same text tower
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",
