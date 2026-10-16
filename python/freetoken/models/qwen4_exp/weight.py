@@ -24,9 +24,10 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import drop_page_cache, iter_weight_files, safetensors_weight_map
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
+    decode_csf_scales,
 )
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
@@ -40,7 +41,8 @@ from tqdm import tqdm
 # stacked ``mtp.layers.N.mlp.experts.*`` tensors.
 _EXPERT_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2|input_scale|weight_scale\.nvfp4_csf_fixed|weight_scale\.nvfp4_csf_exceptions)$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
@@ -48,6 +50,20 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
+    # per-expert input scales are runtime quantities, not stored by the banks
+    ignored_kinds=frozenset({"input_scale"}),
+)
+# FP4-Local stores the routed-expert block scales as lossless CSF slab pairs instead of the
+# plain E4M3 matrix; decode_csf_scales expands each pair back into the matrix the banks read.
+_CSF_KINDS = ("weight_scale.nvfp4_csf_fixed", "weight_scale.nvfp4_csf_exceptions")
+_NVFP4_LOCAL_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,
+    desc="Qwen3.8-Flash-Next-FP4-Local CSF NVFP4 experts",
+    scale_pair=_CSF_KINDS,
+    scale_decoder=decode_csf_scales,
+    ignored_kinds=frozenset({"input_scale"}),
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -383,6 +399,11 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 
 
 def nvfp4_expert_spec(model_path: str, config):
+    """Pick the expert source spec for the checkpoint's scale encoding."""
+    folder = download_hf_weight(model_path)
+    weight_map = safetensors_weight_map(folder)
+    if any(".nvfp4_csf_fixed" in name for name in weight_map):
+        return _NVFP4_LOCAL_SOURCE_SPEC
     return _NVFP4_SOURCE_SPEC
 
 

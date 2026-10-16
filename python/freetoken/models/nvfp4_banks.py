@@ -27,6 +27,15 @@ class Nvfp4ExpertSourceSpec:
     # The checkpoint stores the QUANT-side global scale (local fp8 scales were
     # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
+    # Tensor kinds present in the checkpoint but never fetched (per-expert input
+    # scales are runtime quantities, not stored here).
+    ignored_kinds: frozenset[str] = frozenset()
+    # The checkpoint stores the block scales as a lossless CSF slab pair instead of
+    # the plain E4M3 matrix (e.g. "weight_scale.nvfp4_csf_fixed" /
+    # "weight_scale.nvfp4_csf_exceptions"); scale_decoder expands the parts into the
+    # plain matrix the banks consume.
+    scale_pair: tuple[str, ...] | None = None
+    scale_decoder: Callable[..., torch.Tensor] | None = None
 
 
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
@@ -63,6 +72,40 @@ def _kind_suffix(kind: str) -> str:
     return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
 
 
+def decode_csf_scales(fixed: torch.Tensor, exceptions: torch.Tensor) -> torch.Tensor:
+    """Expand the CSF slab encoding of an NVFP4 per-16 scale into the plain E4M3 matrix (CPU).
+
+    ``fixed`` is U8 ``[slabs, 16 * (1 + row_bytes)]``: the first 16 bytes of each slab hold the
+    per-row scale bases (one byte per row of the slab's 16 rows), the rest are row-major code
+    bytes with column c at bit 4c. ``exceptions`` is U32 records, ``pos = rec & 0xFFFFFF``
+    (row-major scale index, below 2**24) and ``value = rec >> 24`` (the exact E4M3 byte),
+    applied after base + offset.
+    """
+    if fixed.ndim != 2 or fixed.dtype != torch.uint8:
+        raise ValueError(f"CSF fixed slab tensor is {tuple(fixed.shape)} {fixed.dtype}, expected U8 [slabs, slab_bytes]")
+    slabs, slab_bytes = fixed.shape
+    row_bytes = slab_bytes // 16 - 1
+    if row_bytes < 1 or slab_bytes != 16 * (1 + row_bytes):
+        raise ValueError(f"CSF slab width {slab_bytes} does not hold 16 bases plus 16 * row_bytes code bytes")
+    rows = slabs * 16
+    cols = row_bytes * 2
+    data = fixed.to(torch.int16)
+    base = data[:, :16].reshape(rows, 1)
+    codes = data[:, 16:].reshape(rows, row_bytes)
+    bits = 4 * torch.arange(cols)
+    scale = (base + ((codes[:, bits // 8] >> bits % 8) & 0x0F)) & 0xFF
+    if exceptions.numel():
+        rec = exceptions.reshape(-1)
+        if rec.dtype == torch.uint8:
+            rec = rec.view(torch.uint32)
+        elif rec.dtype != torch.uint32:
+            rec = rec.to(torch.int32).view(torch.uint32)
+        scale = scale.to(torch.int32)
+        flat = scale.reshape(-1)
+        flat.scatter_(0, (rec & 0xFFFFFF).to(torch.int64), (rec >> 24).to(torch.int32))
+    return scale.to(torch.uint8).view(torch.float8_e4m3fn)
+
+
 def iter_nvfp4_expert_pieces(
     model_path: str,
     config,
@@ -90,6 +133,7 @@ def iter_nvfp4_expert_pieces(
     weight_map = safetensors_weight_map(folder)
 
     wanted: dict[str, tuple[int, int, str]] = {}
+    pair_kinds = spec.scale_pair
     for name in weight_map:
         match = spec.key_pattern.match(name)
         if match is None:
@@ -101,10 +145,19 @@ def iter_nvfp4_expert_pieces(
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = _canon_kind(spec, match.group("kind"))
-        if kind not in ("weight", "weight_scale", "weight_scale_2"):
+        role = spec.proj_to_role[proj]
+        if kind in spec.ignored_kinds:
+            continue
+        if pair_kinds is not None:
+            if kind not in pair_kinds:
+                raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+            wanted[name] = (bank_layer, int(match.group("expert")), f"{role}~{kind}")
+        elif kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * config.num_experts * 9
+        else:
+            wanted[name] = (bank_layer, int(match.group("expert")), role + _kind_suffix(kind))
+    per_expert = 9 if pair_kinds is None else 3 * (2 + len(pair_kinds))
+    expected = _num_moe_layers(config) * config.num_experts * per_expert
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
@@ -132,7 +185,42 @@ def iter_nvfp4_expert_pieces(
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    if pair_kinds is None:
+        return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    if spec.scale_decoder is None:
+        raise ValueError(f"{spec.desc}: scale_pair requires a scale_decoder")
+    decoder = spec.scale_decoder
+
+    # CSF checkpoints stream the slab parts as separate tensors; group them back into the
+    # same 9 logical roles, decoding the scale pair on the fly.
+    roles = list(spec.proj_to_role.values())
+    slots_per_expert = {
+        slot
+        for role in roles
+        for slot in [f"{role}", f"{role}_global", *(f"{role}~{kind}" for kind in pair_kinds)]
+    }
+
+    def _csf_pieces():
+        pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        for name, tensor in _parallel() if parallel else _serial():
+            layer, expert, slot = wanted[name]
+            piece = pending.setdefault((layer, expert), {})
+            piece[slot] = tensor
+            if len(piece) != len(slots_per_expert):
+                continue
+            del pending[(layer, expert)]
+            grouped: dict[str, torch.Tensor] = {}
+            for role in roles:
+                grouped[role] = piece[role].unsqueeze(0)
+                grouped[f"{role}_global"] = piece[f"{role}_global"].reshape(1, -1)
+                grouped[f"{role}_scale"] = decoder(
+                    *[piece[f"{role}~{kind}"] for kind in pair_kinds]
+                ).unsqueeze(0)
+            yield layer, expert, expert + 1, grouped
+        if pending:
+            raise ValueError(f"{spec.desc}: incomplete expert tensors for (layer, expert) {sorted(pending)[:8]}")
+
+    return _csf_pieces()
 
 
-__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+__all__ = ["Nvfp4ExpertSourceSpec", "decode_csf_scales", "iter_nvfp4_expert_pieces"]

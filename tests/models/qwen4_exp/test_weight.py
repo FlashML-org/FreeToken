@@ -16,11 +16,16 @@ from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
+import freetoken.models.qwen4_exp.weight as qwen4_exp_weight
+from freetoken.models.nvfp4_banks import decode_csf_scales, iter_nvfp4_expert_pieces
 from freetoken.models.qwen4_exp.weight import (
+    _NVFP4_LOCAL_SOURCE_SPEC,
+    _NVFP4_SOURCE_SPEC,
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
     iter_weights,
     load_ple_table,
+    nvfp4_expert_spec,
 )
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -62,6 +67,108 @@ def _hc_weights(prefix: str, inject: bool) -> dict[str, torch.Tensor]:
 
 def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
+
+
+def _csf_target(rows: int, cols: int, seed: int = 0) -> torch.Tensor:
+    """An E4M3 scale matrix whose rows share a high nibble (so base + 4-bit offset is exact)."""
+    rng = random.Random(seed)
+    high = torch.tensor([[rng.randrange(16)] for _ in range(rows)], dtype=torch.uint8)
+    off = torch.tensor([[rng.randrange(16) for _ in range(cols)] for _ in range(rows)], dtype=torch.uint8)
+    return high << 4 | off
+
+
+def _csf_encode(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CSF slab pair of ``target``: fixed slabs (per-row high-nibble bases + 4-bit offsets) and a
+    few absolute exception records. The reference the decoder test compares against."""
+    rows, cols = target.shape
+    assert rows % 16 == 0 and cols % 2 == 0
+    row_bytes = cols // 2
+    fixed = torch.zeros(rows // 16, 16 * (1 + row_bytes), dtype=torch.uint8)
+    exceptions: list[int] = []
+    for r in range(rows):
+        slab, row = divmod(r, 16)
+        base = target[r, 0] & 0xF0
+        fixed[slab, row] = base
+        for j in range(row_bytes):
+            fixed[slab, 16 + row * row_bytes + j] = (target[r, 2 * j + 1] & 0xF) << 4 | (target[r, 2 * j] & 0xF)
+    # absolute records: (value << 24) | row-major position
+    for pos in (3, rows * cols - 1):
+        value = 0xFF - (target.ravel()[pos] & 0xFF)
+        exceptions.append((value << 24) | pos)
+    exc = torch.tensor(exceptions, dtype=torch.int32)
+    ref = target.reshape(-1).clone()
+    for rec in exceptions:
+        ref[rec & 0xFFFFFF] = rec >> 24
+    return fixed, exc, ref
+
+
+# --------------------------------------------------------------------------- CSF slab scales
+
+
+def test_csf_decode_roundtrip():
+    for rows, cols in ((32, 8), (128, 160), (40 * 16, 40)):
+        target = _csf_target(rows, cols, seed=rows)
+        fixed, exc, ref = _csf_encode(target)
+        out = decode_csf_scales(fixed, exc)
+        assert out.shape == (rows, cols) and out.dtype is torch.float8_e4m3fn
+        assert torch.equal(out.view(torch.uint8), ref)
+        # the same records as a U32 byte stream
+        assert torch.equal(decode_csf_scales(fixed, exc.view(torch.uint8)).view(torch.uint8), ref)
+        # with no exceptions the slab decode is the target itself (rows share a high nibble)
+        no_exc = decode_csf_scales(fixed, torch.zeros(0, dtype=torch.int32))
+        assert torch.equal(no_exc.view(torch.uint8), target.reshape(-1))
+
+
+def test_nvfp4_expert_spec_selects_the_csf_checkpoint(monkeypatch):
+    monkeypatch.setattr(qwen4_exp_weight, "download_hf_weight", lambda path: "<csf-ckpt>")
+    weight_map = {
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight": "m.safetensors",
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed": "m.safetensors",
+    }
+    monkeypatch.setattr(qwen4_exp_weight, "safetensors_weight_map", lambda folder: weight_map)
+    spec = nvfp4_expert_spec("unused", SimpleNamespace())
+    assert spec is _NVFP4_LOCAL_SOURCE_SPEC
+    assert spec.scale_pair == ("weight_scale.nvfp4_csf_fixed", "weight_scale.nvfp4_csf_exceptions")
+    plain = {k.replace(".weight_scale.nvfp4_csf_fixed", ".weight_scale"): v for k, v in weight_map.items()}
+    monkeypatch.setattr(qwen4_exp_weight, "safetensors_weight_map", lambda folder: plain)
+    assert nvfp4_expert_spec("unused", SimpleNamespace()) is _NVFP4_SOURCE_SPEC
+    assert "input_scale" in _NVFP4_SOURCE_SPEC.ignored_kinds
+
+
+def test_csf_expert_reader_expands_the_scale_pieces(tmp_path):
+    """A CSF checkpoint streams slab pairs; the reader expands them into the 9 plain roles."""
+    from freetoken.models.loader import drop_page_cache
+
+    lm = "model.language_model"
+    H_, I_ = 128, 64  # hidden / expert width; K multiples of 16, rows multiples of 16
+    raw: dict[str, torch.Tensor] = {}
+    refs: dict[tuple[int, str], torch.Tensor] = {}
+    for expert in range(2):
+        for proj, rows, k in (("gate_proj", I_, H_), ("up_proj", I_, H_), ("down_proj", H_, I_)):
+            base = f"{lm}.layers.0.mlp.experts.{expert}.{proj}"
+            raw[f"{base}.weight"] = torch.randint(0, 256, (rows, k // 2), dtype=torch.uint8)
+            raw[f"{base}.weight_scale_2"] = torch.rand(()) + 0.5
+            raw[f"{base}.input_scale"] = torch.rand(()) + 0.5  # ignored by the banks
+            fixed, exc, ref = _csf_encode(_csf_target(rows, k // 16, seed=expert + k))
+            raw[f"{base}.weight_scale.nvfp4_csf_fixed"] = fixed
+            raw[f"{base}.weight_scale.nvfp4_csf_exceptions"] = exc
+            refs[(expert, proj)] = ref
+    shard = "model-00001-of-00001.safetensors"
+    save_file(raw, tmp_path / shard)
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"metadata": None, "weight_map": {n: shard for n in raw}}))
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(str(tmp_path), config, _NVFP4_LOCAL_SOURCE_SPEC, drop_page_cache=drop_page_cache))
+    assert sorted(p[1] for p in pieces) == [0, 1]
+    for layer, e0, e1, piece in pieces:
+        assert (layer, e0, e1) == (0, e0, e0 + 1)
+        for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
+            base = f"{lm}.layers.0.mlp.experts.{e0}.{proj}"
+            assert torch.equal(piece[role][0], raw[f"{base}.weight"])
+            assert piece[f"{role}_global"].dtype is torch.float16 and torch.equal(
+                piece[f"{role}_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).to(torch.float16)
+            )
+            assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
+            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0].reshape(-1), refs[(e0, proj)])
 
 
 def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
