@@ -81,6 +81,8 @@ def _write_checkpoint(tmp_path, table, n_shards):
 
 def test_source_rejects_a_packed_nvfp4_table(tmp_path):
     """The disk store reads native FP8 rows; the packed e2m1 table needs the pinned backend."""
+    from safetensors.torch import save_file
+
     save_file(
         {
             f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(4, 8, dtype=torch.uint8),
