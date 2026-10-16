@@ -41,7 +41,9 @@ def _hf_indexer(seq: int, topk: int):
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
-    ref_topk = idx(x, q_resid, (cos, sin), None, pos[None])  # [1, S, topk]
+    # bool causal mask, True = visible: since transformers 5.18 the indexer no longer builds one when given None
+    causal = (pos[None, :] <= pos[:, None])[None]
+    ref_topk = idx(x, q_resid, (cos, sin), causal, pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
 

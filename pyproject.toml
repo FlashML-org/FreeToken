@@ -57,7 +57,7 @@ dependencies = [
     "torch>=2.14,<2.15",
     "torchvision>=0.29,<0.30",
     "tqdm>=4.66,<5",
-    "transformers>=5.16,<5.17",
+    "transformers>=5.18,<5.19",
     # CUDA torch 2.14 resolves Triton 3.8; AMD's ROCm 7.14 image supplies its
     # gfx1201-enabled Triton 3.7 build. Keep both supported without replacing the
     # runtime-specific wheel selected by the PyTorch distribution.
