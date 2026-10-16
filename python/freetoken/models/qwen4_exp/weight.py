@@ -74,6 +74,12 @@ _PLE_SHARD_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+# FP4-Local tables pack the rows as e2m1 (two per byte), keep a per-16 e4m3 scale row per shard
+# and put the global scale in ``weight_scale_2``.
+_PLE_SHARD_SCALE_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight_scale$"
+)
+_PLE_GLOBAL_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale_2"
 _PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
 # Zero-centered Qwen4ExpTextRMSNorm weights, loaded RAW: GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm
@@ -267,14 +273,20 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
 
 @dataclass(frozen=True)
 class PleTable:
-    """The filled n-gram table: one pinned host bank plus the checkpoint's per-tensor FP8 scale."""
+    """The filled n-gram table: one pinned host bank plus the checkpoint's per-tensor scale.
+
+    FP8 tables hold e4m3 values and a scalar ``weight_scale``; NVFP4 tables hold packed e2m1
+    values in ``bank`` and the per-16 e4m3 scale rows in ``scale_bank``, with ``weight_scale``
+    reading the checkpoint's global ``weight_scale_2``.
+    """
 
     bank: HostBank
-    weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16)
+    weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16 or fp32)
+    scale_bank: HostBank | None = None  # [total_rows, ngram_head_dim // 16] e4m3, NVFP4 tables
 
     @property
     def tensor(self) -> torch.Tensor:
-        """``[total_rows, ngram_head_dim]`` float8_e4m3fn view of the bank."""
+        """``[total_rows, ngram_head_dim // (2 if packed else 1)]`` view of the value bank."""
         return self.bank.tensor
 
 
@@ -340,42 +352,70 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
     table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
     """
+    encoding = getattr(qwen4_args, "ple_embedding_dtype", "fp8")
+    if encoding not in ("fp8", "nvfp4"):
+        raise ValueError(f"unsupported ple_embedding_dtype {encoding!r}")
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
+    scale_parts: dict[int, tuple[str, int, int]] = {}
     scale: torch.Tensor | None = None
     rows = cols = 0
+    st_dtype = _PLE_ST_DTYPE if encoding == "fp8" else "U8"
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
         for key, meta in header.items():
             if key == "__metadata__":
                 continue
-            if key.endswith(_PLE_SCALE_SUFFIX):
+            if key.endswith(_PLE_GLOBAL_SCALE_SUFFIX if encoding == "nvfp4" else _PLE_SCALE_SUFFIX):
                 with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                     scale = f.get_tensor(key).reshape(())
                 continue
             match = _PLE_SHARD_RE.search(key)
-            if match is None:
+            if match is not None:
+                if meta["dtype"] != st_dtype:
+                    raise ValueError(
+                        f"PLE table shard {key} has dtype {meta['dtype']}, "
+                        f"expected {st_dtype} for ple_embedding_dtype={encoding}"
+                    )
+                shape = meta["shape"]
+                if rows and tuple(shape) != (rows, cols):
+                    raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
+                rows, cols = shape
+                begin, end = meta["data_offsets"]
+                parts[int(match.group("shard"))] = (path, base + begin, end - begin)
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE table shard {key} has unsupported dtype {meta['dtype']}")
-            shape = meta["shape"]
-            if rows and tuple(shape) != (rows, cols):
-                raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
-            rows, cols = shape
-            begin, end = meta["data_offsets"]
-            parts[int(match.group("shard"))] = (path, base + begin, end - begin)
+            if encoding == "nvfp4":
+                match = _PLE_SHARD_SCALE_RE.search(key)
+                if match is not None:
+                    if meta["dtype"] != _PLE_ST_DTYPE:
+                        raise ValueError(f"PLE scale shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+                    shape = meta["shape"]
+                    if rows and tuple(shape) != (rows, cols // 8):
+                        raise ValueError(f"PLE scale shard {key} is {shape}, expected {[rows, cols // 8]}")
+                    begin, end = meta["data_offsets"]
+                    scale_parts[int(match.group("shard"))] = (path, base + begin, end - begin)
 
     expected = int(qwen4_args.split_ngram_parts)
     if sorted(parts) != list(range(expected)):
         raise ValueError(
             f"PLE table needs shards 0..{expected - 1}, found {len(parts)}: {sorted(parts)[:8]}"
         )
-    if cols != qwen4_args.ngram_head_dim:
-        raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
+    head_dim = qwen4_args.ngram_head_dim
+    if encoding == "nvfp4":
+        if cols != head_dim // 2:
+            raise ValueError(
+                f"PLE table row is {cols} packed bytes, config says {head_dim // 2} for a {head_dim}-dim head"
+            )
+        if sorted(scale_parts) != list(range(expected)):
+            raise ValueError(
+                f"PLE table needs scale shards 0..{expected - 1}, found {len(scale_parts)}: {sorted(scale_parts)[:8]}"
+            )
+    elif cols != head_dim:
+        raise ValueError(f"PLE table row is {cols} wide, config says {head_dim}")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        raise ValueError(f"PLE table has no {'weight_scale_2' if encoding == 'nvfp4' else 'weight_scale'}")
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
+    bank = HostBank((expected * rows, cols), torch.uint8 if encoding == "nvfp4" else torch.float8_e4m3fn)
     shard_bytes = rows * cols
     bar = byte_bar(expected * shard_bytes, "Loading PLE table")
     try:
@@ -388,9 +428,27 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             bar.update(nbytes)
     finally:
         bar.close()
+    scale_bank = None
+    if encoding == "nvfp4":
+        scale_cols = cols // 8
+        scale_bank = HostBank((expected * rows, scale_cols), torch.float8_e4m3fn)
+        scale_shard_bytes = rows * scale_cols
+        bar = byte_bar(expected * scale_shard_bytes, "Loading PLE table scales")
+        try:
+            sbuf = scale_bank.memoryview()
+            for shard in range(expected):
+                path, offset, nbytes = scale_parts[shard]
+                assert nbytes == scale_shard_bytes, f"PLE scale shard {shard} is {nbytes} B, expected {scale_shard_bytes}"
+                read_range_into(sbuf, path, file_offset=offset, nbytes=nbytes,
+                                dest_offset=shard * scale_shard_bytes, workers=workers, chunk=chunk)
+                bar.update(nbytes)
+        finally:
+            bar.close()
+        if pin and torch.cuda.is_available():
+            scale_bank.pin()
     if pin and torch.cuda.is_available():
         bank.pin()
-    return PleTable(bank=bank, weight_scale=scale)
+    return PleTable(bank=bank, weight_scale=scale, scale_bank=scale_bank)
 
 
 # ======================================================================================

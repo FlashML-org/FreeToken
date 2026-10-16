@@ -201,12 +201,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         from .weight import load_ple_table
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
-        self._ple_table = table  # owns the pinned HostBank; keep it alive
+        self._ple_table = table  # owns the pinned HostBank(s); keep it alive
+        kwargs = {"scale_tensor": table.scale_bank.tensor} if table.scale_bank is not None else {}
         for ple in ple_layers:
             ple.ple_embedding.attach_table(
-                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
+                PinnedUVATable(table.bank.tensor, float(table.weight_scale), **kwargs)
             )
-        return table.bank.nbytes
+        return table.bank.nbytes + (table.scale_bank.nbytes if table.scale_bank is not None else 0)
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

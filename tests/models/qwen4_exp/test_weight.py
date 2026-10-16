@@ -462,6 +462,70 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
         load_ple_table(folder, args, pin=False)
 
 
+def _nvfp4_ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """The FP4-Local table: packed e2m1 values (u8, two per byte) with per-16 e4m3 scale rows.
+
+    head_dim is 16 so a packed row is 8 bytes with a single per-16 scale.
+    """
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    rows, parts, dim = 5, 3, 16
+    tensors = {
+        f"{prefix}.shard_{i}.weight": (
+            torch.arange(i * rows * dim // 2, (i + 1) * rows * dim // 2)
+            .remainder(255).to(torch.uint8).view(rows, dim // 2)
+        )
+        for i in range(parts)
+    }
+    tensors.update(
+        {
+            f"{prefix}.shard_{i}.weight_scale": (
+                torch.arange(i * rows * dim // 16, (i + 1) * rows * dim // 16)
+                .remainder(127).to(torch.uint8).view(rows, dim // 16).view(torch.float8_e4m3fn)
+            )
+            for i in range(parts)
+        }
+    )
+    scale = torch.tensor([0.25], dtype=torch.float32)
+    tensors[f"{prefix}.weight_scale_2"] = scale
+    return tensors, scale, rows, dim, parts
+
+
+def test_load_ple_table_nvfp4_concatenates_packed_shards(tmp_path):
+    """The FP4-Local table: packed e2m1 value rows, per-16 e4m3 scale rows, global weight_scale_2."""
+    tensors, scale, rows, dim, parts = _nvfp4_ngram_table()
+    names = sorted(tensors)
+    save_file({n: tensors[n] for n in names[:2]}, str(tmp_path / "model-plefp4-00000.safetensors"))
+    save_file({n: tensors[n] for n in names[2:]}, str(tmp_path / "model-plefp4-00001.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=parts, ngram_head_dim=dim, ple_embedding_dtype="nvfp4")
+    table = load_ple_table(str(tmp_path), args, pin=False)
+    assert table.tensor.shape == (parts * rows, dim // 2)
+    assert table.tensor.dtype is torch.uint8
+    assert table.scale_bank is not None
+    assert table.scale_bank.tensor.shape == (parts * rows, dim // 16)
+    assert table.scale_bank.tensor.dtype is torch.float8_e4m3fn
+    assert table.weight_scale.dtype is torch.float32
+    assert float(table.weight_scale) == 0.25
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    for shard in range(parts):
+        assert torch.equal(
+            table.tensor[shard * rows : (shard + 1) * rows], tensors[f"{prefix}.shard_{shard}.weight"]
+        )
+        assert torch.equal(
+            table.scale_bank.tensor[shard * rows : (shard + 1) * rows],
+            tensors[f"{prefix}.shard_{shard}.weight_scale"],
+        )
+
+
+def test_load_ple_table_rejects_a_nvfp4_table_under_fp8(tmp_path):
+    """A packed table's U8 value shards must not load as an FP8 table."""
+    tensors, _scale, rows, dim, parts = _nvfp4_ngram_table()
+    for i, name in enumerate(sorted(tensors)):
+        save_file({name: tensors[name]}, str(tmp_path / f"model-plefp4-{i:05d}.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=parts, ngram_head_dim=dim, ple_embedding_dtype="fp8")
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        load_ple_table(str(tmp_path), args, pin=False)
+
+
 # ======================================================================================
 # read_range_into: the O_DIRECT byte-range read the PLE table load is built on
 # ======================================================================================
