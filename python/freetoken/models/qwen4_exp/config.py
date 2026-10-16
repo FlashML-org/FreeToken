@@ -45,6 +45,8 @@ class Qwen4ExpArgs:
     image_token_id: int | None = None
     # GGUF stores ssm_out with its value-head columns in llama.cpp's tiled order
     gdn_out_heads_tiled: bool = False
+    # PLE n-gram table encoding: native FP8-e4m3 (default) or packed e2m1 NVFP4 (FP4-Local)
+    ple_embedding_dtype: str = "fp8"
 
     @property
     def index_topk_blocks(self) -> int:
@@ -101,9 +103,11 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
-        # HF Qwen4ExpTextConfig rewrites full_attention to indexed_attention in __post_init__.
+        # HF Qwen4ExpTextConfig rewrites full_attention to a non-"full" token in
+        # __post_init__: indexed_attention in transformers 5.18+, qwen_sparse_attention in 5.16.
         return [
-            "full_attention" if t == "indexed_attention" else t for t in layer_types
+            "full_attention" if t in ("indexed_attention", "qwen_sparse_attention") else t
+            for t in layer_types
         ]
     # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
     interval = int(getattr(text, "full_attention_interval", 4))
@@ -227,6 +231,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
         image_token_id=getattr(hf_config, "image_token_id", None),
+        ple_embedding_dtype=str(getattr(text, "ple_embedding_dtype", "fp8")),
     )
 
     return ModelConfig(

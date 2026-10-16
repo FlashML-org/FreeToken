@@ -78,6 +78,11 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
+            if meta["dtype"] == "U8":
+                raise NotImplementedError(
+                    f"the disk PLE backend reads native { _PLE_ST_DTYPE } rows; "
+                    f"shard {key} holds packed e2m1 (NVFP4 table) -- use the default pinned backend"
+                )
             if meta["dtype"] != _PLE_ST_DTYPE:
                 raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
             if rows and tuple(meta["shape"]) != (rows, cols):

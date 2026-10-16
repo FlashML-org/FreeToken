@@ -92,6 +92,18 @@ def test_groups_and_layer_split():
     assert linear[0].num_key_heads == 16 and linear[0].num_value_heads == 48
 
 
+def test_layer_types_accept_both_hf_full_attention_aliases():
+    """HF rewrites full_attention to a version-specific alias; both must map back."""
+    from types import SimpleNamespace
+    from freetoken.models.qwen4_exp.config import _layer_types
+
+    base = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(48)]
+    for alias in ("indexed_attention", "qwen_sparse_attention"):
+        rewritten = [alias if t == "full_attention" else t for t in base]
+        text = SimpleNamespace(layer_types=rewritten, num_hidden_layers=48)
+        assert _layer_types(text) == base
+
+
 def test_kv_specs_resolve_qsa():
     cfg = parse_config(_hf_config())
     specs = {s.name: s for s in cfg.kv_cache_group_specs()}

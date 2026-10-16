@@ -79,6 +79,24 @@ def _write_checkpoint(tmp_path, table, n_shards):
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
+def test_source_rejects_a_packed_nvfp4_table(tmp_path):
+    """The disk store reads native FP8 rows; the packed e2m1 table needs the pinned backend."""
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(4, 8, dtype=torch.uint8),
+            f"{_KEY_PREFIX}.shard_0.weight_scale": torch.zeros(4, 1, dtype=torch.float8_e4m3fn),
+            f"{_KEY_PREFIX}.weight_scale_2": torch.tensor([1.0]),
+        },
+        str(tmp_path / "model-plefp4-00000.safetensors"),
+    )
+    from freetoken.models.qwen4_exp.ple_disk import source_from_safetensors
+
+    with pytest.raises(NotImplementedError, match="packed e2m1"):
+        source_from_safetensors(str(tmp_path))
+
+
 def _make_table(tmp_path):
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
