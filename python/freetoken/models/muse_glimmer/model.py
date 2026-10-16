@@ -105,6 +105,8 @@ class MuseGlimmerModel(BaseOP):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
+            quant_config=config.quant,
+            prefix=f"{prefix}.embed_tokens",
         )
         # NormedEmbedding: a weightless RMSNorm on top of the embeddings. Kept separate
         # from the embedding matrix (the reference cannot fold it either -- the DFlash
