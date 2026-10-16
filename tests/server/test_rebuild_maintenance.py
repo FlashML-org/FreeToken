@@ -23,6 +23,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from freetoken.server.api_server import FrontendManager, dispatch_rebuild
@@ -257,6 +258,30 @@ def test_cache_rebuild_guarded_during_loading():
         assert "loading" in r.json().get("error", "").lower()
     finally:
         api._GLOBAL_STATE = prev
+
+
+_GATED_REQUESTS = {
+    "/v1/chat/completions": {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    "/v1/messages": {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
+    "/v1/responses": {"model": "m", "input": "hi"},
+    "/generate": {"prompt": "hi", "max_tokens": 8},
+}
+
+
+@pytest.mark.parametrize("path", sorted(_GATED_REQUESTS))
+@pytest.mark.parametrize("stage, named", [("loading", "loading"), ("rebuilding", "rebuild"), ("stopping", "stopping"),
+                                          ("failed", "failed")])
+def test_every_api_names_the_stage_it_refuses_in(path, stage, named):
+    import freetoken.server.api_server as api
+
+    prev = api._GLOBAL_STATE
+    api._GLOBAL_STATE = SimpleNamespace(maintenance_state=stage, fatal_error=None)
+    try:
+        response = TestClient(api.app).post(path, json=_GATED_REQUESTS[path])
+    finally:
+        api._GLOBAL_STATE = prev
+    assert response.status_code == 503
+    assert named in response.text.lower()
 
 
 def test_cache_rebuild_timeout_keeps_gate_closed():
