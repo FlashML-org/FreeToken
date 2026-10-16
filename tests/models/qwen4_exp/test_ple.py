@@ -267,7 +267,8 @@ def test_gpu_resident_fp4_lookup_matches_the_lut():
     lut = torch.tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
     )
-    values = torch.stack((lut[packed & 0x0F], lut[(packed >> 4) & 0x0F]), dim=2).reshape(rows, dim)
+    nibbles = packed.to(torch.int64)
+    values = torch.stack((lut[nibbles & 0x0F], lut[(nibbles >> 4) & 0x0F]), dim=2).reshape(rows, dim)
     want = (values * scales.float().repeat_interleave(16, dim=1) * scale).to(torch.bfloat16)
     assert torch.equal(table.lookup(ids).view(-1, dim), want[ids.reshape(-1)])
 
