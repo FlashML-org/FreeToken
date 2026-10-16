@@ -259,7 +259,7 @@ def test_gpu_resident_fp4_lookup_matches_the_lut():
     """CPU oracle: e2m1 nibble decode, per-16 e4m3 scale rows, global scale."""
     gen = torch.Generator().manual_seed(3)
     rows, dim, scale = 64, 32, 0.5
-    packed = torch.randint(0, 256, (rows, dim // 2), generator=gen)
+    packed = torch.randint(0, 256, (rows, dim // 2), generator=gen).to(torch.uint8)
     scales = (torch.rand(rows, dim // 16, generator=gen) * 8).to(torch.float8_e4m3fn)
     table = GpuResidentTable(packed, scale, dtype=torch.bfloat16, scale_tensor=scales)
     ids = torch.randint(0, rows, (5, 16))

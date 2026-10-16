@@ -522,7 +522,7 @@ def test_load_ple_table_rejects_a_nvfp4_table_under_fp8(tmp_path):
     for i, name in enumerate(sorted(tensors)):
         save_file({name: tensors[name]}, str(tmp_path / f"model-plefp4-{i:05d}.safetensors"))
     args = SimpleNamespace(split_ngram_parts=parts, ngram_head_dim=dim, ple_embedding_dtype="fp8")
-    with pytest.raises(ValueError, match="unsupported dtype"):
+    with pytest.raises(ValueError, match="expected F8_E4M3"):
         load_ple_table(str(tmp_path), args, pin=False)
 
 

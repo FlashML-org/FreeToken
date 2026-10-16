@@ -95,14 +95,16 @@ def decode_csf_scales(fixed: torch.Tensor, exceptions: torch.Tensor) -> torch.Te
     bits = 4 * torch.arange(cols)
     scale = (base + ((codes[:, bits // 8] >> bits % 8) & 0x0F)) & 0xFF
     if exceptions.numel():
+        # CPU torch has no uint32 shifts; the same bit math in int32 is well defined,
+        # including (rec >> 24) & 0xFF for records with the sign bit set.
         rec = exceptions.reshape(-1)
         if rec.dtype == torch.uint8:
-            rec = rec.view(torch.uint32)
-        elif rec.dtype != torch.uint32:
-            rec = rec.to(torch.int32).view(torch.uint32)
+            rec = rec.view(torch.int32)
+        elif rec.dtype != torch.int32:
+            rec = rec.to(torch.int32)
         scale = scale.to(torch.int32)
         flat = scale.reshape(-1)
-        flat.scatter_(0, (rec & 0xFFFFFF).to(torch.int64), (rec >> 24).to(torch.int32))
+        flat.scatter_(0, (rec & 0xFFFFFF).to(torch.int64), (rec >> 24) & 0xFF)
     return scale.to(torch.uint8).view(torch.float8_e4m3fn)
 
 
@@ -149,9 +151,12 @@ def iter_nvfp4_expert_pieces(
         if kind in spec.ignored_kinds:
             continue
         if pair_kinds is not None:
-            if kind not in pair_kinds:
+            if kind in pair_kinds:
+                wanted[name] = (bank_layer, int(match.group("expert")), f"{role}~{kind}")
+            elif kind in ("weight", "weight_scale_2"):
+                wanted[name] = (bank_layer, int(match.group("expert")), role + _kind_suffix(kind))
+            else:
                 raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-            wanted[name] = (bank_layer, int(match.group("expert")), f"{role}~{kind}")
         elif kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         else:
