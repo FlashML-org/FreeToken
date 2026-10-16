@@ -19,6 +19,9 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "glm4moe": "Glm4MoeGGUFForCausalLM",
+    # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
+    "glm5-next": "Glm5NextGGUFForCausalLM",
+    "glm5next": "Glm5NextGGUFForCausalLM",
     "llama": "LlamaGGUFForCausalLM",
     "minimax-m2": "MiniMaxM2GGUFForCausalLM",
     "minimax-m3": "MiniMaxM3GGUFForCausalLM",
