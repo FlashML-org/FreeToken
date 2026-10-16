@@ -230,17 +230,16 @@ class TritonAttentionBackend(BaseAttnBackend):
         cached_lens = [req.cached_len for req in reqs]
         num_query_tokens = sum(seqlens_q)
         is_decode = max(seqlens_q) == 1
-        prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": device.type == "cuda"}
+        prefix_lens = torch.tensor(cached_lens, **CPU_KWARGS).to(device, non_blocking=True)
 
-        indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)
+        indptr = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(0).to(device, non_blocking=True)
         if is_decode:
             cu_seqlens_q_gpu = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):
             cu_seqlens_q_gpu = indptr
         else:
-            cu_seqlens_q_gpu = torch.tensor(
-                [0] + seqlens_q, dtype=torch.int32, device=device
-            ).cumsum_(0)
+            cu_seqlens_q_gpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(0).to(device, non_blocking=True)
         indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
         swa_indices = None
         if getattr(self.kvcache, "swa_paged", False):
