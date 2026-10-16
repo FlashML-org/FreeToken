@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.attention import AttentionSpec
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaRMSNorm, LinearQKVMerged, LinearReplicated
+from freetoken.layers import BaseOP, GemmaRMSNorm, LinearOProj, LinearQKVMerged
 from freetoken.layers.rotary import get_rope
 from freetoken.models.config import FullAttentionGroupConfig, SWAAttentionGroupConfig
 from freetoken.utils import nvtx_annotate
@@ -40,7 +40,12 @@ class Gemma4Attention(BaseOP):
             quant_config=config.quant,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
+        # Row-parallel, as every other family with a column-parallel qkv builds o_proj:
+        # each rank's attention output is its local head slice, so o_proj takes the sharded
+        # input dim and all-reduces the partial sums. At TP=1 this degenerates to the previous
+        # replicated behaviour exactly (div_even(x, 1) == x, all-reduce skipped), so it is a
+        # no-op today and correct whenever this family gains tensor parallelism.
+        self.o_proj = LinearOProj(
             self.q_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
