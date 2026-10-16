@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import platform
 from pathlib import Path
 
 import sys
@@ -96,8 +97,56 @@ else:
 
 _check_toolchain()
 
+# ggml-cpu's quant kernels for GGUF experts on the CPU MoE executor, as a static C library linked into _cpu_moe.
+# They are built for AVX2 only; the executor checks the CPU before it calls them.
+GGML_DIR = "python/freetoken/kernel/csrc/ggml"
+GGML_CPU = platform.machine().lower() in ("x86_64", "amd64")
+if sys.platform == "win32":
+    ggml_cpu_cflags = ["/O2", "/DNDEBUG", "/std:c11", "/utf-8", "/arch:AVX2", "/D__BMI2__", "/D_CRT_SECURE_NO_WARNINGS"]
+else:
+    ggml_cpu_cflags = ["-O3", "-fPIC", "-fvisibility=hidden", "-DNDEBUG", "-std=c11", "-mavx", "-mavx2", "-mfma", "-mf16c", "-mbmi2"]
+ggml_cpu_libraries = [
+    ("freetoken_ggml_cpu", {
+        "sources": [
+            f"{GGML_DIR}/src/ggml-quants.c",
+            f"{GGML_DIR}/ggml-cpu/quants.c",
+            f"{GGML_DIR}/ggml-cpu/arch/x86/quants.c",
+            f"{GGML_DIR}/freetoken/cpu_kernels.c",
+        ],
+        "include_dirs": [f"{GGML_DIR}/include", f"{GGML_DIR}/src", f"{GGML_DIR}/ggml-cpu", GGML_DIR],
+        "obj_deps": {"": sorted(str(p.relative_to(ROOT)) for d in ("include", "src", "ggml-cpu", "freetoken") for p in (ROOT / GGML_DIR / d).rglob("*.h"))},
+        "cflags": ggml_cpu_cflags,
+    })
+] if GGML_CPU else []
+
+
+class BuildExt(BuildExtension):
+    def run(self):
+        # build_ext alone (`setup.py build_ext --inplace`) does not run build_clib
+        if self.distribution.has_c_libraries():
+            self.run_command("build_clib")
+        # build_ext would link every build_clib library into every extension; build_extension adds it to _cpu_moe only
+        libraries, self.distribution.libraries = self.distribution.libraries, None
+        try:
+            super().run()
+        finally:
+            self.distribution.libraries = libraries
+
+    def build_extension(self, ext):
+        if ext.name == "freetoken.kernel._cpu_moe" and GGML_CPU:
+            build_clib = self.get_finalized_command("build_clib")
+            if "freetoken_ggml_cpu" not in ext.libraries:
+                ext.libraries.append("freetoken_ggml_cpu")
+                ext.library_dirs.append(build_clib.build_clib)
+            lib = os.path.join(build_clib.build_clib, self.compiler.library_filename("freetoken_ggml_cpu"))
+            # relink when only the static library changed
+            if lib not in ext.depends:
+                ext.depends.append(lib)
+        super().build_extension(ext)
+
 
 setup(
+    libraries=ggml_cpu_libraries,
     ext_modules=[
         CppExtension(
             name="freetoken.kernel._pinned_tensor",
@@ -126,7 +175,8 @@ setup(
                     for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
                 ),
             ],
-            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
+            define_macros=[("FT_GGML_CPU", "1")] if GGML_CPU else [],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
             extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
@@ -143,5 +193,5 @@ setup(
             )
         ] if sys.platform == "linux" else []),
     ],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    cmdclass={"build_ext": BuildExt.with_options(use_ninja=True)},
 )

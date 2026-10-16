@@ -63,7 +63,7 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
-# else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
+# else is offload-only here.
 _CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})

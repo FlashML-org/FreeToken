@@ -1479,6 +1479,8 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt == "gguf":
+        return fmt in _cpu_moe.weight_formats() and not _cpu_moe.gguf_cpu_unavailable()
     return fmt == "mxfp4" or fmt in _cpu_moe.weight_formats()
 
 

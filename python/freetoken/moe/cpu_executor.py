@@ -147,6 +147,16 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     return len(reps), list(reps)
 
 
+def _format_label(name: str, opts: tuple) -> str:
+    """One format instance as the startup log names it, e.g. ``gguf(gate_up=IQ2_XXS, down=IQ4_NL)``."""
+    if name == "gguf":
+        from freetoken.layers.quantization.ggml_types import type_name
+
+        gate_up, down = dict(opts)["gate_up_type"], dict(opts)["down_type"]
+        return f"gguf(gate_up={type_name(gate_up)}, down={type_name(down)})"
+    return name + (f"({', '.join(f'{k}={v}' for k, v in opts)})" if opts else "")
+
+
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (the formats ``_cpu_moe.weight_formats()`` lists — see ``_resolve_banks``)."""
@@ -182,6 +192,8 @@ class CpuMoeExecutor:
                     f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
                     f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
                 )
+            if f == "gguf" and (why := _cpu_moe.gguf_cpu_unavailable()):
+                raise NotImplementedError(f"--moe-strategy cpu/hybrid cannot compute GGUF experts here: {why}; use --moe-strategy offload instead.")
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
         if apply_router_weight_on_input and (output_only := {"mxfp4_triton", "ds_fp4"} & set(names)):
@@ -348,7 +360,7 @@ class CpuMoeExecutor:
             self._watchdog.start()
 
 
-        fmt_label = "; ".join(f"{name}{dict(opts) if opts else ''}: {n} layers" for (name, opts), n in layer_counts.items())
+        fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} "
@@ -404,6 +416,8 @@ class CpuMoeExecutor:
         (see ``_make_table``), not a single bank's -- the C++ side resolves
         ``tbl[layer_id]`` per task.
         """
+        if fmt == "gguf":
+            return self._resolve_gguf_banks(banks, rep, int(opts["gate_up_type"]), int(opts["down_type"]))
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]
@@ -417,9 +431,6 @@ class CpuMoeExecutor:
             assert tuple(down[rep].shape[1:]) == (H, I), (down[rep].shape, H, I)
             banks = self._tables(gate_up=gate_up, down=down)
             return banks, {}, (H, I)
-
-        if fmt == "q4_0":
-            return self._resolve_q4_0_banks(banks, rep)
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks, rep)
@@ -447,23 +458,17 @@ class CpuMoeExecutor:
         banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, gate_up_global=gug, down_scale=dns, down_global=dng)
         return banks, {}, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+    def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int) -> tuple[dict, dict, tuple[int, int]]:
+        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each."""
+        from freetoken.layers.quantization.ggml_types import row_bytes, type_name
+
         gate_up, down = banks["gate_up"], banks["down"]
-        assert gate_up[rep].dtype == torch.uint8 and down[rep].dtype == torch.uint8, (
-            gate_up[rep].dtype, down[rep].dtype,
-        )
-        I = int(gate_up[rep].shape[1] // 2)
-        H = int(down[rep].shape[1])
-        assert gate_up[rep].shape[1] == 2 * I
-        assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[rep].shape[2]) == (H // 32) * 18, (gate_up[rep].shape, H)
-        assert int(down[rep].shape[2]) == (I // 32) * 18, (down[rep].shape, I)
+        H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)
+        for role, t, ggml_type, k in (("gate_up", gate_up[rep], gate_up_type, H), ("down", down[rep], down_type, I)):
+            if t.dtype != torch.uint8 or t.shape[-1] != row_bytes(ggml_type, k):
+                raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
         banks = self._tables(gate_up=gate_up, down=down)
-        return banks, {}, (H, I)
+        return banks, {"gate_up_type": gate_up_type, "down_type": down_type}, (H, I)
 
     def _resolve_mxfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales
