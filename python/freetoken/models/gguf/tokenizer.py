@@ -22,6 +22,9 @@ _BOS_PRE = frozenset((
     "llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2", "jina-v5-nano", "tekken", "chameleon",
 ))
 
+# Llama 3 pre-tokenizers, whose HF tokenizer and llama.cpp take a word that is one vocabulary token as is instead of merging it
+_IGNORE_MERGES_PRE = frozenset(("llama3", "llama-v3", "llama-bpe"))
+
 
 def _add_bos(meta: dict) -> bool:
     if "tokenizer.ggml.add_bos_token" in meta:
@@ -77,6 +80,8 @@ def load_gguf_tokenizer(model_path: str):
     fast, _ = convert_gguf_tokenizer(arch, tok_dict)
     meta = load_gguf_metadata(model_path)
     fast = _fix_added_tokens(fast, meta)
+    if meta.get("tokenizer.ggml.model") == "gpt2" and meta.get("tokenizer.ggml.pre") in _IGNORE_MERGES_PRE:
+        fast.model.ignore_merges = True
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template
     return PreTrainedTokenizerFast(
         tokenizer_object=fast,
