@@ -163,36 +163,36 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
-        fmt: str | None = None,
-        act_block: int | None = None,
-        layer_formats: list[str] | None = None,
+        fmt: str | tuple[str, dict[str, int]] | None = None,
+        layer_formats: list[tuple[str, dict[str, int]]] | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
-        fmt = fmt or cache.quant_format
-        # experts of several formats: layer_formats[l] serves layer l, fmt the layers of the most common one
-        if layer_formats is not None:
-            assert len(layer_formats) == cache.num_layers, (len(layer_formats), cache.num_layers)
-            fmt = max(sorted(set(layer_formats)), key=layer_formats.count)
-        for f in {fmt, *(layer_formats or ())}:
+        # layer_formats[l] = (format, options) of layer l; fmt, a name or (name, options), stands for every layer
+        if layer_formats is None:
+            spec = fmt or cache.quant_format
+            layer_formats = [spec if isinstance(spec, tuple) else (spec, {})] * int(cache.num_layers)
+        assert len(layer_formats) == cache.num_layers, (len(layer_formats), cache.num_layers)
+        keys = [(name, tuple(sorted(opts.items()))) for name, opts in layer_formats]
+        specs = list(dict.fromkeys(keys))
+        names = sorted({name for name, _ in specs})
+        for f in names:
             if f not in _cpu_moe.weight_formats():
                 raise NotImplementedError(
                     f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
                     f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
                     f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
                 )
-            if f in ("ds_fp4", "mxfp4_triton") and layer_formats is not None and len(set(layer_formats)) > 1:
-                raise NotImplementedError(f"CPU MoE backend: {f} experts do not combine with experts of another format")
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
-        if apply_router_weight_on_input and fmt in ("mxfp4_triton", "ds_fp4"):
-            raise NotImplementedError(f"CPU MoE backend: {fmt} experts apply the router weight on the output only")
+        if apply_router_weight_on_input and (output_only := {"mxfp4_triton", "ds_fp4"} & set(names)):
+            raise NotImplementedError(f"CPU MoE backend: {sorted(output_only)} experts apply the router weight on the output only")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
         # handles its act inside the kernel and predates the marker.)
-        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+        if _ACT_IDS[activation] >= 3 and names != ["mxfp4_triton"]:
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
                 raise RuntimeError(
@@ -205,7 +205,7 @@ class CpuMoeExecutor:
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)
         self.top_k = int(top_k)
-        self.quant_format = fmt
+        self.quant_format = ",".join(names)
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
@@ -213,16 +213,16 @@ class CpuMoeExecutor:
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         by_role = {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}
-        layers_of = {f: [l for l, lf in enumerate(layer_formats) if lf == f] for f in set(layer_formats)} if layer_formats else {fmt: [0]}
-        banks, options, (self.H, self.I) = self._resolve_banks(by_role, fmt, layers_of[fmt][0])
-        # the other formats' tables address every layer too, but only their own layers' rows are read
-        self._extra_formats = []
-        for f, layers in sorted(layers_of.items()):
-            if f == fmt:
-                continue
-            f_banks, f_options, hi = self._resolve_banks(by_role, f, layers[0])
-            assert hi == (self.H, self.I), f"{f} experts are {hi}, the {fmt} ones {(self.H, self.I)}: one executor serves one (H, I)"
-            self._extra_formats.append((f, f_banks, f_options, layers))
+        # every format's tables address every layer, but a format reads only its own layers' rows
+        formats, shapes = [], set()
+        for name, opts in specs:
+            banks, options, shape = self._resolve_banks(by_role, name, keys.index((name, opts)), dict(opts))
+            formats.append((name, banks, {**dict(opts), **options}))
+            shapes.add(shape)
+        if len(shapes) != 1:
+            raise NotImplementedError(f"CPU MoE formats disagree on the expert shape (hidden, intermediate): {sorted(shapes)}")
+        (self.H, self.I), = shapes
+        layer_counts = {spec: keys.count(spec) for spec in specs}
 
         # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
         # that the C++ side runs single-threaded on the CUDA host-callback thread --
@@ -231,12 +231,15 @@ class CpuMoeExecutor:
         # round-trip as a captured GPU kernel BEFORE the D2H (see decode_submit) and tell
         # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
-        self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda" and _DSFP4_GPU_PREQUANT
         # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
-        self._act_block = act_block
-        if fmt == "ds_fp4":
-            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
-            options.update(act_block=int(act_block), input_prequant=int(self._gpu_prequant))
+        blocks = {options.get("act_block") for name, _, options in formats if name == "ds_fp4"}
+        assert None not in blocks, "ds_fp4 experts need the act_block option, the checkpoint's fp8 activation quant block"
+        # the GPU round-trip rewrites the whole input, so only when every layer is ds_fp4 with one block
+        self._gpu_prequant = names == ["ds_fp4"] and len(blocks) == 1 and device.type == "cuda" and _DSFP4_GPU_PREQUANT
+        self._act_block = next(iter(blocks)) if self._gpu_prequant else None
+        for name, _, options in formats:
+            if name == "ds_fp4":
+                options["input_prequant"] = int(self._gpu_prequant)
         if self._gpu_prequant:
             logger.info_rank0(
                 "ds_fp4: input FP8 round-trip moved to the GPU "
@@ -287,9 +290,8 @@ class CpuMoeExecutor:
             max_tokens=self.max_tokens,
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
-            weight_format=fmt,
-            banks=banks,
-            options=options,
+            formats=formats,
+            layer_formats=[specs.index(k) for k in keys],
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
@@ -298,8 +300,6 @@ class CpuMoeExecutor:
             w_ptr=self._io["w"].data_ptr(),
             y_ptr=self._io["y"].data_ptr(),
         )
-        for f, f_banks, f_options, layers in self._extra_formats:
-            self._ext.set_layer_format(weight_format=f, banks=f_banks, options=f_options, layers=layers)
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
@@ -350,10 +350,11 @@ class CpuMoeExecutor:
             self._watchdog.start()
 
 
+        fmt_label = "; ".join(f"{name}{dict(opts) if opts else ''}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt}"
-            f"{''.join(f'+{f}({len(layers)} layers)' for f, _, _, layers in self._extra_formats)} "
+            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} "
+            f"fmt={fmt_label} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
             f"spin_wait={self.spin_wait} "
@@ -395,7 +396,7 @@ class CpuMoeExecutor:
         options = dict(gu_scale_stride=int(gus[rep].stride(1)), dn_scale_stride=int(dns[rep].stride(1)))
         return banks, options, (H, I)
 
-    def _resolve_banks(self, banks: dict, fmt: str, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
+    def _resolve_banks(self, banks: dict, fmt: str, rep: int = 0, opts: dict | None = None) -> tuple[dict, dict, tuple[int, int]]:
         """Return (banks, options, (H, I)) for the C++ ctor: banks maps each canonical role
         the format reads to its per-layer table's address, options holds its integer settings.
 

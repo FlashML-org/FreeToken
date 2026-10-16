@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -103,6 +104,9 @@ std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams&
   throw std::invalid_argument("unknown CPU MoE weight format " + name);
 }
 
+// One format instance as cpu_executor.py passes it: name, bank tables by role, integer options.
+using FormatSpec = std::tuple<std::string, std::map<std::string, uint64_t>, std::map<std::string, int64_t>>;
+
 struct CpuMoeExecutor {
   // A host-function callback gets one pointer, so it carries the executor with the task.
   struct HostTask {
@@ -113,9 +117,8 @@ struct CpuMoeExecutor {
   const int num_layers, num_experts;
   const bool apply_on_input;
   MoeParams params;  // the formats keep a reference; declared before fmts
-  // fmts[layer_fmt[layer]] serves a layer: the constructor's format serves every layer until set_layer_format moves some to another.
   std::vector<std::unique_ptr<MoeFormat>> fmts;
-  std::vector<int> layer_fmt;
+  std::vector<int> layer_fmt;  // [num_layers], index into fmts
   int n_iblk = 0, n_hblk = 0;  // kRowBlock blocks per intermediate row and per output row
 
   // Pinned IO shared by every layer and batch size (one task in flight): [max_tokens, H] x and y, [max_tokens, top_k] ids and w.
@@ -167,9 +170,8 @@ struct CpuMoeExecutor {
 
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens_, int activation_id,
-                 int apply_router_weight_on_input, const std::string& weight_format,
-                 std::map<std::string, uint64_t> banks, std::map<std::string, int64_t> options,
-                 double swiglu_alpha_, double swiglu_limit_,
+                 int apply_router_weight_on_input, std::vector<FormatSpec> formats,
+                 std::vector<int> layer_formats, double swiglu_alpha_, double swiglu_limit_,
                  std::vector<int> core_ids_, uintptr_t x_ptr, uintptr_t ids_ptr, uintptr_t w_ptr,
                  uintptr_t y_ptr)
       : num_layers(num_layers_),
@@ -184,8 +186,13 @@ struct CpuMoeExecutor {
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
-    fmts.push_back(make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)}));
-    layer_fmt.assign(num_layers, 0);
+    for (auto& [name, banks, options] : formats)
+      fmts.push_back(make_format(name, params, FormatArgs{name, std::move(banks), std::move(options)}));
+    if (static_cast<int>(layer_formats.size()) != num_layers)
+      throw std::invalid_argument("CPU MoE needs the format of every layer");
+    for (const int f : layer_formats)
+      if (f < 0 || f >= static_cast<int>(fmts.size())) throw std::out_of_range("CPU MoE layer format index out of range");
+    layer_fmt = std::move(layer_formats);
     n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
     n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
@@ -216,19 +223,16 @@ struct CpuMoeExecutor {
     return MoeTask{static_cast<uint64_t>(layer_id), static_cast<uint64_t>(num_tokens)};
   }
 
-  std::string isa_name() const { return fmts[0]->isa_name(); }
+  std::string isa_name() const {
+    std::vector<std::string> names;
+    for (const auto& f : fmts)
+      if (const std::string n = f->isa_name(); std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+    std::string out;
+    for (const auto& n : names) out += (out.empty() ? "" : ",") + n;
+    return out;
+  }
 
   const MoeFormat& format_of(const MoeTask& t) const { return *fmts[layer_fmt[t.layer]]; }
-
-  // Experts of several formats: serve `layers` with another format over the same H, I and IO. Call before the first task.
-  void set_layer_format(const std::string& weight_format, std::map<std::string, uint64_t> banks,
-                        std::map<std::string, int64_t> options, const std::vector<int>& layers) {
-    fmts.push_back(make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)}));
-    for (const int layer : layers) {
-      if (layer < 0 || layer >= num_layers) throw std::out_of_range("CPU MoE layer " + std::to_string(layer) + " is outside the executor's layers");
-      layer_fmt[layer] = static_cast<int>(fmts.size()) - 1;
-    }
-  }
 
   // Whether any route of the task names an expert; do_pass1 and do_pass2 skip the others.
   bool has_routes(const MoeTask& t) const {
@@ -525,18 +529,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using freetoken::cpu_moe::CpuMoeExecutor;
   using freetoken::cpu_moe::GpuSync;
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
-      .def(py::init<int, int, int, int, int, int, int, int, int, std::string,
-                    std::map<std::string, uint64_t>, std::map<std::string, int64_t>,
-                    double, double, std::vector<int>, uintptr_t, uintptr_t, uintptr_t, uintptr_t>(),
+      .def(py::init<int, int, int, int, int, int, int, int, int, std::vector<freetoken::cpu_moe::FormatSpec>,
+                    std::vector<int>, double, double, std::vector<int>, uintptr_t, uintptr_t, uintptr_t,
+                    uintptr_t>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
-           py::arg("apply_router_weight_on_input"), py::arg("weight_format"),
-           py::arg("banks"), py::arg("options"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
+           py::arg("apply_router_weight_on_input"), py::arg("formats"), py::arg("layer_formats"),
+           py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
            py::arg("core_ids"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
-      .def("set_layer_format", &CpuMoeExecutor::set_layer_format, py::arg("weight_format"), py::arg("banks"),
-           py::arg("options"), py::arg("layers"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("layer_id"), py::arg("num_tokens"),
            py::call_guard<py::gil_scoped_release>())

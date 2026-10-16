@@ -49,7 +49,7 @@ def test_dsfp4_gpu_prequant_bit_parity(monkeypatch):
         monkeypatch.setattr(cpu_executor, "_DSFP4_GPU_PREQUANT", not cpu_roundtrip)
         ex = CpuMoeExecutor(
             cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
-            num_threads=4, max_tokens=2, device=dev, swiglu_limit=10.0, act_block=128,
+            num_threads=4, max_tokens=2, device=dev, swiglu_limit=10.0, fmt=("ds_fp4", {"act_block": 128}),
         )
         assert ex._gpu_prequant != cpu_roundtrip, "ds_fp4 on CUDA should enable GPU prequant"
         out = ex.decode(0, x, wts, ids.clone()).clone()

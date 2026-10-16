@@ -28,6 +28,9 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "W4A8 ds_fp4 experts need the fp8 activation quant block"
         return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
 
+    def cpu_options(self, cfg: MoEConfig) -> dict[str, int]:
+        return {"act_block": int(cfg.act_block)}
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.intermediate, cfg.hidden
         return {

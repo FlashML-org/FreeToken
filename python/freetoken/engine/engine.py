@@ -606,6 +606,7 @@ class Engine:
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
+                layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
             )
         attach_resident_banks(layers, banks)
 
@@ -925,10 +926,8 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
-        method = sample.quant_method
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
-        formats = [getattr(layer.quant_method, "cpu_format", None) for layer in by_id]
-        layer_formats = formats if len(set(formats)) > 1 else None
+        layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -939,8 +938,6 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            fmt=method.cpu_format,
-            act_block=method.cfg.act_block,
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)

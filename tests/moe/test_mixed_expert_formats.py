@@ -221,7 +221,7 @@ def test_cpu_executor_computes_each_layer_in_its_format():
     cache, layers, _ = _mixed_cache(device, pieces, decode_target="hybrid")
     ex = CpuMoeExecutor(
         cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False, num_threads=2,
-        max_tokens=4, device=device, fmt="nvfp4", layer_formats=FORMATS,
+        max_tokens=4, device=device, fmt="nvfp4", layer_formats=[(f, {}) for f in FORMATS],
     )
     cache.set_cpu_executor(ex)
     bs = 3
