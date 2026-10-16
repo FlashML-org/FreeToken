@@ -253,6 +253,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=1536,
         expert_formats=("bf16",),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
+        arch_aliases=("Glm4MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="nvidia/GLM-4.7-NVFP4",
