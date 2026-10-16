@@ -110,6 +110,28 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
     ),
+    # llama.cpp qwen2 / qwen3 / qwen3moe GGUF: the same model classes with every tensor in its packed ggml type
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3",
+        "Qwen3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
     "Qwen3VLForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_vl",
